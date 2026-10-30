@@ -644,7 +644,9 @@ impl Drop for KillPidFilesOnDrop {
 }
 
 /// The agent reads a demoted command's progress and then its exit through the work id, so its
-/// result arrives inside the task that started it and no completion task follows.
+/// result arrives inside the task that started it and no completion task follows. The completion
+/// is recorded at the call that returned the exit, right after that call's `background_command`
+/// line, before the task and the session end.
 #[test]
 fn a_demoted_command_is_read_back_through_its_handle() {
     if common::skip_without_host_support("a_demoted_command_is_read_back_through_its_handle") {
@@ -746,10 +748,41 @@ fn a_demoted_command_is_read_back_through_its_handle() {
     let completed = events_of_type(&events, "shell_completed");
     assert_eq!(completed.len(), 1, "{completed:?}");
     assert_eq!(completed[0]["work_id"], work_id);
+    assert_eq!(completed[0]["delivered_via"], "background_command");
     assert!(
         completed[0].get("completion_task_id").is_none(),
         "no completion task was enqueued: {}",
         completed[0]
+    );
+    // Under load the `status` call can already see the exit, and then it is the call that
+    // delivers it; otherwise the `wait` does.
+    let position = |matches: &dyn Fn(&Value) -> bool| {
+        events
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("{events:#?}"))
+    };
+    let delivered_at = position(&|event| {
+        event["event_type"] == "background_command" && event["state"] == "exited"
+    });
+    let completed_at = position(&|event| event["event_type"] == "shell_completed");
+    let task_end_at = position(&|event| event["event_type"] == "task_end");
+    let session_end_at = position(&|event| event["event_type"] == "session_end");
+    assert_eq!(
+        completed_at,
+        delivered_at + 1,
+        "shell_completed follows the call that returned the exit: {events:#?}"
+    );
+    assert!(
+        completed_at < task_end_at && task_end_at < session_end_at,
+        "{events:#?}"
+    );
+    let exited_at = completed[0]["exited_at_ms"].as_u64().unwrap();
+    assert!(
+        detached[0]["timestamp"].as_u64().unwrap() <= exited_at
+            && exited_at <= events[delivered_at]["timestamp"].as_u64().unwrap()
+            && exited_at <= completed[0]["timestamp"].as_u64().unwrap(),
+        "exited_at_ms falls between the demotion and the read: {events:#?}"
     );
     assert!(events_of_type(&events, "shell_abandoned").is_empty());
     let task_ends = events_of_type(&events, "task_end");
@@ -1137,6 +1170,187 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     );
 }
 
+/// A killed session's `trace.jsonl` copied into a folder of its own, as a benchmark keeps each
+/// attempt, resumes as the session it records: no warning, the loss reported once, and the marker
+/// appended to the copy that was resumed, leaving the original untouched.
+#[test]
+fn a_copied_trace_resumes_as_the_session_it_records_and_reports_its_lost_work_once() {
+    if common::skip_without_host_support(
+        "a_copied_trace_resumes_as_the_session_it_records_and_reports_its_lost_work_once",
+    ) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call("msg_1", "toolu_build", "sleep 60; echo never-seen"),
+        end_turn("msg_2", "Started the build."),
+        end_turn("msg_3", "Continued once."),
+        end_turn("msg_4", "Noted the lost work."),
+        end_turn("msg_5", "Continued twice."),
+        end_turn("msg_6", "Nothing outstanding."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let bench = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let killed_manifest = create_agent_project_with_lifecycle(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+        "lifecycle:\n  shell_grace_secs: 1\n  task_acceptance: queue\n  after_task: sleep\n",
+    );
+    let mut killed = spawn_mur_run(
+        &home,
+        project.path(),
+        &killed_manifest,
+        &["--task", "Start a long build.", "--json"],
+        "killed",
+    );
+    let killed_dir = await_trace(
+        home.path(),
+        project.path(),
+        "the first run to demote and finish its task",
+        |events| {
+            !events_of_type(events, "shell_detached").is_empty()
+                && !events_of_type(events, "task_end").is_empty()
+        },
+    );
+    killed.kill().expect("SIGKILL reaches the run");
+    killed.wait().expect("the killed run is reaped");
+    let killed_session = session_name(&killed_dir);
+    let original_trace = killed_dir.join("trace.jsonl");
+    let original_bytes = fs::read(&original_trace).unwrap();
+    let work_id = events_of_type(&trace_events(&killed_dir), "shell_detached")[0]["work_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let copy_dir = bench.path().join("bench-attempt-1");
+    fs::create_dir_all(&copy_dir).unwrap();
+    let copied_trace = copy_dir.join("trace.jsonl");
+    fs::write(&copied_trace, &original_bytes).unwrap();
+    let copy_session_event_id = events_of_type(&trace_events(&copy_dir), "session_start")[0]
+        ["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resume_manifest = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+    );
+    let resume_from = copied_trace.to_str().unwrap();
+    let status = spawn_mur_run(
+        &home,
+        project.path(),
+        &resume_manifest,
+        &["--resume", resume_from, "--task", "Carry on.", "--json"],
+        "resume-1",
+    )
+    .wait()
+    .unwrap();
+    let resume_stderr = fs::read_to_string(project.path().join("resume-1-stderr.txt")).unwrap();
+    assert!(status.success(), "the resume failed:\n{resume_stderr}");
+    for absent in [
+        "is not a session directory name",
+        "left unaccounted is not reported",
+    ] {
+        assert!(
+            !resume_stderr.contains(absent),
+            "a copied trace resumes with no warning:\n{resume_stderr}"
+        );
+    }
+
+    let resumed_dir = session_records(home.path(), project.path())
+        .into_iter()
+        .find(|dir| dir != &killed_dir)
+        .expect("the resume opened its own session");
+    let resumed_session = session_name(&resumed_dir);
+    let resumed_events = trace_events(&resumed_dir);
+    let resumed_start = events_of_type(&resumed_events, "session_start")[0].clone();
+    assert_eq!(
+        resumed_start["resumed_from"],
+        killed_session.as_str(),
+        "the session continued is the one the trace records, not the folder it was copied to"
+    );
+    let reports: Vec<&Value> = events_of_type(&resumed_events, "task_start")
+        .into_iter()
+        .filter(|event| event["source"] == "detached_lost")
+        .collect();
+    assert_eq!(reports.len(), 1, "one task reports the whole loss");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .map(common::last_user_text)
+            .any(|text| text.contains(&format!("work_id: {work_id}"))),
+        "a request carries the loss report naming {work_id}"
+    );
+
+    let lost = events_of_type(&trace_events(&copy_dir), "shell_lost")
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(lost.len(), 1, "one marker, in the copy that was resumed");
+    assert_eq!(lost[0]["work_id"], work_id.as_str());
+    assert_eq!(lost[0]["session_id"], killed_session.as_str());
+    assert_eq!(lost[0]["parent_id"], copy_session_event_id.as_str());
+    assert_eq!(lost[0]["reconciled_by_session"], resumed_session.as_str());
+    assert_eq!(
+        fs::read(&original_trace).unwrap(),
+        original_bytes,
+        "the original trace is left as it was"
+    );
+
+    let copy_bytes = fs::read(&copied_trace).unwrap();
+    let status = spawn_mur_run(
+        &home,
+        project.path(),
+        &resume_manifest,
+        &[
+            "--resume",
+            copy_dir.to_str().unwrap(),
+            "--task",
+            "Carry on again.",
+            "--json",
+        ],
+        "resume-2",
+    )
+    .wait()
+    .unwrap();
+    let second_stderr = fs::read_to_string(project.path().join("resume-2-stderr.txt")).unwrap();
+    assert!(
+        status.success(),
+        "the second resume failed:\n{second_stderr}"
+    );
+    let second_dir = session_records(home.path(), project.path())
+        .into_iter()
+        .find(|dir| dir != &killed_dir && dir != &resumed_dir)
+        .expect("the second resume opened its own session");
+    assert!(
+        events_of_type(&trace_events(&second_dir), "task_start")
+            .iter()
+            .all(|event| event["source"] != "detached_lost"),
+        "a marked work id is not reported again"
+    );
+    assert_eq!(
+        fs::read(&copied_trace).unwrap(),
+        copy_bytes,
+        "a second resume of the copy appends nothing"
+    );
+}
+
 /// A prior trace that cannot be read, and one whose writer was killed mid-line, both leave the
 /// resume running: reconciliation reports nothing rather than refusing the launch.
 #[test]
@@ -1174,7 +1388,6 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     fs::write(staged.accessible_workdir.join("task.md"), "Say something.").unwrap();
     let first = launch_session(staged, |_| {}).expect("the first launch should succeed");
-    let first_session = first.session_id.clone();
     let context_id = trace_events(&first.records_dir)
         .iter()
         .find(|event| event["event_type"] == "task_start")
@@ -1194,7 +1407,7 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
         &home,
         project.path(),
         &manifest_path,
-        &first_session,
+        &first.records_dir,
         &context_id,
     );
     fs::write(staged.accessible_workdir.join("task.md"), "Continue.").unwrap();
@@ -1233,7 +1446,7 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
         &home,
         project.path(),
         &manifest_path,
-        &first_session,
+        &first.records_dir,
         &context_id,
     );
     fs::write(staged.accessible_workdir.join("task.md"), "Continue again.").unwrap();

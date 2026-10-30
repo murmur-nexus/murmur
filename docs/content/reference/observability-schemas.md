@@ -72,7 +72,7 @@ before the first task begins
 | `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this session's commands ran under: the class of `effective_grants.enforcement_tier`, capped at `"advisory"` by `workdir_exec` or a runtime directory inside the work folder. Only a session declaring `"sealed"` records `"sealed"`. See [Declared class and host tier](containment.md#declared-class-and-host-tier) |
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
 | `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the work folder kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
-| `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
+| `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued: the `session_id` on the resumed trace's own `session_start` line, wherever that `trace.jsonl` sits, or the name of its directory when it has no `session_start`. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
 | `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
 | `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver` (the driver artifact's full name), `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch), `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch) and `model_limits` (the choice's own, shaped as the top-level `model_limits`). Written only when `inference.alternates` is declared; absent otherwise |
@@ -472,9 +472,13 @@ A demoted command raises `total_shell_calls` and its task's `shell_calls` here, 
 `shell_completed` line does not, so each shell command is counted exactly once whichever way it
 ran.
 
-**`shell_completed`** — written when a demoted command finishes: where the task loop enqueues its
-result as a task, or skips that because [`background-command`](runtime-provided-tools.md#background-command)
-already returned the exit, or during teardown for a command whose exit the agent already read
+**`shell_completed`** — written once per demoted command whose result reached the agent, at the
+moment it did. Whichever delivery comes first writes the line:
+
+| Delivery | `delivered_via` | Written |
+|---|---|---|
+| A [`background-command`](runtime-provided-tools.md#background-command) `status`, `wait` or `stop` returned the finished state | `"background_command"` | Right after that call's `background_command` line, so a `wait` that returns the exit writes it at the exit |
+| The task loop queued the result as a `completion`-origin task | `"task"` | When the task is queued, before that task's `task_start` |
 
 | Field | Type | Notes |
 |---|---|---|
@@ -483,11 +487,13 @@ already returned the exit, or during teardown for a command whose exit the agent
 | `command` | string | As on `shell` |
 | `exit_code` | i32 | `128 + signal` for a signal kill |
 | `duration_ms` | u64 | From spawn to exit, foreground portion included |
+| `exited_at_ms` | u64 | Epoch milliseconds at which the runtime recorded the command's exit. Never later than the line's `timestamp`; the gap is how long the result waited to reach the agent |
 | `output_path` | string | The absolute path of the file holding the command's full stdout and stderr: `logs/<work_id>.log` in the session's [records directory](workdir.md#records-directory) |
 | `output_bytes` | u64 | Size of that file, header and `Exit code:` line included. `0` when it could not be written |
 | `resource_limit` | string | As on `shell`, and omitted on the same terms |
 | `status` | string | `"ok"` \| `"error"`. `"error"` for a non-zero exit, a signal kill, an attributed `resource_limit`, or a wait that itself failed |
-| `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it. Absent when no task was enqueued because `background-command` had already returned the exit |
+| `delivered_via` | string | `"background_command"` \| `"task"`, as in the table above |
+| `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was queued as, so a reader can join a command to the task that reported it. Present exactly when `delivered_via` is `"task"`. A queued task's own `task_start` or `task_rejected` says whether it ran |
 
 **`shell_abandoned`** — written once per demoted command the session ended without carrying its
 result back, whether it was still running when the session ended or finished while it was shutting
@@ -515,12 +521,14 @@ it, and one grouped report naming every discarded command is written to stderr a
 agent already read through `background-command` is recorded as `shell_completed` instead.
 
 **`shell_lost`** — written once per demoted command a later `mur run --resume` found with no
-`shell_completed` and no `shell_abandoned`, and appended to the `trace.jsonl` of the session that
-started it rather than to the resuming session's own
+`shell_completed` and no `shell_abandoned`, and appended to the `trace.jsonl` that `--resume`
+named rather than to the resuming session's own: the records directory of the session that started
+the command, or the folder a copy of its trace was moved to. A trace with no `session_start` line
+names no session to mark, so nothing is reported or appended for it, and one line on stderr says so
 
 | Field | Type | Notes |
 |---|---|---|
-| `session_id` | string | The session that started the command, so the line matches the file it is written into |
+| `session_id` | string | The session that started the command, as the trace's own `session_start` names it, so the line matches the file it is written into |
 | `parent_id` | string | That session's `session_start` node. Absent when that record could not be read back |
 | `work_id` | string | The `shell_detached` line's `work_id` |
 | `binary` | string | As on `shell` |
@@ -534,7 +542,7 @@ writes `shell_abandoned` runs on every clean exit. This line carries no `exit_co
 no `duration_ms`, no `output_path` and no `output_bytes`, because a command whose runtime was
 killed produced none of them — including no output log, which is written from inside the
 runtime after the command exits. Its presence is also what keeps a second resume of the same
-session from reporting the same work id again.
+trace from reporting the same work id again.
 
 **`shell_detach_unrecorded`** — written when a command was moved to the background and its own
 `shell_detached` line could not be written
@@ -720,7 +728,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task); `"no_answer"` if the model ended it with [`end-without-answer`](runtime-provided-tools.md#end-without-answer) |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task), or a formation's end or the spawner's exit cancelled it; `"deadline_reached"`, the word `session_end` uses, if the session [deadline](cli.md#mur-run-deadline) ended the task — cancelled it, or stopped it while it was kept working or its done check ran; `"no_answer"` if the model ended it with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). The task's A2A state is separate: a deadline-cancelled task reads `canceled`, and one that held an answer when the deadline stopped it reads `completed` with that answer |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -730,8 +738,8 @@ for every task, on every exit path
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
 | `capped_turns` | u32 | The task's agent-loop turns that stopped at the [output cap](manifest.md#inference-max-tokens-reached), its `inference` lines with `stop_reason` `"max_tokens"`. Always present; `0` when none did. A reader that finds no `capped_turns` field should default it to `0` |
 | `running_commands` | array of string | The `work_id`s of the shell commands moved to the background and still running when the task ended, oldest first — the same commands the task's A2A result names in [`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata). Absent when there were none |
-| `keep_working` | object | Present only when the capsule sets [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working): `used` (u32), the continuations sent across reopens; `limit` (u32), `lifecycle.keep_working.limit`; `stopped_by` (string \| null), what stopped the task being kept working — `"limit"`, `"max_turns"`, `"spend_ceiling"`, `"deadline"` or `"no_session"` (see [Keeping a task working](../concepts/session-loop.md#keep-working)) — and `null` when it ended any other way. A stopped task's `exit_status` is `"ok"` |
-| `done_check` | object | Present only when the capsule sets [`lifecycle.done_check`](manifest.md#lifecycle-done-check): `runs` (u32), the check's runs across reopens; `reopens` (u32), the reopens failing runs caused; `limit` (u32), `lifecycle.done_check.limit`; `met` (bool \| null), whether the last run passed — `null` when the check never ran, `false` after a run a cancel or the deadline stopped; `stopped_by` (string \| null), what ended the task with the check unmet — `"limit"`, `"max_turns"`, `"spend_ceiling"` or `"deadline"` (see [Done check](../concepts/session-loop.md#done-check)) — and `null` otherwise. A task ended at the limit has `exit_status` `"ok"` |
+| `keep_working` | object | Present only when the capsule sets [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working): `used` (u32), the continuations sent across reopens; `limit` (u32), `lifecycle.keep_working.limit`; `stopped_by` (string \| null), what stopped the task being kept working — `"limit"`, `"max_turns"`, `"spend_ceiling"`, `"deadline"` or `"no_session"` (see [Keeping a task working](../concepts/session-loop.md#keep-working)) — and `null` when it ended any other way. A task stopped by `"deadline"` has `exit_status` `"deadline_reached"`; every other stop has `"ok"` |
+| `done_check` | object | Present only when the capsule sets [`lifecycle.done_check`](manifest.md#lifecycle-done-check): `runs` (u32), the check's runs across reopens; `reopens` (u32), the reopens failing runs caused; `limit` (u32), `lifecycle.done_check.limit`; `met` (bool \| null), whether the last run passed — `null` when the check never ran, `false` after a run a cancel or the deadline stopped; `stopped_by` (string \| null), what ended the task with the check unmet — `"limit"`, `"max_turns"`, `"spend_ceiling"` or `"deadline"` (see [Done check](../concepts/session-loop.md#done-check)) — and `null` otherwise. A task stopped by `"deadline"` has `exit_status` `"deadline_reached"`; every other stop, the limit included, has `"ok"` |
 
 **`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
 called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
@@ -1612,7 +1620,7 @@ failed early. A `"canceled"` run settles every step, so its counts sum to `steps
   started.
 - A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"`,
   `"max_turns_reached"` or `"spend_ceiling_reached"` on a task the runtime survived and reported
-  on. The launch's own `session_end` carries the first of those outcomes among the tasks that
+  on, and `"deadline_reached"` on a task the session deadline ended. The launch's own `session_end` carries the first of those outcomes among the tasks that
   decide the launch, and a later task that completed does not replace it.
 - Every failed attempt writes one `task_failed` line before its task's `task_end`.
 

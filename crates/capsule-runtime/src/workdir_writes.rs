@@ -334,8 +334,9 @@ mod tests {
         (
             "trace.rs",
             "trace",
-            "A resumed-from session's `trace.jsonl`, relative to the records group every session \
-             of this workdir root keeps its records directory in, outside every workdir.",
+            "A resumed trace's `trace.jsonl`, in the directory `mur run --resume` named it in \
+             (`ResumeRequest::trace_dir`): the prior session's records directory, or the folder \
+             its trace was copied to. Only `shell_lost` markers are appended.",
         ),
         (
             "runtime.rs",

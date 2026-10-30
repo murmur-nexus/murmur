@@ -1069,6 +1069,7 @@ fn demote(
         let observed = wait_for_exit_unreaped(pgid);
         policy.registry.leader_exited(&work_id);
         let waited = child.wait();
+        let exited_at_ms = crate::trace::timestamp_ms();
         let (_, _, output_holders) =
             finish_output(readers, pgid, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -1119,6 +1120,7 @@ fn demote(
                 command: policy.command.clone(),
                 exit_code,
                 duration_ms,
+                exited_at_ms,
                 output_path: log.path,
                 output_bytes,
                 resource_limit,

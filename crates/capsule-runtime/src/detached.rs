@@ -102,6 +102,9 @@ pub(crate) struct DetachedCompletion {
     pub command: String,
     pub exit_code: i32,
     pub duration_ms: u64,
+    /// Epoch milliseconds at which the command's own wait returned, before its output finished
+    /// draining and before the completion was recorded.
+    pub exited_at_ms: u64,
     /// The log's absolute path, [`output_path_for`]'s [`OutputLog::path`] for this work id. Named
     /// even when [`Self::error`] is set, so a reader knows where the output was meant to be.
     pub output_path: String,
@@ -268,6 +271,26 @@ impl CommandState {
     }
 }
 
+/// How a finished command's completion reached the agent. Claimed once per work id, by whichever
+/// path gets there first, and that path writes the work id's one `shell_completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A `background-command` call returned the finished state.
+    BackgroundCommand,
+    /// The task loop queued the completion as a `completion`-origin task.
+    Task,
+}
+
+impl Delivery {
+    /// `shell_completed.delivered_via`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BackgroundCommand => "background_command",
+            Self::Task => "task",
+        }
+    }
+}
+
 /// The output section of a demoted command's log, written as its pipes are read.
 ///
 /// The log is `Command: <binary> <args…>`, a blank line, the output section, and the
@@ -366,9 +389,9 @@ struct DetachedEntry {
     /// Signals sent to the group by `stop` and `kill_running`.
     signals_sent: u32,
     finished: Option<DetachedCompletion>,
-    /// Set once `background-command` returned a finished state, so the completion is not also
-    /// enqueued as a task.
-    exit_reported: bool,
+    /// How the completion reached the agent, once one path has claimed it. Only a finished entry
+    /// is claimed.
+    delivery: Option<Delivery>,
     phase: watch::Sender<Phase>,
 }
 
@@ -387,6 +410,9 @@ pub(crate) struct CommandSnapshot {
     /// The last [`crate::shell::MAX_SHELL_OUTPUT_BYTES`] bytes of the output section, or all of
     /// it when it is shorter.
     pub tail: Vec<u8>,
+    /// Whether this read claimed the completion for [`Delivery::BackgroundCommand`], which makes
+    /// its caller the writer of the work id's `shell_completed`.
+    pub delivered_now: bool,
 }
 
 /// How a `wait` ended.
@@ -458,7 +484,7 @@ impl DetachedRegistry {
                 stop_requested: false,
                 signals_sent: 0,
                 finished: None,
-                exit_reported: false,
+                delivery: None,
                 phase,
             },
         );
@@ -507,13 +533,16 @@ impl DetachedRegistry {
 
     /// `work_id`'s state now, or `None` for a work id this session never issued.
     ///
-    /// A finished state read here counts as the agent having read the exit: the entry is marked
-    /// so its completion is not also enqueued as a task.
+    /// A finished state read here counts as the agent having read the exit: an unclaimed entry is
+    /// claimed for [`Delivery::BackgroundCommand`], so its completion is not also enqueued as a
+    /// task, and [`CommandSnapshot::delivered_now`] says this read made the claim. A running
+    /// entry, and one already claimed either way, claims nothing.
     pub(crate) fn read(&self, work_id: &str) -> Option<CommandSnapshot> {
         let mut entries = self.lock();
         let entry = entries.get_mut(work_id)?;
-        if entry.finished.is_some() {
-            entry.exit_reported = true;
+        let delivered_now = entry.finished.is_some() && entry.delivery.is_none();
+        if delivered_now {
+            entry.delivery = Some(Delivery::BackgroundCommand);
         }
         let state = match (&entry.finished, entry.stop_requested) {
             (None, _) => CommandState::Running,
@@ -539,14 +568,31 @@ impl DetachedRegistry {
             output_path: entry.output_path.clone(),
             output_bytes,
             tail,
+            delivered_now,
         })
     }
 
-    /// Whether `background-command` has returned `work_id`'s finished state.
+    /// Claims `work_id`'s completion for [`Delivery::Task`], under the same lock [`Self::read`]
+    /// claims under. `false` when a read already claimed it, so the task loop enqueues nothing and
+    /// writes nothing. A work id this registry does not hold has nothing to race and is `true`.
+    pub(crate) fn claim_for_task(&self, work_id: &str) -> bool {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(work_id) else {
+            return true;
+        };
+        if entry.delivery.is_some() {
+            return false;
+        }
+        entry.delivery = Some(Delivery::Task);
+        true
+    }
+
+    /// Whether `background-command` has returned `work_id`'s finished state: its completion was
+    /// claimed for [`Delivery::BackgroundCommand`].
     pub(crate) fn exit_reported(&self, work_id: &str) -> bool {
         self.lock()
             .get(work_id)
-            .is_some_and(|entry| entry.exit_reported)
+            .is_some_and(|entry| entry.delivery == Some(Delivery::BackgroundCommand))
     }
 
     fn phase(&self, work_id: &str) -> Option<watch::Receiver<Phase>> {
@@ -1106,6 +1152,7 @@ mod tests {
             command: "sleep 3".to_string(),
             exit_code: 0,
             duration_ms: 3_000,
+            exited_at_ms: 1_000,
             output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: None,
@@ -1141,6 +1188,7 @@ mod tests {
             command: "make -j64".to_string(),
             exit_code: 1,
             duration_ms: 3_000,
+            exited_at_ms: 1_000,
             output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: Some("cgroup_pids_max".into()),
@@ -1174,6 +1222,7 @@ mod tests {
             command: "make -j64".to_string(),
             exit_code: 0,
             duration_ms: 3_000,
+            exited_at_ms: 1_000,
             output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 12,
             resource_limit: None,
@@ -1759,6 +1808,139 @@ mod tests {
         }
         assert!(data.ends_with("\n\ndone\n"), "{data}");
         assert!(registry.exit_reported(&info.work_id));
+    }
+
+    // ── delivery: one claim per completion ─────────────────────────────────────
+
+    /// A registry holding `work_id`, registered with no process behind it: these cases complete it
+    /// by hand and never signal its group.
+    fn registry_holding(work_id: &str) -> Arc<DetachedRegistry> {
+        let (registry, _receiver) = DetachedRegistry::new();
+        registry.register(
+            DetachedWork {
+                work_id: work_id.to_string(),
+                binary: "/usr/bin/bash".to_string(),
+                command: "sleep 3".to_string(),
+                started_at_ms: 1_000,
+            },
+            Instant::now(),
+            0,
+            format!("/records/logs/{work_id}.log"),
+            Arc::new(Mutex::new(LiveOutput {
+                file: None,
+                tail: VecDeque::new(),
+                section_bytes: 0,
+                write_error: None,
+            })),
+        );
+        registry
+    }
+
+    fn completion_of(work_id: &str) -> DetachedCompletion {
+        DetachedCompletion {
+            work_id: work_id.to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "sleep 3".to_string(),
+            exit_code: 0,
+            duration_ms: 3_000,
+            exited_at_ms: 4_000,
+            output_path: format!("/records/logs/{work_id}.log"),
+            output_bytes: 0,
+            resource_limit: None,
+            output_holders: crate::shell::OutputHolders::Closed,
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+            error: None,
+        }
+    }
+
+    /// The first read of a finished command claims it for `background-command`: that read alone
+    /// says so, and the task loop's later claim fails, so the completion is neither enqueued nor
+    /// recorded twice.
+    #[test]
+    fn a_read_claims_a_finished_command_before_the_task_loop_does() {
+        let registry = registry_holding("wrk_read");
+        registry.complete(completion_of("wrk_read"));
+
+        let first = registry.read("wrk_read").unwrap();
+        assert_eq!(first.state, CommandState::Exited);
+        assert!(first.delivered_now, "the first read of the exit claims it");
+        assert!(
+            !registry.read("wrk_read").unwrap().delivered_now,
+            "a second read claims nothing"
+        );
+        assert!(registry.exit_reported("wrk_read"));
+        assert!(
+            !registry.claim_for_task("wrk_read"),
+            "the task loop finds the completion already delivered"
+        );
+    }
+
+    /// The task loop claiming first leaves nothing for a later read to deliver.
+    #[test]
+    fn the_task_loop_claims_a_completion_no_read_has_delivered() {
+        let registry = registry_holding("wrk_task");
+        registry.complete(completion_of("wrk_task"));
+
+        assert!(registry.claim_for_task("wrk_task"));
+        assert!(!registry.claim_for_task("wrk_task"), "claimed once");
+        let read = registry.read("wrk_task").unwrap();
+        assert_eq!(read.state, CommandState::Exited);
+        assert!(
+            !read.delivered_now,
+            "the queued task delivers it, not the read"
+        );
+        assert!(
+            !registry.exit_reported("wrk_task"),
+            "a task delivery is not a background-command one"
+        );
+    }
+
+    /// A running command has no completion to claim, so reading it leaves both paths open.
+    #[test]
+    fn a_read_of_a_running_command_claims_nothing() {
+        let registry = registry_holding("wrk_running");
+        let read = registry.read("wrk_running").unwrap();
+        assert_eq!(read.state, CommandState::Running);
+        assert!(!read.delivered_now);
+        assert!(!registry.exit_reported("wrk_running"));
+
+        registry.complete(completion_of("wrk_running"));
+        assert!(registry.read("wrk_running").unwrap().delivered_now);
+    }
+
+    /// `exited_at_ms` is when the command's wait returned, stamped by its own thread before the
+    /// completion is sent, not when anything later read it.
+    #[test]
+    fn exited_at_ms_is_stamped_at_the_exit_not_at_the_read() {
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let before = crate::trace::timestamp_ms();
+        let (outcome, registry, mut receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "sleep 2; exit 3",
+            Duration::from_millis(500),
+        );
+        let _guard = KillRunningOnDrop(Arc::clone(&registry));
+        let info = demoted(outcome);
+
+        let completion = await_completion(&mut receiver);
+        let received = crate::trace::timestamp_ms();
+        assert!(
+            completion.exited_at_ms >= before + 2_000 && completion.exited_at_ms <= received,
+            "exited at {} for a command started after {before} and received at {received}",
+            completion.exited_at_ms
+        );
+
+        std::thread::sleep(Duration::from_millis(400));
+        let read = registry.read(&info.work_id).unwrap();
+        assert!(read.delivered_now);
+        assert_eq!(
+            read.finished.unwrap().exited_at_ms,
+            completion.exited_at_ms,
+            "the read hands back the exit time the command's thread stamped"
+        );
     }
 
     #[tokio::test]

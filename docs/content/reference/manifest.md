@@ -2571,8 +2571,8 @@ How the exit reaches the agent:
 
 A non-zero exit, a signal kill and a [resource limit](resource-limits.md#which-limit) are told
 apart by the `status` field on the command's
-[`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record, which is written
-either way.
+[`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record. It is written once,
+when the exit reaches the agent by either delivery, and its `delivered_via` names which.
 
 A task that ends while background commands are still running names them in its A2A result, as
 [`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata), and in the `running_commands`
