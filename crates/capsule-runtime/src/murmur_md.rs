@@ -155,6 +155,10 @@ pub(crate) struct MurmurMdInputs {
     pub(crate) runtime_dir_tools: Vec<String>,
     /// What the session's commands can start, on the tier its `ShellEnforcement` applies.
     pub(crate) exec: ExecFacts,
+    /// What a delegating parent copied into the work folder before this session started, from
+    /// `mur run --parent-workdir-snapshot`: one `- Work folder contents:` line under the work
+    /// folder. `None` adds nothing.
+    pub(crate) parent_workdir: Option<crate::workdir_snapshot::WorkdirSnapshot>,
 }
 
 /// The primary driver choice's limits as the `- Context budget:` line states them.
@@ -285,6 +289,11 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     let skills_section = build_skills_section(runtime_root, system_prompt_artifact);
     let shell_section = build_shell_section(&inputs.shell_allow, &inputs.exec);
     let workdir = inputs.accessible_workdir.display();
+    let parent_workdir_line = inputs
+        .parent_workdir
+        .as_ref()
+        .map(parent_workdir_line)
+        .unwrap_or_default();
     let runtime_dir_entry = runtime_dir_entry(
         &runtime_root.path().display().to_string(),
         facts.shell_interpreter,
@@ -336,6 +345,7 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
          \n\
          - Model: {model}\n\
          - Work folder: {workdir}  (`./`)\n\
+         {parent_workdir_line}\
          {runtime_dir_entry}\
          - Writable: the work folder{except}\n\
          - Network allowlist: {network}\n\
@@ -618,6 +628,17 @@ fn build_shell_section(shell_allow: &[String], exec: &ExecFacts) -> String {
     out
 }
 
+/// The `- Work folder contents:` line of a session whose work folder started as a copy of its
+/// delegating parent's. Never names the parent's host path: the child has no business with it.
+fn parent_workdir_line(snapshot: &crate::workdir_snapshot::WorkdirSnapshot) -> String {
+    let files = if snapshot.files == 1 { "file" } else { "files" };
+    format!(
+        "- Work folder contents: started as a copy of the delegating capsule's work folder \
+         ({} {files}, {} bytes) when it delegated this task; changes here do not reach it\n",
+        snapshot.files, snapshot.bytes
+    )
+}
+
 /// The inputs of an http agent session declaring nothing optional, launched from `murmur.yaml`
 /// without `--workdir`.
 #[cfg(test)]
@@ -645,6 +666,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
             runtime_dirs: Vec::new(),
             workdir_exec: false,
         },
+        parent_workdir: None,
     }
 }
 
@@ -744,6 +766,40 @@ mod tests {
                 "{part:?} missing"
             );
         }
+    }
+
+    /// A child whose work folder started as a copy of its parent's is told so on one line under
+    /// the work folder, without the parent's host path; every other session's MURMUR.md is
+    /// unchanged.
+    #[test]
+    fn murmur_md_states_a_parent_workdir_snapshot_on_one_line() {
+        let tmp = TempDir::new().unwrap();
+        let body = |content: String| content.lines().skip(2).collect::<Vec<_>>().join("\n");
+        let without = body(render(&tmp, |_| {}));
+        let with = body(render(&tmp, |inputs| {
+            inputs.parent_workdir = Some(crate::workdir_snapshot::WorkdirSnapshot {
+                source: "/home/you/secret-project".to_string(),
+                files: 12,
+                dirs: 3,
+                symlinks: 0,
+                repointed_symlinks: 0,
+                bytes: 40960,
+                skipped_count: 0,
+                skipped: Vec::new(),
+            });
+        }));
+        let line = "- Work folder contents: started as a copy of the delegating capsule's work \
+                    folder (12 files, 40960 bytes) when it delegated this task; changes here do \
+                    not reach it";
+        assert!(
+            with.contains(&format!(
+                "- Work folder: /work  (`./`)\n{line}\n- Runtime directory"
+            )),
+            "{with}"
+        );
+        assert!(!with.contains("secret-project"), "{with}");
+        assert_eq!(with.replace(&format!("{line}\n"), ""), without);
+        assert!(!without.contains("Work folder contents"), "{without}");
     }
 
     /// The runtime-directory entry of a session with a shell interpreter or not, and with

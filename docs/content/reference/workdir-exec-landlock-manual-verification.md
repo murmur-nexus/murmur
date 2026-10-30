@@ -340,6 +340,7 @@ Effective grants
   shell allow:
     - bash
   spawn allow: <none>
+  spawn workdir snapshot: <none>
   env allow: <none>
   plan submit:      false
   install skill: <none>
@@ -373,6 +374,7 @@ Effective grants
   shell allow:
     - bash
   spawn allow: <none>
+  spawn workdir snapshot: <none>
   env allow: <none>
   plan submit:      false
   install skill: <none>

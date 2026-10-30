@@ -274,6 +274,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         formation_member: None,
         source_supply,
         expected_workdir_identity: None,
+        parent_workdir_snapshot: None,
         session_deadline: None,
         manifest_file: Some(manifest_file),
     };

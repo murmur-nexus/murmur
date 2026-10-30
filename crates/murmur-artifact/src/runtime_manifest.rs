@@ -1710,6 +1710,11 @@ pub struct StagedRuntimeGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCapabilities {
     pub allow: Vec<String>,
+    /// `capabilities.spawn.workdir_snapshot`: the entries of [`Self::allow`] whose every
+    /// delegation starts in a copy of this capsule's work folder as it stood when the delegation
+    /// was made, rather than in an empty one. Full names, each also in `allow`; empty when the
+    /// key is absent.
+    pub workdir_snapshot: Vec<String>,
 }
 
 /// Host environment variables a WASM guest may observe, from `capabilities.env`.
@@ -2488,6 +2493,8 @@ struct RawInstallCapabilities {
 struct RawSpawnCapabilities {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    workdir_snapshot: Vec<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3213,7 +3220,7 @@ impl RawBlock for RawInstallCapabilities {
 }
 
 impl RawBlock for RawSpawnCapabilities {
-    const KNOWN_KEYS: &'static [&'static str] = &["allow"];
+    const KNOWN_KEYS: &'static [&'static str] = &["allow", "workdir_snapshot"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -4849,7 +4856,7 @@ fn parse_capabilities(
 
     let spawn = raw_caps
         .spawn
-        .map(|raw_spawn| parse_spawn_allow(raw_spawn.allow))
+        .map(|raw_spawn| parse_spawn_allow(raw_spawn.allow, raw_spawn.workdir_snapshot))
         .transpose()?;
 
     let env = raw_caps.env.map(|raw_env| EnvCapabilities {
@@ -4946,8 +4953,12 @@ fn parse_capabilities(
 }
 
 /// Lower `capabilities.spawn.allow`: every entry a full name, no two sharing a bare part —
-/// `delegate-task` offers the model the bare parts, so each must pick out one capsule.
-fn parse_spawn_allow(allow: Vec<String>) -> Result<SpawnCapabilities, RuntimeManifestError> {
+/// `delegate-task` offers the model the bare parts, so each must pick out one capsule — and
+/// `capabilities.spawn.workdir_snapshot`: every entry a full name, listed once and also in `allow`.
+fn parse_spawn_allow(
+    allow: Vec<String>,
+    workdir_snapshot: Vec<String>,
+) -> Result<SpawnCapabilities, RuntimeManifestError> {
     let mut parsed: Vec<ArtifactName> = Vec::with_capacity(allow.len());
     for (index, entry) in allow.iter().enumerate() {
         let name = ArtifactName::parse(entry).map_err(|error| {
@@ -4975,7 +4986,44 @@ fn parse_spawn_allow(allow: Vec<String>) -> Result<SpawnCapabilities, RuntimeMan
         }
         parsed.push(name);
     }
-    Ok(SpawnCapabilities { allow })
+    let mut snapshotted: Vec<ArtifactName> = Vec::with_capacity(workdir_snapshot.len());
+    for (index, entry) in workdir_snapshot.iter().enumerate() {
+        let field = format!("capabilities.spawn.workdir_snapshot[{index}]");
+        let name = ArtifactName::parse(entry).map_err(|error| {
+            RuntimeManifestError::InvalidArtifactName {
+                field: field.clone(),
+                message: error.to_string(),
+                hint: error.hint(),
+            }
+        })?;
+        if snapshotted.contains(&name) {
+            return Err(RuntimeManifestError::InvalidArtifactName {
+                field,
+                message: format!("'{name}' is listed more than once"),
+                hint: Some(format!(
+                    "keep one '{name}' in capabilities.spawn.workdir_snapshot"
+                )),
+            });
+        }
+        if !parsed.contains(&name) {
+            return Err(RuntimeManifestError::InvalidArtifactName {
+                field,
+                message: format!(
+                    "'{name}' is not in capabilities.spawn.allow, so this capsule cannot \
+                     delegate to it"
+                ),
+                hint: Some(format!(
+                    "add '{name}' to capabilities.spawn.allow, or remove it from \
+                     capabilities.spawn.workdir_snapshot"
+                )),
+            });
+        }
+        snapshotted.push(name);
+    }
+    Ok(SpawnCapabilities {
+        allow,
+        workdir_snapshot,
+    })
 }
 
 /// Refuse an `artifacts[index].name` of the wrong form: a full name for an entry that resolves,
@@ -13755,6 +13803,18 @@ capabilities:
             .collect()
     }
 
+    #[test]
+    fn spawn_workdir_snapshot_is_a_known_key_beside_a_sibling_probe() {
+        let keys = raw_unknown_keys(
+            "name: cap\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: [local/r]\n    \
+             workdir_snapshot: [local/r]\n    probe_spawn: 1\n",
+        );
+        assert_eq!(
+            keys,
+            vec![("probe_spawn".to_string(), "capabilities.spawn".to_string())]
+        );
+    }
+
     /// Every block the manifest type owns, each carrying one key no field of it claims, reported
     /// once and at its own dotted path. A block added after this one is held to the same rule by
     /// `every_raw_struct_descends_into_the_blocks_it_owns`; this is what "descended into" means.
@@ -14913,6 +14973,74 @@ mod scoped_name_tests {
         assert_eq!(
             hint.as_deref(),
             Some("keep one of 'local/worker' and 'ana/worker' in capabilities.spawn.allow")
+        );
+    }
+
+    #[test]
+    fn spawn_workdir_snapshot_lowers_beside_allow_and_is_empty_when_absent() {
+        let yaml = "name: cap\nversion: 0.0.1\ncapabilities:\n  spawn:\n    \
+                    allow: [local/reviewer, local/worker]\n    \
+                    workdir_snapshot: [local/reviewer]\n";
+        let spawn = RuntimeManifest::from_yaml_str(yaml)
+            .expect("a snapshot entry that is also in allow parses")
+            .capabilities
+            .unwrap()
+            .spawn
+            .unwrap();
+        assert_eq!(
+            spawn,
+            SpawnCapabilities {
+                allow: vec!["local/reviewer".to_string(), "local/worker".to_string()],
+                workdir_snapshot: vec!["local/reviewer".to_string()],
+            }
+        );
+
+        let absent = "name: cap\nversion: 0.0.1\ncapabilities:\n  spawn:\n    \
+                      allow: [local/reviewer]\n";
+        let spawn = RuntimeManifest::from_yaml_str(absent)
+            .unwrap()
+            .capabilities
+            .unwrap()
+            .spawn
+            .unwrap();
+        assert!(spawn.workdir_snapshot.is_empty());
+    }
+
+    #[test]
+    fn spawn_workdir_snapshot_refuses_an_entry_outside_allow_a_bare_name_and_a_duplicate() {
+        let with = |snapshot: &str| {
+            format!(
+                "name: cap\nversion: 0.0.1\ncapabilities:\n  spawn:\n    \
+                 allow: [local/reviewer, local/worker]\n    workdir_snapshot: [{snapshot}]\n"
+            )
+        };
+
+        let (field, message, hint) = name_refusal(&with("local/reviewer, local/other"));
+        assert_eq!(field, "capabilities.spawn.workdir_snapshot[1]");
+        assert_eq!(
+            message,
+            "'local/other' is not in capabilities.spawn.allow, so this capsule cannot delegate \
+             to it"
+        );
+        assert!(
+            hint.as_deref()
+                .is_some_and(|hint| hint.contains("capabilities.spawn.allow")),
+            "{hint:?}"
+        );
+
+        let (field, message, _) = name_refusal(&with("reviewer"));
+        assert_eq!(field, "capabilities.spawn.workdir_snapshot[0]");
+        assert!(
+            message.contains("'reviewer' is not a full artifact name"),
+            "{message}"
+        );
+
+        let (field, message, hint) = name_refusal(&with("local/reviewer, local/reviewer"));
+        assert_eq!(field, "capabilities.spawn.workdir_snapshot[1]");
+        assert_eq!(message, "'local/reviewer' is listed more than once");
+        assert_eq!(
+            hint.as_deref(),
+            Some("keep one 'local/reviewer' in capabilities.spawn.workdir_snapshot")
         );
     }
 

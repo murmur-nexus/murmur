@@ -173,6 +173,7 @@ pub(crate) fn run_run(
     json: bool,
     readiness_tokens: bool,
     workdir_identity_arg: Option<&str>,
+    parent_workdir_snapshot: Option<capsule_runtime::WorkdirSnapshot>,
     verbose: bool,
     bind_addr: &str,
     no_env_file: bool,
@@ -654,7 +655,10 @@ pub(crate) fn run_run(
             io_max,
             &launch_workdir,
         )
-        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?
+        // What `session_start.effective_grants.parent_workdir` would record, so a child's report
+        // is the object its launch writes.
+        .with_parent_workdir(parent_workdir_snapshot.clone());
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(
@@ -913,6 +917,7 @@ pub(crate) fn run_run(
         formation_member,
         source_supply,
         expected_workdir_identity: workdir_identity,
+        parent_workdir_snapshot,
         session_deadline,
         // An installed capsule's manifest came out of the artifact, not off disk.
         manifest_file: installed_capsule.is_none().then(|| manifest_path.clone()),

@@ -551,6 +551,7 @@ impl Arm {
             formation_member: None,
             source_supply: self.source_supply.clone(),
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: Some(self.manifest_path.clone()),
         }

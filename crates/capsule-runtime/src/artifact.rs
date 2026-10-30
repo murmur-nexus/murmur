@@ -269,6 +269,34 @@ pub fn extract_declared_spawn_allow(
         .unwrap_or_default())
 }
 
+/// The `capabilities.resources.workdir_max_bytes` a packed manifest declares, read on its own:
+/// `None` when it declares none, which is [`crate::resources::DEFAULT_WORKDIR_MAX_BYTES`].
+///
+/// The sibling of [`extract_declared_env_allow`], and narrow for the same reason: a delegating
+/// parent bounds the copy of its work folder into a child's by the child's own ceiling, and a
+/// whole-manifest parse would demand that child's `${VAR}` references be resolvable first.
+/// Malformed YAML, or a value that is not a non-negative integer, is an error naming the artifact
+/// and version.
+pub fn extract_declared_workdir_max_bytes(
+    artifact_name: &str,
+    artifact_version: &str,
+    manifest_yaml: &str,
+) -> Result<Option<u64>, RuntimeError> {
+    let declared: DeclaredResourcesManifest =
+        serde_norway::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            message: format!(
+                "cannot read capabilities.resources.workdir_max_bytes from \
+                 {PACKED_MANIFEST_ENTRY}: {err}"
+            ),
+        })?;
+    Ok(declared
+        .capabilities
+        .and_then(|capabilities| capabilities.resources)
+        .and_then(|resources| resources.workdir_max_bytes))
+}
+
 /// The only keys [`extract_declared_env_allow`] and [`extract_declared_spawn_allow`] read. Every
 /// other manifest key deserializes into nothing here, so a child declaring anything at all is
 /// still readable.
@@ -284,6 +312,26 @@ struct DeclaredCapabilities {
     env: Option<DeclaredAllowList>,
     #[serde(default)]
     spawn: Option<DeclaredAllowList>,
+}
+
+/// The only key [`extract_declared_workdir_max_bytes`] reads, apart from the allows so a
+/// malformed `resources:` block never stops a child's `env.allow` being read.
+#[derive(serde::Deserialize)]
+struct DeclaredResourcesManifest {
+    #[serde(default)]
+    capabilities: Option<DeclaredResourcesCapabilities>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeclaredResourcesCapabilities {
+    #[serde(default)]
+    resources: Option<DeclaredResources>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeclaredResources {
+    #[serde(default)]
+    workdir_max_bytes: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -457,6 +505,44 @@ mod tests {
                 other => panic!("expected ArtifactArchive error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn reads_the_declared_workdir_max_bytes_out_of_a_manifest() {
+        let declared = "name: worker\nversion: 0.1.0\ncapabilities:\n  resources:\n    \
+                        workdir_max_bytes: 1024\n    cgroup_pids_max: 64\n";
+        assert_eq!(
+            extract_declared_workdir_max_bytes("worker", "0.1.0", declared).unwrap(),
+            Some(1024)
+        );
+        for manifest in [
+            "name: worker\nversion: 0.1.0\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A_KEY]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  resources:\n    cgroup_pids_max: 8\n",
+        ] {
+            assert_eq!(
+                extract_declared_workdir_max_bytes("worker", "0.1.0", manifest).unwrap(),
+                None,
+                "{manifest}"
+            );
+        }
+        let malformed = "name: worker\nversion: 0.1.0\ncapabilities:\n  resources:\n    \
+                         workdir_max_bytes: lots\n  env:\n    allow: [A_KEY]\n";
+        match extract_declared_workdir_max_bytes("worker", "0.1.0", malformed).unwrap_err() {
+            RuntimeError::ArtifactArchive { name, message, .. } => {
+                assert_eq!(name, "worker");
+                assert!(
+                    message.contains("capabilities.resources.workdir_max_bytes"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected ArtifactArchive error, got {other:?}"),
+        }
+        assert_eq!(
+            extract_declared_env_allow("worker", "0.1.0", malformed).unwrap(),
+            vec!["A_KEY".to_string()],
+            "a malformed resources block does not stop env.allow being read"
+        );
     }
 
     #[test]

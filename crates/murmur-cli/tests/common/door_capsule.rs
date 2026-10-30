@@ -113,6 +113,7 @@ fn stage_door_with(
         capsule_runtime::StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,

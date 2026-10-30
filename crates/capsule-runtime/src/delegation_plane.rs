@@ -43,7 +43,9 @@ use crate::a2a::{
     send_message_params, user_message, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION,
     A2A_VERSION_HEADER, RESPONSE_ARTIFACT,
 };
-use crate::child_launch::{launch_child_capsule, ChildLaunchRequest, LaunchedChild};
+use crate::child_launch::{
+    launch_child_capsule, ChildLaunchRequest, LaunchedChild, ParentWorkdirSource,
+};
 use crate::delegation::{CompletionAddress, Spawner};
 use crate::errors::RuntimeError;
 use crate::formation::FormationId;
@@ -51,6 +53,7 @@ use crate::http_client::http_json;
 use crate::session_status::SessionDeadline;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
 use crate::workdir_fs::WorkdirRoot;
+use crate::workdir_snapshot::{SnapshotLimits, WorkdirSnapshot};
 
 /// The deadline a session delegates under when nothing declares one.
 ///
@@ -265,6 +268,37 @@ pub struct DelegationLaunch {
     /// The child's records directory, absolute, as the child reported it: where its own
     /// `trace.jsonl` and `completion.json` are.
     pub child_records_dir: String,
+    /// What was copied from this session's work folder into the child's before it started, or
+    /// `None` for a capsule not listed under `capabilities.spawn.workdir_snapshot`.
+    pub workdir_snapshot: Option<WorkdirSnapshot>,
+}
+
+/// A session's `capabilities.spawn.workdir_snapshot`, and the work folder it copies.
+#[derive(Debug, Clone)]
+pub struct WorkdirSnapshotGrant {
+    /// The full names whose every delegation starts in a copy of [`Self::source`].
+    pub capsules: Vec<String>,
+    /// The session's accessible work folder, held.
+    pub source: WorkdirRoot,
+    /// `(st_dev, st_ino)` of the session's runtime and records directories, never copied.
+    pub excluded: Vec<(u64, u64)>,
+}
+
+impl WorkdirSnapshotGrant {
+    /// The grant of a session listing `capsules`, whose work folder is `source` and whose own
+    /// directories — runtime and records — are `own_dirs`. Those lie inside `source` only on an
+    /// `advisory`-capped launch, and are never copied.
+    pub fn new(capsules: Vec<String>, source: WorkdirRoot, own_dirs: &[&WorkdirRoot]) -> Self {
+        let excluded = own_dirs
+            .iter()
+            .filter_map(|dir| dir.identity().ok())
+            .collect();
+        Self {
+            capsules,
+            source,
+            excluded,
+        }
+    }
 }
 
 /// The parent's side of one delegation, beyond the three strings its agent supplied.
@@ -352,6 +386,10 @@ pub struct DelegationPlane {
     /// The delegating session's deadline, the earliest bound placed on it, handed to every child
     /// as that child's inherited deadline. `None` until [`DelegationPlane::bounded_by`] names one.
     deadline: Option<SessionDeadline>,
+    /// Which children start in a copy of this session's work folder. `None` until
+    /// [`DelegationPlane::snapshotting_workdir`] names a grant, which starts every child in an
+    /// empty one.
+    workdir_snapshot: Option<WorkdirSnapshotGrant>,
 }
 
 impl DelegationPlane {
@@ -387,7 +425,15 @@ impl DelegationPlane {
             own_url: String::new(),
             formation_id,
             deadline: None,
+            workdir_snapshot: None,
         }
+    }
+
+    /// Start every child `grant` lists in a copy of its work folder, made before the child
+    /// process exists. A grant listing nothing is no grant.
+    pub fn snapshotting_workdir(mut self, grant: WorkdirSnapshotGrant) -> Self {
+        self.workdir_snapshot = (!grant.capsules.is_empty()).then_some(grant);
+        self
     }
 
     /// Bound every child this plane launches by `deadline`, the delegating session's own, so no
@@ -434,10 +480,24 @@ impl DelegationPlane {
     /// rather than an empty list: a child launched without what it declares fails later and less
     /// legibly.
     fn child_env_allow(&self, capsule: &str, version: &str) -> Result<Vec<String>, RuntimeError> {
+        let manifest_yaml = self.child_manifest_yaml(capsule, version, "capabilities.env.allow")?;
+        let declared =
+            crate::artifact::extract_declared_env_allow(capsule, version, &manifest_yaml)?;
+        Ok(env_allow_intersection(&declared, &self.parent_env_allow))
+    }
+
+    /// The packed manifest of the child `capsule@version`, out of [`Self::registry`], for a
+    /// narrow read of `key`; an artifact that cannot be resolved is an error naming the capsule,
+    /// the version and `key`.
+    fn child_manifest_yaml(
+        &self,
+        capsule: &str,
+        version: &str,
+        key: &str,
+    ) -> Result<String, RuntimeError> {
         let name = murmur_artifact::ArtifactName::parse(capsule).map_err(|error| {
             RuntimeError::Runtime(format!(
-                "cannot read what '{capsule}@{version}' declares under capabilities.env.allow: \
-                 {error}"
+                "cannot read what '{capsule}@{version}' declares under {key}: {error}"
             ))
         })?;
         let resolved = self
@@ -445,15 +505,40 @@ impl DelegationPlane {
             .resolve_with_platform(&name, version, Some(murmur_artifact::current_platform()))
             .map_err(|error| {
                 RuntimeError::Runtime(format!(
-                    "cannot read what '{capsule}@{version}' declares under \
-                     capabilities.env.allow: {error}"
+                    "cannot read what '{capsule}@{version}' declares under {key}: {error}"
                 ))
             })?;
+        crate::artifact::extract_manifest_yaml(capsule, version, &resolved.bytes)
+    }
+
+    /// What [`launch_child_capsule`] copies into this child's work folder: this session's work
+    /// folder, bounded by the child's own `capabilities.resources.workdir_max_bytes`, for a
+    /// `capsule` this session lists under `capabilities.spawn.workdir_snapshot` (a full name);
+    /// `None` for every other.
+    fn parent_workdir_source(
+        &self,
+        capsule: &str,
+        version: &str,
+    ) -> Result<Option<ParentWorkdirSource>, RuntimeError> {
+        let Some(grant) = self
+            .workdir_snapshot
+            .as_ref()
+            .filter(|grant| grant.capsules.iter().any(|listed| listed == capsule))
+        else {
+            return Ok(None);
+        };
         let manifest_yaml =
-            crate::artifact::extract_manifest_yaml(capsule, version, &resolved.bytes)?;
-        let declared =
-            crate::artifact::extract_declared_env_allow(capsule, version, &manifest_yaml)?;
-        Ok(env_allow_intersection(&declared, &self.parent_env_allow))
+            self.child_manifest_yaml(capsule, version, "capabilities.resources.workdir_max_bytes")?;
+        let max_bytes =
+            crate::artifact::extract_declared_workdir_max_bytes(capsule, version, &manifest_yaml)?
+                .unwrap_or(crate::resources::DEFAULT_WORKDIR_MAX_BYTES);
+        Ok(Some(ParentWorkdirSource {
+            root: grant.source.clone(),
+            limits: SnapshotLimits {
+                max_bytes,
+                excluded: grant.excluded.clone(),
+            },
+        }))
     }
 
     /// This session's credential, cloned for a caller that delegates through a plane of its own.
@@ -548,6 +633,8 @@ impl DelegationPlane {
             // Independent of `spawner`: a launch that names no lineage still joins the formation.
             formation_id: self.formation_id.clone(),
             deadline: self.deadline,
+            parent_workdir_snapshot: self
+                .parent_workdir_source(&request.capsule, &request.version)?,
         })
     }
 
@@ -578,6 +665,7 @@ impl DelegationPlane {
                 child_session_id: child.session_id.clone(),
                 child_workdir: child.workdir.to_string_lossy().into_owned(),
                 child_records_dir: child.records_dir.display().to_string(),
+                workdir_snapshot: child.workdir_snapshot.clone(),
             });
         }
     }
@@ -1521,6 +1609,13 @@ mod tests {
     /// [`DelegationPlane::child_env_allow`] reads the child's declaration out of the archive
     /// rather than out of a directory.
     fn store_with_worker() -> tempfile::TempDir {
+        store_with_worker_declaring(
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A, B, C]\n",
+        )
+    }
+
+    /// [`store_with_worker`], with `local/worker@0.1.0`'s packed manifest being `manifest`.
+    fn store_with_worker_declaring(manifest: &str) -> tempfile::TempDir {
         let store = tempfile::tempdir().unwrap();
         let mut zipped = std::io::Cursor::new(Vec::<u8>::new());
         {
@@ -1531,11 +1626,7 @@ mod tests {
                     .compression_method(zip::CompressionMethod::Deflated),
             )
             .unwrap();
-            std::io::Write::write_all(
-                &mut zip,
-                b"name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A, B, C]\n",
-            )
-            .unwrap();
+            std::io::Write::write_all(&mut zip, manifest.as_bytes()).unwrap();
             zip.finish().unwrap();
         }
         murmur_artifact::Registry::publish(
@@ -1693,6 +1784,77 @@ through that constructor rather than composing a second request literal."
                 vec!["B".to_string(), "C".to_string()],
                 "{named} hands on what both manifests declare, in the child's order"
             );
+        }
+    }
+
+    /// A capsule listed under `capabilities.spawn.workdir_snapshot` — by its full name, as
+    /// `delegate-task` spawns it — is launched with this session's work folder to copy, bounded by
+    /// the child's own `workdir_max_bytes` or the default; every other capsule with none, on both
+    /// paths.
+    #[test]
+    fn workdir_snapshot_is_composed_for_a_listed_capsule_only() {
+        let work = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let source = crate::workdir_fs::WorkdirRoot::open(work.path()).unwrap();
+        let runtime_root = crate::workdir_fs::WorkdirRoot::open(runtime.path()).unwrap();
+        let grant = |capsules: &[&str]| {
+            WorkdirSnapshotGrant::new(
+                capsules.iter().map(|name| name.to_string()).collect(),
+                source.clone(),
+                &[&runtime_root],
+            )
+        };
+        let compose = |plane: &DelegationPlane, report_to: Option<CompletionAddress>| {
+            plane
+                .launch_request(
+                    &request(),
+                    &origin(),
+                    SpawnApproval::new("approved".to_string()),
+                    report_to,
+                )
+                .expect("the store holds the child's declaration")
+                .parent_workdir_snapshot
+        };
+
+        let defaulted = store_with_worker();
+        let declaring = store_with_worker_declaring(
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  resources:\n    \
+             workdir_max_bytes: 1024\n",
+        );
+        for report_to in [Some(completion_address()), None] {
+            let listed = compose(
+                &plane_over(&defaulted, &[]).snapshotting_workdir(grant(&["local/worker"])),
+                report_to.clone(),
+            )
+            .expect("a listed capsule is handed the work folder");
+            assert_eq!(listed.root.path(), work.path());
+            assert_eq!(
+                listed.limits.max_bytes,
+                crate::resources::DEFAULT_WORKDIR_MAX_BYTES
+            );
+            assert_eq!(
+                listed.limits.excluded,
+                vec![runtime_root.identity().unwrap()]
+            );
+
+            let bounded = compose(
+                &plane_over(&declaring, &[]).snapshotting_workdir(grant(&["local/worker"])),
+                report_to.clone(),
+            )
+            .unwrap();
+            assert_eq!(bounded.limits.max_bytes, 1024);
+
+            for plane in [
+                plane_over(&defaulted, &[]),
+                plane_over(&defaulted, &[]).snapshotting_workdir(grant(&[])),
+                plane_over(&defaulted, &[]).snapshotting_workdir(grant(&["local/other"])),
+                plane_over(&defaulted, &[]).snapshotting_workdir(grant(&["worker"])),
+            ] {
+                assert!(
+                    compose(&plane, report_to.clone()).is_none(),
+                    "{report_to:?}"
+                );
+            }
         }
     }
 

@@ -225,6 +225,11 @@ pub struct CapabilityPolicy {
     pub read_only_paths: Vec<String>,
     pub shell_allow: Vec<String>,
     pub spawn_allow: Vec<String>,
+    /// From `capabilities.spawn.workdir_snapshot`: the full names in [`Self::spawn_allow`] whose
+    /// every delegation starts in a copy of this session's work folder, made by this runtime
+    /// before the child process starts. Empty by default, which starts every child in an empty
+    /// folder.
+    pub spawn_workdir_snapshot: Vec<String>,
     pub shell_strip_env: Vec<String>,
     pub shell_baseline_env: Vec<String>,
     /// Typed interpreter-runtime grants from `capabilities.shell.interpreter_runtime`: each
@@ -539,6 +544,10 @@ pub struct StageRequest {
     /// Set by a delegating parent through `mur run --workdir-identity`, for the child directory it
     /// created. `None` checks nothing.
     pub expected_workdir_identity: Option<(u64, u64)>,
+    /// What a delegating parent copied into [`Self::workdir`] before starting this session, from
+    /// `mur run --parent-workdir-snapshot`. Reported as `session_start.effective_grants.
+    /// parent_workdir` and in `MURMUR.md`, and grants nothing. `None` for every other session.
+    pub parent_workdir_snapshot: Option<crate::workdir_snapshot::WorkdirSnapshot>,
     /// The hard limit `mur run --deadline` set, counted from the moment `mur run` started. Only
     /// [`crate::launch_session_handling_sigterm`] on an agent capsule enforces one: reached, it
     /// ends the session through the termination routine a first `SIGTERM` begins. Every other
@@ -988,6 +997,10 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.spawn.as_ref())
         .map(|spawn| spawn.allow.clone())
         .unwrap_or_default();
+    let spawn_workdir_snapshot = caps
+        .and_then(|c| c.spawn.as_ref())
+        .map(|spawn| spawn.workdir_snapshot.clone())
+        .unwrap_or_default();
 
     let env_allow = caps
         .and_then(|c| c.env.as_ref())
@@ -1010,6 +1023,7 @@ pub fn capability_policy_from_runtime_manifest(
         read_only_paths,
         shell_allow,
         spawn_allow,
+        spawn_workdir_snapshot,
         shell_strip_env,
         shell_baseline_env,
         shell_interpreter_runtime,

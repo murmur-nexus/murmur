@@ -416,6 +416,7 @@ fn launch_bounded(
         completion_deadline,
         formation_id: None,
         deadline: None,
+        parent_workdir_snapshot: None,
     })
     .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
 }

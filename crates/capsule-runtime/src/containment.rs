@@ -1012,6 +1012,18 @@ pub struct ScopeReport {
     pub shell_allow: Vec<String>,
     /// `capabilities.spawn.allow`, verbatim.
     pub spawn_allow: Vec<String>,
+    /// `capabilities.spawn.workdir_snapshot`, verbatim: the entries of [`Self::spawn_allow`] whose
+    /// every delegation starts in a copy of this session's work folder. Always serialized, `[]`
+    /// when undeclared.
+    pub spawn_workdir_snapshot: Vec<String>,
+    /// What this session's work folder started with, when a delegating parent copied its own
+    /// into it, and what keeps this session's commands off the parent's real folder on its tier:
+    /// `null` for every session but such a child. Always serialized.
+    ///
+    /// A report of what the launching parent did, from `mur run --parent-workdir-snapshot`, never
+    /// a grant: it opens nothing and changes no class, floor or tier. Its `restriction` is
+    /// [`Self::filesystem_boundary`]'s, keyed on the same applied tier.
+    pub parent_workdir: Option<crate::workdir_snapshot::ParentWorkdirReport>,
     /// `capabilities.env.allow`, verbatim.
     pub env_allow: Vec<String>,
     /// `capabilities.plan.submit` — whether the model is offered the `submit-plan` tool. Always
@@ -1243,6 +1255,11 @@ impl ScopeReport {
         out.push_str(&format!("  unix sockets:     {}\n", self.unix_sockets));
         push_list(&mut out, "shell allow", &self.shell_allow);
         push_list(&mut out, "spawn allow", &self.spawn_allow);
+        push_list(
+            &mut out,
+            "spawn workdir snapshot",
+            &self.spawn_workdir_snapshot,
+        );
         push_list(&mut out, "env allow", &self.env_allow);
         out.push_str(&format!("  plan submit:      {}\n", self.plan_submit));
         out.push_str(&render_install(
@@ -1272,6 +1289,10 @@ impl ScopeReport {
                 .collect::<Vec<_>>(),
         );
         push_list(&mut out, "artifact config", &self.configured_artifacts);
+
+        if let Some(parent) = &self.parent_workdir {
+            out.push_str(&render_parent_workdir(parent));
+        }
 
         out.push_str("\nResource plane\n");
         match &self.exports_files {
@@ -1335,6 +1356,59 @@ impl ScopeReport {
         }
         out
     }
+}
+
+impl ScopeReport {
+    /// This report with [`Self::parent_workdir`] set from `snapshot`, the restriction read off
+    /// [`Self::filesystem_boundary`] so the two cannot disagree about one tier. `None` leaves it
+    /// `null`.
+    #[must_use]
+    pub fn with_parent_workdir(
+        mut self,
+        snapshot: Option<crate::workdir_snapshot::WorkdirSnapshot>,
+    ) -> Self {
+        let restriction = self.filesystem_boundary.restriction;
+        self.parent_workdir =
+            snapshot.map(|snapshot| crate::workdir_snapshot::ParentWorkdirReport {
+                snapshot,
+                restriction,
+            });
+        self
+    }
+}
+
+/// The `Parent work folder` block of `mur run --explain-scope`, for a delegated child whose work
+/// folder started as a copy of its parent's. Starts with a blank line and ends with a newline.
+#[must_use]
+pub fn render_parent_workdir(parent: &crate::workdir_snapshot::ParentWorkdirReport) -> String {
+    let snapshot = &parent.snapshot;
+    let mut out = String::from("\nParent work folder\n");
+    out.push_str(&format!("  source:      {}\n", snapshot.source));
+    out.push_str(&format!(
+        "  copied:      {} files, {} directories, {} symlinks ({} re-pointed), {} bytes\n",
+        snapshot.files,
+        snapshot.dirs,
+        snapshot.symlinks,
+        snapshot.repointed_symlinks,
+        snapshot.bytes
+    ));
+    if snapshot.skipped_count == 0 {
+        out.push_str("  skipped:     <none>\n");
+    } else {
+        out.push_str(&format!("  skipped:     {}\n", snapshot.skipped_count));
+        for entry in &snapshot.skipped {
+            let reason = serde_json::to_value(entry.reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            out.push_str(&format!("    - {} ({reason})\n", entry.path));
+        }
+    }
+    out.push_str(&format!(
+        "  restriction: {}\n",
+        parent.restriction_sentence()
+    ));
+    out
 }
 
 /// The allowlisted binaries a declared `capabilities.filesystem.read_only` is only advisory
@@ -1637,6 +1711,10 @@ pub(crate) fn scope_report_for_tier(
         unix_sockets: policy.unix_sockets_allowed,
         shell_allow: policy.shell_allow.clone(),
         spawn_allow: policy.spawn_allow.clone(),
+        spawn_workdir_snapshot: policy.spawn_workdir_snapshot.clone(),
+        // Set by the caller that knows it, through `with_parent_workdir`: the snapshot is what
+        // the launching parent did, not something the policy declares.
+        parent_workdir: None,
         env_allow: policy.env_allow.clone(),
         plan_submit: policy.plan_submit,
         install_skill: policy.install_skill.clone(),
@@ -3929,6 +4007,7 @@ mod tests {
             ("read_only_paths", "read_only_paths"),
             ("shell_allow", "shell_allow"),
             ("spawn_allow", "spawn_allow"),
+            ("spawn_workdir_snapshot", "spawn_workdir_snapshot"),
             ("shell_interpreter_runtime", "interpreter_runtime_grants"),
             (
                 "shell_derived_interpreter_runtime",
@@ -4024,6 +4103,138 @@ mod tests {
             crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(tier, declared)),
             IoMaxReport::default(),
         )
+    }
+
+    fn sample_snapshot() -> crate::workdir_snapshot::WorkdirSnapshot {
+        crate::workdir_snapshot::WorkdirSnapshot {
+            source: "/home/you/project".to_string(),
+            files: 12,
+            dirs: 3,
+            symlinks: 1,
+            repointed_symlinks: 0,
+            bytes: 40960,
+            skipped_count: 1,
+            skipped: vec![crate::workdir_snapshot::SkippedEntry {
+                path: "run/pipe".to_string(),
+                reason: crate::workdir_snapshot::SkipReason::Fifo,
+            }],
+        }
+    }
+
+    /// Both keys are always serialized: `[]` and `null` for a session that declares no snapshot
+    /// grant and was started in no copy, and the human report lists the grant beside `spawn allow`.
+    #[test]
+    fn spawn_workdir_snapshot_and_parent_workdir_are_always_reported() {
+        let report = boundary_report(ContainmentClass::Scoped, EnforcementTier::KernelFull);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["spawn_workdir_snapshot"], serde_json::json!([]));
+        assert!(json.as_object().unwrap().contains_key("parent_workdir"));
+        assert_eq!(json["parent_workdir"], serde_json::Value::Null);
+        let rendered = report.render();
+        let snapshot_line = rendered
+            .find("\n  spawn workdir snapshot: <none>\n")
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            rendered.find("\n  spawn allow:").unwrap() < snapshot_line,
+            "{rendered}"
+        );
+
+        assert!(!rendered.contains("Parent work folder"), "{rendered}");
+
+        let mut policy = sample_policy();
+        policy.spawn_allow = vec!["local/reviewer".to_string(), "local/worker".to_string()];
+        policy.spawn_workdir_snapshot = vec!["local/reviewer".to_string()];
+        let report = report_for(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            Some(6),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
+            IoMaxReport::default(),
+        );
+        assert_eq!(report.spawn_workdir_snapshot, vec!["local/reviewer"]);
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["spawn_workdir_snapshot"],
+            serde_json::json!(["local/reviewer"])
+        );
+        assert!(
+            report
+                .render()
+                .contains("  spawn workdir snapshot:\n    - local/reviewer\n"),
+            "{}",
+            report.render()
+        );
+    }
+
+    /// A child's `parent_workdir.restriction` is its own filesystem restriction on the tier it
+    /// applies — never the achieved class — and the human report says it in words.
+    #[test]
+    fn parent_workdir_restriction_follows_the_applied_tier() {
+        for (declared, tier, restriction) in [
+            (
+                ContainmentClass::Sealed,
+                EnforcementTier::KernelSealed,
+                "absent",
+            ),
+            (
+                ContainmentClass::Scoped,
+                EnforcementTier::KernelFull,
+                "enforced",
+            ),
+            (
+                ContainmentClass::Advisory,
+                EnforcementTier::KernelSeccompOnly,
+                "advisory",
+            ),
+            (
+                ContainmentClass::Advisory,
+                EnforcementTier::EnvironmentOnly,
+                "advisory",
+            ),
+        ] {
+            let report =
+                boundary_report(declared, tier).with_parent_workdir(Some(sample_snapshot()));
+            let json = serde_json::to_value(&report).unwrap();
+            let parent = &json["parent_workdir"];
+            assert_eq!(parent["restriction"], restriction, "{tier:?}");
+            assert_eq!(
+                parent["restriction"],
+                json["filesystem_boundary"]["restriction"]
+            );
+            assert_eq!(parent["source"], "/home/you/project");
+            assert_eq!(parent["files"], 12);
+            assert_eq!(parent["skipped"][0]["reason"], "fifo");
+
+            let rendered = report.render();
+            assert!(
+                rendered.contains(
+                    "\nParent work folder\n  source:      /home/you/project\n  copied:      \
+                     12 files, 3 directories, 1 symlinks (0 re-pointed), 40960 bytes\n  \
+                     skipped:     1\n    - run/pipe (fifo)\n  restriction: "
+                ),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("  restriction: {restriction}: ")),
+                "{rendered}"
+            );
+        }
+        assert_eq!(
+            boundary_report(ContainmentClass::Scoped, EnforcementTier::KernelFull)
+                .with_parent_workdir(None)
+                .parent_workdir,
+            None
+        );
     }
 
     /// Every tier names the same three subprocess routes it confines, on the line under

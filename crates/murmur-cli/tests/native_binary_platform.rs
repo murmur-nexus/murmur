@@ -173,6 +173,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        parent_workdir_snapshot: None,
         session_deadline: None,
         manifest_file: None,
         credentials_file: None,

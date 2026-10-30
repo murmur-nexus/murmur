@@ -1323,3 +1323,156 @@ fn a_script_capsule_posts_a_session_span_and_a_tool_call_span() {
     assert_eq!(call["parentSpanId"], session["spanId"]);
     assert_eq!(call["traceId"], session["traceId"]);
 }
+
+/// A project declaring `capabilities.spawn` with the given body, in a fresh directory.
+fn spawn_project(spawn_yaml: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("murmur.yaml"),
+        format!("name: demo\nversion: 0.1.0\ncapabilities:\n  spawn:\n{spawn_yaml}"),
+    )
+    .unwrap();
+    fs::write(dir.path().join("capsule.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    dir
+}
+
+fn explain_scope_of(project: &Path, extra: &[&str]) -> std::process::Output {
+    let home = tempfile::tempdir().unwrap();
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(project)
+        .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+const SNAPSHOT_JSON: &str = r#"{"source":"/home/you/project","files":12,"dirs":3,"symlinks":1,"repointed_symlinks":0,"bytes":40960,"skipped_count":1,"skipped":[{"path":"run/pipe","reason":"fifo"}]}"#;
+
+/// The parent's report lists `capabilities.spawn.workdir_snapshot` beside `spawn allow`, and a
+/// session started in no copy reports `parent_workdir: null`.
+#[test]
+fn explain_scope_reports_spawn_workdir_snapshot() {
+    let project =
+        spawn_project("    allow: [local/reviewer]\n    workdir_snapshot: [local/reviewer]\n");
+
+    let json = explain_scope_of(project.path(), &["--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        report["spawn_workdir_snapshot"],
+        serde_json::json!(["local/reviewer"])
+    );
+    assert!(report.as_object().unwrap().contains_key("parent_workdir"));
+    assert_eq!(report["parent_workdir"], serde_json::Value::Null);
+
+    let human = String::from_utf8(explain_scope_of(project.path(), &[]).stdout).unwrap();
+    assert!(
+        human.contains(
+            "  spawn allow:\n    - local/reviewer\n  spawn workdir snapshot:\n    - local/reviewer\n"
+        ),
+        "{human}"
+    );
+
+    let undeclared = spawn_project("    allow: [local/reviewer]\n");
+    let report: serde_json::Value =
+        serde_json::from_slice(&explain_scope_of(undeclared.path(), &["--json"]).stdout).unwrap();
+    assert_eq!(report["spawn_workdir_snapshot"], serde_json::json!([]));
+}
+
+/// A child told what its parent copied reports it under `parent_workdir`, with this host's
+/// restriction; the human report prints a `Parent work folder` block.
+#[test]
+fn explain_scope_reports_parent_workdir_from_the_hidden_flag() {
+    let project = spawn_project("    allow: []\n");
+    let workdir = tempfile::tempdir().unwrap();
+    let workdir_arg = workdir.path().to_str().unwrap();
+    let flags = [
+        "--workdir",
+        workdir_arg,
+        "--parent-workdir-snapshot",
+        SNAPSHOT_JSON,
+    ];
+
+    let mut json_flags = flags.to_vec();
+    json_flags.push("--json");
+    let output = explain_scope_of(project.path(), &json_flags);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parent = &report["parent_workdir"];
+    assert_eq!(parent["source"], "/home/you/project");
+    assert_eq!(parent["files"], 12);
+    assert_eq!(parent["bytes"], 40960);
+    assert_eq!(parent["skipped"][0]["reason"], "fifo");
+    assert_eq!(
+        parent["restriction"], report["filesystem_boundary"]["restriction"],
+        "{report}"
+    );
+
+    let human = String::from_utf8(explain_scope_of(project.path(), &flags).stdout).unwrap();
+    assert!(
+        human.contains(
+            "\nParent work folder\n  source:      /home/you/project\n  copied:      12 files, 3 \
+             directories, 1 symlinks (0 re-pointed), 40960 bytes\n  skipped:     1\n    - \
+             run/pipe (fifo)\n  restriction: "
+        ),
+        "{human}"
+    );
+}
+
+/// The flag takes only the snapshot JSON a parent's runtime writes, needs `--workdir`, conflicts
+/// with `--roster` and is hidden from `--help`.
+#[test]
+fn parent_workdir_snapshot_flag_is_hidden_and_validated() {
+    let project = spawn_project("    allow: []\n");
+    let workdir = tempfile::tempdir().unwrap();
+    let workdir_arg = workdir.path().to_str().unwrap();
+
+    let malformed = explain_scope_of(
+        project.path(),
+        &[
+            "--workdir",
+            workdir_arg,
+            "--parent-workdir-snapshot",
+            "{\"files\":\"many\"}",
+        ],
+    );
+    assert!(!malformed.status.success());
+    let stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(stderr.contains("--parent-workdir-snapshot"), "{stderr}");
+
+    let no_workdir = explain_scope_of(
+        project.path(),
+        &["--parent-workdir-snapshot", SNAPSHOT_JSON],
+    );
+    assert!(!no_workdir.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_workdir.stderr).contains("--workdir"),
+        "{no_workdir:?}"
+    );
+
+    let roster = Command::cargo_bin("mur")
+        .unwrap()
+        .args([
+            "run",
+            "--roster",
+            "roster.yaml",
+            "--parent-workdir-snapshot",
+            SNAPSHOT_JSON,
+        ])
+        .output()
+        .unwrap();
+    assert!(!roster.status.success());
+    assert!(
+        String::from_utf8_lossy(&roster.stderr).contains("cannot be used with"),
+        "{roster:?}"
+    );
+
+    let help = Command::cargo_bin("mur")
+        .unwrap()
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("parent-workdir-snapshot"));
+}

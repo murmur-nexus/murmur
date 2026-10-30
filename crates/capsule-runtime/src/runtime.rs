@@ -2549,7 +2549,8 @@ pub fn stage_session(
         // `NotProbed` here so the staged report claims nothing, and overwritten from
         // `prepare_scope`'s real write outcome before `session_start` is written.
         crate::cgroup::IoMaxReport::default(),
-    );
+    )
+    .with_parent_workdir(request.parent_workdir_snapshot.clone());
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
     // sleep` withdraws that bound on purpose. Once withdrawn, the declared lifetime is the only
@@ -3362,7 +3363,11 @@ pub fn stage_session(
     // And the delegation tool, on the same terms again. Its schema is built rather than fixed:
     // the `capsule` property's `enum` is this capsule's own `capabilities.spawn.allow`, so the
     // model is offered the names the operator granted and cannot name anything else.
-    write_delegate_task_tool_manifest(&runtime_root, &request.capability_policy.spawn_allow)?;
+    write_delegate_task_tool_manifest(
+        &runtime_root,
+        &request.capability_policy.spawn_allow,
+        &request.capability_policy.spawn_workdir_snapshot,
+    )?;
 
     // And the member-call tool, whose grant is the roster: written only for a formation member
     // the roster lets call another, its schema's `enum` the members it may call.
@@ -3492,6 +3497,7 @@ pub fn stage_session(
                 &request.capability_policy,
                 containment.applied_tier(),
             ),
+            parent_workdir: request.parent_workdir_snapshot.clone(),
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
         inputs
@@ -4227,7 +4233,14 @@ fn launch(
                 // completion is posted, and what makes `DelegationPlane::start` available at all.
                 .reporting_to(format!("http://{capsule_url}"))
                 // A child runs no longer than this session: its own session deadline is this one.
-                .bounded_by(session_deadline),
+                .bounded_by(session_deadline)
+                .snapshotting_workdir(
+                    crate::delegation_plane::WorkdirSnapshotGrant::new(
+                        staged.capability_policy.spawn_workdir_snapshot.clone(),
+                        accessible_root.clone(),
+                        &[&runtime_root, &records_root],
+                    ),
+                ),
             )
         });
 
@@ -9835,6 +9848,7 @@ impl CapsuleStoreState {
                     &notice.child_session_id,
                     &notice.child_workdir,
                     &notice.child_records_dir,
+                    notice.workdir_snapshot.as_ref(),
                 )
                 .await;
         }
@@ -11670,6 +11684,7 @@ const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
 fn write_delegate_task_tool_manifest(
     runtime_root: &WorkdirRoot,
     spawn_allow: &[String],
+    workdir_snapshot: &[String],
 ) -> Result<(), RuntimeError> {
     if spawn_allow.is_empty() {
         return Ok(());
@@ -11677,7 +11692,7 @@ fn write_delegate_task_tool_manifest(
     write_runtime_provided_tool_manifest(
         runtime_root,
         DELEGATE_TASK_TOOL,
-        &delegate_task_tool_manifest(spawn_allow),
+        &delegate_task_tool_manifest(spawn_allow, workdir_snapshot),
     )
 }
 
@@ -11694,9 +11709,13 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 /// continues in this conversation with each outcome, naming the result file; that the delegation
 /// deadline ends a sub-capsule still running; that no tool reports on a running sub-capsule; and
 /// that a task that ends any other way ends its sub-capsules with it. It is the same on every
-/// lifecycle and identical on every launch for a given `spawn_allow`, because it sits in the
-/// cached prompt prefix.
-fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
+/// lifecycle and identical on every launch for a given `spawn_allow` and `workdir_snapshot`,
+/// because it sits in the cached prompt prefix.
+///
+/// `workdir_snapshot` (`capabilities.spawn.workdir_snapshot`) adds one sentence naming the
+/// capsules that start in a copy of this capsule's work folder; empty, it adds nothing, so the
+/// description is the one a capsule without the grant has always had.
+fn delegate_task_tool_manifest(spawn_allow: &[String], workdir_snapshot: &[String]) -> String {
     // The bare parts, which the manifest parser keeps unique: the model never sees a scope.
     let bare: Vec<&str> = spawn_allow
         .iter()
@@ -11711,13 +11730,15 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     let terminated = crate::delegation::DelegationStatus::Terminated.as_str();
     let bound_kib = crate::delegation_plane::MAX_OUTPUT_BYTES / 1024;
     let delegations = crate::runtime_dir::DELEGATIONS_SUBDIR;
+    let snapshot_sentence = workdir_snapshot_sentence(workdir_snapshot);
     let description = format!(
         "Hand one task to one sub-capsule and return as soon as it is running and holding that \
          task. This call does not wait for the sub-capsule to finish and never returns its \
          answer. `capsule` must be one of the names this capsule is allowed to delegate to; \
          `version` is that capsule's exact version, because there is no latest or stable alias; \
          `task` is the whole of what the sub-capsule is told, so state the objective in full. \
-         The sub-capsule runs as its own process with its own workdir. On success the result \
+         The sub-capsule runs as its own process with its own workdir.{snapshot_sentence} On \
+         success the result \
          has `status: {started}`, a `delegation_id`, the sub-capsule's `session_id` and its \
          `child_workdir`, along with the `capsule` and `version` it was given; there is no \
          `output` and no `result_path`, because nothing has been produced yet. A refused \
@@ -11734,6 +11755,28 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          sub-capsule with it."
     );
     native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
+}
+
+/// The sentence `delegate-task`'s description gains for `capabilities.spawn.workdir_snapshot`,
+/// with a leading space, naming the bare parts the model is offered; empty for an empty list.
+fn workdir_snapshot_sentence(workdir_snapshot: &[String]) -> String {
+    let names: Vec<String> = workdir_snapshot
+        .iter()
+        .map(|entry| format!("`{}`", murmur_artifact::tool_name_of(entry)))
+        .collect();
+    let (subject, starts, they) = match names.as_slice() {
+        [] => return String::new(),
+        [one] => (one.clone(), "starts", "it changes"),
+        [rest @ .., last] => (
+            format!("{} and {last}", rest.join(", ")),
+            "start",
+            "they change",
+        ),
+    };
+    format!(
+        " {subject} {starts} with a copy of this capsule's work folder as it is when the call is \
+         made, and nothing {they} reaches this capsule's work folder."
+    )
 }
 
 /// The `data` a `delegate-task` call returns for `result`, as JSON.
@@ -13689,10 +13732,10 @@ mod tests {
     /// what stops it naming a capsule the operator never granted.
     #[test]
     fn the_delegation_manifest_carries_the_granted_names_and_nothing_else() {
-        let manifest = super::delegate_task_tool_manifest(&[
-            "local/worker".to_string(),
-            "ana/reviewer".to_string(),
-        ]);
+        let manifest = super::delegate_task_tool_manifest(
+            &["local/worker".to_string(), "ana/reviewer".to_string()],
+            &[],
+        );
         let parsed: serde_norway::Value =
             serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("delegate-task"));
@@ -13727,7 +13770,7 @@ mod tests {
     /// by its bare part.
     #[test]
     fn delegate_task_enum_offers_the_bare_parts_of_spawn_allow() {
-        let manifest = super::delegate_task_tool_manifest(&["local/worker".to_string()]);
+        let manifest = super::delegate_task_tool_manifest(&["local/worker".to_string()], &[]);
         let parsed: serde_norway::Value =
             serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         let schema: serde_json::Value =
@@ -13742,6 +13785,53 @@ mod tests {
 
     /// The result names the capsule the way the model named it, though the delegation ran the
     /// full entry `spawn_target` mapped it to.
+    /// `capabilities.spawn.workdir_snapshot` adds exactly one sentence, naming the bare parts it
+    /// lists; an empty list leaves the description byte for byte as it is without the key.
+    #[test]
+    fn delegate_task_description_names_the_snapshotted_capsules_in_one_sentence() {
+        let description = |snapshot: &[String]| {
+            let manifest = super::delegate_task_tool_manifest(
+                &["local/reviewer".to_string(), "ana/worker".to_string()],
+                snapshot,
+            );
+            let parsed: serde_norway::Value = serde_norway::from_str(&manifest).unwrap();
+            parsed["description"].as_str().unwrap().to_string()
+        };
+        let without = description(&[]);
+        assert!(
+            !without.contains("copy of this capsule's work folder"),
+            "{without}"
+        );
+
+        let one = description(&["local/reviewer".to_string()]);
+        let sentence =
+            " `reviewer` starts with a copy of this capsule's work folder as it is when \
+                        the call is made, and nothing it changes reaches this capsule's work \
+                        folder.";
+        assert_eq!(
+            one,
+            without.replacen(
+                "its own workdir.",
+                &format!("its own workdir.{sentence}"),
+                1
+            )
+        );
+        assert!(
+            !one.contains("local/reviewer"),
+            "the model never sees a scope: {one}"
+        );
+
+        let two = description(&["local/reviewer".to_string(), "ana/worker".to_string()]);
+        assert!(
+            two.contains(
+                " `reviewer` and `worker` start with a copy of this capsule's work folder as it \
+                 is when the call is made, and nothing they change reaches this capsule's work \
+                 folder."
+            ),
+            "{two}"
+        );
+    }
+
     #[test]
     fn delegate_task_result_reports_the_bare_capsule_name() {
         use crate::delegation_plane::{DelegationResult, DelegationStatus};
@@ -13773,6 +13863,7 @@ mod tests {
         super::write_delegate_task_tool_manifest(
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &[],
+            &[],
         )
         .unwrap();
         assert!(!dir.path().join("tools").join("delegate-task").exists());
@@ -13780,6 +13871,7 @@ mod tests {
         super::write_delegate_task_tool_manifest(
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &["worker".to_string()],
+            &[],
         )
         .unwrap();
         assert!(dir
@@ -13797,7 +13889,7 @@ mod tests {
     fn the_delegation_description_names_every_field_the_handler_returns() {
         use crate::delegation_plane::{DelegationResult, DelegationStatus};
 
-        let manifest = super::delegate_task_tool_manifest(&["worker".to_string()]);
+        let manifest = super::delegate_task_tool_manifest(&["worker".to_string()], &[]);
         let parsed: serde_norway::Value =
             serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         let description = parsed["description"].as_str().expect("a description");
@@ -13860,6 +13952,7 @@ mod tests {
         super::write_delegate_task_tool_manifest(
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &["worker".to_string()],
+            &[],
         )
         .unwrap();
         let written = std::fs::read_to_string(
@@ -14721,6 +14814,7 @@ mod tests {
         super::write_delegate_task_tool_manifest(
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &["worker".to_string()],
+            &[],
         )
         .unwrap();
         let synthetic = dir
@@ -15850,6 +15944,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -15954,6 +16049,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -16047,6 +16143,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -16139,6 +16236,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -16292,6 +16390,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -16404,6 +16503,7 @@ inference:
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
@@ -28749,6 +28849,7 @@ mod submitting_task_tests {
             child_session_id: "ses_child".to_string(),
             child_workdir: "/records/ses_parent/children/worker-1".to_string(),
             child_records_dir: "/home/test/.murmur/records/work/ses_child".to_string(),
+            workdir_snapshot: None,
         }
     }
 
