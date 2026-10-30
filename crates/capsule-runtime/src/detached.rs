@@ -1,13 +1,16 @@
-//! Shell commands that outran their grace period and run on in the background.
+//! Shell commands that were moved out of the foreground and run on in the background.
 //!
-//! Every shell command starts in the foreground. One that has not exited by the time
-//! `lifecycle.shell_grace_secs` elapses is demoted: the turn gets a work id and carries on, the
-//! command keeps running on an OS thread of its own, and its output is written to a log in the
-//! session's records directory as it is read.
+//! Every shell command starts in the foreground. One is demoted when it has not exited by the
+//! time a declared `lifecycle.shell_grace_secs` elapses, or when the call waiting on it is
+//! abandoned or its task is canceled: the turn gets a work id and carries on, the command keeps
+//! running on an OS thread of its own, and its output is written to a log in the session's
+//! records directory as it is read. With no `shell_grace_secs` a command is never demoted on a
+//! clock.
 //!
 //! The work id is an address. [`DetachedRegistry`] keeps every demoted command of the session,
 //! running or finished, and the runtime-provided `background-command` tool
-//! ([`crate::background_command`]) reads its state, waits for it or stops it by that id. When a
+//! ([`crate::background_command`]), offered when `shell_grace_secs` is set, reads its state,
+//! waits for it or stops it by that id. When a
 //! command finishes, the runtime also enqueues a task on this capsule with
 //! [`crate::origin::TaskOrigin::Completion`] carrying the exit code and the log's path, unless
 //! the agent already read the exit through the tool.
@@ -177,31 +180,47 @@ pub(crate) struct DetachedDispatchInfo {
     pub work_id: String,
     pub binary: String,
     pub command: String,
-    /// The grace period this command outran, in milliseconds — the configured
-    /// `lifecycle.shell_grace_secs`, recorded so a trace reader can see which setting was in
-    /// force without consulting the manifest.
-    pub grace_ms: u64,
+    /// The configured `lifecycle.shell_grace_secs` in milliseconds, recorded so a trace reader
+    /// can see which setting was in force without consulting the manifest. `None` when the
+    /// session declares no grace, so the command was demoted by an abandoned call or a cancel.
+    pub grace_ms: Option<u64>,
 }
 
 /// The tool result a demoted command hands back to the turn. `delivered` is
 /// [`DetachPolicy::delivered`]: whether the completion can also reach the model as a later task.
+/// `tool_offered` is whether the session offers `background-command`, which it does exactly when
+/// `lifecycle.shell_grace_secs` is set; without it the text names no tool.
 ///
-/// Constant size by construction for either value of `delivered`: nothing here derives from the
-/// command, its arguments or its output, so no input can make the text the model reads grow. It
-/// names no path and shows no output; `background-command` reports both.
-pub(crate) fn demotion_tool_result(work_id: &str, delivered: bool) -> ToolResult {
-    let mut data = format!(
-        "The command is still running and was moved to the background as {work_id}. The \
-         {tool} tool reports on it, waits for it or stops it by that id. A command still running \
-         when the session ends is killed.",
-        tool = crate::background_command::BACKGROUND_COMMAND_TOOL,
-    );
-    if delivered {
-        data.push_str(&format!(
+/// Constant size by construction for every combination: nothing here derives from the command,
+/// its arguments or its output, so no input can make the text the model reads grow. It names no
+/// path and shows no output; `background-command` reports both.
+pub(crate) fn demotion_tool_result(
+    work_id: &str,
+    delivered: bool,
+    tool_offered: bool,
+) -> ToolResult {
+    let tool = crate::background_command::BACKGROUND_COMMAND_TOOL;
+    let mut data = if tool_offered {
+        format!(
+            "The command is still running and was moved to the background as {work_id}. The \
+             {tool} tool reports on it, waits for it or stops it by that id. A command still \
+             running when the session ends is killed."
+        )
+    } else {
+        format!(
+            "The command is still running and was moved to the background as {work_id}. A \
+             command still running when the session ends is killed."
+        )
+    };
+    match (delivered, tool_offered) {
+        (true, true) => data.push_str(&format!(
             " If it exits before {tool} has reported its exit, its result also arrives later as a \
-             separate task.",
-            tool = crate::background_command::BACKGROUND_COMMAND_TOOL,
-        ));
+             separate task."
+        )),
+        (true, false) => {
+            data.push_str(" When it exits, its result arrives later as a separate task.");
+        }
+        (false, _) => {}
     }
     ToolResult {
         status: Status::Passed,
@@ -656,7 +675,10 @@ impl Drop for KillRunningOnDrop {
 /// keeps `plan.rs` and the script-capsule store state foreground-only: neither runs a task loop,
 /// so neither has anywhere to deliver a completion.
 pub(crate) struct DetachPolicy {
-    pub grace: Duration,
+    /// How long the command runs in the foreground before it is demoted: the declared
+    /// `lifecycle.shell_grace_secs`. `None` sets no deadline, so the command stays in the
+    /// foreground until it exits unless `abandoned` or `canceled` demotes it.
+    pub grace: Option<Duration>,
     /// Whether the completion reaches the model as a later task, which only `task_acceptance:
     /// queue` with `after_task: sleep` does. Decides what [`demotion_tool_result`] tells it.
     pub delivered: bool,
@@ -671,7 +693,7 @@ pub(crate) struct DetachPolicy {
     /// the round trip instead of being reset by the runtime enqueuing its own task.
     pub provenance: Option<TaskProvenance>,
     /// Raised when whoever was waiting for the foreground result has gone away. The command is
-    /// then demoted at once, exactly as if it had outrun `grace`. `None` for every caller that
+    /// then demoted at once, whether or not `grace` is set. `None` for every caller that
     /// cannot go away mid-call; the process-transport tool bridge is the one that can.
     pub abandoned: Option<AbandonSignal>,
     /// The cancel of the task whose turn made the call. Raised before the spawn, the command is
@@ -877,8 +899,7 @@ pub(crate) struct LostWork {
     pub binary: String,
     /// As [`DetachedWork::command`].
     pub command: String,
-    /// The `shell_detached` line's own timestamp — the demotion instant, which is the start
-    /// instant plus the grace period the command outran.
+    /// The `shell_detached` line's own timestamp — the demotion instant.
     pub detached_at_ms: u64,
 }
 
@@ -985,7 +1006,7 @@ mod tests {
         workdir: &Path,
         runtime_base: &Path,
         script: &str,
-        grace: Duration,
+        grace: impl Into<Option<Duration>>,
     ) -> (
         ShellOutcome,
         Arc<DetachedRegistry>,
@@ -1005,7 +1026,7 @@ mod tests {
         workdir: &Path,
         enforcement: &ShellEnforcement,
         script: &str,
-        grace: Duration,
+        grace: impl Into<Option<Duration>>,
     ) -> (
         ShellOutcome,
         Arc<DetachedRegistry>,
@@ -1020,7 +1041,7 @@ mod tests {
             &bash_policy(),
             enforcement,
             Some(DetachPolicy {
-                grace,
+                grace: grace.into(),
                 delivered: true,
                 registry: Arc::clone(&registry),
                 command: script.to_string(),
@@ -1301,7 +1322,7 @@ mod tests {
             "work id {} must match ^wrk_[0-9a-f]+$",
             info.work_id
         );
-        assert_eq!(info.grace_ms, 1_000);
+        assert_eq!(info.grace_ms, Some(1_000));
         assert_eq!(
             registry
                 .outstanding()
@@ -1398,6 +1419,61 @@ mod tests {
         assert!(!workdir.path().join("logs").exists());
     }
 
+    /// With no grace there is no clock: a command that runs for seconds stays in the foreground
+    /// and returns its output to the call, and nothing is registered.
+    #[test]
+    fn with_no_grace_a_slow_command_finishes_in_the_foreground() {
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let (outcome, registry, mut receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "sleep 3; echo finished",
+            None,
+        );
+
+        let result = match outcome {
+            ShellOutcome::Finished(result) => result,
+            ShellOutcome::Detached(info) => {
+                panic!("no grace, yet the command was demoted as {}", info.work_id)
+            }
+        };
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(result.stdout.trim(), "finished");
+        assert_eq!(result.exit_code, 0);
+        assert!(registry.outstanding().is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// A grace of zero demotes at the first poll after the spawn.
+    #[test]
+    fn a_zero_grace_demotes_at_the_first_poll() {
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let (outcome, registry, _receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "sleep 5",
+            Some(Duration::ZERO),
+        );
+
+        let ShellOutcome::Detached(info) = outcome else {
+            panic!("a zero grace must demote a five-second command: {outcome:?}");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "demotion took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(info.grace_ms, Some(0));
+        registry.kill_running();
+    }
+
     /// A command that beats the grace period returns its result to the turn and registers nothing.
     #[test]
     fn a_fast_command_finishes_in_the_foreground() {
@@ -1470,17 +1546,20 @@ mod tests {
         assert_eq!(await_completion(&mut receiver).status(), "ok");
     }
 
-    /// The demotion text names the work id and the tool that takes it, says what becomes of the
-    /// command at session end, and stays small for either lifecycle; only a lifecycle that
-    /// delivers completions mentions the separate task.
+    /// The demotion text names the work id, names the tool that takes it only when the session
+    /// offers that tool, says what becomes of the command at session end, and stays small for
+    /// either lifecycle; only a lifecycle that delivers completions mentions the separate task.
     #[test]
     fn the_demotion_result_names_the_tool_and_stays_small() {
-        for delivered in [true, false] {
-            let result = demotion_tool_result("wrk_0a1b", delivered);
+        for (delivered, tool_offered) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let result = demotion_tool_result("wrk_0a1b", delivered, tool_offered);
             let data = result.data.as_deref().unwrap();
             assert!(data.len() < 400, "{} bytes: {data}", data.len());
             assert!(data.contains("wrk_0a1b"), "{data}");
-            assert!(data.contains("background-command"), "{data}");
+            assert_eq!(data.contains("background-command"), tool_offered, "{data}");
+            assert_eq!(data.contains(" tool"), tool_offered, "{data}");
             assert!(data.contains("is killed"), "{data}");
             for retired in [concat!("nothing to ", "poll"), concat!("no way ", "to ask")] {
                 assert!(!data.contains(retired), "{retired}: {data}");
@@ -1496,11 +1575,36 @@ mod tests {
             );
         }
         assert_eq!(
-            demotion_tool_result("wrk_1", false).data.as_deref(),
+            demotion_tool_result("wrk_1", false, true).data.as_deref(),
             Some(
                 "The command is still running and was moved to the background as wrk_1. The \
                  background-command tool reports on it, waits for it or stops it by that id. A \
                  command still running when the session ends is killed."
+            )
+        );
+        assert_eq!(
+            demotion_tool_result("wrk_1", true, true).data.as_deref(),
+            Some(
+                "The command is still running and was moved to the background as wrk_1. The \
+                 background-command tool reports on it, waits for it or stops it by that id. A \
+                 command still running when the session ends is killed. If it exits before \
+                 background-command has reported its exit, its result also arrives later as a \
+                 separate task."
+            )
+        );
+        assert_eq!(
+            demotion_tool_result("wrk_1", false, false).data.as_deref(),
+            Some(
+                "The command is still running and was moved to the background as wrk_1. A \
+                 command still running when the session ends is killed."
+            )
+        );
+        assert_eq!(
+            demotion_tool_result("wrk_1", true, false).data.as_deref(),
+            Some(
+                "The command is still running and was moved to the background as wrk_1. A \
+                 command still running when the session ends is killed. When it exits, its \
+                 result arrives later as a separate task."
             )
         );
     }
@@ -1825,13 +1929,15 @@ mod tests {
     #[test]
     fn the_demotion_result_is_a_constant_size() {
         for delivered in [true, false] {
-            the_demotion_result_is_a_constant_size_when(delivered);
+            for tool_offered in [true, false] {
+                the_demotion_result_is_a_constant_size_when(delivered, tool_offered);
+            }
         }
     }
 
-    fn the_demotion_result_is_a_constant_size_when(delivered: bool) {
+    fn the_demotion_result_is_a_constant_size_when(delivered: bool, tool_offered: bool) {
         let reduce = |work_id: &str| {
-            let result = demotion_tool_result(work_id, delivered);
+            let result = demotion_tool_result(work_id, delivered, tool_offered);
             result
                 .data
                 .or(result.summary)

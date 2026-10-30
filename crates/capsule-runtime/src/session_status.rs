@@ -640,6 +640,23 @@ mod tests {
         serde_json::to_value(status.snapshot_at(now, spend)).unwrap()
     }
 
+    /// The tool reports neither a CPU-time limit nor a shell grace period, and its description
+    /// promises neither.
+    #[test]
+    fn session_status_names_no_cpu_limit_and_no_shell_grace() {
+        let started = Instant::now();
+        let status = SessionStatus::new(started, false, Some(20), None, 300, None, None);
+        let text = serde_json::to_string(&status.snapshot_at(started, no_spend())).unwrap();
+        for description in [description_http(), description_process()] {
+            for named in [text.as_str(), description.as_str()] {
+                let lower = named.to_lowercase();
+                for word in ["cpu", "grace", "background"] {
+                    assert!(!lower.contains(word), "{word}: {named}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn session_status_reports_every_fed_value_on_http() {
         let started = Instant::now();

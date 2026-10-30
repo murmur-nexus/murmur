@@ -854,11 +854,11 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for a native subprocess with no cgroup scope: the account's count at that spawn plus this value, in threads on Linux and processes on macOS. No effect on Linux when the subprocess runs in a cgroup scope, where `cgroup_pids_max` is the bound. Default: 128. Must be > 0. See [`max_processes` by platform](resource-limits.md#max-processes-headroom). |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
-| `capabilities.resources.cpu_seconds` | integer | no | The CPU time, in CPU-seconds, after which each native subprocess gets `SIGXCPU`, and `SIGKILL` one second later. Default: 3600 (1 hour). Must be > 0. |
+| `capabilities.resources.cpu_seconds` | integer | no | The CPU time, in CPU-seconds, after which each native subprocess gets `SIGXCPU`, and `SIGKILL` one second later. Default: not set — no CPU-time limit; a subprocess keeps the `RLIMIT_CPU` `mur` was started with. Must be > 0. |
 | `capabilities.resources.memory_bytes` | integer | no | `RLIMIT_AS` (Linux) hard ceiling on each native subprocess's address space, in bytes. Default: 2147483648 (2 GiB). Must be > 0. macOS maps this to `RLIMIT_DATA`, which its kernel does not enforce — see the [platform note](resource-limits.md#host-resource-limits). |
 | `capabilities.resources.cgroup_memory_bytes` | integer | no | cgroup v2 `memory.max` — aggregate memory across the whole subprocess tree, in bytes. Swap is bounded too: the scope's `memory.swap.max` is `0`, so a tree over this ceiling is OOM-killed rather than pushed out to swap. Default: 4294967296 (4 GiB). Must be > 0. Linux only. On a kernel that exposes no `memory.swap.max`, swap is not bounded and [`mur doctor`](cli.md#mur-doctor) says so. |
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
-| `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
+| `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: not set — no CPU cap; the scope's `cpu.max` stays at the kernel's `max`. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) reports [`io_max.status: unavailable`](resource-limits.md#io-max-report) with [`W-SEC-021`](diagnostics.md#w-sec-021) and keeps the other three controllers. |
 | `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the work folder, the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) together, in bytes, checked every 10 seconds; crossing it ends the session with `E-RUN-013`. See [Size ceiling](workdir.md#work-folder-ceiling). Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
@@ -1318,7 +1318,7 @@ bodies can be large, and a blob holds the wire payload or the received message a
 | `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `SendMessage` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
-| `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
+| `lifecycle.shell_grace_secs` | integer | no | Default: not set — a command runs in the foreground until it exits. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
 | `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a delegated sub-capsule may run before it is ended, and a [`call-member`](runtime-provided-tools.md#call-member) call may spend offering a busy member the task and waiting for its answer — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
 | `lifecycle.deadline_notice_secs` | integer | no | Default: five minutes, or a tenth of the deadline when that is shorter, and at least `1`. Seconds before a [`mur run --deadline`](cli.md#mur-run-deadline) at which the agent is told, once, that the session is about to end — see [The deadline notice](runtime-provided-tools.md#deadline-notice). `0` sends no notice. Must be ≥ 0. Inert without `--deadline`. |
 | `lifecycle.keep_working` | object | no | Absent: a task ends at its first turn end. Sends `message` after each turn end, up to `limit` times per task — see [`lifecycle.keep_working`](#lifecycle-keep-working). |
@@ -2470,7 +2470,7 @@ lifecycle:
   queue_depth: 1
   conversation: stateless
   max_task_reopens: 1
-  shell_grace_secs: 10
+  # shell_grace_secs: absent, so a shell command runs in the foreground until it exits
   delegation_deadline_secs: 600
   # keep_working: absent, so a task ends at its first turn end — see lifecycle.keep_working
   # done_check: absent, so a task ends when the model stops
@@ -2531,18 +2531,21 @@ See [request-input WIT import](wit-interfaces.md#murmurtasktask) and
 ### `lifecycle.shell_grace_secs` { #lifecycle-shell-grace-secs }
 
 How long a shell command runs in the foreground before the runtime moves it to the background.
-Every command starts in the foreground and the clock decides.
+Every command starts in the foreground.
 
 | Value | Behaviour |
 |---|---|
-| `10` (default) | A command exiting within 10 seconds returns its output to the turn. One that runs longer moves to the background. |
-| `N` (positive integer) | The same, with an `N`-second window. |
+| not set (default) | A command runs in the foreground until it exits, and its output returns to the turn. The [`background-command`](runtime-provided-tools.md#background-command) tool is not offered. |
+| `N` (positive integer) | A command exiting within `N` seconds returns its output to the turn. One that runs longer moves to the background. |
 | `0` | The first check after the spawn moves the command to the background, unless it has already exited by then. |
 
+Whatever the value, a command still in the foreground also moves to the background when its task
+is canceled, or when a `transport: process` harness stops waiting for the call.
+
 A backgrounded command hands the turn a work id of the form `wrk_<hex>` and the fact that it is
-still running. The work id is valid for the rest of the session. The runtime-provided
-[`background-command`](runtime-provided-tools.md#background-command) tool takes it and reports the
-command's state and output so far, waits for it to exit, or stops it.
+still running. The work id is valid for the rest of the session. With `shell_grace_secs` set, the
+runtime-provided [`background-command`](runtime-provided-tools.md#background-command) tool takes it
+and reports the command's state and output so far, waits for it to exit, or stops it.
 
 From the moment it moves to the background, the command's stdout and stderr are written to
 `logs/<work_id>.log` in the session's [records directory](workdir.md#records-directory) as they
@@ -2563,7 +2566,7 @@ How the exit reaches the agent:
 
 | Lifecycle | Delivery |
 |---|---|
-| Any | `background-command` returns the exit code, `status` and the last 16 KiB of output once the command has exited |
+| `shell_grace_secs` set | `background-command` returns the exit code, `status` and the last 16 KiB of output once the command has exited |
 | `task_acceptance: queue` with `after_task: sleep` | Also a task with [origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane, carrying the work id, the exit code and the log's path. Not enqueued when `background-command` already returned the exit |
 
 A non-zero exit, a signal kill and a [resource limit](resource-limits.md#which-limit) are told
@@ -2582,7 +2585,7 @@ A process it starts in the background with `&` stays in that group and, unless i
 redirected, holds the call's stdout and stderr open after the command itself has exited. Once the
 command's own process exits, the call:
 
-1. Waits up to 1 second for its stdout and stderr to close, and never past the end of the
+1. Waits up to 1 second for its stdout and stderr to close, and never past the end of a
    `lifecycle.shell_grace_secs` window. Output a background process prints and exits within that
    second is part of the result.
 2. Kills every process still in the command's process group with `SIGKILL`, if the output is

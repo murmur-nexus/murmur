@@ -26,7 +26,7 @@ Each one appears only when the declaration in the second column is present.
 | `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
 | `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
 | `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
-| `background-command` | An [`inference:`](manifest.md#field-inference) block and a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
+| `background-command` | An [`inference:`](manifest.md#field-inference) block, a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -166,8 +166,9 @@ reached is described under [The deadline](cli.md#mur-run-deadline).
 ## `background-command` { #background-command }
 
 A shell command that runs past [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs)
-moves to the background, and its shell call returns a work id of the form `wrk_<hex>`.
-`background-command` takes that id:
+moves to the background, and its shell call returns a work id of the form `wrk_<hex>`. The tool is
+offered only to a capsule that sets `lifecycle.shell_grace_secs`; without it no command moves to
+the background on a clock. `background-command` takes that id:
 
 ```json
 {"type":"object","properties":{"operation":{"type":"string","enum":["status","wait","stop"]},"work_id":{"type":"string"},"wait_secs":{"type":"integer","minimum":0}},"required":["operation","work_id"]}

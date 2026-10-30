@@ -454,9 +454,10 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 | `duration_ms` | u64 | |
 | `resource_limit` | string | The `capabilities.resources` field this subprocess hit — `cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes` or `cgroup_pids_max`. Written only when the kernel's own evidence names exactly one limit, and omitted from the line otherwise — see [Which limit a subprocess hit](resource-limits.md#which-limit) |
 
-**`shell_detached`** — written when a command outruns
-[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) and moves to the
-background, in place of that command's `shell` line
+**`shell_detached`** — written when a command moves to the background, in place of that command's
+`shell` line: it outran
+[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), its task was canceled, or
+a `transport: process` harness stopped waiting for the call
 
 | Field | Type | Notes |
 |---|---|---|
@@ -465,7 +466,7 @@ background, in place of that command's `shell` line
 | `work_id` | string | `wrk_` followed by a UUID v7 in undashed lowercase hex. The same id appears on this command's `shell_completed` or `shell_abandoned` line |
 | `binary` | string | As on `shell` |
 | `command` | string | As on `shell` |
-| `grace_ms` | u64 | The grace period this command outran, in milliseconds |
+| `grace_ms` | u64, optional | The [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) this command outran, in milliseconds. Absent when the capsule sets none: the command moved to the background because its task was canceled or a `transport: process` harness stopped waiting for the call |
 
 A demoted command raises `total_shell_calls` and its task's `shell_calls` here, and its
 `shell_completed` line does not, so each shell command is counted exactly once whichever way it

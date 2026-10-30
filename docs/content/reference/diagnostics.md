@@ -3662,7 +3662,7 @@ see [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
 scope did not succeed. Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/reference/diagnostics/#w-sec-021)
+[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max and pids.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/reference/diagnostics/#w-sec-021)
 ```
 
 **Why it matters:** `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block
@@ -3671,8 +3671,11 @@ ceiling is always applied, every capsule that gets a cgroup scope has a declared
 this warning is what says the ceiling is not on the scope.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. `io.max` is the
-one cgroup limit this runtime treats as non-fatal; `memory.max`, `pids.max` and `cpu.max` stay
-enforced on the scope and stay fatal on failure. See
+one cgroup limit this runtime treats as non-fatal; `memory.max` and `pids.max` stay enforced on
+the scope and stay fatal on failure. The message names the limits in force: it reads
+`memory.max, pids.max and cpu.max` when
+[`capabilities.resources.cgroup_cpu_percent`](manifest.md#field-capabilities) sets a CPU cap, and
+`memory.max and pids.max` when it does not. See
 [Whether the I/O ceiling applied](resource-limits.md#io-max-report).
 
 **What to do:** the same reason this warning carries is in `io_max.reason`, in

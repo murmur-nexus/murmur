@@ -10908,7 +10908,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &policy,
             &enforcement,
             Some(DetachPolicy {
-                grace: std::time::Duration::ZERO,
+                grace: Some(std::time::Duration::ZERO),
                 delivered: true,
                 registry: Arc::clone(&registry),
                 command: "-l 127.0.0.1 8080".to_string(),

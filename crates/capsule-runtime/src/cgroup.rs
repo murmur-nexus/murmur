@@ -111,7 +111,9 @@ pub(crate) struct ScopeLimit {
 }
 
 /// The limit writes a scope is created with, in write order. `io.max` is not among them: it is
-/// best-effort and reported separately (see [`CgroupScope::apply_io_max`]).
+/// best-effort and reported separately (see [`CgroupScope::apply_io_max`]). `cpu.max` is among
+/// them only when `cgroup_cpu_percent` is set; without it the scope keeps the kernel's
+/// `max 100000`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
     let required = |file, value| ScopeLimit {
@@ -119,7 +121,7 @@ pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
         value,
         absent_ok: false,
     };
-    vec![
+    let mut writes = vec![
         required("memory.max", limits.cgroup_memory_bytes.to_string()),
         ScopeLimit {
             file: "memory.swap.max",
@@ -127,14 +129,17 @@ pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
             absent_ok: true,
         },
         required("pids.max", limits.cgroup_pids_max.to_string()),
-        required(
+    ];
+    if let Some(percent) = limits.cgroup_cpu_percent {
+        writes.push(required(
             "cpu.max",
             format!(
                 "{} {CPU_MAX_PERIOD_US}",
-                u64::from(limits.cgroup_cpu_percent) * (CPU_MAX_PERIOD_US / 100)
+                u64::from(percent) * (CPU_MAX_PERIOD_US / 100)
             ),
-        ),
-    ]
+        ));
+    }
+    writes
 }
 
 /// Whether this kernel gives a cgroup a `memory.swap.max` to write, as `mur doctor` reports it.
@@ -352,8 +357,9 @@ pub enum IoMaxStatus {
     /// The `io.max` write succeeded against the device backing the workdir. The ceiling is on the
     /// scope.
     Enforced,
-    /// A scope exists and the `io.max` write did not succeed. `memory.max`, `pids.max` and
-    /// `cpu.max` are still enforced on it; I/O bandwidth is not bounded. What `W-SEC-021` reports.
+    /// A scope exists and the `io.max` write did not succeed. `memory.max` and `pids.max` are
+    /// still enforced on it, and so is `cpu.max` when `cgroup_cpu_percent` sets a cap; I/O
+    /// bandwidth is not bounded. What `W-SEC-021` reports.
     Unavailable,
     /// No scope was asked for: either this capsule declares no way to reach a native subprocess,
     /// or this is not Linux, where cgroups cannot exist. Not a shortfall — there is no process
@@ -436,27 +442,39 @@ const NO_SCOPE_REASON: &str = "this capsule declares no way to run a native subp
 const NOT_LINUX_REASON: &str =
     "cgroups are a Linux mechanism and this host has none, so no io.max ceiling can exist here";
 
-/// The message `W-SEC-021` carries, minus the reason the host gave.
+/// The message `W-SEC-021` carries, minus the limits still enforced and the reason the host gave.
 const IO_MAX_UNAVAILABLE_WARNING: &str = "the declared \
 capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup \
-scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max \
-and cpu.max are still enforced on the scope";
+scope, so this capsule's native subprocess tree has no I/O bandwidth bound";
 
 /// Pure decision for the unenforced-`io.max` warning, split out of
 /// [`warn_for_unenforced_io_max`] the same way `sandbox::aggregate_bounding_warning` is split out
 /// of its emitter, so a test can assert it without capturing stderr.
 ///
 /// Fires on [`IoMaxStatus::Unavailable`] alone. `NotRequired` is not a shortfall and `NotProbed`
-/// is not a finding, so neither warns.
-pub(crate) fn io_max_warning(report: &IoMaxReport) -> Option<(&'static str, String)> {
+/// is not a finding, so neither warns. `cpu_capped` is whether the scope carries a `cpu.max`
+/// write ([`HostResourceLimits::cgroup_cpu_percent`] is set), so the message names only the
+/// limits that are in force.
+pub(crate) fn io_max_warning(
+    report: &IoMaxReport,
+    cpu_capped: bool,
+) -> Option<(&'static str, String)> {
     if report.status != IoMaxStatus::Unavailable {
         return None;
     }
     let declared = report.declared_bytes_per_sec;
     let reason = report.reason.as_deref().unwrap_or("no reason reported");
+    let enforced = if cpu_capped {
+        "memory.max, pids.max and cpu.max"
+    } else {
+        "memory.max and pids.max"
+    };
     Some((
         murmur_artifact::W_SEC_021,
-        format!("{IO_MAX_UNAVAILABLE_WARNING} (declared {declared} bytes/s): {reason}"),
+        format!(
+            "{IO_MAX_UNAVAILABLE_WARNING}; {enforced} are still enforced on the scope \
+             (declared {declared} bytes/s): {reason}"
+        ),
     ))
 }
 
@@ -464,8 +482,9 @@ pub(crate) fn io_max_warning(report: &IoMaxReport) -> Option<(&'static str, Stri
 pub(crate) fn warn_for_unenforced_io_max(
     workdir: &crate::workdir_fs::WorkdirRoot,
     report: &IoMaxReport,
+    cpu_capped: bool,
 ) {
-    if let Some((code, message)) = io_max_warning(report) {
+    if let Some((code, message)) = io_max_warning(report, cpu_capped) {
         let link = murmur_artifact::security_warning_link(code);
         crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         crate::agent::append_bootstrap_log(
@@ -2191,7 +2210,7 @@ mod tests {
         assert_eq!(report.status, IoMaxStatus::NotProbed);
         assert_eq!(report.declared_bytes_per_sec, 0);
         assert_eq!(report.reason, None);
-        assert_eq!(io_max_warning(&report), None);
+        assert_eq!(io_max_warning(&report, false), None);
     }
 
     /// `reason` is the only optional key, and it is present for every status but `Enforced`.
@@ -2212,28 +2231,43 @@ mod tests {
     }
 
     /// `W-SEC-021` fires on the one status that is a shortfall, and its message names the
-    /// declared ceiling, the host's reason, and the three limits that *are* still enforced —
+    /// declared ceiling, the host's reason, and the limits that *are* still enforced —
     /// without which "io.max did not apply" reads as "this session is unbounded".
     #[test]
     fn the_warning_fires_only_where_a_declared_ceiling_did_not_apply() {
-        assert_eq!(io_max_warning(&IoMaxReport::enforced(4_096)), None);
+        assert_eq!(io_max_warning(&IoMaxReport::enforced(4_096), true), None);
         assert_eq!(
-            io_max_warning(&IoMaxReport::not_required(4_096, NO_SCOPE_REASON)),
+            io_max_warning(&IoMaxReport::not_required(4_096, NO_SCOPE_REASON), true),
             None
         );
 
-        let (code, message) = io_max_warning(&IoMaxReport::unavailable(
-            4_096,
-            "device 0:24 is not a block device",
-        ))
-        .expect("an unapplied ceiling must be reported");
+        let unavailable = IoMaxReport::unavailable(4_096, "device 0:24 is not a block device");
+        let (code, message) =
+            io_max_warning(&unavailable, true).expect("an unapplied ceiling must be reported");
         assert_eq!(code, murmur_artifact::W_SEC_021);
         assert!(message.contains("4096 bytes/s"), "message was: {message}");
         assert!(
             message.contains("device 0:24 is not a block device"),
             "message was: {message}"
         );
-        assert!(message.contains("memory.max"), "message was: {message}");
+        assert!(
+            message.contains("memory.max, pids.max and cpu.max are still enforced on the scope"),
+            "message was: {message}"
+        );
+    }
+
+    /// With no `cgroup_cpu_percent` the scope has no `cpu.max` write, so the warning does not
+    /// claim one.
+    #[test]
+    fn the_warning_names_cpu_max_only_when_a_cpu_cap_is_set() {
+        let unavailable = IoMaxReport::unavailable(4_096, "no io controller");
+        let (_, message) =
+            io_max_warning(&unavailable, false).expect("an unapplied ceiling must be reported");
+        assert!(
+            message.contains("memory.max and pids.max are still enforced on the scope"),
+            "message was: {message}"
+        );
+        assert!(!message.contains("cpu.max"), "message was: {message}");
     }
 
     /// `--explain-scope` runs before the workdir exists, so the probe has to name the device a
@@ -2449,7 +2483,7 @@ mod tests {
             scope.io_max.reason.is_some(),
             "not-required must say which cause"
         );
-        assert_eq!(io_max_warning(&scope.io_max), None);
+        assert_eq!(io_max_warning(&scope.io_max, false), None);
     }
 
     /// macOS can never have a cgroup, so a required scope there must be a silent `None` rather
@@ -2501,12 +2535,16 @@ mod tests {
             .scope
             .expect("a required scope on Linux is never `None`");
 
-        for file in ["memory.max", "pids.max", "cpu.max"] {
+        for file in ["memory.max", "pids.max"] {
             let contents = std::fs::read_to_string(scope.path().join(file))
                 .unwrap_or_else(|error| panic!("{file} unreadable in the scope: {error}"));
             assert!(!contents.trim().is_empty(), "{file} was left unset");
             assert_ne!(contents.trim(), "max", "{file} carries no ceiling");
         }
+        // No `cgroup_cpu_percent`, no `cpu.max` write: the scope keeps the kernel's own value.
+        let cpu_max = std::fs::read_to_string(scope.path().join("cpu.max"))
+            .unwrap_or_else(|error| panic!("cpu.max unreadable in the scope: {error}"));
+        assert_eq!(cpu_max.trim(), "max 100000");
         match std::fs::read_to_string(scope.path().join("memory.swap.max")) {
             Ok(contents) => {
                 assert_eq!(
@@ -2542,11 +2580,34 @@ mod tests {
         );
         if io_max.status == IoMaxStatus::Unavailable {
             assert!(io_max.reason.is_some(), "unavailable must carry a reason");
-            assert!(io_max_warning(&io_max).is_some());
+            assert!(io_max_warning(&io_max, false).is_some());
         } else {
             assert_eq!(io_max.reason, None);
-            assert_eq!(io_max_warning(&io_max), None);
+            assert_eq!(io_max_warning(&io_max, false), None);
         }
+    }
+
+    /// A declared `cgroup_cpu_percent` reaches the kernel as the quota it names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_declared_cpu_cap_is_written_to_the_scope() {
+        if skip_without_host_support("a_declared_cpu_cap_is_written_to_the_scope") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let limits = HostResourceLimits {
+            cgroup_cpu_percent: Some(50),
+            ..HostResourceLimits::default()
+        };
+        let scope = prepare_scope(true, &limits, "ses_cpucap", temp.path())
+            .expect(
+                "a Linux host with a systemd user session must be able to bound a subprocess tree",
+            )
+            .scope
+            .expect("a required scope on Linux is never `None`");
+        let cpu_max = std::fs::read_to_string(scope.path().join("cpu.max"))
+            .unwrap_or_else(|error| panic!("cpu.max unreadable in the scope: {error}"));
+        assert_eq!(cpu_max.trim(), "50000 100000");
     }
 
     /// On a kernel with no `cgroup.kill`, killing a scope freezes it, signals every member and
@@ -2820,6 +2881,7 @@ mod tests {
     fn the_scope_limits_bound_swap_at_zero() {
         let declared = HostResourceLimits {
             cgroup_memory_bytes: 268_435_456,
+            cgroup_cpu_percent: Some(50),
             ..HostResourceLimits::default()
         };
         for limits in [HostResourceLimits::default(), declared] {
@@ -2833,8 +2895,8 @@ mod tests {
             );
             assert!(writes.contains(&("memory.max", limits.cgroup_memory_bytes.to_string())));
             assert_eq!(
-                writes.iter().map(|(file, _)| *file).collect::<Vec<_>>(),
-                ["memory.max", "memory.swap.max", "pids.max", "cpu.max"]
+                &writes.iter().map(|(file, _)| *file).collect::<Vec<_>>()[..3],
+                ["memory.max", "memory.swap.max", "pids.max"]
             );
         }
         let absent_ok: Vec<&str> = scope_limits(&HostResourceLimits::default())
@@ -2843,6 +2905,27 @@ mod tests {
             .map(|limit| limit.file)
             .collect();
         assert_eq!(absent_ok, ["memory.swap.max"]);
+    }
+
+    /// A silent manifest writes no `cpu.max`; a declared `cgroup_cpu_percent` writes it last, as a
+    /// quota against the kernel's 100 000 µs period.
+    #[test]
+    fn the_scope_limits_write_cpu_max_only_for_a_declared_cap() {
+        let files: Vec<&str> = scope_limits(&HostResourceLimits::resolve(None))
+            .into_iter()
+            .map(|limit| limit.file)
+            .collect();
+        assert_eq!(files, ["memory.max", "memory.swap.max", "pids.max"]);
+
+        let capped = HostResourceLimits {
+            cgroup_cpu_percent: Some(50),
+            ..HostResourceLimits::default()
+        };
+        let writes = scope_limits(&capped);
+        assert_eq!(writes.len(), 4);
+        assert_eq!(writes[3].file, "cpu.max");
+        assert_eq!(writes[3].value, "50000 100000");
+        assert!(!writes[3].absent_ok);
     }
 
     #[test]

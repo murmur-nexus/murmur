@@ -1245,3 +1245,193 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     );
     fs::set_permissions(&trace_path, fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+/// Every tool name a request offered the model.
+fn offered_tool_names(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Limits:` line of a request's `[Capsule]` block.
+fn limits_line(request: &Value) -> String {
+    let system = common::system_text(&request["system"]).expect("system field");
+    system
+        .lines()
+        .find(|line| line.starts_with("Limits: "))
+        .unwrap_or_else(|| panic!("no Limits: line in the system text:\n{system}"))
+        .to_string()
+}
+
+/// A capsule with no `lifecycle` block sets no grace: a 30-second command stays in the
+/// foreground and its output comes back in the same call, nothing is demoted, the model is not
+/// offered `background-command`, and its limits name neither demotion nor a CPU-time limit.
+#[test]
+fn a_command_with_no_grace_runs_in_the_foreground_until_it_exits() {
+    if common::skip_without_host_support(
+        "a_command_with_no_grace_runs_in_the_foreground_until_it_exits",
+    ) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call("msg_1", "toolu_long", "sleep 30; echo finished"),
+        end_turn("msg_2", "It finished."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let manifest_path = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+    );
+
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run a long command and report what it printed.",
+    )
+    .unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "two turns were scripted");
+
+    let result = tool_result_text(
+        find_tool_result_block(&requests[1], "toolu_long").expect("the long call has a result"),
+    );
+    assert!(
+        result.lines().any(|line| line == "Exit code: 0"),
+        "the command ran to its exit:\n{result}"
+    );
+    assert!(
+        result.lines().any(|line| line == "finished"),
+        "the output came back in the same call:\n{result}"
+    );
+    assert!(!result.contains("wrk_"), "nothing was demoted:\n{result}");
+
+    let events = trace_events(&launched.records_dir);
+    assert!(
+        events_of_type(&events, "shell_detached").is_empty(),
+        "no command is demoted without a grace"
+    );
+    let foreground = events_of_type(&events, "shell");
+    assert_eq!(foreground.len(), 1, "one command ran to an exit");
+    let duration_ms = foreground[0]["duration_ms"].as_u64().unwrap();
+    assert!(
+        duration_ms >= 30_000,
+        "the shell record covers the whole command, got {duration_ms} ms"
+    );
+
+    for request in &requests {
+        let tools = offered_tool_names(request);
+        assert!(tools.iter().any(|name| name == "bash"), "{tools:?}");
+        assert!(
+            !tools.iter().any(|name| name == "background-command"),
+            "background-command is offered only with a grace: {tools:?}"
+        );
+    }
+
+    let system = common::system_text(&requests[0]["system"]).expect("system field");
+    assert!(
+        system.contains("\nLimits: 2 GiB memory per command.\n"),
+        "got:\n{system}"
+    );
+    assert!(
+        !system.contains("moves to the background"),
+        "got:\n{system}"
+    );
+    assert!(!system.contains("CPU time"), "got:\n{system}");
+}
+
+/// A declared grace keeps demoting: the command hands the turn a work id, the tool that takes it
+/// is offered, the trace records the grace, and the limits say so.
+#[test]
+fn a_declared_grace_still_demotes() {
+    if common::skip_without_host_support("a_declared_grace_still_demotes") {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call("msg_1", "toolu_late", "sleep 6; echo late"),
+        end_turn("msg_2", "Moved to the background."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let manifest_path = create_agent_project_with_lifecycle(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+        "lifecycle:\n  shell_grace_secs: 2\n",
+    );
+
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run a slow command.",
+    )
+    .unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "two turns were scripted");
+
+    let demotion = tool_result_text(
+        find_tool_result_block(&requests[1], "toolu_late").expect("the slow call has a result"),
+    );
+    assert!(demotion.contains("wrk_"), "a work id:\n{demotion}");
+    assert!(
+        demotion.contains("background-command"),
+        "the tool that takes the work id:\n{demotion}"
+    );
+    assert!(!demotion.contains("late\n"), "no output:\n{demotion}");
+
+    let events = trace_events(&launched.records_dir);
+    let detached = events_of_type(&events, "shell_detached");
+    assert_eq!(detached.len(), 1, "exactly one command was demoted");
+    assert_eq!(detached[0]["grace_ms"], 2000);
+    let work_id = detached[0]["work_id"].as_str().unwrap();
+    assert!(demotion.contains(work_id), "{work_id}:\n{demotion}");
+
+    for request in &requests {
+        let tools = offered_tool_names(request);
+        assert!(
+            tools.iter().any(|name| name == "background-command"),
+            "a grace offers background-command: {tools:?}"
+        );
+    }
+    let limits = limits_line(&requests[0]);
+    assert!(
+        limits.ends_with("a shell command still running after 2 s moves to the background."),
+        "got: {limits}"
+    );
+    assert!(!limits.contains("CPU time"), "got: {limits}");
+}

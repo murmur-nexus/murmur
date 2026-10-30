@@ -5753,7 +5753,7 @@ mod tests {
             shell_allow: vec!["bash".to_string()],
             resources: crate::resources::HostResourceLimits {
                 memory_bytes: 1 << 30,
-                cpu_seconds: 120,
+                cpu_seconds: Some(120),
                 workdir_max_bytes: 512 << 20,
                 ..crate::resources::HostResourceLimits::resolve(None)
             },
@@ -5765,7 +5765,7 @@ mod tests {
             ..crate::capsule_facts::test_http_inference()
         };
         let lifecycle = murmur_artifact::LifecycleConfig {
-            shell_grace_secs: 30,
+            shell_grace_secs: Some(30),
             ..murmur_artifact::LifecycleConfig::default()
         };
         CapsuleFacts::resolve(&policy, &inference, &lifecycle, Vec::new())
@@ -5787,7 +5787,7 @@ mod tests {
                 "[Capsule]\nName: my-capsule\nVersion: 1.0.0\n\
                  Work folder: ./ (your current directory). You may write anywhere in it.\n\
                  Network allowlist: none\n\
-                 Limits: 10 turns per task; 2 GiB memory and 3600 s CPU time per command.\n\
+                 Limits: 10 turns per task; 2 GiB memory per command.\n\
                  {NOTICES}\n\ncustom"
             )
         );
@@ -5834,7 +5834,7 @@ mod tests {
         );
         let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None, None, &facts, None);
         assert!(
-            prompt.contains("\nLimits: 2 GiB memory and 3600 s CPU time per command.\n"),
+            prompt.contains("\nLimits: 2 GiB memory per command.\n"),
             "got:\n{prompt}"
         );
         assert!(!prompt.contains("turns"), "got:\n{prompt}");

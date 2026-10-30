@@ -729,8 +729,7 @@ mod tests {
              \n\
              - 10 turns per task\n\
              - 50000 tokens per session\n\
-             - 2 GiB memory and 3600 s CPU time per command\n\
-             - a shell command still running after 10 s moves to the background\n\
+             - 2 GiB memory per command\n\
              - 10 GiB across the work folder, $HOME and $TMPDIR\n\
              - Context budget: 191808 input tokens, the context window less the output cap \
              (context window 200000, output cap 8192, input ceiling none) (compaction not \

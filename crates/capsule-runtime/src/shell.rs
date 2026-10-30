@@ -353,10 +353,11 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) const CANCELED_BEFORE_SPAWN: &str =
     "the task was canceled before this command started, so it was not run";
 
-/// Run a shell command, demoting it to the background if it outruns `detach`'s grace period.
+/// Run a shell command, demoting it to the background if it outruns `detach`'s grace period, when
+/// the policy sets one.
 ///
 /// The command starts as the leader of a new process group, with `/dev/null` as its stdin. Once
-/// its own process has exited, the call waits at most [`PIPE_DRAIN_AFTER_EXIT`] — never past the
+/// its own process has exited, the call waits at most [`PIPE_DRAIN_AFTER_EXIT`] — never past a
 /// grace deadline — for its stdout and stderr to close, then kills every process still in that
 /// group and waits at most [`LEFTOVER_KILL_WAIT`] more; see [`finish_output`]. A background
 /// process whose output is redirected away from the call holds neither pipe, so it never triggers
@@ -366,8 +367,8 @@ pub(crate) const CANCELED_BEFORE_SPAWN: &str =
 /// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
 /// and so neither has anywhere to deliver a completion.
 ///
-/// With `detach: Some`, the child is polled until it exits, the deadline passes, or the policy's
-/// abandon or cancel signal is raised; a cancel already raised refuses the call before the spawn.
+/// With `detach: Some`, the child is polled until it exits, the grace deadline (if any) passes, or
+/// the policy's abandon or cancel signal is raised; a cancel already raised refuses the call before the spawn.
 /// On demotion the child, its two pipe readers and the metadata needed to describe it all move to
 /// one plain OS thread — not a `spawn_blocking` task — so runtime teardown never waits on it. The
 /// session's end kills it with every other process the session started.
@@ -618,17 +619,20 @@ fn spawn_and_wait(
             }
         }
         Wait::Detach(policy) => {
-            let deadline = started + policy.grace;
+            // No grace, no deadline: only the abandon and cancel signals demote.
+            let deadline = policy.grace.map(|grace| started + grace);
             loop {
                 match child.try_wait().map_err(|error| error.to_string())? {
                     Some(status) => {
+                        let drain = Instant::now() + PIPE_DRAIN_AFTER_EXIT;
                         break (
                             status,
-                            (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
-                        )
+                            deadline.map_or(drain, |deadline| drain.min(deadline)),
+                        );
                     }
                     None => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let remaining = deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
                         // A caller that stopped waiting gets the same demotion the deadline
                         // gives, at the next poll: nobody is left to read a foreground result.
                         let abandoned = policy
@@ -644,7 +648,10 @@ fn spawn_and_wait(
                         if let Some(signal) = canceled {
                             signal.note_phase(crate::cancel::PHASE_SHELL);
                         }
-                        if remaining.is_zero() || abandoned || canceled.is_some() {
+                        if remaining.is_some_and(|remaining| remaining.is_zero())
+                            || abandoned
+                            || canceled.is_some()
+                        {
                             // A zero grace demotes here, at the first poll after the spawn.
                             let records_root = records_root
                                 .expect("a detach policy is kept only with a records root")
@@ -667,7 +674,9 @@ fn spawn_and_wait(
                             );
                             return Ok((ShellOutcome::Detached(detached), None));
                         }
-                        std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
+                        std::thread::sleep(remaining.map_or(DETACH_POLL_INTERVAL, |remaining| {
+                            remaining.min(DETACH_POLL_INTERVAL)
+                        }));
                     }
                 }
             }
@@ -1006,9 +1015,7 @@ fn demote(
         grace_ms: context
             .policy
             .grace
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
+            .map(|grace| grace.as_millis().try_into().unwrap_or(u64::MAX)),
     };
 
     let arg_refs: Vec<&str> = context.args.iter().map(String::as_str).collect();
@@ -1025,8 +1032,8 @@ fn demote(
             work_id: work_id.clone(),
             binary: context.resolved_binary.clone(),
             command: context.policy.command.clone(),
-            // The spawn instant, not this one. Demotion happens a whole grace period after the
-            // command started, and every reader of this field — the cancel residue, the
+            // The spawn instant, not this one. Demotion happens after the command has run in the
+            // foreground for a while, and every reader of this field — the cancel residue, the
             // session-end sweep's `running_ms` — reports it as how long the command has been
             // running, which must include the foreground portion to match the `duration_ms` a
             // completion carries.
@@ -1529,7 +1536,7 @@ mod tests {
     fn a_command_that_ignores_sigxcpu_is_killed_one_second_later() {
         let result = run_bash_with_limits(
             crate::resources::HostResourceLimits {
-                cpu_seconds: 1,
+                cpu_seconds: Some(1),
                 ..crate::resources::HostResourceLimits::default()
             },
             "( trap '' XCPU; while :; do :; done ); echo \"status=$?\"; times",
@@ -1570,7 +1577,7 @@ mod tests {
     fn the_cpu_limit_warns_one_second_before_its_hard_ceiling() {
         let result = run_bash_with_limits(
             crate::resources::HostResourceLimits {
-                cpu_seconds: 5,
+                cpu_seconds: Some(5),
                 max_open_files: 64,
                 ..crate::resources::HostResourceLimits::default()
             },
@@ -1588,6 +1595,54 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             assert_eq!(lines.next(), Some("raise refused"));
         }
+    }
+
+    /// With no `cpu_seconds` the runtime makes no `RLIMIT_CPU` call, so a command sees the same
+    /// two slots this process inherited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code, clippy::unnecessary_cast)]
+    fn with_no_cpu_seconds_a_command_keeps_the_inherited_cpu_limit() {
+        let mut own = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `own` is a live, writable `rlimit` for the duration of the call.
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_CPU, &mut own) };
+        assert_eq!(read, 0, "getrlimit(RLIMIT_CPU) failed");
+        let render = |slot: libc::rlim_t| {
+            if slot == libc::RLIM_INFINITY {
+                "unlimited".to_string()
+            } else {
+                slot.to_string()
+            }
+        };
+
+        let result = run_bash_with_limits(
+            crate::resources::HostResourceLimits::resolve(None),
+            r#"echo "$(ulimit -St) $(ulimit -Ht)""#,
+        );
+
+        assert_eq!(
+            result.stdout.trim(),
+            format!("{} {}", render(own.rlim_cur), render(own.rlim_max)),
+            "stderr was: {}",
+            result.stderr
+        );
+    }
+
+    /// With no `cpu_seconds` a CPU-bound command runs until it is done and names no limit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_no_cpu_seconds_a_cpu_bound_command_runs_to_its_end() {
+        let result = run_bash_with_limits(
+            crate::resources::HostResourceLimits::resolve(None),
+            "end=$((SECONDS + 3)); while [ \"$SECONDS\" -lt \"$end\" ]; do :; done; echo done",
+        );
+
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "done");
+        assert_eq!(result.resource_limit_hit, None);
     }
 
     /// The same ceiling through a kernel tier's `pre_exec` setup while this process holds more
@@ -1714,7 +1769,7 @@ mod tests {
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             resources: crate::resources::HostResourceLimits {
-                cpu_seconds: 5,
+                cpu_seconds: Some(5),
                 max_open_files: 64,
                 ..crate::resources::HostResourceLimits::default()
             },
@@ -2667,6 +2722,16 @@ mod tests {
     /// period takes, rather than holding a blocking thread for the rest of the grace window.
     #[test]
     fn an_abandoned_command_demotes_before_its_grace() {
+        an_abandoned_command_demotes_under(Some(Duration::from_secs(60)));
+    }
+
+    /// With no grace there is no clock to demote on, and an abandoned call still demotes.
+    #[test]
+    fn an_abandoned_command_demotes_with_no_grace() {
+        an_abandoned_command_demotes_under(None);
+    }
+
+    fn an_abandoned_command_demotes_under(grace: Option<Duration>) {
         use std::sync::Arc;
 
         use crate::{
@@ -2687,6 +2752,7 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 abandon.raise();
+                Instant::now()
             })
         };
 
@@ -2702,7 +2768,7 @@ mod tests {
             &ShellEnforcement::environment_only()
                 .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
             Some(DetachPolicy {
-                grace: Duration::from_secs(60),
+                grace,
                 delivered: true,
                 registry: Arc::clone(&registry),
                 command: "sleep 5".to_string(),
@@ -2713,15 +2779,25 @@ mod tests {
             }),
         )
         .expect("a declared binary runs");
-        let elapsed = started.elapsed();
-        raiser.join().unwrap();
+        let returned = Instant::now();
+        let elapsed = returned - started;
+        let raised = raiser.join().unwrap();
 
         let ShellOutcome::Detached(info) = outcome else {
             panic!("an abandoned command must demote, got {outcome:?}");
         };
         assert!(
             elapsed < Duration::from_secs(2),
-            "demotion waited {elapsed:?}, as if the 60 s grace still applied"
+            "demotion waited {elapsed:?}, as if the command had to finish first"
+        );
+        assert!(
+            returned.saturating_duration_since(raised) < Duration::from_secs(1),
+            "demotion came {:?} after the abandon",
+            returned.saturating_duration_since(raised)
+        );
+        assert_eq!(
+            info.grace_ms,
+            grace.map(|grace| u64::try_from(grace.as_millis()).unwrap())
         );
         assert!(
             registry
@@ -2732,15 +2808,16 @@ mod tests {
         );
     }
 
-    /// A detach policy for a cancel test, with a grace no test outlasts.
+    /// A detach policy for a cancel test, with a grace no test outlasts or none at all.
     fn cancel_test_policy(
         registry: &std::sync::Arc<crate::detached::DetachedRegistry>,
         command: &str,
         canceled: crate::cancel::CancelSignal,
+        grace: Option<Duration>,
     ) -> crate::detached::DetachPolicy {
         use crate::origin::{TaskOrigin, TaskProvenance};
         crate::detached::DetachPolicy {
-            grace: Duration::from_secs(60),
+            grace,
             delivered: true,
             registry: std::sync::Arc::clone(registry),
             command: command.to_string(),
@@ -2755,6 +2832,16 @@ mod tests {
     /// the command is demoted and registered, and the cancel is claimed for the shell.
     #[test]
     fn a_canceled_task_demotes_its_foreground_command() {
+        a_canceled_task_demotes_its_foreground_command_under(Some(Duration::from_secs(60)));
+    }
+
+    /// A cancel is not a clock limit: with no grace it still demotes the foreground command.
+    #[test]
+    fn a_canceled_task_demotes_its_foreground_command_with_no_grace() {
+        a_canceled_task_demotes_its_foreground_command_under(None);
+    }
+
+    fn a_canceled_task_demotes_its_foreground_command_under(grace: Option<Duration>) {
         use crate::{
             cancel::{CancelSignal, PHASE_SHELL},
             detached::{DetachedRegistry, KillRunningOnDrop},
@@ -2774,6 +2861,7 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 cancel.cancel();
+                Instant::now()
             })
         };
 
@@ -2786,18 +2874,29 @@ mod tests {
             &policy,
             &ShellEnforcement::environment_only()
                 .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
-            Some(cancel_test_policy(&registry, "sleep 30", cancel.clone())),
+            Some(cancel_test_policy(
+                &registry,
+                "sleep 30",
+                cancel.clone(),
+                grace,
+            )),
         )
         .expect("a declared binary runs");
-        let elapsed = started.elapsed();
-        raiser.join().unwrap();
+        let returned = Instant::now();
+        let elapsed = returned - started;
+        let raised = raiser.join().unwrap();
 
         let ShellOutcome::Detached(info) = outcome else {
             panic!("a canceled task's command must demote, got {outcome:?}");
         };
         assert!(
             elapsed < Duration::from_secs(2),
-            "demotion waited {elapsed:?}, as if the 60 s grace still applied"
+            "demotion waited {elapsed:?}, as if the command had to finish first"
+        );
+        assert!(
+            returned.saturating_duration_since(raised) < Duration::from_secs(1),
+            "demotion came {:?} after the cancel",
+            returned.saturating_duration_since(raised)
         );
         assert!(
             registry
@@ -2844,7 +2943,12 @@ mod tests {
             &policy,
             &ShellEnforcement::environment_only()
                 .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
-            Some(cancel_test_policy(&registry, "sleep 30", cancel.clone())),
+            Some(cancel_test_policy(
+                &registry,
+                "sleep 30",
+                cancel.clone(),
+                Some(Duration::from_secs(60)),
+            )),
         )
         .expect("a declared binary runs");
         raiser.join().unwrap();
@@ -2856,6 +2960,16 @@ mod tests {
     /// A shell call reached after the task's cancel is refused before anything is spawned.
     #[test]
     fn a_canceled_task_starts_no_command() {
+        a_canceled_task_starts_no_command_under(Some(Duration::from_secs(60)));
+    }
+
+    /// The refusal before the spawn does not depend on a grace being set.
+    #[test]
+    fn a_canceled_task_starts_no_command_with_no_grace() {
+        a_canceled_task_starts_no_command_under(None);
+    }
+
+    fn a_canceled_task_starts_no_command_under(grace: Option<Duration>) {
         use crate::{cancel::CancelSignal, detached::DetachedRegistry};
 
         let temp = tempdir().unwrap();
@@ -2880,6 +2994,7 @@ mod tests {
                 &registry,
                 "touch started",
                 cancel.clone(),
+                grace,
             )),
         );
 
@@ -3065,7 +3180,7 @@ mod tests {
                 &ShellEnforcement::environment_only()
                     .with_runtime_dir(crate::sandbox::test_runtime_dir(&runtime_base), None),
                 Some(DetachPolicy {
-                    grace: Duration::from_secs(5),
+                    grace: Some(Duration::from_secs(5)),
                     delivered: true,
                     registry: Arc::clone(&registry),
                     command: script.to_string(),
@@ -3162,7 +3277,7 @@ mod tests {
             &ShellEnforcement::environment_only()
                 .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
             Some(DetachPolicy {
-                grace: Duration::from_secs(5),
+                grace: Some(Duration::from_secs(5)),
                 delivered: true,
                 registry: Arc::clone(&registry),
                 command: script.to_string(),
@@ -3218,7 +3333,7 @@ mod tests {
                 &ShellEnforcement::environment_only()
                     .with_runtime_dir(crate::sandbox::test_runtime_dir(&runtime_base), None),
                 Some(DetachPolicy {
-                    grace: Duration::from_secs(5),
+                    grace: Some(Duration::from_secs(5)),
                     delivered: true,
                     registry: Arc::clone(&registry),
                     command: script.to_string(),

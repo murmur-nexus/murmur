@@ -122,10 +122,9 @@ impl BridgeNote {
                 decided: true,
             } => format!(
                 "The harness closed the connection for its call to {tool_name} {elapsed_ms} ms \
-                 into the call. A shell command still running is moved to the background as if \
-                 it had outrun lifecycle.shell_grace_secs, or, with no task to deliver its \
-                 completion to, runs to the end with its result discarded; anything else still \
-                 running finishes unobserved."
+                 into the call. A shell command still running is moved to the background, or, \
+                 with no task to deliver its completion to, runs to the end with its result \
+                 discarded; anything else still running finishes unobserved."
             ),
             BridgeNote::AtCapacity { tool_name, limit } => format!(
                 "The call to {tool_name} was refused because {limit} tool calls were already \

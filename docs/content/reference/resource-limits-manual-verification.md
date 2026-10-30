@@ -107,7 +107,7 @@ runtime:
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
 4. creates the session's cgroup, `<base>/murmur-<session_id>-<pid>-<n>`, and writes `memory.max`,
-   `memory.swap.max` (`0`), `pids.max`, `cpu.max` (fatal on failure; a `memory.swap.max` the
+   `memory.swap.max` (`0`), `pids.max`, `cpu.max` when `cgroup_cpu_percent` is declared (fatal on failure; a `memory.swap.max` the
    kernel does not expose is skipped) and `io.max` (non-fatal, reported in
    [`io_max`](resource-limits.md#io-max-report) and by
    [`W-SEC-021`](diagnostics.md#w-sec-021));
@@ -210,7 +210,7 @@ inference:
 | `interpreter_runtime` | `python3` starts only with its standard library and `lib-dynload` readable ([scenario 3](#scenario-3)). Both paths differ between hosts; replace them with the directory the comment's command prints and its `lib-dynload`. Declaring the grant prints `W-SEC-009` on every run. |
 | `context.max_tokens`, `inference.max_tokens` | `murmur/driver-openai` `0.10.0` declares no limits for `gpt-5.6-luna`. Without an output cap the launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052); without a context window `mur doctor` warns [`W-RUN-009`](diagnostics.md#w-run-009). |
 | `max_open_files: 64` | Far enough below the 1024 default that [scenario 1](#scenario-1)'s probe reaches `EMFILE` within its loop, and the value [scenario 8](#scenario-8) checks on a native tool. |
-| `lifecycle.shell_grace_secs: 60` | A command still running after [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) moves to the background, and its trace records neither `exit_code` nor `resource_limit`. At `cgroup_cpu_percent: 50`, scenario 4's 5 CPU-seconds take about 10 seconds, the default. |
+| `lifecycle.shell_grace_secs: 60` | A command still running after [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) moves to the background, and its trace records neither `exit_code` nor `resource_limit`. At `cgroup_cpu_percent: 50`, scenario 4's 5 CPU-seconds take about 10 seconds, well inside 60. |
 
 Any driver works, but the model must follow the scenario's instructions exactly. Asked plainly to
 run a fork bomb, a model declines it; asked plainly to run a CPU hog, it wraps the command in its
@@ -302,17 +302,17 @@ mur run --manifest murmur-defaults.yaml --task 'run this shell command and repor
 |---|---|---|
 | `ulimit -Hn` | `1024` (`max_open_files`) | `1024` |
 | `ulimit -Hu` | The value `ulimit -Hu` prints in the shell that launched `mur`. A subprocess in a cgroup scope keeps the `RLIMIT_NPROC` `mur` inherited, and `cgroup_pids_max` bounds it instead | The account's process count at that spawn plus 128 (`max_processes`). Compare against `ps -u "$(id -un)" \| wc -l` run just before |
-| `ulimit -Ht` | `3601` (`cpu_seconds` + 1) | `3601` (`cpu_seconds` + 1) |
+| `ulimit -Ht` | The value `ulimit -Ht` prints in the shell that launched `mur`. With no `cpu_seconds` the runtime sets no `RLIMIT_CPU` | The same |
 
 All three come from a manifest that declares no `resources:` block at all.
 
 **Failures to watch for:**
 
-- `unlimited` on the `-Hn` or `-Ht` line. That would mean the defaulting path was skipped and the
+- `unlimited` on the `-Hn` line. That would mean the defaulting path was skipped and the
   subprocess is unbounded — the exact failure mode `capabilities.limits` already guards against
   and this block must match.
-- `3600` on the `-Ht` line. That means the soft and hard `RLIMIT_CPU` slots are equal, so a
-  command that uses up its CPU time is killed with `SIGKILL` and its `shell` event names no limit.
+- A `-Ht` line that differs from the launching shell's value. That means `mur` set a CPU-time
+  limit the manifest never declared.
 - On Linux, a `-Hu` line that differs from the launching shell's value. That means `mur` set
   `RLIMIT_NPROC` on a subprocess in a cgroup scope, where threads the rest of the host starts
   during the session would fail its `fork()` calls.

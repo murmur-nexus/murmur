@@ -189,8 +189,9 @@ pub const W_SEC_019: &str = "W-SEC-019";
 /// `io.max` is the one cgroup limit this runtime treats as non-fatal: the backing device of a path
 /// cannot always be resolved to a `MAJ:MIN` the block layer accepts (tmpfs, overlayfs, btrfs
 /// subvolumes and device-mapper stacks all break the assumption), and a capsule that saturates
-/// disk bandwidth is slow where one that exhausts memory or pids is fatal. `memory.max`,
-/// `pids.max` and `cpu.max` stay enforced on the scope and stay fatal on failure. Fires once per
+/// disk bandwidth is slow where one that exhausts memory or pids is fatal. `memory.max` and
+/// `pids.max` stay enforced on the scope and stay fatal on failure, and so does `cpu.max` when
+/// `capabilities.resources.cgroup_cpu_percent` sets a cap. Fires once per
 /// launch, and carries the same reason `--explain-scope`'s and `session_start`'s `io_max.reason`
 /// carry.
 pub const W_SEC_021: &str = "W-SEC-021";

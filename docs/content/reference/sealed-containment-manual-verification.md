@@ -1012,12 +1012,11 @@ the kernel swaps the capsule out instead of OOM-killing it, and the 4 GiB `memor
 for the same probe. A finding for the runtime's cgroup setup, not for this harness: the boundary
 verdict is unaffected, and the case's probe and expectation are unchanged.
 
-**The manifest declares `lifecycle.shell_grace_secs`.** A shell command that outruns
-`lifecycle.shell_grace_secs` (default 10 seconds) is moved to the background, and its tool result
-carries a `wrk_` handle instead of an exit code. The first `scoped` attempt, before the generated
-manifest set the grace, recorded `resource-memory-hog` as INCONCLUSIVE for that reason. Each case
-now declares `shell_grace_secs` equal to the harness's per-case timeout (`--timeout-secs`, default
-300).
+**The manifest declares no `lifecycle.shell_grace_secs`.** A shell command that outruns a declared
+`lifecycle.shell_grace_secs` is moved to the background, and its tool result carries a `wrk_`
+handle instead of an exit code, which a case cannot grade. With no grace declared, every probe runs
+in the foreground until it exits or the harness's per-case timeout (`--timeout-secs`, default 300)
+ends it.
 
 #### Refusals, quoted from the same build
 
