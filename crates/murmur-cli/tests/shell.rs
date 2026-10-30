@@ -1170,9 +1170,9 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     );
 }
 
-/// A killed session's `trace.jsonl` copied into a folder of its own, as a benchmark keeps each
-/// attempt, resumes as the session it records: no warning, the loss reported once, and the marker
-/// appended to the copy that was resumed, leaving the original untouched.
+/// A killed session's `trace.jsonl` copied into a folder of its own resumes as the session it
+/// records: no warning, the loss reported once, and the marker appended to the copy that was
+/// resumed, leaving the original untouched.
 #[test]
 fn a_copied_trace_resumes_as_the_session_it_records_and_reports_its_lost_work_once() {
     if common::skip_without_host_support(

@@ -1620,8 +1620,9 @@ failed early. A `"canceled"` run settles every step, so its counts sum to `steps
   started.
 - A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"`,
   `"max_turns_reached"` or `"spend_ceiling_reached"` on a task the runtime survived and reported
-  on, and `"deadline_reached"` on a task the session deadline ended. The launch's own `session_end` carries the first of those outcomes among the tasks that
-  decide the launch, and a later task that completed does not replace it.
+  on, and `"deadline_reached"` on a task the session deadline ended. The launch's own
+  `session_end` carries the first of those outcomes among the tasks that decide the launch, and a
+  later task that completed does not replace it.
 - Every failed attempt writes one `task_failed` line before its task's `task_end`.
 
 ---

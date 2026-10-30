@@ -1399,7 +1399,16 @@ fn a_roster_deadline_ends_every_member_at_it() {
         reported["left_secs"].as_u64().unwrap() <= DEADLINE_SECS,
         "{reported}"
     );
-    assert_task_canceled(&planner_trace);
+    // The deadline cancelled the entry member's task, so its `task_end` names the deadline.
+    let kinds = event_kinds(&planner_trace);
+    assert!(kinds.contains(&"task_canceled"), "{kinds:?}");
+    assert!(
+        planner_trace
+            .iter()
+            .any(|event| event["event_type"] == "task_end"
+                && event["exit_status"] == "deadline_reached"),
+        "{kinds:?}"
+    );
 }
 
 /// The kill path: `SIGKILL` of the launcher leaves nothing to stop the members, and every member

@@ -237,7 +237,7 @@ The runtime keeps sending the message until the first of these stops it:
 | `limit` continuations were sent and the next turn ends | `limit` | `ok`, with that last turn's answer |
 | [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at a turn end or inside a continued attempt | `max_turns` | `ok`, with the last turn end's answer |
 | A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a continued attempt | `spend_ceiling` | `ok`, with the last turn end's answer. The refused call is not retried |
-| The [session deadline](#deadlines) falls while the task is being kept working | `deadline` | `ok`, with the last turn end's answer, and `task_end.exit_status` `deadline_reached`. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+| The [session deadline](#deadlines) falls while the task is being kept working | `deadline` | `deadline_reached`, with the last turn end's answer. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
 | `transport: process` left no harness session to resume | `no_session` | `ok`, with the last turn end's answer |
 
 "The last turn end's answer" is the text `out/result.txt`, `GetTask` and the stream's final status
@@ -301,7 +301,7 @@ What ends a task with its check unmet:
 | `limit` reopens were spent and the next run failed too | `limit` | `ok`, with the last answer |
 | [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at the stop or inside a reopened attempt | `max_turns` | `ok`, with the answer that preceded the reopen when a reopened attempt ran out |
 | A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a reopened attempt | `spend_ceiling` | `ok`, with the answer that preceded the reopen |
-| The [session deadline](#deadlines) falls while the check runs or a reopened attempt works | `deadline` | `ok`, with the answer being checked, and `task_end.exit_status` `deadline_reached`; a running check is killed. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+| The [session deadline](#deadlines) falls while the check runs or a reopened attempt works | `deadline` | `deadline_reached`, with the answer being checked; a running check is killed. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
 
 A person's `CancelTask`, `mur stop` and `SIGTERM` still end the task `canceled`; a check they
 interrupt is killed and `task_canceled.phase` is `"done_check"`.
