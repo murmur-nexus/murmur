@@ -7,6 +7,11 @@
 //! harness's output itself, so nothing here interprets text; it only counts turns and writes
 //! records.
 //!
+//! The sink also builds the one `Inference` hook event no harness event produces: the
+//! announcement of a bridged tool call, dispatched by [`ProcessEventSink::announce_call`] at the
+//! call's decision point, before it runs. The turn's own `Inference` event still fires when the
+//! turn closes.
+//!
 //! # Turns
 //!
 //! One logical turn is one model action, counted as the `transport: http` path counts it. A turn
@@ -24,7 +29,7 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use murmur_artifact::{security_warning_link, W_SEC_031};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     agent::DriverUsage,
@@ -285,6 +290,35 @@ impl<'a> ProcessEventSink<'a> {
             Some(open) => open.index,
             None => self.first_turn + self.turns.saturating_sub(1),
         }
+    }
+
+    /// The turn a bridged call belongs to: the open turn, or the turn the harness's report of the
+    /// call will open.
+    ///
+    /// The bridge receives a call before the harness's `tool-call` event for it has been read, so
+    /// with no turn open the call's turn is the next one. Best-effort when a harness message holds
+    /// several calls: a call answered after an earlier one's `tool-result` closed the turn is
+    /// numbered with the turn after it.
+    pub(super) fn call_turn(&self) -> u32 {
+        match self.open.as_ref() {
+            Some(open) => open.index,
+            None => self.first_turn + self.turns,
+        }
+    }
+
+    /// Announce one bridged call to every `on-inference` hook, before the call runs.
+    ///
+    /// Called from the call's decision point with the bare tool name the bridge received and the
+    /// argument object dispatch is about to be handed. The announcement is not a turn: it writes
+    /// no trace record, opens no turn, and leaves the session's running totals where they are
+    /// (see [`HookRuntime::announce`]).
+    pub(super) async fn announce_call(&self, hooks: &mut HookRuntime, name: &str, input: &Value) {
+        hooks
+            .announce(
+                &self.records_root,
+                call_announcement(self.call_turn(), name, input),
+            )
+            .await;
     }
 
     /// Feed one `parse` batch through. Events after a terminal one, in the same batch, are
@@ -802,6 +836,9 @@ impl<'a> ProcessEventSink<'a> {
             reported.as_ref(),
         )
         .await;
+        // The turn's own `on-inference`, carrying its counts. Each call the turn made was
+        // announced on its own at the decision point, before it ran (`announce_call`).
+        //
         // No hook inference flush after this emit or the `on-tool-call` one: a hook's
         // `run-inference` is answered with `InferenceUnavailable::ProcessTransport` on this
         // transport, so it buffers no `HookInferenceRecord` or spend refusal. A change that lets
@@ -836,6 +873,24 @@ impl<'a> ProcessEventSink<'a> {
             .await;
         self.a2a.mark_spend_refused(&refusal);
         Err(SinkOutcome::SpendCeilingReached(refusal))
+    }
+}
+
+/// The `on-inference` event announcing one bridged call, in the shape `transport: http` hands a
+/// hook a tool-calling turn: zero counts, a `tool_call` decision, the call's bare name, and an
+/// `output` holding one `tool_call` content block. The block carries no `id`, because a bridged
+/// call has no provider tool-use id, and `input` is the argument object itself. `prompt` and
+/// `tools` stay absent: the harness builds the request, so the runtime holds neither.
+fn call_announcement(turn: u32, name: &str, input: &Value) -> HookEvent {
+    HookEvent::Inference {
+        turn,
+        input_tokens: 0,
+        output_tokens: 0,
+        decision: "tool_call".to_string(),
+        tool_name: Some(name.to_string()),
+        prompt: None,
+        output: Some(json!([{ "type": "tool_call", "name": name, "input": input }]).to_string()),
+        tools: None,
     }
 }
 
@@ -1460,6 +1515,93 @@ mod tests {
             std::fs::read_to_string(h.workdir.join("out/result.txt")).unwrap(),
             "hello"
         );
+    }
+
+    /// A bridged call is announced in the shape `transport: http` hands a hook a tool-calling
+    /// turn: zero counts, a `tool_call` decision, the bare name, and one `tool_call` block in
+    /// `output` whose `input` is the argument object and which has no `id`.
+    #[test]
+    fn a_call_announcement_carries_one_tool_call_block() {
+        let input = serde_json::json!({"path": "notes.txt", "content": "hello"});
+        let HookEvent::Inference {
+            turn,
+            input_tokens,
+            output_tokens,
+            decision,
+            tool_name,
+            prompt,
+            output,
+            tools,
+        } = call_announcement(4, "tool-write", &input)
+        else {
+            panic!("an announcement is an Inference event");
+        };
+        assert_eq!(turn, 4);
+        assert_eq!((input_tokens, output_tokens), (0, 0));
+        assert_eq!(decision, "tool_call");
+        assert_eq!(tool_name.as_deref(), Some("tool-write"));
+        assert_eq!(prompt, None);
+        assert_eq!(tools, None);
+        let blocks: Json = serde_json::from_str(&output.expect("output carries the call")).unwrap();
+        let blocks = blocks
+            .as_array()
+            .expect("output is an array of content blocks");
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        let block = blocks[0].as_object().unwrap();
+        assert_eq!(block["type"], "tool_call");
+        assert_eq!(block["name"], "tool-write");
+        assert_eq!(block["input"]["path"], "notes.txt");
+        assert_eq!(
+            block["input"], input,
+            "input is the argument object, not a string"
+        );
+        assert!(
+            !block.contains_key("id"),
+            "a bridged call has no tool-use id"
+        );
+    }
+
+    /// `call_turn` is the open turn while one is open, and otherwise the turn the harness's
+    /// report of the call will open — one past the last closed turn, unlike `current_turn`.
+    #[tokio::test]
+    async fn a_call_announced_with_no_turn_open_takes_the_next_turn() {
+        let mut h = Harness::new(10).await.continuing_from(3);
+        let session = RunSession::new(&h.plan, &h.policy, HARNESS, "fixture-driver");
+        let mut sink = ProcessEventSink::new(
+            &crate::workdir_fs::WorkdirRoot::open(&h.workdir).unwrap(),
+            h.max_turns,
+            h.task_max_turns,
+            h.first_turn,
+            session,
+            Arc::clone(&h.spend),
+            &mut h.a2a,
+            GatewayTable::default(),
+        );
+        assert_eq!(
+            sink.call_turn(),
+            3,
+            "no turn opened yet: the run's first turn"
+        );
+
+        sink.consume(
+            vec![tool_call("c1", "echo-tool")],
+            &mut h.hooks,
+            &mut h.trace,
+            &mut h.otel,
+        )
+        .await;
+        assert_eq!(sink.call_turn(), 3, "the open turn");
+        assert_eq!(sink.call_turn(), sink.current_turn());
+
+        sink.consume(
+            vec![tool_result("c1", false)],
+            &mut h.hooks,
+            &mut h.trace,
+            &mut h.otel,
+        )
+        .await;
+        assert_eq!(sink.current_turn(), 3, "the turn that closed");
+        assert_eq!(sink.call_turn(), 4, "the turn the next call will open");
     }
 
     /// A tool result closes the turn that issued the call, and the next action opens a new one.

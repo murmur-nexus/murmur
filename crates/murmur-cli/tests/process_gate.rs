@@ -18,7 +18,10 @@ use std::{
 };
 
 use capsule_runtime::launch_session;
-use common::hook_wat::{create_hook_zip, deny_hook_wasm, none_hook_wasm, spin_hook_wasm};
+use common::hook_wat::{
+    create_hook_zip, deny_hook_wasm, inference_output_match_hook_wasm, none_hook_wasm,
+    spin_hook_wasm,
+};
 use serde_json::Value;
 
 const DRIVER: &str = "local/fixture-process-driver";
@@ -715,4 +718,140 @@ fn a_bridged_call_with_every_required_field_runs() {
         .collect();
     assert_eq!(calls.len(), 1, "{}", session.trace_raw);
     assert_eq!(calls[0]["status"], "ok");
+}
+
+// ── A bridged call is announced to on-inference hooks before it runs ─────────
+
+/// The name the announcement scenarios publish the marker tool under, so the announcement names
+/// the tool `murmur/hook-diff-summary` snapshots files for.
+const WRITE_TOOL: &str = "tool-write";
+const WRITE_ARGS: &str = r#"{"path":"notes.txt","content":"hello"}"#;
+/// What the announcement hook looks for in `output`: the written path, as the call's `input` carries it.
+const ANNOUNCED_PATH: &str = r#""path":"notes.txt""#;
+const ANNOUNCE_HOOK: &str = "announce-match";
+
+/// A capsule whose harness calls [`WRITE_TOOL`] with [`WRITE_ARGS`] `calls` times, with an
+/// `on-inference` hook that logs one line for every event whose `output` carries
+/// [`ANNOUNCED_PATH`].
+fn writing_with_the_announcement_hook<'a>(calls: u32) -> Capsule<'a> {
+    Capsule {
+        tool_name: WRITE_TOOL,
+        call_tool: Some(WRITE_TOOL),
+        call_args: Some(WRITE_ARGS),
+        calls,
+        ..Capsule::calling_the_marker_tool()
+    }
+    .with_hook(hook(
+        ANNOUNCE_HOOK,
+        "on-inference",
+        "none",
+        inference_output_match_hook_wasm(ANNOUNCED_PATH),
+    ))
+}
+
+/// The announcement hook's log, one line per event that carried the announced call.
+fn announcement_log(session: &Session) -> PathBuf {
+    session
+        .records_dir
+        .join("logs")
+        .join(format!("hook-{ANNOUNCE_HOOK}.log"))
+}
+
+fn announcement_log_lines(session: &Session) -> usize {
+    fs::read_to_string(announcement_log(session))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// A bridged call reaches an `on-inference` hook as one `tool_call` block carrying the call's
+/// input, before the tool runs, and the announcement is not recorded as a turn.
+#[test]
+fn a_bridged_call_is_announced_before_it_runs() {
+    if common::skip_without_host_support("a_bridged_call_is_announced_before_it_runs") {
+        return;
+    }
+    let session = run_session(&writing_with_the_announcement_hook(1));
+
+    let log = announcement_log(&session);
+    assert!(
+        log.exists(),
+        "the announcement carrying the call's input reached the hook:\n{}",
+        session.trace_raw
+    );
+    let logged = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        announcement_log_lines(&session),
+        1,
+        "one call, one announcement; the turn-close events carry no call input:\n{logged}"
+    );
+    assert!(
+        logged.contains("arm 'deny' from 'on-inference'"),
+        "the line is the hook's match, not a failure of the hook: {logged}"
+    );
+    assert!(
+        session.marker_exists(),
+        "the call still ran:\n{}",
+        session.trace_raw
+    );
+    let announced = fs::metadata(&log).unwrap().modified().unwrap();
+    let ran = fs::metadata(session.workdir.join(MARKER))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        announced <= ran,
+        "the hook was handed the call before the tool wrote its marker"
+    );
+
+    // `bridge-call` with one call opens two turns: the tool turn, closed by the call's result,
+    // and the answer turn. The announcement adds no `inference` record.
+    let inferences = session.events("inference");
+    assert_eq!(inferences.len(), 2, "{}", session.trace_raw);
+    assert_eq!(inferences[0]["decision"], "tool_call");
+    assert_eq!(inferences[0]["tool_name"], WRITE_TOOL);
+    assert_eq!(inferences[1]["decision"], "end_turn");
+}
+
+/// A call a policy hook refuses was still announced, once, before the refusal.
+#[test]
+fn a_refused_bridged_call_was_still_announced() {
+    if common::skip_without_host_support("a_refused_bridged_call_was_still_announced") {
+        return;
+    }
+    let session = run_session(&writing_with_the_announcement_hook(1).with_hook(hook(
+        "write-policy",
+        "on-tool-call",
+        "deny",
+        deny_hook_wasm("on-tool-call", "no writes today"),
+    )));
+
+    assert!(
+        !session.marker_exists(),
+        "the call was refused:\n{}",
+        session.trace_raw
+    );
+    assert_eq!(session.denial()["hook_name"], "write-policy");
+    assert_eq!(
+        announcement_log_lines(&session),
+        1,
+        "the refused call was announced exactly once:\n{}",
+        session.trace_raw
+    );
+}
+
+/// Each bridged call is its own announcement.
+#[test]
+fn each_bridged_call_is_announced() {
+    if common::skip_without_host_support("each_bridged_call_is_announced") {
+        return;
+    }
+    let session = run_session(&writing_with_the_announcement_hook(2));
+
+    assert_eq!(
+        announcement_log_lines(&session),
+        2,
+        "two calls, two announcements:\n{}",
+        session.trace_raw
+    );
 }

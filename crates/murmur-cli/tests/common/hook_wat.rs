@@ -986,6 +986,57 @@ pub fn inference_tokens_trap_hook_wasm(input: u64, output: u64) -> Vec<u8> {
     policy_component("on-inference", HOOK_OUTPUT, "", &body)
 }
 
+/// An `on-inference` hook that returns `deny(needle)` exactly when it is handed an `output`
+/// containing `needle`, and `none` otherwise — including for every event with no `output`.
+///
+/// `on-inference` does not honor `deny`, so each match is logged as one unsupported-arm line in
+/// `logs/hook-<name>.log` and the hook carries on: the log's line count is the number of matching
+/// events. A trap would not count them, because a trapped instance refuses every later call.
+///
+/// `output` is read out of guest memory at its canonical-ABI offsets in `inference-event`: the
+/// `u8` option discriminant at 56, the string's pointer at 60 and its length at 64. `needle` is
+/// laid down at [`REASON_POOL`] and compared byte by byte at every position of `output`.
+pub fn inference_output_match_hook_wasm(needle: &str) -> Vec<u8> {
+    let body = format!(
+        r#"      (local $p i32)
+      (local $l i32)
+      (local $i i32)
+      (local $j i32)
+      (if (i32.eq (i32.load8_u (i32.add (local.get $event) (i32.const 56))) (i32.const 1))
+        (then
+          (local.set $p (i32.load (i32.add (local.get $event) (i32.const 60))))
+          (local.set $l (i32.load (i32.add (local.get $event) (i32.const 64))))
+          (block $miss
+            (loop $outer
+              (br_if $miss (i32.gt_u (i32.add (local.get $i) (i32.const {len})) (local.get $l)))
+              (local.set $j (i32.const 0))
+              (block $next
+                (loop $inner
+                  (if (i32.ge_u (local.get $j) (i32.const {len}))
+                    (then
+                      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+                      (i32.store (i32.const {disc}) (i32.const 6))
+                      (i32.store (i32.const {ptr}) (i32.const {REASON_POOL}))
+                      (i32.store (i32.const {slen}) (i32.const {len}))
+                      (return (i32.const {RETURN_AREA}))))
+                  (br_if $next (i32.ne
+                    (i32.load8_u (i32.add (local.get $p) (i32.add (local.get $i) (local.get $j))))
+                    (i32.load8_u (i32.add (i32.const {REASON_POOL}) (local.get $j)))))
+                  (local.set $j (i32.add (local.get $j) (i32.const 1)))
+                  (br $inner)))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $outer)))))
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (i32.store (i32.const {disc}) (i32.const 0))
+      (i32.const {RETURN_AREA})"#,
+        len = needle.len(),
+        disc = RETURN_AREA + 4,
+        ptr = RETURN_AREA + 8,
+        slen = RETURN_AREA + 12,
+    );
+    policy_component("on-inference", HOOK_OUTPUT, needle, &body)
+}
+
 /// A hook whose `fn_name` traps.
 pub fn trap_hook_wasm(fn_name: &str) -> Vec<u8> {
     policy_component(fn_name, HOOK_OUTPUT, "", "      unreachable")

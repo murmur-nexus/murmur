@@ -485,7 +485,7 @@ runtime has no other way back under the token budget:
 | `on-stage` | Once at capsule staging, before any session starts |
 | `on-session-start` | Once per capsule launch, before the first task's work begins |
 | `on-task-start` | Once per task, before that task's first inference turn |
-| `on-inference` | After each inference driver response is parsed. Its `turn` is the number the turn's [`inference`](observability-schemas.md#inference) trace line carries: zero-based, counted across every attempt of the task |
+| `on-inference` | On `inference.transport: http`, after each inference driver response is parsed. On `inference.transport: process`, before each tool call the runtime runs for the harness, and again when each turn closes. Its `turn` is the number the turn's [`inference`](observability-schemas.md#inference) trace line carries: zero-based, counted across every attempt of the task. See [What `on-inference` carries on each transport](#inference-event-by-transport) |
 | `on-tool-call` | Twice per model-requested tool invocation: once before it is dispatched, once after it returns or errors |
 | `on-shell` | Twice per allowed shell command: once before it is dispatched, once after it returns |
 | `on-compaction` | When the session token threshold is reached, before any history is replaced |
@@ -571,6 +571,33 @@ can never make a capsule able to do something its manifest did not allow. Return
 other handler, or from the observation dispatch of these two, is the same loud-but-non-fatal fault
 as any other unhonored arm. See [Policy hooks](../concepts/hooks.md#policy-hooks) for the
 fail-closed rule that governs a policy hook's failures.
+
+### What `on-inference` carries on each transport { #inference-event-by-transport }
+
+On `inference.transport: process` the harness, not the runtime, talks to the model, so
+`on-inference` is dispatched at two points: once per tool call, at the call's decision point, and
+once per turn, when the turn closes. Each tool call's announcement is handed to the hook before
+the call runs, and a call that is then refused — by a missing required field, by
+`capabilities.filesystem.read_only` or by a policy hook — was still announced.
+
+| `inference-event` field | `transport: http` | `transport: process`, call announcement | `transport: process`, turn close |
+|---|---|---|---|
+| When it fires | After each driver response is parsed, before any of the turn's tool calls is checked or run | Before each tool call the runtime runs for the harness, once per call | When the turn closes: at its tool call's result, or when the harness ends or fails the turn |
+| `turn` | The turn's number | The number of the turn the call belongs to | The turn's number |
+| `input-tokens`, `output-tokens` | The turn's counts | `0` | The harness's counts for the turn, `0` where it reported none |
+| `decision` | `tool_call`, `end_turn`, `capped` or `text` | `tool_call` | `tool_call`, `end_turn` or `error` |
+| `tool-name` | The turn's first tool call | The call's tool name | The turn's first tool call |
+| `output` | The response's content blocks, as a JSON array | A JSON array holding one `tool_call` block: `type`, `name` and `input`, the call's argument object. It has no `id` | The turn's last text, or absent |
+| `prompt` | The request's messages, as JSON | Absent: the harness builds the request | Absent |
+| `tools` | The request's tool list, as JSON | Absent | Absent |
+| Counts toward `on-session-end`'s `total-turns` | Yes | No | Yes |
+| Returned `artifact` | Forwarded to the task's stream from a turn that calls no tool; dropped for a tool-calling turn | Dropped | Forwarded from the turn the harness ends; dropped for a tool-calling turn |
+
+An announcement's `output` for a call to `tool-write`:
+
+```json
+[{"input":{"content":"hello","path":"notes.txt"},"name":"tool-write","type":"tool_call"}]
+```
 
 ### Event field notes
 
