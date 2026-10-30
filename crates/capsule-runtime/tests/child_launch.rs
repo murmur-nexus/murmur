@@ -1379,10 +1379,10 @@ fn workdir_snapshot_a_wasm_tool_reads_the_copy_and_not_the_parents_folder() {
     );
 }
 
-/// A child launched without a source is launched exactly as before: no flag, no copy, an empty
-/// folder but for what the parent placed.
+/// A child launched without a source gets no flag and no copy: an empty folder but for what the
+/// parent placed.
 #[test]
-fn workdir_snapshot_absent_launches_the_child_as_before() {
+fn workdir_snapshot_absent_starts_the_child_in_an_empty_folder() {
     let parent = Parent::new();
     std::fs::write(parent.dir().join("parent-file.txt"), "from the parent").unwrap();
 

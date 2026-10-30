@@ -90,19 +90,21 @@ The daemon's own environment holds no provider credential — see
 A parent capsule launches its children as processes of its own runtime, so the daemon, the parent
 and every child it delegates to run in one container:
 
-1. Install `mur` and `mur-roost` in the image, and publish or install the parent and its
+1. Run the container with a seccomp and AppArmor policy that permits `unshare(CLONE_NEWUSER)`, or
+   with `--cap-add SYS_ADMIN`. A capsule that declares `capabilities.spawn.allow` or
+   `capabilities.shell.allow` needs a network namespace of its own, and a container that refuses
+   one refuses the launch with [`E-CAP-005`](diagnostics.md#e-cap-005).
+2. Install `mur` and `mur-roost` in the image, and publish or install the parent and its
    sub-capsules into the store under the container's `HOME`.
-2. Start `mur-roost` in the container, with `--spawn-allow` naming the parent.
-3. Set `MURMUR_ROOST_URL=http://127.0.0.1:7700` for the parent and run it with `mur run` in the
+3. Start `mur-roost` in the container, with `--spawn-allow` naming the parent.
+4. Set `MURMUR_ROOST_URL=http://127.0.0.1:7700` for the parent and run it with `mur run` in the
    same container.
-4. Run `mur run --explain-scope` for the sub-capsule's manifest in the container. Its `mechanism:`
+5. Run `mur run --explain-scope` for the sub-capsule's manifest in the container. Its `mechanism:`
    line is the tier the child applies there, and so the `restriction` its
    [workdir snapshot](#workdir-snapshot) reports.
 
-A container whose seccomp profile refuses user namespaces gives the child no mount namespace, and
-one that refuses the Landlock system calls gives it no Landlock domain: the child then runs at
-`seccomp-only`, its `capabilities.containment` floor permitting, and a snapshot's `restriction` is
-`advisory`.
+A container that lets `mur` create a user namespace but not mount the composed root runs a child
+at `landlock+seccomp` at best, so a child that declares `sealed` is refused there.
 
 ---
 
@@ -362,8 +364,8 @@ starts every delegation in a work folder that already holds a copy of its parent
 it stood when the delegation was made. The parent's runtime makes the copy into the child's
 directory before the child process exists. The child reads the parent's code, runs it and its
 tests, and writes caches, a `.venv` or anything else into its copy. The parent's folder is never
-granted to the child — no Landlock rule, bind, preopen or environment variable names it — and the
-copy is never written back: the parent receives only the child's answer.
+granted to the child, and the copy is never written back: the parent receives only the child's
+answer.
 
 The copy is taken once. Later changes to either folder are not seen by the other, and a file the
 parent's own commands are writing at that moment may be copied mid-write. The copy is removed with
@@ -377,10 +379,10 @@ and the child reports it as `parent_workdir.restriction`:
 |---|---|---|
 | `mountns+pivot_root+landlock+seccomp` (`sealed`) | `absent` | The parent's folder is not in the child's composed root |
 | `landlock+seccomp` (`scoped`) | `enforced` | Landlock refuses every open of it |
-| `seccomp-only`, or `none` on macOS (`advisory`) | `advisory` | Nothing in the kernel. No copied link points into it, but a command that names its absolute path reaches it, as it reaches any path the user can |
+| `seccomp-only`, or `none` on macOS (`advisory`) | `advisory` | Nothing in the kernel. The runtime grants it nowhere, but a command that names its path, or follows a copied link to it, reaches it, as it reaches any path the user can |
 
-On every tier a WASM tool of the child is preopened into the child's own folder, so no tool reaches
-the parent's folder.
+On every tier a WASM tool of the child opens files in the child's own folder only, so no tool
+reaches the parent's folder.
 
 What the copy holds:
 

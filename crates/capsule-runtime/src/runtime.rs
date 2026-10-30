@@ -11713,8 +11713,7 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 /// because it sits in the cached prompt prefix.
 ///
 /// `workdir_snapshot` (`capabilities.spawn.workdir_snapshot`) adds one sentence naming the
-/// capsules that start in a copy of this capsule's work folder; empty, it adds nothing, so the
-/// description is the one a capsule without the grant has always had.
+/// capsules that start in a copy of this capsule's work folder; empty, it adds nothing.
 fn delegate_task_tool_manifest(spawn_allow: &[String], workdir_snapshot: &[String]) -> String {
     // The bare parts, which the manifest parser keeps unique: the model never sees a scope.
     let bare: Vec<&str> = spawn_allow
@@ -13783,8 +13782,6 @@ mod tests {
         assert!(!manifest.contains("local/"), "{manifest}");
     }
 
-    /// The result names the capsule the way the model named it, though the delegation ran the
-    /// full entry `spawn_target` mapped it to.
     /// `capabilities.spawn.workdir_snapshot` adds exactly one sentence, naming the bare parts it
     /// lists; an empty list leaves the description byte for byte as it is without the key.
     #[test]
@@ -13832,6 +13829,8 @@ mod tests {
         );
     }
 
+    /// The result names the capsule the way the model named it, though the delegation ran the
+    /// full entry `spawn_target` mapped it to.
     #[test]
     fn delegate_task_result_reports_the_bare_capsule_name() {
         use crate::delegation_plane::{DelegationResult, DelegationStatus};

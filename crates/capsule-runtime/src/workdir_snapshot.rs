@@ -127,8 +127,7 @@ impl ParentWorkdirReport {
             }
             FilesystemRestriction::Advisory => {
                 "advisory: nothing in the kernel stops a command that names the parent's work \
-                 folder by its absolute path; the runtime grants it nowhere and no copied link \
-                 points into it"
+                 folder by its absolute path; the runtime grants it nowhere"
             }
         }
     }

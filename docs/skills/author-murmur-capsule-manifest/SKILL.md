@@ -391,6 +391,8 @@ Do not claim a stronger posture than another field makes possible. In particular
 
 Use `capabilities.spawn.allow` only when this capsule may create named sub-capsules. List exact allowed capsule full names (`<scope>/<name>`); no two may share the part after the `/`. Do not use shell permissions as a substitute for Murmur capsule spawning.
 
+A child starts in an empty work folder. When a child must read or run this capsule's files — a reviewer running the tests, for example — also list it under `capabilities.spawn.workdir_snapshot`: each delegation to it then starts in a copy of this capsule's work folder, and nothing the child writes reaches the original. Every entry must also be in `spawn.allow`, and the copy counts against the child's `capabilities.resources.workdir_max_bytes`.
+
 #### Peer file ingestion
 
 Use `capabilities.peer_fetch.allow` only when the capsule must redeem file handles from specific peers. This is separate from general network access and its `allow` list must be non-empty when present.
