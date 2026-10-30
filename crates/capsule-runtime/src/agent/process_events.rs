@@ -7,9 +7,10 @@
 //! harness's output itself, so nothing here interprets text; it only counts turns and writes
 //! records.
 //!
-//! The sink also builds the one `Inference` hook that comes from no event: the announcement of a
-//! bridged tool call, dispatched by [`ProcessEventSink::announce_call`] at the call's decision
-//! point, before it runs. The turn's own `Inference` hook still fires when the turn closes.
+//! The sink also builds the one `Inference` hook event no harness event produces: the
+//! announcement of a bridged tool call, dispatched by [`ProcessEventSink::announce_call`] at the
+//! call's decision point, before it runs. The turn's own `Inference` event still fires when the
+//! turn closes.
 //!
 //! # Turns
 //!

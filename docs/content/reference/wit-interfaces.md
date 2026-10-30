@@ -596,7 +596,7 @@ the call runs, and a call that is then refused — by a missing required field, 
 An announcement's `output` for a call to `tool-write`:
 
 ```json
-[{"type":"tool_call","name":"tool-write","input":{"path":"notes.txt","content":"hello"}}]
+[{"input":{"content":"hello","path":"notes.txt"},"name":"tool-write","type":"tool_call"}]
 ```
 
 ### Event field notes
