@@ -52,6 +52,7 @@ use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 use crate::workdir_fs::WorkdirRoot;
+use crate::workdir_snapshot::{copy_workdir, SnapshotLimits, WorkdirSnapshot};
 
 /// Environment variable naming the `mur` binary to launch children with.
 ///
@@ -70,6 +71,12 @@ pub const READINESS_TOKENS_FLAG: &str = "--readiness-tokens";
 /// created for its child, which the child's staging compares with the `--workdir` it opened
 /// before writing anything there (`E-RUN-051` on a mismatch).
 pub const WORKDIR_IDENTITY_FLAG: &str = "--workdir-identity";
+
+/// The hidden `mur run` flag carrying, as [`WorkdirSnapshot`] JSON, what a delegating parent
+/// copied into the child's `--workdir` before starting it. A report of what the parent did, never
+/// a grant: the child's staging records it as `session_start.effective_grants.parent_workdir` and
+/// in `MURMUR.md`, and holds nothing more because of it.
+pub const PARENT_WORKDIR_SNAPSHOT_FLAG: &str = "--parent-workdir-snapshot";
 
 /// `(st_dev, st_ino)` in [`WORKDIR_IDENTITY_FLAG`]'s `<dev>:<ino>` form.
 #[must_use]
@@ -184,6 +191,20 @@ pub struct ChildLaunchRequest {
     /// ends it there. `None` bounds nothing. A script-capsule child takes no session deadline from
     /// it, and ends with its parent through its spawner lifeline.
     pub deadline: Option<crate::session_status::SessionDeadline>,
+    /// The parent's work folder to copy into the child's before the child starts, or `None` to
+    /// start it in an empty one. Set for a capsule the parent lists under
+    /// `capabilities.spawn.workdir_snapshot`.
+    pub parent_workdir_snapshot: Option<ParentWorkdirSource>,
+}
+
+/// A parent's work folder as [`launch_child_capsule`] copies it into a child's.
+#[derive(Debug, Clone)]
+pub struct ParentWorkdirSource {
+    /// The parent's accessible work folder, held. Only read, and never handed to the child.
+    pub root: WorkdirRoot,
+    /// The child's own `capabilities.resources.workdir_max_bytes`, and the parent's runtime and
+    /// records directories, which the copy never enters.
+    pub limits: SnapshotLimits,
 }
 
 /// How a child's process ended, as the watcher sees it.
@@ -412,6 +433,9 @@ pub struct LaunchedChild {
     started: Instant,
     /// The completion watcher's thread, for a launch whose spawner names an address.
     watcher: Option<std::thread::JoinHandle<()>>,
+    /// What was copied from the parent's work folder into [`Self::workdir`] before the child
+    /// started, or `None` for a child that started in an empty one.
+    pub workdir_snapshot: Option<WorkdirSnapshot>,
 }
 
 impl std::fmt::Debug for LaunchedChild {
@@ -567,6 +591,21 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     })?;
     let workdir_rel = child_workdir_rel(&request.capsule_name);
     let workdir_root = create_child_dir(&request.parent_records_root, &workdir_rel)?;
+    // Before any process exists, so a copy that fails for any reason starts nothing and leaves no
+    // directory behind.
+    let workdir_snapshot = match &request.parent_workdir_snapshot {
+        None => None,
+        Some(source) => match copy_workdir(&source.root, &workdir_root, &source.limits) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                let _ = request.parent_records_root.remove_dir_all(&workdir_rel);
+                return Err(RuntimeError::Runtime(format!(
+                    "the child capsule '{}@{}' was not started: {error}",
+                    request.capsule_name, request.capsule_version
+                )));
+            }
+        },
+    };
     let identity = workdir_root.identity()?;
     let workdir = workdir_root.path().to_path_buf();
 
@@ -590,6 +629,14 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     if let Some(deadline) = request.deadline {
         argv.push(crate::session_status::INHERITED_DEADLINE_FLAG.to_string());
         argv.push(deadline.at_unix_millis().to_string());
+    }
+    if let Some(snapshot) = &workdir_snapshot {
+        argv.push(PARENT_WORKDIR_SNAPSHOT_FLAG.to_string());
+        argv.push(serde_json::to_string(snapshot).map_err(|error| {
+            RuntimeError::Runtime(format!(
+                "the child capsule's workdir snapshot could not be encoded: {error}"
+            ))
+        })?);
     }
     // Minted here, once per launch: a caller holding one `Spawner` that delegates twice gets two
     // delegation ids, and neither child can report under the other's.
@@ -674,6 +721,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         stderr_tail,
         started,
         watcher: None,
+        workdir_snapshot,
     };
 
     // Started only for a launch somebody wants told about. A lineage-only handle names no
@@ -1493,6 +1541,7 @@ mod tests {
             completion_deadline: None,
             formation_id: None,
             deadline: None,
+            parent_workdir_snapshot: None,
         }
     }
 
@@ -1787,6 +1836,7 @@ mod tests {
             }),
             started: Instant::now(),
             watcher: None,
+            workdir_snapshot: None,
         };
         let debug = format!("{child:?}");
         assert!(!debug.contains("secretpayload"), "{debug}");
@@ -1950,6 +2000,7 @@ mod tests {
                 }),
                 started: Instant::now(),
                 watcher: None,
+                workdir_snapshot: None,
             }
         };
         let children = vec![wedged(), wedged()];
@@ -2015,6 +2066,7 @@ mod tests {
                 }),
                 started: Instant::now(),
                 watcher: None,
+                workdir_snapshot: None,
             };
             (child, process, write)
         };
@@ -2084,6 +2136,7 @@ mod tests {
             }),
             started: Instant::now(),
             watcher: None,
+            workdir_snapshot: None,
         };
         let watcher = watch_for_completion(
             &child,
@@ -2160,6 +2213,7 @@ mod tests {
             }),
             started: Instant::now(),
             watcher: None,
+            workdir_snapshot: None,
         };
         let watcher = watch_for_completion(
             &child,

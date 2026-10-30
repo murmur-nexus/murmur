@@ -370,6 +370,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,

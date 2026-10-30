@@ -94,6 +94,16 @@ const PROBE_TOOL: &str = "runtime-dir-probe";
 const FORGING_PARENT: &str = "forging-delegator";
 /// The sub-capsule whose one command tries to forge its own outcome, and whose task then fails.
 const FORGER: &str = "forger";
+/// The parent that lists [`REVIEWER`] under `capabilities.spawn.workdir_snapshot`, and
+/// [`PLAIN_REVIEWER`] under `spawn.allow` alone.
+const REVIEWING_PARENT: &str = "reviewing-delegator";
+/// The sub-capsule that starts in a copy of its parent's work folder and runs the parent's
+/// `check.sh` there.
+const REVIEWER: &str = "reviewer";
+/// The same sub-capsule, which its parent does not list for a snapshot.
+const PLAIN_REVIEWER: &str = "plain-reviewer";
+/// What the reviewing parent's `notes.txt` says, and what its reviewer's answer quotes back.
+const NOTES: &str = "NOTES-FROM-THE-PARENT-5V8D";
 
 /// The host variable both the parent and [`WORKER`] declare, and the whole of what a delegated
 /// child is handed beyond the names the runtime owns.
@@ -571,6 +581,9 @@ struct Suite {
     worker_inference: AlwaysReplying,
     /// The forging sub-capsule's own inference endpoint, scripted by its one case.
     forger_inference: QueuedServer,
+    /// The reviewing sub-capsules' own inference endpoints, each scripted by its one case.
+    reviewer_inference: QueuedServer,
+    plain_reviewer_inference: QueuedServer,
     /// Kept for the life of the process: `HOME` points inside it.
     _home: TempDir,
 }
@@ -603,6 +616,7 @@ fn suite() -> &'static Suite {
                 common::local(UNGRANTED_PARENT).as_str(),
                 common::local(FORGING_PARENT).as_str(),
                 common::local(READING_PARENT).as_str(),
+                common::local(REVIEWING_PARENT).as_str(),
             ],
         );
         std::env::set_var("MURMUR_ROOST_URL", &roost.url);
@@ -803,11 +817,48 @@ fn suite() -> &'static Suite {
             None,
         );
 
+        // The reviewing parent's envelope, and the two reviewers under it: `scoped`, with `bash`
+        // to run the parent's script.
+        roost.publish(
+            REVIEWING_PARENT,
+            VERSION,
+            &format!(
+                "artifacts: []\ncapabilities:\n  \
+                 network:\n    allow: [127.0.0.1]\n  \
+                 env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
+                 shell:\n    allow: [bash]\n  \
+                 spawn:\n    allow: [{}, {}]\n",
+                common::local(REVIEWER),
+                common::local(PLAIN_REVIEWER)
+            ),
+            Some(&common::fixture_path(
+                "run/components/capsule-env-echo.wasm",
+            )),
+        );
+        let reviewer_inference = QueuedServer::start();
+        let plain_reviewer_inference = QueuedServer::start();
+        for (name, inference) in [
+            (REVIEWER, &reviewer_inference),
+            (PLAIN_REVIEWER, &plain_reviewer_inference),
+        ] {
+            roost.publish(
+                name,
+                VERSION,
+                &agent_capsule_manifest(&inference.endpoint).replace(
+                    "capabilities:\n",
+                    "capabilities:\n  containment: scoped\n  shell:\n    allow: [bash]\n",
+                ),
+                None,
+            );
+        }
+
         Suite {
             roost,
             registry,
             worker_inference,
             forger_inference,
+            reviewer_inference,
+            plain_reviewer_inference,
             _home: home,
         }
     })
@@ -970,6 +1021,7 @@ impl Parent {
             StageRequest {
                 source_supply: None,
                 expected_workdir_identity: None,
+                parent_workdir_snapshot: None,
                 session_deadline: None,
                 manifest_file: None,
                 credentials_file: None,
@@ -1233,6 +1285,7 @@ fn stage_request(
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        parent_workdir_snapshot: None,
         session_deadline: None,
         manifest_file: None,
         credentials_file: None,
@@ -3594,4 +3647,280 @@ fn a_plan_steps_cut_answer_is_marked_and_kept_whole() {
         std::fs::read_to_string(parent.runtime_dir.join(format!("delegations/{id}.txt"))).unwrap(),
         long_answer()
     );
+}
+
+// ── A reviewer that starts in a copy of its parent's work folder ──────────────
+
+/// Every entry under `root` as (relative path, kind, permission bits, content or link target),
+/// sorted: what "the folder did not change" is compared on.
+fn folder_digest(root: &Path) -> Vec<(String, &'static str, u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            let (kind, content) = if metadata.file_type().is_symlink() {
+                (
+                    "link",
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                )
+            } else if metadata.is_dir() {
+                pending.push(path.clone());
+                ("dir", Vec::new())
+            } else {
+                ("file", std::fs::read(&path).unwrap())
+            };
+            entries.push((
+                path.strip_prefix(root).unwrap().display().to_string(),
+                kind,
+                metadata.permissions().mode() & 0o7777,
+                content,
+            ));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// Whether a scoped child can run here; prints why a case is skipped when it cannot.
+fn scoped_children_run_here(case: &str) -> bool {
+    if common::skip_without_host_support(case) {
+        return false;
+    }
+    if capsule_runtime::detect_containment_decision(ContainmentClass::Scoped)
+        .0
+        .achieved()
+        < ContainmentClass::Scoped
+    {
+        eprintln!("[SKIP-HOST] {case}: the reviewers declare scoped");
+        return false;
+    }
+    true
+}
+
+/// Answers the reviewer's second turn with its first command's `NOTES|` line, once that command's
+/// result reaches its model: the answer the parent receives is what the child really read.
+fn answer_with_what_was_read(inference: &'static QueuedServer, tool_id: &'static str) {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < deadline {
+            if let Some(result) = tool_result_text(&inference.requests(), tool_id) {
+                let notes = result
+                    .lines()
+                    .find(|line| line.starts_with("NOTES|"))
+                    .unwrap_or("NOTES|<nothing read>")
+                    .to_string();
+                inference.push(end_turn_response(&format!("reviewed: {notes}")));
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// The one `session_start` of the child that ran in `child_dir`.
+fn child_session_start(parent: &Parent, child_dir: &Path) -> Value {
+    let start = &parent.events("delegation_start")[0];
+    let child_session_id = start["child_session_id"].as_str().unwrap().to_string();
+    only_event(&child_events(child_dir, &child_session_id), "session_start").clone()
+}
+
+/// The `parent_workdir.restriction` a child on `enforcement_tier` reports.
+fn restriction_on(enforcement_tier: &str) -> &'static str {
+    match enforcement_tier {
+        "mountns+pivot_root+landlock+seccomp" => "absent",
+        "landlock+seccomp" => "enforced",
+        _ => "advisory",
+    }
+}
+
+/// A parent granting `reviewer` a snapshot delegates to it; the reviewer runs the `check.sh`
+/// copied from the parent's work folder, which reads the parent's `notes.txt`, writes a cache in
+/// its own folder and tries to write the parent's real folder. The answer carries what it read;
+/// the cache is in the child's folder; the write was refused; the parent's folder is unchanged;
+/// both traces record the copy.
+#[test]
+#[allow(clippy::print_stdout)]
+fn workdir_snapshot_a_reviewer_reads_and_runs_its_parents_code_in_a_copy() {
+    if !scoped_children_run_here(
+        "workdir_snapshot_a_reviewer_reads_and_runs_its_parents_code_in_a_copy",
+    ) {
+        return;
+    }
+    let suite = suite();
+    suite.reviewer_inference.push(tool_use_response(
+        "toolu_check",
+        "bash",
+        json!({"command": "bash ./check.sh"}),
+    ));
+    answer_with_what_was_read(&suite.reviewer_inference, "toolu_check");
+
+    let parent = Parent::launch(
+        REVIEWING_PARENT,
+        &format!(
+            "  spawn:\n    allow: [{reviewer}, {plain}]\n    workdir_snapshot: [{reviewer}]\n",
+            reviewer = common::local(REVIEWER),
+            plain = common::local(PLAIN_REVIEWER)
+        ),
+    );
+    let project = parent.project.clone();
+    std::fs::write(project.join("notes.txt"), format!("{NOTES}\n")).unwrap();
+    std::fs::write(
+        project.join("check.sh"),
+        format!(
+            "read -r notes < notes.txt\n\
+             echo \"NOTES|$notes\"\n\
+             printf 'cached' > .review-cache\n\
+             echo \"CACHE|$?\"\n\
+             out=$( {{ printf 'tampered' > '{parent_notes}'; }} 2>&1 )\n\
+             echo \"PARENTWRITE|$?|$out\"\n",
+            parent_notes = project.join("notes.txt").display()
+        ),
+    )
+    .unwrap();
+    let before = folder_digest(&project);
+    let (files, bytes) = before
+        .iter()
+        .filter(|(_, kind, ..)| *kind == "file")
+        .fold((0u64, 0u64), |(files, bytes), (_, _, _, content)| {
+            (files + 1, bytes + content.len() as u64)
+        });
+
+    let text = parent.delegate("toolu_review", REVIEWER, VERSION, "review the code");
+    println!("── delegate-task\n{text}");
+    let child_dir = parent.only_child_dir();
+
+    let ran = tool_result_text(&suite.reviewer_inference.requests(), "toolu_check")
+        .expect("the reviewer's model saw its command's result");
+    println!("── the reviewer's command\n{ran}");
+    assert!(
+        ran.lines().any(|line| line == format!("NOTES|{NOTES}")),
+        "{ran}"
+    );
+    assert!(ran.lines().any(|line| line == "CACHE|0"), "{ran}");
+    let write = ran
+        .lines()
+        .find(|line| line.starts_with("PARENTWRITE|"))
+        .unwrap_or_else(|| panic!("{ran}"));
+    assert!(!write.starts_with("PARENTWRITE|0|"), "{write}");
+
+    // The cache is the child's, beside its copy of the parent's files.
+    assert_eq!(
+        std::fs::read_to_string(child_dir.join(".review-cache")).unwrap(),
+        "cached"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child_dir.join("notes.txt")).unwrap(),
+        format!("{NOTES}\n")
+    );
+    assert_eq!(
+        folder_digest(&project),
+        before,
+        "the parent's folder changed"
+    );
+
+    // The answer the parent received is what the reviewer read.
+    let outcomes = parent.outcome_messages();
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome.contains(&format!("reviewed: NOTES|{NOTES}"))),
+        "{outcomes:?}"
+    );
+
+    let start = &parent.events("delegation_start")[0];
+    let snapshot = &start["workdir_snapshot"];
+    assert_eq!(
+        snapshot["source"],
+        json!(project.display().to_string()),
+        "{start}"
+    );
+    assert!(files >= 2);
+    assert_eq!(snapshot["files"], json!(files), "{start}");
+    assert_eq!(snapshot["bytes"], json!(bytes), "{start}");
+
+    let session_start = child_session_start(&parent, &child_dir);
+    let grants = &session_start["effective_grants"];
+    let received = &grants["parent_workdir"];
+    assert_eq!(received["files"], snapshot["files"], "{grants}");
+    assert_eq!(received["bytes"], snapshot["bytes"], "{grants}");
+    assert_eq!(received["source"], snapshot["source"], "{grants}");
+    assert_eq!(
+        received["restriction"],
+        restriction_on(grants["enforcement_tier"].as_str().unwrap()),
+        "{grants}"
+    );
+    assert_eq!(grants["spawn_workdir_snapshot"], json!([]), "{grants}");
+}
+
+/// A sub-capsule in `spawn.allow` but not in `workdir_snapshot` starts with none of its parent's
+/// files and cannot read the parent's by absolute path; neither trace records a copy.
+#[test]
+#[allow(clippy::print_stdout)]
+fn workdir_snapshot_absent_a_plain_reviewer_starts_empty_and_cannot_reach_the_parent() {
+    if !scoped_children_run_here(
+        "workdir_snapshot_absent_a_plain_reviewer_starts_empty_and_cannot_reach_the_parent",
+    ) {
+        return;
+    }
+    let suite = suite();
+    let parent = Parent::launch(
+        REVIEWING_PARENT,
+        &format!(
+            "  spawn:\n    allow: [{reviewer}, {plain}]\n    workdir_snapshot: [{reviewer}]\n",
+            reviewer = common::local(REVIEWER),
+            plain = common::local(PLAIN_REVIEWER)
+        ),
+    );
+    let project = parent.project.clone();
+    std::fs::write(project.join("notes.txt"), format!("{NOTES}\n")).unwrap();
+    let before = folder_digest(&project);
+    suite.plain_reviewer_inference.push(tool_use_response(
+        "toolu_look",
+        "bash",
+        json!({"command": format!(
+            "if [ -e notes.txt ]; then echo 'HAS|yes'; else echo 'HAS|no'; fi; \
+             out=$( {{ read -r n < '{}' && echo \"$n\"; }} 2>&1 ); echo \"PARENTREAD|$?|$out\"",
+            project.join("notes.txt").display()
+        )}),
+    ));
+    suite
+        .plain_reviewer_inference
+        .push(end_turn_response("looked"));
+
+    let text = parent.delegate("toolu_plain", PLAIN_REVIEWER, VERSION, "look around");
+    println!("── delegate-task\n{text}");
+    let child_dir = parent.only_child_dir();
+
+    let looked = tool_result_text(&suite.plain_reviewer_inference.requests(), "toolu_look")
+        .expect("the reviewer's model saw its command's result");
+    println!("── the reviewer's command\n{looked}");
+    assert!(looked.lines().any(|line| line == "HAS|no"), "{looked}");
+    assert!(!looked.contains(NOTES), "{looked}");
+    let read = looked
+        .lines()
+        .find(|line| line.starts_with("PARENTREAD|"))
+        .unwrap_or_else(|| panic!("{looked}"));
+    assert!(!read.starts_with("PARENTREAD|0|"), "{read}");
+    assert!(!child_dir.join("notes.txt").exists());
+    assert_eq!(folder_digest(&project), before);
+
+    let start = &parent.events("delegation_start")[0];
+    assert!(
+        start.as_object().unwrap().contains_key("workdir_snapshot"),
+        "{start}"
+    );
+    assert_eq!(start["workdir_snapshot"], Value::Null, "{start}");
+    let session_start = child_session_start(&parent, &child_dir);
+    let grants = &session_start["effective_grants"];
+    assert!(
+        grants.as_object().unwrap().contains_key("parent_workdir"),
+        "{grants}"
+    );
+    assert_eq!(grants["parent_workdir"], Value::Null, "{grants}");
 }

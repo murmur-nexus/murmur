@@ -2171,6 +2171,10 @@ struct DelegationStartEvent {
     /// The child's records directory, absolute, as the child reported it: its own `trace.jsonl`
     /// and `completion.json` are there.
     child_records_dir: String,
+    /// What was copied from this capsule's work folder into the child's before it started, or
+    /// `null` for a child not listed under `capabilities.spawn.workdir_snapshot`. Always
+    /// serialized.
+    workdir_snapshot: Option<crate::workdir_snapshot::WorkdirSnapshot>,
 }
 
 impl DelegationStartEvent {
@@ -2186,6 +2190,7 @@ impl DelegationStartEvent {
         child_session_id: &str,
         child_workdir: &str,
         child_records_dir: &str,
+        workdir_snapshot: Option<&crate::workdir_snapshot::WorkdirSnapshot>,
     ) -> Self {
         Self {
             event_type: "delegation_start",
@@ -2199,6 +2204,7 @@ impl DelegationStartEvent {
             child_session_id: child_session_id.to_string(),
             child_workdir: child_workdir.to_string(),
             child_records_dir: child_records_dir.to_string(),
+            workdir_snapshot: workdir_snapshot.cloned(),
         }
     }
 }
@@ -4855,6 +4861,7 @@ impl ResourceTraceAppender {
     ///
     /// Every field is known by the time the child has reported its session id, so none is
     /// optional: a delegation with nothing to say here was never launched and writes no line.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_delegation_start(
         &self,
         delegation_id: &str,
@@ -4863,6 +4870,7 @@ impl ResourceTraceAppender {
         child_session_id: &str,
         child_workdir: &str,
         child_records_dir: &str,
+        workdir_snapshot: Option<&crate::workdir_snapshot::WorkdirSnapshot>,
     ) {
         let event = DelegationStartEvent::new(
             &self.session_id,
@@ -4873,6 +4881,7 @@ impl ResourceTraceAppender {
             child_session_id,
             child_workdir,
             child_records_dir,
+            workdir_snapshot,
         );
         self.append(&event).await;
     }
@@ -5494,6 +5503,7 @@ impl PlanTraceAppender {
     /// The synchronous twin of [`ResourceTraceAppender::write_delegation_start`]. Both go through
     /// [`DelegationStartEvent::new`], so the two lines are identical but for their ids and
     /// clocks — held by there being one constructor rather than by a test.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_delegation_start(
         &self,
         delegation_id: &str,
@@ -5502,6 +5512,7 @@ impl PlanTraceAppender {
         child_session_id: &str,
         child_workdir: &str,
         child_records_dir: &str,
+        workdir_snapshot: Option<&crate::workdir_snapshot::WorkdirSnapshot>,
     ) {
         let event = DelegationStartEvent::new(
             &self.session_id,
@@ -5512,6 +5523,7 @@ impl PlanTraceAppender {
             child_session_id,
             child_workdir,
             child_records_dir,
+            workdir_snapshot,
         );
         self.append(&event);
     }
@@ -9700,6 +9712,16 @@ mod tests {
         .await
         .unwrap();
 
+        let snapshot = crate::workdir_snapshot::WorkdirSnapshot {
+            source: "/home/you/project".to_string(),
+            files: 2,
+            dirs: 0,
+            symlinks: 0,
+            repointed_symlinks: 0,
+            bytes: 12,
+            skipped_count: 0,
+            skipped: Vec::new(),
+        };
         plan.write_delegation_start(
             "dlg_abc123",
             "worker",
@@ -9707,6 +9729,7 @@ mod tests {
             "ses_child",
             ".murmur/c",
             "/r/ses_child",
+            Some(&snapshot),
         );
         tool.write_delegation_start(
             "dlg_abc123",
@@ -9715,6 +9738,7 @@ mod tests {
             "ses_child",
             ".murmur/c",
             "/r/ses_child",
+            Some(&snapshot),
         )
         .await;
         plan.write_delegation(
@@ -9748,6 +9772,10 @@ mod tests {
         let from_tool = read(tool_dir.path());
         assert_eq!(from_plan.len(), 2);
         assert_eq!(from_tool.len(), 2);
+        assert_eq!(
+            from_plan[0]["workdir_snapshot"],
+            serde_json::to_value(&snapshot).unwrap()
+        );
 
         for (planned, called, event_type) in [
             (&from_plan[0], &from_tool[0], "delegation_start"),

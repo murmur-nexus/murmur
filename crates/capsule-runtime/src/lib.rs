@@ -117,6 +117,7 @@ pub(crate) mod trust_store;
 pub mod types;
 pub(crate) mod wit_versions;
 pub mod workdir_fs;
+pub mod workdir_snapshot;
 pub mod workdir_writes;
 
 pub use artifact_config::{
@@ -198,8 +199,8 @@ pub use a2a::{
 };
 pub use child_launch::{
     child_workdir_for, format_workdir_identity, launch_child_capsule, parse_workdir_identity,
-    ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV, READINESS_TOKENS_FLAG,
-    WORKDIR_IDENTITY_FLAG,
+    ChildLaunchRequest, LaunchedChild, ParentWorkdirSource, MUR_BINARY_ENV,
+    PARENT_WORKDIR_SNAPSHOT_FLAG, READINESS_TOKENS_FLAG, WORKDIR_IDENTITY_FLAG,
 };
 // The delegation types and constants stay module-qualified beyond these: `Spawner` and
 // `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the
@@ -313,6 +314,13 @@ pub use workdir_fs::{
 // `session_start.effective_grants.runtime_writes`. Flat, on the same terms as the other report
 // types: a consumer of a scope report reads these names off it.
 pub use runtime_dir::SESSION_ID_PLACEHOLDER;
+// What a delegated child started with when its parent copied its work folder into the child's:
+// the parent's `delegation_start.workdir_snapshot` and the child's
+// `session_start.effective_grants.parent_workdir`.
+pub use workdir_snapshot::{
+    copy_workdir, ParentWorkdirReport, SkipReason, SkippedEntry, SnapshotError, SnapshotLimits,
+    WorkdirSnapshot,
+};
 pub use workdir_writes::{
     render_runtime_writes, RuntimeWriteCondition, RuntimeWriteKind, RuntimeWriteReport,
 };

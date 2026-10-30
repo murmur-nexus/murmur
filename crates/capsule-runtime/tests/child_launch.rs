@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use capsule_runtime::session_status::{SessionDeadline, INHERITED_DEADLINE_FLAG};
 use capsule_runtime::{
     child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
-    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner,
-    HOST_WARNINGS_REPORTED_ENV, SPAWNER_LIFELINE_ENV,
+    ChildLaunchRequest, FormationId, LaunchedChild, ParentWorkdirSource, SnapshotLimits,
+    SpawnApproval, Spawner, WorkdirRoot, HOST_WARNINGS_REPORTED_ENV, PARENT_WORKDIR_SNAPSHOT_FLAG,
+    SPAWNER_LIFELINE_ENV,
 };
 use common::{component, files_under, find_in_files, mur_binary, Roost, ScriptedServer};
 use serde_json::{json, Value};
@@ -80,7 +81,8 @@ fn suite() -> &'static Suite {
                  env:\n    allow: [{A_ONLY}, {B_ONLY}, MURMUR_TEST_ALLOWED_VAR]\n  \
                  spawn:\n    allow: [local/child-agent, local/child-a, local/child-b, \
                  local/child-escape, local/child-sealed, local/child-leak, local/child-reader, \
-                 local/child-repeat, local/child-handed, local/child-misreported]\n",
+                 local/child-repeat, local/child-handed, local/child-misreported, \
+                 local/child-snapshot, local/child-small]\n",
                 endpoint = inference.authority(),
             ),
             Some(&component("capsule-env-echo.wasm")),
@@ -114,6 +116,7 @@ fn suite() -> &'static Suite {
             "local/child-reader",
             "local/child-repeat",
             "local/child-misreported",
+            "local/child-snapshot",
         ] {
             common::publish_capsule(
                 &registry_path,
@@ -123,6 +126,15 @@ fn suite() -> &'static Suite {
                 Some(&component("capsule-path-reader.wasm")),
             );
         }
+        // A reader whose work folder may hold 1 KiB: a copy of a larger parent folder cannot
+        // start it.
+        common::publish_capsule(
+            &registry_path,
+            "local/child-small",
+            "0.1.0",
+            "artifacts: []\ncapabilities:\n  resources:\n    workdir_max_bytes: 1024\n",
+            Some(&component("capsule-path-reader.wasm")),
+        );
         common::publish_capsule(
             &registry_path,
             "local/child-leak",
@@ -183,13 +195,16 @@ fn suite() -> &'static Suite {
 /// (`misreported.pid`), prints a readiness line naming a records directory outside
 /// `~/.murmur/records`, and sleeps in the same process.
 ///
-/// Every other launch passes straight through.
+/// Every launch, whatever it is, first appends its arguments as one line to [`LAUNCH_LOG`] in
+/// `home`, so a case can show a launch started no process. Every other launch then passes straight
+/// through.
 fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
     let wrapper = home.join("mur-recording-wrapper");
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/sh
+             echo \"$*\" >> '{log}'
              case \" $* \" in
   *\" local/child-handed \"*)
                  env > handed.env
@@ -202,9 +217,10 @@ fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
                  exec sleep 300
                  ;;
 esac
-             exec '{}' \"$@\"
+             exec '{mur}' \"$@\"
 ",
-            mur.display()
+            log = home.join(LAUNCH_LOG).display(),
+            mur = mur.display()
         ),
     )
     .unwrap();
@@ -215,6 +231,9 @@ esac
     }
     wrapper
 }
+
+/// The file in `HOME` [`recording_wrapper`] appends every launch's arguments to.
+const LAUNCH_LOG: &str = "launches.log";
 
 /// One case's parent: a directory standing for its records directory, whose `children/` every
 /// child's work folder is composed in.
@@ -262,11 +281,25 @@ impl Parent {
         targets: &[String],
         place: impl FnOnce(&Path),
     ) -> (LaunchedChild, Vec<String>) {
+        self.launch_reading_with(name, targets, None, place)
+    }
+
+    /// [`Parent::launch_reading`], copying `snapshot` into the child's work folder first.
+    fn launch_reading_with(
+        &self,
+        name: &str,
+        targets: &[String],
+        snapshot: Option<ParentWorkdirSource>,
+        place: impl FnOnce(&Path),
+    ) -> (LaunchedChild, Vec<String>) {
         let children = self.dir().join("children");
         let before = dirs_under(&children);
 
         let child = std::thread::scope(|scope| {
-            let launch = scope.spawn(|| self.launch(name, &[]));
+            let launch = scope.spawn(|| {
+                self.try_launch_with(name, &[], None, snapshot)
+                    .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
+            });
             if let Some(dir) = wait_for_new_dir(&children, &before) {
                 place(&dir);
                 // Renamed into place, so the child that is polling for the list never reads half
@@ -298,6 +331,17 @@ impl Parent {
         env_allow: &[&str],
         deadline: Option<SessionDeadline>,
     ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
+        self.try_launch_with(name, env_allow, deadline, None)
+    }
+
+    /// [`Parent::try_launch_bounded`], copying `snapshot` into the child's work folder first.
+    fn try_launch_with(
+        &self,
+        name: &str,
+        env_allow: &[&str],
+        deadline: Option<SessionDeadline>,
+        parent_workdir_snapshot: Option<ParentWorkdirSource>,
+    ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
         let (grant, _) = self.approve(name);
         launch_child_capsule(ChildLaunchRequest {
             parent_records_root: capsule_runtime::WorkdirRoot::open(self.dir()).unwrap(),
@@ -311,6 +355,7 @@ impl Parent {
             completion_deadline: None,
             formation_id: None,
             deadline,
+            parent_workdir_snapshot,
         })
     }
 }
@@ -529,6 +574,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
         completion_deadline: None,
         formation_id: None,
         deadline: None,
+        parent_workdir_snapshot: None,
     })
     .expect("a child that declares no variables launches");
     assert_eq!(
@@ -563,6 +609,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
             completion_deadline: None,
             formation_id: Some(formation.clone()),
             deadline: None,
+            parent_workdir_snapshot: None,
         })
         .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"));
 
@@ -826,6 +873,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         completion_deadline: None,
         formation_id: None,
         deadline: None,
+        parent_workdir_snapshot: None,
     })
     .expect("the leak fixture launches");
 
@@ -882,6 +930,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         completion_deadline: None,
         formation_id: None,
         deadline: None,
+        parent_workdir_snapshot: None,
     })
     .expect_err("a child cannot register with a daemon that is not listening");
     let message = error.to_string();
@@ -1163,6 +1212,7 @@ fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
         completion_deadline: None,
         formation_id: Some(formation.clone()),
         deadline: None,
+        parent_workdir_snapshot: None,
     });
     std::env::remove_var(FORMATION_LIFELINE_ENV);
     std::env::remove_var(SPAWNER_LIFELINE_ENV);
@@ -1271,4 +1321,183 @@ fn process_is_alive(pid: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn process_is_alive(_pid: u32) -> bool {
     false
+}
+
+/// A WASM tool of a child started in a copy of its parent's work folder is preopened into the
+/// copy alone: the copied file is served with the parent's content, and the parent's real file
+/// is refused.
+///
+/// The parent's work folder here is its records directory, as on an `advisory`-capped launch
+/// where that directory lies inside it, so the copy also has to skip the child's own new
+/// directory rather than recurse into it.
+#[test]
+fn workdir_snapshot_a_wasm_tool_reads_the_copy_and_not_the_parents_folder() {
+    let parent = Parent::new();
+    std::fs::write(parent.dir().join("parent-file.txt"), "from the parent").unwrap();
+    let source = ParentWorkdirSource {
+        root: WorkdirRoot::open(parent.dir()).unwrap(),
+        limits: SnapshotLimits {
+            max_bytes: 1 << 20,
+            excluded: Vec::new(),
+        },
+    };
+
+    let (child, outcomes) = parent.launch_reading_with(
+        "local/child-snapshot",
+        &[
+            "./parent-file.txt".to_string(),
+            "../../parent-file.txt".to_string(),
+        ],
+        Some(source),
+        |_| {},
+    );
+
+    assert_eq!(outcomes, ["served from the parent", "blocked"]);
+    let snapshot = child
+        .workdir_snapshot
+        .clone()
+        .expect("a launch with a source reports its copy");
+    assert_eq!(snapshot.source, parent.dir().display().to_string());
+    assert_eq!((snapshot.files, snapshot.bytes), (1, 15), "{snapshot:?}");
+    assert!(
+        snapshot
+            .skipped
+            .iter()
+            .any(|entry| child.workdir.ends_with(&entry.path)),
+        "the child's own directory is skipped: {snapshot:?}"
+    );
+    let flag = child
+        .argv
+        .iter()
+        .position(|arg| arg == PARENT_WORKDIR_SNAPSHOT_FLAG)
+        .expect("the child is told what it received");
+    let told: Value = serde_json::from_str(&child.argv[flag + 1]).unwrap();
+    assert_eq!(told, serde_json::to_value(&snapshot).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(parent.dir().join("parent-file.txt")).unwrap(),
+        "from the parent"
+    );
+}
+
+/// A child launched without a source gets no flag and no copy: an empty folder but for what the
+/// parent placed.
+#[test]
+fn workdir_snapshot_absent_starts_the_child_in_an_empty_folder() {
+    let parent = Parent::new();
+    std::fs::write(parent.dir().join("parent-file.txt"), "from the parent").unwrap();
+
+    let (child, outcomes) = parent.launch_reading(
+        "local/child-snapshot",
+        &["./parent-file.txt".to_string()],
+        |_| {},
+    );
+
+    assert_eq!(outcomes, ["blocked"]);
+    assert!(child.workdir_snapshot.is_none());
+    assert!(!child
+        .argv
+        .iter()
+        .any(|arg| arg == PARENT_WORKDIR_SNAPSHOT_FLAG));
+}
+
+/// A copy past the child's own `workdir_max_bytes` fails the launch before any process exists,
+/// naming the child and the ceiling, and leaves no directory for it behind. Through the plane it
+/// is a `failed` delegation whose output is that text, read off the child's own manifest.
+#[test]
+fn workdir_snapshot_past_the_childs_ceiling_starts_nothing_and_leaves_no_directory() {
+    let parent = Parent::new();
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("big.bin"), vec![7u8; 4096]).unwrap();
+    let launches = || {
+        std::fs::read_to_string(suite()._home.path().join(LAUNCH_LOG))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("local/child-small"))
+            .count()
+    };
+    let leftovers = || {
+        dirs_under(&parent.dir().join("children"))
+            .into_iter()
+            .filter(|dir| {
+                dir.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("child-small-"))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let error = parent
+        .try_launch_with(
+            "local/child-small",
+            &[],
+            None,
+            Some(ParentWorkdirSource {
+                root: WorkdirRoot::open(work.path()).unwrap(),
+                limits: SnapshotLimits {
+                    max_bytes: 1024,
+                    excluded: Vec::new(),
+                },
+            }),
+        )
+        .expect_err("a copy past the ceiling starts no child");
+    let message = error.to_string();
+    for part in [
+        "local/child-small",
+        "1024",
+        "capabilities.resources.workdir_max_bytes",
+    ] {
+        assert!(message.contains(part), "{part} missing from: {message}");
+    }
+    assert_eq!(launches(), 0, "no process was started");
+    assert_eq!(leftovers(), Vec::<PathBuf>::new());
+
+    // The same refusal through the plane, which reads the 1024 off the child's manifest.
+    let suite = suite();
+    let registry = suite._home.path().join(".murmur").join("artifacts");
+    let records = WorkdirRoot::open(parent.dir()).unwrap();
+    let plane = capsule_runtime::delegation_plane::DelegationPlane::new(
+        suite.roost.url.clone(),
+        capsule_runtime::SpawnCredential::new(suite.credential.clone()),
+        records.clone(),
+        PARENT_SESSION.to_string(),
+        Duration::from_secs(60),
+        std::sync::Arc::new(murmur_artifact::LocalRegistry::new(&registry)),
+        Vec::new(),
+        None,
+    )
+    .snapshotting_workdir(
+        capsule_runtime::delegation_plane::WorkdirSnapshotGrant::new(
+            vec!["local/child-small".to_string()],
+            WorkdirRoot::open(work.path()).unwrap(),
+            &[],
+        ),
+    );
+    let result = plane.delegate(
+        &capsule_runtime::delegation_plane::DelegationRequest {
+            capsule: "local/child-small".to_string(),
+            version: "0.1.0".to_string(),
+            task: "read nothing".to_string(),
+        },
+        &capsule_runtime::delegation_plane::DelegationOrigin::default(),
+        &records,
+    );
+    assert_eq!(
+        result.status,
+        capsule_runtime::delegation_plane::DelegationStatus::Failed,
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("1024")
+            && result
+                .output
+                .contains("capabilities.resources.workdir_max_bytes"),
+        "{}",
+        result.output
+    );
+    assert_eq!(
+        launches(),
+        0,
+        "no process was started through the plane either"
+    );
+    assert_eq!(leftovers(), Vec::<PathBuf>::new());
 }

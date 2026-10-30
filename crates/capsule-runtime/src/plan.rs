@@ -1237,6 +1237,20 @@ fn dispatch_shell_step(
     }
 }
 
+/// The session's `capabilities.spawn.workdir_snapshot`, copying its work folder and never its
+/// runtime or records directory: what a `capsule` step's plane starts a listed child with, exactly
+/// as the session's own `delegate-task` plane does.
+fn snapshot_grant(
+    ctx: &SchedulerContext<'_>,
+    records_root: &WorkdirRoot,
+) -> crate::delegation_plane::WorkdirSnapshotGrant {
+    crate::delegation_plane::WorkdirSnapshotGrant::new(
+        ctx.capability_policy.spawn_workdir_snapshot.clone(),
+        ctx.accessible_workdir.clone(),
+        &[&ctx.runtime_dir.runtime, records_root],
+    )
+}
+
 fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Value) -> StepResult {
     let named = step.capsule.as_deref().unwrap_or_default();
     // A step names a capsule by the bare part, as `delegate-task` does; mur-roost is asked about
@@ -1279,6 +1293,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
              work folder is created",
         );
     };
+    let snapshot_grant = snapshot_grant(ctx, &records_root);
     let plane = DelegationPlane::new(
         roost_url,
         credential.clone(),
@@ -1289,7 +1304,8 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         ctx.capability_policy.env_allow.clone(),
         ctx.formation_id.clone(),
     )
-    .bounded_by(ctx.deadline);
+    .bounded_by(ctx.deadline)
+    .snapshotting_workdir(snapshot_grant);
     // The launch notice is written where it arrives, on this thread, while the child is still
     // holding its task: `delegate` blocks until the child answers, so a notice parked for later
     // would only reach disk once there was already a terminal line to write beside it. The task
@@ -1306,6 +1322,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
                     &notice.child_session_id,
                     &notice.child_workdir,
                     &notice.child_records_dir,
+                    notice.workdir_snapshot.as_ref(),
                 );
             }
             if let Some(plan_task) = plan_task {
@@ -1634,6 +1651,31 @@ mod tests {
             truncated: false,
             metadata: Vec::new(),
         }
+    }
+
+    /// A `capsule` step's plane copies what the session's own `delegate-task` plane copies: the
+    /// session's `capabilities.spawn.workdir_snapshot`, its work folder, and never its runtime or
+    /// records directory.
+    #[test]
+    fn plan_capsule_step_snapshot_grant_is_the_sessions() {
+        let work = tempdir().unwrap();
+        let records = tempdir().unwrap();
+        let invoke = |_: &str, _: ToolInput| -> Result<ToolResult, String> { unreachable!() };
+        let mut ctx = test_ctx(work.path().to_path_buf(), &invoke);
+        ctx.capability_policy.spawn_workdir_snapshot = vec!["local/worker".to_string()];
+        let records_root = WorkdirRoot::open(records.path()).unwrap();
+
+        let grant = snapshot_grant(&ctx, &records_root);
+
+        assert_eq!(grant.capsules, vec!["local/worker".to_string()]);
+        assert_eq!(grant.source.path(), work.path());
+        assert_eq!(
+            grant.excluded,
+            vec![
+                ctx.runtime_dir.runtime.identity().unwrap(),
+                records_root.identity().unwrap()
+            ]
+        );
     }
 
     fn write_plan(workdir: &Path, plan: Value) -> PathBuf {

@@ -613,6 +613,7 @@ fn stage_agent_session_inner(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline,
             manifest_file: Some(manifest_path.to_path_buf()),
             credentials_file: None,

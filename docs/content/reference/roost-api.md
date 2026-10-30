@@ -85,6 +85,27 @@ Any other flag is rejected and the daemon exits. There is no `--max-total` — s
 The daemon's own environment holds no provider credential — see
 [Environment variables](#environment-variables).
 
+### In a container { #in-a-container }
+
+A parent capsule launches its children as processes of its own runtime, so the daemon, the parent
+and every child it delegates to run in one container:
+
+1. Run the container with a seccomp and AppArmor policy that permits `unshare(CLONE_NEWUSER)`, or
+   with `--cap-add SYS_ADMIN`. A capsule that declares `capabilities.spawn.allow` or
+   `capabilities.shell.allow` needs a network namespace of its own, and a container that refuses
+   one refuses the launch with [`E-CAP-005`](diagnostics.md#e-cap-005).
+2. Install `mur` and `mur-roost` in the image, and publish or install the parent and its
+   sub-capsules into the store under the container's `HOME`.
+3. Start `mur-roost` in the container, with `--spawn-allow` naming the parent.
+4. Set `MURMUR_ROOST_URL=http://127.0.0.1:7700` for the parent and run it with `mur run` in the
+   same container.
+5. Run `mur run --explain-scope` for the sub-capsule's manifest in the container. Its `mechanism:`
+   line is the tier the child applies there, and so the `restriction` its
+   [workdir snapshot](#workdir-snapshot) reports.
+
+A container that lets `mur` create a user namespace but not mount the composed root runs a child
+at `landlock+seccomp` at best, so a child that declares `sealed` is refused there.
+
 ---
 
 ## Endpoints
@@ -306,6 +327,7 @@ before the restart then returns `404`.
 | Ask whether a child may be spawned | The parent capsule's runtime, at `POST /spawn` |
 | Referee the child's manifest against the parent's | The daemon |
 | Create the child's directory and place its inputs | The parent capsule's runtime |
+| Copy the parent's work folder into the child's, for a capsule listed under `capabilities.spawn.workdir_snapshot` | The parent capsule's runtime, before the child process starts — see [Workdir snapshot](#workdir-snapshot) |
 | Start the child process | The parent capsule's runtime, as a `mur` subprocess |
 | Probe the host for its containment class | The child's own runtime, in the child's own process |
 | Record what the child holds | The daemon, at the child's `POST /register` |
@@ -331,6 +353,64 @@ parent's [records directory](workdir.md#records-directory), outside the parent's
 it is read-only to the parent's commands wherever the host enforces the records directory. A child
 cannot reach out of its own work folder. It is removed with the parent's records directory, by
 [`mur trace rm`](cli.md#mur-trace-rm) or [`trace.retain`](manifest.md#trace-retain).
+
+The folder starts empty, unless the parent lists the capsule under
+`capabilities.spawn.workdir_snapshot`.
+
+### Workdir snapshot { #workdir-snapshot }
+
+A capsule listed under [`capabilities.spawn.workdir_snapshot`](manifest.md#field-capabilities)
+starts every delegation in a work folder that already holds a copy of its parent's work folder as
+it stood when the delegation was made. The parent's runtime makes the copy into the child's
+directory before the child process exists. The child reads the parent's code, runs it and its
+tests, and writes caches, a `.venv` or anything else into its copy. The parent's folder is never
+granted to the child, and the copy is never written back: the parent receives only the child's
+answer.
+
+The copy is taken once. Later changes to either folder are not seen by the other, and a file the
+parent's own commands are writing at that moment may be copied mid-write. The copy is removed with
+the parent's records directory, by [`mur trace rm`](cli.md#mur-trace-rm) or
+[`trace.retain`](manifest.md#trace-retain).
+
+What keeps the child's commands off the parent's real folder depends on the tier the child applies,
+and the child reports it as `parent_workdir.restriction`:
+
+| Child's tier | `restriction` | What keeps the child's commands off the parent's folder |
+|---|---|---|
+| `mountns+pivot_root+landlock+seccomp` (`sealed`) | `absent` | The parent's folder is not in the child's composed root |
+| `landlock+seccomp` (`scoped`) | `enforced` | Landlock refuses every open of it |
+| `seccomp-only`, or `none` on macOS (`advisory`) | `advisory` | Nothing in the kernel. The runtime grants it nowhere, but a command that names its path, or follows a copied link to it, reaches it, as it reaches any path the user can |
+
+On every tier a WASM tool of the child opens files in the child's own folder only, so no tool
+reaches the parent's folder.
+
+What the copy holds:
+
+| Entry in the parent's folder | In the child's copy |
+|---|---|
+| Regular file | Its content, its `rwx` bits for user, group and other, and its modification time. Setuid, setgid and sticky bits are dropped |
+| Directory | Recreated with its `rwx` bits and, once its contents are in, its modification time |
+| Symbolic link | Recreated and never followed. A target that is an absolute path inside the parent's folder is re-pointed at the same place in the child's copy; every other target is copied as it is |
+| FIFO, socket, device node | Skipped, as `fifo`, `socket` or `device` |
+| A file or directory the parent's runtime cannot open | Skipped, as `unreadable` |
+| `peer-in` and `out` at the top level — the [runtime writes](workdir.md#what-the-capsule-changed) | Skipped, as `runtime-owned` |
+| The parent session's runtime directory, its records directory, and the child's own directory, when one lies inside the work folder | Skipped, as `runtime-owned` |
+
+The copied bytes count against the child's own `capabilities.resources.workdir_max_bytes`, read
+from the child's manifest, or 10 GiB when it declares none. A parent folder larger than that stops
+the copy, removes the child's directory and fails the delegation before a child process exists:
+`delegate-task` returns `status: failed`, and a plan `capsule` step fails, with an `output` naming
+the child, the ceiling and `capabilities.resources.workdir_max_bytes`. A copy that fails for any
+other reason, such as a full disk, fails the delegation the same way.
+
+Both sides record the copy:
+
+| Where | What |
+|---|---|
+| The parent's `mur run --explain-scope` | `spawn workdir snapshot`, the listed capsules |
+| The parent's `trace.jsonl` | [`delegation_start.workdir_snapshot`](observability-schemas.md): the source folder, counts, bytes and skipped entries |
+| The child's `trace.jsonl` | `session_start.effective_grants.parent_workdir`: the same object, plus `restriction` |
+| The child's `MURMUR.md` | One line under the work folder: the file count and size of the copy, and that changes there do not reach the parent |
 
 ### The child's environment { #the-childs-environment }
 
@@ -431,6 +511,11 @@ inventory its model is shown, so the model has nothing to call.
 | `capsule` | yes | The sub-capsule's bare name. The schema's `enum` holds the bare part of each `capabilities.spawn.allow` entry — `worker` for `local/worker` — so the granted capsules are the only ones the model can name. The runtime maps the name back to the full entry before asking `mur-roost` |
 | `version` | yes | That capsule's exact version. `latest`, `stable` and `edge` are reserved words that resolve to no artifact |
 | `task` | yes | The whole of what the sub-capsule is told. It arrives as the child's first user message |
+
+A capsule listed under `capabilities.spawn.workdir_snapshot` is named in one more sentence of the
+tool's description: it starts with a copy of this capsule's work folder as it is when the call is
+made, and nothing it changes reaches this capsule's work folder. See
+[Workdir snapshot](#workdir-snapshot).
 
 Those three strings are the whole of what the agent supplies. The daemon's address, this session's
 credential, the approval, the child's directory, the child's process and the A2A conversation with

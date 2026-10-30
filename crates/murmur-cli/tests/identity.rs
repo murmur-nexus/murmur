@@ -142,6 +142,7 @@ fn stage_agent_with_port(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,

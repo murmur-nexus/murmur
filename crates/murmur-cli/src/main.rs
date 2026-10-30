@@ -350,6 +350,7 @@ enum Commands {
                 "explain_scope",
                 "readiness_tokens",
                 "workdir_identity",
+                "parent_workdir_snapshot",
                 "inherited_deadline",
             ]
         )]
@@ -472,6 +473,18 @@ enum Commands {
         /// other directory is refused with E-RUN-051 before anything is written there.
         #[arg(long, hide = true, requires = "workdir", value_name = "DEV:INO")]
         workdir_identity: Option<String>,
+
+        /// What a parent capsule's runtime copied from its own work folder into the --workdir
+        /// directory before launching this delegated child, as JSON. Recorded as
+        /// session_start.effective_grants.parent_workdir and in MURMUR.md; it grants nothing.
+        #[arg(
+            long,
+            hide = true,
+            requires = "workdir",
+            value_name = "JSON",
+            value_parser = parse_parent_workdir_snapshot
+        )]
+        parent_workdir_snapshot: Option<capsule_runtime::WorkdirSnapshot>,
 
         /// Print extended startup info: workdir, manifest identity, driver, and installed skills.
         /// Session ID is always shown at startup regardless of this flag.
@@ -607,6 +620,14 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+}
+
+/// `mur run --parent-workdir-snapshot`'s value: the snapshot JSON a delegating parent's runtime
+/// built. Anything else is a usage error naming the flag.
+fn parse_parent_workdir_snapshot(value: &str) -> Result<capsule_runtime::WorkdirSnapshot, String> {
+    serde_json::from_str(value).map_err(|error| {
+        format!("not a work-folder snapshot as a parent's runtime writes it: {error}")
+    })
 }
 
 /// The capsule and the task `mur cancel` was given.
@@ -821,6 +842,7 @@ fn main() {
             json,
             readiness_tokens,
             workdir_identity,
+            parent_workdir_snapshot,
             verbose,
             bind,
             no_env_file,
@@ -847,6 +869,7 @@ fn main() {
             json,
             readiness_tokens,
             workdir_identity.as_deref(),
+            parent_workdir_snapshot,
             verbose,
             &bind,
             no_env_file,

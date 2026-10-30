@@ -260,6 +260,7 @@ Effective grants
   shell allow:
     - git
   spawn allow: <none>
+  spawn workdir snapshot: <none>
   env allow: <none>
   plan submit:      false
   install skill: <none>

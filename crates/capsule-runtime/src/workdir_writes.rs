@@ -229,6 +229,7 @@ mod tests {
         ("trace.rs", include_str!("trace.rs")),
         ("trace_blobs.rs", include_str!("trace_blobs.rs")),
         ("types.rs", include_str!("types.rs")),
+        ("workdir_snapshot.rs", include_str!("workdir_snapshot.rs")),
     ];
 
     /// Constant names a `workdir.join(...)` may name, paired with the constant itself.
