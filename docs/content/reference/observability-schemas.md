@@ -37,7 +37,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry` | The turn node, falling back to the task node and then the session node |
+| `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
@@ -135,6 +135,8 @@ order:
 | `error_code` | string | Why the call failed — one of the [`error_code` values](#inference-error-code). Present exactly when `decision` is `"error"` |
 | `error` | string | The failure in words, present exactly when `error_code` is. Every credential value the session holds is replaced with `[redacted]`, and the text is capped at 2,000 bytes. For `credential_rejected` it is the runtime's own `E-RUN-027` message, never the provider's reply |
 | `provider_status` | u16 | The HTTP status the runtime's credential gateway received for the failed call. Absent when the request reached no provider, on the `process` transport, and for a driver with no `gateway:` |
+| `gateway_reached_ms` | u64 \| null | Milliseconds from the start of the attempt this record describes — the last, when the call was retried — until the driver's first request reached the runtime's credential gateway. `null` when no request reached it. Present on every call made through the gateway of a `gateway:` driver, failed or not: an agent-loop `transport: http` turn and a hook's `run-inference`. Absent on the `process` transport and for a driver with no `gateway:` |
+| `upstream_responded_ms` | u64 \| null | Milliseconds from the start of the same attempt until the provider's last response head arrived at the gateway. `null` when none arrived. Present exactly when `gateway_reached_ms` is |
 | `attempts` | u32 | How many attempts the call took under [`inference.retry`](manifest.md#inference-retry). Written only when it took more than one; each earlier attempt has an [`inference_retry`](#inference-retry) line |
 | `retry_stopped` | string | Why a call whose last attempt failed transiently was not made again: `"max_retries"` \| `"retry_after"` \| `"deadline"`. Written only on such a failed call |
 
@@ -187,6 +189,18 @@ block. Whether it counts as a turn depends on where it failed:
 | `transport: process`, with no turn open | Absent | No |
 | A hook's `run-inference` | `input_tokens` only: the runtime's count of the request it sent | Yes, as every hook record is |
 
+`gateway_reached_ms` and `upstream_responded_ms` tell apart the two ways a call through a
+`gateway:` driver can hang until its [deadline](../concepts/capsules.md#execution-limits) stops it:
+
+| `gateway_reached_ms` | `upstream_responded_ms` | The call |
+|---|---|---|
+| `null` | `null` | Never sent: the driver stopped before its request reached the gateway |
+| A number | `null` | Slow provider: the request went out and no response came back |
+| A number | A number | Answered |
+
+The gateway is shared by the agent loop and every hook's `run-inference`, so a hook's request made
+during an agent-loop call counts toward that call's two values, and the reverse.
+
 A call that returned an answer the loop could not act on — `stop_reason: "tool_call"` with no tool
 call, or an unsupported stop reason — succeeded, and is recorded with the provider's own
 `stop_reason` before the [`task_failed`](#task-failed) that ends the attempt.
@@ -197,7 +211,7 @@ call, or an unsupported stop reason — succeeded, and is recorded with the prov
 |---|---|
 | `credential_rejected` | The provider answered `401` and the key, re-read and resent, was refused too |
 | `driver_error` | The driver reported the call failed: a provider HTTP error, the driver's own error, a request the runtime refused before sending it, or a response whose `stop_reason` is `"error"` |
-| `driver_failed` | The driver component could not be run, or stopped partway: it failed to load, hit `capabilities.limits.deadline_seconds`, or exceeded its memory limit |
+| `driver_failed` | The driver component could not be run, or stopped partway: it failed to load, hit `capabilities.limits.deadline_seconds` while computing or waiting on the host, or exceeded its memory limit. A call stopped while waiting on the host is preceded by a [`call_deadline`](#call-deadline) line |
 | `malformed_response` | The driver reported success with no response body, or a body that is not JSON |
 | `harness_auth` | A `process` harness reported a `turn-failed` of kind `auth` |
 | `harness_quota` | A `process` harness reported a `turn-failed` of kind `quota` |
@@ -207,6 +221,26 @@ call, or an unsupported stop reason — succeeded, and is recorded with the prov
 
 A spend ceiling that refuses a call before it is sent, a canceled call, and a `process` harness
 failure of kind `max-turns` or `canceled` write no failed record.
+
+### `call_deadline` { #call-deadline }
+
+Written when a component call is stopped at
+[`capabilities.limits.deadline_seconds`](../concepts/capsules.md#execution-limits) while it waited on
+the host, one line per stopped call. A driver's or a tool's comes before the `inference` or
+`tool_call` record of the call it stopped, and every one comes before `session_end`. A call stopped
+while running its own code writes none.
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task in scope. Absent outside a task |
+| `component` | string | The artifact's tool name for a tool or driver, the hook's name, or the capsule's `name` for a capsule's own `run` |
+| `role` | string | `"capsule"` \| `"driver"` — an inference driver run for a model call, the agent loop's or a hook's `run-inference` \| `"tool"` \| `"hook"` \| `"process_driver"` |
+| `call` | string | `"instantiate"` \| `"run"` \| a hook lifecycle function such as `"on-session-start"` or `"on-stage"` \| a process driver function: `"describe"`, `"launch"`, `"parse"` or `"classify-exit"` |
+| `deadline_seconds` | u64 | The deadline in force for the call |
+| `elapsed_ms` | u64 | How long the stopped phase had run: the deadline plus the 2-second grace, and a little more |
+
+`mur trace show` lists each under **Call deadlines**, as
+`call_deadline  driver stall-driver run  stopped at 3s`.
 
 ### `inference_credential` { #inference-credential }
 

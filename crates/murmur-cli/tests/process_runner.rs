@@ -508,6 +508,14 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     assert_eq!(inferences.len(), 2, "{inferences:#?}");
     assert_eq!(inferences[0]["decision"], "tool_call");
     assert_eq!(inferences[1]["decision"], "end_turn");
+    // The harness reaches its provider itself, through no runtime gateway.
+    for inference in &inferences {
+        assert!(inference.get("gateway_reached_ms").is_none(), "{inference}");
+        assert!(
+            inference.get("upstream_responded_ms").is_none(),
+            "{inference}"
+        );
+    }
 
     let start = run.one("harness_start");
     assert_eq!(

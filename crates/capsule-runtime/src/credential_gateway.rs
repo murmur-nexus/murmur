@@ -19,7 +19,12 @@
 //!
 //! No error this module returns carries the key or the rendered header.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use http::{
@@ -116,6 +121,40 @@ pub(crate) struct CredentialGateway {
     /// What became of the last request [`Self::send`] sent upstream, until
     /// [`Self::take_upstream_outcome`] takes it.
     last_outcome: std::sync::Mutex<Option<UpstreamOutcome>>,
+    /// When requests reached [`Self::send`] and responses came back, until
+    /// [`Self::take_timing`] takes it.
+    timing: std::sync::Mutex<GatewayTiming>,
+}
+
+/// When the requests a gateway handled since the last take reached it and were answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GatewayTiming {
+    /// When the first request entered [`CredentialGateway::send`], whether it was then sent,
+    /// failed to connect or was refused before sending.
+    pub(crate) reached: Option<Instant>,
+    /// When the last response head arrived from the upstream.
+    pub(crate) responded: Option<Instant>,
+}
+
+impl GatewayTiming {
+    /// Both instants as milliseconds after `started`, the start of the attempt they belong to.
+    pub(crate) fn offsets_from(self, started: Instant) -> GatewayOffsets {
+        let millis = |at: Instant| {
+            u64::try_from(at.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX)
+        };
+        GatewayOffsets {
+            reached_ms: self.reached.map(millis),
+            responded_ms: self.responded.map(millis),
+        }
+    }
+}
+
+/// An attempt's [`GatewayTiming`] as the `inference` record writes it:
+/// `gateway_reached_ms` and `upstream_responded_ms`, `None` for a moment that never came.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GatewayOffsets {
+    pub(crate) reached_ms: Option<u64>,
+    pub(crate) responded_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for CredentialGateway {
@@ -280,6 +319,7 @@ impl CredentialGateway {
             credential,
             metering,
             last_outcome: std::sync::Mutex::new(None),
+            timing: std::sync::Mutex::new(GatewayTiming::default()),
         })
     }
 
@@ -304,6 +344,16 @@ impl CredentialGateway {
             .take()
     }
 
+    /// Takes when a request first reached this gateway and when the last response head arrived
+    /// since the last take, leaving neither.
+    ///
+    /// Taken with the same discipline as [`Self::take_upstream_outcome`], immediately before an
+    /// attempt and again after, and with the same caveat: a request another call sends on the
+    /// shared gateway in between counts toward it, and the last response wins.
+    pub(crate) fn take_timing(&self) -> GatewayTiming {
+        std::mem::take(&mut *self.timing.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// [`Self::take_upstream_outcome`]'s status alone: `None` for a connection failure as for
     /// nothing recorded.
     #[cfg(test)]
@@ -319,6 +369,12 @@ impl CredentialGateway {
         options: Option<RequestOptions>,
     ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
         let sent = send_direct(request, options).await;
+        if sent.is_ok() {
+            self.timing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .responded = Some(Instant::now());
+        }
         let outcome = match &sent {
             Ok((response, _)) => UpstreamOutcome::Response {
                 status: response.status().as_u16(),
@@ -374,6 +430,11 @@ impl CredentialGateway {
         request: http::Request<WasiBody>,
         options: Option<RequestOptions>,
     ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
+        self.timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reached
+            .get_or_insert_with(Instant::now);
         let Some(credential) = self.credential.clone() else {
             return self
                 .send_recorded(self.rewrite(request, None)?, options)
@@ -786,6 +847,12 @@ mod tests {
         };
         assert!(message.contains("has not been injected"), "{message}");
         assert_eq!(gateway.take_upstream_status(), None);
+        let timing = gateway.take_timing();
+        assert!(
+            timing.reached.is_some(),
+            "a refused request still reached the gateway"
+        );
+        assert_eq!(timing.responded, None);
         std::thread::sleep(Duration::from_millis(100));
         assert!(upstream.accept().is_err(), "nothing reached the upstream");
     }
@@ -827,6 +894,16 @@ mod tests {
         });
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         server.join().unwrap();
+        let timing = gateway.take_timing();
+        let (Some(reached), Some(responded)) = (timing.reached, timing.responded) else {
+            panic!("an answered request records both instants: {timing:?}");
+        };
+        assert!(reached <= responded);
+        assert_eq!(
+            gateway.take_timing(),
+            GatewayTiming::default(),
+            "a take clears both"
+        );
         assert_eq!(
             gateway.take_upstream_outcome(),
             Some(UpstreamOutcome::Response {
@@ -860,6 +937,9 @@ mod tests {
                 Some(UpstreamOutcome::ConnectionFailed { transient: false }),
                 "key {key:?}"
             );
+            let timing = gateway.take_timing();
+            assert!(timing.reached.is_some(), "key {key:?}");
+            assert_eq!(timing.responded, None, "no response head arrived");
             let _ = rt.block_on(async {
                 Arc::clone(&gateway)
                     .send(request("http://127.0.0.1:9/v1/messages", &[]), None)
@@ -867,6 +947,22 @@ mod tests {
             });
             assert_eq!(gateway.take_upstream_status(), None);
         }
+    }
+
+    #[test]
+    fn timing_offsets_count_from_the_attempts_start() {
+        let started = Instant::now();
+        let timing = GatewayTiming {
+            reached: Some(started + Duration::from_millis(40)),
+            responded: None,
+        };
+        assert_eq!(
+            timing.offsets_from(started),
+            GatewayOffsets {
+                reached_ms: Some(40),
+                responded_ms: None,
+            }
+        );
     }
 
     #[test]

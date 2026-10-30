@@ -13,21 +13,29 @@
 //! `DEFAULT_*` constants below for any field it omits. A silent manifest means defaults,
 //! never "unlimited".
 //!
-//! ## What an epoch deadline does and does not bound
+//! ## Two mechanisms for one deadline
 //!
-//! Epoch checks are compiled into wasm loop back-edges and function entries, so the
-//! deadline can only fire while guest code is executing. Time spent blocked inside a host
-//! call (notably `wasi:io/poll`) elapses against the same wall-clock budget but cannot be
-//! interrupted until control returns to wasm. This bounds runaway *guest compute*, which is
-//! what makes a spin loop killable; it is not a general-purpose I/O timeout.
+//! Epoch checks are compiled into wasm loop back-edges and function entries, so the epoch
+//! deadline can only fire while guest code is executing. A call blocked inside a host call — a
+//! `wasi:clocks` sleep, a `wasi:io/poll` on an HTTP response that never comes — is out of its
+//! reach until control returns to wasm.
+//!
+//! Every component call is therefore also wrapped in a wall-clock bound, [`bound_call`], of
+//! `deadline_seconds` plus [`WALL_DEADLINE_GRACE`], measured per phase (instantiation, then the
+//! call) from the moment that phase's future starts. A guest computing past its deadline is
+//! trapped by the epoch first, with the epoch's message; the wall bound fires only where the
+//! epoch cannot, and stops the call by dropping its future, which disposes the guest fiber and
+//! any outbound request pending under it. Each firing is pushed into the session's
+//! [`CallDeadlines`] latch, which the trace drains into `call_deadline` lines.
 
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use wasmtime::{Engine, ResourceLimiter, StoreLimits, StoreLimitsBuilder};
@@ -47,6 +55,18 @@ pub const DEFAULT_TABLE_ELEMENTS: usize = 100_000;
 /// instance per core module, so single digits is typical; this only stops a pathological
 /// instantiation loop.
 pub const DEFAULT_INSTANCES: usize = 1_000;
+
+/// What the wall-clock bound on a component call adds to `deadline_seconds`.
+///
+/// Long enough that a guest computing past its deadline is still caught by the epoch trap,
+/// which needs a tick of [`EPOCH_TICK_INTERVAL`] and control back in wasm, so only a call
+/// pending in the host is stopped by the wall bound.
+pub(crate) const WALL_DEADLINE_GRACE: Duration = Duration::from_secs(2);
+
+const _: () = assert!(
+    WALL_DEADLINE_GRACE.as_millis() > EPOCH_TICK_INTERVAL.as_millis(),
+    "the wall bound must leave the epoch at least one tick to fire first"
+);
 
 /// Default wall-clock budget for a single guest invocation — 10 minutes.
 ///
@@ -149,6 +169,12 @@ impl ExecutionLimits {
     pub(crate) fn deadline_ticks(&self) -> u64 {
         let tick_ms = EPOCH_TICK_INTERVAL.as_millis() as u64;
         (self.deadline_seconds.saturating_mul(1_000) / tick_ms).max(1)
+    }
+
+    /// The wall-clock bound on one phase of a call under these limits: `deadline_seconds` plus
+    /// [`WALL_DEADLINE_GRACE`], handed to [`bound_call`] or [`CallDeadlines::bound`].
+    pub(crate) fn wall_bound(&self) -> Duration {
+        Duration::from_secs(self.deadline_seconds).saturating_add(WALL_DEADLINE_GRACE)
     }
 
     /// Build the store limiter enforcing these limits.
@@ -298,6 +324,164 @@ impl Drop for EpochTicker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// A component call the wall-clock bound stopped, with how long it had run when it was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WallDeadline {
+    pub(crate) elapsed: Duration,
+}
+
+/// Await `call` for at most `bound`, measured from now. Past it the future is dropped, which
+/// is what stops a component call pending in a host wait, and the result is a [`WallDeadline`].
+///
+/// The one wall-clock bound every component entry point goes through, by way of
+/// [`CallDeadlines::bound`]. Needs a tokio runtime with its time driver enabled.
+pub(crate) async fn bound_call<F: Future>(
+    bound: Duration,
+    call: F,
+) -> Result<F::Output, WallDeadline> {
+    let started = Instant::now();
+    tokio::time::timeout(bound, call)
+        .await
+        .map_err(|_| WallDeadline {
+            elapsed: started.elapsed(),
+        })
+}
+
+/// What a component is running as when its call is bound, as `call_deadline.role` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComponentRole {
+    /// A script capsule's own component.
+    Capsule,
+    /// An inference driver run for a model call: the agent loop's turn or a hook's
+    /// `run-inference`.
+    Driver,
+    /// Every other tool-world component call, a driver reached by name included.
+    Tool,
+    Hook,
+    ProcessDriver,
+}
+
+impl ComponentRole {
+    /// The value `call_deadline.role` carries.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Capsule => "capsule",
+            Self::Driver => "driver",
+            Self::Tool => "tool",
+            Self::Hook => "hook",
+            Self::ProcessDriver => "process_driver",
+        }
+    }
+}
+
+/// One firing of the wall-clock bound, as its `call_deadline` line records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallDeadline {
+    /// The tool name of the artifact, the hook's name, or the capsule's manifest `name`.
+    pub(crate) component: String,
+    pub(crate) role: ComponentRole,
+    /// `instantiate`, `run`, a hook lifecycle function such as `on-session-start`, or a process
+    /// driver function: `describe`, `launch`, `parse` or `classify-exit`.
+    pub(crate) call: String,
+    pub(crate) deadline_seconds: u64,
+    pub(crate) elapsed_ms: u64,
+}
+
+/// The session's record of every component call the wall-clock bound stopped, filled where no
+/// trace writer is in reach and drained by the one that is.
+///
+/// Created at staging and cloned into everything that runs a component: the capsule store and
+/// every tool or driver store dispatched from it, each hook store, the process driver. The
+/// trace writer holding a clone drains it ahead of every line it writes, so each firing becomes
+/// exactly one `call_deadline` line before the record of the call it cut and before
+/// `session_end`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CallDeadlines(Arc<Mutex<Vec<CallDeadline>>>);
+
+impl CallDeadlines {
+    /// [`bound_call`] for one phase of a call under `limits`, recording a firing.
+    ///
+    /// A bound that fires inside another — a hook's `run-inference` driver call, a tool a script
+    /// capsule's `run` invokes — records itself; the outer one never fires for it, since the
+    /// inner call has returned. An outer bound that fires first drops the inner call before it
+    /// can record.
+    pub(crate) async fn bound<F: Future>(
+        &self,
+        component: &str,
+        role: ComponentRole,
+        call: &str,
+        limits: &ExecutionLimits,
+        future: F,
+    ) -> Result<F::Output, WallDeadline> {
+        let deadline = (limits.deadline_seconds, limits.wall_bound());
+        self.bound_within(component, role, call, deadline, future)
+            .await
+    }
+
+    /// [`Self::bound`] with the wall bound given outright beside the `deadline_seconds` it is
+    /// recorded under, so a test need not wait out a whole second.
+    async fn bound_within<F: Future>(
+        &self,
+        component: &str,
+        role: ComponentRole,
+        call: &str,
+        (deadline_seconds, bound): (u64, Duration),
+        future: F,
+    ) -> Result<F::Output, WallDeadline> {
+        let bounded = bound_call(bound, future).await;
+        if let Err(cut) = &bounded {
+            self.lock().push(CallDeadline {
+                component: component.to_string(),
+                role,
+                call: call.to_string(),
+                deadline_seconds,
+                elapsed_ms: u64::try_from(cut.elapsed.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        bounded
+    }
+
+    /// Takes every firing recorded since the last take, oldest first.
+    pub(crate) fn take(&self) -> Vec<CallDeadline> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    /// Records `cut` as if a bound had fired, for a test of what drains the latch.
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&self, cut: CallDeadline) {
+        self.lock().push(cut);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<CallDeadline>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The failure text of a call `subject` the wall-clock bound stopped, on the paths that report
+/// failures as plain text. The epoch's wording is [`GuestFailure::message`].
+pub(crate) fn wall_deadline_message(subject: &str, seconds: u64) -> String {
+    format!(
+        "{subject} waited on the host past its {seconds}s execution deadline \
+         (capabilities.limits.deadline_seconds) and was stopped"
+    )
+}
+
+/// [`wall_deadline_message`] for hook `hook`'s `fn_name` call, naming the key on the hook's own
+/// `artifacts:` entry, `entry`, as [`GuestFailure::hook_message`] does.
+pub(crate) fn wall_deadline_hook_message(
+    hook: &str,
+    entry: &str,
+    fn_name: &str,
+    seconds: u64,
+) -> String {
+    format!(
+        "hook '{hook}' {fn_name} waited on the host past its {seconds}s execution deadline \
+         (capabilities.limits.deadline_seconds on the artifacts: entry '{entry}') and was stopped"
+    )
 }
 
 /// Why a guest invocation failed, separating the two limits this module enforces from an
@@ -524,6 +708,83 @@ mod tests {
         assert!(failure
             .message("tool 'echo'", &error)
             .starts_with("tool 'echo' trapped: "));
+    }
+
+    #[test]
+    fn the_wall_bound_is_the_deadline_plus_a_positive_grace() {
+        assert!(WALL_DEADLINE_GRACE > Duration::ZERO);
+        let limits = ExecutionLimits {
+            deadline_seconds: 3,
+            ..ExecutionLimits::default()
+        };
+        assert_eq!(
+            limits.wall_bound(),
+            Duration::from_secs(3) + WALL_DEADLINE_GRACE
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_call_returns_a_finished_futures_output() {
+        assert_eq!(
+            bound_call(Duration::from_millis(50), async { 7 }).await,
+            Ok(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_call_stops_a_pending_future_after_the_bound() {
+        let bound = Duration::from_millis(30);
+        let cut = bound_call(bound, std::future::pending::<()>())
+            .await
+            .expect_err("a future that never finishes must be stopped");
+        assert!(cut.elapsed >= bound, "stopped after {:?}", cut.elapsed);
+    }
+
+    /// A firing is recorded once with what the call was, and a call that finished in time
+    /// records nothing.
+    #[tokio::test]
+    async fn the_latch_records_one_entry_per_firing() {
+        let deadlines = CallDeadlines::default();
+        let bound = (3, Duration::from_millis(30));
+        let finished = deadlines
+            .bound_within("echo", ComponentRole::Tool, "run", bound, async { 1 })
+            .await;
+        assert_eq!(finished, Ok(1));
+        assert!(deadlines.take().is_empty());
+
+        let cut = deadlines
+            .bound_within(
+                "stall",
+                ComponentRole::Driver,
+                "run",
+                bound,
+                std::future::pending::<()>(),
+            )
+            .await;
+        assert!(cut.is_err());
+        let taken = deadlines.take();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].component, "stall");
+        assert_eq!(taken[0].role.wire_name(), "driver");
+        assert_eq!(taken[0].call, "run");
+        assert_eq!(taken[0].deadline_seconds, 3);
+        assert!(taken[0].elapsed_ms >= 30);
+        assert!(deadlines.take().is_empty(), "a take clears the latch");
+    }
+
+    #[test]
+    fn wall_deadline_messages_name_the_key_that_set_the_deadline() {
+        assert_eq!(
+            wall_deadline_message("tool 'stall'", 3),
+            "tool 'stall' waited on the host past its 3s execution deadline \
+             (capabilities.limits.deadline_seconds) and was stopped"
+        );
+        assert_eq!(
+            wall_deadline_hook_message("sleep", "local/sleep", "on-session-start", 2),
+            "hook 'sleep' on-session-start waited on the host past its 2s execution deadline \
+             (capabilities.limits.deadline_seconds on the artifacts: entry 'local/sleep') and was \
+             stopped"
+        );
     }
 
     #[test]

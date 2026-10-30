@@ -747,6 +747,8 @@ impl<'a> ProcessEventSink<'a> {
                     spent: None,
                     settings: None,
                     retry: crate::inference_retry::RetryNote::default(),
+                    // The process transport sends nothing through a runtime gateway.
+                    gateway: None,
                 })
                 .await;
             return Ok(Vec::new());
@@ -801,6 +803,8 @@ impl<'a> ProcessEventSink<'a> {
                         spent: Some((spent.input, spent.output)),
                         settings: None,
                         retry: crate::inference_retry::RetryNote::default(),
+                        // The process transport sends nothing through a runtime gateway.
+                        gateway: None,
                     })
                     .await
             }

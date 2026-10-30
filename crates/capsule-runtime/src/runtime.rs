@@ -76,7 +76,10 @@ use crate::{
     inference_import::{HookInferenceCtx, InferenceUnavailable},
     keep_working::KeepWorkingStop,
     lanes::LaneQueue,
-    limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
+    limits::{
+        classify_guest_failure, wall_deadline_message, CallDeadlines, ComponentRole, EpochTicker,
+        ExecutionLimiter, GuestFailure,
+    },
     murmur_md,
     network_policy::{
         effective_tool_network_rules, parse_network_allow_rules, resolve_scoped_dir,
@@ -2641,6 +2644,9 @@ pub fn stage_session(
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
     // hooks, which are already subject to the epoch deadline.
     let epoch_ticker = EpochTicker::spawn(&engine);
+    // Every component this session runs, from the on-stage hooks below on, records a call its
+    // wall-clock bound stopped here.
+    let call_deadlines = CallDeadlines::default();
     // Every report above names artifacts by full name; from here on the session knows each by its
     // tool name, and `full_names` takes it back to the full name for the store, the lock and the
     // identity records.
@@ -2996,8 +3002,14 @@ pub fn stage_session(
                     RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
                 })?;
             let description = rt.block_on(async {
-                let mut driver =
-                    ProcessDriver::instantiate(&engine, &component, &name, &version).await?;
+                let mut driver = ProcessDriver::instantiate(
+                    &engine,
+                    &component,
+                    &name,
+                    &version,
+                    call_deadlines.clone(),
+                )
+                .await?;
                 driver.describe().await
             })?;
             check_required_env(
@@ -3383,6 +3395,7 @@ pub fn stage_session(
     let stage_env = HookEnvVars {
         formation_id: request.formation_id.as_ref().map(FormationId::as_str),
         formation_member: request.formation_member.as_ref(),
+        call_deadlines: call_deadlines.clone(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -3543,6 +3556,7 @@ pub fn stage_session(
         registry,
         source_supply: request.source_supply,
         _epoch_ticker: epoch_ticker,
+        call_deadlines,
         // Minted by the daemon at registration, which `launch_session` performs — it names a
         // session id, and staging is what mints one.
         spawn_credential: None,
@@ -4186,6 +4200,7 @@ fn launch(
         let host_facts = staged.host_facts;
         let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
+        let call_deadlines = staged.call_deadlines.clone();
         let capability_policy = staged.capability_policy.clone();
         let protected_paths = staged.protected_paths.clone();
         let tool_annotations = staged.tool_annotations.clone();
@@ -4259,6 +4274,7 @@ fn launch(
                 Some(refusal) => RuntimeError::WorkdirPathRefused { refusal },
                 None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
             })?;
+            trace.set_call_deadlines(call_deadlines.clone());
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
             let session_status = Arc::new(crate::session_status::SessionStatus::new(
                 std::time::Instant::now(),
@@ -4466,6 +4482,7 @@ fn launch(
                         // the per-tool limiters built in `dispatch_tool_async` (from
                         // `capability_policy.limits`) that bound this path's guests.
                         limits: capability_policy.limits.limiter(),
+                        call_deadlines: call_deadlines.clone(),
                         table: ResourceTable::new(),
                         // The capsule's own store is the ceiling itself, never narrowed:
                         // per-artifact grants apply to staged tools/drivers, not to the
@@ -4620,6 +4637,7 @@ fn launch(
                                     retries: std::sync::Mutex::new(Vec::new()),
                                     retry: inference.retry.into(),
                                     deadline: session_status.deadline(),
+                                    call_deadlines: state.call_deadlines.clone(),
                                 })
                             })
                             .ok_or(InferenceUnavailable::NotConfigured)
@@ -4645,6 +4663,7 @@ fn launch(
                             dataset_id: dataset_id.as_deref(),
                             formation_id: formation_id.as_ref().map(FormationId::as_str),
                             formation_member: formation_member.as_ref(),
+                            call_deadlines: call_deadlines.clone(),
                         },
                         hook_limits,
                         hook_inference,
@@ -5478,6 +5497,7 @@ fn launch(
     trace.set_gateways(session_gateway_records);
     trace.set_control(staged.control.as_ref().map(|state| state.session_control()));
     trace.set_tool_refresh(None);
+    trace.set_call_deadlines(staged.call_deadlines.clone());
     trace.set_runtime_artifacts(&staged.installed_artifacts);
     trace.set_host_facts(&staged.host_facts);
     trace.set_formation_id(staged.formation_id.as_ref());
@@ -5590,6 +5610,7 @@ fn launch(
         // A script capsule has no agent loop to offer the tool to.
         member_calls: None,
         limits: capsule_limits.limiter(),
+        call_deadlines: staged.call_deadlines.clone(),
     };
 
     let mut store = Store::new(&staged.engine, state);
@@ -5597,12 +5618,25 @@ fn launch(
     // the store enforces, and instantiation itself allocates against them.
     store.limiter(|state| &mut state.limits);
 
+    let call_deadlines = staged.call_deadlines.clone();
+    let capsule_name = staged.capsule_name.clone();
+    // A phase the wall-clock bound stopped fails exactly as one the epoch interrupted.
+    let stopped = || RuntimeError::CapsuleDeadlineExceeded {
+        seconds: capsule_limits.deadline_seconds,
+    };
     let ran: Result<(), RuntimeError> = rt.block_on(async {
         // Instantiation runs the guest's own start/init code, so it gets a deadline too.
         store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let instantiated = linker
-            .instantiate_async(&mut store, &capsule_component)
-            .await;
+        let instantiated = call_deadlines
+            .bound(
+                &capsule_name,
+                ComponentRole::Capsule,
+                "instantiate",
+                &capsule_limits,
+                linker.instantiate_async(&mut store, &capsule_component),
+            )
+            .await
+            .map_err(|_| stopped())?;
         let instance = match instantiated {
             Ok(instance) => instance,
             Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
@@ -5622,7 +5656,16 @@ fn launch(
 
         // Fresh budget for `run` itself, so instantiation cost cannot eat into it.
         store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let called = run.call_async(&mut store, ()).await;
+        let called = call_deadlines
+            .bound(
+                &capsule_name,
+                ComponentRole::Capsule,
+                "run",
+                &capsule_limits,
+                run.call_async(&mut store, ()),
+            )
+            .await
+            .map_err(|_| stopped())?;
         if let Err(err) = called {
             return Err(capsule_guest_error(&err, &store.data().limits));
         }
@@ -7661,6 +7704,9 @@ pub(crate) struct CapsuleStoreState {
     /// any growth request it denied, which `classify_guest_failure` reads to tell a
     /// limit trap apart from a guest panic.
     pub(crate) limits: ExecutionLimiter,
+    /// The session's latch, cloned into every tool and driver store dispatched from here, where
+    /// a call the wall-clock bound stops is recorded.
+    pub(crate) call_deadlines: CallDeadlines,
     pub(crate) table: ResourceTable,
     pub(crate) wasi: WasiCtx,
     pub(crate) http: WasiHttpCtx,
@@ -8703,6 +8749,11 @@ pub(crate) struct ToolInvokeEnv<'a> {
     pub(crate) formation: Option<&'a Arc<FormationMember>>,
     /// The task this dispatch runs for, whose trust a formation call is stamped with.
     pub(crate) task_provenance: Option<TaskProvenance>,
+    /// [`ComponentRole::Driver`] for an inference driver run for a model call,
+    /// [`ComponentRole::Tool`] for every other call: what a `call_deadline` names it as.
+    pub(crate) role: ComponentRole,
+    /// The session's latch, where a call the wall-clock bound stops is recorded.
+    pub(crate) call_deadlines: &'a CallDeadlines,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -8764,6 +8815,8 @@ pub(crate) async fn invoke_tool_component(
         gateway,
         formation,
         task_provenance,
+        role,
+        call_deadlines,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -8930,10 +8983,19 @@ pub(crate) async fn invoke_tool_component(
     // Registered before instantiation — see the capsule store for why.
     store.limiter(|state| &mut state.limits);
 
+    let subject = format!("tool '{name}'");
+    let stopped = |_| wall_deadline_message(&subject, tool_limits.deadline_seconds);
     store.set_epoch_deadline(tool_limits.deadline_ticks());
-    let instance = linker
-        .instantiate_async(&mut store, component)
+    let instance = call_deadlines
+        .bound(
+            name,
+            role,
+            "instantiate",
+            &tool_limits,
+            linker.instantiate_async(&mut store, component),
+        )
         .await
+        .map_err(stopped)?
         .map_err(|err| format!("failed to instantiate tool '{name}': {err}"))?;
 
     let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
@@ -8960,7 +9022,16 @@ pub(crate) async fn invoke_tool_component(
     // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
     // also the driver path (`agent.rs` dispatches the inference driver through here).
     store.set_epoch_deadline(tool_limits.deadline_ticks());
-    let called = run.call_async(&mut store, (input,)).await;
+    let called = call_deadlines
+        .bound(
+            name,
+            role,
+            "run",
+            &tool_limits,
+            run.call_async(&mut store, (input,)),
+        )
+        .await
+        .map_err(stopped)?;
     let (result,) = match called {
         Ok(result) => result,
         Err(err) => {
@@ -8968,7 +9039,7 @@ pub(crate) async fn invoke_tool_component(
             // deadline or limit trap is distinguishable on a path that reports failures
             // as plain text. `Other` reproduces the pre-slice wording verbatim.
             let failure = classify_guest_failure(&err, &store.data().limits);
-            return Err(failure.message(&format!("tool '{name}'"), &err));
+            return Err(failure.message(&subject, &err));
         }
     };
     Ok(result)
@@ -9080,8 +9151,15 @@ impl CapsuleStoreState {
         let env = driver_choice_env(&self.inference_env, choice, gateway);
         // The one dispatch whose `tool-call-started` and `tool-call-input-bytes` reach the stream.
         let tool_calls = Some(Arc::clone(&self.a2a_tool_calls));
-        self.dispatch_component_with_env(&choice.driver, input, gateway, &env, tool_calls)
-            .await
+        self.dispatch_component_with_env(
+            &choice.driver,
+            input,
+            gateway,
+            &env,
+            tool_calls,
+            ComponentRole::Driver,
+        )
+        .await
     }
 
     async fn dispatch_component_async(
@@ -9090,8 +9168,15 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gateway: Option<&Arc<CredentialGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        self.dispatch_component_with_env(name, input, gateway, &self.inference_env, None)
-            .await
+        self.dispatch_component_with_env(
+            name,
+            input,
+            gateway,
+            &self.inference_env,
+            None,
+            ComponentRole::Tool,
+        )
+        .await
     }
 
     /// Whether the operator's entry for tool `name` declares a `capabilities.filesystem.scope`.
@@ -9126,6 +9211,7 @@ impl CapsuleStoreState {
         gateway: Option<&Arc<CredentialGateway>>,
         inference_env: &[(String, String)],
         tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
+        role: ComponentRole,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -9145,6 +9231,8 @@ impl CapsuleStoreState {
                 gateway,
                 formation: self.http_hooks.formation.as_ref(),
                 task_provenance: self.current_task_provenance,
+                role,
+                call_deadlines: &self.call_deadlines,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -17359,6 +17447,7 @@ inference:
         let root = WorkdirRoot::open(&workdir).unwrap();
         CapsuleStoreState {
             limits: crate::limits::ExecutionLimits::default().limiter(),
+            call_deadlines: CallDeadlines::default(),
             table: ResourceTable::new(),
             wasi,
             http: WasiHttpCtx::new(),
@@ -21948,6 +22037,8 @@ inference:
                     gateway: None,
                     formation: None,
                     task_provenance: None,
+                    role: ComponentRole::Tool,
+                    call_deadlines: &CallDeadlines::default(),
                 },
                 ToolA2aWiring::silent(),
                 "scoped-tool",
@@ -21994,6 +22085,8 @@ inference:
                     gateway: None,
                     formation: None,
                     task_provenance: None,
+                    role: ComponentRole::Tool,
+                    call_deadlines: &CallDeadlines::default(),
                 },
                 ToolA2aWiring::silent(),
                 "plain-tool",
@@ -23959,6 +24052,7 @@ inference:
             retries: std::sync::Mutex::new(Vec::new()),
             retry: Default::default(),
             deadline: None,
+            call_deadlines: CallDeadlines::default(),
         });
         let mut hooks =
             crate::hooks::test_support::inference_calling_hooks(&state.engine, &workdir, ctx).await;

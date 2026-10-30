@@ -24,11 +24,12 @@ use crate::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
     },
-    credential_gateway::UpstreamOutcome,
+    credential_gateway::{GatewayOffsets, UpstreamOutcome},
     inference_retry::{
         millis, AttemptFailure, InferenceRetryRecord, RetryDecision, RetryNote, RetryPolicy,
         RetryReason,
     },
+    limits::{CallDeadlines, ComponentRole},
     network_policy::{NetworkAllowRule, ToolCapabilityGrant},
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
     session_status::SessionDeadline,
@@ -76,6 +77,8 @@ pub(crate) struct HookInferenceRecord {
     /// The attempts the call took and why its retrying stopped. Every attempt before the last
     /// has its own [`InferenceRetryRecord`].
     pub(crate) retry: RetryNote,
+    /// The last attempt's gateway timing; `None` when the context holds no gateway.
+    pub(crate) gateway: Option<GatewayOffsets>,
 }
 
 /// Why one `run-inference` call failed: what the guest is told, and what the trace records.
@@ -197,6 +200,8 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) retry: RetryPolicy,
     /// The session deadline, past which no retry's wait may run.
     pub(crate) deadline: Option<SessionDeadline>,
+    /// The session's latch, where a driver call the wall-clock bound stops is recorded.
+    pub(crate) call_deadlines: CallDeadlines,
 }
 
 impl HookInferenceCtx {
@@ -264,7 +269,9 @@ impl HookInferenceCtx {
             };
 
             let started = Instant::now();
-            let outcome = self.dispatch(payload_json.clone(), inference_env).await;
+            let (outcome, gateway_timing) = self
+                .dispatch(payload_json.clone(), inference_env, started)
+                .await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let (output_tokens, usage, failure, result, stopped) = match outcome {
@@ -372,6 +379,7 @@ impl HookInferenceCtx {
                 failure,
                 settings,
                 retry: RetryNote::new(retries_made + 1, stopped),
+                gateway: gateway_timing,
             });
 
             return result;
@@ -397,23 +405,33 @@ impl HookInferenceCtx {
 
     /// Dispatch the payload through the shared tool-invocation path and pull the
     /// completion text and the optional `usage` block out of the driver's response.
-    /// Returns `(raw, text, usage)`. The failure is boxed because it is far larger than the
-    /// success value and is built only on the cold path.
+    /// Returns `(raw, text, usage)`, beside the gateway's timing as milliseconds from `started`,
+    /// the attempt's start. The failure is boxed because it is far larger than the success
+    /// value and is built only on the cold path.
     async fn dispatch(
         &self,
         payload_json: String,
         inference_env: &[(String, String)],
-    ) -> Result<(String, String, Option<DriverUsage>), Box<FailedAttempt>> {
+        started: Instant,
+    ) -> (
+        Result<(String, String, Option<DriverUsage>), Box<FailedAttempt>>,
+        Option<GatewayOffsets>,
+    ) {
         // What the gateway records during this dispatch belongs to this attempt.
         if let Some(gateway) = &self.gateway {
             gateway.take_upstream_outcome();
+            gateway.take_timing();
         }
         let result = self.dispatch_driver(payload_json, inference_env).await;
         let outcome = self
             .gateway
             .as_ref()
             .and_then(|gateway| gateway.take_upstream_outcome());
-        result.map_err(|failed| {
+        let timing = self
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.take_timing().offsets_from(started));
+        let result = result.map_err(|failed| {
             let DriverFailure {
                 code,
                 message,
@@ -436,7 +454,8 @@ impl HookInferenceCtx {
                 transient,
                 outcome,
             })
-        })
+        });
+        (result, timing)
     }
 
     /// [`Self::dispatch`] without the gateway bookkeeping. The failure is boxed for the same
@@ -461,6 +480,8 @@ impl HookInferenceCtx {
                 // A hook's completion runs for no task of its own, so a formation call from it
                 // stamps `untrusted`.
                 task_provenance: None,
+                role: ComponentRole::Driver,
+                call_deadlines: &self.call_deadlines,
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.
@@ -1079,6 +1100,7 @@ mod tests {
             retries: std::sync::Mutex::new(Vec::new()),
             retry: Default::default(),
             deadline: None,
+            call_deadlines: CallDeadlines::default(),
         }
     }
 
