@@ -189,8 +189,13 @@ preceded the reopen.
 ## Deadlines { #deadlines }
 
 A deadline is a wall-clock moment at which the runtime ends the session, whatever it is doing: the
-running task is cancelled and ends `canceled`, the session ends `deadline_reached`, and `mur run`
-exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053).
+running task is cancelled, the session ends `deadline_reached`, and `mur run` exits with
+[`E-RUN-053`](../reference/diagnostics.md#e-run-053).
+
+| Record | What a deadline-cancelled task reads |
+|---|---|
+| The task's A2A state, its stream's final status and `out/result.txt` | `canceled` |
+| [`task_end.exit_status`](../reference/observability-schemas.md#task-end) | `deadline_reached`, the word `session_end.exit_status` uses |
 
 A session runs under the **earliest** deadline placed on it:
 
@@ -209,10 +214,11 @@ child, [`lifecycle.delegation_deadline_secs`](../reference/manifest.md#lifecycle
 is a separate bound: whichever falls first ends the child.
 
 A task [kept working](#keep-working) past a turn end is the exception to the cancel: the deadline
-ends it `ok` with its last turn end's answer, while the session still ends `deadline_reached` and
-`mur run` still exits with `E-RUN-053`. So is a task whose [done check](#done-check) is running or
-has reopened it: the deadline kills a running check and ends the task `ok` with the answer it was
-checking.
+ends it `completed` with its last turn end's answer, while the session still ends
+`deadline_reached` and `mur run` still exits with `E-RUN-053`. So is a task whose
+[done check](#done-check) is running or has reopened it: the deadline kills a running check and
+ends the task `completed` with the answer it was checking. Either way its `task_end.exit_status` is
+`deadline_reached`.
 
 ## Keeping a task working { #keep-working }
 
@@ -231,7 +237,7 @@ The runtime keeps sending the message until the first of these stops it:
 | `limit` continuations were sent and the next turn ends | `limit` | `ok`, with that last turn's answer |
 | [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at a turn end or inside a continued attempt | `max_turns` | `ok`, with the last turn end's answer |
 | A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a continued attempt | `spend_ceiling` | `ok`, with the last turn end's answer. The refused call is not retried |
-| The [session deadline](#deadlines) falls while the task is being kept working | `deadline` | `ok`, with the last turn end's answer. The session still ends `deadline_reached`, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+| The [session deadline](#deadlines) falls while the task is being kept working | `deadline` | `deadline_reached`, with the last turn end's answer. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
 | `transport: process` left no harness session to resume | `no_session` | `ok`, with the last turn end's answer |
 
 "The last turn end's answer" is the text `out/result.txt`, `GetTask` and the stream's final status
@@ -295,7 +301,7 @@ What ends a task with its check unmet:
 | `limit` reopens were spent and the next run failed too | `limit` | `ok`, with the last answer |
 | [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at the stop or inside a reopened attempt | `max_turns` | `ok`, with the answer that preceded the reopen when a reopened attempt ran out |
 | A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a reopened attempt | `spend_ceiling` | `ok`, with the answer that preceded the reopen |
-| The [session deadline](#deadlines) falls while the check runs or a reopened attempt works | `deadline` | `ok`, with the answer being checked; a running check is killed. The session still ends `deadline_reached`, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+| The [session deadline](#deadlines) falls while the check runs or a reopened attempt works | `deadline` | `deadline_reached`, with the answer being checked; a running check is killed. The session ends `deadline_reached` too, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
 
 A person's `CancelTask`, `mur stop` and `SIGTERM` still end the task `canceled`; a check they
 interrupt is killed and `task_canceled.phase` is `"done_check"`.
@@ -573,6 +579,12 @@ The report is a task the capsule generated for itself, so `lifecycle.task_accept
 gate it: a resume delivers it under `none`, `single` and `queue` alike, after the task the resume
 was launched for.
 
-Each reported command is marked `shell_lost` in the trace of the session that started it, so a
-second resume of the same session reports nothing. A session that ended cleanly has nothing to
-report either way.
+Each reported command is marked `shell_lost` in the `trace.jsonl` the resume read, so a second
+resume of the same trace reports nothing. A session that ended cleanly has nothing to report either
+way.
+
+The session a resume continues is the one the trace's own `session_start` line names, so a
+`trace.jsonl` copied into a folder of any name — as a benchmark keeps each attempt — resumes as
+that session, with the same report, and the copy is the file the `shell_lost` markers are appended
+to. A trace with no `session_start` line still resumes its conversation, but names no session whose
+background work could be reported: nothing is reported, and one line on stderr says so.

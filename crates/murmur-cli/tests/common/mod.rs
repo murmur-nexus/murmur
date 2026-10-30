@@ -554,20 +554,21 @@ pub fn stage_agent_session_with_workdir(
     )
 }
 
-/// `stage_agent_session` for a launch that continues `from_session` under `context_id`, the pair
-/// `mur run --resume` resolves before staging.
+/// `stage_agent_session` for a launch that continues the session whose records directory is
+/// `prior_records_dir` under `context_id`, the pair `mur run --resume` resolves before staging.
+/// The session id is the directory's name, as it is for any records directory the runtime made.
 pub fn stage_agent_session_resuming(
     home: &TempDir,
     project_dir: &Path,
     manifest_path: &Path,
-    from_session: &str,
+    prior_records_dir: &Path,
     context_id: &str,
 ) -> StagedSession {
     stage_agent_session_inner(
         home,
         project_dir,
         manifest_path,
-        Some((from_session.to_string(), context_id.to_string())),
+        Some((prior_records_dir.to_path_buf(), context_id.to_string())),
         None,
         ContainmentClass::Advisory,
         None,
@@ -578,7 +579,7 @@ fn stage_agent_session_inner(
     home: &TempDir,
     project_dir: &Path,
     manifest_path: &Path,
-    resume: Option<(String, String)>,
+    resume: Option<(PathBuf, String)>,
     workdir: Option<PathBuf>,
     floor: ContainmentClass,
     session_deadline: Option<capsule_runtime::session_status::SessionDeadline>,
@@ -630,8 +631,13 @@ fn stage_agent_session_inner(
             context_id: resume.as_ref().map(|(_, context_id)| context_id.clone()),
             resume: resume
                 .as_ref()
-                .map(|(from_session, _)| capsule_runtime::ResumeRequest {
-                    from_session: from_session.clone(),
+                .map(|(prior_records_dir, _)| capsule_runtime::ResumeRequest {
+                    from_session: prior_records_dir
+                        .file_name()
+                        .expect("a records directory has a name")
+                        .to_string_lossy()
+                        .into_owned(),
+                    trace_dir: prior_records_dir.clone(),
                     mode: capsule_runtime::ResumeMode::Full,
                 }),
             forget_session: false,

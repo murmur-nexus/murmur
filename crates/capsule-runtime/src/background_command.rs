@@ -357,6 +357,7 @@ mod tests {
             output_path: "/records/logs/wrk_0a1b.log".to_string(),
             output_bytes,
             tail: tail.to_vec(),
+            delivered_now: false,
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
                 command: "make test".to_string(),
                 exit_code,
                 duration_ms: 12_345,
+                exited_at_ms: 1_000,
                 output_path: "/records/logs/wrk_0a1b.log".to_string(),
                 output_bytes: 7,
                 resource_limit: None,

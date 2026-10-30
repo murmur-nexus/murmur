@@ -845,8 +845,16 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
         completed[0]["completion_task_id"], completion_start["task_id"],
         "shell_completed names the task it enqueued"
     );
+    assert_eq!(completed[0]["delivered_via"], "task");
     assert_eq!(completed[0]["exit_code"], 0);
     assert_eq!(completed[0]["status"], "ok");
+    let exited_at = completed[0]["exited_at_ms"].as_u64().unwrap();
+    assert!(
+        detached[0]["timestamp"].as_u64().unwrap() <= exited_at
+            && exited_at <= completed[0]["timestamp"].as_u64().unwrap(),
+        "exited_at_ms falls between the demotion and the record: {}",
+        completed[0]
+    );
     let log = trace_path
         .parent()
         .unwrap()

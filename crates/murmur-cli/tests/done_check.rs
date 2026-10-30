@@ -547,8 +547,8 @@ fn a_spend_ceiling_ends_a_reopened_attempt_ok() {
 
 const DEADLINE_SECS: u64 = 45;
 
-/// A deadline that falls while the check runs kills it and ends the task `ok` with the answer;
-/// the session still ends `deadline_reached`.
+/// A deadline that falls while the check runs kills it and ends the task with the answer as its
+/// result; `task_end` and `session_end` both name the deadline.
 #[test]
 fn a_deadline_stops_a_running_check() {
     if common::skip_without_host_support("a_deadline_stops_a_running_check") {
@@ -594,7 +594,7 @@ fn a_deadline_stops_a_running_check() {
     );
     assert_eq!(session_end, trace.len() - 1, "{trace:#?}");
     assert_eq!(trace[session_end]["exit_status"], "deadline_reached");
-    assert_eq!(trace[task_end]["exit_status"], "ok");
+    assert_eq!(trace[task_end]["exit_status"], "deadline_reached");
     assert_eq!(trace[task_end]["done_check"]["stopped_by"], "deadline");
     assert_eq!(trace[task_end]["done_check"]["met"], false);
     assert_eq!(run.result(), "answer");

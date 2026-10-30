@@ -813,7 +813,8 @@ fn the_deadline_notice_is_sent_once() {
 /// the session is in its first turn when it falls.
 const DEADLINE_SECS: u64 = 25;
 
-/// `deadline_reached`, then the wind-down, then `session_end` saying so, and `E-RUN-053`.
+/// `deadline_reached`, then the wind-down, then `task_end` and `session_end` saying so, and
+/// `E-RUN-053`.
 ///
 /// A host loaded enough to spend the whole deadline staging reaches it before the task starts,
 /// which ends the session with no task run at all; that is asserted instead.
@@ -843,7 +844,7 @@ fn assert_ended_by_the_deadline(run: &Run) {
             .all(|event| event["event_type"] != "task_canceled"),
         "deadline_reached precedes every cancel: {trace:#?}"
     );
-    assert_eq!(trace[task_end]["exit_status"], "canceled");
+    assert_eq!(trace[task_end]["exit_status"], "deadline_reached");
     assert_eq!(
         trace[reached]["deadline_at"],
         first(&trace, "session_start")["deadline"]["at"]

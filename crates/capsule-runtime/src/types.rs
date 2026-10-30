@@ -405,8 +405,13 @@ pub enum ResumeMode {
 /// stateless` — and the provenance the trace records.
 #[derive(Debug, Clone)]
 pub struct ResumeRequest {
-    /// The prior session's id, recorded verbatim as `session_start.resumed_from`.
+    /// The prior session's id, recorded verbatim as `session_start.resumed_from`: the id its
+    /// trace's own `session_start` carries, or the trace's directory name when it records none.
     pub from_session: String,
+    /// The absolute directory holding the resumed trace's `trace.jsonl`: the prior session's
+    /// records directory, or wherever that trace was copied. The lost-work reconciliation reads
+    /// this file and appends its `shell_lost` markers to it.
+    pub trace_dir: PathBuf,
     pub mode: ResumeMode,
 }
 

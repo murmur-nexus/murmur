@@ -3023,6 +3023,7 @@ fn lineage_survives_a_resume_of_the_parent() {
     // goes away.
     assert_eq!(first.events("delegation").len(), 1);
     let first_session_id = first.session_id();
+    let first_records_dir = first.records_dir.clone();
     let child_dir = first.only_child_dir();
     drop(first);
 
@@ -3033,6 +3034,7 @@ fn lineage_survives_a_resume_of_the_parent() {
         Some(context_id.clone()),
         Some(capsule_runtime::ResumeRequest {
             from_session: first_session_id.clone(),
+            trace_dir: first_records_dir,
             mode: capsule_runtime::ResumeMode::Full,
         }),
     );

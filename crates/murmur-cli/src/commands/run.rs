@@ -27,7 +27,7 @@ use murmur_artifact::{
 use murmur_artifact::{runtime_warning_link, W_RUN_007};
 
 use crate::{
-    commands::trace::{first_task_context_id, resolve_session_dir},
+    commands::trace::{resolve_session_dir, trace_head},
     config::load_effective_mur_config_if_any_exists,
     error::{
         CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
@@ -106,6 +106,11 @@ fn absolutise(dir: &Path) -> PathBuf {
 /// directory exists — which is what makes `@1` name the previous run rather than the one being
 /// started. `--resume` is sugar over `--context`: the id this returns goes into the same
 /// `StageRequest.context_id` field `--context` fills, and there is no second load path.
+///
+/// The session continued is the one the trace's own `session_start` names, so a `trace.jsonl`
+/// copied into a folder of any name resumes as the session it records, and the runtime accounts
+/// for its lost work in that copy. A trace with no `session_start` before its first task resumes
+/// under its directory's name.
 fn resolve_resume(
     resume_arg: &str,
     resume_mode: ResumeMode,
@@ -114,11 +119,14 @@ fn resolve_resume(
 ) -> Result<(ResumeRequest, String), CliError> {
     let root = workdir_root(project_dir, workdir_arg);
     let session_dir = resolve_session_dir(resume_arg, &root, "--resume")?;
-    let session = session_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| resume_arg.to_string());
-    let context_id = first_task_context_id(&session_dir)?.ok_or_else(|| {
+    let head = trace_head(&session_dir)?;
+    let session = head.session_id.unwrap_or_else(|| {
+        session_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| resume_arg.to_string())
+    });
+    let context_id = head.context_id.ok_or_else(|| {
         CliError::with_hint(
             E_RUN_016,
             format!(
@@ -136,6 +144,7 @@ fn resolve_resume(
     Ok((
         ResumeRequest {
             from_session: session,
+            trace_dir: absolutise(&session_dir),
             mode: resume_mode,
         },
         context_id,
@@ -1538,6 +1547,59 @@ mod tests {
         assert!(!started_by_hand_in_a_formation(true, false, true));
         assert!(!started_by_hand_in_a_formation(false, false, false));
         assert!(!started_by_hand_in_a_formation(false, true, true));
+    }
+
+    /// `--resume` continues the session a trace's own `session_start` names, wherever the trace
+    /// sits: a copy in a folder not named for any session resolves to the session it records, read
+    /// off the line as JSON even when it carries nothing else, and to its directory's name when it
+    /// records no `session_start` at all.
+    #[test]
+    fn resume_reads_the_session_id_off_the_trace_not_its_directory() {
+        let root = tempdir().unwrap();
+        let copy = root.path().join("bench-attempt-1");
+        fs::create_dir_all(&copy).unwrap();
+        let task_start = r#"{"event_type":"task_start","event_id":"evt_2","session_id":"ses_killed","timestamp":2,"task_id":"tsk_1","context_id":"ctx_copied","source":"task_md","message_parts_bytes":9}"#;
+        fs::write(
+            copy.join("trace.jsonl"),
+            format!(
+                "{{\"event_type\":\"session_start\",\"event_id\":\"evt_1\",\"session_id\":\"ses_killed\",\"timestamp\":1}}\n{task_start}\n"
+            ),
+        )
+        .unwrap();
+
+        for address in [copy.clone(), copy.join("trace.jsonl")] {
+            let (request, context_id) = resolve_resume(
+                address.to_str().unwrap(),
+                ResumeMode::Full,
+                root.path(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(request.from_session, "ses_killed");
+            assert_eq!(request.trace_dir, copy);
+            assert_eq!(context_id, "ctx_copied");
+        }
+        assert_eq!(
+            trace_head(&copy).unwrap(),
+            crate::commands::trace::TraceHead {
+                session_id: Some("ses_killed".to_string()),
+                context_id: Some("ctx_copied".to_string()),
+            }
+        );
+
+        fs::write(copy.join("trace.jsonl"), format!("{task_start}\n")).unwrap();
+        assert_eq!(trace_head(&copy).unwrap().session_id, None);
+        let (request, _) =
+            resolve_resume(copy.to_str().unwrap(), ResumeMode::Full, root.path(), None).unwrap();
+        assert_eq!(request.from_session, "bench-attempt-1");
+
+        fs::write(
+            copy.join("trace.jsonl"),
+            format!("not json\n{task_start}\n"),
+        )
+        .unwrap();
+        let error = trace_head(&copy).unwrap_err();
+        assert_eq!(error.code, "E-TRC-001", "{error:?}");
     }
 
     #[test]

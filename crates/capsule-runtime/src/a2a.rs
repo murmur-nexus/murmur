@@ -1370,6 +1370,9 @@ pub(crate) struct TaskRegistry {
     /// Tasks holding a standing answer whose signal the session deadline raised without
     /// recording `Canceled`; read by [`Self::stopped_at_deadline`].
     stopped_at_deadline: HashSet<String>,
+    /// Tasks the session deadline's cancel was accepted for; read by
+    /// [`Self::canceled_at_deadline`].
+    canceled_at_deadline: HashSet<String>,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -1407,6 +1410,7 @@ impl TaskRegistry {
             status_times: HashMap::new(),
             standing_answers: HashSet::new(),
             stopped_at_deadline: HashSet::new(),
+            canceled_at_deadline: HashSet::new(),
         }
     }
 
@@ -1562,6 +1566,7 @@ impl TaskRegistry {
         self.cancels.remove(&tid);
         self.standing_answers.remove(&tid);
         self.stopped_at_deadline.remove(&tid);
+        self.canceled_at_deadline.remove(&tid);
         // An accepted cancel is final. A turn a person stopped must never later read as one
         // that ran to completion, so the outcome the loop reports loses to the one already
         // recorded.
@@ -1698,17 +1703,24 @@ impl TaskRegistry {
         self.stopped_at_deadline.contains(task_id)
     }
 
+    /// Whether the session deadline cancelled `task_id`: its cancel was accepted by
+    /// [`Self::cancel_every_live`] at the deadline, not by a person or another termination first.
+    pub(crate) fn canceled_at_deadline(&self, task_id: &str) -> bool {
+        self.canceled_at_deadline.contains(task_id)
+    }
+
     /// Cancel every task that is not yet terminal, and return the ids that were cancelled, sorted.
     ///
     /// Each goes through [`Self::request_cancel`], so a running task's signal is raised and a
     /// `submitted` task's queue slot is given back. A second call returns nothing: every task the
     /// first one touched is `Canceled`, which is terminal.
     ///
-    /// With `spare_standing_answers`, which the session deadline passes, a task holding a standing
-    /// answer ([`Self::mark_standing_answer`]) only has its signal raised and is marked
+    /// With `at_deadline`, which the session deadline passes, a task holding a standing answer
+    /// ([`Self::mark_standing_answer`]) only has its signal raised and is marked
     /// [`Self::stopped_at_deadline`]: its history is left as it is, it is not in the returned ids,
-    /// and the task loop ends it with that answer.
-    pub(crate) fn cancel_every_live(&mut self, spare_standing_answers: bool) -> Vec<String> {
+    /// and the task loop ends it with that answer. Every task it does cancel is marked
+    /// [`Self::canceled_at_deadline`].
+    pub(crate) fn cancel_every_live(&mut self, at_deadline: bool) -> Vec<String> {
         let live: Vec<String> = self
             .history
             .iter()
@@ -1717,7 +1729,7 @@ impl TaskRegistry {
             .collect();
         let (spared, live): (Vec<String>, Vec<String>) = live
             .into_iter()
-            .partition(|task_id| spare_standing_answers && self.standing_answers.contains(task_id));
+            .partition(|task_id| at_deadline && self.standing_answers.contains(task_id));
         for task_id in spared {
             self.cancel_watch(&task_id).cancel();
             self.stopped_at_deadline.insert(task_id);
@@ -1726,6 +1738,9 @@ impl TaskRegistry {
             .into_iter()
             .filter(|task_id| matches!(self.request_cancel(task_id), CancelOutcome::Accepted))
             .collect();
+        if at_deadline {
+            self.canceled_at_deadline.extend(canceled.iter().cloned());
+        }
         // `history` is a `HashMap`, so without this the same two tasks come back in a different
         // order on every call and nothing can diff two stops.
         canceled.sort();
@@ -2705,6 +2720,36 @@ mod tests {
             !r.stopped_at_deadline("tsk_a"),
             "finish_task clears the mark"
         );
+    }
+
+    /// The deadline marks every task it cancels, and only those: a task a person cancelled first
+    /// keeps its own cancel, and no other termination marks anything.
+    #[test]
+    fn cancel_every_live_at_the_deadline_marks_the_tasks_it_cancels() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        r.enqueue("tsk_b", "ctx_001");
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        assert_eq!(r.request_cancel("tsk_b"), CancelOutcome::Accepted);
+
+        assert_eq!(r.cancel_every_live(true), vec!["tsk_a"]);
+        assert!(r.canceled_at_deadline("tsk_a"));
+        assert!(
+            !r.canceled_at_deadline("tsk_b"),
+            "a person's cancel came first"
+        );
+        assert_eq!(
+            r.finish_task(TaskState::Completed),
+            Some(TaskState::Canceled)
+        );
+        assert!(
+            !r.canceled_at_deadline("tsk_a"),
+            "finish_task clears the mark"
+        );
+
+        let mut r = running_registry("tsk_001");
+        assert_eq!(r.cancel_every_live(false), vec!["tsk_001"]);
+        assert!(!r.canceled_at_deadline("tsk_001"));
     }
 
     /// Only the deadline spares: every other termination cancels a marked task at once.

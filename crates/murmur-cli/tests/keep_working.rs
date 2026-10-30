@@ -447,10 +447,10 @@ fn a_spend_ceiling_ends_a_kept_working_task_with_the_last_answer() {
 
 const DEADLINE_SECS: u64 = 45;
 
-/// A deadline that falls while the task is kept working ends the task `ok` with the last turn
-/// end's answer; the session still ends `deadline_reached`.
+/// A deadline that falls while the task is kept working ends the task with the last turn end's
+/// answer as its result, and both `task_end` and `session_end` name the deadline.
 #[test]
-fn the_deadline_ends_a_kept_working_task_ok_and_the_session_deadline_reached() {
+fn the_deadline_ends_a_kept_working_task_deadline_reached_with_its_last_answer() {
     let home = home_with_driver();
     let asked = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&asked);
@@ -488,7 +488,7 @@ fn the_deadline_ends_a_kept_working_task_ok_and_the_session_deadline_reached() {
     );
     assert_eq!(session_end, trace.len() - 1, "{trace:#?}");
     assert_eq!(trace[session_end]["exit_status"], "deadline_reached");
-    assert_eq!(trace[task_end]["exit_status"], "ok");
+    assert_eq!(trace[task_end]["exit_status"], "deadline_reached");
     assert_eq!(
         trace[task_end]["keep_working"],
         json!({"used": records.len(), "limit": 1000, "stopped_by": "deadline"})

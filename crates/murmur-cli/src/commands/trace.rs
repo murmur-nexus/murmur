@@ -2208,20 +2208,21 @@ enum FirstTaskContext {
     Found(String),
     /// The trace ends with no `task_start` carrying a context id.
     NoTask,
-    /// Line `line`, 1-based, is not valid JSON, and no line before it answered.
+    /// Line `line`, 1-based, does not parse, and no line before it answered.
     Torn {
         line: usize,
         error: serde_json::Error,
     },
 }
 
-/// Scan the trace at `path` for the context its first task ran under. The `Err` is the trace
-/// that could not be opened or read, absent included.
+/// Scan the trace at `path` for the session its first `session_start` records and the context its
+/// first task ran under. The `Err` is the trace that could not be opened or read, absent included.
 ///
-/// `mur run --resume` ([`first_task_context_id`]) and `mur trace list` both read the context
-/// through this one body.
-fn scan_first_task_context(path: &Path) -> std::io::Result<FirstTaskContext> {
+/// `mur run --resume` ([`trace_head`]) and `mur trace list` both read the context through this one
+/// body; only `--resume` reads the session id.
+fn scan_trace_head(path: &Path) -> std::io::Result<(Option<String>, FirstTaskContext)> {
     let file = fs::File::open(path)?;
+    let mut session_id = None;
 
     // Read no further than the answer. The runtime appends one whole record per `write_all`
     // under `O_APPEND`, so a writer killed mid-write leaves a truncated *tail* and nothing
@@ -2234,44 +2235,84 @@ fn scan_first_task_context(path: &Path) -> std::io::Result<FirstTaskContext> {
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<TraceEvent>(line) {
+        let torn = |error| {
+            Ok((
+                session_id.clone(),
+                FirstTaskContext::Torn { line: i + 1, error },
+            ))
+        };
+        let record = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(record) => record,
+            Err(error) => return torn(error),
+        };
+        // Read off the line as JSON rather than as the typed record, so a `session_start` written
+        // by hand or by another runtime still names its session.
+        if record["event_type"] == "session_start" {
+            if session_id.is_none() {
+                session_id = record["session_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+            }
+            continue;
+        }
+        match serde_json::from_value::<TraceEvent>(record) {
             Ok(TraceEvent::TaskStart(task)) if !task.context_id.is_empty() => {
-                return Ok(FirstTaskContext::Found(task.context_id));
+                return Ok((session_id, FirstTaskContext::Found(task.context_id)));
             }
             Ok(_) => {}
-            Err(error) => return Ok(FirstTaskContext::Torn { line: i + 1, error }),
+            Err(error) => return torn(error),
         }
     }
 
-    Ok(FirstTaskContext::NoTask)
+    Ok((session_id, FirstTaskContext::NoTask))
 }
 
-/// The context id the first task of `session_dir` ran under, read off its `trace.jsonl`.
+/// What `mur run --resume` reads off the head of a trace.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TraceHead {
+    /// The first `session_start` line's `session_id`: the session the trace records, whatever its
+    /// directory is called. `None` when no `session_start` comes before the first task.
+    pub(crate) session_id: Option<String>,
+    /// The context id the first task ran under. `None` means the trace holds no `task_start`
+    /// carrying one — a session that never ran a task, or one written by a runtime that predates
+    /// the key, which reaches `task_start.context_id` as the empty string.
+    pub(crate) context_id: Option<String>,
+}
+
+/// The session `session_dir/trace.jsonl` records and the context its first task ran under.
 ///
 /// `mur run --resume` turns a session address into the `--context` value it would otherwise have
 /// been given by hand, and this is the lookup: `task_start` is where the runtime already records
-/// the context, so the resolution needs no new trace field and no index. `None` means the trace
-/// holds no `task_start` carrying one — a session that never ran a task, or one written by a
-/// runtime that predates the key, which reaches `task_start.context_id` as the empty string.
+/// the context, and `session_start` the session, so the resolution needs no new trace field and no
+/// index, and a trace copied out of its records directory resolves the same as the original.
 ///
-/// A line that does not parse before the answer is `E-TRC-001`: there is nothing to weigh it
+/// A line that is not JSON before the first task is `E-TRC-001`: there is nothing to weigh it
 /// against, and no killed writer produces one there.
-pub(crate) fn first_task_context_id(session_dir: &Path) -> Result<Option<String>, CliError> {
+pub(crate) fn trace_head(session_dir: &Path) -> Result<TraceHead, CliError> {
     let path = session_dir.join("trace.jsonl");
-    match scan_first_task_context(&path).map_err(|e| trace_read_error(&path, &e))? {
-        FirstTaskContext::Found(context_id) => Ok(Some(context_id)),
-        FirstTaskContext::NoTask => Ok(None),
-        FirstTaskContext::Torn { line, error } => Err(CliError::new(
-            E_TRC_001,
-            format!("{}:{line}: {error}", path.display()),
-        )),
-    }
+    let (session_id, first_task) =
+        scan_trace_head(&path).map_err(|e| trace_read_error(&path, &e))?;
+    let context_id = match first_task {
+        FirstTaskContext::Found(context_id) => Some(context_id),
+        FirstTaskContext::NoTask => None,
+        FirstTaskContext::Torn { line, error } => {
+            return Err(CliError::new(
+                E_TRC_001,
+                format!("{}:{line}: {error}", path.display()),
+            ))
+        }
+    };
+    Ok(TraceHead {
+        session_id,
+        context_id,
+    })
 }
 
 /// The diagnostic for a trace file that could not be opened or read.
 ///
 /// Shared so that reaching the same file by different routes — streamed by
-/// [`first_task_context_id`], read whole by [`parse_trace_records`] — cannot report an absent or
+/// [`trace_head`], read whole by [`parse_trace_records`] — cannot report an absent or
 /// unreadable trace two different ways.
 fn trace_read_error(path: &Path, err: &std::io::Error) -> CliError {
     match err.kind() {
@@ -6210,7 +6251,7 @@ struct ListedSession {
     records_dir: String,
     /// The mint time the session id carries, RFC 3339 UTC to the millisecond.
     started_at: Option<String>,
-    /// [`scan_first_task_context`]'s answer; `None` for no task, no trace, or a torn line before
+    /// [`scan_trace_head`]'s answer; `None` for no task, no trace, or a torn line before
     /// the first task.
     context_id: Option<String>,
     /// A record in `~/.murmur/running` names this session and its process is alive, or alive
@@ -6246,9 +6287,9 @@ pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(),
     let mut sessions = Vec::with_capacity(names.len());
     for session_id in names {
         let records_dir = group.join(&session_id);
-        let context_id = match scan_first_task_context(&records_dir.join("trace.jsonl")) {
-            Ok(FirstTaskContext::Found(context_id)) => Some(context_id),
-            Ok(FirstTaskContext::NoTask | FirstTaskContext::Torn { .. }) => None,
+        let context_id = match scan_trace_head(&records_dir.join("trace.jsonl")) {
+            Ok((_, FirstTaskContext::Found(context_id))) => Some(context_id),
+            Ok((_, FirstTaskContext::NoTask | FirstTaskContext::Torn { .. })) => None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(trace_read_error(&records_dir.join("trace.jsonl"), &e)),
         };
@@ -6819,7 +6860,7 @@ mod tests {
         let session_dir = tempfile::tempdir().unwrap();
         std::fs::write(session_dir.path().join("trace.jsonl"), format!("{line}\n")).unwrap();
         assert_eq!(
-            first_task_context_id(session_dir.path()).unwrap(),
+            trace_head(session_dir.path()).unwrap().context_id,
             Some("ctx_3c4d5e6f7a8b".to_string()),
             "an older trace must still resolve its context id for `mur run --resume`"
         );

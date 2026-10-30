@@ -174,16 +174,6 @@ fn pending_task_input(runtime_root: &WorkdirRoot) -> Option<u64> {
     runtime_root.file_len(TASK_INPUT_FILE).ok().flatten()
 }
 
-/// The records group this session's records directory sits in, held open: every sibling
-/// session's records directory, outside every workdir. Refusals beneath it land on the session's
-/// latch and name their paths absolutely. `None` when it cannot be opened.
-fn records_group_root(
-    records_root: &WorkdirRoot,
-    accessible_root: &WorkdirRoot,
-) -> Option<WorkdirRoot> {
-    WorkdirRoot::open_sharing_latch_absolute(records_root.path().parent()?, accessible_root).ok()
-}
-
 /// `peer_file_fetch.outcome` when the stored path, or a directory on the way to it, is a link
 /// inside the workdir and nothing was written.
 const PEER_FETCH_PATH_REFUSED: &str = "path_refused";
@@ -300,7 +290,8 @@ fn check_workdir_identity(
 /// bound), or `Err` when a hook still wanted to reopen but the reopen budget or turn
 /// ceiling was reached — so every existing `.is_err()` branch at the call sites treats an
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
-/// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
+/// `"reopen_budget_exhausted"`; when the session deadline ended the task it is
+/// `"deadline_reached"` ([`task_end_status`]); otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
 /// This function is the one writer of the task's terminal status, and writes exactly one, after
 /// the last `on-task-end` dispatch, after `task_end` is in the trace and after the registry slot
@@ -1086,13 +1077,19 @@ async fn run_task_with_reopens(
             }
             None => {
                 // No hook asked to reopen — this attempt is terminal.
+                let exit_status = task_end_status(
+                    exit_str,
+                    at_deadline,
+                    canceled,
+                    registry_ended_by_deadline(state, task_id),
+                );
                 end_task(
                     state,
                     hooks,
                     trace,
                     &mode,
                     task_id,
-                    exit_str,
+                    exit_status,
                     reopens_used,
                     keep_working_summary(keep_working.as_ref(), keep_working_used, stopped_by),
                     done_check_summary(done_check.as_ref(), &done_check_tally),
@@ -1133,6 +1130,36 @@ fn keep_working_decision(
     } else {
         budget.map_or(KeepWorkingDecision::Continue, KeepWorkingDecision::Stop)
     }
+}
+
+/// `task_end.exit_status` for a task whose last attempt ended `attempt`: `"deadline_reached"`, the
+/// word `session_end.exit_status` uses, when the session deadline ended the task, and `attempt`
+/// otherwise. The deadline ended it when a `keep_working` or `done_check` stop names the deadline
+/// (`deadline_stop`), or when the attempt was `canceled` and the cancel was the deadline's
+/// (`ended_by_deadline`). The task's A2A ending and the `on-task-end` hook's exit status are not
+/// this string: they keep the attempt's own.
+fn task_end_status(
+    attempt: &'static str,
+    deadline_stop: bool,
+    canceled: bool,
+    ended_by_deadline: bool,
+) -> &'static str {
+    if deadline_stop || (canceled && ended_by_deadline) {
+        LaunchEnding::DeadlineReached.as_str()
+    } else {
+        attempt
+    }
+}
+
+/// Whether the session deadline ended `task_id`: it raised the signal of a task holding a standing
+/// answer, or its cancel was the one accepted for the task. `false` with no registry.
+fn registry_ended_by_deadline(state: &CapsuleStoreState, task_id: &str) -> bool {
+    state.a2a_task_registry.as_ref().is_some_and(|registry| {
+        let registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.stopped_at_deadline(task_id) || registry.canceled_at_deadline(task_id)
+    })
 }
 
 /// Whether the task registry recorded `task_id` as stopped by the session deadline while it held
@@ -4097,9 +4124,12 @@ fn launch(
             .resume
             .as_ref()
             .map(|resume| resume.from_session.clone());
-        // The same value, read again below by the reconciliation step, which needs the directory
-        // name after `TraceWriter::open` has taken the one above.
-        let reconcile_from_session = trace_resumed_from.clone();
+        // Where the resumed trace is, read below by the reconciliation step, which marks lost work
+        // in that file wherever it lives.
+        let reconcile_trace_dir = staged
+            .resume
+            .as_ref()
+            .map(|resume| resume.trace_dir.clone());
         let trace_context_id = supplied_context_id.clone();
         // Lineage for `session_start`, from the handle the spawning capsule's launcher injected.
         // Both `None` for a capsule nobody delegated, and both omitted from the record then.
@@ -4746,14 +4776,21 @@ fn launch(
                     // on every clean exit. The one over-report is a graceful exit whose own
                     // `write_shell_abandoned` failed, which reads here as unplanned death; for
                     // accounting that is the right direction to be wrong in.
-                    if let (Some(from_session), Some(records_group)) = (
-                        reconcile_from_session.as_deref(),
-                        records_group_root(&records_root, &accessible_root),
-                    ) {
+                    let resumed_trace_dir = reconcile_trace_dir.as_deref().and_then(|dir| {
+                        WorkdirRoot::open_sharing_latch_absolute(dir, &accessible_root)
+                            .map_err(|error| {
+                                crate::runtime_err!(
+                                    "[capsule-runtime] could not open {} ({error}); background \
+                                     work the resumed session left unaccounted is not reported",
+                                    dir.display()
+                                );
+                            })
+                            .ok()
+                    });
+                    if let Some(trace_dir) = resumed_trace_dir {
                         if let Some(report) =
                             crate::detached_reconcile::reconcile_prior_session(
-                                &records_group,
-                                from_session,
+                                &trace_dir,
                                 &session_id,
                                 &task_context_id(supplied_context_id.as_deref()),
                             )
@@ -5298,22 +5335,8 @@ fn launch(
                                 }
                                 let status = completion.status();
                                 // The agent already read this exit through `background-command`,
-                                // so nothing about it was lost.
+                                // so nothing about it was lost, and that call recorded it.
                                 if detached.exit_reported(&completion.work_id) {
-                                    let _ = trace
-                                        .write_shell_completed(
-                                            &completion.work_id,
-                                            &completion.binary,
-                                            &completion.command,
-                                            completion.exit_code,
-                                            completion.duration_ms,
-                                            &completion.output_path,
-                                            completion.output_bytes,
-                                            completion.resource_limit.clone(),
-                                            status,
-                                            None,
-                                        )
-                                        .await;
                                     continue;
                                 }
                                 abandoned.push(AbandonedWork {
@@ -10382,6 +10405,15 @@ impl CapsuleStoreState {
                     snapshot.output_bytes,
                 )
                 .await;
+            // The completion reached the agent through this call, so this call records it, and
+            // the task loop finds it claimed and writes nothing.
+            if let Some(completion) = snapshot
+                .finished
+                .as_ref()
+                .filter(|_| snapshot.delivered_now)
+            {
+                trace.write_shell_completed(completion).await;
+            }
         }
         let (result, runtime_note) = background_command::render(&snapshot, waited);
         Ok(DispatchOutcome {
@@ -13373,9 +13405,8 @@ fn enqueue_launch_task(
 /// flight has less room for new inbound requests. A loss report costs exactly one pending item
 /// however many work ids it names, and the drain loop clears it on its first pass.
 ///
-/// A completion whose exit `background-command` already returned to the agent, as `detached`
-/// records, enqueues nothing: it is recorded as `shell_completed` with no task id and costs no
-/// pending item.
+/// A completion `background-command` already returned to the agent, which claimed it in
+/// `detached` first, enqueues nothing and writes nothing: that call wrote its `shell_completed`.
 async fn enqueue_detached_report(
     report: DetachedReport,
     detached: &DetachedRegistry,
@@ -13384,21 +13415,7 @@ async fn enqueue_detached_report(
     trace: &mut TraceWriter,
 ) {
     let task = match report {
-        DetachedReport::Completed(completion) if detached.exit_reported(&completion.work_id) => {
-            let _ = trace
-                .write_shell_completed(
-                    &completion.work_id,
-                    &completion.binary,
-                    &completion.command,
-                    completion.exit_code,
-                    completion.duration_ms,
-                    &completion.output_path,
-                    completion.output_bytes,
-                    completion.resource_limit.clone(),
-                    completion.status(),
-                    None,
-                )
-                .await;
+        DetachedReport::Completed(completion) if !detached.claim_for_task(&completion.work_id) => {
             return;
         }
         DetachedReport::Completed(completion) => {
@@ -13422,18 +13439,7 @@ async fn enqueue_detached_report(
                 part_kinds: Vec::new(),
             };
             let _ = trace
-                .write_shell_completed(
-                    &completion.work_id,
-                    &completion.binary,
-                    &completion.command,
-                    completion.exit_code,
-                    completion.duration_ms,
-                    &completion.output_path,
-                    completion.output_bytes,
-                    completion.resource_limit.clone(),
-                    completion.status(),
-                    Some(&task.task_id),
-                )
+                .write_shell_completed(&completion, &task.task_id)
                 .await;
             task
         }
@@ -13521,6 +13527,30 @@ mod tests {
             keep_working_decision(false, false, None),
             KeepWorkingDecision::Continue
         );
+    }
+
+    /// `task_end.exit_status` names the deadline whenever the deadline ended the task, and is the
+    /// attempt's own word otherwise: a person's cancel stays `canceled`, and an `ok` attempt that
+    /// finished before the deadline fell stays `ok`.
+    #[test]
+    fn task_end_status_names_the_deadline_only_when_it_ended_the_task() {
+        use super::task_end_status;
+        assert_eq!(task_end_status("ok", true, false, true), "deadline_reached");
+        assert_eq!(
+            task_end_status("ok", true, false, false),
+            "deadline_reached"
+        );
+        assert_eq!(
+            task_end_status("canceled", false, true, true),
+            "deadline_reached"
+        );
+        assert_eq!(task_end_status("canceled", false, true, false), "canceled");
+        assert_eq!(task_end_status("ok", false, false, true), "ok");
+        assert_eq!(
+            task_end_status("max_turns_reached", false, false, false),
+            "max_turns_reached"
+        );
+        assert_eq!(task_end_status("failed", false, false, true), "failed");
     }
 
     /// `task_end.keep_working` is absent with the option off and carries the count, the limit and
@@ -14397,15 +14427,40 @@ mod tests {
         );
     }
 
-    /// A completion whose exit the agent already read through `background-command` enqueues no
-    /// task and is recorded with no task id; one it never read is enqueued as before.
+    /// A completion whose exit the agent already read through `background-command` is recorded by
+    /// that call, right after its `background_command` line, with no task id, and the task loop then
+    /// enqueues nothing and writes nothing for it; one it never read is enqueued and recorded with
+    /// its task id. One `shell_completed` per work id either way.
     #[tokio::test]
     async fn a_completion_the_agent_already_read_is_not_enqueued_again() {
         let workdir = TempDir::new().unwrap();
         let runtime = TempDir::new().unwrap();
-        let (state, mut reports) = background_state(workdir.path(), runtime.path());
+        let (mut state, mut reports) = background_state(workdir.path(), runtime.path());
         let detached = Arc::clone(state.detached.as_ref().unwrap());
         let _guard = detached::KillRunningOnDrop(Arc::clone(&detached));
+        let trace_dir = TempDir::new().unwrap();
+        let mut trace = tool_refresh_trace(trace_dir.path()).await;
+        trace.flush().await.unwrap();
+        state.peer_trace = Some(Arc::new(
+            crate::trace::ResourceTraceAppender::open(
+                &WorkdirRoot::open(trace_dir.path()).unwrap(),
+                "ses_test".to_string(),
+                trace.session_event_id().to_string(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let events = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(trace_dir.path().join("trace.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| {
+                    event["event_type"] == "shell_completed"
+                        || event["event_type"] == "background_command"
+                })
+                .collect()
+        };
 
         let read = demote_command(&state, "sleep 1.5").await;
         let unread = demote_command(&state, "sleep 1.5").await;
@@ -14428,13 +14483,34 @@ mod tests {
             line_value(status.result.data.as_deref().unwrap(), "state"),
             Some("exited")
         );
+        let at_the_read = events();
+        assert_eq!(at_the_read.len(), 2, "{at_the_read:?}");
+        assert_eq!(at_the_read[0]["event_type"], "background_command");
+        assert_eq!(at_the_read[1]["event_type"], "shell_completed");
+        assert_eq!(at_the_read[1]["work_id"], read.as_str());
+        assert_eq!(at_the_read[1]["delivered_via"], "background_command");
+        assert!(
+            at_the_read[1].get("completion_task_id").is_none(),
+            "{}",
+            at_the_read[1]
+        );
+        call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "status", "work_id": read}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events().len(),
+            3,
+            "a second read of the same exit writes its background_command line and nothing more"
+        );
         completions.sort_by_key(|report| match report {
             DetachedReport::Completed(completion) => completion.work_id != read,
             DetachedReport::Lost(_) => true,
         });
 
-        let trace_dir = TempDir::new().unwrap();
-        let mut trace = tool_refresh_trace(trace_dir.path()).await;
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(8, TaskAcceptance::Queue)));
         let mut lanes = LaneQueue::new();
         let mut completions = completions.into_iter();
@@ -14468,22 +14544,22 @@ mod tests {
         assert!(task.message_text.contains(&unread), "{}", task.message_text);
 
         trace.flush().await.unwrap();
-        let completed: Vec<serde_json::Value> =
-            std::fs::read_to_string(trace_dir.path().join("trace.jsonl"))
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .filter(|event| event["event_type"] == "shell_completed")
-                .collect();
-        assert_eq!(completed.len(), 2);
+        let completed: Vec<serde_json::Value> = events()
+            .into_iter()
+            .filter(|event| event["event_type"] == "shell_completed")
+            .collect();
+        assert_eq!(completed.len(), 2, "{completed:?}");
         assert_eq!(completed[0]["work_id"], read.as_str());
-        assert!(
-            completed[0].get("completion_task_id").is_none(),
-            "{}",
-            completed[0]
-        );
         assert_eq!(completed[1]["work_id"], unread.as_str());
+        assert_eq!(completed[1]["delivered_via"], "task");
         assert_eq!(completed[1]["completion_task_id"], task.task_id.as_str());
+        for record in &completed {
+            let exited = record["exited_at_ms"].as_u64().unwrap();
+            assert!(
+                exited > 0 && exited <= record["timestamp"].as_u64().unwrap(),
+                "{record}"
+            );
+        }
     }
 
     /// `background-command` exists for an agent capsule that can run a shell command and declares

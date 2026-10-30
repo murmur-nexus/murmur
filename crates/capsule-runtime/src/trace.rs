@@ -777,8 +777,11 @@ struct ShellDetachedEvent {
     grace_ms: Option<u64>,
 }
 
-/// A detached command finishing, written where the task loop drains it. Hangs off the session
-/// rather than a turn: by the time it lands, the turn that started the command is over.
+/// A detached command's completion reaching the agent, written once per work id by whichever path
+/// delivered it: [`ResourceTraceAppender::write_shell_completed`] right after the
+/// `background_command` line of the call that returned the finished state, or
+/// [`TraceWriter::write_shell_completed`] where the task loop queues it as a task. Hangs off the
+/// session rather than a turn: the turn that started the command may be long over.
 #[derive(Serialize)]
 struct ShellCompletedEvent {
     event_type: &'static str,
@@ -791,6 +794,9 @@ struct ShellCompletedEvent {
     command: String,
     exit_code: i32,
     duration_ms: u64,
+    /// Epoch milliseconds at which the runtime recorded the command's exit, which is never after
+    /// [`Self::timestamp`].
+    exited_at_ms: u64,
     /// Absolute path of the file holding the command's full stdout and stderr,
     /// `logs/<work_id>.log` in the session's records directory.
     output_path: String,
@@ -801,11 +807,43 @@ struct ShellCompletedEvent {
     /// `"ok"` or `"error"` — the field that tells a failed background command from a successful
     /// one without reading its prose.
     status: String,
+    /// [`crate::detached::Delivery::as_str`]: `"background_command"` or `"task"`.
+    delivered_via: &'static str,
     /// The `completion`-origin task this completion was enqueued as, which is what makes "which
-    /// command produced this task" answerable from `trace.jsonl` alone. Absent when no task was
-    /// enqueued because `background-command` had already returned the exit to the agent.
+    /// command produced this task" answerable from `trace.jsonl` alone. Present exactly when
+    /// [`Self::delivered_via`] is `"task"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     completion_task_id: Option<String>,
+}
+
+impl ShellCompletedEvent {
+    fn new(
+        session_id: String,
+        parent_id: Option<String>,
+        completion: &crate::detached::DetachedCompletion,
+        delivery: crate::detached::Delivery,
+        completion_task_id: Option<&str>,
+    ) -> Self {
+        Self {
+            event_type: "shell_completed",
+            event_id: new_event_id(),
+            parent_id,
+            session_id,
+            timestamp: timestamp_ms(),
+            work_id: completion.work_id.clone(),
+            binary: completion.binary.clone(),
+            command: completion.command.clone(),
+            exit_code: completion.exit_code,
+            duration_ms: completion.duration_ms,
+            exited_at_ms: completion.exited_at_ms,
+            output_path: completion.output_path.clone(),
+            output_bytes: completion.output_bytes,
+            resource_limit: completion.resource_limit.clone(),
+            status: completion.status().to_string(),
+            delivered_via: delivery.as_str(),
+            completion_task_id: completion_task_id.map(str::to_string),
+        }
+    }
 }
 
 /// One answered `background-command` call. Hangs off the session, as `session_status` does.
@@ -3142,41 +3180,20 @@ impl TraceWriter {
         Ok(())
     }
 
-    /// A detached command finishing, written by the task loop as it turns the completion into a
-    /// task. `completion_task_id` is that task's id, so the two records join, and `None` when no
-    /// task was enqueued because the agent had already read the exit through
-    /// `background-command`.
-    #[allow(clippy::too_many_arguments)]
+    /// A detached command's completion queued as the `completion`-origin task
+    /// `completion_task_id`, written by the task loop as it enqueues it, so the two records join.
     pub(crate) async fn write_shell_completed(
         &mut self,
-        work_id: &str,
-        binary: &str,
-        command: &str,
-        exit_code: i32,
-        duration_ms: u64,
-        output_path: &str,
-        output_bytes: u64,
-        resource_limit: Option<String>,
-        status: &str,
-        completion_task_id: Option<&str>,
+        completion: &crate::detached::DetachedCompletion,
+        completion_task_id: &str,
     ) -> std::io::Result<()> {
-        let event = ShellCompletedEvent {
-            event_type: "shell_completed",
-            event_id: new_event_id(),
-            parent_id: self.session_parent(),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            work_id: work_id.to_string(),
-            binary: binary.to_string(),
-            command: command.to_string(),
-            exit_code,
-            duration_ms,
-            output_path: output_path.to_string(),
-            output_bytes,
-            resource_limit,
-            status: status.to_string(),
-            completion_task_id: completion_task_id.map(str::to_string),
-        };
+        let event = ShellCompletedEvent::new(
+            self.session_id.clone(),
+            self.session_parent(),
+            completion,
+            crate::detached::Delivery::Task,
+            Some(completion_task_id),
+        );
         self.write_event(&event).await
     }
 
@@ -4667,6 +4684,23 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
+    /// Records a detached command's completion that a `background-command` call just returned to
+    /// the agent, hung off the session node with no `completion_task_id`. Written after that call's
+    /// `background_command` line. Failures are swallowed, as that line's are.
+    pub(crate) async fn write_shell_completed(
+        &self,
+        completion: &crate::detached::DetachedCompletion,
+    ) {
+        let event = ShellCompletedEvent::new(
+            self.session_id.clone(),
+            Some(self.session_event_id.clone()),
+            completion,
+            crate::detached::Delivery::BackgroundCommand,
+            None,
+        );
+        self.append(&event).await;
+    }
+
     /// Records the deadline notice `tool_name`'s result carried, hung off the session node.
     pub(crate) async fn write_deadline_notice(
         &self,
@@ -5129,22 +5163,21 @@ pub(crate) struct PriorSessionTraceAppender {
 }
 
 impl PriorSessionTraceAppender {
-    /// `trace` is the prior session's `trace.jsonl`, relative to `records_group`, the records
-    /// group both sessions keep their records directories in. Errors when it cannot be read or
-    /// opened for appending, which the caller reports rather than reporting work it could not
-    /// mark.
+    /// `trace` is the resumed trace's file name in `trace_dir`, the directory
+    /// [`crate::ResumeRequest::trace_dir`] names. Errors when it cannot be read or opened for
+    /// appending, which the caller reports rather than reporting work it could not mark.
     pub(crate) async fn open(
-        records_group: &WorkdirRoot,
+        trace_dir: &WorkdirRoot,
         trace: &str,
         session_id: String,
         session_event_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let contents = records_group
+        let contents = trace_dir
             .read_file(trace, u64::MAX)?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         // An empty file counts as terminated: there is no record for an appended line to run into.
         let terminate_torn_tail = contents.last().is_some_and(|last| *last != b'\n');
-        let file = File::from_std(records_group.open_append(trace, DEFAULT_FILE_MODE)?);
+        let file = File::from_std(trace_dir.open_append(trace, DEFAULT_FILE_MODE)?);
         Ok(Self {
             file,
             session_id,
@@ -8190,28 +8223,42 @@ mod tests {
         assert!(ends[1].get("running_commands").is_none(), "{}", ends[1]);
     }
 
-    /// A completion the agent already read is recorded with no `completion_task_id` at all, and
-    /// one enqueued as a task names it.
+    /// The two writers of `shell_completed` build one record: a completion a `background-command`
+    /// call delivered carries no `completion_task_id`, one queued as a task names it, and both
+    /// carry when the command exited and which way it reached the agent.
     #[tokio::test]
-    async fn shell_completed_without_a_completion_task_omits_the_field() {
+    async fn shell_completed_names_its_delivery_and_exit_time() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        for task in [None, Some("tsk_2")] {
-            w.write_shell_completed(
-                "wrk_0a",
-                "/usr/bin/bash",
-                "sleep 3",
-                0,
-                3_000,
-                "/records/logs/wrk_0a.log",
-                10,
+        let appender = ResourceTraceAppender::open(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            "test-session-id".to_string(),
+            w.session_event_id().to_string(),
+        )
+        .await
+        .unwrap();
+        let completion = crate::detached::DetachedCompletion {
+            work_id: "wrk_0a".to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "sleep 3".to_string(),
+            exit_code: 0,
+            duration_ms: 3_000,
+            exited_at_ms: 1_750,
+            output_path: "/records/logs/wrk_0a.log".to_string(),
+            output_bytes: 10,
+            resource_limit: None,
+            output_holders: crate::shell::OutputHolders::Closed,
+            context_id: "ctx_1".to_string(),
+            provenance: crate::origin::TaskProvenance::derive(
+                crate::origin::TaskOrigin::Completion,
                 None,
-                "ok",
-                task,
-            )
-            .await
-            .unwrap();
-        }
+            ),
+            error: None,
+        };
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+        appender.write_shell_completed(&completion).await;
+        w.write_shell_completed(&completion, "tsk_2").await.unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -8219,12 +8266,23 @@ mod tests {
             .iter()
             .filter(|e| e["event_type"] == "shell_completed")
             .collect();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["delivered_via"], "background_command");
         assert!(
             completed[0].get("completion_task_id").is_none(),
             "{}",
             completed[0]
         );
+        assert_eq!(completed[1]["delivered_via"], "task");
         assert_eq!(completed[1]["completion_task_id"], "tsk_2");
+        for record in &completed {
+            assert_eq!(record["exited_at_ms"], 1_750);
+            assert_eq!(record["work_id"], "wrk_0a");
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["duration_ms"], 3_000);
+            assert_eq!(record["session_id"], "test-session-id");
+            assert_eq!(record["parent_id"].as_str(), Some(w.session_event_id()));
+        }
     }
 
     #[tokio::test]
