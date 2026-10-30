@@ -368,10 +368,10 @@ pub(crate) const CANCELED_BEFORE_SPAWN: &str =
 /// and so neither has anywhere to deliver a completion.
 ///
 /// With `detach: Some`, the child is polled until it exits, the grace deadline (if any) passes, or
-/// the policy's abandon or cancel signal is raised; a cancel already raised refuses the call before the spawn.
-/// On demotion the child, its two pipe readers and the metadata needed to describe it all move to
-/// one plain OS thread — not a `spawn_blocking` task — so runtime teardown never waits on it. The
-/// session's end kills it with every other process the session started.
+/// the policy's abandon or cancel signal is raised; a cancel already raised refuses the call
+/// before the spawn. On demotion the child, its two pipe readers and the metadata needed to
+/// describe it all move to one plain OS thread — not a `spawn_blocking` task — so runtime teardown
+/// never waits on it. The session's end kills it with every other process the session started.
 ///
 /// A detach policy is honoured only when `enforcement` holds a records directory, where a demoted
 /// command's log goes. Without one the command runs to completion in the foreground.
@@ -1601,15 +1601,10 @@ mod tests {
     /// two slots this process inherited.
     #[cfg(target_os = "linux")]
     #[test]
-    #[allow(unsafe_code, clippy::unnecessary_cast)]
+    #[allow(clippy::unnecessary_cast)]
     fn with_no_cpu_seconds_a_command_keeps_the_inherited_cpu_limit() {
-        let mut own = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `own` is a live, writable `rlimit` for the duration of the call.
-        let read = unsafe { libc::getrlimit(libc::RLIMIT_CPU, &mut own) };
-        assert_eq!(read, 0, "getrlimit(RLIMIT_CPU) failed");
+        let own = crate::resources::read_rlimit(libc::RLIMIT_CPU as u32)
+            .expect("getrlimit(RLIMIT_CPU) failed");
         let render = |slot: libc::rlim_t| {
             if slot == libc::RLIM_INFINITY {
                 "unlimited".to_string()

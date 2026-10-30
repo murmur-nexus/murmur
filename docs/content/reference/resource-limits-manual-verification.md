@@ -107,8 +107,8 @@ runtime:
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
 4. creates the session's cgroup, `<base>/murmur-<session_id>-<pid>-<n>`, and writes `memory.max`,
-   `memory.swap.max` (`0`), `pids.max`, `cpu.max` when `cgroup_cpu_percent` is declared (fatal on failure; a `memory.swap.max` the
-   kernel does not expose is skipped) and `io.max` (non-fatal, reported in
+   `memory.swap.max` (`0`), `pids.max`, `cpu.max` when `cgroup_cpu_percent` is declared (fatal
+   on failure; a `memory.swap.max` the kernel does not expose is skipped) and `io.max` (non-fatal, reported in
    [`io_max`](resource-limits.md#io-max-report) and by
    [`W-SEC-021`](diagnostics.md#w-sec-021));
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there

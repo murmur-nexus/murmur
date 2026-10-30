@@ -119,8 +119,8 @@ not enforce `RLIMIT_DATA`.
 
 `cgroup_io_bytes_per_sec` is the one cgroup limit whose failure does not refuse a launch.
 `memory.max`, `pids.max`, `cpu.max` when `cgroup_cpu_percent` is set, and `memory.swap.max`
-wherever the kernel has it, are settable on any cgroup v2 host once the controllers are delegated, so a failure there means the
-bound genuinely does not exist and the session must not start. `io.max` names a block device by
+wherever the kernel has it, are settable on any cgroup v2 host once the controllers are delegated,
+so a failure there means the bound genuinely does not exist and the session must not start. `io.max` names a block device by
 `MAJ:MIN`, and a filesystem with no block device behind it — tmpfs, overlayfs, FUSE and network
 mounts — has none to name. A capsule that saturates disk
 bandwidth is slow; one that exhausts memory or pids is fatal.

@@ -43,9 +43,10 @@
 //!
 //! A set `RLIMIT_CPU` is the one exception: its soft slot is `cpu_seconds` and its hard slot one
 //! second above ([`cpu_rlimit_slots`]). The kernel sends `SIGXCPU`, the signal
-//! [`limit_from_signal`] attributes, only while the soft slot sits below the hard one. The bound is the hard slot: a
-//! process that raises its soft slot to the hard one, or ignores `SIGXCPU`, gets `SIGKILL` at
-//! `cpu_seconds + 1`, so CPU time per process stays within `cpu_seconds` plus one second.
+//! [`limit_from_signal`] attributes, only while the soft slot sits below the hard one. The bound
+//! is the hard slot: a process that raises its soft slot to the hard one, or ignores `SIGXCPU`,
+//! gets `SIGKILL` at `cpu_seconds + 1`, so CPU time per process stays within `cpu_seconds` plus
+//! one second.
 
 use std::{
     path::{Path, PathBuf},
@@ -461,7 +462,7 @@ fn cpu_rlimit_slots(cpu_seconds: u64, inherited_hard: libc::rlim_t) -> libc::rli
 /// `getrlimit(resource)`, with a failure returned as the bare OS error.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn read_rlimit(resource: u32) -> std::io::Result<libc::rlimit> {
+pub(crate) fn read_rlimit(resource: u32) -> std::io::Result<libc::rlimit> {
     let mut current = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

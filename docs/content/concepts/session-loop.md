@@ -529,9 +529,9 @@ in is on its `task_start` record and on the task row of `mur trace steps`.
 With [`lifecycle.shell_grace_secs`](../reference/manifest.md#lifecycle-shell-grace-secs) set, a
 shell command that runs longer than it moves to the background and the turn carries on. With it
 not set, a command runs in the foreground until it exits; it moves to the background only when its
-task is canceled or a `transport: process` harness stops waiting for the call. The turn receives a work id of the
-form `wrk_<hex>` and the fact that the command is still running. From then on the command's stdout
-and stderr are written to a log in the session's
+task is canceled or a `transport: process` harness stops waiting for the call. The turn receives a
+work id of the form `wrk_<hex>` and the fact that the command is still running. From then on the
+command's stdout and stderr are written to a log in the session's
 [records directory](../reference/workdir.md#records-directory) as they arrive, instead of into the
 conversation.
 
@@ -539,12 +539,11 @@ Every command starts in the foreground, so the model chooses nothing here and a 
 finishes inside the grace period returns its output to the turn.
 
 The work id is an address for the rest of the session. With `lifecycle.shell_grace_secs` set, the
-runtime-provided
-[`background-command`](../reference/runtime-provided-tools.md#background-command) tool takes it
-and returns the command's state, its exit code once it has one, and the last 16 KiB of its output,
-either at once, after waiting up to 600 seconds for it to exit, or after stopping it. A long test
-suite therefore needs no long grace period: the agent waits on the work id, as many times as it
-takes.
+runtime-provided [`background-command`](../reference/runtime-provided-tools.md#background-command)
+tool takes it and returns the command's state, its exit code once it has one, and the last 16 KiB
+of its output, either at once, after waiting up to 600 seconds for it to exit, or after stopping
+it. A long test suite therefore needs no long grace period: the agent waits on the work id, as many
+times as it takes.
 
 How the result can reach the agent:
 
