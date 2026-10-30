@@ -362,7 +362,7 @@ Both require the binary to already be in `shell.allow`. They are mutually exclus
 
 Use `capabilities.limits` for component-level WASM limits and `capabilities.resources` for native subprocess-tree limits.
 
-Only override defaults when the workload needs a different hard ceiling. Useful native-process controls include:
+Only override defaults when the workload needs a different hard ceiling. CPU time (`cpu_seconds`) and the cgroup CPU cap (`cgroup_cpu_percent`) have no default: an unset field means no CPU bound, so set them when the capsule needs one. Useful native-process controls include:
 
 - process/task count;
 - open files;

@@ -5,9 +5,16 @@ operating-system processes it spawns. Field types, defaults and validation for b
 the [manifest reference](manifest.md#field-capabilities); this page covers what enforces them, what
 happens when one is crossed, and what each platform can enforce.
 
-Both blocks are optional field by field: an omitted field takes its default, and an omitted block
-is the same as omitting every field in it. A silent manifest means defaults, never "unlimited". A
-field declared as `0` is rejected when the manifest is parsed, before any component runs:
+Both blocks are optional field by field, and an omitted block is the same as omitting every field
+in it. What an omitted field means:
+
+| Field | Omitted |
+|---|---|
+| `capabilities.resources.cpu_seconds` | No CPU-time limit: a process keeps the `RLIMIT_CPU` `mur` was started with |
+| `capabilities.resources.cgroup_cpu_percent` | No CPU cap: the scope's `cpu.max` stays at the kernel's `max` |
+| Every other field | Its default, listed in the [manifest reference](manifest.md#field-capabilities) |
+
+A field declared as `0` is rejected when the manifest is parsed, before any component runs:
 
 ```
 error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.limits.memory_bytes': must be greater than zero
@@ -70,8 +77,8 @@ Three mechanisms enforce the block, in descending order of portability:
 
 | Mechanism | Fields | Platforms | Notes |
 |---|---|---|---|
-| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. `cpu_seconds` is the exception: the process gets `SIGXCPU` at `cpu_seconds` and `SIGKILL` one second later, so it can neither raise the bound nor run more than one second past it. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field. `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
-| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host |
+| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. `cpu_seconds` is the exception: the process gets `SIGXCPU` at `cpu_seconds` and `SIGKILL` one second later, so it can neither raise the bound nor run more than one second past it. With no `cpu_seconds`, `RLIMIT_CPU` is left as `mur` inherited it. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field. `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
+| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host. `cgroup_cpu_percent` is the scope's `cpu.max`, written only when declared |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The [work folder](workdir.md#work-folder-ceiling), the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) are walked every 10 seconds and their sizes summed. The cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` — `work folder, $HOME and $TMPDIR together grew to <N> bytes, past the <M> byte ceiling (capabilities.resources.workdir_max_bytes)` — and blocks any further subprocess. The breach's `logs/bootstrap.log` line appends `; measured: <work folder>, <tmp>, <home>` |
 
 ### `max_processes` by platform { #max-processes-headroom }
@@ -111,9 +118,9 @@ not enforce `RLIMIT_DATA`.
 ### Whether the I/O ceiling applied { #io-max-report }
 
 `cgroup_io_bytes_per_sec` is the one cgroup limit whose failure does not refuse a launch.
-`memory.max`, `pids.max` and `cpu.max`, and `memory.swap.max` wherever the kernel has it, are
-settable on any cgroup v2 host once the controllers are delegated, so a failure there means the
-bound genuinely does not exist and the session must not start. `io.max` names a block device by
+`memory.max`, `pids.max`, `cpu.max` when `cgroup_cpu_percent` is set, and `memory.swap.max`
+wherever the kernel has it, are settable on any cgroup v2 host once the controllers are delegated,
+so a failure there means the bound genuinely does not exist and the session must not start. `io.max` names a block device by
 `MAJ:MIN`, and a filesystem with no block device behind it — tmpfs, overlayfs, FUSE and network
 mounts — has none to name. A capsule that saturates disk
 bandwidth is slow; one that exhausts memory or pids is fatal.
@@ -130,7 +137,7 @@ Every session reports what became of the ceiling, in an `io_max` object carried 
 | `status` | Means |
 |---|---|
 | `enforced` | The `io.max` write succeeded against the device backing the workdir. The ceiling is on the scope |
-| `unavailable` | A scope exists and the write did not succeed. `memory.max`, `pids.max` and `cpu.max` are still enforced on it; I/O bandwidth is not bounded. [`W-SEC-021`](diagnostics.md#w-sec-021) reports it |
+| `unavailable` | A scope exists and the write did not succeed. `memory.max` and `pids.max` are still enforced on it, and so is `cpu.max` when `cgroup_cpu_percent` is set; I/O bandwidth is not bounded. [`W-SEC-021`](diagnostics.md#w-sec-021) reports it |
 | `not-required` | No scope was asked for: the capsule can reach no native subprocess, or this is not Linux |
 | `not-probed` | The write was never attempted, so nothing is claimed either way |
 

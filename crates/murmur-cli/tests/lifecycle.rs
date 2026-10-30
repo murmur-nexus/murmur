@@ -794,7 +794,7 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Sleep,
             queue_depth: 4,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,
@@ -898,7 +898,7 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Sleep,
             queue_depth: 8,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,
@@ -1003,7 +1003,7 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Exit,
             queue_depth: 4,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,
@@ -1077,7 +1077,7 @@ fn lifecycle_a_command_inside_the_grace_period_is_reported_nowhere() {
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Exit,
             queue_depth: 4,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,
@@ -1150,7 +1150,7 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Exit,
             queue_depth: 4,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,
@@ -1345,7 +1345,7 @@ fn lifecycle_queue_exit_task_md_still_reports_discarded_shell_work() {
             task_acceptance: TaskAcceptance::Queue,
             after_task: AfterTask::Exit,
             queue_depth: 4,
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..Default::default()
         }),
         None,

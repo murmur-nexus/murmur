@@ -189,17 +189,9 @@ pub fn manifest_yaml(
     // `network.unix_sockets` keeps its default of false — which is what the four network cases
     // and the two AF_UNIX cases assert against. `env.allow` is left undeclared too: the harness
     // environment then holds only what the driver's launch plan sets, and so does every probe
-    // subprocess's.
-    //
-    // A shell command that outruns `lifecycle.shell_grace_secs` is demoted to the background and
-    // its tool result carries a `wrk_` handle instead of an exit code, which a `ShellExit` case
-    // cannot grade. A resource case can run far past the default grace, so the grace matches how
-    // long the harness waits for the case.
-    yaml.push_str("\nlifecycle:\n");
-    yaml.push_str(&format!(
-        "  shell_grace_secs: {}\n",
-        config.timeout.as_secs()
-    ));
+    // subprocess's. `lifecycle.shell_grace_secs` is left undeclared too, so no probe is ever
+    // demoted to the background: a demoted command's tool result carries a `wrk_` handle instead
+    // of an exit code, which a `ShellExit` case cannot grade.
     let probe = probe_config(case, driver_log);
     yaml.push_str("\ninference:\n");
     yaml.push_str("  transport: process\n");
@@ -1229,7 +1221,7 @@ mod tests {
                 );
                 assert_eq!(
                     manifest.effective_lifecycle().shell_grace_secs,
-                    config.timeout.as_secs(),
+                    None,
                     "case {id} at class {class}: a probe must stay in the foreground for the \
                      whole case"
                 );

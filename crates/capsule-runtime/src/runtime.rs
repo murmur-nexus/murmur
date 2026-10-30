@@ -3378,6 +3378,10 @@ pub fn stage_session(
         &runtime_root,
         request.inference.as_ref(),
         &request.capability_policy,
+        request
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.shell_grace_secs),
     )?;
 
     // Read once, here, from the manifests just staged: the schema is fixed before the session
@@ -3756,7 +3760,15 @@ fn launch(
     staged.scope_report.io_max = prepared_scope.io_max.clone();
     // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
     // not apply has to be *said* here or the manifest and the scope report both go on implying it.
-    cgroup::warn_for_unenforced_io_max(&staged.records_root, &prepared_scope.io_max);
+    cgroup::warn_for_unenforced_io_max(
+        &staged.records_root,
+        &prepared_scope.io_max,
+        staged
+            .capability_policy
+            .resources
+            .cgroup_cpu_percent
+            .is_some(),
+    );
     let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
         &staged.accessible_root,
@@ -5591,7 +5603,7 @@ fn launch(
         // have nowhere to be delivered: every command it dispatches runs to completion in the
         // foreground.
         detached: None,
-        shell_grace_secs: 0,
+        shell_grace_secs: None,
         background_results_delivered: false,
         a2a_task_registry: None,
         a2a_sse: None,
@@ -7876,8 +7888,9 @@ pub(crate) struct CapsuleStoreState {
     /// run no task loop, so a completion would have nowhere to land.
     pub(crate) detached: Option<Arc<DetachedRegistry>>,
     /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
-    /// is demoted. Read from the resolved lifecycle once per launch.
-    pub(crate) shell_grace_secs: u64,
+    /// is demoted. Read from the resolved lifecycle once per launch. `None` demotes no command on
+    /// a clock, and the session offers no `background-command`.
+    pub(crate) shell_grace_secs: Option<u64>,
     /// Whether a demoted command's completion reaches the model as a later task: the effective
     /// lifecycle's `can_receive_background_tasks`.
     pub(crate) background_results_delivered: bool,
@@ -9427,10 +9440,10 @@ impl CapsuleStoreState {
     /// whose caller can go away mid-call.
     ///
     /// `abandon` is raised by the bridge when the harness closes the connection the call arrived
-    /// on. A shell command still in the foreground then demotes at once, as if it had outrun
-    /// `lifecycle.shell_grace_secs`; with no task context to deliver a completion to, it runs to
-    /// the end on the blocking pool and its result is discarded. No other branch reads the
-    /// signal: the bridge drops their futures instead.
+    /// on. A shell command still in the foreground then demotes at once, whether or not
+    /// `lifecycle.shell_grace_secs` is set; with no task context to deliver a completion to, it
+    /// runs to the end on the blocking pool and its result is discarded. No other branch reads
+    /// the signal: the bridge drops their futures instead.
     pub(crate) async fn dispatch_bridged_tool_async(
         &self,
         name: &str,
@@ -9627,7 +9640,7 @@ impl CapsuleStoreState {
             // `command` is filled in by `dispatch_shell_tool`, which is where it is parsed.
             let detach = match (&self.detached, &self.current_context_id) {
                 (Some(registry), Some(context_id)) => Some(DetachPolicy {
-                    grace: std::time::Duration::from_secs(self.shell_grace_secs),
+                    grace: self.shell_grace_secs.map(std::time::Duration::from_secs),
                     delivered: self.background_results_delivered,
                     registry: Arc::clone(registry),
                     command: String::new(),
@@ -11936,15 +11949,17 @@ fn write_session_status_tool_manifest(
     )
 }
 
-/// Writes `background-command`'s synthetic manifest for an agent capsule that can run a shell
-/// command, on either transport, and for no other capsule. Its grant is the shell grant: the file
-/// exists exactly when `inference` does and `capabilities.shell.allow` is non-empty.
+/// Writes `background-command`'s synthetic manifest for an agent capsule whose shell commands
+/// can be demoted on a clock, on either transport, and for no other capsule: the file exists
+/// exactly when `inference` does, `capabilities.shell.allow` is non-empty and `shell_grace_secs`
+/// (`lifecycle.shell_grace_secs`, which no `--lifecycle-*` flag changes) is set.
 fn write_background_command_tool_manifest(
     runtime_root: &WorkdirRoot,
     inference: Option<&InferenceConfig>,
     policy: &CapabilityPolicy,
+    shell_grace_secs: Option<u64>,
 ) -> Result<(), RuntimeError> {
-    if inference.is_none() || policy.shell_allow.is_empty() {
+    if inference.is_none() || policy.shell_allow.is_empty() || shell_grace_secs.is_none() {
         return Ok(());
     }
     write_runtime_provided_tool_manifest(
@@ -12459,6 +12474,9 @@ fn dispatch_shell_tool(
 
     // Only a command given a policy can be demoted, so the flag is read before it moves.
     let delivered = detach.as_ref().is_some_and(|detach| detach.delivered);
+    // The policy's grace is the session's, and `background-command` is staged exactly when the
+    // session has one.
+    let tool_offered = detach.as_ref().is_some_and(|detach| detach.grace.is_some());
     let detach = detach.map(|detach| DetachPolicy {
         command: command.clone(),
         ..detach
@@ -12510,7 +12528,7 @@ fn dispatch_shell_tool(
         // the fields `ShellDispatchInfo` exists to carry — hence `shell: None`, and hence no
         // `HookEvent::Shell`. What it did produce is the handle.
         Ok(ShellOutcome::Detached(info)) => {
-            let result = demotion_tool_result(&info.work_id, delivered);
+            let result = demotion_tool_result(&info.work_id, delivered, tool_offered);
             DispatchOutcome {
                 detached: Some(info),
                 ..DispatchOutcome::tool(result)
@@ -14177,7 +14195,7 @@ mod tests {
         let (registry, reports) = DetachedRegistry::new();
         state.detached = Some(registry);
         state.current_context_id = Some("ctx_background".to_string());
-        state.shell_grace_secs = 1;
+        state.shell_grace_secs = Some(1);
         (state, reports)
     }
 
@@ -14468,8 +14486,9 @@ mod tests {
         assert_eq!(completed[1]["completion_task_id"], task.task_id.as_str());
     }
 
-    /// `background-command` exists for an agent capsule that can run a shell command, on either
-    /// transport, and for no other capsule; the policy decision point sees it as a tool call.
+    /// `background-command` exists for an agent capsule that can run a shell command and declares
+    /// a grace, on either transport, and for no other capsule; the policy decision point sees it
+    /// as a tool call.
     #[test]
     fn the_tool_is_staged_only_for_an_agent_capsule_that_can_run_shell() {
         let manifest_path = |dir: &Path| {
@@ -14491,6 +14510,7 @@ mod tests {
                 &WorkdirRoot::open(agent.path()).unwrap(),
                 Some(&inference),
                 &with_shell,
+                Some(10),
             )
             .unwrap();
             let manifest: Value =
@@ -14507,11 +14527,33 @@ mod tests {
                 Some(crate::background_command::INPUT_SCHEMA)
             );
 
+            let zero_grace = TempDir::new().unwrap();
+            super::write_background_command_tool_manifest(
+                &WorkdirRoot::open(zero_grace.path()).unwrap(),
+                Some(&inference),
+                &with_shell,
+                Some(0),
+            )
+            .unwrap();
+            assert!(manifest_path(zero_grace.path()).exists(), "{transport}");
+
+            // No grace, no demotion on a clock, so nothing for the tool to address.
+            let no_grace = TempDir::new().unwrap();
+            super::write_background_command_tool_manifest(
+                &WorkdirRoot::open(no_grace.path()).unwrap(),
+                Some(&inference),
+                &with_shell,
+                None,
+            )
+            .unwrap();
+            assert!(!manifest_path(no_grace.path()).exists(), "{transport}");
+
             let no_shell = TempDir::new().unwrap();
             super::write_background_command_tool_manifest(
                 &WorkdirRoot::open(no_shell.path()).unwrap(),
                 Some(&inference),
                 &CapabilityPolicy::default(),
+                Some(10),
             )
             .unwrap();
             assert!(!manifest_path(no_shell.path()).exists(), "{transport}");
@@ -14521,6 +14563,7 @@ mod tests {
             &WorkdirRoot::open(script.path()).unwrap(),
             None,
             &with_shell,
+            Some(10),
         )
         .unwrap();
         assert!(!manifest_path(script.path()).exists());
@@ -17510,7 +17553,7 @@ inference:
             current_forget_harness_session: None,
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
-            shell_grace_secs: 0,
+            shell_grace_secs: None,
             background_results_delivered: false,
             a2a_task_registry: None,
             a2a_sse: None,
@@ -20034,7 +20077,7 @@ inference:
                 &policy,
                 &enforcement,
                 Some(DetachPolicy {
-                    grace: std::time::Duration::from_secs(10),
+                    grace: Some(std::time::Duration::from_secs(10)),
                     delivered: true,
                     registry,
                     command: String::new(),
@@ -20119,7 +20162,7 @@ inference:
     fn a_foreground_command_over_cpu_seconds_names_the_limit_and_what_to_do() {
         let tmp = TempDir::new().unwrap();
         let limits = crate::resources::HostResourceLimits {
-            cpu_seconds: 1,
+            cpu_seconds: Some(1),
             ..crate::resources::HostResourceLimits::default()
         };
         let policy = CapabilityPolicy {
@@ -21199,9 +21242,9 @@ inference:
                     work_id: "work_1".to_string(),
                     command: "sleep 60".to_string(),
                     binary: "/bin/sh".to_string(),
-                    grace_ms: 1,
+                    grace_ms: Some(1),
                 }),
-                ..DispatchOutcome::tool(demotion_tool_result("work_1", false))
+                ..DispatchOutcome::tool(demotion_tool_result("work_1", false, true))
             },
             DispatchOutcome::skill(tool_result_with(Some("# how to deploy"), None)),
         ];

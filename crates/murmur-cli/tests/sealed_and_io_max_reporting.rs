@@ -421,11 +421,13 @@ fn a_failed_io_max_write_is_visible_wherever_the_ceiling_is_claimed() {
         for line in &fired {
             // The exact text an operator reads, pinned here so the docs page and the emission
             // cannot drift apart: what did not apply, what is still enforced, and the ceiling.
+            // The manifest declares no `cgroup_cpu_percent`, so the scope has no `cpu.max`.
             assert!(
                 line.contains(
                     "the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did \
                      not apply to this session's cgroup scope"
-                ) && line.contains("memory.max, pids.max and cpu.max are still enforced")
+                ) && line.contains("memory.max and pids.max are still enforced on the scope")
+                    && !line.contains("cpu.max")
                     && line.contains("bytes/s)")
                     && line.contains("#w-sec-021"),
                 "unexpected W-SEC-021 text: {line}"

@@ -22,13 +22,16 @@
 //! * **a periodic workdir-size check** ([`WorkdirGuard`]), on every platform. A plain filesystem
 //!   walk on a fixed cadence, so a breach is caught within one poll interval — not instantly.
 //!
-//! ## A silent manifest means defaults, never "unlimited"
+//! ## A silent manifest: no CPU limit, a default for everything else
 //!
-//! [`HostResourceLimits::resolve`] follows [`crate::limits::ExecutionLimits::resolve`] exactly:
-//! the manifest's `capabilities.resources` block with every omitted field replaced by its
-//! `DEFAULT_*` constant, and the whole block's absence treated as "every field omitted". There
-//! is no "unset" state downstream — a capsule that declares nothing is bounded identically to
-//! one that declares every default by hand.
+//! [`HostResourceLimits::resolve`] reads the manifest's `capabilities.resources` block, and
+//! treats the whole block's absence as "every field omitted". The two CPU fields carry over as
+//! declared: an omitted `cpu_seconds` sets no `RLIMIT_CPU`, so a subprocess keeps the limit this
+//! process inherited, and an omitted `cgroup_cpu_percent` writes no `cpu.max`, so the scope
+//! keeps the kernel's `max`. Both change how fast and how long an agent's work may run, not
+//! whether the host survives it. Every other field replaces an omission with its `DEFAULT_*`
+//! constant, as [`crate::limits::ExecutionLimits::resolve`] does: a capsule that declares none
+//! of them is bounded identically to one that declares every default by hand.
 //!
 //! ## Hard limits, not soft ones
 //!
@@ -38,11 +41,12 @@
 //! capsule undoes it. Every limit this module sets writes `rlim_cur == rlim_max`, leaving no
 //! ceiling to raise into, and lowering `rlim_max` is irreversible for an unprivileged process.
 //!
-//! `RLIMIT_CPU` is the one exception: its soft slot is `cpu_seconds` and its hard slot one second
-//! above ([`cpu_rlimit_slots`]). The kernel sends `SIGXCPU`, the signal [`limit_from_signal`]
-//! attributes, only while the soft slot sits below the hard one. The bound is the hard slot: a
-//! process that raises its soft slot to the hard one, or ignores `SIGXCPU`, gets `SIGKILL` at
-//! `cpu_seconds + 1`, so CPU time per process stays within `cpu_seconds` plus one second.
+//! A set `RLIMIT_CPU` is the one exception: its soft slot is `cpu_seconds` and its hard slot one
+//! second above ([`cpu_rlimit_slots`]). The kernel sends `SIGXCPU`, the signal
+//! [`limit_from_signal`] attributes, only while the soft slot sits below the hard one. The bound
+//! is the hard slot: a process that raises its soft slot to the hard one, or ignores `SIGXCPU`,
+//! gets `SIGKILL` at `cpu_seconds + 1`, so CPU time per process stays within `cpu_seconds` plus
+//! one second.
 
 use std::{
     path::{Path, PathBuf},
@@ -66,10 +70,6 @@ pub const DEFAULT_MAX_OPEN_FILES: u64 = 1024;
 /// Default `RLIMIT_FSIZE` hard ceiling — 4 GiB, the largest single file a subprocess may write.
 pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Default CPU time per spawned subprocess at which `RLIMIT_CPU` sends `SIGXCPU` — one hour,
-/// with `SIGKILL` one second later.
-pub const DEFAULT_CPU_SECONDS: u64 = 3600;
-
 /// Default `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling — 2 GiB per subprocess.
 pub const DEFAULT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -80,9 +80,6 @@ pub const DEFAULT_CGROUP_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Default cgroup `pids.max` — 256 tasks aggregate across the whole subprocess tree.
 pub const DEFAULT_CGROUP_PIDS_MAX: u64 = 256;
-
-/// Default cgroup `cpu.max` quota as a percentage of one core: 200 = two cores' worth.
-pub const DEFAULT_CGROUP_CPU_PERCENT: u32 = 200;
 
 /// Default cgroup `io.max` read+write throughput on the workdir's backing device — 100 MiB/s.
 pub const DEFAULT_CGROUP_IO_BYTES_PER_SEC: u64 = 100 * 1024 * 1024;
@@ -99,7 +96,8 @@ pub const DEFAULT_WORKDIR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Fully-resolved host-process limits for one session: the manifest's `capabilities.resources`
-/// block with every omitted field replaced by its `DEFAULT_*`.
+/// block with every omitted field replaced by its `DEFAULT_*`, except the two CPU fields, which
+/// stay `None` when omitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostResourceLimits {
     /// `RLIMIT_NPROC` headroom above the uid's count at each spawn, applied only to a spawn
@@ -112,16 +110,18 @@ pub struct HostResourceLimits {
     /// `RLIMIT_FSIZE` hard ceiling, in bytes.
     pub max_file_size_bytes: u64,
     /// CPU time, in CPU-seconds, at which `RLIMIT_CPU` sends a spawned subprocess `SIGXCPU`, with
-    /// `SIGKILL` one second later ([`cpu_rlimit_slots`]).
-    pub cpu_seconds: u64,
+    /// `SIGKILL` one second later ([`cpu_rlimit_slots`]). `None` sets no `RLIMIT_CPU`: a
+    /// subprocess keeps the one this process inherited.
+    pub cpu_seconds: Option<u64>,
     /// `RLIMIT_AS` on Linux, `RLIMIT_DATA` on macOS (which has no `RLIMIT_AS`), in bytes.
     pub memory_bytes: u64,
     /// cgroup v2 `memory.max`, in bytes. Linux only.
     pub cgroup_memory_bytes: u64,
     /// cgroup v2 `pids.max`. Linux only.
     pub cgroup_pids_max: u64,
-    /// cgroup v2 `cpu.max` quota as a percentage of one core. Linux only.
-    pub cgroup_cpu_percent: u32,
+    /// cgroup v2 `cpu.max` quota as a percentage of one core. Linux only. `None` writes no
+    /// `cpu.max`, so the scope keeps the kernel's `max`.
+    pub cgroup_cpu_percent: Option<u32>,
     /// cgroup v2 `io.max` rbps+wbps on the workdir's backing device. Linux only, best-effort.
     pub cgroup_io_bytes_per_sec: u64,
     /// Ceiling on total workdir size, in bytes. Every platform.
@@ -134,11 +134,11 @@ impl Default for HostResourceLimits {
             max_processes: DEFAULT_MAX_PROCESSES,
             max_open_files: DEFAULT_MAX_OPEN_FILES,
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
-            cpu_seconds: DEFAULT_CPU_SECONDS,
+            cpu_seconds: None,
             memory_bytes: DEFAULT_MEMORY_BYTES,
             cgroup_memory_bytes: DEFAULT_CGROUP_MEMORY_BYTES,
             cgroup_pids_max: DEFAULT_CGROUP_PIDS_MAX,
-            cgroup_cpu_percent: DEFAULT_CGROUP_CPU_PERCENT,
+            cgroup_cpu_percent: None,
             cgroup_io_bytes_per_sec: DEFAULT_CGROUP_IO_BYTES_PER_SEC,
             workdir_max_bytes: DEFAULT_WORKDIR_MAX_BYTES,
         }
@@ -147,7 +147,8 @@ impl Default for HostResourceLimits {
 
 impl HostResourceLimits {
     /// Resolve a manifest `capabilities.resources` block, substituting the default for each
-    /// field the manifest left out (and for the whole block when it is absent).
+    /// field the manifest left out (and for the whole block when it is absent). The CPU fields
+    /// have no default and stay `None` when left out.
     #[must_use]
     pub fn resolve(declared: Option<&murmur_artifact::ResourceCapabilities>) -> Self {
         let defaults = Self::default();
@@ -160,15 +161,13 @@ impl HostResourceLimits {
             max_file_size_bytes: declared
                 .max_file_size_bytes
                 .unwrap_or(defaults.max_file_size_bytes),
-            cpu_seconds: declared.cpu_seconds.unwrap_or(defaults.cpu_seconds),
+            cpu_seconds: declared.cpu_seconds,
             memory_bytes: declared.memory_bytes.unwrap_or(defaults.memory_bytes),
             cgroup_memory_bytes: declared
                 .cgroup_memory_bytes
                 .unwrap_or(defaults.cgroup_memory_bytes),
             cgroup_pids_max: declared.cgroup_pids_max.unwrap_or(defaults.cgroup_pids_max),
-            cgroup_cpu_percent: declared
-                .cgroup_cpu_percent
-                .unwrap_or(defaults.cgroup_cpu_percent),
+            cgroup_cpu_percent: declared.cgroup_cpu_percent,
             cgroup_io_bytes_per_sec: declared
                 .cgroup_io_bytes_per_sec
                 .unwrap_or(defaults.cgroup_io_bytes_per_sec),
@@ -287,7 +286,8 @@ pub(crate) enum NprocBound {
 
 /// Sets every [`HostResourceLimits`] rlimit field as a **hard** limit (`rlim_cur == rlim_max`)
 /// except `RLIMIT_CPU`, whose soft slot sits one second below its hard slot
-/// ([`cpu_rlimit_slots`]), plus `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for
+/// ([`cpu_rlimit_slots`]) and which is left as inherited when `cpu_seconds` is `None`, plus
+/// `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for
 /// [`NprocBound::Headroom`]; for [`NprocBound::CgroupPidsMax`] no `RLIMIT_NPROC` call is made at
 /// all.
 ///
@@ -363,7 +363,9 @@ pub(crate) fn apply_nproc_bound(
 pub(crate) fn apply_per_process_rlimits(limits: &HostResourceLimits) -> std::io::Result<()> {
     set_hard_rlimit(libc::RLIMIT_NOFILE as u32, limits.max_open_files)?;
     set_hard_rlimit(libc::RLIMIT_FSIZE as u32, limits.max_file_size_bytes)?;
-    set_cpu_rlimit(limits.cpu_seconds)?;
+    if let Some(cpu_seconds) = limits.cpu_seconds {
+        set_cpu_rlimit(cpu_seconds)?;
+    }
     set_hard_rlimit(libc::RLIMIT_CORE as u32, 0)?;
 
     // `memory_bytes` maps to `RLIMIT_AS` (total address space) on Linux, where it is enforced
@@ -460,7 +462,7 @@ fn cpu_rlimit_slots(cpu_seconds: u64, inherited_hard: libc::rlim_t) -> libc::rli
 /// `getrlimit(resource)`, with a failure returned as the bare OS error.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn read_rlimit(resource: u32) -> std::io::Result<libc::rlimit> {
+pub(crate) fn read_rlimit(resource: u32) -> std::io::Result<libc::rlimit> {
     let mut current = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -879,8 +881,26 @@ mod tests {
         );
     }
 
+    /// A silent manifest sets no CPU-time limit and no CPU cap; a declared one passes through.
+    #[test]
+    fn the_cpu_fields_are_unset_unless_declared() {
+        let silent = HostResourceLimits::resolve(None);
+        assert_eq!(silent.cpu_seconds, None);
+        assert_eq!(silent.cgroup_cpu_percent, None);
+
+        let declared = murmur_artifact::ResourceCapabilities {
+            cpu_seconds: Some(7),
+            cgroup_cpu_percent: Some(50),
+            ..murmur_artifact::ResourceCapabilities::default()
+        };
+        let limits = HostResourceLimits::resolve(Some(&declared));
+        assert_eq!(limits.cpu_seconds, Some(7));
+        assert_eq!(limits.cgroup_cpu_percent, Some(50));
+        assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_BYTES);
+    }
+
     /// The rule inherited from `capabilities.limits`: a manifest that declares the section but
-    /// omits a field gets that field's default, never "unlimited".
+    /// omits a field gets that field's default, except the CPU fields, which stay unset.
     #[test]
     fn resolve_fills_each_omitted_field_independently() {
         let declared = murmur_artifact::ResourceCapabilities {
@@ -894,10 +914,10 @@ mod tests {
         assert_eq!(limits.cgroup_pids_max, 32);
         assert_eq!(limits.max_processes, DEFAULT_MAX_PROCESSES);
         assert_eq!(limits.max_file_size_bytes, DEFAULT_MAX_FILE_SIZE_BYTES);
-        assert_eq!(limits.cpu_seconds, DEFAULT_CPU_SECONDS);
+        assert_eq!(limits.cpu_seconds, None);
         assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_BYTES);
         assert_eq!(limits.cgroup_memory_bytes, DEFAULT_CGROUP_MEMORY_BYTES);
-        assert_eq!(limits.cgroup_cpu_percent, DEFAULT_CGROUP_CPU_PERCENT);
+        assert_eq!(limits.cgroup_cpu_percent, None);
         assert_eq!(
             limits.cgroup_io_bytes_per_sec,
             DEFAULT_CGROUP_IO_BYTES_PER_SEC

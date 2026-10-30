@@ -803,7 +803,7 @@ fn detached_scenario(name: &str) -> (common::ScriptedServer, TempDir, Capsule, S
         &home,
         &manifest_path,
         LifecycleConfig {
-            shell_grace_secs: 1,
+            shell_grace_secs: Some(1),
             ..queue_lifecycle()
         },
     ));
@@ -899,7 +899,7 @@ fn cancel_demotes_a_running_foreground_command() {
         &home,
         &manifest_path,
         LifecycleConfig {
-            shell_grace_secs: 120,
+            shell_grace_secs: Some(120),
             ..queue_lifecycle()
         },
     ));

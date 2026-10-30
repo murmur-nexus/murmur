@@ -771,7 +771,10 @@ struct ShellDetachedEvent {
     binary: String,
     command: String,
     /// The `lifecycle.shell_grace_secs` in force, in milliseconds — what this command outran.
-    grace_ms: u64,
+    /// Absent when the session declares no grace, so the command was demoted by an abandoned
+    /// call or a cancel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace_ms: Option<u64>,
 }
 
 /// A detached command finishing, written where the task loop drains it. Hangs off the session
@@ -3118,7 +3121,7 @@ impl TraceWriter {
         work_id: &str,
         binary: &str,
         command: &str,
-        grace_ms: u64,
+        grace_ms: Option<u64>,
     ) -> std::io::Result<()> {
         let event = ShellDetachedEvent {
             event_type: "shell_detached",
@@ -5584,7 +5587,7 @@ mod tests {
             work_id: "wrk_0a1b2c3d4e5f6a7b".to_string(),
             binary: "/usr/bin/bash".to_string(),
             command: "make -j8".to_string(),
-            grace_ms: 1_000,
+            grace_ms: Some(1_000),
         }
     }
 
@@ -5626,6 +5629,24 @@ mod tests {
         assert_eq!(events[0]["event_type"], "shell_detached");
         assert_eq!(events[0]["work_id"], "wrk_0a1b2c3d4e5f6a7b");
         assert_eq!(events[0]["turn"], 3);
+        assert_eq!(events[0]["grace_ms"], 1_000);
+    }
+
+    /// A demotion with no grace in force carries no `grace_ms` key at all.
+    #[tokio::test]
+    async fn a_demotion_with_no_grace_writes_no_grace_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        let info = crate::detached::DetachedDispatchInfo {
+            grace_ms: None,
+            ..demotion_info()
+        };
+        crate::agent::record_demotion(&mut writer, 3, &info).await;
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "shell_detached");
+        assert!(events[0].get("grace_ms").is_none(), "{}", events[0]);
     }
 
     #[tokio::test]

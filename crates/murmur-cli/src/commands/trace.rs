@@ -497,13 +497,17 @@ struct ShellEvent {
     binary: Option<String>,
 }
 
-/// A shell command that outran `lifecycle.shell_grace_secs` and moved to the background.
+/// A shell command moved to the background: it outran `lifecycle.shell_grace_secs`, or the call
+/// waiting on it was abandoned or its task canceled.
 #[derive(Debug, Deserialize)]
 struct ShellDetachedEvent {
     work_id: String,
     #[serde(default)]
     binary: Option<String>,
-    grace_ms: u64,
+    /// Absent when the session declared no grace, so the command was demoted by an abandoned
+    /// call or a cancel.
+    #[serde(default)]
+    grace_ms: Option<u64>,
 }
 
 /// That command finishing, carrying the same `work_id` and the id of the task it was enqueued as.
@@ -4942,11 +4946,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_dur(e.duration_ms)
         ),
         TraceEvent::ShellDetached(e) => format!(
-            "{}{}  {}  detached after {}",
+            "{}{}  {}  {}",
             kind("shell_detached"),
             e.binary.as_deref().unwrap_or("—"),
             fmt_id_short(&e.work_id, 12),
-            fmt_dur(e.grace_ms)
+            e.grace_ms.map_or_else(
+                || "detached".to_string(),
+                |grace_ms| format!("detached after {}", fmt_dur(grace_ms))
+            )
         ),
         TraceEvent::ShellCompleted(e) => format!(
             "{}{}  {}  exit {} {}  {}  {}",
@@ -6912,6 +6919,17 @@ mod tests {
         assert_eq!(
             row(line),
             "shell_detached /usr/bin/bash  wrk_0a1b2c3d…  detached after 10.0s"
+        );
+    }
+
+    /// A session with no grace demotes only on an abandoned call or a cancel, and its line
+    /// carries no `grace_ms`.
+    #[test]
+    fn shell_detached_row_with_no_grace_says_detached_and_no_duration() {
+        let line = r#"{"event_type":"shell_detached","event_id":"evt_1","session_id":"s","timestamp":1,"turn":2,"task_id":"tsk_1","work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8"}"#;
+        assert_eq!(
+            row(line),
+            "shell_detached /usr/bin/bash  wrk_0a1b2c3d…  detached"
         );
     }
 

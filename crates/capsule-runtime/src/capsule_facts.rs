@@ -6,12 +6,14 @@
 //! state them: the `[Capsule]` block (`transport: http`), the `transport: process` system prompt
 //! and MURMUR.md. The limits are rendered for all three by [`CapsuleFacts::limit_parts`].
 //!
-//! Nothing here varies between launches of one manifest. Left out on purpose: the per-turn output
-//! cap, which a `control:` block can change mid-session; the delegation deadline, which
-//! `MURMUR_DELEGATION_TIMEOUT_SECS` can change per launch; whether a demoted shell command's result
-//! is delivered, which the `--lifecycle-*` flags decide; the work-folder ceiling, which bounds the
-//! work folder only for a session launched without `--workdir`; and any wall-clock limit, because
-//! the runtime enforces none.
+//! Nothing here varies between launches of one manifest. Only the limits in force are stated: a
+//! manifest with no `capabilities.resources.cpu_seconds` sets no CPU-time limit, and one with no
+//! `lifecycle.shell_grace_secs` demotes no shell command on a clock, so neither is mentioned.
+//! Left out on purpose: the per-turn output cap, which a `control:` block can change mid-session;
+//! the delegation deadline, which `MURMUR_DELEGATION_TIMEOUT_SECS` can change per launch; whether
+//! a demoted shell command's result is delivered, which the `--lifecycle-*` flags decide; the
+//! work-folder ceiling, which bounds the work folder only for a session launched without
+//! `--workdir`; and any wall-clock limit, because the runtime enforces none.
 
 use murmur_artifact::{InferenceConfig, LifecycleConfig};
 
@@ -46,10 +48,11 @@ pub(crate) struct CapsuleFacts {
 pub(crate) struct DispatchLimits {
     /// `HostResourceLimits::memory_bytes`: `RLIMIT_AS` (`RLIMIT_DATA` on macOS) per command.
     pub(crate) memory_bytes: u64,
-    /// `HostResourceLimits::cpu_seconds`: `RLIMIT_CPU` per command.
-    pub(crate) cpu_seconds: u64,
+    /// `HostResourceLimits::cpu_seconds`: `RLIMIT_CPU` per command. `None` sets none.
+    pub(crate) cpu_seconds: Option<u64>,
     /// `lifecycle.shell_grace_secs`, when the model's tool list holds a runtime shell tool
-    /// (`capabilities.shell.allow` is not empty).
+    /// (`capabilities.shell.allow` is not empty). `None` without a shell tool and without a
+    /// declared grace: either way no command is demoted on a clock.
     pub(crate) shell_grace_secs: Option<u64>,
 }
 
@@ -68,8 +71,9 @@ impl CapsuleFacts {
         let dispatch_limits = (inference.transport != "process").then(|| DispatchLimits {
             memory_bytes: policy.resources.memory_bytes,
             cpu_seconds: policy.resources.cpu_seconds,
-            shell_grace_secs: (!policy.shell_allow.is_empty())
-                .then_some(lifecycle.shell_grace_secs),
+            shell_grace_secs: lifecycle
+                .shell_grace_secs
+                .filter(|_| !policy.shell_allow.is_empty()),
         });
         Self {
             read_only_paths: policy.read_only_paths.clone(),
@@ -99,11 +103,11 @@ impl CapsuleFacts {
             parts.push(format!("{tokens} tokens per session"));
         }
         if let Some(limits) = self.dispatch_limits {
-            parts.push(format!(
-                "{} memory and {} s CPU time per command",
-                render_bytes(limits.memory_bytes),
-                limits.cpu_seconds
-            ));
+            let memory = render_bytes(limits.memory_bytes);
+            parts.push(match limits.cpu_seconds {
+                Some(cpu) => format!("{memory} memory and {cpu} s CPU time per command"),
+                None => format!("{memory} memory per command"),
+            });
             if let Some(grace) = limits.shell_grace_secs {
                 parts.push(format!(
                     "a shell command still running after {grace} s moves to the background"
@@ -201,7 +205,7 @@ pub(crate) fn test_enforced_limits() -> (CapabilityPolicy, InferenceConfig, Life
         shell_allow: vec!["bash".to_string()],
         resources: crate::resources::HostResourceLimits {
             memory_bytes: 1_073_741_824,
-            cpu_seconds: 120,
+            cpu_seconds: Some(120),
             workdir_max_bytes: 536_870_912,
             ..crate::resources::HostResourceLimits::resolve(None)
         },
@@ -213,7 +217,7 @@ pub(crate) fn test_enforced_limits() -> (CapabilityPolicy, InferenceConfig, Life
         ..test_http_inference()
     };
     let lifecycle = LifecycleConfig {
-        shell_grace_secs: 30,
+        shell_grace_secs: Some(30),
         ..LifecycleConfig::default()
     };
     (policy, inference, lifecycle)
@@ -237,10 +241,42 @@ mod tests {
         let facts = test_default_facts();
         assert_eq!(
             facts.limits_sentence(),
-            "10 turns per task; 2 GiB memory and 3600 s CPU time per command."
+            "10 turns per task; 2 GiB memory per command."
         );
         assert_eq!(facts.network_allowlist(), "none");
         assert!(facts.read_only_paths.is_empty());
+    }
+
+    /// A shell grant with no declared grace demotes nothing on a clock, so it adds no limit.
+    #[test]
+    fn capsule_facts_of_a_shell_grant_without_a_grace_state_no_demotion() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let facts = CapsuleFacts::resolve(
+            &policy,
+            &test_http_inference(),
+            &LifecycleConfig::default(),
+            Vec::new(),
+        );
+        assert_eq!(facts.dispatch_limits.unwrap().shell_grace_secs, None);
+        assert_eq!(
+            facts.limits_sentence(),
+            "10 turns per task; 2 GiB memory per command."
+        );
+
+        // A grace with no shell grant has no shell tool to apply to.
+        let facts = CapsuleFacts::resolve(
+            &CapabilityPolicy::default(),
+            &test_http_inference(),
+            &LifecycleConfig {
+                shell_grace_secs: Some(5),
+                ..LifecycleConfig::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(facts.dispatch_limits.unwrap().shell_grace_secs, None);
     }
 
     /// Every value is the one the runtime enforces, read from the staged policy, inference
@@ -254,7 +290,7 @@ mod tests {
             Some(DispatchLimits {
                 memory_bytes: policy.resources.memory_bytes,
                 cpu_seconds: policy.resources.cpu_seconds,
-                shell_grace_secs: Some(lifecycle.shell_grace_secs),
+                shell_grace_secs: lifecycle.shell_grace_secs,
             })
         );
         assert_eq!(facts.max_turns, inference.max_turns);

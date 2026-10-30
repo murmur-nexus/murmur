@@ -60,17 +60,18 @@ pub struct LifecycleConfig {
     /// cumulative turn count.
     pub max_task_reopens: u32,
     /// How long a shell command runs in the foreground before it is demoted to the background.
-    /// Defaults to 10 seconds. A command that exits inside this window returns its output to the
-    /// turn as it always has; one that outruns it hands the turn a handle, keeps running, and
-    /// reports back later as a `completion`-origin task. `0` demotes at the first poll after the
-    /// spawn, so effectively every command detaches.
-    pub shell_grace_secs: u64,
+    /// `None` when not declared: a command runs in the foreground until it exits, nothing is
+    /// demoted on a clock, and the `background-command` tool is not offered. With a value, a
+    /// command that exits inside this window returns its output to the turn; one that outruns it
+    /// hands the turn a handle, keeps running, and reports back later as a `completion`-origin
+    /// task. `0` demotes at the first poll after the spawn, so effectively every command detaches.
+    pub shell_grace_secs: Option<u64>,
     /// The single bound on a delegation, covering both waits one can have: how long a sub-capsule
     /// started by `delegate-task` is watched, and how long a plan `capsule` step waits for its
     /// answer. Defaults to 600 seconds. Absent is a ceiling rather than an absence: a capsule that
     /// never declares this one is still bounded, because an unbounded delegation leaves a wedged
     /// sub-capsule running for as long as the capsule that started it. `0` gives up at the first
-    /// poll after the task is delivered, the same reading `shell_grace_secs: 0` has.
+    /// poll after the task is delivered.
     ///
     /// Reaching the deadline ends the sub-capsule. A `delegate-task` caller is told in a
     /// `completion`-origin task carrying `status: terminated` and a detail naming the bound; a plan
@@ -180,7 +181,7 @@ impl Default for LifecycleConfig {
             input_timeout_secs: None,
             conversation_mode: ConversationMode::Stateless,
             max_task_reopens: 1,
-            shell_grace_secs: 10,
+            shell_grace_secs: None,
             delegation_deadline_secs: 600,
             deadline_notice_secs: None,
             keep_working: None,
@@ -4023,7 +4024,7 @@ impl RuntimeManifest {
                     input_timeout_secs: raw_lc.input_timeout_secs,
                     conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
                     max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
-                    shell_grace_secs: raw_lc.shell_grace_secs.unwrap_or(defaults.shell_grace_secs),
+                    shell_grace_secs: raw_lc.shell_grace_secs,
                     delegation_deadline_secs: raw_lc
                         .delegation_deadline_secs
                         .unwrap_or(defaults.delegation_deadline_secs),
@@ -11513,7 +11514,7 @@ context:
         )
         .unwrap();
         let lifecycle = manifest.lifecycle.unwrap();
-        assert_eq!(lifecycle.shell_grace_secs, 45);
+        assert_eq!(lifecycle.shell_grace_secs, Some(45));
         // Every other lifecycle field is untouched by declaring this one.
         assert_eq!(
             lifecycle.task_acceptance,
@@ -11535,19 +11536,21 @@ context:
         );
     }
 
+    /// An undeclared grace is no grace at all, whether the `lifecycle:` block is there or not.
     #[test]
-    fn lifecycle_shell_grace_secs_defaults_to_10() {
+    fn lifecycle_shell_grace_secs_is_unset_when_not_declared() {
         let manifest = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
         )
         .unwrap();
         let lifecycle = manifest.lifecycle.unwrap();
-        assert_eq!(lifecycle.shell_grace_secs, 10);
+        assert_eq!(lifecycle.shell_grace_secs, None);
         assert_eq!(lifecycle.queue_depth, 3);
 
         let without_block =
             RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
-        assert_eq!(without_block.effective_lifecycle().shell_grace_secs, 10);
+        assert_eq!(without_block.effective_lifecycle().shell_grace_secs, None);
+        assert_eq!(LifecycleConfig::default().shell_grace_secs, None);
     }
 
     /// The bound a capsule delegates under is declared, and a capsule that declares nothing is
@@ -11911,7 +11914,7 @@ context:
         )
         .unwrap();
         let lifecycle = manifest.lifecycle.unwrap();
-        assert_eq!(lifecycle.shell_grace_secs, 0);
+        assert_eq!(lifecycle.shell_grace_secs, Some(0));
         assert_eq!(
             lifecycle.max_task_reopens,
             LifecycleConfig::default().max_task_reopens
