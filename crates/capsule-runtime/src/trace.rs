@@ -4180,13 +4180,6 @@ impl TraceWriter {
         self.writer.flush().await
     }
 
-    /// Writes one event as one line, and flushes.
-    ///
-    /// The flush is not an optimisation choice: [`ResourceTraceAppender`] appends to this same
-    /// `trace.jsonl` while a task runs, so a line left half-buffered here would be split around
-    /// whatever the appender wrote in between and the file would stop parsing as JSONL. The
-    /// two writers agree on one rule — a complete line per write, then flush — and that rule is
-    /// what makes concurrent reads during a running task safe to record.
     /// Write `event` as one line, after a `call_deadline` line for each firing the session's
     /// latch holds. Draining here, ahead of every line, is what puts a cut call's
     /// `call_deadline` before the record of that call and every one before `session_end`.
@@ -4224,6 +4217,13 @@ impl TraceWriter {
         Ok(())
     }
 
+    /// Writes one event as one line, and flushes.
+    ///
+    /// The flush is not an optimisation choice: [`ResourceTraceAppender`] appends to this same
+    /// `trace.jsonl` while a task runs, so a line left half-buffered here would be split around
+    /// whatever the appender wrote in between and the file would stop parsing as JSONL. The
+    /// two writers agree on one rule — a complete line per write, then flush — and that rule is
+    /// what makes concurrent reads during a running task safe to record.
     async fn write_line(&mut self, event: &impl Serialize) -> std::io::Result<()> {
         let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
         line.push('\n');

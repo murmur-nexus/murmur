@@ -6963,8 +6963,6 @@ mod tests {
         );
     }
 
-    /// A retry row names the attempt out of every attempt the call may make, the status, and the
-    /// wait; a retry with no status names its reason instead.
     /// A `call_deadline` line renders as one row naming the role, the component, the call and
     /// the deadline it was stopped at.
     #[test]
@@ -6997,6 +6995,8 @@ mod tests {
         );
     }
 
+    /// A retry row names the attempt out of every attempt the call may make, the status, and the
+    /// wait; a retry with no status names its reason instead.
     #[test]
     fn inference_retry_row_names_the_attempt_the_status_and_the_wait() {
         let line = r#"{"event_type":"inference_retry","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"turn":0,"task_id":"tsk_1","attempt":1,"max_retries":6,"reason":"status","provider_status":429,"error":"HTTP 429: slow down","delay_ms":1200,"retry_after_ms":1200,"charged_tokens":0}"#;

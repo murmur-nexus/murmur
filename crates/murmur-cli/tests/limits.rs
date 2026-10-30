@@ -6,6 +6,9 @@
 //! these tests fail on the timeout instead of hanging the suite forever — which is exactly
 //! the failure mode epoch interruption exists to remove.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
 use assert_cmd::Command;
@@ -60,47 +63,15 @@ fn run_capsule(home: &Path, manifest_path: &Path) -> assert_cmd::assert::Assert 
 
 /// Every line of the one `trace.jsonl` the run left under `home`'s records.
 fn trace_lines(home: &Path) -> Vec<serde_json::Value> {
-    let mut stack = vec![home.join(".murmur").join("records")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
-                return fs::read_to_string(&path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-            }
-        }
-    }
-    panic!("no trace.jsonl under {}", home.display());
+    let trace = common::find_file(&common::records_root(home), "trace.jsonl")
+        .unwrap_or_else(|| panic!("no trace.jsonl under {}", home.display()));
+    common::read_whole_trace(&trace)
 }
 
 /// The first and last lines of the one `trace.jsonl` the run left under `home`'s records.
 fn trace_frame(home: &Path) -> (serde_json::Value, serde_json::Value) {
     let lines = trace_lines(home);
     (lines[0].clone(), lines.last().unwrap().clone())
-}
-
-/// Whether a file named `name` exists anywhere under `root`.
-fn file_under(root: &Path, name: &str) -> bool {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|file| file == name) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// The headline proof: a capsule spinning in a loop that never returns and never calls the
@@ -179,7 +150,8 @@ fn a_capsule_sleeping_in_the_host_is_stopped_at_its_deadline() {
     assert_eq!(end["event_type"], "session_end");
     assert_eq!(end["exit_status"], "deadline_exceeded");
     assert!(
-        !file_under(project.path(), "done.txt") && !file_under(home.path(), "done.txt"),
+        common::find_file(project.path(), "done.txt").is_none()
+            && common::find_file(home.path(), "done.txt").is_none(),
         "the stopped run wrote nothing after its sleep"
     );
 }

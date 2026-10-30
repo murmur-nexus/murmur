@@ -184,11 +184,9 @@ impl Run {
     }
 
     fn trace(&self) -> Vec<Value> {
-        fs::read_to_string(self.records_dir().join("trace.jsonl"))
-            .unwrap_or_else(|err| panic!("no trace.jsonl ({err}); {}", self.context()))
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        let trace = self.records_dir().join("trace.jsonl");
+        assert!(trace.is_file(), "no trace.jsonl; {}", self.context());
+        common::read_whole_trace(&trace)
     }
 
     fn of_type(&self, event_type: &str) -> Vec<Value> {

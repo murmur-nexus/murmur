@@ -496,12 +496,7 @@ impl ProcessDriver {
             }
             GuestFailure::Other => format!("trapped: {error:#}"),
         };
-        RuntimeError::ProcessDriverCallFailed {
-            name: self.name.clone(),
-            version: self.version.clone(),
-            call: call.to_string(),
-            message,
-        }
+        self.failed_in(call, message)
     }
 
     fn load_error(&self, message: String) -> RuntimeError {
