@@ -1159,6 +1159,18 @@ impl HookRuntime {
         self.dispatch(workdir, event).await.artifacts
     }
 
+    /// Dispatch an announcement of a tool call to all bound hooks, before the call runs.
+    ///
+    /// An announcement is not a turn. It reaches hooks exactly as [`Self::emit`] would —
+    /// blocking hooks inline, async hooks enqueued, errors logged, faults recorded — but it
+    /// advances none of the running totals (`total_turns`, the token totals, the tool-call and
+    /// shell-call totals), so `on-session-end` counts the session's turns and spend as if no
+    /// announcement had been made. Any artifact a hook returns is discarded, as the artifacts of
+    /// a tool-calling turn are.
+    pub(crate) async fn announce(&mut self, workdir: &WorkdirRoot, event: HookEvent) {
+        self.dispatch_uncounted(workdir, event).await;
+    }
+
     /// Whether this session has a policy hook bound at all — a blocking hook declaring
     /// `commit_policy: deny` on `on-shell` or `on-tool-call`.
     ///
@@ -1331,7 +1343,8 @@ impl HookRuntime {
     /// Every caller reads only the [`DispatchOutcome`] field its event honors and ignores
     /// the rest; a per-hook error is still logged and the loop still continues regardless
     /// of which field the caller reads. Event-keyed side effects (the running
-    /// token/tool-call/shell-call totals) run here so all events funnel through one place.
+    /// token/tool-call/shell-call totals) run here so all events funnel through one place;
+    /// [`Self::announce`] is the one caller that skips them.
     async fn dispatch(&mut self, workdir: &WorkdirRoot, event: HookEvent) -> DispatchOutcome {
         if let HookEvent::Inference {
             input_tokens,
@@ -1349,7 +1362,16 @@ impl HookRuntime {
         if matches!(event, HookEvent::Shell { .. }) {
             self.total_shell_calls = self.total_shell_calls.saturating_add(1);
         }
+        self.dispatch_uncounted(workdir, event).await
+    }
 
+    /// [`Self::dispatch`] without the running totals: hands `event` to every bound hook and
+    /// reports the totals as they stand.
+    async fn dispatch_uncounted(
+        &mut self,
+        workdir: &WorkdirRoot,
+        event: HookEvent,
+    ) -> DispatchOutcome {
         let totals = HookTotals {
             input_tokens: self.total_input_tokens,
             output_tokens: self.total_output_tokens,
@@ -2719,6 +2741,58 @@ mod tests {
             3,
             "on-task-end fires per task"
         );
+    }
+
+    /// An announcement reaches a hook bound to `on-inference` but is not a turn: after one
+    /// `announce` the session's `total_turns` is still `0`, and only an `emit` of the same
+    /// event makes it `1`. The double's mismatched signature makes every attempted call log one
+    /// line, so the log's line count is the number of times the hook was dispatched.
+    #[test]
+    fn announcement_is_dispatched_without_counting_a_turn() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let mut all_fns: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
+        all_fns.extend_from_slice(&OPTIONAL_HOOK_FNS);
+        let component = hook_double(&engine, &all_fns);
+        let staged = vec![staged_double_named(
+            "announced",
+            HookBinding::OnInference,
+            component,
+        )];
+        let event = HookEvent::Inference {
+            turn: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            decision: "tool_call".to_string(),
+            tool_name: Some("tool-write".to_string()),
+            prompt: None,
+            output: Some(
+                r#"[{"type":"tool_call","name":"tool-write","input":{"path":"notes.txt"}}]"#
+                    .to_string(),
+            ),
+            tools: None,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let workdir = crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap();
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), staged)
+                .await
+                .expect("the double exports every lifecycle fn and instantiates");
+
+            hooks.announce(&workdir, event.clone()).await;
+            assert_eq!(
+                hook_log_lines(session.path(), "announced"),
+                1,
+                "the announcement must reach the on-inference hook"
+            );
+            assert_eq!(hooks.total_turns(), 0, "an announcement is not a turn");
+
+            hooks.emit(&workdir, event).await;
+            assert_eq!(hook_log_lines(session.path(), "announced"), 2);
+            assert_eq!(hooks.total_turns(), 1, "an emitted inference is a turn");
+        });
     }
 
     /// Invariant 6: a component missing one of the six original functions still fails

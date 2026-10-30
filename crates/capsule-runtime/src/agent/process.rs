@@ -1130,6 +1130,11 @@ async fn drive_harness(
                 }
                 // Arguments that are not JSON have no keys, so they miss every required field.
                 let input = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                // Every call the gate answers is announced to `on-inference` hooks first: dispatch
+                // waits on this arm's reply, so the announcement precedes the call running, and a
+                // call refused below was still announced, as http's `on-inference` carries a call
+                // refused after it.
+                sink.announce_call(hooks, &tool_name, &input).await;
                 let mut gate = CallGate::new(
                     hooks,
                     trace,

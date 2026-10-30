@@ -13,7 +13,7 @@ non-fatal — failures are logged to `logs/hook-<name>.log` in the session's
 | `on-stage` | During staging, before the agent loop begins. Once per launch. |
 | `on-session-start` | After staging, before the first task's work begins. Once per capsule launch. |
 | `on-task-start` | Before that task's first inference turn. Once per task. |
-| `on-inference` | After each inference response is received. |
+| `on-inference` | After each inference response is received. On `inference.transport: process`, also before each tool call the runtime runs for the harness — see [What `on-inference` carries on each transport](../reference/wit-interfaces.md#inference-event-by-transport). |
 | `on-tool-call` | Before each tool invocation is dispatched, and again after it returns. |
 | `on-shell` | Before each shell command is dispatched, and again after it returns. |
 | `on-compaction` | When session tokens reach the [compaction threshold](context.md). |
