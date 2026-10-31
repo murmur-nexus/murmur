@@ -210,11 +210,12 @@ enum Commands {
     },
     /// Build a .mur.zip artifact from a source directory
     Build {
-        /// Source directory containing murmur.yaml (or input path/zip for --skill)
+        /// Source directory containing murmur.yaml, a skill folder with SKILL.md and no
+        /// murmur.yaml, or the input path/zip for --skill
         #[arg(default_value = ".")]
         source: PathBuf,
 
-        /// Output file path (or directory)
+        /// Output file path (or directory). Skill builds default to the current directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -223,11 +224,13 @@ enum Commands {
         #[arg(long = "skill", value_name = "NAME", num_args = 0..=1)]
         skill: Option<Option<String>>,
 
-        /// Artifact version for the generated manifest (used with --skill only; default: 0.1.0)
+        /// Artifact version for the generated manifest (skill builds only: --skill, or a folder
+        /// with SKILL.md and no murmur.yaml; default: 0.1.0)
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
 
-        /// One-line description written into the manifest (used with --skill only).
+        /// One-line description written into the manifest (skill builds only; overrides the
+        /// SKILL.md front block's description).
         /// Appears as the skill's summary in the tool inventory and mur list output.
         #[arg(long, value_name = "TEXT")]
         summary: Option<String>,

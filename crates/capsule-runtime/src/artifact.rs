@@ -4,7 +4,7 @@ use murmur_artifact::payload_shape::{
     native_binary_entry, select_root_wasm_in_archive, SKILL_MD_ENTRY,
 };
 use murmur_artifact::zip_guard;
-use murmur_artifact::PACKED_MANIFEST_ENTRY;
+use murmur_artifact::{BUILD_INFO_FILE, PACKED_MANIFEST_ENTRY};
 use zip::ZipArchive;
 
 use crate::errors::RuntimeError;
@@ -130,17 +130,27 @@ fn extract_native_binary_capped(
     })
 }
 
-/// Extract `skill.md` from a skill artifact's `.mur.zip`.
+/// One skill's installable files: each as its `/`-separated path under `tools/<name>/` and its
+/// bytes, `skill.md` first.
+pub type SkillFiles = Vec<(String, Vec<u8>)>;
+
+/// The files of a skill artifact's `.mur.zip` that install under `tools/<name>/`: each as its
+/// `/`-separated path inside the archive and its bytes, `skill.md` first.
 ///
-/// Canonical skill artifact layout:
-///   murmur.yaml      — artifact manifest at zip root
-///   skill.md         — guidance content at zip root (primary payload)
-pub fn extract_skill_md(
+/// Skill artifact layout:
+///   murmur.yaml        — artifact manifest at zip root (not returned; staging writes its own)
+///   skill.md           — guidance content at zip root (required)
+///   murmur-build.json  — build record at zip root (not returned)
+///   anything else      — supporting files the guidance points at, at their packed paths
+///
+/// An entry name that escapes the archive fails the extraction, and so does a total past the
+/// artifact decompression ceiling.
+pub fn extract_skill_files(
     artifact_name: &str,
     artifact_version: &str,
     artifact_bytes: &[u8],
-) -> Result<Vec<u8>, RuntimeError> {
-    extract_skill_md_capped(
+) -> Result<SkillFiles, RuntimeError> {
+    extract_skill_files_capped(
         artifact_name,
         artifact_version,
         artifact_bytes,
@@ -148,29 +158,68 @@ pub fn extract_skill_md(
     )
 }
 
-fn extract_skill_md_capped(
+fn extract_skill_files_capped(
     artifact_name: &str,
     artifact_version: &str,
     artifact_bytes: &[u8],
     max_bytes: u64,
-) -> Result<Vec<u8>, RuntimeError> {
-    let cursor = std::io::Cursor::new(artifact_bytes);
-    let mut archive = ZipArchive::new(cursor).map_err(|err| RuntimeError::ArtifactArchive {
+) -> Result<SkillFiles, RuntimeError> {
+    let archive_error = |message: String| RuntimeError::ArtifactArchive {
         name: artifact_name.to_string(),
         version: artifact_version.to_string(),
-        message: err.to_string(),
-    })?;
+        message,
+    };
+    let cursor = std::io::Cursor::new(artifact_bytes);
+    let mut archive = ZipArchive::new(cursor).map_err(|err| archive_error(err.to_string()))?;
 
-    zip_guard::read_zip_entry_capped(&mut archive, SKILL_MD_ENTRY, max_bytes).map_err(|err| {
-        RuntimeError::ArtifactArchive {
-            name: artifact_name.to_string(),
-            version: artifact_version.to_string(),
-            message: format!(
+    let skill_md = zip_guard::read_zip_entry_capped(&mut archive, SKILL_MD_ENTRY, max_bytes)
+        .map_err(|err| {
+            archive_error(format!(
                 "{SKILL_MD_ENTRY} not found or unreadable at archive root (ensure \
                  {SKILL_MD_ENTRY} is at the root of the .mur.zip): {err}"
-            ),
+            ))
+        })?;
+    let mut total = skill_md.len() as u64;
+    let mut files = vec![(SKILL_MD_ENTRY.to_string(), skill_md)];
+
+    let mut supporting = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(index)
+            .map_err(|err| archive_error(err.to_string()))?;
+        if entry.is_dir() {
+            continue;
         }
-    })
+        let raw_name = entry
+            .name()
+            .map_err(|err| archive_error(err.to_string()))?
+            .into_owned();
+        let relative = zip_guard::sanitize_entry_path(&raw_name)
+            .map_err(|err| archive_error(err.to_string()))?;
+        let relative = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if relative.is_empty()
+            || [SKILL_MD_ENTRY, PACKED_MANIFEST_ENTRY, BUILD_INFO_FILE].contains(&relative.as_str())
+        {
+            continue;
+        }
+        supporting.push((raw_name, relative));
+    }
+
+    for (raw_name, relative) in supporting {
+        let remaining = max_bytes.saturating_sub(total);
+        let bytes = zip_guard::read_zip_entry_capped(&mut archive, &raw_name, remaining)
+            .map_err(|err| archive_error(format!("failed to read '{raw_name}': {err}")))?;
+        total += bytes.len() as u64;
+        files.push((relative, bytes));
+    }
+    Ok(files)
 }
 
 pub fn extract_manifest_yaml(
@@ -620,14 +669,79 @@ mod tests {
     }
 
     #[test]
-    fn extract_skill_md_rejects_entry_past_ceiling() {
+    fn extract_skill_files_rejects_entry_past_ceiling() {
         let big = vec![b'a'; 1024];
         let archive = archive_with_files(&[("skill.md", &big)]);
 
-        let err = extract_skill_md_capped("demo", "0.0.1", &archive, 16).unwrap_err();
+        let err = extract_skill_files_capped("demo", "0.0.1", &archive, 16).unwrap_err();
         match err {
             RuntimeError::ArtifactArchive { message, .. } => {
                 assert!(message.contains("decompression ceiling"));
+            }
+            other => panic!("expected ArtifactArchive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_skill_files_rejects_a_total_past_ceiling() {
+        let archive =
+            archive_with_files(&[("skill.md", &[b'a'; 10]), ("references/a.md", &[b'b'; 10])]);
+
+        let err = extract_skill_files_capped("demo", "0.0.1", &archive, 16).unwrap_err();
+        match err {
+            RuntimeError::ArtifactArchive { message, .. } => {
+                assert!(message.contains("references/a.md"), "{message}");
+                assert!(message.contains("decompression ceiling"), "{message}");
+            }
+            other => panic!("expected ArtifactArchive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_skill_files_returns_supporting_files_without_manifest_or_build_record() {
+        let archive = archive_with_files(&[
+            (PACKED_MANIFEST_ENTRY, b"name: demo"),
+            ("references/forms.md", b"# Forms\n"),
+            ("skill.md", b"# Demo\n"),
+            (BUILD_INFO_FILE, b"{}"),
+            ("scripts/fill.py", b"print(1)\n"),
+        ]);
+
+        let files = extract_skill_files("demo", "0.0.1", &archive).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                ("skill.md".to_string(), b"# Demo\n".to_vec()),
+                ("references/forms.md".to_string(), b"# Forms\n".to_vec()),
+                ("scripts/fill.py".to_string(), b"print(1)\n".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_skill_files_requires_skill_md() {
+        let archive = archive_with_files(&[(PACKED_MANIFEST_ENTRY, b"name: demo")]);
+
+        let err = extract_skill_files("demo", "0.0.1", &archive).unwrap_err();
+        match err {
+            RuntimeError::ArtifactArchive { message, .. } => {
+                assert!(
+                    message.contains("skill.md not found or unreadable at archive root"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected ArtifactArchive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_skill_files_refuses_an_escaping_entry() {
+        let archive = archive_with_files(&[("skill.md", b"# s"), ("../escape.md", b"x")]);
+
+        let err = extract_skill_files("demo", "0.0.1", &archive).unwrap_err();
+        match err {
+            RuntimeError::ArtifactArchive { message, .. } => {
+                assert!(message.contains("../escape.md"), "{message}");
             }
             other => panic!("expected ArtifactArchive error, got {other:?}"),
         }

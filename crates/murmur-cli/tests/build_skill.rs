@@ -272,13 +272,6 @@ fn skill_build_existing_mur_build_unchanged() {
 
 #[test]
 fn skill_build_roundtrip_skill_md_installed_in_workdir() {
-    use capsule_runtime::{
-        capability_policy_from_runtime_manifest, stage_session, ArtifactRequest, StageRequest,
-    };
-    use murmur_artifact::{
-        load_runtime_manifest, ContainmentClass, InferenceConfig, InferenceDriver, LocalRegistry,
-    };
-    use std::collections::HashSet;
     use tempfile::TempDir;
 
     let home: TempDir = tempdir().unwrap();
@@ -323,7 +316,44 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
-    let runtime_manifest = load_runtime_manifest(&manifest_path).unwrap();
+    let staged = stage_capsule(&home, capsule_dir.path(), &manifest_path);
+
+    // 6. Verify tools/rt-skill/skill.md is present in the runtime directory: the model-facing directory
+    // carries the bare name
+    let skill_path = staged
+        .runtime_dir
+        .join("tools")
+        .join("rt-skill")
+        .join("skill.md");
+    assert!(
+        skill_path.exists(),
+        "tools/rt-skill/skill.md should be present after staging; workdir: {}",
+        staged.accessible_workdir.display()
+    );
+    let content = fs::read_to_string(&skill_path).unwrap();
+    assert!(
+        content.contains("Roundtrip Skill"),
+        "skill.md content mismatch: {content}"
+    );
+}
+
+/// Stage the capsule at `capsule_dir` (its manifest at `manifest_path`) against `home`'s global
+/// store, with a minimal inference config so stage_session accepts empty capsule bytes. The
+/// inference endpoint is never called during staging — only artifact installation runs.
+fn stage_capsule(
+    home: &tempfile::TempDir,
+    capsule_dir: &Path,
+    manifest_path: &Path,
+) -> capsule_runtime::StagedSession {
+    use capsule_runtime::{
+        capability_policy_from_runtime_manifest, stage_session, ArtifactRequest, StageRequest,
+    };
+    use murmur_artifact::{
+        load_runtime_manifest, ContainmentClass, InferenceConfig, InferenceDriver, LocalRegistry,
+    };
+    use std::collections::HashSet;
+
+    let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
     let mut requested_artifacts = Vec::new();
     for a in &runtime_manifest.artifacts {
         requested_artifacts.push(ArtifactRequest {
@@ -365,7 +395,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
     common::process_home();
-    let staged = stage_session(
+    stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
@@ -374,7 +404,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             session_deadline: None,
             manifest_file: None,
             credentials_file: None,
-            manifest_dir: capsule_dir.path().to_path_buf(),
+            manifest_dir: capsule_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
             capsule_artifact: None,
@@ -409,23 +439,397 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             formation_member: None,
         },
     )
+    .unwrap()
+}
+
+// ── manifest-less skill folders (the Claude Code / Codex / pi layout) ────────
+
+const PDF_HELPER_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+
+/// A standard skill folder under `base`: `Some Folder/SKILL.md` with a front block and
+/// `Some Folder/references/forms.md`, no murmur.yaml.
+fn pdf_helper_folder(base: &Path) -> PathBuf {
+    let folder = base.join("Some Folder");
+    fs::create_dir_all(folder.join("references")).unwrap();
+    fs::write(folder.join("SKILL.md"), PDF_HELPER_SKILL_MD).unwrap();
+    fs::write(folder.join("references/forms.md"), "# Forms\n").unwrap();
+    folder
+}
+
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn manifest_yaml(zip: &Path) -> serde_norway::Value {
+    serde_norway::from_str(&zip_entry_content(zip, "murmur.yaml")).unwrap()
+}
+
+fn mur_build(cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("mur")
+        .unwrap()
+        .arg("build")
+        .args(args)
+        .current_dir(cwd)
+        .assert()
+}
+
+#[test]
+fn manifest_less_skill_folder_builds_from_its_front_block() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+
+    mur_build(outdir.path(), &[folder.to_str().unwrap()])
+        .success()
+        .stdout(
+            predicate::str::is_match(
+                r"^Built artifact: .*/pdf-helper-0\.1\.0\.mur\.zip \(WIT level \d+\)\n$",
+            )
+            .unwrap(),
+        );
+
+    let zip = outdir.path().join("pdf-helper-0.1.0.mur.zip");
+    assert_eq!(
+        zip_entries(&zip),
+        [
+            "murmur-build.json",
+            "murmur.yaml",
+            "references/forms.md",
+            "skill.md"
+        ]
+    );
+    assert_eq!(zip_entry_content(&zip, "skill.md"), PDF_HELPER_SKILL_MD);
+    assert_eq!(zip_entry_content(&zip, "references/forms.md"), "# Forms\n");
+    let manifest = manifest_yaml(&zip);
+    assert_eq!(manifest["name"].as_str(), Some("pdf-helper"));
+    assert_eq!(manifest["version"].as_str(), Some("0.1.0"));
+    assert_eq!(manifest["runtime"].as_str(), Some("skill"));
+    assert_eq!(
+        manifest["description"].as_str(),
+        Some("Fill PDF forms: use when a form must be filled.")
+    );
+    // Nothing is written into the source folder.
+    assert_eq!(files_in(&folder), ["SKILL.md", "references"]);
+    assert_eq!(files_in(outdir.path()), ["pdf-helper-0.1.0.mur.zip"]);
+}
+
+#[test]
+fn folder_without_manifest_or_skill_md_still_fails_as_before() {
+    let src = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    fs::write(src.path().join("README.md"), "just a readme").unwrap();
+
+    mur_build(outdir.path(), &[src.path().to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("E-IO-001"))
+        .stderr(predicate::str::contains("murmur.yaml not found at"));
+
+    assert_eq!(files_in(src.path()), ["README.md"]);
+    assert!(files_in(outdir.path()).is_empty());
+}
+
+#[test]
+fn manifest_backed_skill_folder_packs_only_requires_files() {
+    let src = tempdir().unwrap();
+    fs::create_dir_all(src.path().join("references")).unwrap();
+    fs::write(
+        src.path().join("murmur.yaml"),
+        "name: curated-skill\nversion: 0.2.0\nruntime: skill\n",
+    )
+    .unwrap();
+    fs::write(src.path().join("skill.md"), "# Curated\n").unwrap();
+    fs::write(src.path().join("references/x.md"), "# X\n").unwrap();
+
+    mur_build(src.path(), &[src.path().to_str().unwrap()]).success();
+    let zip = src.path().join("curated-skill-0.2.0.mur.zip");
+    assert_eq!(
+        zip_entries(&zip),
+        ["murmur-build.json", "murmur.yaml", "skill.md"]
+    );
+
+    fs::remove_file(&zip).unwrap();
+    fs::remove_file(src.path().join("skill.md")).unwrap();
+    mur_build(src.path(), &[src.path().to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("E-IO-003"))
+        .stderr(predicate::str::contains("missing required file 'skill.md'"));
+}
+
+#[test]
+fn skill_flags_override_the_front_block() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+
+    mur_build(
+        outdir.path(),
+        &[
+            "--skill",
+            "other-name",
+            "--summary",
+            "Short",
+            folder.to_str().unwrap(),
+        ],
+    )
+    .success();
+
+    let zip = outdir.path().join("other-name-0.1.0.mur.zip");
+    let manifest = manifest_yaml(&zip);
+    assert_eq!(manifest["name"].as_str(), Some("other-name"));
+    assert_eq!(manifest["description"].as_str(), Some("Short"));
+    assert_eq!(files_in(outdir.path()), ["other-name-0.1.0.mur.zip"]);
+}
+
+#[test]
+fn front_block_without_name_falls_back_to_the_folder_name() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = base.path().join("pdf-tools");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("SKILL.md"),
+        "---\ndescription: \"Tools for PDFs\"\nlicense: MIT\n---\n# Tools\n",
+    )
     .unwrap();
 
-    // 6. Verify tools/rt-skill/skill.md is present in the runtime directory: the model-facing directory
-    // carries the bare name
-    let skill_path = staged
-        .runtime_dir
-        .join("tools")
-        .join("rt-skill")
-        .join("skill.md");
+    mur_build(outdir.path(), &[folder.to_str().unwrap()]).success();
+
+    let manifest = manifest_yaml(&outdir.path().join("pdf-tools-0.1.0.mur.zip"));
+    assert_eq!(manifest["name"].as_str(), Some("pdf-tools"));
+    assert_eq!(manifest["description"].as_str(), Some("Tools for PDFs"));
+}
+
+#[test]
+fn front_block_name_that_is_not_an_artifact_name_is_refused() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = base.path().join("pdf");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("SKILL.md"),
+        "---\nname: PDF_Helper\n---\n# PDF\n",
+    )
+    .unwrap();
+
+    mur_build(outdir.path(), &[folder.to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("E-BLD-001"))
+        .stderr(predicate::str::contains(
+            "invalid artifact name 'PDF_Helper'",
+        ))
+        .stderr(predicate::str::contains("pass --skill <name>"));
+
+    assert!(files_in(outdir.path()).is_empty());
+    assert_eq!(files_in(&folder), ["SKILL.md"]);
+}
+
+#[test]
+fn front_block_folded_description_is_written_as_yaml() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = base.path().join("folded");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("SKILL.md"),
+        "---\nname: folded\ndescription: >\n  Quotes ' and \" and: colons\n  on two lines.\n---\n# F\n",
+    )
+    .unwrap();
+
+    mur_build(outdir.path(), &[folder.to_str().unwrap()]).success();
+
+    let zip = outdir.path().join("folded-0.1.0.mur.zip");
+    let manifest_text = zip_entry_content(&zip, "murmur.yaml");
     assert!(
-        skill_path.exists(),
-        "tools/rt-skill/skill.md should be present after staging; workdir: {}",
-        staged.accessible_workdir.display()
+        manifest_text.starts_with("name: folded\nversion: '0.1.0'\nruntime: skill\ndescription: "),
+        "got: {manifest_text}"
     );
-    let content = fs::read_to_string(&skill_path).unwrap();
+    assert_eq!(
+        manifest_yaml(&zip)["description"].as_str(),
+        Some("Quotes ' and \" and: colons on two lines.")
+    );
+}
+
+#[test]
+fn manifest_less_build_skips_dot_entries_and_built_artifacts() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+    fs::create_dir_all(folder.join(".git")).unwrap();
+    fs::write(folder.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(folder.join(".DS_Store"), "x").unwrap();
+    fs::write(folder.join("old-0.0.1.mur.zip"), "stale").unwrap();
+
+    mur_build(outdir.path(), &[folder.to_str().unwrap()]).success();
+
+    assert_eq!(
+        zip_entries(&outdir.path().join("pdf-helper-0.1.0.mur.zip")),
+        [
+            "murmur-build.json",
+            "murmur.yaml",
+            "references/forms.md",
+            "skill.md"
+        ]
+    );
+}
+
+fn assert_refused_with_no_output(folder: &Path, outdir: &Path, names: &str) {
+    mur_build(outdir, &[folder.to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("E-BLD-002"))
+        .stderr(predicate::str::contains(names));
+    assert!(files_in(outdir).is_empty(), "{:?}", files_in(outdir));
     assert!(
-        content.contains("Roundtrip Skill"),
-        "skill.md content mismatch: {content}"
+        !files_in(folder)
+            .iter()
+            .any(|name| name.ends_with(".tmp") || name.ends_with(".mur.zip")),
+        "{:?}",
+        files_in(folder)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_less_build_refuses_a_symlink() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+    std::os::unix::fs::symlink("forms.md", folder.join("references/link.md")).unwrap();
+
+    assert_refused_with_no_output(&folder, outdir.path(), "references/link.md");
+}
+
+#[test]
+fn manifest_less_build_refuses_two_spellings_of_skill_md() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+    fs::write(folder.join("skill.md"), "# other\n").unwrap();
+
+    assert_refused_with_no_output(&folder, outdir.path(), "both SKILL.md and skill.md");
+}
+
+#[test]
+fn manifest_less_build_refuses_an_authored_build_record() {
+    let base = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+    fs::write(folder.join("murmur-build.json"), "{\"built_at_level\":9}").unwrap();
+
+    assert_refused_with_no_output(&folder, outdir.path(), "murmur-build.json");
+}
+
+#[test]
+fn skill_build_output_names_a_directory_or_the_file() {
+    let base = tempdir().unwrap();
+    let cwd = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+    let dist = base.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+
+    mur_build(
+        cwd.path(),
+        &[folder.to_str().unwrap(), "--output", dist.to_str().unwrap()],
+    )
+    .success();
+    assert_eq!(files_in(&dist), ["pdf-helper-0.1.0.mur.zip"]);
+
+    // An output file inside the folder, under a name the walk does not skip, is not packed
+    // into the next build.
+    let inside = folder.join("artifact.zip");
+    for _ in 0..2 {
+        mur_build(
+            cwd.path(),
+            &[folder.to_str().unwrap(), "-o", inside.to_str().unwrap()],
+        )
+        .success()
+        .stdout(predicate::str::contains("artifact.zip"));
+    }
+    assert_eq!(
+        zip_entries(&inside),
+        [
+            "murmur-build.json",
+            "murmur.yaml",
+            "references/forms.md",
+            "skill.md"
+        ]
+    );
+    assert!(files_in(cwd.path()).is_empty());
+}
+
+#[test]
+fn skill_flag_with_a_manifest_packs_the_folder_recursively() {
+    let src = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    fs::create_dir_all(src.path().join("references")).unwrap();
+    let manifest = "name: authored\nversion: '1.2.3'\nruntime: skill\n";
+    fs::write(src.path().join("murmur.yaml"), manifest).unwrap();
+    fs::write(
+        src.path().join("SKILL.md"),
+        "---\nname: ignored\n---\n# A\n",
+    )
+    .unwrap();
+    fs::write(src.path().join("references/x.md"), "# X\n").unwrap();
+
+    mur_build(
+        outdir.path(),
+        &["--skill", "authored", src.path().to_str().unwrap()],
+    )
+    .success();
+
+    let zip = outdir.path().join("authored-0.1.0.mur.zip");
+    assert_eq!(
+        zip_entries(&zip),
+        [
+            "murmur-build.json",
+            "murmur.yaml",
+            "references/x.md",
+            "skill.md"
+        ]
+    );
+    assert_eq!(zip_entry_content(&zip, "murmur.yaml"), manifest);
+}
+
+#[test]
+fn skill_build_roundtrip_installs_supporting_files() {
+    let home = tempdir().unwrap();
+    let base = tempdir().unwrap();
+    let build_out = tempdir().unwrap();
+    let folder = pdf_helper_folder(base.path());
+
+    mur_build(build_out.path(), &[folder.to_str().unwrap()]).success();
+    let artifact = build_out.path().join("pdf-helper-0.1.0.mur.zip");
+    common::publish_local(&home, &artifact)
+        .success()
+        .stdout(predicate::str::contains("Published local/pdf-helper@0.1.0"));
+
+    let capsule_dir = tempdir().unwrap();
+    let manifest_path = capsule_dir.path().join("murmur.yaml");
+    fs::write(
+        &manifest_path,
+        "name: test-capsule\nversion: 0.1.0\nartifacts:\n  - name: local/pdf-helper\n    version: 0.1.0\n    runtime: skill\n",
+    )
+    .unwrap();
+    let staged = stage_capsule(&home, capsule_dir.path(), &manifest_path);
+
+    let tool_dir = staged.runtime_dir.join("tools").join("pdf-helper");
+    assert_eq!(
+        fs::read_to_string(tool_dir.join("skill.md")).unwrap(),
+        PDF_HELPER_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(tool_dir.join("references/forms.md")).unwrap(),
+        "# Forms\n"
+    );
+    assert_eq!(
+        files_in(&tool_dir),
+        ["murmur.yaml", "references", "skill.md"]
+    );
+    let installed: serde_norway::Value =
+        serde_norway::from_str(&fs::read_to_string(tool_dir.join("murmur.yaml")).unwrap()).unwrap();
+    assert_eq!(installed["name"].as_str(), Some("pdf-helper"));
 }

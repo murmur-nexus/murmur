@@ -886,9 +886,9 @@ impl CapsuleStoreState {
                 )
             }
             RuntimeType::Static => {
-                let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
+                let files = extract_skill_files(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_skill_files(&self.runtime_root, vec![(tool.clone(), skill_md)])
+                install_skill_files(&self.runtime_root, vec![(tool.clone(), files)])
                     .map_err(|err| err.to_string())?;
                 (ArtifactRuntime::Skill, None, None)
             }

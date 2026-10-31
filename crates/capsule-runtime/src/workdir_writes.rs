@@ -1077,7 +1077,7 @@ mod tests {
         ),
         (
             "runtime.rs",
-            "load_local_skill_md",
+            "load_local_skill_files",
             "A local skill source named relative to the manifest directory, read before any \
              workdir exists.",
         ),

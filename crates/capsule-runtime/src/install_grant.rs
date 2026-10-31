@@ -43,9 +43,10 @@ impl InstallTier {
     /// The tier of a resolved artifact, or `None` when it is not pullable at all.
     ///
     /// Keyed on the payload type, because that is what the pull extracts and so what can
-    /// execute: a static payload yields only `skill.md`, a WASM or native payload yields code. The
-    /// declared role must agree with it. A `driver` or `hook`, or a role that disagrees with its
-    /// payload, is never pullable.
+    /// execute: a static payload yields `skill.md` and the files it points at, installed
+    /// read-only and not executable; a WASM or native payload yields code. The declared role
+    /// must agree with it. A `driver` or `hook`, or a role that disagrees with its payload, is
+    /// never pullable.
     pub(crate) fn of(meta: &ArtifactMeta) -> Option<Self> {
         match (meta.runtime, meta.artifact_runtime.as_str()) {
             (RuntimeType::Static, "skill") => Some(Self::Skill),
