@@ -200,6 +200,11 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
+    /// A local skill source directory holds what `mur build` refuses to pack: a symlink, two
+    /// spellings of `skill.md`, or a root `murmur-build.json`.
+    #[error("skill source refused: {message}")]
+    SkillSourceRefused { message: String },
+
     #[error("invalid network capability allow entry '{entry}': {message}")]
     InvalidNetworkAllowEntry { entry: String, message: String },
 

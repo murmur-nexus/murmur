@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use murmur_artifact::{ArtifactRuntime, PACKED_MANIFEST_ENTRY};
+use murmur_artifact::{skill_md_description, ArtifactRuntime, PACKED_MANIFEST_ENTRY};
 use serde_norway::Value;
 
 use crate::{
@@ -488,7 +488,7 @@ fn build_skills_section(
                 _ => continue,
             }
 
-            // Read description from manifest, fall back to first non-empty line of skill.md.
+            // Read description from manifest, fall back to how skill.md describes itself.
             let description = sanitize_description(
                 &runtime_root
                     .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
@@ -506,12 +506,8 @@ fn build_skills_section(
                             .read_to_string(&skill_md)
                             .ok()
                             .flatten()
+                            .and_then(|text| skill_md_description(&text))
                             .unwrap_or_default()
-                            .lines()
-                            .find(|l| !l.trim().is_empty())
-                            .map(str::trim)
-                            .unwrap_or_default()
-                            .to_string()
                     }),
             );
 
@@ -687,6 +683,46 @@ mod tests {
             input_ceiling: ceiling,
             budget: InputBudget::of(window, cap.unwrap_or(0), ceiling),
         }
+    }
+
+    /// A local-source skill carries no manifest description, so MURMUR.md describes it from its
+    /// `skill.md`: the front block's description, else the first line after the block, else the
+    /// first line of a skill with no block.
+    #[test]
+    fn skills_section_describes_a_skill_from_its_front_block() {
+        let tmp = TempDir::new().unwrap();
+        for (name, skill_md) in [
+            (
+                "fronted",
+                "---\nname: fronted\ndescription: Fill PDF forms.\n---\n# Fronted\n",
+            ),
+            (
+                "nameonly",
+                "---\nname: nameonly\n---\n\n# After the block\n",
+            ),
+            ("plain", "\n# Plain skill\nBody.\n"),
+        ] {
+            let dir = tmp.path().join("tools").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(PACKED_MANIFEST_ENTRY),
+                format!("name: {name}\nversion: 0.0.0\nruntime: skill\n"),
+            )
+            .unwrap();
+            fs::write(dir.join("skill.md"), skill_md).unwrap();
+        }
+
+        let section = build_skills_section(&WorkdirRoot::open(tmp.path()).unwrap(), None);
+        assert!(
+            section.contains("**fronted** — Fill PDF forms."),
+            "{section}"
+        );
+        assert!(
+            section.contains("**nameonly** — # After the block"),
+            "{section}"
+        );
+        assert!(section.contains("**plain** — # Plain skill"), "{section}");
+        assert!(!section.contains("— ---"), "{section}");
     }
 
     /// MURMUR.md for the runtime directory `tmp`, from [`test_inputs`] as `edit` leaves them.

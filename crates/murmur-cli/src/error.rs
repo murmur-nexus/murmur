@@ -531,6 +531,11 @@ impl From<RuntimeError> for CliError {
                 E_IO_003,
                 format!("failed to read skill source at {path}: {source}"),
             ),
+            RuntimeError::SkillSourceRefused { message } => CliError::with_hint(
+                E_BLD_002,
+                format!("skill source refused: {message}"),
+                "a skill folder holds regular files, one skill.md and no murmur-build.json",
+            ),
             RuntimeError::InvalidNetworkAllowEntry { entry, message } => CliError::new(
                 E_CAP_001,
                 format!("invalid network allow entry '{entry}': {message}"),

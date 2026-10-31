@@ -5,9 +5,10 @@ use std::{
 };
 
 use murmur_artifact::{
-    build_artifact, build_warning_link, lint_build_warnings, load_manifest, newest_fitting_level,
-    resolve_manifest_path, scan_yaml_secrets, security_warning_link, BuildInfo, WitContracts,
-    BUILD_INFO_FILE, W_SEC_004,
+    build_artifact, build_warning_link, collect_skill_folder, lint_build_warnings, load_manifest,
+    newest_fitting_level, parse_skill_front_block, resolve_manifest_path, scan_yaml_secrets,
+    security_warning_link, BuildInfo, SkillFolderError, SkillFrontBlock, WitContracts,
+    BUILD_INFO_FILE, SKILL_MD_ENTRY, W_SEC_004,
 };
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -23,31 +24,44 @@ pub(crate) fn run_build(
     version: Option<&str>,
     summary: Option<&str>,
 ) -> Result<(), CliError> {
-    match skill {
-        None => run_build_standard(source, output_arg),
-        Some(skill_arg) => {
-            let cwd = std::env::current_dir().map_err(|e| {
-                CliError::new(
-                    E_IO_003,
-                    format!("failed to determine working directory: {e}"),
-                )
-            })?;
-            let (name, input_path) = resolve_skill_args(skill_arg.as_deref(), source);
-            let out = build_skill_artifact(
-                &input_path,
-                name.as_deref(),
-                version.unwrap_or("0.1.0"),
-                &cwd,
-                summary,
-            )?;
-            capsule_runtime::report_println!(
-                "Built artifact: {}{}",
-                out.display(),
-                level_suffix(skill_built_at_level())
-            );
-            Ok(())
-        }
+    let skill_arg = match skill {
+        Some(skill_arg) => skill_arg,
+        None if is_manifest_less_skill_folder(source) => None,
+        None => return run_build_standard(source, output_arg),
+    };
+    let cwd = std::env::current_dir().map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to determine working directory: {e}"),
+        )
+    })?;
+    let (name, input_path) = resolve_skill_args(skill_arg.as_deref(), source);
+    let out = build_skill_artifact(
+        &input_path,
+        name.as_deref(),
+        version.unwrap_or("0.1.0"),
+        output_arg.unwrap_or(&cwd),
+        summary,
+    )?;
+    capsule_runtime::report_println!(
+        "Built artifact: {}{}",
+        out.display(),
+        level_suffix(skill_built_at_level())
+    );
+    Ok(())
+}
+
+/// A folder with no `murmur.yaml` and a root `skill.md` in any casing: the layout a Claude Code,
+/// Codex or pi skill ships in, which `mur build` packs as `mur build --skill` would.
+fn is_manifest_less_skill_folder(source: &Path) -> bool {
+    if resolve_manifest_path(source).exists() || !source.is_dir() {
+        return false;
     }
+    fs::read_dir(source).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().to_lowercase() == SKILL_MD_ENTRY)
+    })
 }
 
 fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), CliError> {
@@ -203,63 +217,90 @@ fn infer_name_from_path(path: &Path) -> String {
     }
 }
 
-// (original_filename, bytes, manifest_bytes_opt, extra_files)
-type SkillContents = (String, Vec<u8>, Option<Vec<u8>>, Vec<(String, Vec<u8>)>);
-
-fn read_skill_from_dir(dir: &Path) -> Result<SkillContents, CliError> {
-    let mut skill_md: Option<(String, Vec<u8>)> = None;
-    let mut manifest: Option<Vec<u8>> = None;
-    let mut extra: Vec<(String, Vec<u8>)> = Vec::new();
-
-    let entries = fs::read_dir(dir).map_err(|e| {
-        CliError::new(
-            E_IO_001,
-            format!("cannot read directory {}: {e}", dir.display()),
-        )
-    })?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| CliError::new(E_IO_003, format!("directory read error: {e}")))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let fname = entry.file_name().to_string_lossy().into_owned();
-        let lower = fname.to_lowercase();
-
-        if lower == "skill.md" {
-            let bytes = fs::read(&path).map_err(|e| {
-                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
-            })?;
-            skill_md = Some((fname, bytes));
-        } else if lower == "murmur.yaml" {
-            let bytes = fs::read(&path).map_err(|e| {
-                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
-            })?;
-            manifest = Some(bytes);
-        } else {
-            let bytes = fs::read(&path).map_err(|e| {
-                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
-            })?;
-            extra.push((fname, bytes));
-        }
-    }
-
-    let (name, bytes) = skill_md.ok_or_else(|| {
-        CliError::new(
-            E_IO_001,
-            format!(
-                "SKILL.md not found in {} (case-insensitive search found no match)",
-                dir.display()
-            ),
-        )
-    })?;
-
-    Ok((name, bytes, manifest, extra))
+/// What a skill build packs, read from its input.
+struct SkillInput {
+    skill_md: Vec<u8>,
+    manifest: Option<Vec<u8>>,
+    extra: Vec<ExtraFile>,
+    /// The `SKILL.md` front block, read only for a folder with no `murmur.yaml`.
+    front: SkillFrontBlock,
 }
 
-fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
+/// A packed file besides `murmur.yaml` and `skill.md`.
+struct ExtraFile {
+    /// The archive entry name.
+    name: String,
+    bytes: Vec<u8>,
+    /// Where a folder build read it from; `None` for zip input.
+    source: Option<PathBuf>,
+}
+
+fn read_skill_from_dir(dir: &Path) -> Result<SkillInput, CliError> {
+    let folder = collect_skill_folder(dir).map_err(|e| skill_folder_error(dir, e))?;
+    let skill_md = read_source_file(&folder.skill_md)?;
+    let manifest = folder
+        .manifest
+        .as_deref()
+        .map(read_source_file)
+        .transpose()?;
+    // The front block names and describes a skill only when no murmur.yaml does.
+    let front = manifest
+        .is_none()
+        .then(|| parse_skill_front_block(&String::from_utf8_lossy(&skill_md)))
+        .flatten()
+        .unwrap_or_default();
+    let mut extra = Vec::with_capacity(folder.supporting_files.len());
+    for (name, path) in folder.supporting_files {
+        let bytes = read_source_file(&path)?;
+        extra.push(ExtraFile {
+            name,
+            bytes,
+            source: Some(path),
+        });
+    }
+    Ok(SkillInput {
+        skill_md,
+        manifest,
+        extra,
+        front,
+    })
+}
+
+fn read_source_file(path: &Path) -> Result<Vec<u8>, CliError> {
+    fs::read(path)
+        .map_err(|e| CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display())))
+}
+
+fn skill_folder_error(dir: &Path, error: SkillFolderError) -> CliError {
+    match error {
+        SkillFolderError::MissingSkillMd { .. } => CliError::new(E_IO_001, error.to_string()),
+        SkillFolderError::Io {
+            ref path,
+            ref source,
+        } if path == dir => CliError::new(
+            E_IO_001,
+            format!("cannot read directory {}: {source}", dir.display()),
+        ),
+        SkillFolderError::Io { .. } => CliError::new(E_IO_003, error.to_string()),
+        SkillFolderError::DuplicateSkillMd { .. } => CliError::with_hint(
+            E_BLD_002,
+            error.to_string(),
+            "keep one of them — the skill packs as skill.md either way",
+        ),
+        SkillFolderError::Symlink { .. } => CliError::with_hint(
+            E_BLD_002,
+            error.to_string(),
+            "replace the link with the file it points to, or move it out of the skill folder",
+        ),
+        SkillFolderError::ReservedBuildInfo { .. } => CliError::with_hint(
+            E_BLD_002,
+            error.to_string(),
+            "remove it from the skill — mur build writes murmur-build.json itself",
+        ),
+    }
+}
+
+fn read_skill_from_zip(zip_path: &Path) -> Result<SkillInput, CliError> {
     let file = fs::File::open(zip_path)
         .map_err(|e| CliError::new(E_IO_001, format!("cannot open {}: {e}", zip_path.display())))?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
@@ -271,7 +312,7 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
 
     let mut skill_md: Option<(String, Vec<u8>)> = None;
     let mut manifest: Option<Vec<u8>> = None;
-    let mut extra: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut extra: Vec<ExtraFile> = Vec::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -301,11 +342,15 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
         } else if lower == "murmur.yaml" {
             manifest = Some(bytes);
         } else {
-            extra.push((entry_name, bytes));
+            extra.push(ExtraFile {
+                name: entry_name,
+                bytes,
+                source: None,
+            });
         }
     }
 
-    let (name, bytes) = skill_md.ok_or_else(|| {
+    let (_, skill_md) = skill_md.ok_or_else(|| {
         CliError::new(
             E_IO_001,
             format!(
@@ -315,36 +360,58 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
         )
     })?;
 
-    Ok((name, bytes, manifest, extra))
+    Ok(SkillInput {
+        skill_md,
+        manifest,
+        extra,
+        front: SkillFrontBlock::default(),
+    })
 }
 
 // Packages an external skill into a .mur.zip artifact.
 //
 // Input may be a directory or a .zip file containing SKILL.md (case-insensitive).
-// When no murmur.yaml is present one is generated with runtime: skill.
+// A directory packs every file collect_skill_folder finds; a zip packs its root entries.
+// When no murmur.yaml is present one is generated with runtime: skill, named and described from
+// a folder's SKILL.md front block unless explicit_name / summary say otherwise.
 // When murmur.yaml is present it must declare runtime: skill or an error is returned.
-// Output is written to output_dir/<name>-<version>.mur.zip.
+// output is a directory (the zip is written there as <name>-<version>.mur.zip) or the output file.
 // skill.md is always stored as lowercase "skill.md" in the output zip.
 // When summary is Some, it is written to (or overwrites) the description field in the manifest.
 pub(crate) fn build_skill_artifact(
     input: &Path,
     explicit_name: Option<&str>,
     version: &str,
-    output_dir: &Path,
+    output: &Path,
     summary: Option<&str>,
 ) -> Result<PathBuf, CliError> {
     let is_zip = input.to_string_lossy().to_lowercase().ends_with(".zip");
 
-    let (_, skill_md_bytes, manifest_bytes_opt, extra_files) = if is_zip {
+    let SkillInput {
+        skill_md: skill_md_bytes,
+        manifest: manifest_bytes_opt,
+        mut extra,
+        front,
+    } = if is_zip {
         read_skill_from_zip(input)?
     } else {
         read_skill_from_dir(input)?
     };
 
-    let artifact_name = if let Some(n) = explicit_name {
-        n.to_string()
-    } else {
-        infer_name_from_path(input)
+    let artifact_name = match (explicit_name, front.name) {
+        (Some(n), _) => n.to_string(),
+        (None, Some(front_name)) => {
+            murmur_artifact::validate_artifact_name(&front_name).map_err(|e| {
+                let mut error = CliError::from(e);
+                error.hint = Some(format!(
+                    "the SKILL.md front block names the skill '{front_name}'; pass --skill <name> \
+                     to build it under a valid artifact name"
+                ));
+                error
+            })?;
+            front_name
+        }
+        (None, None) => infer_name_from_path(input),
     };
     murmur_artifact::validate_artifact_name(&artifact_name).map_err(CliError::from)?;
 
@@ -391,20 +458,22 @@ pub(crate) fn build_skill_artifact(
             }
         }
         None => {
-            let desc_line = summary
-                .map(|d| format!("description: '{}'\n", d.replace('\'', "''")))
-                .unwrap_or_default();
+            let desc_line = match summary.map(str::to_string).or(front.description) {
+                Some(desc) => description_line(&desc)?,
+                None => String::new(),
+            };
             format!("name: {artifact_name}\nversion: '{version}'\nruntime: skill\n{desc_line}")
                 .into_bytes()
         }
     };
 
-    if let Some((name, _)) = extra_files.iter().find(|(name, _)| name == BUILD_INFO_FILE) {
+    if let Some(file) = extra.iter().find(|file| file.name == BUILD_INFO_FILE) {
         return Err(CliError::with_hint(
             E_BLD_002,
             format!(
-                "{name} in {} packs as the archive entry '{BUILD_INFO_FILE}', which is reserved \
+                "{} in {} packs as the archive entry '{BUILD_INFO_FILE}', which is reserved \
                  for mur build",
+                file.name,
                 input.display()
             ),
             "remove it from the skill — mur build writes murmur-build.json itself",
@@ -412,15 +481,33 @@ pub(crate) fn build_skill_artifact(
     }
 
     let output_name = format!("{artifact_name}-{version}.mur.zip");
-    let output_path = output_dir.join(&output_name);
+    let output_path = if output.is_dir() {
+        output.join(&output_name)
+    } else {
+        output.to_path_buf()
+    };
+    // An output inside the folder under a name the walk does not skip is never packed into
+    // itself.
+    if let Ok(output_canonical) = fs::canonicalize(&output_path) {
+        extra.retain(|file| {
+            file.source
+                .as_deref()
+                .and_then(|source| fs::canonicalize(source).ok())
+                .is_none_or(|source| source != output_canonical)
+        });
+    }
+    let output_file_name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or(output_name);
     // Write to a temp file first, then rename — prevents a partial zip on failure.
-    let tmp_path = output_dir.join(format!(".{output_name}.tmp"));
+    let tmp_path = output_path.with_file_name(format!(".{output_file_name}.tmp"));
 
     let write_result = write_skill_zip(
         &tmp_path,
         &manifest_bytes,
         &skill_md_bytes,
-        &extra_files,
+        &extra,
         skill_built_at_level(),
     );
 
@@ -440,11 +527,23 @@ pub(crate) fn build_skill_artifact(
     Ok(output_path)
 }
 
+/// The generated manifest's `description:` line. A front-block description can carry `:`,
+/// quotes and newlines, so the value goes through the YAML serializer.
+fn description_line(description: &str) -> Result<String, CliError> {
+    let mut mapping = serde_norway::Mapping::new();
+    mapping.insert(
+        serde_norway::Value::String("description".to_string()),
+        serde_norway::Value::String(description.to_string()),
+    );
+    serde_norway::to_string(&mapping)
+        .map_err(|e| CliError::new(E_MAN_002, format!("murmur.yaml serialization error: {e}")))
+}
+
 fn write_skill_zip(
     path: &Path,
     manifest_bytes: &[u8],
     skill_md_bytes: &[u8],
-    extra_files: &[(String, Vec<u8>)],
+    extra_files: &[ExtraFile],
     built_at_level: Option<u64>,
 ) -> Result<(), CliError> {
     let output_file = fs::File::create(path).map_err(|e| {
@@ -468,7 +567,7 @@ fn write_skill_zip(
     zip.write_all(skill_md_bytes)
         .map_err(|e| CliError::new(E_IO_003, format!("zip write error: {e}")))?;
 
-    for (name, bytes) in extra_files {
+    for ExtraFile { name, bytes, .. } in extra_files {
         zip.start_file(name.as_str(), options)
             .map_err(|e| CliError::new(E_IO_003, format!("zip error writing {name}: {e}")))?;
         zip.write_all(bytes)

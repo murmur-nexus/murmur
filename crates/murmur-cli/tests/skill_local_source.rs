@@ -392,3 +392,143 @@ fn source_directory_without_skill_md_fails() {
 
     assert!(!capsule_dir.path().join("workdir").exists());
 }
+
+/// Stage the capsule whose manifest is `capsule_dir/murmur.yaml` against an empty store.
+fn stage_capsule_dir(home: &TempDir, capsule_dir: &TempDir) -> capsule_runtime::StagedSession {
+    let manifest_path = capsule_dir.path().join("murmur.yaml");
+    let runtime_manifest = load_runtime_manifest(&manifest_path).unwrap();
+    let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+
+    common::process_home();
+    stage_session(
+        std::sync::Arc::new(local_registry),
+        StageRequest {
+            source_supply: None,
+            expected_workdir_identity: None,
+            parent_workdir_snapshot: None,
+            session_deadline: None,
+            manifest_file: None,
+            credentials_file: None,
+            manifest_dir: capsule_dir.path().to_path_buf(),
+            capsule_name: runtime_manifest.name.clone(),
+            capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
+            capsule_component_bytes: Vec::new(),
+            artifacts: requested_from(&runtime_manifest),
+            allowlisted_tools: HashSet::new(),
+            lock_expectations: None,
+            capability_policy,
+            inference: stub_inference(),
+            system_prompt_overridden: false,
+            context: None,
+            context_id: None,
+            resume: None,
+            forget_session: false,
+            otel_endpoint: None,
+            eval_config_json: None,
+            case_id: None,
+            dataset_id: None,
+            lifecycle: None,
+            lifecycle_override: None,
+            trace: None,
+            workdir: None,
+            bind_addr: "127.0.0.1".to_string(),
+            internal_port: None,
+            declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
+            control: None,
+            door_authentication: None,
+            spawn_grant: None,
+            machine_tokens_per_day: None,
+            formation_id: None,
+            formation_member: None,
+        },
+    )
+    .unwrap()
+}
+
+const S1_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+
+/// A directory source installs the whole folder under `tools/<name>/`: `skill.md` and every
+/// supporting file, but never the folder's own `murmur.yaml` (staging writes the skill's) and
+/// never a dot-entry. MURMUR.md describes the skill from its front block.
+#[test]
+fn local_source_directory_installs_supporting_files() {
+    let home: TempDir = tempdir().unwrap();
+    let capsule_dir: TempDir = tempdir().unwrap();
+
+    let skill_dir = capsule_dir.path().join("Some Folder");
+    fs::create_dir_all(skill_dir.join("references")).unwrap();
+    fs::create_dir_all(skill_dir.join(".git")).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), S1_SKILL_MD).unwrap();
+    fs::write(skill_dir.join("references/forms.md"), "# Forms\n").unwrap();
+    fs::write(skill_dir.join(".git/HEAD"), "ref\n").unwrap();
+    fs::write(
+        skill_dir.join("murmur.yaml"),
+        "name: authored-in-folder\nversion: 9.9.9\nruntime: skill\n",
+    )
+    .unwrap();
+    fs::write(
+        capsule_dir.path().join("murmur.yaml"),
+        "name: cap\nversion: 0.1.0\nartifacts:\n  - name: pdf-helper\n    source: ./Some Folder\n    runtime: skill\n",
+    )
+    .unwrap();
+
+    let staged = stage_capsule_dir(&home, &capsule_dir);
+
+    let tool_dir = staged.runtime_dir.join("tools").join("pdf-helper");
+    assert_eq!(
+        fs::read_to_string(tool_dir.join("skill.md")).unwrap(),
+        S1_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(tool_dir.join("references/forms.md")).unwrap(),
+        "# Forms\n"
+    );
+    let mut installed: Vec<String> = fs::read_dir(&tool_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    installed.sort();
+    assert_eq!(installed, ["murmur.yaml", "references", "skill.md"]);
+    let manifest = fs::read_to_string(tool_dir.join("murmur.yaml")).unwrap();
+    assert!(
+        manifest.contains("name: pdf-helper") && !manifest.contains("authored-in-folder"),
+        "the runtime's manifest must not be overwritten by the folder's: {manifest}"
+    );
+
+    let murmur_md = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
+    assert!(
+        murmur_md.contains("**pdf-helper** — Fill PDF forms: use when a form must be filled."),
+        "MURMUR.md should describe the skill from its front block:\n{murmur_md}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_source_directory_with_a_symlink_fails_before_staging() {
+    let home = home_with_dummy_driver();
+    let capsule_dir: TempDir = tempdir().unwrap();
+    let skill_dir = capsule_dir.path().join("skills").join("linked");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "# Linked\n").unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", skill_dir.join("passwd")).unwrap();
+    let manifest_path = capsule_dir.path().join("murmur.yaml");
+    fs::write(
+        &manifest_path,
+        "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: local/dummy-driver\nartifacts:\n  - name: linked\n    source: ./skills/linked\n    runtime: skill\n  - name: local/dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["run", "--manifest", manifest_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("E-BLD-002"))
+        .stderr(predicate::str::contains("passwd"));
+
+    assert!(!capsule_dir.path().join("workdir").exists());
+}

@@ -9,7 +9,7 @@ section that explains it.
 | Code | Meaning | Details |
 |---|---|---|
 | `E-BLD-001` | Manifest `name:` is not a valid artifact identifier, or carries a scope | [E-BLD-001](#e-bld-001) |
-| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive | [E-BLD-002](#e-bld-002) |
+| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive, or a skill folder holds a symlink, two `skill.md` spellings or a `murmur-build.json` | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
 | `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
@@ -2029,13 +2029,17 @@ name: -my-tool       # E-BLD-001
 name: ana/my-tool    # E-BLD-001
 ```
 
-### E-BLD-002 — unsafe or colliding `requires_files:` entry { #e-bld-002 }
+### E-BLD-002 — unsafe or colliding packed entry { #e-bld-002 }
 
 ```text
 error[E-BLD-002]: requires_files entry '<entry>' has an unsafe path: <reason>
 error[E-BLD-002]: requires_files entry '<entry>' is a symlink (<path>); declare the file it points to instead
 error[E-BLD-002]: requires_files entries '<a>' and '<b>' both pack as the archive entry '<name>'
 error[E-BLD-002]: requires_files entry 'murmur-build.json' packs as the archive entry 'murmur-build.json', which is reserved for mur build
+error[E-BLD-002]: <path> is a symlink; a skill folder packs regular files only
+error[E-BLD-002]: <folder> holds both SKILL.md and skill.md; a skill has one skill.md
+error[E-BLD-002]: <folder>/murmur-build.json packs as the archive entry 'murmur-build.json', which is reserved for mur build
+error[E-BLD-002]: skill source refused: <one of the three skill-folder messages above>
 ```
 
 Every `requires_files:` entry must be a plain relative path to a real file inside the source
@@ -2053,6 +2057,12 @@ directory, and the entries must not collide once they are inside the archive:
 - **No `murmur-build.json` at the archive root.** `mur build` writes that entry itself, with the
   artifact's [built-at WIT level](wit-levels.md#built-at-level). The same name in a
   `mur build --skill` input is refused too.
+
+A skill folder built with no `murmur.yaml` (see [`mur build` skill packaging](cli.md#skill-packaging-skill)),
+or installed as a local `source:` directory, follows the same rules over every file it holds: no
+symlink anywhere, one `skill.md` at the root in whichever casing, and no root `murmur-build.json`.
+The `skill source refused:` form is `mur run` refusing a local `source:` directory before any
+workdir is created.
 
 A `requires_files:` entry that redundantly names `murmur.yaml` is *not* a collision — it is
 dropped before packing, and reported as [`W-BLD-001`](#w-bld-001) instead.

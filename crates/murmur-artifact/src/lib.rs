@@ -27,6 +27,7 @@ pub mod runtime_warnings;
 pub mod secrets;
 pub mod security_warnings;
 pub mod shell_words;
+pub mod skill_folder;
 pub mod trace_capture;
 pub mod unknown_manifest_keys;
 pub mod wit_contract;
@@ -138,6 +139,10 @@ pub use security_warnings::{
     W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
 };
 pub use shell_words::split_shell_words;
+pub use skill_folder::{
+    collect_skill_folder, parse_skill_front_block, skill_md_description, SkillFolder,
+    SkillFolderError, SkillFrontBlock,
+};
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,
 };

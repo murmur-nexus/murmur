@@ -100,7 +100,7 @@ pub(crate) fn build_tool_inventory(
             continue;
         }
 
-        // Description: manifest field, or fall back to the first non-empty line of skill.md.
+        // Description: manifest field, or fall back to how skill.md describes itself.
         let description = {
             let from_manifest = value
                 .get("description")
@@ -115,12 +115,8 @@ pub(crate) fn build_tool_inventory(
                         .read_to_string(format!("tools/{name}/skill.md"))
                         .ok()
                         .flatten()
+                        .and_then(|text| murmur_artifact::skill_md_description(&text))
                         .unwrap_or_default()
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .map(str::trim)
-                        .unwrap_or_default()
-                        .to_string()
                 } else {
                     String::new()
                 }
@@ -332,6 +328,52 @@ mod tests {
             format!("name: {name}\nversion: 1.0.0\nruntime: tool\n"),
         )
         .unwrap();
+    }
+
+    /// A skill with no manifest description is described from its `skill.md`: the front
+    /// block's description, else the first line after the block, else its first line.
+    #[test]
+    fn skill_description_falls_back_to_the_front_block() {
+        let workdir = tempfile::tempdir().unwrap();
+        for (name, skill_md) in [
+            (
+                "fronted",
+                "---\nname: fronted\ndescription: Fill PDF forms.\n---\n# Fronted\n",
+            ),
+            (
+                "nameonly",
+                "---\nname: nameonly\n---\n\n# After the block\n",
+            ),
+            ("plain", "\n# Plain skill\nBody.\n"),
+        ] {
+            let dir = workdir.path().join("tools").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(PACKED_MANIFEST_ENTRY),
+                format!("name: {name}\nversion: 0.0.0\nruntime: skill\n"),
+            )
+            .unwrap();
+            fs::write(dir.join("skill.md"), skill_md).unwrap();
+        }
+
+        let descriptions: Vec<(String, String)> =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])
+                .iter()
+                .map(|t| {
+                    (
+                        t["name"].as_str().unwrap().to_string(),
+                        t["description"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            descriptions,
+            [
+                ("fronted".to_string(), "Fill PDF forms.".to_string()),
+                ("nameonly".to_string(), "# After the block".to_string()),
+                ("plain".to_string(), "# Plain skill".to_string()),
+            ]
+        );
     }
 
     /// Tool order is sorted regardless of the order the directories were created in, because
