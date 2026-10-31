@@ -269,7 +269,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-editor@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 1, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 1` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 2, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 2` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-editor@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
@@ -882,7 +882,7 @@ the driver with an empty WASI context and grants it nothing.
 |---|---|---|
 | `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, and whether it reports token usage |
 | `launch` | Once per run | The arguments, environment, files and stdin to run the harness with, or an error |
-| `parse` | For each batch of complete stdout lines | The events those lines describe |
+| `parse` | For each batch of complete stdout lines, including those printed [after the terminal event](#process-after-terminal) | The events those lines describe |
 | `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
 
 One driver instance serves a whole run, so `parse` may answer from what `launch` was given. A call
@@ -958,6 +958,79 @@ The runtime writes nothing for:
 A complete `tool-call` whose name differs from its start's is recorded under the `tool-call`'s
 name, and the difference is written to the trace as a `harness_note`.
 
+### Subscription windows { #process-quota }
+
+A driver whose harness reports how much of the person's subscription is used sends the `quota`
+event. Its payload is a list of `quota-window` records:
+
+| Member | Type | Value |
+|---|---|---|
+| `name` | `string` | A stable lowercase label the driver documents, such as `five-hour` or `seven-day` |
+| `used` | `option<f64>` | How much of the window is used, as a fraction from 0 to 1 |
+| `resets-at` | `option<u64>` | When the window resets, in milliseconds since the Unix epoch |
+| `window-minutes` | `option<u64>` | How long the window is, in minutes |
+| `state` | `option<quota-state>` | `ok`, `warning` or `exhausted`, as the harness reports it |
+
+| Rule | What it means |
+|---|---|
+| The driver translates | A harness's own spelling — a percentage, seconds, numbered `primary`/`secondary` windows — becomes these names and units in the driver |
+| A snapshot of the windows it names | A later report replaces a window of the same name whole and leaves the others standing. A driver whose harness sends sparse updates merges them into its own last report before sending one |
+| Absent is not zero | `none` means the harness did not report the member. Every surface leaves it out |
+| Optional | A driver whose harness reports no windows never sends the event, and `describe` declares nothing about it |
+
+The runtime refuses a window whose `name` is not 1 to 64 characters of `a`-`z`, `0`-`9` and `-`
+starting with a letter or digit, or whose `used` is not a number from 0 to 1. It names each refused
+window and why in one `harness_note` and keeps the rest. Of two windows with one name in one report,
+the last stands.
+
+Each report with at least one window left:
+
+- is written to the trace as a [`harness_quota`](observability-schemas.md#harness-quota) record;
+- sets the `quota` field of [`session-status`](runtime-provided-tools.md#session-status) to the
+  latest window per name;
+- reaches a client streaming the task as a [`quota`](streaming-protocol.md#event-quota) frame.
+
+The runtime acts on no report: no window, however exhausted, warns, stops, retries, slows the run
+or changes a prompt. The event opens no inference turn, and a run that only reported a quota
+commits no harness session.
+
+### The suggested prompt { #process-suggested-prompt }
+
+A driver whose harness predicts what the person will ask next sends it as
+`suggested-prompt(string)`.
+
+| Rule | What it means |
+|---|---|
+| Optional | A driver whose harness makes no such prediction never sends it |
+| May arrive late | A harness may print it after its terminal event; it is read [while the harness exits](#process-after-terminal) |
+| Empty says nothing | An empty suggestion is dropped |
+
+Each suggestion is written to the trace as a
+[`harness_suggestion`](observability-schemas.md#harness-suggestion) record and reaches a client
+streaming the task as a [`suggested-prompt`](streaming-protocol.md#event-suggested-prompt) frame. A
+task the person cancelled forwards no suggestion, as it forwards no answer; the record is still
+written. The event opens no inference turn.
+
+### Events after the terminal event { #process-after-terminal }
+
+Once the driver has returned `turn-end` or `turn-failed`, the runtime closes the harness's stdin and
+gives it 3 seconds to exit. Until the harness has exited and closed its stdout, or those 3 seconds
+have passed, the runtime keeps reading its output and handing it to `parse`. The same rules cover
+the rest of the batch the terminal event arrived in:
+
+| Event | What the runtime does |
+|---|---|
+| `quota` | Records and forwards it, as before the terminal event |
+| `suggested-prompt` | Records and forwards it, as before the terminal event |
+| `note` | Writes it to the trace as a `harness_note` |
+| Any other | Writes one `harness_note` naming the event, `<event> after the turn's terminal event, ignored`, and ignores it |
+
+Nothing read after the terminal event changes the turn's outcome, its result, its token counts or
+its spend. No `parse` call starts after the 3 seconds; a harness still running then is killed, and
+its `harness_exit` record says `killed: true`. A `parse` call that fails in that time is written as
+a `harness_note` and ends the reading. A run that was stopped — by a cancel, `inference.max_turns`,
+a spend ceiling or inactivity — reads nothing after it ends.
+
 ---
 
 ## Package versioning
@@ -984,7 +1057,7 @@ serve it.
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
-| `murmur:driver` | `0.3.0` |
+| `murmur:driver` | `0.4.0` |
 
 | Tier | When |
 |---|---|

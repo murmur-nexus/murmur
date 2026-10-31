@@ -1,4 +1,4 @@
-package murmur:driver@0.3.0;
+package murmur:driver@0.4.0;
 
 /// The contract between the runtime and a process driver: an artifact that knows how to drive
 /// one harness CLI. Pure translation; the runtime grants it nothing.
@@ -234,6 +234,39 @@ interface process {
     message: string,
   }
 
+  /// Whether a subscription window still has room, as the harness reports it.
+  enum quota-state {
+    /// The window has room.
+    ok,
+    /// The harness warns that the window is close to its limit.
+    warning,
+    /// The window is used up until it resets.
+    exhausted,
+  }
+
+  /// One subscription window a harness reports: a span of time over which the person's
+  /// subscription allows a certain amount of use.
+  ///
+  /// The driver translates its harness's spelling into these names and units: a percentage
+  /// becomes a fraction, seconds become milliseconds, and a harness that numbers its windows
+  /// (`primary`, `secondary`) is given names. Every member but `name` is independently optional,
+  /// and `none` means the harness did not report that member, never zero.
+  record quota-window {
+    /// A stable lowercase label for the window, which the driver documents, such as `five-hour`
+    /// or `seven-day`: 1 to 64 characters of `a`-`z`, `0`-`9` and `-`, starting with a letter or
+    /// digit. A window with any other name is refused and noted in the trace.
+    name: string,
+    /// How much of the window is used, as a fraction from 0 to 1. A value outside that range,
+    /// or not finite, refuses the window.
+    used: option<f64>,
+    /// When the window resets, in milliseconds since the Unix epoch.
+    resets-at: option<u64>,
+    /// How long the window is, in minutes.
+    window-minutes: option<u64>,
+    /// Whether the window still has room, as the harness reports it.
+    state: option<quota-state>,
+  }
+
   /// One thing the harness did, read out of its output.
   variant event {
     /// The harness's session id, and how it is billing.
@@ -268,6 +301,16 @@ interface process {
     tool-call-started(tool-call-start),
     /// How much of a started call's input has been written so far.
     tool-call-progress(tool-call-progress),
+    /// The subscription windows the harness reports as used, as a snapshot of the windows it
+    /// names. A later report replaces a window of the same name whole and leaves the others
+    /// standing, so a driver whose harness sends sparse updates merges them into its own last
+    /// report before sending one. The runtime records and forwards it and never acts on it.
+    /// Optional: a driver whose harness reports no windows never sends it. May arrive after the
+    /// terminal event.
+    quota(list<quota-window>),
+    /// The harness's prediction of what the person will ask next. Optional: a driver whose
+    /// harness makes no such prediction never sends it. May arrive after the terminal event.
+    suggested-prompt(string),
   }
 
   /// How the harness exited, for a run whose output ended without a terminal event.
@@ -291,6 +334,12 @@ interface process {
   launch: func(request: launch-request) -> result<launch-plan, string>;
 
   /// Reads a batch of complete stdout lines into events. May return none.
+  ///
+  /// After the batch holding the terminal event (`turn-end` or `turn-failed`), the runtime keeps
+  /// reading the harness's output until the harness exits or a short grace runs out. From those
+  /// lines, and from the rest of the terminal event's batch, only `quota`, `suggested-prompt` and
+  /// `note` are taken; every other event is noted in the trace and ignored, and never changes the
+  /// turn's outcome, its result or its spend.
   parse: func(lines: list<string>) -> list<event>;
 
   /// Classifies a run whose output ended without `turn-end` or `turn-failed`. Returns only

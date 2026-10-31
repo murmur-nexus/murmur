@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::agent::{DriverUsage, OccupancyBasis};
 use crate::model_limits::{BudgetBasis, InputBudget};
+use crate::process_driver::QuotaWindow;
 use crate::spend::SpendMeter;
 
 /// The runtime-provided tool every agent capsule has, on both transports, with no grant.
@@ -253,6 +254,9 @@ struct Fed {
     /// `inference` records that carried no token count.
     unreported_calls: u64,
     context: Option<ContextReading>,
+    /// The latest subscription window the harness reported under each name, in the order the
+    /// names were first reported.
+    quota: Vec<QuotaWindow>,
 }
 
 /// One session's standing, shared by the store, the trace writer and the agent loop.
@@ -393,6 +397,19 @@ impl SessionStatus {
         }
     }
 
+    /// Fed by `TraceWriter::write_harness_quota` with one validated report. Each window replaces
+    /// the whole of the one held under its name, so a member the new report leaves out is gone;
+    /// a name not seen before is added after the others.
+    pub(crate) fn record_quota(&self, windows: &[QuotaWindow]) {
+        let mut fed = self.fed();
+        for window in windows {
+            match fed.quota.iter_mut().find(|held| held.name == window.name) {
+                Some(held) => *held = window.clone(),
+                None => fed.quota.push(window.clone()),
+            }
+        }
+    }
+
     /// Fed by the http agent loop right after its compaction check: the occupancy that check
     /// compared, the window of the choice that served the call (`None` when it has none), the
     /// input budget the check compared against (`None` with no window) and how the count was
@@ -473,6 +490,8 @@ impl SessionStatus {
                 },
             ),
             context,
+            quota: (self.harness_transport && !fed.quota.is_empty())
+                .then(|| fed.quota.iter().map(QuotaReport::of).collect()),
             tokens: TokensReport {
                 input: or_unknown(fed.input),
                 output: or_unknown(fed.output),
@@ -534,8 +553,50 @@ pub(crate) struct StatusReport {
     done_check: Value,
     /// An object under `transport: http`; `"unknown"` under `transport: process`.
     context: Value,
+    /// The latest window per name the harness reported, under `transport: process` once it has
+    /// reported one; left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<Vec<QuotaReport>>,
     tokens: TokensReport,
     spend: SpendReport,
+}
+
+/// One subscription window as `session-status` reports it. A member the harness did not report
+/// is left out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct QuotaReport {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used: Option<f64>,
+    /// RFC 3339 UTC to the second, as `time.deadline.at` is spelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+}
+
+impl QuotaReport {
+    fn of(window: &QuotaWindow) -> Self {
+        Self {
+            name: window.name.clone(),
+            used: window.used,
+            resets_at: window.resets_at.and_then(rfc3339_of_unix_millis),
+            window_minutes: window.window_minutes,
+            state: window
+                .state
+                .map(crate::process_driver::QuotaState::wire_name),
+        }
+    }
+}
+
+/// `millis` after the Unix epoch as RFC 3339 UTC to the second; `None` past what the calendar
+/// holds.
+fn rfc3339_of_unix_millis(millis: u64) -> Option<String> {
+    let millis = i64::try_from(millis).ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -601,7 +662,8 @@ pub fn description_process() -> String {
         "{FIELDS} Turns are counted as they close. context: \"unknown\"; the harness keeps its \
          own context. tokens: harness-reported input, output, cached, cache_write for \
          this session's closed turns, and unreported_calls, turns it reported none for. \
-         {SPEND_AND_VALUES}"
+         quota, once the harness reports one: its latest subscription windows, name, used (0-1), \
+         resets_at, window_minutes, state; unreported members are left out. {SPEND_AND_VALUES}"
     )
 }
 
@@ -611,6 +673,7 @@ pub const INPUT_SCHEMA: &str = r#"{"type":"object","properties":{}}"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_driver::QuotaState;
     use serde_json::json;
 
     fn usage(
@@ -800,6 +863,76 @@ mod tests {
                    "unreported_calls": 1})
         );
         assert_eq!(value["turns"], json!({"used": 2, "cap": 10}));
+    }
+
+    fn window(
+        name: &str,
+        used: Option<f64>,
+        resets_at: Option<u64>,
+        window_minutes: Option<u64>,
+        state: Option<QuotaState>,
+    ) -> QuotaWindow {
+        QuotaWindow {
+            name: name.to_string(),
+            used,
+            resets_at,
+            window_minutes,
+            state,
+        }
+    }
+
+    /// A later report replaces a window of the same name whole, a member it leaves out is gone,
+    /// a window it does not name stands, and the order is the order names were first reported.
+    #[test]
+    fn session_status_quota_keeps_the_latest_window_per_name() {
+        let started = Instant::now();
+        let status = SessionStatus::new(started, true, None, None, 0, None, None);
+        assert!(report(&status, started, no_spend()).get("quota").is_none());
+        status.record_quota(&[
+            window(
+                "five-hour",
+                Some(0.42),
+                Some(1_792_497_600_999),
+                Some(300),
+                Some(QuotaState::Ok),
+            ),
+            window("seven-day", Some(0.1), None, Some(10_080), None),
+        ]);
+        assert_eq!(
+            report(&status, started, no_spend())["quota"],
+            json!([
+                {"name": "five-hour", "used": 0.42, "resets_at": "2026-10-20T12:00:00Z",
+                 "window_minutes": 300, "state": "ok"},
+                {"name": "seven-day", "used": 0.1, "window_minutes": 10080}
+            ])
+        );
+        status.record_quota(&[
+            window("extra", None, None, None, None),
+            window(
+                "five-hour",
+                Some(0.97),
+                None,
+                None,
+                Some(QuotaState::Warning),
+            ),
+        ]);
+        assert_eq!(
+            report(&status, started, no_spend())["quota"],
+            json!([
+                {"name": "five-hour", "used": 0.97, "state": "warning"},
+                {"name": "seven-day", "used": 0.1, "window_minutes": 10080},
+                {"name": "extra"}
+            ])
+        );
+    }
+
+    /// An http session never reports `quota`, even one fed a report.
+    #[test]
+    fn session_status_quota_is_never_on_http() {
+        let started = Instant::now();
+        let status = SessionStatus::new(started, false, None, None, 0, None, None);
+        status.record_quota(&[window("five-hour", Some(1.0), None, None, None)]);
+        assert!(report(&status, started, no_spend()).get("quota").is_none());
     }
 
     #[test]
@@ -1100,6 +1233,8 @@ mod tests {
                     "tokens: harness-reported input, output, cached, cache_write for this \
                      session's closed turns",
                     "unreported_calls, turns it reported none for",
+                    "quota, once the harness reports one: its latest subscription windows, name, \
+                     used (0-1), resets_at, window_minutes, state; unreported members are left out.",
                 ][..],
             ),
         ] {
@@ -1119,5 +1254,6 @@ mod tests {
         ] {
             assert!(!process.contains(http_only), "{http_only}: {process}");
         }
+        assert!(!http.contains("quota"), "{http}");
     }
 }

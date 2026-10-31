@@ -1389,14 +1389,14 @@ mod tests {
         assert!(
             err.starts_with(
                 "does-not-fit: [E-WIT-LEVEL-001] artifact 'local/tool-editor@2.0.0' does not fit \
-                 WIT level 1, the level this mur serves: it imports \
-                 murmur:tool-registry/invoke@9.9.9, and level 1 has murmur:tool-registry@"
+                 WIT level 2, the level this mur serves: it imports \
+                 murmur:tool-registry/invoke@9.9.9, and level 2 has murmur:tool-registry@"
             ),
             "{err}"
         );
         assert!(
             err.ends_with(
-                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 1"
+                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 2"
             ),
             "{err}"
         );
@@ -1446,7 +1446,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("; no version of local/tool-editor in the store fits level 1"),
+            err.ends_with("; no version of local/tool-editor in the store fits level 2"),
             "{err}"
         );
         assert_eq!(snapshot(&project, &state), before);

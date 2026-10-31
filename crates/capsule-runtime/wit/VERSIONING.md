@@ -24,7 +24,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
-| `murmur:driver`          | `0.3.0`  |
+| `murmur:driver`          | `0.4.0`  |
 
 `SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
@@ -329,6 +329,49 @@ repository's own driver fixtures were rebuilt against `murmur:stream`. One
 `murmur:text` component stays committed under
 `crates/murmur-cli/tests/fixtures/streaming-driver-text/`, so the refusal stays
 testable.
+
+`murmur:driver` then went to `0.4.0`, WIT level 2, when the `process` interface
+learned to carry what a harness reports about the person's subscription. A new
+`quota-window` record — `name`, and `used` (a fraction from 0 to 1),
+`resets-at` (unix milliseconds), `window-minutes` and `state`, each optional —
+and a new `quota-state` enum (`ok`, `warning`, `exhausted`) arrived with two new
+`event` cases, `quota(list<quota-window>)` and `suggested-prompt(string)`,
+**appended** after `tool-call-progress` so the existing discriminants `0`–`13`
+keep their indices. Adding a case to a variant is a breaking change under the
+rule below: `TypedFunc::typed` does not admit variant subtyping, so a host
+lifting a fourteen-case `event` list cannot call a driver built for sixteen, nor
+the reverse. Its instance name is now `murmur:driver/process@0.4.0`.
+
+The units are the interface's, not any harness's. One harness reports a window
+as a 0–1 utilization with a reset in seconds, another as an integer percentage
+on `primary`/`secondary` slots, and the runtime has no business knowing which:
+the driver translates into fraction, milliseconds and a name it documents. A
+report is a snapshot of the windows it names, and a later report replaces a
+window of the same name whole, so a driver whose harness sends sparse updates
+merges them into its own last report first. The runtime records and forwards
+both events and acts on neither: no warning, stop, retry or prompt change
+follows from a quota, however exhausted.
+
+The same step made the lines a harness prints after its terminal event
+readable. A harness emits its prompt suggestion after its result, so during the
+existing exit grace the runtime keeps reading and parsing, taking only `quota`,
+`suggested-prompt` and `note` from what it reads. That is a contract change
+without a shape change, recorded on `parse` in the `.wit`.
+
+The cost was paid knowingly. Every installed `@0.3.0` driver is refused at
+launch with `E-WIT-LEVEL-001` the moment `mur` upgrades: it does not fit WIT
+level 2, it exports `murmur:driver/process@0.3.0`, and level 2 has
+`murmur:driver@0.4.0`, with a hint to pin a version that fits and run
+`mur install`. Every process driver must be rebuilt. One `@0.3.0` component
+stays committed under `crates/murmur-cli/tests/fixtures/process-driver-v3/`,
+beside the `@0.1.0` and `@0.2.0` ones and with its own frozen `.wit`, so that
+refusal stays testable.
+
+Nothing else was bundled with it. `description` did not gain a field declaring
+that a driver sends either case: both are optional for a driver, as
+`tool-call-started` is, so nothing needs to declare them. Every other package
+stays where level 1 had it, so an artifact whose interfaces are all outside
+`murmur:driver` fits level 2 unchanged.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

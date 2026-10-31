@@ -1226,19 +1226,35 @@ async fn drive_harness(
     };
 
     // Whatever ended the loop, the harness does not outlive this function. A run that produced
-    // its terminal event is given the grace period to exit on its own; one that is still mid-turn
-    // is killed outright, because waiting on it is waiting on spend. An interrupted run is killed
-    // outright too: it has already had its grace.
-    let grace = match &end {
-        _ if interrupted => None,
-        RunEnd::Terminal(_) | RunEnd::Eof => Some(TERMINAL_EXIT_GRACE),
-        RunEnd::TurnBudget(_)
-        | RunEnd::SpendCeiling(_)
-        | RunEnd::Inactive
-        | RunEnd::Interrupted
-        | RunEnd::Failed(_) => None,
+    // its terminal event is given the grace period to exit on its own, and what it prints in that
+    // time is still read; one that is still mid-turn is killed outright, because waiting on it is
+    // waiting on spend. An interrupted run is killed outright too: it has already had its grace.
+    let exit = match &end {
+        RunEnd::Terminal(_) if !interrupted => {
+            finish_after_terminal(
+                &mut child,
+                stdin,
+                &mut line_rx,
+                driver,
+                sink,
+                trace,
+                TERMINAL_EXIT_GRACE,
+            )
+            .await
+        }
+        _ => {
+            let grace = match &end {
+                _ if interrupted => None,
+                RunEnd::Terminal(_) | RunEnd::Eof => Some(TERMINAL_EXIT_GRACE),
+                RunEnd::TurnBudget(_)
+                | RunEnd::SpendCeiling(_)
+                | RunEnd::Inactive
+                | RunEnd::Interrupted
+                | RunEnd::Failed(_) => None,
+            };
+            finish_child(&mut child, stdin, grace).await
+        }
     };
-    let exit = finish_child(&mut child, stdin, grace).await;
     if let Some(handle) = stderr_drain {
         let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
     }
@@ -1639,6 +1655,84 @@ async fn finish_child(
         None => None,
     };
     match waited {
+        Some(Ok(status)) => ExitReport {
+            code: status.code(),
+            signal: exit_signal(&status),
+            killed: false,
+        },
+        _ => {
+            let _ = child.kill().await;
+            let status = child.wait().await.ok();
+            ExitReport {
+                code: status.as_ref().and_then(std::process::ExitStatus::code),
+                signal: status.as_ref().and_then(exit_signal),
+                killed: true,
+            }
+        }
+    }
+}
+
+/// [`finish_child`] for a harness that has produced its terminal event, reading what it prints
+/// while it exits.
+///
+/// Closes stdin, then until the harness has exited and its stdout has closed, or `grace` has
+/// passed, hands each batch of lines (at most [`PARSE_BATCH_MAX_LINES`]) to `parse` and the
+/// events to [`ProcessEventSink::after_terminal`]. No `parse` call starts once `grace` has passed,
+/// and a failed one is noted and ends the parsing, never the run: the turn's outcome is already
+/// decided. A harness still running when `grace` runs out is killed and reaped.
+async fn finish_after_terminal(
+    child: &mut Child,
+    stdin: Option<ChildStdin>,
+    line_rx: &mut mpsc::Receiver<String>,
+    driver: &mut ProcessDriver,
+    sink: &mut ProcessEventSink<'_>,
+    trace: &mut TraceWriter,
+    grace: Duration,
+) -> ExitReport {
+    drop(stdin);
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut exited = None;
+    let mut stdout_open = true;
+    let mut parsing = true;
+    while exited.is_none() || stdout_open {
+        tokio::select! {
+            status = child.wait(), if exited.is_none() => exited = Some(status),
+            line = line_rx.recv(), if stdout_open => {
+                let Some(first) = line else {
+                    stdout_open = false;
+                    continue;
+                };
+                let mut lines = vec![first];
+                while lines.len() < PARSE_BATCH_MAX_LINES {
+                    match line_rx.try_recv() {
+                        Ok(line) => lines.push(line),
+                        Err(_) => break,
+                    }
+                }
+                if !parsing || tokio::time::Instant::now() >= deadline {
+                    continue;
+                }
+                match driver.parse(lines).await {
+                    Ok(events) => {
+                        for event in events {
+                            sink.after_terminal(event, trace).await;
+                        }
+                    }
+                    Err(error) => {
+                        parsing = false;
+                        let _ = trace
+                            .write_harness_note(&format!(
+                                "parsing the harness's output after the turn's terminal event \
+                                 failed, and the rest was not read: {error}"
+                            ))
+                            .await;
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    match exited {
         Some(Ok(status)) => ExitReport {
             code: status.code(),
             signal: exit_signal(&status),

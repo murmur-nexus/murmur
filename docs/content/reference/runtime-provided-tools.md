@@ -122,6 +122,12 @@ Seconds are whole, rounded down.
 | `context.budget_tokens` | The [input budget](manifest.md#inference-max-tokens) that check compared it with: the input ceiling, or the window less the output cap the last call sent, whichever is smaller. Compaction fires at `inference.compaction.threshold` of it | `"none"` when the choice has no window |
 | `context.budget_basis` | Which limit set `budget_tokens`: `"max_input_tokens"` (the driver's input ceiling) or `"context_window_less_output_cap"` | `"none"` when the choice has no window |
 | `context.measured_by` | `"actual"`: the provider's own count of the last call, its request plus its completion. `"estimate"`: the runtime's own count, when that call reported none. The same values as the [`compaction`](observability-schemas.md) record's `tokens_before_source` | — |
+| `quota` | Under `transport: process`, the latest subscription window per name the harness has [reported](wit-interfaces.md#process-quota), in the order the names were first reported: `[{"name": "five-hour", "used": 0.42, "resets_at": "2026-10-20T15:00:00Z", "window_minutes": 300, "state": "ok"}]` | Absent until the harness reports a window, and always under `transport: http` |
+| `quota[].name` | The window's name, as the driver documents it | — |
+| `quota[].used` | Fraction of the window used, 0 to 1 | Absent when the harness did not report it |
+| `quota[].resets_at` | When the window resets, RFC 3339 UTC to the second | Absent when not reported |
+| `quota[].window_minutes` | The window's length in minutes | Absent when not reported |
+| `quota[].state` | `"ok"`, `"warning"` or `"exhausted"`, as the harness reports it | Absent when not reported |
 | `tokens.input`, `tokens.output`, `tokens.cached`, `tokens.cache_write` | Sums of what the provider reported over the session's `inference` records so far | `"unknown"` for a member no record carried |
 | `tokens.unreported_calls` | `inference` records that carried no count | — |
 | `spend.tokens` | Tokens the spend ceilings count for this session | — |
@@ -137,6 +143,10 @@ The two transports differ in where the numbers come from:
 | `turns.used` | Every inference call | Turns the harness has closed |
 | `context` | An object | `"unknown"`: the harness keeps its own context |
 | `tokens` | The provider's `usage` on each call | The harness's own counts for each closed turn |
+| `quota` | Absent | The harness's latest windows, once it has reported one |
+
+The runtime reports `quota` and never acts on it: no window, however exhausted, stops, slows or
+warns about the session.
 
 Each call writes one [`session_status`](observability-schemas.md#session-status) record carrying
 the object returned.

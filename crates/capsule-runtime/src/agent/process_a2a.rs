@@ -69,9 +69,10 @@ use crate::{
     cancel::CANCELED_STATUS_MESSAGE,
     errors::RuntimeError,
     hooks::HookArtifact,
+    process_driver::{QuotaState, QuotaWindow},
     streaming::{
-        emit_frame, emit_status, emit_text, emit_thinking, MurmurFrame, StreamArtifact, StreamSink,
-        StreamTask,
+        emit_frame, emit_status, emit_text, emit_thinking, MurmurFrame, QuotaFrameWindow,
+        StreamArtifact, StreamSink, StreamTask,
     },
     tool_call_progress::ToolCallProgress,
 };
@@ -297,6 +298,34 @@ impl A2aStream {
         }
     }
 
+    /// One validated report of the subscription windows the harness says are used, sent as the
+    /// driver reported it. Opens no segment and leaves the task working.
+    pub(super) fn quota(&self, windows: &[QuotaWindow]) {
+        self.frame(MurmurFrame::Quota {
+            windows: windows
+                .iter()
+                .map(|window| QuotaFrameWindow {
+                    name: window.name.clone(),
+                    used: window.used,
+                    resets_at_ms: window.resets_at,
+                    window_minutes: window.window_minutes,
+                    state: window.state.map(QuotaState::wire_name),
+                })
+                .collect(),
+        });
+    }
+
+    /// The harness's prediction of what the person will ask next. Opens no segment. An
+    /// interrupted attempt sends none, as it sends no answer: a person stopped the task.
+    pub(super) fn suggested_prompt(&self, text: &str) {
+        if self.interrupted {
+            return;
+        }
+        self.frame(MurmurFrame::SuggestedPrompt {
+            text: text.to_string(),
+        });
+    }
+
     /// The harness failed the turn. The attempt's ending is [`Self::ending`]'s, which the attempt
     /// reaches by returning the failure as an error.
     pub(super) fn turn_failed(&mut self) {
@@ -385,7 +414,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::streaming::{buffered, event_kind, SseEventBuffer};
+    use crate::streaming::{buffered, event_kind, frame_of, SseEventBuffer};
 
     /// `ms` milliseconds after `base`.
     fn at(base: Instant, ms: u64) -> Instant {
@@ -425,6 +454,64 @@ mod tests {
             event_types(&frames),
             ["status-update", "tool-call-started", "tool-call-progress"]
         );
+    }
+
+    /// A quota report and a suggestion are one frame each, opening no segment, so no `working`
+    /// status precedes them; the frame carries the report as sent, members left out stay out.
+    #[tokio::test]
+    async fn quota_and_suggestion_are_one_frame_each_and_open_no_segment() {
+        let (stream, frames) = stream();
+        stream.quota(&[
+            QuotaWindow {
+                name: "five-hour".into(),
+                used: Some(0.5),
+                resets_at: Some(1_792_497_600_000),
+                window_minutes: None,
+                state: Some(QuotaState::Exhausted),
+            },
+            QuotaWindow {
+                name: "seven-day".into(),
+                used: None,
+                resets_at: None,
+                window_minutes: None,
+                state: None,
+            },
+        ]);
+        stream.suggested_prompt("now run the tests");
+        assert_eq!(event_types(&frames), ["quota", "suggested-prompt"]);
+        let sent = buffered(&frames);
+        assert_eq!(
+            frame_of(&sent[0]),
+            serde_json::json!({"frame": "quota", "windows": [
+                {"name": "five-hour", "used": 0.5, "resetsAtMs": 1_792_497_600_000_u64,
+                 "state": "exhausted"},
+                {"name": "seven-day"}
+            ]})
+        );
+        assert_eq!(
+            sent[0]["statusUpdate"]["status"]["state"],
+            "TASK_STATE_WORKING"
+        );
+        assert_eq!(
+            frame_of(&sent[1]),
+            serde_json::json!({"frame": "suggested-prompt", "text": "now run the tests"})
+        );
+    }
+
+    /// An interrupted attempt forwards no suggestion, but still forwards a quota report.
+    #[tokio::test]
+    async fn an_interrupted_attempt_forwards_quota_and_no_suggestion() {
+        let (mut stream, frames) = stream();
+        stream.mark_interrupted();
+        stream.suggested_prompt("ask me more");
+        stream.quota(&[QuotaWindow {
+            name: "five-hour".into(),
+            used: Some(1.0),
+            resets_at: None,
+            window_minutes: None,
+            state: None,
+        }]);
+        assert_eq!(event_types(&frames), ["quota"]);
     }
 
     /// A start the stream does not believe opens no segment, so it writes no `working` status.

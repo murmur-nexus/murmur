@@ -296,12 +296,16 @@ carries it too.
 | [`tool-call-started`](#event-tool-call-started) | yes | yes |
 | [`tool-call-progress`](#event-tool-call-progress) | yes | yes |
 | [`artifact`](#event-artifact) | yes | yes |
+| [`quota`](#event-quota) | yes, on a `transport: process` capsule | yes, on a `transport: process` capsule |
+| [`suggested-prompt`](#event-suggested-prompt) | yes, on a `transport: process` capsule | yes, on a `transport: process` capsule |
 | [`gap`](#event-gap) | yes, when the request sent `Last-Event-ID` | yes |
 | [`lagged`](#event-lagged) | yes | yes |
 | [`connection-ack`](#event-connection-ack) | no | yes, first event |
 | [`capsule-closed`](#event-capsule-closed) | no | yes, as the last event when it is written |
 
-Read the list from the capsule's card rather than from this table.
+Read the list from the capsule's card rather than from this table. The example above is a
+`transport: http` capsule's; a `transport: process` capsule's lists `quota` and `suggested-prompt`
+after `artifact`.
 
 ### Activation { #activation }
 
@@ -367,6 +371,8 @@ harness:
 | Answers a tool call | [`artifact`](#event-artifact) |
 | Ends the turn | One [`artifact`](#event-artifact) frame for each artifact an `on-inference` hook returned for that turn, then the whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the `response` artifact and the task's `TASK_STATE_COMPLETED` status |
 | Fails the turn | The task's `TASK_STATE_FAILED` status |
+| Reports its subscription windows | [`quota`](#event-quota) |
+| Predicts the person's next prompt | [`suggested-prompt`](#event-suggested-prompt) |
 
 A process task ends in the same [one final status](#one-final-status) as an http task, on every
 path out of its last attempt, including the ones a runtime diagnostic ends: the status message is
@@ -403,11 +409,14 @@ One attempt of a task writes its events in this order:
 5. The next turn repeats from step 1.
 6. When the attempt completes, one `artifact` per hook artifact, then the whole reply as one
    `text` `"final":true` frame when the last turn streamed no text.
-7. A reopen writes the [reopen boundary](#reopened-tasks), and the next attempt starts at step 1.
-8. The task's [one final status](#one-final-status) is its last event, after its `response`
+7. On a `transport: process` capsule, [`quota`](#event-quota) and
+   [`suggested-prompt`](#event-suggested-prompt) frames wherever the harness reports them,
+   including after the turn's end while the harness exits, and always before the steps below.
+8. A reopen writes the [reopen boundary](#reopened-tasks), and the next attempt starts at step 1.
+9. The task's [one final status](#one-final-status) is its last event, after its `response`
    artifact when it completed with one.
 
-A plain connection receives steps 1, 4's statuses, 7 and 8 only.
+A plain connection receives steps 1, 4's statuses, 8 and 9 only.
 
 ---
 
@@ -554,6 +563,59 @@ successful call whatever its exit status, so `bash` reports `"isError":false` be
 | A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\nExit code: 0\nStdout:\nhello\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false}` |
 | A call that never reached a tool | `{"frame":"artifact","toolName":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fenceSource":null,"toolCallId":"toolu_03","isError":true,"durationMs":0,"exitCode":null,"truncated":false}` |
 | A hook artifact | `{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}` |
+
+---
+
+## `quota` { #event-quota }
+
+One report of the subscription windows a `transport: process` capsule's harness says are used, as
+its [process driver](wit-interfaces.md#process-quota) sent it. It is a snapshot of the windows it
+names: a later frame replaces a window of the same name and leaves the others standing. The
+merged view is the `quota` field of [`session-status`](runtime-provided-tools.md#session-status).
+
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `quota` |
+| `windows` | array | At least one window |
+| `windows[].name` | string | The window's name, such as `five-hour` |
+| `windows[].used` | f64 | Fraction of the window used, 0 to 1. Absent when the harness did not report it |
+| `windows[].resetsAtMs` | u64 | When the window resets, unix milliseconds. Absent when not reported |
+| `windows[].windowMinutes` | u64 | The window's length in minutes. Absent when not reported |
+| `windows[].state` | string | `ok`, `warning` or `exhausted`. Absent when not reported |
+
+| Property | Value |
+|---|---|
+| Carrier | A `TASK_STATE_WORKING` status; the task keeps working |
+| Turns | Opens no inference turn |
+| Effect | None: the capsule reports a window and acts on none, however exhausted |
+| Canceled task | Still written |
+
+```json
+{"frame":"quota","windows":[{"name":"five-hour","used":0.42,"resetsAtMs":1793491200000,"windowMinutes":300,"state":"ok"},{"name":"seven-day","used":0.1}]}
+```
+
+---
+
+## `suggested-prompt` { #event-suggested-prompt }
+
+What a `transport: process` capsule's harness predicts the person will ask next, as its
+[process driver](wit-interfaces.md#process-suggested-prompt) sent it.
+
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `suggested-prompt` |
+| `text` | string | The predicted prompt, never empty |
+
+| Property | Value |
+|---|---|
+| Carrier | A `TASK_STATE_WORKING` status; the task keeps working |
+| When | Often after the turn's end, read while the harness exits; always before the task's final status |
+| Turns | Opens no inference turn |
+| Canceled task | Not written, as a canceled task delivers no answer |
+
+```json
+{"frame":"suggested-prompt","text":"Run the test suite"}
+```
 
 ---
 
@@ -772,6 +834,7 @@ follows them.
 | `text`, `artifact` | Printed to stdout; text is printed as it arrives, and the next status or artifact line after text that did not end its line starts on a new line |
 | `thinking` | Not shown |
 | `tool-call-started`, `tool-call-progress` | Not shown |
+| `quota`, `suggested-prompt` | Not shown |
 | `connection-ack` | Read for `conversationMode`, which sets how status lines are labelled |
 | Heartbeat | Read and discarded |
 | `gap` | A warning on stderr naming `firstAvailableId` |

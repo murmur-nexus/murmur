@@ -209,6 +209,8 @@ pub(crate) enum StreamFrame {
     ToolCallStarted,
     ToolCallProgress,
     Artifact,
+    Quota,
+    SuggestedPrompt,
     Gap,
     Lagged,
     ConnectionAck,
@@ -217,12 +219,14 @@ pub(crate) enum StreamFrame {
 
 impl StreamFrame {
     /// Every frame, in the order the stream extension's `params.frames` lists them.
-    pub(crate) const ALL: [StreamFrame; 9] = [
+    pub(crate) const ALL: [StreamFrame; 11] = [
         StreamFrame::Text,
         StreamFrame::Thinking,
         StreamFrame::ToolCallStarted,
         StreamFrame::ToolCallProgress,
         StreamFrame::Artifact,
+        StreamFrame::Quota,
+        StreamFrame::SuggestedPrompt,
         StreamFrame::Gap,
         StreamFrame::Lagged,
         StreamFrame::ConnectionAck,
@@ -237,6 +241,8 @@ impl StreamFrame {
             StreamFrame::ToolCallStarted => "tool-call-started",
             StreamFrame::ToolCallProgress => "tool-call-progress",
             StreamFrame::Artifact => "artifact",
+            StreamFrame::Quota => "quota",
+            StreamFrame::SuggestedPrompt => "suggested-prompt",
             StreamFrame::Gap => "gap",
             StreamFrame::Lagged => "lagged",
             StreamFrame::ConnectionAck => "connection-ack",
@@ -274,6 +280,11 @@ pub(crate) enum MurmurFrame {
     },
     /// One tool call's result or one hook artifact, as the model received it.
     Artifact(StreamArtifact),
+    /// One report of the subscription windows the harness says are used, as the driver sent it
+    /// after validation: a snapshot of the windows it names, not the runtime's merged view.
+    Quota { windows: Vec<QuotaFrameWindow> },
+    /// The harness's prediction of what the person will ask next.
+    SuggestedPrompt { text: String },
     /// The replay this connection asked for starts later than its cursor.
     #[serde(rename_all = "camelCase")]
     Gap { first_available_id: u64 },
@@ -297,12 +308,32 @@ impl MurmurFrame {
             MurmurFrame::ToolCallStarted { .. } => StreamFrame::ToolCallStarted,
             MurmurFrame::ToolCallProgress { .. } => StreamFrame::ToolCallProgress,
             MurmurFrame::Artifact(_) => StreamFrame::Artifact,
+            MurmurFrame::Quota { .. } => StreamFrame::Quota,
+            MurmurFrame::SuggestedPrompt { .. } => StreamFrame::SuggestedPrompt,
             MurmurFrame::Gap { .. } => StreamFrame::Gap,
             MurmurFrame::Lagged { .. } => StreamFrame::Lagged,
             MurmurFrame::ConnectionAck { .. } => StreamFrame::ConnectionAck,
             MurmurFrame::CapsuleClosed => StreamFrame::CapsuleClosed,
         }
     }
+}
+
+/// One subscription window on a `quota` frame. A member the harness did not report is left out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuotaFrameWindow {
+    pub(crate) name: String,
+    /// A fraction from 0 to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) used: Option<f64>,
+    /// Milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resets_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window_minutes: Option<u64>,
+    /// `ok`, `warning` or `exhausted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<&'static str>,
 }
 
 /// What the stream extension says on one event: a frame, or the reopen boundary's annotation.
@@ -775,6 +806,33 @@ mod tests {
                 r#"{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}"#,
             ),
             (MurmurFrame::CapsuleClosed, r#"{"frame":"capsule-closed"}"#),
+            (
+                MurmurFrame::Quota {
+                    windows: vec![
+                        QuotaFrameWindow {
+                            name: "five-hour".into(),
+                            used: Some(0.42),
+                            resets_at_ms: Some(1_792_497_600_000),
+                            window_minutes: Some(300),
+                            state: Some("ok"),
+                        },
+                        QuotaFrameWindow {
+                            name: "seven-day".into(),
+                            used: None,
+                            resets_at_ms: None,
+                            window_minutes: None,
+                            state: None,
+                        },
+                    ],
+                },
+                r#"{"frame":"quota","windows":[{"name":"five-hour","used":0.42,"resetsAtMs":1792497600000,"windowMinutes":300,"state":"ok"},{"name":"seven-day"}]}"#,
+            ),
+            (
+                MurmurFrame::SuggestedPrompt {
+                    text: "run the tests".into(),
+                },
+                r#"{"frame":"suggested-prompt","text":"run the tests"}"#,
+            ),
         ];
         for (frame, expected) in cases {
             assert_eq!(payload(&frame), expected);

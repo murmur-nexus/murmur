@@ -747,15 +747,15 @@ fn s3_refused_pulls_write_nothing() {
     assert!(
         unfit.starts_with(
             "does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@0.3.0' does not fit \
-             WIT level 1, the level this mur serves: it imports \
-             murmur:tool-registry/invoke@9.9.9, and level 1 has murmur:tool-registry@"
+             WIT level 2, the level this mur serves: it imports \
+             murmur:tool-registry/invoke@9.9.9, and level 2 has murmur:tool-registry@"
         ),
         "{unfit}"
     );
     assert!(
         unfit.ends_with(
             "; murmur/tool-editor@0.2.0 is the newest version in the global store that fits \
-             level 1"
+             level 2"
         ),
         "{unfit}"
     );
@@ -811,7 +811,7 @@ fn s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused() {
         "{text}"
     );
     assert!(
-        text.ends_with("; no version of murmur/tool-editor in the global store fits level 1"),
+        text.ends_with("; no version of murmur/tool-editor in the global store fits level 2"),
         "{text}"
     );
     assert!(!workdir.join("tools").join(EDITOR_TOOL).exists());

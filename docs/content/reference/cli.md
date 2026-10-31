@@ -607,7 +607,7 @@ mur build [source] [--output <path-or-dir>]
 
 ```bash
 mur build .
-# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 1)
+# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 2)
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
@@ -1316,7 +1316,7 @@ payload. The check never writes to either store.
 
 ```text
 WIT level
-  this mur serves WIT level 1:
+  this mur serves WIT level 2:
     PACKAGE                  VERSION
     murmur:artifact-manager  0.1.0
     murmur:capsule           0.1.0
@@ -1324,9 +1324,9 @@ WIT level
     murmur:tool-registry     0.1.0
 
   installed:
-    local/built-tool@0.1.0   global    built at 1                fits level 1
-    local/notes@0.1.0        global    built at 1 (derived)      fits level 1
-    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 1
+    local/built-tool@0.1.0   global    built at 2                fits level 2
+    local/notes@0.1.0        global    built at 2 (derived)      fits level 2
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 2
   ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
@@ -2868,6 +2868,7 @@ Output sections, in the order they are printed:
 | Section | Printed | Contents |
 |---|---|---|
 | Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a [formation member](#mur-run-formation), a `formation:  <formation-id>` line follows those. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools` |
+| Harness | one or more `harness_warning`, `harness_failed`, `harness_interrupt` or [`harness_quota`](observability-schemas.md#harness-quota) records | One line per warning (`warning <code>: <message>`), failed turn (`harness failed (<kind>): <message>`) and interrupt (`interrupt <method>: …`), in file order. Then one line per subscription window name, with the latest values reported under it, in the order the names were first reported: `quota <name>: used <fraction>, resets <RFC 3339 UTC>, <n> min window, <state>`. A value the harness did not report is left off the line: `quota five-hour: used 0.5, warning` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
@@ -4122,7 +4123,7 @@ mur version [--json]
 ```text
 mur 1.1.0-dev
 commit 0123456789abcdef0123456789abcdef01234567
-WIT level 1
+WIT level 2
 
 PACKAGE                  VERSION
 murmur:artifact-manager  0.1.0

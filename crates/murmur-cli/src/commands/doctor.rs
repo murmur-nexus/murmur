@@ -2630,12 +2630,12 @@ mod tests {
                 "murmur:driver/other@0.1.0",
                 ContractDirection::Import,
                 Some("0.1.0"),
-                Some("0.3.0"),
+                Some("0.4.0"),
             ),
         ];
         assert_eq!(
             release_requirement(&interfaces),
-            "a release built against murmur:driver@0.3.0, without murmur:text"
+            "a release built against murmur:driver@0.4.0, without murmur:text"
         );
     }
 
