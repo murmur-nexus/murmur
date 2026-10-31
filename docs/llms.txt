@@ -61,7 +61,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 
 ### Packaging & Deployment
 
-- [Package a skill into an artifact](/how-to/package-skill-artifact.md): Packaging a `skill.md` file into a `.mur.zip` artifact the runtime installs alongside a capsule.
+- [Package a skill into an artifact](/how-to/package-skill-artifact.md): Packaging a skill folder — `SKILL.md` and the files it points at — into a `.mur.zip` artifact the runtime installs alongside a capsule.
 - [Generate a capsule manifest with mur new](/how-to/generate-manifest.md): Turning a plain-language task description into a ready-to-refine `murmur.yaml`.
 - [Deploy a capsule to the cloud with mur deploy](/how-to/deploy-capsule-cloud.md): Uploading capsule files to a VM via SSH and getting back a public A2A endpoint.
 - [Run a capsule from the CLI or from another program](/how-to/different-ways-to-run-murmur.md): `mur run`'s two output modes and which callers each one serves.

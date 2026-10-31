@@ -444,14 +444,14 @@ fn stage_capsule(
 
 // ── manifest-less skill folders (the Claude Code / Codex / pi layout) ────────
 
-const S1_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+const PDF_HELPER_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
 
 /// A standard skill folder under `base`: `Some Folder/SKILL.md` with a front block and
 /// `Some Folder/references/forms.md`, no murmur.yaml.
-fn s1_folder(base: &Path) -> PathBuf {
+fn pdf_helper_folder(base: &Path) -> PathBuf {
     let folder = base.join("Some Folder");
     fs::create_dir_all(folder.join("references")).unwrap();
-    fs::write(folder.join("SKILL.md"), S1_SKILL_MD).unwrap();
+    fs::write(folder.join("SKILL.md"), PDF_HELPER_SKILL_MD).unwrap();
     fs::write(folder.join("references/forms.md"), "# Forms\n").unwrap();
     folder
 }
@@ -482,7 +482,7 @@ fn mur_build(cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
 fn manifest_less_skill_folder_builds_from_its_front_block() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
 
     mur_build(outdir.path(), &[folder.to_str().unwrap()])
         .success()
@@ -503,7 +503,7 @@ fn manifest_less_skill_folder_builds_from_its_front_block() {
             "skill.md"
         ]
     );
-    assert_eq!(zip_entry_content(&zip, "skill.md"), S1_SKILL_MD);
+    assert_eq!(zip_entry_content(&zip, "skill.md"), PDF_HELPER_SKILL_MD);
     assert_eq!(zip_entry_content(&zip, "references/forms.md"), "# Forms\n");
     let manifest = manifest_yaml(&zip);
     assert_eq!(manifest["name"].as_str(), Some("pdf-helper"));
@@ -564,7 +564,7 @@ fn manifest_backed_skill_folder_packs_only_requires_files() {
 fn skill_flags_override_the_front_block() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
 
     mur_build(
         outdir.path(),
@@ -658,7 +658,7 @@ fn front_block_folded_description_is_written_as_yaml() {
 fn manifest_less_build_skips_dot_entries_and_built_artifacts() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
     fs::create_dir_all(folder.join(".git")).unwrap();
     fs::write(folder.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::write(folder.join(".DS_Store"), "x").unwrap();
@@ -697,7 +697,7 @@ fn assert_refused_with_no_output(folder: &Path, outdir: &Path, names: &str) {
 fn manifest_less_build_refuses_a_symlink() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
     std::os::unix::fs::symlink("forms.md", folder.join("references/link.md")).unwrap();
 
     assert_refused_with_no_output(&folder, outdir.path(), "references/link.md");
@@ -707,7 +707,7 @@ fn manifest_less_build_refuses_a_symlink() {
 fn manifest_less_build_refuses_two_spellings_of_skill_md() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
     fs::write(folder.join("skill.md"), "# other\n").unwrap();
 
     assert_refused_with_no_output(&folder, outdir.path(), "both SKILL.md and skill.md");
@@ -717,7 +717,7 @@ fn manifest_less_build_refuses_two_spellings_of_skill_md() {
 fn manifest_less_build_refuses_an_authored_build_record() {
     let base = tempdir().unwrap();
     let outdir = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
     fs::write(folder.join("murmur-build.json"), "{\"built_at_level\":9}").unwrap();
 
     assert_refused_with_no_output(&folder, outdir.path(), "murmur-build.json");
@@ -727,7 +727,7 @@ fn manifest_less_build_refuses_an_authored_build_record() {
 fn skill_build_output_names_a_directory_or_the_file() {
     let base = tempdir().unwrap();
     let cwd = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
     let dist = base.path().join("dist");
     fs::create_dir_all(&dist).unwrap();
 
@@ -799,7 +799,7 @@ fn skill_build_roundtrip_installs_supporting_files() {
     let home = tempdir().unwrap();
     let base = tempdir().unwrap();
     let build_out = tempdir().unwrap();
-    let folder = s1_folder(base.path());
+    let folder = pdf_helper_folder(base.path());
 
     mur_build(build_out.path(), &[folder.to_str().unwrap()]).success();
     let artifact = build_out.path().join("pdf-helper-0.1.0.mur.zip");
@@ -819,7 +819,7 @@ fn skill_build_roundtrip_installs_supporting_files() {
     let tool_dir = staged.runtime_dir.join("tools").join("pdf-helper");
     assert_eq!(
         fs::read_to_string(tool_dir.join("skill.md")).unwrap(),
-        S1_SKILL_MD
+        PDF_HELPER_SKILL_MD
     );
     assert_eq!(
         fs::read_to_string(tool_dir.join("references/forms.md")).unwrap(),

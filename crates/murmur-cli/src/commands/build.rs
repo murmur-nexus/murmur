@@ -310,7 +310,7 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillInput, CliError> {
         )
     })?;
 
-    let mut skill_md: Option<(String, Vec<u8>)> = None;
+    let mut skill_md: Option<Vec<u8>> = None;
     let mut manifest: Option<Vec<u8>> = None;
     let mut extra: Vec<ExtraFile> = Vec::new();
 
@@ -338,7 +338,7 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillInput, CliError> {
             .map_err(|e| CliError::new(E_IO_003, format!("zip read error: {e}")))?;
 
         if lower == "skill.md" {
-            skill_md = Some((entry_name, bytes));
+            skill_md = Some(bytes);
         } else if lower == "murmur.yaml" {
             manifest = Some(bytes);
         } else {
@@ -350,7 +350,7 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillInput, CliError> {
         }
     }
 
-    let (_, skill_md) = skill_md.ok_or_else(|| {
+    let skill_md = skill_md.ok_or_else(|| {
         CliError::new(
             E_IO_001,
             format!(

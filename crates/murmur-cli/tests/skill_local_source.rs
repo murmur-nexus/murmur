@@ -448,7 +448,7 @@ fn stage_capsule_dir(home: &TempDir, capsule_dir: &TempDir) -> capsule_runtime::
     .unwrap()
 }
 
-const S1_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+const PDF_HELPER_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
 
 /// A directory source installs the whole folder under `tools/<name>/`: `skill.md` and every
 /// supporting file, but never the folder's own `murmur.yaml` (staging writes the skill's) and
@@ -461,7 +461,7 @@ fn local_source_directory_installs_supporting_files() {
     let skill_dir = capsule_dir.path().join("Some Folder");
     fs::create_dir_all(skill_dir.join("references")).unwrap();
     fs::create_dir_all(skill_dir.join(".git")).unwrap();
-    fs::write(skill_dir.join("SKILL.md"), S1_SKILL_MD).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), PDF_HELPER_SKILL_MD).unwrap();
     fs::write(skill_dir.join("references/forms.md"), "# Forms\n").unwrap();
     fs::write(skill_dir.join(".git/HEAD"), "ref\n").unwrap();
     fs::write(
@@ -480,7 +480,7 @@ fn local_source_directory_installs_supporting_files() {
     let tool_dir = staged.runtime_dir.join("tools").join("pdf-helper");
     assert_eq!(
         fs::read_to_string(tool_dir.join("skill.md")).unwrap(),
-        S1_SKILL_MD
+        PDF_HELPER_SKILL_MD
     );
     assert_eq!(
         fs::read_to_string(tool_dir.join("references/forms.md")).unwrap(),

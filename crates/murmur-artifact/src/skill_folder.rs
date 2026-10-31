@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    const S1_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+    const PDF_HELPER_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms: use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
 
     fn write(dir: &Path, rel: &str, contents: &str) {
         let path = dir.join(rel);
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn front_block_with_unquoted_colon_falls_back_to_lines() {
-        let front = parse_skill_front_block(S1_SKILL_MD).unwrap();
+        let front = parse_skill_front_block(PDF_HELPER_SKILL_MD).unwrap();
         assert_eq!(front.name.as_deref(), Some("pdf-helper"));
         assert_eq!(
             front.description.as_deref(),
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn description_prefers_the_front_block() {
         assert_eq!(
-            skill_md_description(S1_SKILL_MD).as_deref(),
+            skill_md_description(PDF_HELPER_SKILL_MD).as_deref(),
             Some("Fill PDF forms: use when a form must be filled.")
         );
     }
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn walk_collects_supporting_files_recursively_and_sorted() {
         let dir = tempdir().unwrap();
-        write(dir.path(), "SKILL.md", S1_SKILL_MD);
+        write(dir.path(), "SKILL.md", PDF_HELPER_SKILL_MD);
         write(dir.path(), "scripts/fill.py", "print(1)\n");
         write(dir.path(), "references/forms.md", "# Forms\n");
         write(dir.path(), "references/deep/a.txt", "a");
