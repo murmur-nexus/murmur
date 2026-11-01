@@ -1,6 +1,6 @@
 //! Durable, capsule-scoped state stores: `~/.murmur/state/<store>/`, granted per artifact by
 //! `capabilities.state` and mounted into a guest as a second WASI preopen named
-//! [`STATE_PREOPEN_NAME`].
+//! [`STATE_PREOPEN_NAME`], or handed to a native tool as [`STATE_DIR_ENV`].
 //!
 //! Two properties decide the layout, and both are load-bearing:
 //!
@@ -31,6 +31,14 @@ use crate::{containment::StateStoreReport, errors::RuntimeError};
 /// One stable literal, shared by both `build_wasi_ctx` functions and by the docs, so a guest never
 /// has to know which role it is running as to find its own store.
 pub const STATE_PREOPEN_NAME: &str = "state";
+
+/// The environment variable a native tool whose entry declares `capabilities.state` reads its
+/// store from: the store's absolute host path. A native process has no preopen, and it starts in
+/// the workdir, so the store reaches it by path. Runtime-owned like
+/// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`]: set for the declaring tool's spawn alone and
+/// never resolved from the host; WASM guests reach their store through [`STATE_PREOPEN_NAME`]
+/// and are not given it.
+pub const STATE_DIR_ENV: &str = "MURMUR_STATE_DIR";
 
 /// Directory under the murmur home that holds every store, one subdirectory per store name.
 const STATE_ROOT_DIR: &str = "state";

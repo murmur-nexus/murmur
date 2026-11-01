@@ -29,8 +29,8 @@
 //!
 //! After [`refuse_before_lock`] and [`refuse_against_lock`] pass, `remove_artifact` writes
 //! `murmur.lock` without the entry, then updates the session (`tool_components`,
-//! `native_entrypoints`, `allowlisted_tools`, `installed_artifacts`, `removed_artifacts`,
-//! `installed_generation`), then deletes `<runtime dir>/tools/<name>/`. A lock write that fails
+//! `native_entrypoints`, `native_tool_settings`, `allowlisted_tools`, `installed_artifacts`,
+//! `removed_artifacts`, `installed_generation`), then deletes `<runtime dir>/tools/<name>/`. A lock write that fails
 //! leaves everything unchanged. A directory that cannot be deleted is reported with
 //! [`undeletable_directory`], and the name is already out of the session and the lock, so
 //! dispatch refuses it. The compiled form under

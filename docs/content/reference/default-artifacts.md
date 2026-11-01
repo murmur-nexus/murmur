@@ -200,7 +200,9 @@ fails with `E-RUN-008` if it is not installed first.
 
 Five of the tools above ship native implementations. Each runs in the capsule's own sandbox, with
 the capsule-wide grants — see [Native tools](containment.md#native-tools) — so what it needs is
-declared in the capsule's top-level `capabilities:` block, never on its own artifact entry:
+declared in the capsule's top-level `capabilities:` block. Its own artifact entry carries only
+`config:` and `capabilities.state`, which reach that tool alone — see
+[A native tool's own config and store](containment.md#native-tool-settings):
 
 | Tool | Capsule grants it needs | `scoped` | `sealed` |
 |---|---|---|---|
@@ -262,19 +264,21 @@ A formation member that may call at least one member also hands every tool, and 
 `inference:` is configured. Shell commands, native tools and a `transport: process` harness are
 not handed it.
 
-Two further variables are injected per artifact rather than per session:
+Three further variables are injected per artifact rather than per session:
 
 | Env var | Injected when | Value |
 |---|---|---|
 | `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
+| `MURMUR_STATE_DIR` | This artifact is a native tool, and its entry declares [`capabilities.state`](manifest.md#tool-capabilities). Native tools only: a WASM artifact reaches its store as the `state` directory | The store's absolute path, `~/.murmur/state/<store>/` |
 | `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint`. Requests sent there reach `gateway.endpoint` with the key attached as the artifact's [`upstream_auth:`](manifest.md#upstream-auth) block declares |
 
 Each reaches the declaring artifact and no other, and the runtime sets it whether or not
 `inference:` is configured. The configured driver receives `MURMUR_GATEWAY_ENDPOINT` on its agent
 turns and a hook's `run-inference`; a driver called by name as a tool receives neither the variable
-nor its gateway. A native tool receives no per-artifact environment, so a `config:` block there is
-reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing, and a `gateway:` block
-there is refused with [`E-CAP-017`](diagnostics.md#e-cap-017).
+nor its gateway. A native tool receives `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR` on every
+containment tier, and none of the per-session variables above; a `gateway:` block on a native tool
+is refused with [`E-CAP-017`](diagnostics.md#e-cap-017). The runtime sets these names, and no
+`capabilities.env.allow` or `capabilities.shell.baseline_env` entry takes them from the host.
 
 Under `transport: process` the driver named by `inference.driver` is a
 [process driver](manifest.md#process-driver): a `runtime: driver` artifact granted nothing at all —

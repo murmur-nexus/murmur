@@ -1088,6 +1088,11 @@ pub(crate) struct SealedBindSources<'a> {
     /// descriptor its home root holds on it, bound read-write and required at its own absolute
     /// path, after [`Self::records_dir`], so `$HOME` names it inside the root.
     pub(crate) home_dir: Option<(&'a Path, (u64, u64))>,
+    /// A native tool's durable store, `~/.murmur/state/<store>/`, and the identity of the
+    /// descriptor its spawn took on it, bound read-write and required at its own absolute path,
+    /// after [`Self::home_dir`], so `$MURMUR_STATE_DIR` names it inside the root. `None` for every
+    /// spawn but the declaring tool's.
+    pub(crate) state_dir: Option<(&'a Path, (u64, u64))>,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1464,6 +1469,23 @@ pub(crate) fn plan_composed_root(
     //    directory it lies in, so this deeper, writable bind is the one that survives on top of
     //    that read-only one. Verified like `/tmp`: a link swapped onto its path moves nothing.
     if let Some((path, identity)) = sources.home_dir {
+        let target = rebase(base, path);
+        builder.mkdir_p(&target);
+        builder.push(
+            RootOp::BindVerified {
+                source: path.to_path_buf(),
+                target,
+                read_only: false,
+                identity,
+            },
+            true,
+        );
+    }
+
+    // 10. A native tool's durable store, read-write and REQUIRED, at its own absolute path, on
+    //     the home folder's terms: a tool that declared a store never runs in a root without it.
+    //     Last, so a store beneath any directory bound above it survives on top.
+    if let Some((path, identity)) = sources.state_dir {
         let target = rebase(base, path);
         builder.mkdir_p(&target);
         builder.push(
@@ -2574,6 +2596,7 @@ mod tests {
             runtime_dir: None,
             records_dir: None,
             home_dir: None,
+            state_dir: None,
         }
     }
 
@@ -2956,6 +2979,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A native tool's store is bound read-write, verified and required at its own absolute
+    /// path, after the home folder; a spawn with no store binds nothing there.
+    #[test]
+    fn a_native_tools_store_is_bound_read_write_verified_and_required_at_its_own_path() {
+        const TEST_HOME_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x/home";
+        const TEST_STATE_DIR: &str = "/home/u/.murmur/state/config-capsule";
+        const TEST_STATE_IDENTITY: (u64, u64) = (7, 79);
+        let sources = SealedBindSources {
+            runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+            home_dir: Some((Path::new(TEST_HOME_DIR), (7, 78))),
+            ..test_sources()
+        };
+        let plan = |sources: &SealedBindSources<'_>| {
+            plan_composed_root(
+                Path::new("/home/u/w"),
+                sources,
+                Path::new("/tmp"),
+                &[],
+                &[],
+                &FakeHost::usrmerge(),
+            )
+        };
+        let with_store = plan(&SealedBindSources {
+            state_dir: Some((Path::new(TEST_STATE_DIR), TEST_STATE_IDENTITY)),
+            ..sources
+        });
+        let position = |plan: &ComposedRootPlan, source: &str| {
+            plan.steps.iter().position(|step| {
+                matches!(&step.op, RootOp::BindVerified { source: s, .. } if s == Path::new(source))
+            })
+        };
+        let home = position(&with_store, TEST_HOME_DIR).expect("the home folder is bound");
+        let store = position(&with_store, TEST_STATE_DIR).expect("the store is bound");
+        assert!(home < store, "the store bind comes after the home bind");
+        assert!(
+            with_store.steps[store].required,
+            "a store that cannot be bound ends the session"
+        );
+        let target = PathBuf::from("/tmp").join(TEST_STATE_DIR.trim_start_matches('/'));
+        assert_eq!(
+            with_store.steps[store].op,
+            RootOp::BindVerified {
+                source: PathBuf::from(TEST_STATE_DIR),
+                target: target.clone(),
+                read_only: false,
+                identity: TEST_STATE_IDENTITY,
+            }
+        );
+        assert!(
+            with_store.steps[..store]
+                .iter()
+                .any(|step| step.op == RootOp::MkDir(target.clone())),
+            "the store's mount point is made before its bind"
+        );
+        assert_eq!(position(&plan(&sources), TEST_STATE_DIR), None);
     }
 
     /// A delegating session's root binds nothing beneath the directory its delegated children keep

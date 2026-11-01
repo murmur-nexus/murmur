@@ -141,10 +141,9 @@ pub struct ArtifactRequest {
     ///
     /// Lowered to compact JSON at staging by [`crate::artifact_config::lower_artifact_config`] and
     /// delivered to this artifact alone as [`crate::artifact_config::ARTIFACT_CONFIG_ENV`]. `None`
-    /// means the variable is absent from the guest environment. Consumed for `runtime: hook`,
-    /// `runtime: tool` and `runtime: driver`; the manifest parser rejects the key on
-    /// `runtime: skill`, and a native tool warns `W-SEC-015` because it reads no per-artifact
-    /// environment at all.
+    /// means the variable is absent from the artifact's environment. Consumed for `runtime: hook`,
+    /// `runtime: tool` (WASM and native) and `runtime: driver`; the manifest parser rejects the
+    /// key on `runtime: skill`.
     pub config: Option<serde_norway::Value>,
     /// This artifact's operator-declared `gateway:` block, copied verbatim from its entry in the
     /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::gateway`) — the same
@@ -578,6 +577,25 @@ pub struct StagedProcessDriver {
     pub(crate) binary_source: String,
 }
 
+/// The per-tool settings a native tool's spawn carries, lowered at staging from the capsule
+/// operator's own entry for that tool, never from the artifact's bundled `murmur.yaml`, so a tool
+/// pulled from a registry cannot configure itself or name a store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NativeToolSettings {
+    /// The entry's `config:` block as compact JSON, from
+    /// [`crate::artifact_config::lower_artifact_config`]: the value of
+    /// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`] in this tool's environment. `None` leaves
+    /// the variable unset.
+    pub(crate) config_json: Option<String>,
+    /// The store `capabilities.state` names, created by
+    /// [`crate::state_store::ensure_state_store`]: the value of
+    /// [`crate::state_store::STATE_DIR_ENV`], and on `KernelFull` and `KernelSealed` a
+    /// read-write path granted to this tool's process tree alone
+    /// ([`crate::sandbox::ShellEnforcement::for_native_entrypoint`]). `None` grants nothing and
+    /// leaves the variable unset.
+    pub(crate) state_dir: Option<PathBuf>,
+}
+
 pub struct StagedSession {
     pub session_id: String,
     /// The work folder: the `--workdir` directory, or `<manifest-dir>/workdir/<session-id>`
@@ -688,6 +706,10 @@ pub struct StagedSession {
     /// What each native tool installed at staging needs to start, keyed by tool name. Derived
     /// from the image the runtime wrote; see [`crate::sandbox::NativeEntrypoint`].
     pub(crate) native_entrypoints: HashMap<String, crate::sandbox::NativeEntrypoint>,
+    /// What each native tool's own manifest entry hands it, keyed by tool name. Holds an entry
+    /// only for a tool whose entry declares `config:` or `capabilities.state`; a tool with no
+    /// entry here is spawned with neither variable and no store.
+    pub(crate) native_tool_settings: HashMap<String, NativeToolSettings>,
     /// The process driver, for a `transport: process` session that named one. `None` on every
     /// other transport.
     pub(crate) process_driver: Option<Arc<StagedProcessDriver>>,

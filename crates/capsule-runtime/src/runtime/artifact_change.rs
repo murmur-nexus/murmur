@@ -287,6 +287,7 @@ impl CapsuleStoreState {
         let tool = murmur_artifact::tool_name_of(name).to_string();
         self.tool_components.remove(&tool);
         self.native_entrypoints.remove(&tool);
+        self.native_tool_settings.remove(&tool);
         self.allowlisted_tools.remove(&tool);
         self.installed_artifacts
             .retain(|artifact| artifact.name != name);

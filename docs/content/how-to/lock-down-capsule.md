@@ -345,7 +345,7 @@ Each shell invocation the agent makes appears in the session's [`trace.jsonl`](.
 Per-artifact grants resolve at staging, before the session's records directory exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
 
 - **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/diagnostics.md#w-sec-007).
-- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. A native tool runs under the capsule-wide grants, enforced by the same sandbox as a shell command, and its per-artifact block does not narrow them: narrow the capsule-wide block itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
+- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or declared anything but `state` on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. A native tool runs under the capsule-wide grants, enforced by the same sandbox as a shell command, and its per-artifact block does not narrow them: narrow the capsule-wide block itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
 
 Keep credentials out of the manifest itself. Reference them by environment variable — `gateway.api_key: ${ANTHROPIC_API_KEY}` on the driver's artifact entry, as every example above does — never as a literal string. A literal secret prints a [`W-SEC-004`](../reference/diagnostics.md#w-sec-004) warning and risks leaking into version control.
 
@@ -379,6 +379,6 @@ mur trace show
 | `filesystem.scope` on a WASM artifact | A real directory grant, enforced on every platform including macOS |
 | Bare host under a scheme-bound ceiling | Dropped with `W-SEC-007`; write the entry as specifically as the ceiling |
 | `shell`/`spawn`/`env`/`limits` in a per-artifact block | Parsed but inert; prints `W-SEC-008` |
-| Any per-artifact block on a native tool | Inert; prints `W-SEC-008`. The tool runs under the ceiling, in the same sandbox as `bash` |
+| Any per-artifact sub-block but `state` on a native tool | Inert; prints `W-SEC-008`. The tool runs under the ceiling, in the same sandbox as `bash`. `state` gives it a [durable store](../reference/containment.md#native-tool-settings) |
 | `gateway.api_key: ${ENV_VAR}` | Keeps secrets out of the manifest; a literal triggers `W-SEC-004` |
 | Non-zero exit code | Passed back to the model as data; the session continues |

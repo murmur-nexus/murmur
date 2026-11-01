@@ -348,8 +348,8 @@ deploy:                   # optional: read by mur deploy only
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry. Requires `local_source: true`. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
-| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
-| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
+| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. On a tool with a native implementation `state` is the only sub-block that applies ([Native tools](containment.md#native-tool-settings)). Declaring it on `runtime: skill` fails with `E-MAN-003`. |
+| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` (WASM and native) and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
 | `artifacts[].gateway` | map | no | The third-party upstream this artifact reaches through the credential gateway, and the key the runtime presents there. Required on the `transport: http` driver `inference.driver.artifact` names. Which other entries accept it is in [Credential gateway](#artifact-gateway). |
 | `artifacts[].gateway.endpoint` | string | yes (when `gateway` is set) | Upstream URL. A `gateway:` without it fails with `E-MAN-003`. See [`gateway.endpoint` validation](#gateway-endpoint-validation). |
 | `artifacts[].gateway.api_key` | string | yes, unless `keyless: true` | Literal value or `${NAME}` reference. A gateway with neither a non-blank `api_key` nor `keyless: true` fails with [`E-CAP-018`](diagnostics.md#e-cap-018). See [`gateway.api_key` resolution](#gateway-api-key). |
@@ -549,11 +549,14 @@ Rules:
   [Durable state](workdir.md#state-store).
 - **Only `network`, `filesystem` and `state` apply to a tool or driver.** `shell`, `spawn`, `env`,
   `limits`, `resources` and `containment` parse but are inert here and print
-  [`W-SEC-008`](diagnostics.md#w-sec-008), as does any block on a tool with a **native** (non-WASM)
-  implementation. A native tool runs under the capsule-wide `capabilities.filesystem`,
-  `capabilities.network` and `capabilities.shell.allow`, enforced by the same sandbox as a shell
-  command (see [Native tools](containment.md#native-tools)); the per-artifact block does not
-  narrow them.
+  [`W-SEC-008`](diagnostics.md#w-sec-008).
+- **Only `state` applies to a tool with a native (non-WASM) implementation.** The tool reads the
+  store's absolute path from `MURMUR_STATE_DIR`; who else can open it depends on the tier — see
+  [A native tool's own config and store](containment.md#native-tool-settings). Any other sub-block
+  prints [`W-SEC-008`](diagnostics.md#w-sec-008): a native tool runs under the capsule-wide
+  `capabilities.filesystem`, `capabilities.network` and `capabilities.shell.allow`, enforced by the
+  same sandbox as a shell command (see [Native tools](containment.md#native-tools)), and the
+  per-artifact block does not narrow them.
 
 ##### Artifact config { #artifact-config }
 
@@ -587,8 +590,8 @@ Rules:
   An entry with no `config:` key gets no `MURMUR_ARTIFACT_CONFIG` at all, which an artifact reads
   as an unset variable rather than as an empty object.
 - **`MURMUR_ARTIFACT_CONFIG` is set by the runtime.** Naming it in
-  [`capabilities.env.allow`](#field-capabilities) does not pass the host's value through, and does
-  not override the block.
+  [`capabilities.env.allow`](#field-capabilities) or `capabilities.shell.baseline_env` does not pass
+  the host's value through, and does not override the block.
 - **Types survive the translation.** Numbers stay numbers, sequences stay arrays, nested mappings
   stay objects, and declaration order is preserved, so the same block always produces the same
   bytes.
@@ -598,9 +601,9 @@ Rules:
   [Artifact config shape](#artifact-config-shape) fails with
   [`E-CAP-010`](diagnostics.md#e-cap-010). Which keys a given artifact requires is that artifact's
   own business, and a missing one surfaces as that artifact's error.
-- **A native tool reads no config.** A `runtime: tool` entry whose artifact ships a native
-  (non-WASM) implementation runs as a host subprocess, so a `config:` block there delivers nothing
-  and prints [`W-SEC-015`](diagnostics.md#w-sec-015). The launch continues.
+- **A native tool reads it the same way.** A `runtime: tool` entry whose artifact ships a native
+  (non-WASM) implementation gets `MURMUR_ARTIFACT_CONFIG` in its own process environment on every
+  containment tier — see [A native tool's own config and store](containment.md#native-tool-settings).
 - **Only the capsule operator can configure**, exactly as for capabilities: the block is read from
   your manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
 - **Config is per artifact.** A top-level `config:` key fails with `E-MAN-003`.

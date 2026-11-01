@@ -399,13 +399,16 @@ the records directory:
 | Records directory | `~/.murmur/records/<workdir root>/<session-id>/` | Until [`trace.retain`](manifest.md#trace-retain) or [`mur trace rm`](cli.md#mur-trace-rm) removes it |
 | State store | `~/.murmur/state/<store>/` | Every session of that capsule, on that machine |
 
-A component sees the store as a directory named `state`, beside the work folder it sees as its
+A WASM component sees the store as a directory named `state`, beside the work folder it sees as its
 current directory. Its code reaches the store with an ordinary relative path:
 
 ```rust
 std::fs::write("state/notes.jsonl", contents)?;   // the store
 std::fs::write("out/result.txt", summary)?;       // the work folder
 ```
+
+A [native tool](containment.md#native-tool-settings) runs with the work folder as its current
+directory and reads the store's absolute path from `MURMUR_STATE_DIR`.
 
 `~/.murmur`, `~/.murmur/state/` and each store directory under it are created mode `0700`, and the
 mode is reasserted on every launch. See [`~/.murmur` modes](config.md#murmur-home-permissions).
@@ -428,10 +431,12 @@ cannot see each other's, with or without a declaration on either side. Sharing b
 goes over A2A, with a grant on both ends. Declaring the same `store:` name in two capsules is the
 one way to point them at one directory, and it has to be written in both manifests.
 
-**WASM tools, drivers and hooks reach the store; native subprocesses do not.** Under the `sealed`
-containment class the store is absent from the capsule's composed root, so neither a binary
-allowlisted by `capabilities.shell.allow` nor a sub-capsule allowlisted by
-`capabilities.spawn.allow` can open it.
+**The artifact that declared it reaches the store; shell commands and sub-capsules do not.** Under
+the `sealed` containment class the store is absent from the composed root of every shell command,
+so neither a binary allowlisted by `capabilities.shell.allow` nor a sub-capsule allowlisted by
+`capabilities.spawn.allow` can open it. A native tool that declared the store reaches it on every
+tier, and on the tiers with no filesystem scope so does every other subprocess — see
+[A native tool's own config and store](containment.md#native-tool-settings).
 
 ### What belongs in the work folder instead
 

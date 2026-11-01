@@ -406,10 +406,11 @@ impl HookCapabilityGrant {
 /// Resolve and validate the store name a `capabilities:` block asks for, applying the capsule-name
 /// default. `None` when the block declares no `state`, which is deny.
 ///
-/// Shared by both grants because the rule is one rule: the name comes from the capsule operator's
-/// own manifest entry, the default is the operator's capsule name, and a name that is not a single
-/// usable path segment fails staging rather than surfacing later as a confusing denial.
-fn derive_state_store(
+/// Shared by both grants and by a native tool's staging because the rule is one rule: the name
+/// comes from the capsule operator's own manifest entry, the default is the operator's capsule
+/// name, and a name that is not a single usable path segment fails staging rather than surfacing
+/// later as a confusing denial.
+pub(crate) fn derive_state_store(
     capabilities: &murmur_artifact::Capabilities,
     capsule_name: &str,
 ) -> Result<Option<String>, RuntimeError> {

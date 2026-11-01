@@ -56,6 +56,9 @@ pub const W_SEC_007: &str = "W-SEC-007";
 /// A `runtime: tool`/`runtime: driver` artifact entry declares `capabilities.shell`/`.spawn`/
 /// `.env`/`.limits`, but per-artifact narrowing only reads `network` and `filesystem` — the
 /// other sub-blocks are structurally accepted and silently inert.
+///
+/// On a native tool's entry it fires for any sub-block other than `state`: a native tool runs
+/// under the capsule-wide grants, and `capabilities.state` is the one sub-block applied to it.
 pub const W_SEC_008: &str = "W-SEC-008";
 
 /// `capabilities.shell.interpreter_runtime` grants an allowlisted binary specific host
@@ -119,15 +122,9 @@ pub const W_SEC_013: &str = "W-SEC-013";
 /// Fires at staging, before any session workdir exists.
 pub const W_SEC_014: &str = "W-SEC-014";
 
-/// A `config:` block was declared on a `runtime: tool` entry whose artifact ships a native
-/// (non-WASM) implementation, so no `MURMUR_ARTIFACT_CONFIG` variable is delivered anywhere.
-///
-/// Config travels in the per-artifact WASI environment the runtime builds for a WASM guest. A
-/// native tool runs as a host subprocess under the capsule-wide shell environment, which is not
-/// per-artifact and which the runtime will not write an operator's config block into. Structurally
-/// valid and therefore warned rather than refused, on the same terms `capabilities:` on a native
-/// tool already warns `W-SEC-008`. Fires at staging, before any session workdir exists.
-pub const W_SEC_015: &str = "W-SEC-015";
+// W-SEC-015 is retired and its code is not reused. A native tool receives its entry's `config:`
+// block as `MURMUR_ARTIFACT_CONFIG`, as a WASM tool does. The diagnostics page keeps the
+// `#w-sec-015` anchor.
 
 /// A `capabilities.conversation` block was declared in the capsule-wide `capabilities:` block,
 /// where nothing reads it, so no artifact was granted `murmur:conversation/read`.
@@ -323,9 +320,9 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
-            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027,
-            W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
+            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_016, W_SEC_017,
+            W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_028,
+            W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");
