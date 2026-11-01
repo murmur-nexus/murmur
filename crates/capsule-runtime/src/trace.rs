@@ -992,6 +992,26 @@ struct ShellDetachUnrecordedEvent {
     reason: String,
 }
 
+/// A tool call the driver attached safety checks to, and how they ended. Written once per such
+/// call, after the person answered (or could not be asked) and, for an acknowledged call, before
+/// its `tool_call` record. The person's reply is never written.
+#[derive(Serialize)]
+struct SafetyCheckEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    tool_call_id: String,
+    tool: String,
+    /// The block's `safety_checks` exactly as the driver sent it, a malformed one included.
+    checks: serde_json::Value,
+    /// `acknowledged`, `declined`, `timed_out`, `canceled`, `no_input_channel` or `malformed`.
+    outcome: &'static str,
+}
+
 #[derive(Serialize)]
 struct CompactionEvent {
     event_type: &'static str,
@@ -3374,6 +3394,31 @@ impl TraceWriter {
             work_id: work_id.to_string(),
             binary: binary.to_string(),
             reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Records how one tool call's safety checks ended. Parented to the turn.
+    pub(crate) async fn write_safety_check(
+        &mut self,
+        turn: u32,
+        tool_call_id: &str,
+        tool: &str,
+        checks: &serde_json::Value,
+        outcome: &'static str,
+    ) -> std::io::Result<()> {
+        let event = SafetyCheckEvent {
+            event_type: "safety_check",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
+            checks: checks.clone(),
+            outcome,
         };
         self.write_event(&event).await
     }
@@ -5893,6 +5938,27 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event_type"], "shell_detached");
         assert!(events[0].get("grace_ms").is_none(), "{}", events[0]);
+    }
+
+    #[tokio::test]
+    async fn a_safety_check_event_carries_the_checks_verbatim_and_its_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        let checks = serde_json::json!([{"id": "sc_1", "code": "c", "message": "m", "x": 1}]);
+        writer
+            .write_safety_check(2, "call_1_0", "computer", &checks, "declined")
+            .await
+            .unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "safety_check");
+        assert_eq!(events[0]["turn"], 2);
+        assert_eq!(events[0]["tool_call_id"], "call_1_0");
+        assert_eq!(events[0]["tool"], "computer");
+        assert_eq!(events[0]["checks"], checks);
+        assert_eq!(events[0]["outcome"], "declined");
+        assert!(events[0]["event_id"].is_string() && events[0]["session_id"].is_string());
     }
 
     #[tokio::test]

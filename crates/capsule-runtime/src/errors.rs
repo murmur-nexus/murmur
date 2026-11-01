@@ -293,7 +293,8 @@ pub enum RuntimeError {
     /// Raised in the stage/launch seam, before any registry pull, component compile or workdir
     /// creation — `achieved` always comes from a live host probe, never from the manifest.
     #[error(
-        "declared containment class '{declared}' is not achievable on this host (achieved: '{achieved}'): {reason}"
+        "declared containment class '{declared}' is not achievable on this host (achieved: '{achieved}'): {reason}{}",
+        crate::provider_tool::required_by_lines(.required_by)
     )]
     ContainmentFloorUnmet {
         declared: murmur_artifact::ContainmentClass,
@@ -301,6 +302,10 @@ pub enum RuntimeError {
         reason: String,
         /// Why the floor is unmet, which decides what the operator is told to change.
         cause: crate::containment::ShortfallCause,
+        /// The declared provider tools that need the floor, each named on a `required by:` line.
+        /// Filled only for a declared `sealed` floor; empty otherwise, and then the message has
+        /// no `required by:` line.
+        required_by: Vec<crate::provider_tool::ProviderToolUse>,
     },
     /// A capsule declares an `exports.files.root` that, once resolved against the session's
     /// accessible workdir, lands somewhere else — the root already exists as a symlink pointing
@@ -431,6 +436,47 @@ pub enum RuntimeError {
         declared: murmur_artifact::ContainmentClass,
     },
 
+    /// A capsule declares a tool whose artifact declares `provider_tool:`, under an effective
+    /// containment floor below `sealed`.
+    ///
+    /// Decided against the declared floor alone, like [`Self::StagedRuntimeRequiresSealed`]: the
+    /// floor is never raised for the tool, so a weaker declaration is refused rather than
+    /// upgraded. `tools` names every such tool and its kind; `host_can_back` is what this host
+    /// can back, for the hint.
+    #[error(
+        "{} declare{} a provider tool, which runs only under the 'sealed' containment floor, and \
+         the effective containment floor is '{declared}'",
+        .tools.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        if .tools.len() == 1 { "s" } else { "" }
+    )]
+    ProviderToolRequiresSealed {
+        /// Each such tool, in staging order.
+        tools: Vec<crate::provider_tool::ProviderToolUse>,
+        declared: murmur_artifact::ContainmentClass,
+        host_can_back: murmur_artifact::ContainmentClass,
+    },
+
+    /// A capsule declares a computer tool and a `transport: http` driver choice runs a model
+    /// whose driver marks it `vision: false` in its `models:` table. Names the first such tool
+    /// and the first such choice, primary first.
+    #[error(
+        "tool '{tool}' is a {kind} (provider_tool: {kind}) but model '{model}' of driver choice \
+         '{choice}' has no vision: driver {driver} declares vision: false for it"
+    )]
+    ProviderToolNeedsVision {
+        tool: String,
+        kind: murmur_artifact::ProviderToolKind,
+        model: String,
+        choice: String,
+        /// The driver artifact as `name@version`.
+        driver: String,
+    },
+
+    /// An installed artifact's `provider_tool:` block does not parse, or sits on an artifact that
+    /// is not a tool. `artifact` is `name@version`; `reason` names the dotted field.
+    #[error("artifact '{artifact}' ships a malformed provider_tool: block: {reason}")]
+    ProviderToolMalformed { artifact: String, reason: String },
+
     /// A `sealed` capsule allowlists a script whose interpreter's package tree nothing declared
     /// could make reachable inside the composed root.
     ///
@@ -494,11 +540,15 @@ pub enum RuntimeError {
     /// nothing here, and offering that advice would be actively misleading.
     #[error(
         "this host cannot give the capsule's subprocess tree its own network namespace, so \
-         capabilities.network.allow cannot be enforced for it: {reason}"
+         capabilities.network.allow cannot be enforced for it: {reason}{}",
+        crate::provider_tool::required_by_lines(.required_by)
     )]
     EgressNamespaceUnavailable {
         blocker: crate::network_namespace::EgressNamespaceBlocker,
         reason: String,
+        /// The declared provider tools, each named on a `required by:` line; empty without one,
+        /// and then the message has no `required by:` line.
+        required_by: Vec<crate::provider_tool::ProviderToolUse>,
     },
 
     #[error(

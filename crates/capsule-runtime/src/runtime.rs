@@ -2423,7 +2423,26 @@ pub fn stage_session(
         sealed_shortfall.as_ref(),
         workdir_exec,
         runtime_dir_placement.inside(),
-    )?;
+    )
+    .map_err(|error| match error {
+        RuntimeError::ContainmentFloorUnmet {
+            declared: declared @ murmur_artifact::ContainmentClass::Sealed,
+            achieved,
+            reason,
+            cause,
+            ..
+        } => RuntimeError::ContainmentFloorUnmet {
+            declared,
+            achieved,
+            reason,
+            cause,
+            required_by: crate::provider_tool::provider_tools_in_store(
+                registry.as_ref(),
+                &request.artifacts,
+            ),
+        },
+        other => other,
+    })?;
     // The complete grant set this session is about to run under, in exactly the shape
     // `mur run --explain-scope --json` prints — same builder, same policy, same declared floor,
     // and the same probe taken above. Computed once here rather than at trace-open time so
@@ -2610,7 +2629,13 @@ pub fn stage_session(
     crate::network_namespace::check_egress_namespace(
         has_subprocess_route_at_staging(&request.capability_policy),
         host_probe.egress_namespace_failure().as_ref(),
-    )?;
+    )
+    .map_err(|error| {
+        with_provider_tools_required(
+            error,
+            crate::provider_tool::provider_tools_in_store(registry.as_ref(), &request.artifacts),
+        )
+    })?;
     // Lowered here, in the same pre-registry-pull seam and for the same reason a state store name
     // is: an entry that cannot be a workdir subtree refuses the launch before anything is pulled,
     // created or instantiated, so no call is ever checked against a rule the runtime could not
@@ -3051,6 +3076,30 @@ pub fn stage_session(
         });
     }
 
+    // Read off the manifests the pulls above already hold, before any driver is described or
+    // called and before the session directory exists. A manifest that never names the key is not
+    // parsed, so a capsule without a provider tool does nothing more here.
+    let provider_tools = crate::provider_tool::declared_provider_tools(
+        installed_manifests
+            .iter()
+            .map(|(name, yaml)| (name.as_str(), yaml.as_str())),
+        |tool| {
+            let full_name = crate::tool_names::full_name_of(&full_names, tool);
+            installed_artifacts
+                .iter()
+                .find(|installed| installed.name == tool)
+                .map_or_else(
+                    || full_name.to_string(),
+                    |installed| format!("{full_name}@{}", installed.version),
+                )
+        },
+    )?;
+    crate::provider_tool::check_sealed(
+        &provider_tools,
+        containment.declared(),
+        containment.host_containment(),
+    )?;
+
     let staged_process_driver = match process_driver {
         Some((name, version, component)) => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -3153,7 +3202,7 @@ pub fn stage_session(
     });
     // Resolved before the session directory exists, so a choice with no output cap leaves nothing
     // behind and no request leaves. The warnings wait for the bootstrap log.
-    let (model_limit_warnings, hook_output_caps) =
+    let (model_limit_warnings, hook_output_caps, no_vision) =
         match (request.inference.as_ref(), driver_choices.as_mut()) {
             (Some(inference), Some(choices)) => stage_model_limits(
                 inference,
@@ -3163,9 +3212,16 @@ pub fn stage_session(
                 &installed_artifacts,
                 &request.artifacts,
                 &full_names,
+                &provider_tools,
             )?,
             _ => Default::default(),
         };
+    let provider_tool_terms = crate::provider_tool::ProviderToolTerms {
+        declared_floor: containment.declared(),
+        host_can_back: containment.host_containment(),
+        no_vision,
+        declared: provider_tools,
+    };
     let compaction_driver_config = request
         .inference
         .as_ref()
@@ -3635,6 +3691,7 @@ pub fn stage_session(
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         host_probe,
+        provider_tool_terms,
         temp_mapping,
         protected_paths,
         tool_annotations,
@@ -3832,7 +3889,10 @@ fn launch(
         &staged.capability_policy,
         has_native_artifact,
         staged.host_probe.egress_namespace_failure().as_ref(),
-    )?;
+    )
+    .map_err(|error| {
+        with_provider_tools_required(error, staged.provider_tool_terms.declared.clone())
+    })?;
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
     let prepared_scope = prepare_launch_scope(
@@ -4670,6 +4730,7 @@ fn launch(
                         allowlisted_tools,
                         installed_artifacts,
                         installed_generation: 0,
+                        provider_tool_terms: staged.provider_tool_terms.clone(),
                         declared_artifacts,
                         removed_artifacts: HashSet::new(),
                         required_schema_warned: Mutex::new(BTreeSet::new()),
@@ -5708,6 +5769,7 @@ fn launch(
         declared_artifacts: declared_artifact_names(&staged.installed_artifacts),
         installed_artifacts: staged.installed_artifacts,
         installed_generation: 0,
+        provider_tool_terms: staged.provider_tool_terms,
         removed_artifacts: HashSet::new(),
         required_schema_warned: Mutex::new(BTreeSet::new()),
         logged_tool_inventory: None,
@@ -7631,6 +7693,36 @@ pub(crate) async fn request_input_impl(
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     input_timeout_secs: Option<u64>,
 ) -> wasmtime::Result<String> {
+    wait_for_input(task, prompt, task_registry, sse, input_timeout_secs)
+        .await
+        .map_err(|end| match end {
+            InputWaitEnd::NotWaiting(error) => {
+                wasmtime::Error::msg(format!("request-input: {error}"))
+            }
+            // The agent loop takes the cancel at its next boundary and ends the attempt there,
+            // with the record, the trace and the residue that go with it; the final status event
+            // is the reopen loop's.
+            InputWaitEnd::Canceled => wasmtime::Error::msg("task-canceled"),
+            // The task is not ended here: the agent loop takes the timeout at its next boundary
+            // and ends the attempt, and the reopen loop writes the task's one final status — or
+            // reopens it — once the `on-task-end` hooks have run.
+            InputWaitEnd::TimedOut => wasmtime::Error::msg("input-timeout"),
+        })
+}
+
+/// Puts `task` in `input-required` with `prompt` and waits for the person's reply: the one wait
+/// behind `request-input` and a tool call's safety checks.
+///
+/// An answer emits a `working` `resumed` status and is returned. A cancel ends the wait. A wait
+/// past `input_timeout_secs` marks the timeout in the registry, which the agent loop takes at its
+/// next boundary to end the attempt. Neither writes a terminal state here.
+pub(crate) async fn wait_for_input(
+    task: StreamTask,
+    prompt: String,
+    task_registry: Arc<Mutex<TaskRegistry>>,
+    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    input_timeout_secs: Option<u64>,
+) -> Result<String, InputWaitEnd> {
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -7638,7 +7730,7 @@ pub(crate) async fn request_input_impl(
     let cancel = {
         let mut reg = task_registry.lock().unwrap();
         reg.set_input_required(&task.task_id, prompt.clone(), tx)
-            .map_err(|e| wasmtime::Error::msg(format!("request-input: {e}")))?;
+            .map_err(|e| InputWaitEnd::NotWaiting(e.to_string()))?;
         reg.cancel_watch(&task.task_id)
     };
 
@@ -7670,28 +7762,25 @@ pub(crate) async fn request_input_impl(
             emit_status(&sse, &task, TaskState::Working, "resumed", None);
             Ok(text)
         }
-        // The agent loop takes the cancel at its next boundary and ends the attempt there, with
-        // the record, the trace and the residue that go with it; the final status event is the
-        // reopen loop's.
-        Err(InputWaitEnd::Canceled) => Err(wasmtime::Error::msg("task-canceled")),
-        // The task is not ended here: the agent loop takes the timeout at its next boundary and
-        // ends the attempt, and the reopen loop writes the task's one final status — or reopens
-        // it — once the `on-task-end` hooks have run.
         Err(InputWaitEnd::TimedOut) => {
             task_registry
                 .lock()
                 .unwrap()
                 .record_input_timeout(&task.task_id);
-            Err(wasmtime::Error::msg("input-timeout"))
+            Err(InputWaitEnd::TimedOut)
         }
+        Err(end) => Err(end),
     }
 }
 
-/// Why a `request-input` wait ended without an answer.
+/// Why an input wait ended without an answer.
 ///
-/// The two are not interchangeable: a timeout is this attempt failing, and a cancel is a person
-/// stopping the task. Neither writes a terminal state here.
-enum InputWaitEnd {
+/// A timeout and a cancel are not interchangeable: a timeout is this attempt failing, and a
+/// cancel is a person stopping the task. Neither writes a terminal state here.
+#[derive(Debug)]
+pub(crate) enum InputWaitEnd {
+    /// The registry would not put the task in `input-required`, with its reason.
+    NotWaiting(String),
     Canceled,
     TimedOut,
 }
@@ -8062,6 +8151,8 @@ pub(crate) struct CapsuleStoreState {
     /// The capsule's `context.images` limits, the defaults when it declares none. Read by the
     /// agent loop for each tool result's attachments and by the process transport's bridge.
     pub(crate) image_limits: murmur_artifact::ContextImagesConfig,
+    /// What a runtime pull of a provider tool is checked against.
+    pub(crate) provider_tool_terms: crate::provider_tool::ProviderToolTerms,
     /// The images the message that started the task now in scope carried, set beside
     /// `current_task_provenance`. A fresh attempt's task message carries them after its text.
     pub(crate) current_task_images: Vec<crate::images::CheckedImage>,
@@ -8743,7 +8834,11 @@ fn stage_driver_choices(
 /// `run-inference` sends.
 ///
 /// Refused with [`RuntimeError::ModelLimits`] for a choice with no output cap or no input budget,
-/// or a driver whose table is malformed. Under `transport: process` nothing is resolved.
+/// or a driver whose table is malformed, and with [`RuntimeError::ProviderToolNeedsVision`] when
+/// `provider_tools` holds a computer tool and a choice's model is `vision: false`. Also returns
+/// every such choice, which a runtime pull of a computer tool is checked against. Under
+/// `transport: process` nothing is resolved.
+#[allow(clippy::too_many_arguments)]
 fn stage_model_limits(
     inference: &InferenceConfig,
     context: Option<&ContextConfig>,
@@ -8752,7 +8847,15 @@ fn stage_model_limits(
     installed_artifacts: &[InstalledArtifactSummary],
     declared_artifacts: &[ArtifactRequest],
     full_names: &HashMap<String, String>,
-) -> Result<(Vec<String>, crate::model_limits::HookOutputCaps), RuntimeError> {
+    provider_tools: &[crate::provider_tool::ProviderToolUse],
+) -> Result<
+    (
+        Vec<String>,
+        crate::model_limits::HookOutputCaps,
+        Vec<crate::provider_tool::NoVisionChoice>,
+    ),
+    RuntimeError,
+> {
     let drivers: Vec<(&str, String, &str)> = choices
         .iter()
         .map(|choice| {
@@ -8794,6 +8897,16 @@ fn stage_model_limits(
         )
     };
     let resolved = crate::model_limits::resolve_model_limits(inference, context, lookup)?;
+    let no_vision: Vec<crate::provider_tool::NoVisionChoice> = resolved
+        .iter()
+        .filter(|choice| choice.vision == Some(false))
+        .map(|choice| crate::provider_tool::NoVisionChoice {
+            choice: choice.choice.clone(),
+            model: choice.model.clone(),
+            driver: choice.driver.clone(),
+        })
+        .collect();
+    crate::provider_tool::check_vision(provider_tools, &no_vision)?;
     let hook_output_caps = resolved
         .first()
         .map(|primary| {
@@ -8816,7 +8929,7 @@ fn stage_model_limits(
         .filter_map(|choice| choice.warning.clone())
         .collect();
     choices.record_limits(&resolved);
-    Ok((warnings, hook_output_caps))
+    Ok((warnings, hook_output_caps, no_vision))
 }
 
 /// `W-RUN-009` once per driver choice whose driver declares no limits for its model, to stderr
@@ -12475,6 +12588,24 @@ fn write_shell_tool_manifests(
     Ok(())
 }
 
+/// `error` with `tools` on its `required by:` lines when it is the `E-CAP-005` refusal, and as
+/// it is otherwise.
+fn with_provider_tools_required(
+    error: RuntimeError,
+    tools: Vec<crate::provider_tool::ProviderToolUse>,
+) -> RuntimeError {
+    match error {
+        RuntimeError::EgressNamespaceUnavailable {
+            blocker, reason, ..
+        } => RuntimeError::EgressNamespaceUnavailable {
+            blocker,
+            reason,
+            required_by: tools,
+        },
+        other => other,
+    }
+}
+
 /// Refuses with `E-CAP-005` a capsule whose only subprocess route is a native tool, on a host
 /// that cannot give it a network namespace.
 ///
@@ -15345,6 +15476,7 @@ inference:
                 driver: String::new(),
                 limits,
                 warning: None,
+                vision: None,
             }]);
         }
         u64::from(primary_context_window(Some(&choices), manifest.context.as_ref()).unwrap_or(0))
@@ -15396,6 +15528,7 @@ inference:
             driver: String::new(),
             limits,
             warning: None,
+            vision: None,
         }]);
         assert_eq!(
             primary_context_budget(Some(&choices), None),
@@ -18268,6 +18401,7 @@ inference:
             current_traceparent: None,
             current_task_provenance: None,
             image_limits: murmur_artifact::ContextImagesConfig::default(),
+            provider_tool_terms: crate::provider_tool::ProviderToolTerms::default(),
             current_task_images: Vec::new(),
             current_context_id: None,
             current_forget_harness_session: None,

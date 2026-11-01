@@ -1,6 +1,8 @@
 use std::sync::LazyLock;
 
-use murmur_artifact::{ArtifactRuntime, ToolRefresh, PACKED_MANIFEST_ENTRY};
+use murmur_artifact::{
+    ArtifactRuntime, ProviderTool, ToolRefresh, PACKED_MANIFEST_ENTRY, PROVIDER_TOOL_KEY,
+};
 use serde_json::{json, Value};
 
 use crate::{
@@ -149,6 +151,14 @@ pub(crate) fn build_tool_inventory(
 
         if !description.trim().is_empty() {
             tool["description"] = Value::String(description);
+        }
+
+        // Staging refused a block that does not parse, so one that fails here is left off rather
+        // than guessed at. An entry without the key gains no member.
+        if matches!(runtime, ArtifactRuntime::Tool) && value.get(PROVIDER_TOOL_KEY).is_some() {
+            if let Ok(Some(provider_tool)) = ProviderTool::from_manifest_value(&value) {
+                tool[PROVIDER_TOOL_KEY] = provider_tool.to_json();
+            }
         }
 
         tools.push(tool);
@@ -328,6 +338,51 @@ mod tests {
             format!("name: {name}\nversion: 1.0.0\nruntime: tool\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn inventory_without_a_provider_tool_serializes_as_before() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        write_manifest(
+            &tools_dir,
+            "lookup",
+            "name: lookup\nversion: 1.0.0\nruntime: tool\ndescription: Look a word up.\n\
+             input_schema:\n  type: object\n  properties:\n    word:\n      type: string\n",
+        );
+        write_tool(&tools_dir, "plain");
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        assert_eq!(
+            serde_json::to_string(&tools).unwrap(),
+            r#"[{"description":"Look a word up.","name":"lookup","parameters":{"properties":{"word":{"type":"string"}},"type":"object"}},{"name":"plain","parameters":{"properties":{},"type":"object"}}]"#
+        );
+    }
+
+    #[test]
+    fn inventory_passes_a_provider_tool_block_through_as_declared() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        write_manifest(
+            &tools_dir,
+            "computer",
+            "name: computer\nversion: 1.0.0\nruntime: tool\ndescription: A screen.\n\
+             provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: 800\n",
+        );
+        write_tool(&tools_dir, "plain");
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        assert_eq!(
+            tools[0],
+            json!({
+                "name": "computer",
+                "description": "A screen.",
+                "parameters": {"type": "object", "properties": {}},
+                "provider_tool": {"kind": "computer", "display_width": 1280, "display_height": 800},
+            })
+        );
+        assert_eq!(
+            tools[1],
+            json!({"name": "plain", "parameters": {"type": "object", "properties": {}}})
+        );
     }
 
     /// A skill with no manifest description is described from its `skill.md`: the front

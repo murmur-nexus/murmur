@@ -352,6 +352,91 @@ fn models_a_good_table_builds_and_is_packed_byte_for_byte() {
     assert_eq!(packed, manifest);
 }
 
+/// A tool manifest with `provider_tool` as written, packing one `tool.wasm`.
+fn provider_tool_manifest(runtime: &str, block: &str) -> String {
+    format!(
+        "name: computer\nversion: 0.1.0\nruntime: {runtime}\nrequires_files:\n  - tool.wasm\n\
+         {block}"
+    )
+}
+
+/// A malformed `provider_tool:` block, and one on an artifact that is not a tool, is refused
+/// before anything is written, naming the field.
+#[test]
+fn provider_tool_malformed_blocks_fail_the_build_naming_the_field() {
+    let computer = |width: &str| {
+        format!(
+            "provider_tool:\n  kind: computer\n  display_width: {width}\n  display_height: 800\n"
+        )
+    };
+    for (runtime, block, field) in [
+        (
+            "tool",
+            computer("0"),
+            "'provider_tool.display_width' must be an integer from 1 to 65535",
+        ),
+        (
+            "tool",
+            computer("65536"),
+            "'provider_tool.display_width' must be an integer from 1 to 65535",
+        ),
+        (
+            "tool",
+            computer("wide"),
+            "'provider_tool.display_width' has invalid type",
+        ),
+        (
+            "tool",
+            "provider_tool:\n  kind: phone\n  display_width: 1\n  display_height: 1\n".to_string(),
+            "the known kinds are: computer",
+        ),
+        (
+            "hook",
+            computer("1280"),
+            "'provider_tool' is only valid on an artifact whose runtime is tool",
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("murmur.yaml"),
+            provider_tool_manifest(runtime, &block),
+        )
+        .unwrap();
+        fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
+        build_in(dir.path()).failure().stderr(
+            predicate::str::contains("error[E-BLD-006]:")
+                .and(predicate::str::contains(field))
+                .and(predicate::str::contains(
+                    "hint: provider_tool: goes on a runtime: tool",
+                )),
+        );
+        assert!(!dir.path().join("out.mur.zip").exists(), "{block}");
+    }
+}
+
+/// A well-formed `provider_tool:` block builds, and the manifest is packed byte for byte.
+#[test]
+fn provider_tool_a_good_block_builds_and_is_packed_byte_for_byte() {
+    let dir = tempdir().unwrap();
+    let manifest = provider_tool_manifest(
+        "tool",
+        "provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: 800\n",
+    );
+    fs::write(dir.path().join("murmur.yaml"), &manifest).unwrap();
+    fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
+    build_in(dir.path()).success();
+
+    let mut archive =
+        ZipArchive::new(fs::File::open(dir.path().join("out.mur.zip")).unwrap()).unwrap();
+    let mut packed = String::new();
+    archive
+        .by_name("murmur.yaml")
+        .unwrap()
+        .read_to_string(&mut packed)
+        .unwrap();
+    assert_eq!(packed, manifest);
+}
+
 #[test]
 fn an_invalid_artifact_name_fails_the_build() {
     let dir = tempdir().unwrap();

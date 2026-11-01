@@ -442,6 +442,23 @@ and the command that fixes it.
 A manifest that never declares `capabilities.containment` is never gated by this check — the
 effective floor resolves to `advisory`, which every host satisfies.
 
+### Provider tools { #provider-tools }
+
+A capsule that declares a tool whose artifact carries a
+[`provider_tool:` block](manifest.md#provider-tool) — a computer tool — must run `sealed`. The
+requirement is decided against the effective declared floor, which it never raises:
+
+| Effective declared floor | Result |
+|---|---|
+| `advisory` or `scoped` | Refused with [`E-CAP-003`](diagnostics.md#e-cap-003) before the session directory exists and before any driver call, naming every such tool and its kind, and the floor |
+| `sealed`, on a host that backs it | Runs |
+| `sealed`, on a host that cannot back it | The usual `E-CAP-003` refusal, with a `required by:` line for each such tool |
+
+A computer tool therefore runs on Linux only. A `sealed` capsule whose subprocess tree cannot get
+its own network namespace is refused with [`E-CAP-005`](diagnostics.md#e-cap-005), which carries
+the same `required by:` lines. A `pull-artifact` of such a tool into a session below `sealed` is
+refused, with nothing installed.
+
 ---
 
 ## What bounds a WASM artifact { #artifact-boundary }

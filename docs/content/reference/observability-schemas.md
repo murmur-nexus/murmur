@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `task_continued`, `keep_working`, `done_check`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
-| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
@@ -566,6 +566,23 @@ The demotion stands: the command keeps running and the turn keeps its handle. Th
 attempted into the file whose write just failed, so it is usually absent and the failure reaches
 stderr instead. Either way the command has no `shell_detached` line, so a later resume finds
 nothing to report about it.
+
+<a id="safety-check"></a>
+**`safety_check`** — written once for each tool call a driver attached
+[safety checks](wit-interfaces.md#safety-checks) to, when the person answered or could not be
+asked. For an acknowledged call it comes before the call's `tool_call` line; a call that did not
+run has no `tool_call` line
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `task_id` | string \| null | The task the call belongs to. `null` when no task is in scope |
+| `tool_call_id` | string | The call's id, as the driver returned it |
+| `tool` | string | The tool the call named |
+| `checks` | any | The call's `safety_checks` exactly as the driver sent them, a malformed value included |
+| `outcome` | string | `acknowledged`, `declined`, `timed_out`, `canceled`, `no_input_channel` or `malformed` |
+
+The person's reply is never written to the trace.
 
 **`compaction`** — written when context compaction fires
 

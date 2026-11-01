@@ -13,9 +13,10 @@ section that explains it.
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
 | `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
+| `E-BLD-006` | An artifact's `provider_tool:` block is malformed, or declared on a `driver`, `hook` or `skill` artifact | [E-BLD-006](#e-bld-006) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
-| `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
+| `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host, or a declared provider tool needs `sealed` and the effective floor is below it | [E-CAP-003](#e-cap-003) |
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
 | `E-CAP-005` | Creating a network namespace for the capsule's native subprocess tree — shell commands, spawned capsules and native tools — failed on this host, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
@@ -138,6 +139,8 @@ section that explains it.
 | `E-RUN-054` | `inference.compaction.max_tokens` is above the output ceiling the primary driver's `models:` table declares for the compaction model | [E-RUN-054](#e-run-054) |
 | `E-RUN-055` | A driver choice's output cap, or `inference.compaction.max_tokens`, is at or above its context window, leaving its calls no input budget | [E-RUN-055](#e-run-055) |
 | `E-RUN-056` | The running session a session address named is a script capsule, which binds no door to connect to | [E-RUN-056](#e-run-056) |
+| `E-RUN-057` | A capsule declares a computer tool and a `transport: http` driver choice runs a model its driver marks `vision: false` | [E-RUN-057](#e-run-057) |
+| `E-RUN-058` | A stored tool artifact ships a malformed `provider_tool:` block, or one on an artifact that is not a tool | [E-RUN-058](#e-run-058) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -336,6 +339,7 @@ and the reason. The hint is chosen by the cause:
 | The host lacks the mechanism | `lower the declared floor to '<achieved>' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides '<declared>'` |
 | [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec) | `set capabilities.filesystem.workdir_exec to false, or lower the declared floor to 'advisory' (…the same three places)` |
 | The runtime or records directory lies inside the workdir | `run with a --workdir that does not contain ~/.murmur, or lower the declared floor to 'advisory' (…the same three places)` |
+| A declared [provider tool](containment.md#provider-tools) needs `sealed` and the effective floor is below it | ``set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment sealed`); this host can back '<class>'`` and, when that class is below `sealed`, `so the capsule also needs a host that provides 'sealed'` |
 
 ```text
 error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): scoped requires Landlock filesystem mediation (Linux 5.13+ with a usable Landlock ABI); this host provides no kernel filesystem mediation, so paths outside the workdir are constrained by convention only
@@ -351,6 +355,15 @@ and the readings line `E-CAP-005` ends with:
 
 ```text
 error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): <class sentence and remedy> The probe's <call> failed with <ERRNO> (<description>). Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: <profile>.
+```
+
+When the capsule declares a [provider tool](containment.md#provider-tools), a `sealed` refusal
+names each such tool on its own line under the message, before the hint:
+
+```text
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): <reason>
+  required by: tool 'computer' (provider_tool: computer)
+  hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 ```
 
 A probe that could not run reads `The probe could not run: <the runtime's message>.` in place of
@@ -405,6 +418,18 @@ and the message names the failing step and its errno:
   policy changed. Re-probe with `mur run --explain-scope`.
 
 Neither means the declared floor was wrong; `E-CAP-003` covers that.
+
+**A provider tool below `sealed` names the manifest.** A capsule declaring a tool whose artifact
+carries a [`provider_tool:` block](manifest.md#provider-tool) needs the `sealed` floor whatever the
+host can back. It is decided against the effective declared floor, after the artifacts are read
+and before the session directory exists or any driver is called; the floor is never raised for it:
+
+```text
+error[E-CAP-003]: tool 'computer' (provider_tool: computer) declares a provider tool, which runs only under the 'sealed' containment floor, and the effective containment floor is 'scoped'
+  hint: set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment sealed`); this host can back 'sealed' — see https://docs.murmur.nexus/reference/containment/#provider-tools
+```
+
+Every such tool is named. Set the floor to `sealed`, or remove the tool from `artifacts:`.
 
 ### E-IO-004 — `HOME` cannot hold `~/.murmur` { #e-io-004 }
 
@@ -1509,6 +1534,34 @@ error[E-RUN-056]: ses_019f01a940ce7761854e768ecbe3d399 is a script capsule: it b
 [`mur stop`](cli.md#mur-stop) ends a script capsule with a signal, and its
 [trace](observability-schemas.md) records what it did.
 
+### E-RUN-057 — a computer tool on a model without vision { #e-run-057 }
+
+A computer tool returns screenshots, so every `transport: http` driver choice of a capsule that
+declares one — the primary and each [alternate](manifest.md#inference-alternates) — must run a model
+that reads images. A choice whose driver's [`models:` table](manifest.md#driver-models) marks its
+model `vision: false` refuses the launch before the session directory exists:
+
+```text
+error[E-RUN-057]: tool 'computer' is a computer (provider_tool: computer) but model 'probe-model' of driver choice 'primary' has no vision: driver local/driver-example@1.0.0 declares vision: false for it
+  hint: run that driver choice on a model that reads images, or remove the computer tool from artifacts: — see https://docs.murmur.nexus/reference/diagnostics/#e-run-057
+```
+
+The first such tool and the first such choice, primary first, are named. A model whose entry has
+no `vision` key, or that the table does not list, is not refused. A `transport: process` capsule
+is not checked. A `pull-artifact` of a computer tool into such a session is refused the same way.
+
+### E-RUN-058 — a malformed `provider_tool:` block { #e-run-058 }
+
+A stored tool artifact's [`provider_tool:` block](manifest.md#provider-tool) does not parse, or
+sits on an artifact whose `runtime` is `driver`, `hook` or `skill`:
+
+```text
+error[E-RUN-058]: artifact 'local/computer@1.0.0' ships a malformed provider_tool: block: murmur.yaml: field 'provider_tool.display_width' must be an integer from 1 to 65535
+  hint: provider_tool: holds kind: computer with display_width and display_height, each an integer from 1 to 65535; install a version of the artifact that ships a valid block, or remove it from artifacts: — see https://docs.murmur.nexus/reference/diagnostics/#e-run-058
+```
+
+`mur build` refuses the same block with [`E-BLD-006`](#e-bld-006).
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -1582,6 +1635,10 @@ conditions apart: [Telling host conditions apart](containment.md#telling-host-co
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
 raising nor lowering a declared floor changes this answer.
+
+When the capsule declares a [provider tool](containment.md#provider-tools), the refusal names each
+such tool on its own line under the message, before the hint:
+`  required by: tool 'computer' (provider_tool: computer)`.
 
 ### E-CAP-006 — interpreted entrypoint unreachable under `sealed` { #e-cap-006 }
 
@@ -2107,7 +2164,7 @@ unchanged.
 
 ```text
 error[E-BLD-005]: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
-  hint: models: is a driver's table of model id to max_output_tokens and context_window, and optionally max_input_tokens (at most context_window), each an integer from 1 to 4294967295; a driver shipped with a malformed table is refused at launch with E-RUN-052
+  hint: models: is a driver's table of model id to max_output_tokens and context_window, and optionally max_input_tokens (at most context_window), each an integer from 1 to 4294967295, and vision, a boolean; a driver shipped with a malformed table is refused at launch with E-RUN-052
 ```
 
 `mur build` refuses before writing the `.mur.zip`, naming the field:
@@ -2121,9 +2178,29 @@ error[E-BLD-005]: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be 
 | An entry missing `max_output_tokens` or `context_window` | `models.<id>.<key>` |
 | A value that is not an integer from `1` to `4294967295` | `models.<id>.<key>` |
 | A `max_input_tokens` above the entry's `context_window` | `models.<id>.max_input_tokens` |
+| A `vision` that is not a boolean | `models.<id>.vision` |
 | An entry holding any other key | `models.<id>.<key>` |
 
 The block's shape is in [`models:` block](manifest.md#driver-models).
+
+### E-BLD-006 — malformed `provider_tool:` block { #e-bld-006 }
+
+```text
+error[E-BLD-006]: murmur.yaml: field 'provider_tool.display_width' must be an integer from 1 to 65535
+  hint: provider_tool: goes on a runtime: tool artifact and holds kind: computer with display_width and display_height, each an integer from 1 to 65535; a tool shipped with a malformed block is refused at launch with E-RUN-058
+```
+
+`mur build` refuses before writing the `.mur.zip`, naming the field:
+
+| `provider_tool:` | Field named |
+|---|---|
+| Declared on an artifact whose `runtime` is `driver`, `hook` or `skill` | `provider_tool` |
+| Not a mapping | `provider_tool` |
+| No `kind`, a `kind` that is not a string, or a kind other than `computer` (the message lists the known kinds) | `provider_tool.kind` |
+| A `display_width` or `display_height` missing, not an integer, or outside `1` to `65535` | `provider_tool.<key>` |
+| Any other key | `provider_tool.<key>` |
+
+The block's shape is in [`provider_tool:` block](manifest.md#provider-tool).
 
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 

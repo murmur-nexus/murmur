@@ -38,6 +38,10 @@ use crate::{
     origin::{TaskProvenance, TrustClass},
     otel::OtelEmitter,
     protected_paths::ProtectedPathRefusal,
+    provider_tool::{
+        ask_safety_checks, read_safety_checks, SafetyChecks, SafetyOutcome,
+        ACKNOWLEDGED_SAFETY_CHECKS_KEY,
+    },
     runtime::{CapsuleStoreState, PULL_ARTIFACT_TOOL, REMOVE_ARTIFACT_TOOL},
     runtime_dir::{RUNTIME_DIR_ENV, RUNTIME_DIR_GUEST_PATH},
     spend::SpendRefusal,
@@ -2182,6 +2186,10 @@ pub(crate) async fn run_agent_loop(
                 // Images accepted from this turn's tool calls so far, against
                 // `context.images.max_per_turn`.
                 let mut turn_images = 0u32;
+                // Set when a safety check's wait timed out or was canceled: the attempt ends at
+                // the next boundary, so a later call's checks in this turn end the same way
+                // without asking again.
+                let mut input_wait_ended: Option<SafetyOutcome> = None;
 
                 for block in tool_blocks {
                     let tool_call_id = block
@@ -2244,6 +2252,63 @@ pub(crate) async fn run_agent_loop(
                                 "content": [{ "type": "text", "text": refusal }],
                             })));
                             continue;
+                        }
+                    }
+
+                    // The person's acknowledgement of the driver's safety checks, asked once
+                    // every check above has let the call through and immediately before it is
+                    // dispatched. A call that is not acknowledged is not run: like a gate
+                    // refusal, nothing is recorded as having run.
+                    let mut acknowledged_checks = None;
+                    if refused.is_none() {
+                        let asked = match read_safety_checks(block) {
+                            SafetyChecks::None => None,
+                            SafetyChecks::Malformed { verbatim } => {
+                                Some((verbatim, Vec::new(), SafetyOutcome::Malformed))
+                            }
+                            SafetyChecks::Checks { verbatim, checks } => {
+                                let outcome = match &input_wait_ended {
+                                    Some(ended) => ended.clone(),
+                                    None => {
+                                        ask_safety_checks(
+                                            store_state,
+                                            &tool_name,
+                                            &tool_call_id,
+                                            &checks,
+                                        )
+                                        .await
+                                    }
+                                };
+                                Some((verbatim, checks, outcome))
+                            }
+                        };
+                        if let Some((verbatim, checks, outcome)) = asked {
+                            gate.write_safety_check(
+                                &tool_call_id,
+                                &tool_name,
+                                &verbatim,
+                                outcome.wire_name(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
+                            })?;
+                            if matches!(outcome, SafetyOutcome::TimedOut | SafetyOutcome::Canceled)
+                            {
+                                input_wait_ended = Some(outcome.clone());
+                            }
+                            match outcome.not_run_text(&checks) {
+                                None => acknowledged_checks = Some(verbatim),
+                                Some(text) => {
+                                    tool_messages.push(with_new_id(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call_id,
+                                        "is_error": true,
+                                        "content": [{ "type": "text", "text": text }],
+                                    })));
+                                    continue;
+                                }
+                            }
                         }
                     }
 
@@ -2558,15 +2623,17 @@ pub(crate) async fn run_agent_loop(
                     // it, in record form.
                     let mut content = vec![json!({"type": "text", "text": text})];
                     content.extend(image_blocks);
-                    tool_messages.push(with_fence_source(
-                        with_new_id(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "is_error": is_error,
-                            "content": content,
-                        })),
-                        fence_source,
-                    ));
+                    let mut tool_message = json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "is_error": is_error,
+                        "content": content,
+                    });
+                    // The driver reads its own checks back on its next request.
+                    if let Some(checks) = acknowledged_checks {
+                        tool_message[ACKNOWLEDGED_SAFETY_CHECKS_KEY] = checks;
+                    }
+                    tool_messages.push(with_fence_source(with_new_id(tool_message), fence_source));
 
                     // The checkpoint after every tool dispatch: a call that met a link in the
                     // workdir — a plan file, a fetched peer file, a pulled artifact — has already
@@ -3560,6 +3627,21 @@ impl<'a> CallGate<'a> {
             records_root,
             turn,
         }
+    }
+
+    /// Records how a call's safety checks ended, on the gate's turn. The pause sits between
+    /// [`Self::check`] and the dispatch the gate is handed to, so it writes through the gate's
+    /// trace writer.
+    pub(crate) async fn write_safety_check(
+        &mut self,
+        tool_call_id: &str,
+        tool: &str,
+        checks: &Value,
+        outcome: &'static str,
+    ) -> std::io::Result<()> {
+        self.trace
+            .write_safety_check(self.turn, tool_call_id, tool, checks, outcome)
+            .await
     }
 
     /// Whether [`Self::check`] can refuse a call at all.

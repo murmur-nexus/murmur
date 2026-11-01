@@ -1258,6 +1258,7 @@ mod tests {
                     driver: choice.artifact.clone(),
                     limits,
                     warning: None,
+                    vision: None,
                 }
             })
             .collect();

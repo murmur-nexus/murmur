@@ -1080,6 +1080,7 @@ mod tests {
                     max_output_tokens: DECLARED_CAP,
                     context_window: DECLARED_WINDOW,
                     max_input_tokens: Some(DECLARED_CEILING),
+                    vision: None,
                 },
             )]),
             PRIMARY_CAP,
