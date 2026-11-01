@@ -333,12 +333,31 @@ impl<'a> ProcessEventSink<'a> {
         });
     }
 
-    /// The oldest queued report for a call of `name` with `input`, removed from the queue.
-    fn claim_report(&mut self, name: &str, input: &Value) -> Option<AttachmentReport> {
+    /// The queued report for a call of `name` with `input` whose result is `output`, removed from
+    /// the queue: the oldest one with an image `output` repeats, otherwise the oldest one.
+    ///
+    /// Reports queue in the order answers were written, which is not the order a harness reports
+    /// results in when two calls share a name and arguments. Taking the oldest alone would pair
+    /// such a result with the other call's report and leave its own image's bytes unreplaced.
+    fn claim_report(
+        &mut self,
+        name: &str,
+        input: &Value,
+        output: &str,
+    ) -> Option<AttachmentReport> {
+        let same_call = |queued: &QueuedReport| queued.name == name && queued.input == *input;
+        let repeated = |queued: &QueuedReport| {
+            queued
+                .report
+                .images
+                .iter()
+                .any(|image| !image.base64.is_empty() && output.contains(&image.base64))
+        };
         let index = self
             .reports
             .iter()
-            .position(|queued| queued.name == name && queued.input == *input)?;
+            .position(|queued| same_call(queued) && repeated(queued))
+            .or_else(|| self.reports.iter().position(same_call))?;
         self.reports.remove(index).map(|queued| queued.report)
     }
 
@@ -606,13 +625,14 @@ impl<'a> ProcessEventSink<'a> {
                     return SinkOutcome::Continue;
                 };
                 let status = if result.is_error { "error" } else { "ok" };
-                let (output, attachments) = match self.claim_report(&call.name, &call.input) {
-                    Some(report) => (
-                        without_sent_images(result.output, &report.images),
-                        report.trace,
-                    ),
-                    None => (result.output, Vec::new()),
-                };
+                let (output, attachments) =
+                    match self.claim_report(&call.name, &call.input, &result.output) {
+                        Some(report) => (
+                            without_sent_images(result.output, &report.images),
+                            report.trace,
+                        ),
+                        None => (result.output, Vec::new()),
+                    };
                 let output_bytes = output.len() as u64;
                 let result_id = result.id.clone();
                 // Measured by the runtime rather than taken from the harness: the bridge executes
@@ -3721,5 +3741,45 @@ mod tests {
             "the harness kept only the text".len()
         );
         assert_eq!(attached_paths(&calls[0]), Some(vec!["a.png".to_string()]));
+    }
+
+    /// Two calls with one name and one set of arguments whose answers were written in the other
+    /// order than the harness reports their results: each result is paired with the report whose
+    /// image it repeats, so neither record holds image bytes or names the other call's image.
+    #[tokio::test]
+    async fn a_result_repeating_a_later_reports_image_claims_that_report() {
+        let mut h = Harness::new(10).await.capturing_content().await;
+        let sent = |base64: &str, path: &str| {
+            let mut report = report("t", "{}", path);
+            report.images[0].base64 = base64.to_string();
+            report
+        };
+        let (first, second) = ("Rmlyc3RJbWFnZQ==", "U2Vjb25kSW1hZ2U=");
+        h.feed_with_reports(
+            // The second call's answer was written first.
+            vec![sent(second, "second.png"), sent(first, "first.png")],
+            vec![
+                call_with("c1", "t", "{}"),
+                call_with("c2", "t", "{}"),
+                result_with("c1", &format!("{{\"data\":\"{first}\"}}")),
+                result_with("c2", &format!("{{\"data\":\"{second}\"}}")),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(
+            attached_paths(&calls[0]),
+            Some(vec!["first.png".to_string()])
+        );
+        assert_eq!(
+            attached_paths(&calls[1]),
+            Some(vec!["second.png".to_string()])
+        );
+        let trace = std::fs::read_to_string(h.workdir.join("trace.jsonl")).unwrap();
+        assert!(
+            !trace.contains(first) && !trace.contains(second),
+            "the trace holds image bytes"
+        );
     }
 }

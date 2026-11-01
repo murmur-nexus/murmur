@@ -301,8 +301,8 @@ fn bridged_png_answers_text_then_image() {
     );
 }
 
-/// A tool that attaches nothing gets the answer the bridge has always given: one text item and
-/// `isError`, nothing else, and its record has no `attachments` key.
+/// A tool that attaches nothing gets one text item and `isError`, nothing else, and its record has
+/// no `attachments` key.
 #[test]
 fn bridged_call_without_attachment_answers_as_today() {
     if common::skip_without_host_support("bridged_call_without_attachment_answers_as_today") {

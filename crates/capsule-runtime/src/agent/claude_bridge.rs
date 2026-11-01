@@ -987,8 +987,7 @@ mod tests {
         assert!(report.is_some());
     }
 
-    /// A tool that attaches nothing gets exactly the result the bridge built before images
-    /// existed, and no report.
+    /// A tool that attaches nothing gets the text item alone, byte for byte, and no report.
     #[test]
     fn without_attachments_the_result_is_the_text_item_alone() {
         let dir = tempfile::tempdir().unwrap();
