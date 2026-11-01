@@ -1546,14 +1546,14 @@ Images
   max_per_turn:  5
 ```
 
-Under `transport: process` the harness holds the conversation, so `keep` and `max_per_turn` do
-nothing there, and the block says so:
+Under `transport: process` the harness holds the conversation, so `keep` does nothing there, and
+`max_per_turn` counts the images of one tool call. The block says so:
 
 ```text
 Images
   max_bytes:     5242880
   keep:          5 (does nothing here: the harness holds the conversation)
-  max_per_turn:  5 (does nothing here: the harness holds the conversation)
+  max_per_turn:  5 (counts the images of one tool call here)
 ```
 
 `--json` carries the same facts as `images`: `{"keep", "max_bytes", "max_per_turn", "keep_applies"}`,

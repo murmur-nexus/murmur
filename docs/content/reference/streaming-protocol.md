@@ -378,13 +378,14 @@ A process task ends in the same [one final status](#one-final-status) as an http
 path out of its last attempt, including the ones a runtime diagnostic ends: the status message is
 that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
-On a process capsule the harness runs the turn, so its `artifact` frames differ in two keys:
+On a process capsule the harness runs the turn, so its `artifact` frames differ in these keys:
 
 | Key | On a process capsule | Why |
 |---|---|---|
+| `content` | The harness's report of the result, with each image the tool server returned replaced by `[image: <media_type>, <n> bytes, sha256 <hex>]` | Image bytes never reach a frame |
 | `fenceSource` | Always `null` | The harness receives tool output unfenced |
 | `exitCode`, `truncated` | Always `null` and `false` | A process driver reports no exit status or truncation flag |
-| `attachments` | Always `[]` | The harness's model is shown no image, and nothing is stored |
+| `attachments` | Always `[]` | Nothing is stored, so there is no address to fetch an image from |
 
 A provider retry writes no event on either transport; the driver reports it to the trace as
 `harness_retry`.

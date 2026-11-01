@@ -1024,9 +1024,9 @@ pub struct ScopeReport {
     /// a grant: it opens nothing and changes no class, floor or tier. Its `restriction` is
     /// [`Self::filesystem_boundary`]'s, keyed on the same applied tier.
     pub parent_workdir: Option<crate::workdir_snapshot::ParentWorkdirReport>,
-    /// The `context.images` limits this session applies, and whether `keep` and `max_per_turn`
-    /// apply at all. Set by the caller that knows the transport, through [`Self::with_images`];
-    /// `null` until then. Always serialized.
+    /// The `context.images` limits this session applies, and whether `keep` applies at all. Set
+    /// by the caller that knows the transport, through [`Self::with_images`]; `null` until then.
+    /// Always serialized.
     pub images: Option<ImagesReport>,
     /// `capabilities.env.allow`, verbatim.
     pub env_allow: Vec<String>,
@@ -1374,10 +1374,11 @@ pub struct ImagesReport {
     pub keep: u32,
     /// `context.images.max_bytes`: the largest image accepted.
     pub max_bytes: u64,
-    /// `context.images.max_per_turn`: images accepted per model turn.
+    /// `context.images.max_per_turn`: images accepted per model turn, or per tool call on
+    /// `inference.transport: process`.
     pub max_per_turn: u32,
-    /// Whether `keep` and `max_per_turn` do anything: `false` on `inference.transport: process`,
-    /// whose harness holds the conversation.
+    /// Whether `keep` does anything: `false` on `inference.transport: process`, whose harness
+    /// holds the conversation, and where `max_per_turn` counts the images of one tool call.
     pub keep_applies: bool,
 }
 
@@ -1431,7 +1432,7 @@ pub fn render_images(images: &ImagesReport) -> String {
             images.keep
         ));
         out.push_str(&format!(
-            "  max_per_turn:  {} (does nothing here: the harness holds the conversation)\n",
+            "  max_per_turn:  {} (counts the images of one tool call here)\n",
             images.max_per_turn
         ));
     }

@@ -1078,12 +1078,19 @@ async fn drive_harness(
     // What the bridge saw that belongs in the trace: calls the harness walked away from, and
     // calls refused at the in-flight bound.
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<claude_bridge::BridgeNote>();
+    // What each bridged call's attachments came to, for the `tool_call` record the sink writes
+    // when the harness reports that call's result.
+    let (report_tx, mut report_rx) = mpsc::unbounded_channel::<claude_bridge::AttachmentReport>();
 
     // One long-lived future: re-creating it per iteration would drop a connection mid tool call.
     // Dropping it when this function returns is what ends every call still in flight.
     let bridge_future = async {
         match bridge {
-            Some(handle) => handle.serve(store_state, &gate_tx, &note_tx, &bump).await,
+            Some(handle) => {
+                handle
+                    .serve(store_state, &gate_tx, &note_tx, &report_tx, &bump)
+                    .await
+            }
             None => std::future::pending::<()>().await,
         }
     };
@@ -1184,6 +1191,14 @@ async fn drive_harness(
             )),
             note = next_bridge_note(&mut note_rx) => {
                 let _ = trace.write_harness_note(&note.text()).await;
+                continue;
+            }
+            // Must stay ahead of the output arm, so a report is queued before the result line it
+            // belongs to is read. The bridge sends a call's report before writing its answer, and
+            // the harness can report the call's result only after reading that answer: whenever
+            // the output arm is polled, this arm was polled just before it in the same pass.
+            report = next_attachment_report(&mut report_rx) => {
+                sink.queue_report(report);
                 continue;
             }
             line = line_rx.recv() => line,
@@ -1384,6 +1399,17 @@ async fn next_bridge_note(
     // Parks rather than returning on a closed channel, for the reason `next_gate_request` gives.
     match notes.recv().await {
         Some(note) => note,
+        None => std::future::pending().await,
+    }
+}
+
+/// The report arm's future: what the next bridged call that named an attachment came to.
+async fn next_attachment_report(
+    reports: &mut mpsc::UnboundedReceiver<claude_bridge::AttachmentReport>,
+) -> claude_bridge::AttachmentReport {
+    // Parks rather than returning on a closed channel, for the reason `next_gate_request` gives.
+    match reports.recv().await {
+        Some(report) => report,
         None => std::future::pending().await,
     }
 }

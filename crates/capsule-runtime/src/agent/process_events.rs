@@ -39,8 +39,21 @@
 //! [`ProcessEventSink::after_terminal`]: `quota`, `suggested-prompt` and `note` are taken as they
 //! would be before it, and every other event is one `harness_note` naming it. Nothing there
 //! touches the turn counter, the result, usage, spend or the attempt's ending.
+//!
+//! # Images a bridged tool returned
+//!
+//! The bridge sends an [`AttachmentReport`] for each call whose tool named an attachment, and the
+//! sink queues it until the harness's `tool-result` closes a call with the same bare name and
+//! arguments. The `tool_call` record of that call then carries the report's `attachments`, and
+//! every verbatim occurrence of a base64 image the bridge sent is replaced in the recorded output
+//! by [`SentImage::placeholder`], so no image bytes reach the trace, a hook or a frame. The only
+//! text searched is the base64 the bridge itself produced.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Instant,
+};
 
 use murmur_artifact::{security_warning_link, W_SEC_031};
 use serde_json::{json, Value};
@@ -60,6 +73,7 @@ use crate::{
     },
 };
 
+use super::claude_bridge::{AttachmentReport, SentImage};
 use super::process::RunSession;
 use super::process_a2a::A2aStream;
 use crate::workdir_fs::WorkdirRoot;
@@ -173,6 +187,18 @@ struct PendingToolCall {
     started: Instant,
 }
 
+/// How many attachment reports no result has claimed yet the sink holds; past this the oldest is
+/// dropped.
+const MAX_UNCLAIMED_REPORTS: usize = 64;
+
+/// An attachment report waiting for the result of the call it belongs to, keyed as that call's
+/// [`PendingToolCall`] is: by bare name and parsed arguments.
+struct QueuedReport {
+    name: String,
+    input: Value,
+    report: AttachmentReport,
+}
+
 /// The turn currently open: which index it will be recorded under, the text it produced, and
 /// whether it called anything.
 struct OpenTurn {
@@ -204,6 +230,9 @@ pub(super) struct ProcessEventSink<'a> {
     first_turn: u32,
     open: Option<OpenTurn>,
     pending: HashMap<String, PendingToolCall>,
+    /// Attachment reports no result has claimed yet, oldest first, at most
+    /// [`MAX_UNCLAIMED_REPORTS`].
+    reports: VecDeque<QueuedReport>,
     /// Set by the first terminal event, so the rest of its batch is ignored.
     finished: bool,
     /// The conversation this run belongs to, and where its session id is remembered.
@@ -271,6 +300,7 @@ impl<'a> ProcessEventSink<'a> {
             first_turn,
             open: None,
             pending: HashMap::new(),
+            reports: VecDeque::new(),
             finished: false,
             session,
             reported_session: None,
@@ -287,6 +317,48 @@ impl<'a> ProcessEventSink<'a> {
     /// The session's records directory, which this run writes `out/result.txt` into.
     pub(super) fn records_root(&self) -> &WorkdirRoot {
         &self.records_root
+    }
+
+    /// Hold `report` until a result closes the call it belongs to. Arguments that are not JSON key
+    /// as `null`, as the decision point reads them. Past [`MAX_UNCLAIMED_REPORTS`] the oldest
+    /// report is dropped.
+    pub(super) fn queue_report(&mut self, report: AttachmentReport) {
+        if self.reports.len() >= MAX_UNCLAIMED_REPORTS {
+            self.reports.pop_front();
+        }
+        self.reports.push_back(QueuedReport {
+            name: report.tool_name.clone(),
+            input: serde_json::from_str(&report.input_json).unwrap_or(Value::Null),
+            report,
+        });
+    }
+
+    /// The queued report for a call of `name` with `input` whose result is `output`, removed from
+    /// the queue: the oldest one with an image `output` repeats, otherwise the oldest one.
+    ///
+    /// Reports queue in the order answers were written, which is not the order a harness reports
+    /// results in when two calls share a name and arguments. Taking the oldest alone would pair
+    /// such a result with the other call's report and leave its own image's bytes unreplaced.
+    fn claim_report(
+        &mut self,
+        name: &str,
+        input: &Value,
+        output: &str,
+    ) -> Option<AttachmentReport> {
+        let same_call = |queued: &QueuedReport| queued.name == name && queued.input == *input;
+        let repeated = |queued: &QueuedReport| {
+            queued
+                .report
+                .images
+                .iter()
+                .any(|image| !image.base64.is_empty() && output.contains(&image.base64))
+        };
+        let index = self
+            .reports
+            .iter()
+            .position(|queued| same_call(queued) && repeated(queued))
+            .or_else(|| self.reports.iter().position(same_call))?;
+        self.reports.remove(index).map(|queued| queued.report)
     }
 
     /// The runtime is about to interrupt the harness. Everything the harness says from here on is
@@ -428,6 +500,8 @@ impl<'a> ProcessEventSink<'a> {
     /// committed, and `None` otherwise: that is the session a reopened attempt of the same task
     /// resumes, whether or not the context remembers it.
     pub(super) async fn finish(&mut self, trace: &mut TraceWriter) -> Option<String> {
+        // A report no result claimed belongs to a call the harness never reported back.
+        self.reports.clear();
         let continuable = (self.produced && !self.session_gone).then(|| {
             self.session.commit(self.reported_session.as_deref());
             self.session
@@ -551,9 +625,16 @@ impl<'a> ProcessEventSink<'a> {
                     return SinkOutcome::Continue;
                 };
                 let status = if result.is_error { "error" } else { "ok" };
-                let output_bytes = result.output.len() as u64;
+                let (output, attachments) =
+                    match self.claim_report(&call.name, &call.input, &result.output) {
+                        Some(report) => (
+                            without_sent_images(result.output, &report.images),
+                            report.trace,
+                        ),
+                        None => (result.output, Vec::new()),
+                    };
+                let output_bytes = output.len() as u64;
                 let result_id = result.id.clone();
-                let output = result.output.clone();
                 // Measured by the runtime rather than taken from the harness: the bridge executes
                 // the tool, and this is the only clock that saw both ends of the call.
                 let duration_ms = call
@@ -563,19 +644,20 @@ impl<'a> ProcessEventSink<'a> {
                     .try_into()
                     .unwrap_or(u64::MAX);
                 let _ = trace
-                    .write_tool_call(
+                    .write_tool_call_with_attachments(
                         call.turn,
                         call.name.clone(),
                         Some(result.id),
                         call.input.clone(),
                         call.input_bytes,
-                        &result.output,
+                        &output,
                         output_bytes,
                         duration_ms,
                         status.to_string(),
                         None,
                         None,
                         None,
+                        attachments,
                     )
                     .await;
                 hooks
@@ -596,7 +678,9 @@ impl<'a> ProcessEventSink<'a> {
                 // output, id and failure flag, and the runtime's own measurement — the same
                 // number the `tool_call` trace record above carries. The bridge hands tool output
                 // back to the harness unfenced, it ran no subprocess this runtime saw the exit of,
-                // and the event carries no truncation flag, so those three keys say so.
+                // and the event carries no truncation flag, so those three keys say so. Its
+                // `attachments` stay empty: nothing is stored on this transport, so there is no
+                // address an image could be fetched from.
                 self.a2a
                     .tool_result(StreamArtifact::tool_call(
                         call.name,
@@ -955,6 +1039,18 @@ impl<'a> ProcessEventSink<'a> {
     }
 }
 
+/// `output` with every verbatim occurrence of each image's base64 replaced by its
+/// [`SentImage::placeholder`]. A driver may hand a harness's tool result back with the bridge's
+/// image items inside it, and the bytes are the runtime's own to keep out of its records.
+fn without_sent_images(mut output: String, images: &[SentImage]) -> String {
+    for image in images {
+        if !image.base64.is_empty() && output.contains(&image.base64) {
+            output = output.replace(&image.base64, &image.placeholder());
+        }
+    }
+    output
+}
+
 /// The `on-inference` event announcing one bridged call, in the shape `transport: http` hands a
 /// hook a tool-calling turn: zero counts, a `tool_call` decision, the call's bare name, and an
 /// `output` holding one `tool_call` content block. The block carries no `id`, because a bridged
@@ -1157,6 +1253,45 @@ mod tests {
             .collect()
     }
 
+    /// The trace every sink below writes, at `workdir`, capturing `capture`.
+    async fn open_trace(workdir: &Path, capture: murmur_artifact::TraceCapture) -> TraceWriter {
+        TraceWriter::open(
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "0.1.0".to_string(),
+            "test-model".to_string(),
+            Vec::new(),
+            crate::containment::report_for(
+                &crate::CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                crate::sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    crate::sandbox::EnforcementTier::EnvironmentOnly,
+                    murmur_artifact::ContainmentClass::Advisory,
+                )),
+                crate::cgroup::IoMaxReport::default(),
+            ),
+            capture,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
     /// A sink's sinks and the workdir they write into. Held together so a test can drop the
     /// tempdir only after reading `trace.jsonl` back, and so one A2A stream spans every batch a
     /// test feeds.
@@ -1218,6 +1353,12 @@ mod tests {
             self
         }
 
+        /// The same harness, writing `trace.capture: content`.
+        async fn capturing_content(mut self) -> Self {
+            self.trace = open_trace(&self.workdir, murmur_artifact::TraceCapture::Content).await;
+            self
+        }
+
         /// The same harness, with no `inference.max_turns`.
         fn uncapped(mut self) -> Self {
             self.max_turns = None;
@@ -1257,41 +1398,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let trace = TraceWriter::open(
-                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
-                "ses_test".to_string(),
-                "cap".to_string(),
-                "0.1.0".to_string(),
-                "test-model".to_string(),
-                Vec::new(),
-                crate::containment::report_for(
-                    &crate::CapabilityPolicy::default(),
-                    murmur_artifact::ContainmentClass::Advisory,
-                    crate::sandbox::EnforcementTier::EnvironmentOnly,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
-                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
-                        crate::sandbox::EnforcementTier::EnvironmentOnly,
-                        murmur_artifact::ContainmentClass::Advisory,
-                    )),
-                    crate::cgroup::IoMaxReport::default(),
-                ),
-                murmur_artifact::TraceCapture::Meta,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let trace = open_trace(&workdir, murmur_artifact::TraceCapture::Meta).await;
             let otel = OtelEmitter::new(
                 None,
                 &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
@@ -1341,6 +1448,16 @@ mod tests {
         /// The sink is built per batch because it borrows the stream; its turn state is a
         /// test-local concern and every test here feeds exactly one batch.
         async fn feed(&mut self, events: Vec<Event>) -> SinkOutcome {
+            self.feed_with_reports(Vec::new(), events).await
+        }
+
+        /// [`Self::feed`], with `reports` queued as the run loop's report arm queues them, ahead
+        /// of the batch.
+        async fn feed_with_reports(
+            &mut self,
+            reports: Vec<AttachmentReport>,
+            events: Vec<Event>,
+        ) -> SinkOutcome {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
@@ -1352,6 +1469,9 @@ mod tests {
                 &mut self.a2a,
                 GatewayTable::default(),
             );
+            for report in reports {
+                sink.queue_report(report);
+            }
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
                 .await;
@@ -3383,5 +3503,283 @@ mod tests {
         ])
         .await;
         assert_eq!(h.map.get(CONTEXT).as_deref(), Some("remembered"));
+    }
+
+    /// The base64 every report below says its image was sent as.
+    const SENT: &str = "iVBORw0KGgoAAAA=";
+
+    fn call_with(id: &str, name: &str, input: &str) -> Event {
+        Event::ToolCall(ToolCallInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+        })
+    }
+
+    fn result_with(id: &str, output: &str) -> Event {
+        Event::ToolResult(ToolResultInfo {
+            id: id.to_string(),
+            output: output.to_string(),
+            is_error: false,
+        })
+    }
+
+    /// The report of a call to `name` with `input` whose tool attached one PNG at `path`, sent as
+    /// [`SENT`].
+    fn report(name: &str, input: &str, path: &str) -> AttachmentReport {
+        let sha256 = "ab".repeat(32);
+        AttachmentReport {
+            tool_name: name.to_string(),
+            input_json: input.to_string(),
+            trace: vec![crate::trace::AttachmentRecord {
+                path: path.to_string(),
+                media_type: "image/png".to_string(),
+                bytes: Some(11),
+                sha256: Some(sha256.clone()),
+                refused: None,
+            }],
+            images: vec![SentImage {
+                base64: SENT.to_string(),
+                media_type: "image/png".to_string(),
+                bytes: 11,
+                sha256,
+            }],
+        }
+    }
+
+    /// The paths a `tool_call` record's `attachments` name, or `None` when it has no such key.
+    fn attached_paths(record: &Json) -> Option<Vec<String>> {
+        let attachments = record.get("attachments")?.as_array()?;
+        Some(
+            attachments
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap().to_string())
+                .collect(),
+        )
+    }
+
+    /// A report lands on the call with its bare name and arguments, not on a call of the same tool
+    /// with other arguments.
+    #[tokio::test]
+    async fn a_report_lands_on_the_call_with_its_name_and_arguments() {
+        let mut h = Harness::new(10).await;
+        h.feed_with_reports(
+            vec![report("t", r#"{"a":1}"#, "one.png")],
+            vec![
+                call_with("c1", "t", r#"{"a":2}"#),
+                call_with("c2", "t", r#"{ "a": 1 }"#),
+                result_with("c1", "done"),
+                result_with("c2", "done"),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["tool_call_id"], "c1");
+        assert_eq!(attached_paths(&calls[0]), None);
+        assert_eq!(calls[1]["tool_call_id"], "c2");
+        assert_eq!(attached_paths(&calls[1]), Some(vec!["one.png".to_string()]));
+        assert_eq!(
+            calls[1]["attachments"][0],
+            json!({"path": "one.png", "media_type": "image/png", "bytes": 11, "sha256": "ab".repeat(32)})
+        );
+    }
+
+    #[tokio::test]
+    async fn two_reports_with_one_key_are_claimed_oldest_first() {
+        let mut h = Harness::new(10).await;
+        h.feed_with_reports(
+            vec![
+                report("t", r#"{"a":1}"#, "first.png"),
+                report("t", r#"{"a":1}"#, "second.png"),
+            ],
+            vec![
+                call_with("c1", "t", r#"{"a":1}"#),
+                result_with("c1", "done"),
+                call_with("c2", "t", r#"{"a":1}"#),
+                result_with("c2", "done"),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(
+            attached_paths(&calls[0]),
+            Some(vec!["first.png".to_string()])
+        );
+        assert_eq!(
+            attached_paths(&calls[1]),
+            Some(vec!["second.png".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_with_no_report_writes_no_attachments_key() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            Event::TurnEnd(String::new()),
+        ])
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert!(calls[0].get("attachments").is_none(), "{}", calls[0]);
+        let frames = h.frames();
+        assert_eq!(data_of(&frames, "artifact")[0]["attachments"], json!([]));
+    }
+
+    /// A report no result claims writes nothing, and the run's end drops it.
+    #[tokio::test]
+    async fn an_unclaimed_report_writes_nothing_and_is_gone_after_finish() {
+        let mut h = Harness::new(10).await;
+        let session = RunSession::new(&h.plan, &h.policy, HARNESS, "fixture-driver");
+        let mut sink = ProcessEventSink::new(
+            &crate::workdir_fs::WorkdirRoot::open(&h.workdir).unwrap(),
+            h.max_turns,
+            h.task_max_turns,
+            h.first_turn,
+            session,
+            Arc::clone(&h.spend),
+            &mut h.a2a,
+            GatewayTable::default(),
+        );
+        sink.queue_report(report("other", "{}", "unclaimed.png"));
+        sink.consume(
+            vec![
+                tool_call("c1", "echo-tool"),
+                tool_result("c1", false),
+                Event::TurnEnd(String::new()),
+            ],
+            &mut h.hooks,
+            &mut h.trace,
+            &mut h.otel,
+        )
+        .await;
+        assert_eq!(sink.reports.len(), 1);
+        sink.finish(&mut h.trace).await;
+        assert!(sink.reports.is_empty());
+        drop(sink);
+        let calls = h.of_type("tool_call").await;
+        assert!(calls[0].get("attachments").is_none());
+        let trace = std::fs::read_to_string(h.workdir.join("trace.jsonl")).unwrap();
+        assert!(!trace.contains("unclaimed.png") && !trace.contains(SENT));
+    }
+
+    #[tokio::test]
+    async fn past_sixty_four_unclaimed_reports_the_oldest_is_dropped() {
+        let mut h = Harness::new(10).await;
+        let reports = (0..=MAX_UNCLAIMED_REPORTS)
+            .map(|n| report("t", &format!(r#"{{"n":{n}}}"#), &format!("{n}.png")))
+            .collect();
+        h.feed_with_reports(
+            reports,
+            vec![
+                call_with("c0", "t", r#"{"n":0}"#),
+                result_with("c0", "done"),
+                call_with("c1", "t", r#"{"n":1}"#),
+                result_with("c1", "done"),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(
+            attached_paths(&calls[0]),
+            None,
+            "the 65th dropped the oldest"
+        );
+        assert_eq!(attached_paths(&calls[1]), Some(vec!["1.png".to_string()]));
+    }
+
+    /// A driver that hands back the harness's tool result with the image item's JSON inside it
+    /// leaves no image bytes in the record, the hook's count or the frame.
+    #[tokio::test]
+    async fn with_content_capture_the_sent_base64_is_replaced_where_it_is_recorded() {
+        let mut h = Harness::new(10).await.capturing_content().await;
+        let output =
+            format!("one\n{{\"data\":\"{SENT}\",\"mimeType\":\"image/png\",\"type\":\"image\"}}");
+        let placeholder = format!("[image: image/png, 11 bytes, sha256 {}]", "ab".repeat(32));
+        let replaced = output.replace(SENT, &placeholder);
+        h.feed_with_reports(
+            vec![report("t", "{}", "a.png")],
+            vec![
+                call_with("c1", "t", "{}"),
+                result_with("c1", &output),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(calls[0]["output"], replaced);
+        assert_eq!(calls[0]["output_bytes"], replaced.len());
+        assert_eq!(attached_paths(&calls[0]), Some(vec!["a.png".to_string()]));
+        let frames = h.frames();
+        let artifact = &data_of(&frames, "artifact")[0];
+        assert_eq!(artifact["content"], replaced);
+        assert_eq!(artifact["attachments"], json!([]));
+        let trace = std::fs::read_to_string(h.workdir.join("trace.jsonl")).unwrap();
+        assert!(!trace.contains(SENT), "the trace holds the image bytes");
+    }
+
+    #[tokio::test]
+    async fn an_output_without_the_sent_base64_is_recorded_as_given() {
+        let mut h = Harness::new(10).await.capturing_content().await;
+        h.feed_with_reports(
+            vec![report("t", "{}", "a.png")],
+            vec![
+                call_with("c1", "t", "{}"),
+                result_with("c1", "the harness kept only the text"),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(calls[0]["output"], "the harness kept only the text");
+        assert_eq!(
+            calls[0]["output_bytes"],
+            "the harness kept only the text".len()
+        );
+        assert_eq!(attached_paths(&calls[0]), Some(vec!["a.png".to_string()]));
+    }
+
+    /// Two calls with one name and one set of arguments whose answers were written in the other
+    /// order than the harness reports their results: each result is paired with the report whose
+    /// image it repeats, so neither record holds image bytes or names the other call's image.
+    #[tokio::test]
+    async fn a_result_repeating_a_later_reports_image_claims_that_report() {
+        let mut h = Harness::new(10).await.capturing_content().await;
+        let sent = |base64: &str, path: &str| {
+            let mut report = report("t", "{}", path);
+            report.images[0].base64 = base64.to_string();
+            report
+        };
+        let (first, second) = ("Rmlyc3RJbWFnZQ==", "U2Vjb25kSW1hZ2U=");
+        h.feed_with_reports(
+            // The second call's answer was written first.
+            vec![sent(second, "second.png"), sent(first, "first.png")],
+            vec![
+                call_with("c1", "t", "{}"),
+                call_with("c2", "t", "{}"),
+                result_with("c1", &format!("{{\"data\":\"{first}\"}}")),
+                result_with("c2", &format!("{{\"data\":\"{second}\"}}")),
+                Event::TurnEnd(String::new()),
+            ],
+        )
+        .await;
+        let calls = h.of_type("tool_call").await;
+        assert_eq!(
+            attached_paths(&calls[0]),
+            Some(vec!["first.png".to_string()])
+        );
+        assert_eq!(
+            attached_paths(&calls[1]),
+            Some(vec!["second.png".to_string()])
+        );
+        let trace = std::fs::read_to_string(h.workdir.join("trace.jsonl")).unwrap();
+        assert!(
+            !trace.contains(first) && !trace.contains(second),
+            "the trace holds image bytes"
+        );
     }
 }

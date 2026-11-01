@@ -804,7 +804,7 @@ fn explain_scope_reports_images() {
         json!({"keep": 3, "max_bytes": 5_242_880, "max_per_turn": 5, "keep_applies": true})
     );
 
-    // A process capsule: the harness holds the conversation.
+    // A process capsule: the harness holds the conversation, and the bridge sees tool calls.
     let artifacts = TempDir::new().unwrap();
     let driver = common::create_driver_artifact_with_auth(
         artifacts.path(),
@@ -843,8 +843,10 @@ fn explain_scope_reports_images() {
         ),
         "{human}"
     );
-    assert!(human
-        .contains("  max_per_turn:  5 (does nothing here: the harness holds the conversation)\n"));
+    assert!(
+        human.contains("  max_per_turn:  5 (counts the images of one tool call here)\n"),
+        "{human}"
+    );
     let json = common::explain_scope_json(&home, &process);
     assert_eq!(json["images"]["keep_applies"], false);
 }
