@@ -700,6 +700,150 @@ fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
     assert_eq!(exit["killed"], true);
 }
 
+// ── What the harness prints after its terminal event ─────────────────────────
+
+/// The `text` of every `harness_note`, in order.
+fn note_texts(run: &Run) -> Vec<String> {
+    run.of_type("harness_note")
+        .into_iter()
+        .map(|note| note["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The index of the first record of `event_type` in the trace.
+fn position(events: &[Value], event_type: &str) -> usize {
+    events
+        .iter()
+        .position(|event| event["event_type"] == event_type)
+        .unwrap_or_else(|| panic!("no {event_type} in {events:#?}"))
+}
+
+#[test]
+fn late_lines_printed_while_the_harness_exits_are_read_and_change_nothing() {
+    println!("S5/S6: a quota, a suggestion and a note printed after the result are read in the exit grace; a late text, answer and usage are notes");
+    let capsule = Built::new().build();
+    let run = capsule.run("late-lines", &[]).succeeded();
+    for line in run.trace_raw().lines() {
+        println!("{line}");
+    }
+    let events = run.events();
+    assert_eq!(run.result(), "LATE-RESULT");
+    let inference = run.one("inference");
+    assert_eq!(inference["input_tokens"], 10);
+    assert_eq!(inference["output_tokens"], 5);
+    let task_end = run.one("task_end");
+    assert_eq!(task_end["exit_status"], "ok");
+    assert_eq!(task_end["input_tokens"], 10);
+    assert_eq!(task_end["output_tokens"], 5);
+    assert_eq!(task_end["turns"], 1);
+
+    let quota = run.one("harness_quota");
+    assert_eq!(
+        quota["windows"],
+        serde_json::json!([
+            {"name": "five-hour", "used": 0.5, "resets_at_ms": 1792497600000_u64},
+            {"name": "seven-day", "used": 0.2}
+        ])
+    );
+    assert_eq!(run.one("harness_suggestion")["text"], "run the tests next");
+    let exit = run.one("harness_exit");
+    assert_eq!(exit["cause"], "terminal");
+    assert_eq!(exit["killed"], false);
+    let exit_at = position(&events, "harness_exit");
+    assert!(position(&events, "harness_quota") < exit_at);
+    assert!(position(&events, "harness_suggestion") < exit_at);
+    assert!(position(&events, "inference") < position(&events, "harness_quota"));
+    assert_eq!(
+        note_texts(&run),
+        [
+            "a diagnostic the harness printed late",
+            "text after the turn's terminal event, ignored",
+            "turn-end after the turn's terminal event, ignored",
+            "usage after the turn's terminal event, ignored",
+        ]
+    );
+    for note in run.of_type("harness_note") {
+        assert!(events.iter().position(|e| e == &note).unwrap() < exit_at);
+    }
+}
+
+#[test]
+fn late_lines_after_the_grace_are_never_read() {
+    println!("S7: a harness still running when the 3 s exit grace ends is killed, and what it would have printed later is not recorded");
+    let capsule = Built::new().build();
+    let run = capsule.run("late-after-grace", &[]).succeeded();
+    assert_eq!(run.result(), "GRACE-RESULT");
+    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    let exit = run.one("harness_exit");
+    assert_eq!(exit["cause"], "terminal");
+    assert_eq!(exit["killed"], true);
+    assert!(run.of_type("harness_quota").is_empty());
+    assert!(run.of_type("harness_suggestion").is_empty());
+    assert!(note_texts(&run).is_empty(), "{:?}", note_texts(&run));
+    assert_eq!(run.one("task_end")["exit_status"], "ok");
+    // The kill came at the grace: about 3 s after the terminal event, well before the 5 s the
+    // profile waits before printing.
+    let waited =
+        exit["timestamp"].as_u64().unwrap() - run.one("inference")["timestamp"].as_u64().unwrap();
+    println!("harness_exit came {waited} ms after the inference record");
+    assert!((2_900..5_000).contains(&waited), "{waited} ms");
+}
+
+#[test]
+fn an_exhausted_quota_is_recorded_and_never_acted_on() {
+    println!("S9: a window reported exhausted is recorded and the turn runs as it would have");
+    let capsule = Built::new().build();
+    let run = capsule.run("quota-exhausted", &[]).succeeded();
+    assert_eq!(run.result(), "EXHAUSTED-RESULT");
+    assert_eq!(
+        run.one("harness_quota")["windows"],
+        serde_json::json!([{"name": "five-hour", "used": 1.0, "state": "exhausted"}])
+    );
+    assert!(run.of_type("harness_warning").is_empty());
+    assert!(run.of_type("harness_failed").is_empty());
+    assert!(run.of_type("harness_retry").is_empty());
+    assert_eq!(run.one("inference")["decision"], "end_turn");
+    assert_eq!(run.one("task_end")["exit_status"], "ok");
+    assert_eq!(run.one("harness_exit")["killed"], false);
+    assert!(!run.text.to_lowercase().contains("quota"), "{}", run.text);
+    assert!(
+        !run.text.to_lowercase().contains("exhausted"),
+        "{}",
+        run.text
+    );
+}
+
+#[test]
+fn trace_show_prints_the_latest_quota_window_per_name() {
+    println!("S10: `mur trace show` prints one quota line per window name, latest values, under ── Harness ──");
+    let capsule = Built::new().build();
+    let run = capsule.run("quota", &[]).succeeded();
+    assert_eq!(run.result(), "QUOTA-RESULT");
+    assert_eq!(run.of_type("harness_quota").len(), 2);
+    let shown = capsule.trace_show(&run.records_dir);
+    println!("{shown}");
+    let harness = shown
+        .split("── Harness ──")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no harness section in {shown}"));
+    let harness = harness.split("\n\n").next().unwrap();
+    let lines: Vec<&str> = harness
+        .lines()
+        .filter(|l| l.starts_with("quota "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "quota five-hour: used 0.5, warning",
+            "quota seven-day: used 0.1, 10080 min window"
+        ]
+    );
+
+    let plain = capsule.run("happy", &[]).succeeded();
+    let shown = capsule.trace_show(&plain.records_dir);
+    assert!(!shown.contains("quota "), "{shown}");
+}
+
 // ── S7: exactly the declared environment ──────────────────────────────────────
 
 #[test]

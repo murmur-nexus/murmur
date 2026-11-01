@@ -1079,6 +1079,47 @@ struct HarnessInterruptEvent {
     grace_ms: u64,
 }
 
+/// One report of the subscription windows a `transport: process` harness says are used.
+/// Rendered as the latest window per name, under the harness section.
+#[derive(Debug, Deserialize)]
+struct HarnessQuotaEvent {
+    windows: Vec<HarnessQuotaWindow>,
+}
+
+/// One window of a `harness_quota` record. A member the harness did not report is absent.
+#[derive(Debug, Clone, Deserialize)]
+struct HarnessQuotaWindow {
+    name: String,
+    used: Option<f64>,
+    resets_at_ms: Option<u64>,
+    window_minutes: Option<u64>,
+    state: Option<String>,
+}
+
+impl HarnessQuotaWindow {
+    /// `quota <name>: used <f>, resets <RFC 3339>, <n> min window, <state>`, each member the
+    /// harness did not report left out.
+    fn line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(used) = self.used {
+            parts.push(format!("used {used}"));
+        }
+        if let Some(at) = self.resets_at_ms {
+            parts.push(format!("resets {}", fmt_timestamp_secs(at)));
+        }
+        if let Some(minutes) = self.window_minutes {
+            parts.push(format!("{minutes} min window"));
+        }
+        if let Some(state) = &self.state {
+            parts.push(state.clone());
+        }
+        if parts.is_empty() {
+            parts.push("no members reported".to_string());
+        }
+        format!("quota {}: {}", self.name, parts.join(", "))
+    }
+}
+
 /// The resource-plane and peer-file records are rendered as counts by outcome, so `outcome`
 /// is the only field five of the nine event types contribute.
 #[derive(Debug, Deserialize)]
@@ -1318,6 +1359,7 @@ enum TraceEvent {
     HarnessWarning(HarnessWarningEvent),
     HarnessFailed(HarnessFailedEvent),
     HarnessInterrupt(HarnessInterruptEvent),
+    HarnessQuota(HarnessQuotaEvent),
     ControlChange(ControlChangeEvent),
     ControlRefused(ControlRefusedEvent),
     ControlApplied(ControlAppliedEvent),
@@ -1479,8 +1521,9 @@ struct ContextSeedRecord {
     message_ids: Vec<String>,
 }
 
-/// One `harness_warning`, `harness_failed` or `harness_interrupt` record, already rendered as the
-/// single line `mur trace show` prints for it.
+/// One `harness_warning`, `harness_failed` or `harness_interrupt` record, or the latest
+/// `harness_quota` window of one name, already rendered as the single line `mur trace show`
+/// prints for it.
 struct HarnessLine(String);
 
 /// One `hook_dispatch_error` record — a hook that failed without failing the session.
@@ -1660,7 +1703,8 @@ struct TraceMetrics {
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
     /// The `harness_warning`, `harness_failed` and `harness_interrupt` lines of a
-    /// `transport: process` run, in the order they were written.
+    /// `transport: process` run, in the order they were written, then one line per quota window
+    /// name with its latest values, in the order the names were first reported.
     harness_lines: Vec<HarnessLine>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
     /// anything at this session's launch.
@@ -2574,6 +2618,7 @@ fn compute_metrics(
     let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
     let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
     let mut harness_lines: Vec<HarnessLine> = Vec::new();
+    let mut quota_windows: Vec<HarnessQuotaWindow> = Vec::new();
     let mut retentions: Vec<RetentionRecord> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
     let mut resource_reads = OutcomeCounts::new();
@@ -2813,6 +2858,17 @@ fn compute_metrics(
                 };
                 harness_lines.push(HarnessLine(format!("interrupt {}: {outcome}", e.method)));
             }
+            TraceEvent::HarnessQuota(e) => {
+                for window in e.windows {
+                    match quota_windows
+                        .iter_mut()
+                        .find(|held| held.name == window.name)
+                    {
+                        Some(held) => *held = window,
+                        None => quota_windows.push(window),
+                    }
+                }
+            }
             TraceEvent::Retention(e) => {
                 retentions.push(RetentionRecord {
                     store: e.store,
@@ -3007,6 +3063,11 @@ fn compute_metrics(
         Some(line) if ending_recorded => format!("{} ({})", se.exit_status, torn_line_note(line)),
         _ => se.exit_status,
     };
+    harness_lines.extend(
+        quota_windows
+            .iter()
+            .map(|window| HarnessLine(window.line())),
+    );
 
     Ok((
         TraceMetrics {
@@ -3183,6 +3244,15 @@ fn unended_status(tail: &TraceTail) -> String {
 
 fn torn_line_note(line: usize) -> String {
     format!("line {line}, the last, is not valid JSON and was skipped")
+}
+
+/// Unix milliseconds as RFC 3339 UTC, to the second.
+fn fmt_timestamp_secs(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("{timestamp} ms"))
 }
 
 /// Unix milliseconds as RFC 3339 UTC, to the millisecond.
@@ -6757,6 +6827,45 @@ mod tests {
         let path = dir.path().join("trace.jsonl");
         std::fs::write(&path, lines).unwrap();
         (dir, path)
+    }
+
+    /// The harness section shows the latest window per name, in the order names were first
+    /// reported, after the other harness lines; a member the harness did not report is left out.
+    #[test]
+    fn harness_quota_shows_the_latest_window_per_name() {
+        let first = r#"{"event_type":"harness_quota","event_id":"evt_3","session_id":"ses_child","timestamp":1791000002000,"task_id":"tsk_1","windows":[{"name":"five-hour","used":0.25,"resets_at_ms":1792497600999,"window_minutes":300,"state":"ok"},{"name":"seven-day","used":0.1}]}"#;
+        let warning = r#"{"event_type":"harness_warning","event_id":"evt_4","session_id":"ses_child","timestamp":1791000002500,"code":"W-SEC-031","message":"not a subscription"}"#;
+        let second = r#"{"event_type":"harness_quota","event_id":"evt_5","session_id":"ses_child","timestamp":1791000003000,"task_id":"tsk_1","windows":[{"name":"five-hour","used":0.97,"state":"warning"},{"name":"extra"}]}"#;
+        let (_dir, path) = trace_of(&format!(
+            "{UNENDED_START}\n{UNENDED_TASK}\n{first}\n{warning}\n{second}\n{UNENDED_TURN}\n"
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        let lines: Vec<&str> = metrics.harness_lines.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "warning W-SEC-031: not a subscription",
+                "quota five-hour: used 0.97, warning",
+                "quota seven-day: used 0.1",
+                "quota extra: no members reported",
+            ]
+        );
+        let (_dir, path) = trace_of(&format!("{UNENDED_START}\n{UNENDED_TASK}\n{first}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(
+            metrics.harness_lines[0].0,
+            "quota five-hour: used 0.25, resets 2026-10-20T12:00:00Z, 300 min window, ok"
+        );
+    }
+
+    /// A trace with no `harness_quota` record prints no quota line.
+    #[test]
+    fn harness_quota_absent_prints_no_quota_line() {
+        let (_dir, path) = trace_of(&format!(
+            "{UNENDED_START}\n{UNENDED_TASK}\n{UNENDED_TURN}\n"
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert!(metrics.harness_lines.is_empty());
     }
 
     /// A session killed before it wrote `session_end` is read from the lines it left: its status

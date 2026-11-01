@@ -97,7 +97,7 @@ fn assert_stale_hook_lines(stdout: &str) {
     let entry = installed_entry(stdout, &hook_ref);
     assert!(entry.contains("global"), "{entry}");
     assert!(entry.contains("built at none (derived)"), "{entry}");
-    assert!(entry.contains("does not fit level 1"), "{entry}");
+    assert!(entry.contains("does not fit level 2"), "{entry}");
     let export_line = stdout
         .lines()
         .find(|line| line.contains("exports murmur:hook/lifecycle@0.8.0"))
@@ -220,7 +220,7 @@ fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
     .success();
 
     let built = fs::read_to_string(sidecar_path(&home, "local/built-tool", "0.1.0")).unwrap();
-    assert!(built.contains("\"built_at_level\": 1"), "{built}");
+    assert!(built.contains("\"built_at_level\": 2"), "{built}");
     let derived = fs::read_to_string(sidecar_path(&home, "local/current-tool", "0.1.0")).unwrap();
     assert!(derived.contains("wit_contracts"), "{derived}");
     assert!(!derived.contains("built_at_level"), "{derived}");
@@ -230,7 +230,7 @@ fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
     let stderr = stderr_of(&assert);
     assert!(stdout.contains("All checks passed."), "{stdout}");
     assert!(
-        stdout.contains("WIT level\n  this mur serves WIT level 1:\n    PACKAGE  "),
+        stdout.contains("WIT level\n  this mur serves WIT level 2:\n    PACKAGE  "),
         "{stdout}"
     );
     for (package, version) in SERVED_WIT_PACKAGES {
@@ -243,15 +243,15 @@ fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
         );
     }
     for (reference, built_at) in [
-        ("local/built-tool@0.1.0", "built at 1 "),
-        ("local/current-tool@0.1.0", "built at 1 (derived)"),
-        ("local/payload-tool@0.1.0", "built at 1 (derived)"),
-        ("local/current-skill@0.1.0", "built at 1 (derived)"),
+        ("local/built-tool@0.1.0", "built at 2 "),
+        ("local/current-tool@0.1.0", "built at 2 (derived)"),
+        ("local/payload-tool@0.1.0", "built at 2 (derived)"),
+        ("local/current-skill@0.1.0", "built at 2 (derived)"),
     ] {
         let entry = installed_entry(&stdout, reference);
         assert!(entry.contains("global"), "{entry}");
         assert!(entry.contains(built_at), "{entry}");
-        assert!(entry.ends_with("fits level 1"), "{entry}");
+        assert!(entry.ends_with("fits level 2"), "{entry}");
     }
     for stream in [&stdout, &stderr] {
         assert!(!stream.contains("W-REG-003"), "{stream}");
@@ -292,7 +292,7 @@ fn a_recorded_level_newer_than_this_mur_knows_is_named() {
         entry.contains("built at 99 (newer than this mur knows)"),
         "{entry}"
     );
-    assert!(entry.ends_with("fits level 1"), "{entry}");
+    assert!(entry.ends_with("fits level 2"), "{entry}");
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn recorded_contracts_win_over_the_payload() {
     let stdout = stdout_of(&assert);
     assert!(!stdout.contains("W-REG-003"), "{stdout}");
     let entry = installed_entry(&stdout, &format!("{HOOK}@{HOOK_VERSION}"));
-    assert!(entry.ends_with("fits level 1"), "{entry}");
+    assert!(entry.ends_with("fits level 2"), "{entry}");
     assert!(stdout.contains("All checks passed."), "{stdout}");
 }
 

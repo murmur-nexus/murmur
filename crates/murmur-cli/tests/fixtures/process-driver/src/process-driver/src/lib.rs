@@ -13,8 +13,8 @@ use std::cell::RefCell;
 
 use exports::murmur::driver::process::{
     Description, DriverFile, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
-    LaunchRequest, RetryInfo, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress,
-    ToolCallStart, ToolResultInfo, TurnFailure, Usage,
+    LaunchRequest, QuotaState, QuotaWindow, RetryInfo, SessionInfo, SessionMode, ToolCallInfo,
+    ToolCallProgress, ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
 thread_local! {
@@ -194,6 +194,8 @@ fn parse_line(line: String) -> Event {
             None => Event::Note(line),
         },
         "usage" if reports_usage() => parse_usage(rest, &line),
+        "quota" => parse_quota(rest, &line),
+        "suggest" => Event::SuggestedPrompt(rest.to_string()),
         "end" => Event::TurnEnd(rest.to_string()),
         "fail" => match rest.split_once(' ') {
             Some((kind, message)) => match failure_kind(kind) {
@@ -243,6 +245,61 @@ fn parse_usage(rest: &str, line: &str) -> Event {
         Event::Usage(usage)
     } else {
         Event::Note(line.to_string())
+    }
+}
+
+/// `quota <window> [<window> ...]`, each window
+/// `<name>[,used=<f64>][,resets=<ms>][,minutes=<n>][,state=ok|warning|exhausted]`. Values are
+/// passed through as written, with no range check, so a test can drive the runtime's own
+/// validation; a member that does not parse makes the whole line a note.
+fn parse_quota(rest: &str, line: &str) -> Event {
+    let mut windows = Vec::new();
+    for spec in rest.split_whitespace() {
+        let mut fields = spec.split(',');
+        let name = fields.next().unwrap_or_default();
+        let mut window = QuotaWindow {
+            name: name.to_string(),
+            used: None,
+            resets_at: None,
+            window_minutes: None,
+            state: None,
+        };
+        for field in fields {
+            let Some((member, value)) = field.split_once('=') else {
+                return Event::Note(line.to_string());
+            };
+            let parsed = match member {
+                "used" => value.parse::<f64>().ok().map(|v| window.used = Some(v)),
+                "resets" => value
+                    .parse::<u64>()
+                    .ok()
+                    .map(|v| window.resets_at = Some(v)),
+                "minutes" => value
+                    .parse::<u64>()
+                    .ok()
+                    .map(|v| window.window_minutes = Some(v)),
+                "state" => quota_state(value).map(|v| window.state = Some(v)),
+                _ => None,
+            };
+            if parsed.is_none() {
+                return Event::Note(line.to_string());
+            }
+        }
+        windows.push(window);
+    }
+    if windows.is_empty() {
+        Event::Note(line.to_string())
+    } else {
+        Event::Quota(windows)
+    }
+}
+
+fn quota_state(word: &str) -> Option<QuotaState> {
+    match word {
+        "ok" => Some(QuotaState::Ok),
+        "warning" => Some(QuotaState::Warning),
+        "exhausted" => Some(QuotaState::Exhausted),
+        _ => None,
     }
 }
 

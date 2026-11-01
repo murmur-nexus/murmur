@@ -38,7 +38,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
-| `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
+| `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
@@ -842,7 +842,7 @@ session already ending because of one of them before the deadline writes none.
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | The task that made the call. Absent outside a task |
-| `status` | object | The object the call returned, field for field — see [`session-status`](runtime-provided-tools.md#session-status) |
+| `status` | object | The object the call returned, field for field — see [`session-status`](runtime-provided-tools.md#session-status). Its `quota` is present only on a `process` session whose harness has reported a window |
 
 **`background_command`**{ #background-command } — written once per answered
 [`background-command`](runtime-provided-tools.md#background-command) call, at the call, on both
@@ -1275,11 +1275,46 @@ The run ends with [`E-RUN-033`](diagnostics.md#e-run-033) naming the same kind.
 - an interrupt that could not be delivered;
 - a `classify-exit` call the driver never answered;
 - a tool call whose connection the harness closed before the call returned;
-- a tool call refused at the [concurrent tool call limit](../how-to/run-capsule-on-subscription.md#step-7-know-the-three-fixed-limits).
+- a tool call refused at the [concurrent tool call limit](../how-to/run-capsule-on-subscription.md#step-7-know-the-three-fixed-limits);
+- the windows of a `quota` report the runtime refused, each named with why, in one note;
+- each event other than `quota`, `suggested-prompt` and `note` the driver read
+  [after the turn's terminal event](wit-interfaces.md#process-after-terminal), as
+  `<event> after the turn's terminal event, ignored`;
+- a `parse` call that failed after the turn's terminal event.
 
 | Field | Type | Notes |
 |---|---|---|
 | `text` | string | The note |
+
+**`harness_quota`**{ #harness-quota } — written for each
+[`quota` report](wit-interfaces.md#process-quota) with at least one window the runtime kept,
+including one read after the turn's terminal event
+
+| Field | Type | Notes |
+|---|---|---|
+| `windows` | array | The windows of this report, as the driver sent them after the refused ones were dropped |
+| `windows[].name` | string | The window's name |
+| `windows[].used` | f64 | Fraction from 0 to 1. Absent when the harness did not report it |
+| `windows[].resets_at_ms` | u64 | When the window resets, unix milliseconds. Absent when not reported |
+| `windows[].window_minutes` | u64 | The window's length. Absent when not reported |
+| `windows[].state` | string | `"ok"`, `"warning"` or `"exhausted"`. Absent when not reported |
+
+A report is a snapshot of the windows it names: the latest window per name across every
+`harness_quota` record is what [`session-status`](runtime-provided-tools.md#session-status) and
+`mur trace show` report. This record is unrelated to the `inference` record's `error_code` value
+`harness_quota`, which names a turn that failed on quota.
+
+```json
+{"event_type":"harness_quota","event_id":"evt_01a3b1d0a0c9771f8f4c0e1f2a3b4c5d","parent_id":"evt_01a3b1d09f2a7a3c9b1e2d3f4a5b6c7d","session_id":"ses_01a3b1d09e1b7c4d8e2f3a4b5c6d7e8f","timestamp":1793481601000,"task_id":"tsk_01a3b1d09f2a7a3c","windows":[{"name":"five-hour","used":0.25,"resets_at_ms":1793491200000,"window_minutes":300,"state":"ok"},{"name":"seven-day","used":0.1}]}
+```
+
+**`harness_suggestion`**{ #harness-suggestion } — written for each non-empty
+[suggested prompt](wit-interfaces.md#process-suggested-prompt), including one read after the turn's
+terminal event
+
+| Field | Type | Notes |
+|---|---|---|
+| `text` | string | The harness's prediction of what the person will ask next |
 
 **`harness_interrupt`** — written when a person cancels a task whose harness is running, before
 the harness is given any grace

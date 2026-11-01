@@ -538,6 +538,68 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "end LINGER"
     sleep 60
     ;;
+  quota)
+    # Two quota reports, each followed by a `session-status` call through the bridge whose answer
+    # is kept in status-<n>.answer. The second report replaces five-hour whole and leaves
+    # seven-day standing. The pause before each call gives the runtime the moment it takes to
+    # read the report; it is the bash builtin, so no PATH is needed.
+    echo "started fixture-session-1"
+    QUALIFIED=""
+    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+      case "$candidate" in
+        *__session-status) QUALIFIED="$candidate" ;;
+      esac
+    done
+    echo "quota five-hour,used=0.25,resets=1792497600000,minutes=300,state=ok seven-day,used=0.1,minutes=10080"
+    read -r -t 1 <> <(:) || true
+    echo "tool c1 $QUALIFIED {}"
+    printf '%s\n' "$(call_bridge session-status '{}')" > status-1.answer
+    echo "result c1 ok status 1"
+    echo "quota five-hour,used=0.5,state=warning"
+    read -r -t 1 <> <(:) || true
+    echo "tool c2 $QUALIFIED {}"
+    printf '%s\n' "$(call_bridge session-status '{}')" > status-2.answer
+    echo "result c2 ok status 2"
+    echo "text QUOTA-RESULT"
+    echo "end QUOTA-RESULT"
+    ;;
+  quota-exhausted)
+    # A window reported used up, then an ordinary turn: the runtime must not act on it.
+    echo "started fixture-session-1"
+    echo "quota five-hour,used=1,state=exhausted"
+    echo "text EXHAUSTED-RESULT"
+    echo "end EXHAUSTED-RESULT"
+    ;;
+  late-lines)
+    # Ends its turn, waits for the runtime to close stdin, then prints what a harness prints after
+    # its result — a quota, a suggestion, a diagnostic — and a late text, answer and usage that
+    # must change nothing, then exits 0 inside the exit grace.
+    echo "started fixture-session-1"
+    echo "usage in=10 out=5"
+    echo "text LATE-RESULT"
+    echo "end LATE-RESULT"
+    while IFS= read -r _; do :; done
+    echo "quota five-hour,used=0.5,resets=1792497600000 seven-day,used=0.2"
+    echo "suggest run the tests next"
+    echo "a diagnostic the harness printed late"
+    echo "text LATE-TEXT"
+    echo "end LATE-END"
+    echo "usage in=9000 out=9000"
+    exit 0
+    ;;
+  late-after-grace)
+    # `late-lines`, but its late lines come 5 s after stdin closes: after the 3 s exit grace has
+    # killed it, so nothing late is ever printed.
+    record_pid
+    echo "started fixture-session-1"
+    echo "text GRACE-RESULT"
+    echo "end GRACE-RESULT"
+    while IFS= read -r _; do :; done
+    read -r -t 5 <> <(:) || true
+    echo "quota five-hour,used=0.9"
+    echo "suggest too late"
+    exit 0
+    ;;
   *)
     echo "fail other unknown profile ${FIXTURE_HARNESS_PROFILE:-}"
     ;;

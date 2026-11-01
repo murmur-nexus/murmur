@@ -22,12 +22,23 @@ use crate::ExecutionLimits;
 
 pub use crate::bindings::process_driver::exports::murmur::driver::process::{
     Bridge, Description, DriverFile, Event, ExitStatus, FailureKind, InterruptMethod, LaunchPlan,
-    LaunchRequest, RetryInfo, Session, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress,
-    ToolCallStart, ToolResultInfo, TurnFailure, Usage,
+    LaunchRequest, QuotaState, QuotaWindow, RetryInfo, Session, SessionInfo, SessionMode,
+    ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
+impl QuotaState {
+    /// The WIT spelling of the state, which every record and frame carrying it uses.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            QuotaState::Ok => "ok",
+            QuotaState::Warning => "warning",
+            QuotaState::Exhausted => "exhausted",
+        }
+    }
+}
+
 /// The instance name every process driver exports.
-pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.3.0";
+pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.4.0";
 
 /// Every version of the process interface starts with this, so an export built against another
 /// version is still recognised as a process driver.
@@ -687,35 +698,31 @@ mod tests {
         );
     }
 
-    /// The real level 1 and a synthetic level 2 that moves only `murmur:driver` to 0.4.0.
-    fn level_2() -> WitLevel {
-        let mut level = served().clone();
-        level.level = 2;
-        for (package, version) in &mut level.packages {
-            if package == "murmur:driver" {
-                *version = "0.4.0".to_string();
-            }
-        }
-        level
+    /// Level 1, the committed level before the one this host serves, which has
+    /// `murmur:driver@0.3.0`.
+    fn level_1() -> &'static WitLevel {
+        &crate::wit_versions::wit_levels()[0]
     }
 
     #[test]
     fn process_driver_interface_follows_the_level_it_is_given() {
-        let c = contracts(&["murmur:driver/process@0.3.0"]);
+        let c = contracts(&["murmur:driver/process@0.4.0"]);
         assert!(check_driver_interface("process", "d", "1.0.0", Some(&c), served()).is_ok());
-        match check_driver_interface("process", "d", "1.0.0", Some(&c), &level_2()).unwrap_err() {
+        match check_driver_interface("process", "d", "1.0.0", Some(&c), level_1()).unwrap_err() {
             RuntimeError::WitLevelMismatch {
                 level, mismatched, ..
             } => {
-                assert_eq!(level, 2);
+                assert_eq!(level, 1);
                 assert_eq!(mismatched[0].direction, ContractDirection::Export);
                 assert_eq!(mismatched[0].package, "murmur:driver");
-                assert_eq!(mismatched[0].served_version.as_deref(), Some("0.4.0"));
+                assert_eq!(mismatched[0].served_version.as_deref(), Some("0.3.0"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
+        let old = contracts(&["murmur:driver/process@0.3.0"]);
+        assert!(check_driver_interface("process", "d", "1.0.0", Some(&old), level_1()).is_ok());
         let stream = importing(&["murmur:stream/events@0.1.0"]);
-        assert!(check_stream_interface("d", "1.0.0", Some(&stream), &level_2()).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", Some(&stream), level_1()).is_ok());
     }
 
     #[test]
@@ -779,7 +786,7 @@ mod tests {
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(
             message.contains(
-                "it imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+                "it imports murmur:text/chunks@0.1.0, and level 2 has no version of murmur:text"
             ),
             "{message}"
         );

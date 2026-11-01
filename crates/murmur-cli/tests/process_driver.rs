@@ -41,6 +41,11 @@ fn previous_wasm() -> PathBuf {
     common::fixture_path("process-driver-v2/tool/process-driver-v2.wasm")
 }
 
+/// A driver built against the frozen `@0.3.0` WIT beside it.
+fn v3_wasm() -> PathBuf {
+    common::fixture_path("process-driver-v3/tool/process-driver-v3.wasm")
+}
+
 /// An http driver built against the retired `murmur:text@0.1.0`, frozen beside its README.
 fn text_stream_wasm() -> PathBuf {
     common::fixture_path("streaming-driver-text/tool/streaming-driver.wasm")
@@ -231,7 +236,7 @@ fn http_driver_under_process_is_refused() {
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
     assert!(text.contains(&format!("'{name}@0.1.0'")), "{text}");
-    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.4.0"), "{text}");
 }
 
 /// The host accepts exactly one version of the interface, so a driver built against the retired
@@ -244,8 +249,8 @@ fn a_driver_built_against_the_retired_version_is_refused() {
     let text = capsule.run_refused();
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(!text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("does not fit WIT level 1"), "{text}");
-    assert!(text.contains("level 1 has murmur:driver@0.3.0"), "{text}");
+    assert!(text.contains("does not fit WIT level 2"), "{text}");
+    assert!(text.contains("level 2 has murmur:driver@0.4.0"), "{text}");
     assert!(text.contains("murmur:driver/process@0.1.0"), "{text}");
     assert!(text.contains("rebuild"), "{text}");
 }
@@ -260,10 +265,31 @@ fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
     println!("{text}");
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(!text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("does not fit WIT level 1"), "{text}");
+    assert!(text.contains("does not fit WIT level 2"), "{text}");
     assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
-    assert!(text.contains("level 1 has murmur:driver@0.3.0"), "{text}");
+    assert!(text.contains("level 2 has murmur:driver@0.4.0"), "{text}");
+    assert!(text.contains("mur install"), "{text}");
+}
+
+/// An installed driver built against `@0.3.0`, the version every process driver was built
+/// against before `@0.4.0`, is refused at launch naming WIT level 2 and `murmur:driver@0.4.0`,
+/// with the install that fixes it. Its component is the frozen copy under `process-driver-v3/`.
+#[test]
+fn a_driver_built_against_0_3_0_is_refused_with_the_install_that_fixes_it() {
+    let name = "local/v3-process-driver";
+    let capsule = Capsule::process(name, &v3_wasm(), &["HOME"]);
+    let text = capsule.run_refused();
+    println!("{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(!text.contains("E-RUN-029"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "artifact '{name}@{VERSION}' does not fit WIT level 2, the level this mur serves: it \
+             exports murmur:driver/process@0.3.0, and level 2 has murmur:driver@0.4.0"
+        )),
+        "{text}"
+    );
     assert!(text.contains("mur install"), "{text}");
 }
 
@@ -305,12 +331,12 @@ fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it(
     println!("{text}");
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(!text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("does not fit WIT level 1"), "{text}");
+    assert!(text.contains("does not fit WIT level 2"), "{text}");
     assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
     assert!(
         text.contains(
-            "imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+            "imports murmur:text/chunks@0.1.0, and level 2 has no version of murmur:text"
         ),
         "{text}"
     );
@@ -345,13 +371,13 @@ fn a_declared_driver_that_is_not_the_inference_driver_is_refused_too() {
     println!("{text}");
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(!text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("does not fit WIT level 1"), "{text}");
+    assert!(text.contains("does not fit WIT level 2"), "{text}");
     assert!(text.contains(&format!("'{second}@{VERSION}'")), "{text}");
     assert!(!text.contains(&format!("'{inference_driver}@")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
     assert!(
         text.contains(
-            "imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+            "imports murmur:text/chunks@0.1.0, and level 2 has no version of murmur:text"
         ),
         "{text}"
     );

@@ -1327,6 +1327,11 @@ URI: `https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`
 frames and the events that carry them are under
 [The stream extension](streaming-protocol.md#murmur-stream-v1).
 
+| Capsule | `params.frames` |
+|---|---|
+| `transport: http`, as in the examples on this page | `text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, `gap`, `lagged`, `connection-ack`, `capsule-closed` |
+| `transport: process` | The same, with [`quota`](streaming-protocol.md#event-quota) and [`suggested-prompt`](streaming-protocol.md#event-suggested-prompt) after `artifact`: only a harness reports them |
+
 ## A card with no `supportedInterfaces` { #no-supported-interfaces }
 
 A card without `supportedInterfaces` comes from a runtime at v0.4.0 or earlier, which serves the

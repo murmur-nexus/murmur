@@ -25,6 +25,20 @@
 //! An A2A **segment** is a separate notion, held by [`A2aStream`]: it reads the turn counter to
 //! number itself and never advances it, and a streamed fragment or a started call opens one where
 //! it opens no turn.
+//!
+//! # What the harness reports about the person's subscription
+//!
+//! `quota` and `suggested-prompt` are recorded and forwarded, never acted on: neither opens a
+//! turn or a segment, neither is observable work, and no quota, however exhausted, warns, stops,
+//! retries or changes a prompt.
+//!
+//! # After the terminal event
+//!
+//! Everything the harness says after its terminal event — the rest of that event's batch, and the
+//! lines the runner reads while the harness exits — goes through
+//! [`ProcessEventSink::after_terminal`]: `quota`, `suggested-prompt` and `note` are taken as they
+//! would be before it, and every other event is one `harness_note` naming it. Nothing there
+//! touches the turn counter, the result, usage, spend or the attempt's ending.
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
@@ -37,7 +51,7 @@ use crate::{
     errors::RuntimeError,
     hooks::{HookArtifact, HookEvent, HookRuntime},
     otel::OtelEmitter,
-    process_driver::{Event, FailureKind, Usage},
+    process_driver::{Event, FailureKind, QuotaWindow, Usage},
     spend::{SpendMeter, SpendRefusal},
     streaming::StreamArtifact,
     trace::{
@@ -53,6 +67,9 @@ use crate::workdir_fs::WorkdirRoot;
 /// The billing mode the process transport exists for. Compared as a plain string: what any other
 /// value means is the harness's business, and the runtime only reports that it is not this one.
 const SUBSCRIPTION_AUTH: &str = "subscription";
+
+/// The longest window name a `quota` report may carry.
+const QUOTA_NAME_MAX_CHARS: usize = 64;
 
 /// What a batch of events did to the run.
 pub(super) enum SinkOutcome {
@@ -321,8 +338,9 @@ impl<'a> ProcessEventSink<'a> {
             .await;
     }
 
-    /// Feed one `parse` batch through. Events after a terminal one, in the same batch, are
-    /// ignored: the run is over and the harness is already being shut down.
+    /// Feed one `parse` batch through. Events after a terminal one, in the same batch or a later
+    /// one, go through [`Self::after_terminal`]: the run is over and the harness is already being
+    /// shut down.
     pub(super) async fn consume(
         &mut self,
         events: Vec<Event>,
@@ -330,19 +348,68 @@ impl<'a> ProcessEventSink<'a> {
         trace: &mut TraceWriter,
         otel: &mut OtelEmitter,
     ) -> SinkOutcome {
+        let mut outcome = SinkOutcome::Continue;
         for event in events {
             if self.finished {
-                break;
+                self.after_terminal(event, trace).await;
+                continue;
             }
             match self.handle(event, hooks, trace, otel).await {
                 SinkOutcome::Continue => {}
                 terminal => {
                     self.finished = true;
-                    return terminal;
+                    outcome = terminal;
                 }
             }
         }
-        SinkOutcome::Continue
+        outcome
+    }
+
+    /// One event the harness reported after the turn's terminal event.
+    ///
+    /// `quota`, `suggested-prompt` and `note` are taken as they would be before it. Every other
+    /// event is written as one `harness_note` naming its WIT case, without its payload, and
+    /// ignored: it never changes the turn's outcome, its result, its usage or its spend.
+    pub(super) async fn after_terminal(&mut self, event: Event, trace: &mut TraceWriter) {
+        match event {
+            Event::Quota(windows) => self.record_quota(windows, trace).await,
+            Event::SuggestedPrompt(text) => self.record_suggestion(&text, trace).await,
+            Event::Note(text) => {
+                let _ = trace.write_harness_note(&text).await;
+            }
+            other => {
+                let _ = trace
+                    .write_harness_note(&format!(
+                        "{} after the turn's terminal event, ignored",
+                        event_case_name(&other)
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    /// One `quota` report: each window refused by [`validate_quota`] is named in one
+    /// `harness_note`, and the rest, when any stand, are recorded and forwarded as the driver
+    /// sent them.
+    async fn record_quota(&mut self, windows: Vec<QuotaWindow>, trace: &mut TraceWriter) {
+        let (valid, refused) = validate_quota(windows);
+        if let Some(note) = refused {
+            let _ = trace.write_harness_note(&note).await;
+        }
+        if valid.is_empty() {
+            return;
+        }
+        let _ = trace.write_harness_quota(&valid).await;
+        self.a2a.quota(&valid);
+    }
+
+    /// One suggested prompt. An empty one says nothing and records nothing.
+    async fn record_suggestion(&mut self, text: &str, trace: &mut TraceWriter) {
+        if text.is_empty() {
+            return;
+        }
+        let _ = trace.write_harness_suggestion(text).await;
+        self.a2a.suggested_prompt(text);
     }
 
     /// Close the run out: commit its session, and record every tool call the harness never
@@ -594,6 +661,14 @@ impl<'a> ProcessEventSink<'a> {
             }
             Event::Note(text) => {
                 let _ = trace.write_harness_note(&text).await;
+                SinkOutcome::Continue
+            }
+            Event::Quota(windows) => {
+                self.record_quota(windows, trace).await;
+                SinkOutcome::Continue
+            }
+            Event::SuggestedPrompt(text) => {
+                self.record_suggestion(&text, trace).await;
                 SinkOutcome::Continue
             }
             Event::TurnEnd(result) => {
@@ -909,7 +984,8 @@ fn call_announcement(turn: u32, name: &str, input: &Value) -> HookEvent {
 /// The rest say no, and `session-started` is why this predicate exists: a harness prints the name
 /// of its session before the model has produced anything and before it has written a transcript,
 /// so a run that got no further leaves the harness with nothing to answer to under that name. A
-/// retry, a note, a tool result and a failed turn each report on work rather than being it.
+/// retry, a note, a tool result and a failed turn each report on work rather than being it, and a
+/// quota report and a suggested prompt are what the harness says about the person, not work.
 fn produces_observable_work(event: &Event) -> bool {
     matches!(
         event,
@@ -922,6 +998,79 @@ fn produces_observable_work(event: &Event) -> bool {
             | Event::ToolCallProgress(_)
             | Event::TurnEnd(_)
     )
+}
+
+/// Splits one `quota` report into the windows that stand and the `harness_note` text naming each
+/// refused window and why, `None` when none was refused.
+///
+/// A window stands when its `name` is 1 to [`QUOTA_NAME_MAX_CHARS`] characters of `a`-`z`, `0`-`9`
+/// and `-`, starting with a letter or digit, and its `used`, when present, is a finite number from
+/// 0 to 1. Of several standing windows with one name, the last stands, in the place the first
+/// held. Nothing else is checked: what the members mean is the harness's to say.
+fn validate_quota(windows: Vec<QuotaWindow>) -> (Vec<QuotaWindow>, Option<String>) {
+    let mut valid: Vec<QuotaWindow> = Vec::new();
+    let mut refused = Vec::new();
+    for window in windows {
+        let shown: String = window.name.chars().take(QUOTA_NAME_MAX_CHARS).collect();
+        if !valid_quota_name(&window.name) {
+            refused.push(format!(
+                "{shown:?}: the name is not 1 to {QUOTA_NAME_MAX_CHARS} characters of a-z, 0-9 \
+                 and '-' starting with a letter or digit"
+            ));
+            continue;
+        }
+        if let Some(used) = window.used.filter(|used| !(0.0..=1.0).contains(used)) {
+            refused.push(format!(
+                "{shown:?}: used {used} is not a fraction from 0 to 1"
+            ));
+            continue;
+        }
+        match valid.iter_mut().find(|held| held.name == window.name) {
+            Some(held) => *held = window,
+            None => valid.push(window),
+        }
+    }
+    let note = (!refused.is_empty()).then(|| {
+        format!(
+            "the harness's quota report named windows the runtime refused, and they were dropped: \
+             {}",
+            refused.join("; ")
+        )
+    });
+    (valid, note)
+}
+
+/// Whether `name` is a window name a `quota` report may carry.
+fn valid_quota_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.chars().count() <= QUOTA_NAME_MAX_CHARS
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The WIT case name of `event`, which is all a note about an ignored event says of it.
+fn event_case_name(event: &Event) -> &'static str {
+    match event {
+        Event::SessionStarted(_) => "session-started",
+        Event::TextDelta(_) => "text-delta",
+        Event::Text(_) => "text",
+        Event::ThinkingDelta(_) => "thinking-delta",
+        Event::Thinking(_) => "thinking",
+        Event::ToolCall(_) => "tool-call",
+        Event::ToolResult(_) => "tool-result",
+        Event::Retry(_) => "retry",
+        Event::Usage(_) => "usage",
+        Event::TurnEnd(_) => "turn-end",
+        Event::TurnFailed(_) => "turn-failed",
+        Event::Note(_) => "note",
+        Event::ToolCallStarted(_) => "tool-call-started",
+        Event::ToolCallProgress(_) => "tool-call-progress",
+        Event::Quota(_) => "quota",
+        Event::SuggestedPrompt(_) => "suggested-prompt",
+    }
 }
 
 /// The `inference.error_code` a harness failure of `kind` records, or `None` for a kind that is
@@ -957,8 +1106,8 @@ mod tests {
     use crate::agent::process::{plan_session, HarnessSessionPolicy, SessionPlan};
     use crate::harness_session::HarnessSessionMap;
     use crate::process_driver::{
-        RetryInfo, SessionInfo, ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo,
-        TurnFailure,
+        QuotaState, RetryInfo, SessionInfo, ToolCallInfo, ToolCallProgress, ToolCallStart,
+        ToolResultInfo, TurnFailure,
     };
     use crate::streaming::{buffered, event_kind, frame_of, SseEventBuffer};
     use serde_json::Value as Json;
@@ -1206,6 +1355,31 @@ mod tests {
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
                 .await;
+            self.turn = sink.current_turn();
+            self.carried = sink.finish(&mut self.trace).await;
+            outcome
+        }
+
+        /// [`Self::feed`], then `late` as events read while the harness exits after its terminal
+        /// event, which `process.rs` hands to [`ProcessEventSink::after_terminal`].
+        async fn feed_then_late(&mut self, events: Vec<Event>, late: Vec<Event>) -> SinkOutcome {
+            let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
+            let mut sink = ProcessEventSink::new(
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
+                self.max_turns,
+                self.task_max_turns,
+                self.first_turn,
+                session,
+                Arc::clone(&self.spend),
+                &mut self.a2a,
+                GatewayTable::default(),
+            );
+            let outcome = sink
+                .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
+                .await;
+            for event in late {
+                sink.after_terminal(event, &mut self.trace).await;
+            }
             self.turn = sink.current_turn();
             self.carried = sink.finish(&mut self.trace).await;
             outcome
@@ -1945,22 +2119,239 @@ mod tests {
         assert_eq!(h.trace.task_turns(), 1);
     }
 
-    /// Nothing after the first terminal event in a batch is acted on: the run is over.
+    /// Nothing after the first terminal event in a batch is acted on: the run is over. Each
+    /// ignored event is one note naming it.
     #[tokio::test]
     async fn events_after_a_terminal_event_are_ignored() {
         let mut h = Harness::new(10).await;
-        h.feed(vec![
-            text("first"),
-            Event::TurnEnd("first".into()),
-            text("second"),
-            Event::TurnEnd("second".into()),
-        ])
-        .await;
+        let outcome = h
+            .feed(vec![
+                text("first"),
+                Event::TurnEnd("first".into()),
+                text("second"),
+                Event::TurnEnd("second".into()),
+            ])
+            .await;
+        assert!(matches!(outcome, SinkOutcome::Ended));
         assert_eq!(h.of_type("inference").await.len(), 1);
         assert_eq!(
             std::fs::read_to_string(h.workdir.join("out/result.txt")).unwrap(),
             "first"
         );
+        let notes: Vec<Json> = h
+            .of_type("harness_note")
+            .await
+            .into_iter()
+            .map(|note| note["text"].clone())
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "text after the turn's terminal event, ignored",
+                "turn-end after the turn's terminal event, ignored"
+            ]
+        );
+    }
+
+    fn quota_window(name: &str, used: Option<f64>) -> QuotaWindow {
+        QuotaWindow {
+            name: name.to_string(),
+            used,
+            resets_at: None,
+            window_minutes: None,
+            state: None,
+        }
+    }
+
+    /// A refused window is named, with why, in one note and dropped; the rest stand, and of two
+    /// windows with one name the last does, in the first one's place.
+    #[tokio::test]
+    async fn quota_refuses_malformed_windows_and_keeps_the_last_of_a_name() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::Quota(vec![
+            quota_window("five-hour", Some(0.2)),
+            quota_window("Five Hour", Some(0.3)),
+            quota_window("", None),
+            quota_window("-dash", None),
+            quota_window(&"a".repeat(65), None),
+            quota_window("seven-day", Some(1.5)),
+            quota_window("nan", Some(f64::NAN)),
+            quota_window("weekly", Some(-0.1)),
+            quota_window("monthly", None),
+            QuotaWindow {
+                state: Some(QuotaState::Warning),
+                window_minutes: Some(300),
+                ..quota_window("five-hour", Some(0.9))
+            },
+        ])])
+        .await;
+        let quota = h.of_type("harness_quota").await;
+        assert_eq!(quota.len(), 1);
+        assert_eq!(
+            quota[0]["windows"],
+            serde_json::json!([
+                {"name": "five-hour", "used": 0.9, "window_minutes": 300, "state": "warning"},
+                {"name": "monthly"}
+            ])
+        );
+        let notes = h.of_type("harness_note").await;
+        assert_eq!(notes.len(), 1);
+        let note = notes[0]["text"].as_str().unwrap();
+        for refused in [
+            "\"Five Hour\": the name is not 1 to 64 characters",
+            "\"\": the name",
+            "\"-dash\": the name",
+            &format!("\"{}\": the name", "a".repeat(64)),
+            "\"seven-day\": used 1.5 is not a fraction from 0 to 1",
+            "\"nan\": used NaN is not a fraction",
+            "\"weekly\": used -0.1 is not a fraction",
+        ] {
+            assert!(note.contains(refused), "{refused}: {note}");
+        }
+        assert_eq!(
+            h.frames()
+                .iter()
+                .filter(|frame| frame_of(frame)["frame"] == "quota")
+                .map(frame_of)
+                .collect::<Vec<_>>(),
+            [serde_json::json!({"frame": "quota", "windows": [
+                {"name": "five-hour", "used": 0.9, "windowMinutes": 300, "state": "warning"},
+                {"name": "monthly"}
+            ]})]
+        );
+    }
+
+    /// A report every window of which is refused records nothing but the note, and an empty
+    /// suggestion records nothing at all.
+    #[tokio::test]
+    async fn quota_with_no_valid_window_and_an_empty_suggestion_record_nothing() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::Quota(vec![quota_window("BAD", None)]),
+            Event::Quota(Vec::new()),
+            Event::SuggestedPrompt(String::new()),
+        ])
+        .await;
+        assert!(h.of_type("harness_quota").await.is_empty());
+        assert!(h.of_type("harness_suggestion").await.is_empty());
+        assert_eq!(h.of_type("harness_note").await.len(), 1);
+        assert!(h.frame_kinds().is_empty(), "{:?}", h.frame_kinds());
+    }
+
+    /// Neither new event opens a turn or a segment, and neither is observable work: a run that only
+    /// reported a quota and a suggestion commits no harness session.
+    #[tokio::test]
+    async fn quota_and_suggestion_open_no_turn_and_commit_no_session() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::Quota(vec![quota_window("five-hour", Some(0.5))]),
+            Event::SuggestedPrompt("and then?".into()),
+        ])
+        .await;
+        assert_eq!(h.carried, None);
+        assert!(h.map.get(CONTEXT).is_none());
+        assert_eq!(h.trace.task_turns(), 0);
+        assert!(h.of_type("inference").await.is_empty());
+        assert_eq!(h.frame_kinds(), ["quota", "suggested-prompt"]);
+        let suggestion = h.of_type("harness_suggestion").await;
+        assert_eq!(suggestion[0]["text"], "and then?");
+    }
+
+    /// An exhausted window is recorded and forwarded, and the turn runs as it would have: no
+    /// warning, no failure, the answer recorded.
+    #[tokio::test]
+    async fn an_exhausted_quota_is_never_acted_on() {
+        let mut h = Harness::new(10).await;
+        let outcome = h
+            .feed(vec![
+                Event::Quota(vec![QuotaWindow {
+                    state: Some(QuotaState::Exhausted),
+                    ..quota_window("five-hour", Some(1.0))
+                }]),
+                text("answer"),
+                Event::TurnEnd("answer".into()),
+            ])
+            .await;
+        assert!(matches!(outcome, SinkOutcome::Ended));
+        assert!(h.of_type("harness_warning").await.is_empty());
+        assert!(h.of_type("harness_failed").await.is_empty());
+        assert_eq!(h.of_type("inference").await.len(), 1);
+        assert_eq!(
+            h.of_type("harness_quota").await[0]["windows"][0]["state"],
+            "exhausted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.workdir.join("out/result.txt")).unwrap(),
+            "answer"
+        );
+    }
+
+    /// What arrives while the harness exits: a quota, a suggestion and a note are taken; a late
+    /// text, usage and second answer are one note each and change nothing — the result, the one
+    /// `inference` record and its counts stay the terminal turn's.
+    #[tokio::test]
+    async fn after_terminal_takes_quota_suggestion_and_note_and_notes_the_rest() {
+        let mut h = Harness::new(10).await;
+        let outcome = h
+            .feed_then_late(
+                vec![
+                    usage(&[("in", 10), ("out", 2)]),
+                    text("answer"),
+                    Event::TurnEnd("answer".into()),
+                ],
+                vec![
+                    Event::Quota(vec![quota_window("five-hour", Some(0.4))]),
+                    Event::SuggestedPrompt("try the next step".into()),
+                    Event::Note("a late line".into()),
+                    text("LATE"),
+                    usage(&[("in", 9_000), ("out", 9_000)]),
+                    Event::TurnEnd("LATE".into()),
+                ],
+            )
+            .await;
+        assert!(matches!(outcome, SinkOutcome::Ended));
+        let inference = h.of_type("inference").await;
+        assert_eq!(inference.len(), 1);
+        assert_eq!(inference[0]["input_tokens"], 10);
+        assert_eq!(inference[0]["output_tokens"], 2);
+        // The spend is what the same turn settles with nothing after its terminal event.
+        let mut alone = Harness::new(10).await;
+        alone
+            .feed(vec![
+                usage(&[("in", 10), ("out", 2)]),
+                text("answer"),
+                Event::TurnEnd("answer".into()),
+            ])
+            .await;
+        assert!(alone.spend.used() > 0);
+        assert_eq!(h.spend.used(), alone.spend.used());
+        assert_eq!(
+            std::fs::read_to_string(h.workdir.join("out/result.txt")).unwrap(),
+            "answer"
+        );
+        assert_eq!(h.of_type("harness_quota").await.len(), 1);
+        assert_eq!(
+            h.of_type("harness_suggestion").await[0]["text"],
+            "try the next step"
+        );
+        let notes: Vec<Json> = h
+            .of_type("harness_note")
+            .await
+            .into_iter()
+            .map(|note| note["text"].clone())
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "a late line",
+                "text after the turn's terminal event, ignored",
+                "usage after the turn's terminal event, ignored",
+                "turn-end after the turn's terminal event, ignored"
+            ]
+        );
+        let kinds = h.frame_kinds();
+        assert_eq!(&kinds[kinds.len() - 2..], ["quota", "suggested-prompt"]);
+        assert_eq!(h.trace.task_turns(), 1);
     }
 
     #[tokio::test]

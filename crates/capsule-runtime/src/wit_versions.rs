@@ -21,7 +21,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
     ("murmur:conversation", "0.2.0"),
-    ("murmur:driver", "0.3.0"),
+    ("murmur:driver", "0.4.0"),
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),
@@ -149,8 +149,53 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_1() {
-        assert_eq!(served_wit_level().level, 1);
+    fn wit_levels_served_level_is_level_2() {
+        assert_eq!(served_wit_level().level, 2);
+    }
+
+    /// Level 2 moved `murmur:driver` alone, so an artifact built at level 1 whose interfaces name
+    /// no `murmur:driver` package fits level 2 unchanged, and a level-1 process driver does not.
+    #[test]
+    fn wit_levels_level_2_moves_only_the_driver_package() {
+        use murmur_artifact::{
+            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
+        };
+        let levels = wit_levels();
+        let (one, two) = (&levels[0], &levels[1]);
+        let moved: Vec<_> = one
+            .packages
+            .iter()
+            .zip(&two.packages)
+            .filter(|(before, after)| before != after)
+            .collect();
+        let driver = |version: &str| ("murmur:driver".to_string(), version.to_string());
+        assert_eq!(moved, [(&driver("0.3.0"), &driver("0.4.0"))]);
+
+        let contracts = |exports: &[&str], imports: &[&str]| WitContracts {
+            exports: exports.iter().map(|e| e.to_string()).collect(),
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level, current_platform())
+                == VersionFit::Fits
+        };
+        let hook = || {
+            contracts(
+                &["murmur:hook/lifecycle@0.9.0"],
+                &[
+                    "murmur:runtime/inference@0.4.0",
+                    "murmur:task-io/read@0.1.0",
+                ],
+            )
+        };
+        let tool = || contracts(&["murmur:tool/run@0.1.0"], &["murmur:stream/events@0.1.0"]);
+        for (what, built) in [("hook", hook()), ("tool", tool())] {
+            assert!(fits(built.clone(), one), "{what} at level 1");
+            assert!(fits(built, two), "{what} at level 2");
+        }
+        let old_driver = || contracts(&["murmur:driver/process@0.3.0"], &[]);
+        assert!(fits(old_driver(), one));
+        assert!(!fits(old_driver(), two));
     }
 
     /// The served table is the newest level's set. A version moved in one but not the other

@@ -2,11 +2,11 @@
 
 A test-only process driver, and a fake harness for it to drive, for `tests/process_driver.rs`,
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
-`murmur:driver/process@0.3.0` from the `process-driver` world and imports nothing but WASI.
+`murmur:driver/process@0.4.0` from the `process-driver` world and imports nothing but WASI.
 
-Drivers built against the retired `@0.1.0` and `@0.2.0` live next door, in
-`../process-driver-v1/` and `../process-driver-v2/`, each with the frozen `.wit` it was built from;
-they exist only to be refused.
+Drivers built against the retired `@0.1.0`, `@0.2.0` and `@0.3.0` live next door, in
+`../process-driver-v1/`, `../process-driver-v2/` and `../process-driver-v3/`, each with the frozen
+`.wit` it was built from; they exist only to be refused.
 
 Four components are committed under `tool/`, all built from `src/process-driver`:
 
@@ -78,6 +78,8 @@ One event per line, read from the first word:
 | `result <id> ok\|error <output>` | `tool-result { id, output, is-error }` |
 | `retry <n> <reason>` | `retry { attempt: <n>, reason }` |
 | `usage <member>=<n> ...` | `usage { … }` — see below. Read by every build but `no-usage`, where it is "anything else" |
+| `quota <window> [<window> ...]` | `quota([…])` — see below |
+| `suggest <text>` | `suggested-prompt(<text>)`; `suggest ` with nothing after the space is an empty suggestion |
 | `end <result>` | `turn-end(<result>)` |
 | `fail <kind> <message>` | `turn-failed { kind, message }`, `kind` one of `auth`, `quota`, `max-turns`, `canceled`, `harness-error`, `other` |
 | anything else | `note(<line>)` |
@@ -100,6 +102,20 @@ what changed leaves the rest of the last one standing:
 
 A field that is not `<member>=<number>`, or an unknown member word, makes the whole line "anything
 else".
+
+A `quota` line names one or more windows, space-separated, each
+`<name>[,used=<f64>][,resets=<ms>][,minutes=<n>][,state=ok|warning|exhausted]`. The values are
+passed through as written, with no range check, so a test can drive the runtime's own validation;
+a member that does not parse, an unknown member word or an unknown state makes the whole line
+"anything else":
+
+| Field | `quota-window` member |
+| --- | --- |
+| `<name>` | `name` |
+| `used=<f64>` | `used` |
+| `resets=<ms>` | `resets-at` |
+| `minutes=<n>` | `window-minutes` |
+| `state=<word>` | `state` |
 
 ### `classify-exit(exit)`
 
@@ -151,8 +167,12 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `stream` | Three `delta` fragments, the complete `text`, then `end` with the same words |
 | `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |
 | `think-whole` | One complete `thinking` with nothing streaming it, then `text done` and `end DONE` |
+| `quota` | `quota five-hour,used=0.25,resets=1792497600000,minutes=300,state=ok seven-day,used=0.1,minutes=10080`, a 1 s pause, a bridged `session-status` call kept in `status-1.answer`; then `quota five-hour,used=0.5,state=warning`, a pause and a second call kept in `status-2.answer`; then `end QUOTA-RESULT` |
+| `quota-exhausted` | `quota five-hour,used=1,state=exhausted`, then `text` and `end EXHAUSTED-RESULT` |
+| `late-lines` | `usage in=10 out=5`, `text` and `end LATE-RESULT`; then, once stdin closes, a `quota` of two windows, `suggest run the tests next`, a note line, `text LATE-TEXT`, `end LATE-END` and `usage in=9000 out=9000`, and exit `0` inside the exit grace |
+| `late-after-grace` | `end GRACE-RESULT`; then, once stdin closes, waits 5 s — past the exit grace — before a `quota` and a `suggest` line it never gets to print |
 
-`silent`, `turns`, `linger`, `usage-spends` and the three `interrupt-*` profiles write their pid to `harness.pid`
+`silent`, `turns`, `linger`, `late-after-grace`, `usage-spends` and the three `interrupt-*` profiles write their pid to `harness.pid`
 in their working directory, which is how a test proves the harness is dead.
 
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment

@@ -1795,8 +1795,10 @@ struct HarnessRetryEvent {
     reason: String,
 }
 
+/// A task-node record whose payload is one line of text: `harness_note` and
+/// `harness_suggestion`.
 #[derive(Serialize)]
-struct HarnessNoteEvent {
+struct HarnessTextEvent {
     event_type: &'static str,
     event_id: String,
     parent_id: Option<String>,
@@ -1804,6 +1806,32 @@ struct HarnessNoteEvent {
     timestamp: u64,
     task_id: Option<String>,
     text: String,
+}
+
+/// One subscription window the harness reported, as `harness_quota` records it. A member the
+/// harness did not report is left out, never written as zero or `null`.
+#[derive(Serialize)]
+struct HarnessQuotaWindow<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct HarnessQuotaEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    windows: Vec<HarnessQuotaWindow<'a>>,
 }
 
 #[derive(Serialize)]
@@ -4094,8 +4122,54 @@ impl TraceWriter {
     /// Record a diagnostic the driver produced for the trace alone — a line it could not read,
     /// or a result the runtime could not pair with a call.
     pub(crate) async fn write_harness_note(&mut self, text: &str) -> std::io::Result<()> {
-        let event = HarnessNoteEvent {
+        let event = HarnessTextEvent {
             event_type: "harness_note",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            text: text.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record one report of the subscription windows the harness says are used, already
+    /// validated, and hand it to the session status, which keeps the latest window per name.
+    pub(crate) async fn write_harness_quota(
+        &mut self,
+        windows: &[crate::process_driver::QuotaWindow],
+    ) -> std::io::Result<()> {
+        if let Some(status) = &self.session_status {
+            status.record_quota(windows);
+        }
+        let event = HarnessQuotaEvent {
+            event_type: "harness_quota",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            windows: windows
+                .iter()
+                .map(|window| HarnessQuotaWindow {
+                    name: &window.name,
+                    used: window.used,
+                    resets_at_ms: window.resets_at,
+                    window_minutes: window.window_minutes,
+                    state: window
+                        .state
+                        .map(crate::process_driver::QuotaState::wire_name),
+                })
+                .collect(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record the harness's prediction of what the person will ask next.
+    pub(crate) async fn write_harness_suggestion(&mut self, text: &str) -> std::io::Result<()> {
+        let event = HarnessTextEvent {
+            event_type: "harness_suggestion",
             event_id: new_event_id(),
             parent_id: self.task_parent(),
             session_id: self.session_id.clone(),

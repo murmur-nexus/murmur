@@ -1057,13 +1057,15 @@ const HTTP_FRAMES: [&str; 9] = [
 ];
 
 /// The stream extension's `params.frames` of a `transport: process` capsule that serves
-/// `SendStreamingMessage`.
-const PROCESS_FRAMES: [&str; 9] = [
+/// `SendStreamingMessage`: an http capsule's, with the two frames only a harness reports.
+const PROCESS_FRAMES: [&str; 11] = [
     "text",
     "thinking",
     "tool-call-started",
     "tool-call-progress",
     "artifact",
+    "quota",
+    "suggested-prompt",
     "gap",
     "lagged",
     "connection-ack",
@@ -1109,6 +1111,139 @@ fn every_frame_a_capsule_writes_is_on_its_card() {
             );
         }
     }
+}
+
+// ── What the harness reports about the subscription ──────────────────────────
+
+/// `SendStreamingMessage` params for one task.
+fn task_params(message_id: &str) -> Value {
+    serde_json::json!({
+        "message": {
+            "messageId": message_id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "do the quota thing", "mediaType": "text/plain"}]
+        }
+    })
+}
+
+/// S4. Each quota report reaches a stream that activated the extension as one `quota` frame,
+/// carried by a `working` status, before the task's one terminal status; a stream that did not
+/// activate it carries no trace of them.
+#[test]
+fn quota_frames_reach_an_extended_stream_before_completed_and_no_plain_one() {
+    if common::skip_without_host_support(
+        "quota_frames_reach_an_extended_stream_before_completed_and_no_plain_one",
+    ) {
+        return;
+    }
+    let capsule = ProcessCapsule::new("quota-stream", "quota").start();
+    let (_, events) =
+        common::stream::stream_message(&capsule.url(), None, task_params("quota-1"), true);
+    let labels: Vec<String> = events.iter().map(common::stream::Event::label).collect();
+    println!("extended: {labels:?}");
+    let quota: Vec<&common::stream::Event> = events
+        .iter()
+        .filter(|event| event.kind() == "quota")
+        .collect();
+    assert_eq!(quota.len(), 2, "{labels:?}");
+    for event in &quota {
+        assert_eq!(event.murmur_state(), Some("working"), "{}", event.json);
+        println!("frame: {}", event.frame());
+    }
+    assert_eq!(
+        quota[0].frame(),
+        &serde_json::json!({"frame": "quota", "windows": [
+            {"name": "five-hour", "used": 0.25, "resetsAtMs": 1792497600000_u64,
+             "windowMinutes": 300, "state": "ok"},
+            {"name": "seven-day", "used": 0.1, "windowMinutes": 10080}
+        ]})
+    );
+    assert_eq!(
+        quota[1].frame(),
+        &serde_json::json!({"frame": "quota", "windows": [
+            {"name": "five-hour", "used": 0.5, "state": "warning"}
+        ]})
+    );
+    let last_quota = events.iter().rposition(|e| e.kind() == "quota").unwrap();
+    let terminal = events.iter().position(|e| e.is_terminal_status()).unwrap();
+    assert!(last_quota < terminal, "{labels:?}");
+    assert_eq!(events[terminal].murmur_state(), Some("completed"));
+    assert_eq!(terminal, events.len() - 1, "{labels:?}");
+
+    let (_, plain) =
+        common::stream::stream_message(&capsule.url(), None, task_params("quota-2"), false);
+    let labels: Vec<String> = plain.iter().map(common::stream::Event::label).collect();
+    println!("plain: {labels:?}");
+    assert!(plain.iter().all(|event| !event.is_frame()), "{labels:?}");
+    assert!(
+        plain
+            .iter()
+            .all(|event| !event.json.to_string().contains("five-hour")),
+        "{labels:?}"
+    );
+    assert_eq!(
+        plain.last().and_then(common::stream::Event::murmur_state),
+        Some("completed")
+    );
+}
+
+/// S5. A quota and a suggestion the harness prints after its result, while it exits, reach the
+/// stream before the task's terminal status, and the late text and answer reach it not at all.
+#[test]
+fn late_quota_and_suggestion_reach_the_stream_before_completed() {
+    if common::skip_without_host_support(
+        "late_quota_and_suggestion_reach_the_stream_before_completed",
+    ) {
+        return;
+    }
+    let capsule = ProcessCapsule::new("late-stream", "late-lines").start();
+    let (_, events) =
+        common::stream::stream_message(&capsule.url(), None, task_params("late-1"), true);
+    let labels: Vec<String> = events.iter().map(common::stream::Event::label).collect();
+    println!("late-lines: {labels:?}");
+    for event in &events {
+        println!("{}", event.json);
+    }
+    let at = |kind: &str| {
+        events
+            .iter()
+            .position(|e| e.kind() == kind)
+            .unwrap_or_else(|| panic!("no {kind} in {labels:?}"))
+    };
+    let terminal = events.iter().position(|e| e.is_terminal_status()).unwrap();
+    assert_eq!(terminal, events.len() - 1, "{labels:?}");
+    assert!(
+        at("quota") < terminal && at("suggested-prompt") < terminal,
+        "{labels:?}"
+    );
+    assert_eq!(
+        events[at("suggested-prompt")].frame(),
+        &serde_json::json!({"frame": "suggested-prompt", "text": "run the tests next"})
+    );
+    assert_eq!(events[at("quota")].murmur_state(), Some("working"));
+    assert_eq!(
+        events[at("suggested-prompt")].murmur_state(),
+        Some("working")
+    );
+    let status = &events[terminal];
+    assert_eq!(status.murmur_state(), Some("completed"));
+    assert_eq!(
+        events[terminal - 1].artifact_text(),
+        Some("LATE-RESULT"),
+        "{labels:?}"
+    );
+    let wire = serde_json::to_string(&events.iter().map(|e| &e.json).collect::<Vec<_>>()).unwrap();
+    assert!(
+        !wire.contains("LATE-TEXT") && !wire.contains("LATE-END"),
+        "{wire}"
+    );
+
+    let trace = capsule.trace_after_task_end();
+    let exit = trace_events(&trace, "harness_exit")[0];
+    assert_eq!(exit["cause"], "terminal");
+    assert_eq!(exit["killed"], false);
+    assert_eq!(trace_events(&trace, "harness_quota").len(), 1);
+    assert_eq!(trace_events(&trace, "harness_suggestion").len(), 1);
 }
 
 // ── A tool call being written ─────────────────────────────────────────────────

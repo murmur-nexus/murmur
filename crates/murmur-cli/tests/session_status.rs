@@ -438,6 +438,9 @@ fn session_status_fields_match_the_trace() {
     assert_eq!(start_deadline["source"], "own");
     assert_eq!(start_deadline["at"], status["time"]["deadline"]["at"]);
     assert!(events(&trace, "deadline_notice").is_empty(), "{trace:#?}");
+    // An http session has no harness to report subscription windows, so it never has `quota`.
+    assert!(status.get("quota").is_none(), "{status}");
+    assert!(events(&trace, "harness_quota").is_empty(), "{trace:#?}");
 }
 
 // ── Unset limits and unreported counts ────────────────────────────────────
@@ -563,8 +566,11 @@ fn session_status_through_the_process_bridge() {
     assert_eq!(statuses.len(), 3, "{trace:#?}");
     let workdir = run.workdir();
     let mut carriers = Vec::new();
+    // The harness reported no window, so there is no `quota` field and no record of one.
+    assert!(events(&trace, "harness_quota").is_empty(), "{trace:#?}");
     for (n, (at, record)) in statuses.iter().enumerate() {
         let status = &record["status"];
+        assert!(status.get("quota").is_none(), "{status}");
         assert_eq!(status["context"], "unknown", "{status}");
         assert_eq!(status["turns"]["cap"], 10);
         let before: Vec<&Value> = trace[..*at]
@@ -614,6 +620,110 @@ fn session_status_through_the_process_bridge() {
     let notices = events(&trace, "deadline_notice");
     assert_eq!(notices.len(), 1, "{trace:#?}");
     assert_eq!(notices[0]["tool_name"], "session-status", "{trace:#?}");
+}
+
+/// The latest window per name `harness_quota` records written before `at` add up to, as
+/// `session-status` reports them: a later window replaces one of the same name whole.
+fn merged_quota(trace: &[Value], at: usize) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for record in trace[..at]
+        .iter()
+        .filter(|event| event["event_type"] == "harness_quota")
+    {
+        for window in record["windows"].as_array().unwrap() {
+            let mut reported = window.clone();
+            if let Some(ms) = reported
+                .as_object_mut()
+                .unwrap()
+                .remove("resets_at_ms")
+                .and_then(|ms| ms.as_u64())
+            {
+                reported["resets_at"] = json!(rfc3339_of_millis(ms));
+            }
+            match merged
+                .iter_mut()
+                .find(|held| held["name"] == reported["name"])
+            {
+                Some(held) => *held = reported,
+                None => merged.push(reported),
+            }
+        }
+    }
+    merged
+}
+
+/// Two quota reports through the process bridge: each is one `harness_quota` record, and each
+/// `session-status` call reports the latest window per name — after the second report, five-hour
+/// replaced whole and seven-day still standing.
+#[cfg(unix)]
+#[test]
+fn session_status_reports_the_harness_quota_windows() {
+    let (home, project) = process_project("quota", 0, "");
+    let run = run(&home, &project, &[]);
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    let trace = run.trace();
+
+    let reports = events(&trace, "harness_quota");
+    assert_eq!(reports.len(), 2, "{trace:#?}");
+    assert_eq!(
+        reports[0]["windows"],
+        json!([
+            {"name": "five-hour", "used": 0.25, "resets_at_ms": 1792497600000_u64,
+             "window_minutes": 300, "state": "ok"},
+            {"name": "seven-day", "used": 0.1, "window_minutes": 10080}
+        ])
+    );
+    assert_eq!(
+        reports[1]["windows"],
+        json!([{"name": "five-hour", "used": 0.5, "state": "warning"}])
+    );
+    let task_start = first(&trace, "task_start");
+    for report in &reports {
+        assert_eq!(report["parent_id"], task_start["event_id"], "{report}");
+        assert_eq!(report["task_id"], task_start["task_id"], "{report}");
+    }
+
+    let statuses: Vec<(usize, &Value)> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event_type"] == "session_status")
+        .collect();
+    assert_eq!(statuses.len(), 2, "{trace:#?}");
+    let workdir = run.workdir();
+    for (n, (at, record)) in statuses.iter().enumerate() {
+        let status = &record["status"];
+        println!("session-status {}: {}", n + 1, status["quota"]);
+        assert_eq!(
+            status["quota"],
+            Value::from(merged_quota(&trace, *at)),
+            "the windows the records before it add up to: {trace:#?}"
+        );
+        let text = bridged_text(&workdir, &format!("status-{}.answer", n + 1));
+        let handed: Value = serde_json::from_str(&common::unfence(&split_notice(&text).0)).unwrap();
+        assert_eq!(&handed, status, "the record is what the harness was handed");
+    }
+    assert_eq!(
+        statuses[0].1["status"]["quota"],
+        json!([
+            {"name": "five-hour", "used": 0.25, "resets_at": "2026-10-20T12:00:00Z",
+             "window_minutes": 300, "state": "ok"},
+            {"name": "seven-day", "used": 0.1, "window_minutes": 10080}
+        ])
+    );
+    assert_eq!(
+        statuses[1].1["status"]["quota"],
+        json!([
+            {"name": "five-hour", "used": 0.5, "state": "warning"},
+            {"name": "seven-day", "used": 0.1, "window_minutes": 10080}
+        ])
+    );
+    // Recorded and forwarded, never acted on.
+    assert!(events(&trace, "harness_warning").is_empty(), "{trace:#?}");
+    assert!(
+        !run.stderr.to_lowercase().contains("quota"),
+        "{}",
+        run.stderr
+    );
 }
 
 // ── One notice ────────────────────────────────────────────────────────────

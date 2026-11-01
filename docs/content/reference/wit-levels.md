@@ -19,7 +19,7 @@ the tables on this page are generated from that file and the repository's releas
 ## Fit
 
 An artifact's `murmur:*` interface names are read from its component, for example
-`murmur:driver/process@0.3.0`. Its package is the text before the `/` (`murmur:driver`) and its
+`murmur:driver/process@0.4.0`. Its package is the text before the `/` (`murmur:driver`) and its
 version the text after the `@`.
 
 | The artifact names | Fits the level when |

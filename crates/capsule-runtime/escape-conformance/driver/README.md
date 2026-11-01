@@ -1,7 +1,7 @@
 # escape-conformance-driver
 
 The process driver the escape-conformance gate runs every case through. It exports
-`murmur:driver/process@0.3.0` from the `process-driver` world, imports nothing but WASI, and
+`murmur:driver/process@0.4.0` from the `process-driver` world, imports nothing but WASI, and
 drives one harness: the gate's own `probe-driver` binary
 (`../src/probe_driver.rs`), which makes predetermined tool calls over the capsule's tool bridge.
 

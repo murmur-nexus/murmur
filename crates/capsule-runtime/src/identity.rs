@@ -236,6 +236,10 @@ pub(crate) fn writes_frame(
         | StreamFrame::Artifact
         | StreamFrame::Gap
         | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
+        // Only a process driver reports what its harness says about the subscription.
+        StreamFrame::Quota | StreamFrame::SuggestedPrompt => {
+            (true, true, &[TransportKind::Process])
+        }
         StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
             (false, true, &TransportKind::ALL)
         }
@@ -2763,9 +2767,25 @@ mod tests {
         );
     }
 
-    /// Every murmur frame: what `murmur.WatchSession` carries, and so the stream extension's
-    /// `params.frames` under every acceptance, since `murmur.WatchSession` is served under each.
+    /// Every murmur frame: what `murmur.WatchSession` carries from a process capsule, and so its
+    /// stream extension's `params.frames` under every acceptance, since `murmur.WatchSession` is
+    /// served under each.
     const ALL_FRAMES: &[&str] = &[
+        "text",
+        "thinking",
+        "tool-call-started",
+        "tool-call-progress",
+        "artifact",
+        "quota",
+        "suggested-prompt",
+        "gap",
+        "lagged",
+        "connection-ack",
+        "capsule-closed",
+    ];
+
+    /// Every frame but the two only a process driver's harness reports.
+    const HTTP_ALL_FRAMES: &[&str] = &[
         "text",
         "thinking",
         "tool-call-started",
@@ -2781,9 +2801,9 @@ mod tests {
     /// acceptance. Written once per transport, so a frame one transport alone writes is an edit to
     /// that transport's table.
     const HTTP_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
-        (TaskAcceptance::None, ALL_FRAMES),
-        (TaskAcceptance::Single, ALL_FRAMES),
-        (TaskAcceptance::Queue, ALL_FRAMES),
+        (TaskAcceptance::None, HTTP_ALL_FRAMES),
+        (TaskAcceptance::Single, HTTP_ALL_FRAMES),
+        (TaskAcceptance::Queue, HTTP_ALL_FRAMES),
     ];
 
     const PROCESS_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
@@ -2792,10 +2812,15 @@ mod tests {
         (TaskAcceptance::Queue, ALL_FRAMES),
     ];
 
-    /// What an activated `SendStreamingMessage` carries: every frame but the observer's own.
+    /// What an activated `SendStreamingMessage` carries: every frame the transport writes but the
+    /// observer's own.
     #[test]
-    fn stream_extension_send_streaming_message_carries_the_first_seven_frames() {
+    fn stream_extension_send_streaming_message_carries_all_but_the_observer_frames() {
         for transport in TransportKind::ALL {
+            let all = match transport {
+                TransportKind::Http => HTTP_ALL_FRAMES,
+                TransportKind::Process => ALL_FRAMES,
+            };
             for method in [
                 DoorMethod::SendStreamingMessage,
                 DoorMethod::SubscribeToTask,
@@ -2805,14 +2830,14 @@ mod tests {
                     .filter(|&frame| writes_frame(method, frame, transport))
                     .map(StreamFrame::wire_name)
                     .collect();
-                assert_eq!(carried, ALL_FRAMES[..7], "{method:?} {transport:?}");
+                assert_eq!(carried, all[..all.len() - 2], "{method:?} {transport:?}");
             }
             let watched: Vec<&str> = StreamFrame::ALL
                 .into_iter()
                 .filter(|&frame| writes_frame(DoorMethod::WatchSession, frame, transport))
                 .map(StreamFrame::wire_name)
                 .collect();
-            assert_eq!(watched, ALL_FRAMES, "{transport:?}");
+            assert_eq!(watched, all, "{transport:?}");
         }
     }
 
@@ -3265,18 +3290,25 @@ mod tests {
         }
     }
 
+    /// Every frame is listed on the card of some transport, and on the card of every transport
+    /// that writes it.
     #[test]
     fn stream_frame_every_variant_is_listed() {
-        for kind in TransportKind::ALL {
-            let transport = TransportCapabilities { kind };
-            let frames = served_frames(&TaskAcceptance::Single, transport);
-            for frame in StreamFrame::ALL {
-                assert!(
+        for frame in StreamFrame::ALL {
+            let mut listed = false;
+            for kind in TransportKind::ALL {
+                let transport = TransportCapabilities { kind };
+                let frames = served_frames(&TaskAcceptance::Single, transport);
+                let written = writes_frame(DoorMethod::WatchSession, frame, kind);
+                assert_eq!(
                     frames.contains(&frame.wire_name()),
-                    "{} is never listed on {kind:?}: {frames:?}",
+                    written,
+                    "{} on {kind:?}: {frames:?}",
                     frame.wire_name()
                 );
+                listed |= written;
             }
+            assert!(listed, "{} is never listed", frame.wire_name());
         }
     }
 
