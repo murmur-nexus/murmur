@@ -75,6 +75,10 @@ pub(crate) struct TraceWriter {
     /// Where staging took the facts about each allowlisted binary it examined. Set by
     /// [`Self::set_host_facts`] before `session_start` is written; empty until then.
     host_facts: Vec<HostFactsRecord>,
+    /// What staging read for `inference.instruction_files`, one record per entry. Set by
+    /// [`Self::set_instruction_files`] before `session_start` is written; `None` until then and
+    /// for a capsule without the key.
+    instruction_files: Option<Vec<crate::instruction_files::InstructionFileRecord>>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -407,6 +411,12 @@ struct SessionStartEvent {
     /// kept `~/.murmur/host_facts` entry or were worked out, and why. Always written, `[]` when
     /// no binary was examined.
     host_facts: Vec<HostFactsRecord>,
+    /// One object per `inference.instruction_files` entry, in manifest order: its `path` as
+    /// written and its `status`, with `resolved`, `bytes`, `included_bytes`, `truncated` and
+    /// `sha256` (of the included text) on a `read` entry, `same_as` on a `same_file` one and
+    /// `error` on an `unreadable` one. `null` for a capsule without the key, `[]` for an empty
+    /// list. Always written.
+    instruction_files: Option<Vec<crate::instruction_files::InstructionFileRecord>>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -1719,6 +1729,14 @@ pub(crate) struct HarnessStart {
     /// How many bytes were written to the harness's stdin, and whether it stayed open after.
     pub stdin_bytes: usize,
     pub keep_stdin_open: bool,
+    /// SHA-256 (lowercase hex) of the exact system prompt handed to the process driver: the
+    /// fact lines, the resolved prompt and any instruction-file blocks. Unlike
+    /// `session_start.system_prompt_sha256`, which names the prompt the operator wrote.
+    pub system_prompt_sha256: String,
+    /// The text [`Self::system_prompt_sha256`] hashes, stored as that blob under
+    /// `trace.capture: content` and never written to the line.
+    #[serde(skip)]
+    pub system_prompt: String,
 }
 
 #[derive(Serialize)]
@@ -2462,6 +2480,7 @@ impl TraceWriter {
             tool_refresh: None,
             runtime_artifacts: Vec::new(),
             host_facts: Vec::new(),
+            instruction_files: None,
             resumed_from,
             context_id,
             spawned_by,
@@ -2649,6 +2668,16 @@ impl TraceWriter {
         });
     }
 
+    /// Records what staging read for `inference.instruction_files` for
+    /// `session_start.instruction_files`; `None` writes `null`.
+    pub(crate) fn set_instruction_files(
+        &mut self,
+        files: Option<&crate::instruction_files::InstructionFiles>,
+    ) {
+        self.instruction_files =
+            files.map(crate::instruction_files::InstructionFiles::trace_records);
+    }
+
     /// Records `inference.tool_refresh` for `session_start.tool_refresh`: the wire name under
     /// `transport: http`, `None` under `transport: process`.
     pub(crate) fn set_tool_refresh(&mut self, tool_refresh: Option<&'static str>) {
@@ -2729,6 +2758,7 @@ impl TraceWriter {
             tool_refresh: self.tool_refresh,
             runtime_artifacts: self.runtime_artifacts.clone(),
             host_facts: self.host_facts.clone(),
+            instruction_files: self.instruction_files.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -4027,6 +4057,11 @@ impl TraceWriter {
     /// Record the harness about to be spawned: written after the driver planned the run and
     /// before the process exists, so a spawn that goes wrong still has its plan on record.
     pub(crate) async fn write_harness_start(&mut self, start: HarnessStart) -> std::io::Result<()> {
+        if self.capture.captures_content() {
+            self.blobs
+                .put(&start.system_prompt_sha256, start.system_prompt.as_bytes())
+                .await?;
+        }
         let event = HarnessStartEvent {
             event_type: "harness_start",
             event_id: new_event_id(),
@@ -8717,6 +8752,98 @@ mod tests {
             fetched_from: fetched_from.to_string(),
             owner_id,
             notes: Vec::new(),
+        }
+    }
+
+    /// `instruction_files` is always written: `null` without the key, the records in manifest
+    /// order with it, and `[]` for an empty list.
+    #[tokio::test]
+    async fn session_start_instruction_files_is_null_without_the_key() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("AGENTS.md"), "x").unwrap();
+        let read = crate::instruction_files::InstructionFiles::read(
+            work.path(),
+            &["AGENTS.md".to_string(), "CLAUDE.md".to_string()],
+        );
+        let empty = crate::instruction_files::InstructionFiles::read(work.path(), &[]);
+        for (files, expected) in [
+            (None, serde_json::Value::Null),
+            (Some(&empty), serde_json::json!([])),
+            (
+                Some(&read),
+                serde_json::json!([
+                    {
+                        "path": "AGENTS.md",
+                        "status": "read",
+                        "resolved": "AGENTS.md",
+                        "bytes": 1,
+                        "included_bytes": 1,
+                        "truncated": false,
+                        "sha256": murmur_artifact::sha256_hex(b"x"),
+                    },
+                    {"path": "CLAUDE.md", "status": "missing"},
+                ]),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.set_instruction_files(files);
+            w.write_session_start(Some(10), None, Vec::new())
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+            let events = read_events(dir.path());
+            assert!(events[0].get("instruction_files").is_some());
+            assert_eq!(events[0]["instruction_files"], expected);
+        }
+    }
+
+    fn harness_start_with_prompt(prompt: &str) -> HarnessStart {
+        HarnessStart {
+            driver: "local/fixture-process-driver".to_string(),
+            driver_version: "0.1.0".to_string(),
+            harness: "fixture".to_string(),
+            binary: "/bin/true".to_string(),
+            binary_source: "describe".to_string(),
+            harness_version: None,
+            version_tested: false,
+            harness_session_id: "h".to_string(),
+            session_mode: "new".to_string(),
+            args_count: 0,
+            env_names: Vec::new(),
+            account_env_unset: Vec::new(),
+            files: Vec::new(),
+            bridge_tools: Vec::new(),
+            stdin_bytes: 0,
+            keep_stdin_open: false,
+            system_prompt_sha256: murmur_artifact::sha256_hex(prompt.as_bytes()),
+            system_prompt: prompt.to_string(),
+        }
+    }
+
+    /// `harness_start` names the prompt handed to the driver by its hash, never carries the text,
+    /// and under content capture stores the text as that blob.
+    #[tokio::test]
+    async fn harness_start_records_the_system_prompt_hash_and_blob() {
+        let prompt = "facts\n\nMANIFEST\n\n[Instruction file: AGENTS.md]\nx";
+        let sha = murmur_artifact::sha256_hex(prompt.as_bytes());
+        for capture in [TraceCapture::Meta, TraceCapture::Content] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer_with_opts(dir.path(), capture).await;
+            w.write_harness_start(harness_start_with_prompt(prompt))
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+            let event = &read_events(dir.path())[0];
+            assert_eq!(event["event_type"], "harness_start");
+            assert_eq!(event["system_prompt_sha256"], sha.as_str());
+            assert!(event.get("system_prompt").is_none(), "{event}");
+            let blob = dir.path().join(BLOB_DIR_NAME).join(&sha);
+            if capture == TraceCapture::Content {
+                assert_eq!(std::fs::read(&blob).unwrap(), prompt.as_bytes());
+            } else {
+                assert!(!blob.exists());
+            }
         }
     }
 

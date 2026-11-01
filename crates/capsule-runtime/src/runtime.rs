@@ -3453,6 +3453,17 @@ pub fn stage_session(
     // Resolve lifecycle: manifest config + any override
     let lifecycle = resolve_lifecycle(request.lifecycle, request.lifecycle_override.as_ref());
 
+    // Once per launch, after every `on-stage` hook has run and before `MURMUR.md` names what was
+    // found: every task of the session runs with the same blocks, so an edit to a listed file
+    // applies from the next session.
+    let instruction_files = request
+        .inference
+        .as_ref()
+        .and_then(|inference| inference.instruction_files.as_deref())
+        .map(|entries| {
+            crate::instruction_files::InstructionFiles::read(&accessible_workdir, entries)
+        });
+
     // Written now for agent sessions, after the manifest copy so its tree can list the file, for
     // tooling that inspects the runtime directory after staging (tests, debuggers).
     // `launch_session` rewrites it after port binding with the capsule URL.
@@ -3499,6 +3510,7 @@ pub fn stage_session(
                 containment.applied_tier(),
             ),
             parent_workdir: request.parent_workdir_snapshot.clone(),
+            instruction_files: instruction_files.clone(),
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
         inputs
@@ -3527,6 +3539,7 @@ pub fn stage_session(
         records_root,
         manifest_file_name,
         murmur_md,
+        instruction_files,
         manifest_dir: request.manifest_dir,
         capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
             format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
@@ -3848,6 +3861,13 @@ fn launch(
         // from the workdir.
         import_task_input(&accessible_root, &runtime_root, inference);
         let system_prompt = resolve_system_prompt(&staged.manifest_dir, &runtime_root, inference)?;
+        // What the agent loop and the process driver receive: the resolved prompt followed by
+        // the instruction-file blocks staging read. `system_prompt` itself stays what the
+        // manifest or `--system-prompt` said, which is what the trace records.
+        let agent_system_prompt = crate::instruction_files::compose_system_prompt(
+            system_prompt.as_deref(),
+            staged.instruction_files.as_ref(),
+        );
         let compaction_system_prompt =
             resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
         let session_id = staged.session_id.clone();
@@ -4292,6 +4312,7 @@ fn launch(
         // what the manifest (or `--system-prompt`) actually said, not the runtime's framing of it.
         let trace_system_prompt = system_prompt.clone();
         let system_prompt_overridden = staged.system_prompt_overridden;
+        let instruction_files_for_trace = staged.instruction_files.clone();
         let registry_for_pull = Arc::clone(&staged.registry);
         let source_supply_for_pull = staged.source_supply.clone();
         let compiled_forms_for_pull = staged.compiled_forms.clone();
@@ -4388,6 +4409,7 @@ fn launch(
             trace.set_host_facts(&host_facts);
             trace.set_formation_id(formation_id.as_ref());
             trace.set_formation_member(formation_member.as_deref());
+            trace.set_instruction_files(instruction_files_for_trace.as_ref());
             trace
                 .write_session_start(inference.max_turns, primary_limits, tools_declared)
                 .await
@@ -5151,7 +5173,7 @@ fn launch(
                             effective_lifecycle.max_task_reopens,
                             effective_lifecycle.keep_working.clone(),
                             effective_lifecycle.done_check.clone(),
-                            system_prompt.clone(),
+                            agent_system_prompt.clone(),
                             run_config.clone(),
                             &mut hooks,
                             &mut trace,
@@ -14150,6 +14172,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
@@ -15547,6 +15570,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
@@ -16603,6 +16627,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             // The driver is never staged, so no `models:` table is read: the cap is the manifest's.
             max_tokens: Some(4096),
@@ -18832,6 +18857,7 @@ inference:
                     artifact: "mock-driver".to_string(),
                     config: None,
                 }),
+                instruction_files: None,
                 max_turns: Some(3),
                 tool_refresh: trigger,
                 ..task_io_inference_config()
@@ -22288,6 +22314,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
@@ -23535,6 +23562,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(scenario.max_turns),
             max_tokens: None,
             max_session_tokens: None,
@@ -23649,6 +23677,7 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
+            instruction_files: None,
             max_turns: Some(scenario.max_turns),
             ..task_io_inference_config()
         };
@@ -23934,6 +23963,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
@@ -24567,6 +24597,7 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
+            instruction_files: None,
             max_turns: Some(2),
             ..task_io_inference_config()
         };
@@ -26484,6 +26515,7 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
+            instruction_files: None,
             max_turns: Some(5),
             ..task_io_inference_config()
         };

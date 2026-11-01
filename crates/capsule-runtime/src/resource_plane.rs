@@ -354,7 +354,7 @@ impl ResourceError {
     }
 }
 
-fn io_to_resource_error(error: &std::io::Error) -> ResourceError {
+pub(crate) fn io_to_resource_error(error: &std::io::Error) -> ResourceError {
     match error.kind() {
         std::io::ErrorKind::NotFound => ResourceError::NotFound,
         // A component of the path is not a directory, or O_NOFOLLOW hit a symlink on the final

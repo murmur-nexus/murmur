@@ -102,6 +102,7 @@ and the installed tools. It is an inventory of the session:
 | Identity | Capsule name and version, session id, capsule URL; for a formation member, its roster name and formation id |
 | Capsule | Model, the work folder as an absolute path, the runtime directory with the name each kind of tool opens it by, the read-only paths, `capabilities.network.allow` |
 | Limits | The limits the runtime enforces, the same text the `[Capsule]` block states; `capabilities.resources.workdir_max_bytes` for every `transport: http` session, the [ceiling](../reference/workdir.md#work-folder-ceiling) on the work folder, `$HOME` and `$TMPDIR` together; the context budget |
+| Instruction Files | Present only when [`inference.instruction_files`](../reference/manifest.md#inference-instruction-files) is set: which listed files are in the system prompt, which are not and why, and other files in the work folder with a listed name, which are not loaded |
 | Runtime Directory | The entries of the runtime directory that exist when the file is written |
 | Installed Tools, Installed Skills | Every tool in the model's tool list, under its tool name, and every skill |
 | Running Shell Commands | The binaries `capabilities.shell.allow` declares and how each tool reads its `command` field; on the [tiers that enforce it](../reference/containment.md#subprocess-enforcement-tiers), which programs a command can start and that the kernel refuses any other with exit status 126 |
@@ -171,6 +172,22 @@ The task is never named here: it reaches the model as the first message.
 `[Capsule]`, `Name:` and `Version:` lines. Its `Limits:` line carries the turns and session tokens
 only, or reads `none` when neither is set: the harness runs its own commands outside the
 runtime's per-command limits.
+
+### What the system prompt holds { #system-prompt-contents }
+
+The runtime builds the system prompt once per launch. In order:
+
+1. On `transport: http`, the `[Capsule]` block above; on `transport: process`, its lines from
+   `Work folder:` on.
+2. The manifest's own prompt — `inference.system_prompt`, `system_prompt_file` or
+   `system_prompt_artifact` — or the [`mur run --system-prompt`](../reference/cli.md#mur-run)
+   text that replaces it.
+3. One block per file [`inference.instruction_files`](../reference/manifest.md#inference-instruction-files)
+   lists that was read, in manifest order, each headed `[Instruction file: <entry>]`.
+
+A blank line separates each part from the next. Every request of the session carries the same
+bytes, so a provider's prompt cache matches it from the first request on. Compaction replaces
+messages and never the system prompt, so the instruction-file blocks stay in place after it.
 
 ## Turn limit (`inference.max_turns`)
 

@@ -1269,6 +1269,12 @@ pub struct InferenceConfig {
     /// prompt. Mutually exclusive with `system_prompt` and `system_prompt_file`. The skill is
     /// excluded from the callable tool inventory (it's already in the system prompt).
     pub system_prompt_artifact: Option<String>,
+    /// `inference.instruction_files`: work-folder files appended to the system prompt at launch,
+    /// each as one labelled block after the manifest's own prompt, as the manifest wrote them and
+    /// in its order. Every entry is relative and has no `..` component. `None` reads nothing and
+    /// leaves the system prompt as the prompt keys alone make it; `Some` of an empty list also
+    /// reads nothing, and the trace records the empty list.
+    pub instruction_files: Option<Vec<String>>,
     /// `inference.max_turns`: the most inference turns one task may take, across its reopens and
     /// continuations, enforced as a hard ceiling by the runtime. `None` sets no cap.
     pub max_turns: Option<u32>,
@@ -2668,6 +2674,8 @@ struct RawInferenceConfig {
     #[serde(default)]
     system_prompt_artifact: Option<String>,
     #[serde(default)]
+    instruction_files: Option<Vec<String>>,
+    #[serde(default)]
     driver: Option<RawInferenceDriver>,
     #[serde(default)]
     compaction: Option<RawCompactionConfig>,
@@ -3353,6 +3361,7 @@ impl RawBlock for RawInferenceConfig {
         "system_prompt",
         "system_prompt_file",
         "system_prompt_artifact",
+        "instruction_files",
         "driver",
         "compaction",
         "max_turns",
@@ -4596,30 +4605,69 @@ fn scalar_text(value: &serde_norway::Value) -> Option<String> {
     }
 }
 
+/// Why a manifest path that must stay inside the work folder is refused.
+enum RelativePathRefusal {
+    ParentDir,
+    Absolute,
+}
+
+/// The shape rule shared by every manifest path resolved beneath the accessible workdir:
+/// relative, no `..`, no absolute prefix. `.` components are allowed.
+fn relative_path_refusal(path: &str) -> Option<RelativePathRefusal> {
+    Path::new(path)
+        .components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some(RelativePathRefusal::ParentDir),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                Some(RelativePathRefusal::Absolute)
+            }
+        })
+}
+
 /// The shared `root` shape rule: relative, no `..`, no absolute prefix. Both export blocks
 /// resolve their root against the same accessible workdir, so both refuse the same shapes with
 /// the same sentence.
 fn check_export_root_shape(field: &str, root: &str) -> Result<(), RuntimeManifestError> {
-    for component in Path::new(root).components() {
-        match component {
-            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                return Err(RuntimeManifestError::InvalidExports {
-                    field: field.to_string(),
-                    message: format!(
-                        "'{root}' contains a '..' component; {EXPORT_ROOT_ACCEPTED_FORM}"
-                    ),
-                });
+    let message = match relative_path_refusal(root) {
+        None => return Ok(()),
+        Some(RelativePathRefusal::ParentDir) => {
+            format!("'{root}' contains a '..' component; {EXPORT_ROOT_ACCEPTED_FORM}")
+        }
+        Some(RelativePathRefusal::Absolute) => {
+            format!("'{root}' is absolute; {EXPORT_ROOT_ACCEPTED_FORM}")
+        }
+    };
+    Err(RuntimeManifestError::InvalidExports {
+        field: field.to_string(),
+        message,
+    })
+}
+
+const INSTRUCTION_FILE_ACCEPTED_FORM: &str = "must be a relative path inside the work folder";
+
+/// Checks every `inference.instruction_files` entry and keeps the list as written, in order. The
+/// runtime resolves each entry beneath the accessible work folder at staging, so a shape that
+/// could only name a path outside it is refused here, before anything is staged.
+fn parse_instruction_files(entries: Vec<String>) -> Result<Vec<String>, RuntimeManifestError> {
+    for (index, entry) in entries.iter().enumerate() {
+        let problem = if entry.trim().is_empty() {
+            Some("is empty")
+        } else {
+            match relative_path_refusal(entry) {
+                None => None,
+                Some(RelativePathRefusal::ParentDir) => Some("contains a '..' component"),
+                Some(RelativePathRefusal::Absolute) => Some("is absolute"),
             }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(RuntimeManifestError::InvalidExports {
-                    field: field.to_string(),
-                    message: format!("'{root}' is absolute; {EXPORT_ROOT_ACCEPTED_FORM}"),
-                });
-            }
+        };
+        if let Some(problem) = problem {
+            return Err(RuntimeManifestError::InvalidInferenceConfig {
+                field: format!("inference.instruction_files[{index}]"),
+                message: format!("'{entry}' {problem}; {INSTRUCTION_FILE_ACCEPTED_FORM}"),
+            });
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestError> {
@@ -5496,6 +5544,10 @@ fn parse_inference(
     let system_prompt = optional_trimmed_string(raw.system_prompt);
     let system_prompt_file = optional_trimmed_string(raw.system_prompt_file);
     let system_prompt_artifact = optional_trimmed_string(raw.system_prompt_artifact);
+    let instruction_files = raw
+        .instruction_files
+        .map(parse_instruction_files)
+        .transpose()?;
 
     let prompt_sources_set = [
         system_prompt.is_some(),
@@ -5597,6 +5649,7 @@ fn parse_inference(
                 system_prompt,
                 system_prompt_file,
                 system_prompt_artifact,
+                instruction_files,
                 max_turns,
                 max_tokens: raw.max_tokens,
                 max_session_tokens: raw.max_session_tokens,
@@ -5697,6 +5750,7 @@ fn parse_inference(
                 system_prompt,
                 system_prompt_file,
                 system_prompt_artifact,
+                instruction_files,
                 max_turns,
                 max_tokens: None,
                 max_session_tokens: raw.max_session_tokens,
@@ -9866,6 +9920,113 @@ inference:
         let msg = err.to_string();
         assert!(msg.contains("inference.system_prompt"));
         assert!(msg.contains("system_prompt_file"));
+    }
+
+    fn instruction_files_manifest(transport: &str, entries: &str) -> String {
+        let (artifact, inference) = if transport == "process" {
+            (
+                "  - name: murmur/driver-claude-code\n    version: 0.1.0\n    runtime: driver\n",
+                "  transport: process\n  driver:\n    artifact: murmur/driver-claude-code\n",
+            )
+        } else {
+            (
+                "  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    \
+                 gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n",
+                "  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n",
+            )
+        };
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n{artifact}inference:\n{inference}  \
+             instruction_files: {entries}\n"
+        )
+    }
+
+    #[test]
+    fn instruction_files_absent_is_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur/driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
+inference:
+  model: test-model
+  driver:
+    artifact: murmur/driver-anthropic
+"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.inference.unwrap().instruction_files, None);
+    }
+
+    /// Entries are kept as written and in manifest order, `.` components included, on both
+    /// transports, and the key draws no unknown-key report.
+    #[test]
+    fn instruction_files_are_kept_verbatim_in_order_on_both_transports() {
+        for transport in ["http", "process"] {
+            let manifest = RuntimeManifest::from_yaml_str(&instruction_files_manifest(
+                transport,
+                "[CLAUDE.md, ./AGENTS.md, docs/agents/RULES.md]",
+            ))
+            .unwrap();
+            assert!(
+                manifest.unknown_keys.is_empty(),
+                "{transport}: {:?}",
+                manifest.unknown_keys
+            );
+            assert_eq!(
+                manifest.inference.unwrap().instruction_files,
+                Some(vec![
+                    "CLAUDE.md".to_string(),
+                    "./AGENTS.md".to_string(),
+                    "docs/agents/RULES.md".to_string(),
+                ]),
+                "{transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_files_empty_list_is_some_empty() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&instruction_files_manifest("http", "[]")).unwrap();
+        assert_eq!(manifest.inference.unwrap().instruction_files, Some(vec![]));
+    }
+
+    /// An entry that is blank, absolute or climbs out with `..` is refused on the indexed field,
+    /// with the entry quoted, before anything is staged.
+    #[test]
+    fn instruction_files_refuse_entries_that_leave_the_work_folder() {
+        for (entries, index, entry, problem) in [
+            ("[/etc/passwd]", 0, "/etc/passwd", "is absolute"),
+            (
+                "[AGENTS.md, ../AGENTS.md]",
+                1,
+                "../AGENTS.md",
+                "'..' component",
+            ),
+            ("[a/../../b]", 0, "a/../../b", "'..' component"),
+            ("[\"\"]", 0, "", "is empty"),
+            ("[AGENTS.md, \"  \"]", 1, "  ", "is empty"),
+        ] {
+            let err = RuntimeManifest::from_yaml_str(&instruction_files_manifest("http", entries))
+                .unwrap_err();
+            let RuntimeManifestError::InvalidInferenceConfig { field, message } = &err else {
+                panic!("{entries}: expected InvalidInferenceConfig, got {err:?}");
+            };
+            assert_eq!(field, &format!("inference.instruction_files[{index}]"));
+            assert!(message.contains(&format!("'{entry}'")), "{message}");
+            assert!(message.contains(problem), "{message}");
+            assert!(
+                message.contains("must be a relative path inside the work folder"),
+                "{message}"
+            );
+        }
     }
 
     /// A `${NAME}` is kept as the name it is, whether or not this process holds the variable: the

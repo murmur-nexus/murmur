@@ -206,6 +206,7 @@ mod tests {
         ("delegation_plane.rs", include_str!("delegation_plane.rs")),
         ("detached.rs", include_str!("detached.rs")),
         ("hooks.rs", include_str!("hooks.rs")),
+        ("instruction_files.rs", include_str!("instruction_files.rs")),
         ("murmur_md.rs", include_str!("murmur_md.rs")),
         ("otel.rs", include_str!("otel.rs")),
         ("network_policy.rs", include_str!("network_policy.rs")),
@@ -991,6 +992,14 @@ mod tests {
             "open_no_follow",
             "The resource plane's own reads of files the capsule exported, under its own \
              `SymlinkPolicy`; it resolves and confines every path itself and writes nothing.",
+        ),
+        (
+            "instruction_files.rs",
+            "walk_nested",
+            "Lists the accessible work folder at staging, before any capsule command runs, for \
+             files named like an `inference.instruction_files` entry. It reads directory entries \
+             only, follows and enters no link, and writes nothing; the listed files are read \
+             through `resolve_relpath_beneath_root` and `open_no_follow`, never here.",
         ),
         (
             "resource_plane.rs",

@@ -614,6 +614,9 @@ pub struct StagedSession {
     /// What `MURMUR.md` is rendered from, for an agent session; `None` for a script capsule,
     /// which gets no `MURMUR.md`. Its identity's capsule URL is empty until launch.
     pub(crate) murmur_md: Option<crate::murmur_md::MurmurMdInputs>,
+    /// What staging read for `inference.instruction_files`, once, for every task of the launch.
+    /// `None` when the manifest does not set the key, and for a script capsule.
+    pub(crate) instruction_files: Option<crate::instruction_files::InstructionFiles>,
     /// Owns the runtime directory: dropping it removes the directory, so it is held until the
     /// session ends — `launch` takes it and drops it on return, and a `StagedSession` dropped
     /// unlaunched drops it with itself.

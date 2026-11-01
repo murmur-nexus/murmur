@@ -1209,6 +1209,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens,
             max_session_tokens: None,

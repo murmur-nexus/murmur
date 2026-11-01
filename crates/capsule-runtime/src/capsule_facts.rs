@@ -176,6 +176,7 @@ pub(crate) fn test_http_inference() -> InferenceConfig {
         system_prompt: None,
         system_prompt_file: None,
         system_prompt_artifact: None,
+        instruction_files: None,
         max_turns: Some(10),
         max_tokens: None,
         max_session_tokens: None,
@@ -212,6 +213,7 @@ pub(crate) fn test_enforced_limits() -> (CapabilityPolicy, InferenceConfig, Life
         ..CapabilityPolicy::default()
     };
     let inference = InferenceConfig {
+        instruction_files: None,
         max_turns: Some(7),
         max_session_tokens: Some(50_000),
         ..test_http_inference()
@@ -333,6 +335,7 @@ mod tests {
     #[test]
     fn capsule_facts_state_no_turn_limit_when_none_is_set() {
         let http = InferenceConfig {
+            instruction_files: None,
             max_turns: None,
             ..test_http_inference()
         };
