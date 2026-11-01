@@ -275,6 +275,76 @@ A malformed report degrades to no report rather than failing the call:
 
 An omitted number is absent from the trace event, never written as `0`.
 
+### Provider tools { #provider-tools }
+
+A tool artifact whose own `murmur.yaml` declares a [`provider_tool:` block](manifest.md#provider-tool)
+is one the model's provider defines itself. Its entry in the request's `tools` array carries the
+block as declared, beside the entry's usual `name`, `description` and `parameters`:
+
+```json
+{
+  "name": "computer",
+  "description": "Operates the session's display.",
+  "parameters": {"type": "object", "properties": {}},
+  "provider_tool": {"kind": "computer", "display_width": 1280, "display_height": 800}
+}
+```
+
+| `provider_tool.kind` | The tool | What the driver does |
+|---|---|---|
+| `computer` | Operates a display, keyboard and pointer, and returns screenshots as [images](#tool-attachments) | Sends its provider's own computer tool, sized `display_width` × `display_height`, in place of a function definition. The calls it returns are `tool_call` blocks named after the entry, with the provider's action as `input` |
+
+An entry without the block is an ordinary tool, serialized as it is for any capsule. A driver that
+does not read `provider_tool` offers the entry as an ordinary function.
+
+### Safety checks { #safety-checks }
+
+A driver may attach `safety_checks` to a `tool_call` content block it returns, for checks its
+provider asks a person to acknowledge before the action runs:
+
+```json
+{"type": "tool_call", "id": "call_1", "name": "computer", "input": {"action": "click", "x": 640, "y": 400},
+ "safety_checks": [{"id": "sc_1", "code": "irrelevant_domain", "message": "The page is not the one the task named."}]}
+```
+
+| Member | Type | Required |
+|---|---|---:|
+| `safety_checks[].id` | string | no |
+| `safety_checks[].code` | string | no |
+| `safety_checks[].message` | string, not empty | yes |
+
+`[]` counts as no checks. Any other shape, `null` included, is malformed. Checks are accepted on
+any tool call. Once the capsule's capability checks and any `on-tool-call` policy hook let the call
+through, and before it runs:
+
+1. The runtime puts the task in `input-required` with this prompt, one line per check (`-` for a
+   check with no `code`):
+
+    ```text
+    safety check on tool call '<tool>' (<call id>):
+    <code>: <message>
+    reply yes to acknowledge and run the action; any other reply declines it
+    ```
+
+2. The person replies with a `SendMessage` naming the task, as for [`request-input`](#murmurtasktask).
+   `yes`, `y`, `approve`, `approved`, `acknowledge` and `acknowledged`, ignoring case and
+   surrounding spaces, acknowledge the checks. Any other reply declines them.
+3. Every call that carried checks writes one
+   [`safety_check`](observability-schemas.md#safety-check) trace event.
+
+| Outcome | The call | The tool message the driver reads next |
+|---|---|---|
+| Acknowledged | Runs | The call's result, with `acknowledged_safety_checks` holding the checks exactly as the driver sent them |
+| Declined | Does not run | `is_error: true`: `the person did not acknowledge the safety check on this call, so it was not run: <code>: <message>; their reply: <reply>` |
+| No task to ask a person in | Does not run | `is_error: true`: `this call carries a safety check and this task has no way to ask a person, so it was not run: <code>: <message>` |
+| Malformed checks | Does not run, nobody is asked | `is_error: true`: `the driver returned a malformed safety check with this call, so it was not run` |
+| No reply within [`lifecycle.input_timeout_secs`](manifest.md#lifecycle-input-timeout-secs) | Does not run | `is_error: true`; the attempt ends, and the task ends `TASK_STATE_FAILED` with `input-timeout` unless an `on-task-end` hook reopens it |
+| The task is canceled while it waits | Does not run | The task is canceled |
+
+Several checks on one call are one prompt and one answer; the texts join them with `; `. A driver
+that sends its provider an acknowledgement reads `acknowledged_safety_checks` from the tool
+message on its next request.
+
 ---
 
 ## `murmur:artifact-manager/manage`
@@ -439,6 +509,9 @@ is expected to reply.
 
 It is available in the `tool` world only, and only while the capsule is running an A2A task.
 Called anywhere else, it returns an error immediately.
+
+A driver's [safety checks](#safety-checks) on a tool call raise `input-required` the same way,
+with the same reply and the same timeout.
 
 **Timeout:** `lifecycle.input_timeout_secs` in the manifest (see
 [lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,

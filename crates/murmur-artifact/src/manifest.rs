@@ -459,10 +459,18 @@ pub struct ModelLimits {
     /// The most input tokens the provider accepts in one request, at most `context_window`;
     /// `None` when the entry declares no input ceiling.
     pub max_input_tokens: Option<u32>,
+    /// Whether the model reads images. `None` when the entry does not say; only `Some(false)`
+    /// refuses a capsule that declares a computer tool ([`ProviderToolKind::Computer`]).
+    pub vision: Option<bool>,
 }
 
-/// The keys one `models:` entry may hold: the first two required, `max_input_tokens` optional.
-const MODEL_LIMITS_KEYS: [&str; 3] = ["max_output_tokens", "context_window", "max_input_tokens"];
+/// The keys one `models:` entry may hold: the first two required, the others optional.
+const MODEL_LIMITS_KEYS: [&str; 4] = [
+    "max_output_tokens",
+    "context_window",
+    "max_input_tokens",
+    "vision",
+];
 
 /// Reads the top-level `models:` table from an artifact's bundled manifest text, keyed by the
 /// exact model id each entry names.
@@ -470,8 +478,9 @@ const MODEL_LIMITS_KEYS: [&str; 3] = ["max_output_tokens", "context_window", "ma
 /// An absent key is an empty table. `Err` names the dotted field at fault: `models` that is not a
 /// mapping, declared on an artifact whose `runtime` is not `driver`, or holding a non-string or
 /// empty model id; an entry that is not a mapping, lacks a required key, holds a key other than
-/// `max_output_tokens`, `context_window` and `max_input_tokens`, a value that is not an integer
-/// in `1..=u32::MAX`, or a `max_input_tokens` above its `context_window`.
+/// `max_output_tokens`, `context_window`, `max_input_tokens` and `vision`, a limit that is not an
+/// integer in `1..=u32::MAX`, a `vision` that is not a boolean, or a `max_input_tokens` above its
+/// `context_window`.
 pub fn parse_model_limits(
     manifest_yaml: &str,
 ) -> Result<BTreeMap<String, ModelLimits>, ManifestError> {
@@ -534,7 +543,7 @@ pub fn parse_model_limits(
                         .map_or_else(|| yaml_type_name(extra), str::to_string)
                 ),
                 message: "is not a model limit; an entry holds max_output_tokens and \
-                          context_window, and optionally max_input_tokens"
+                          context_window, and optionally max_input_tokens and vision"
                     .to_string(),
             });
         }
@@ -562,10 +571,22 @@ pub fn parse_model_limits(
                 field: format!("{entry_field}.{name}"),
             })
         };
+        let vision = match entry.get(Value::String(MODEL_LIMITS_KEYS[3].to_string())) {
+            None => None,
+            Some(Value::Bool(vision)) => Some(*vision),
+            Some(other) => {
+                return Err(ManifestError::InvalidType {
+                    field: format!("{entry_field}.{}", MODEL_LIMITS_KEYS[3]),
+                    expected: "boolean".to_string(),
+                    got: yaml_type_name(other),
+                })
+            }
+        };
         let limits = ModelLimits {
             max_output_tokens: limit(MODEL_LIMITS_KEYS[0])?,
             context_window: limit(MODEL_LIMITS_KEYS[1])?,
             max_input_tokens: optional_limit(MODEL_LIMITS_KEYS[2])?,
+            vision,
         };
         if let Some(ceiling) = limits
             .max_input_tokens
@@ -583,6 +604,326 @@ pub fn parse_model_limits(
         table.insert(id.to_string(), limits);
     }
     Ok(table)
+}
+
+/// The top-level key under which a `runtime: tool` artifact's own `murmur.yaml` says the tool is
+/// one a provider defines itself.
+pub const PROVIDER_TOOL_KEY: &str = "provider_tool";
+
+/// What a tool artifact says it is, from the top-level `provider_tool:` block of its bundled
+/// `murmur.yaml`:
+///
+/// ```yaml
+/// provider_tool:
+///   kind: computer
+///   display_width: 1280
+///   display_height: 800
+/// ```
+///
+/// The runtime passes the block to the driver on the tool's tool-array entry. Which tool the
+/// driver sends its provider for it is the driver's to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderTool {
+    pub kind: ProviderToolKind,
+    /// The width in pixels of the display the tool shows the model, from 1 to 65535.
+    pub display_width: u16,
+    /// The height in pixels of that display, from 1 to 65535.
+    pub display_height: u16,
+}
+
+/// The provider tool kinds a tool artifact may declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProviderToolKind {
+    /// The tool operates a display, keyboard and pointer, and returns screenshots.
+    Computer,
+}
+
+impl ProviderToolKind {
+    /// Every known kind, in the order a refusal lists them.
+    pub const ALL: [Self; 1] = [Self::Computer];
+
+    /// The kind as `provider_tool.kind` spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Computer => "computer",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == text)
+    }
+}
+
+impl std::fmt::Display for ProviderToolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ProviderTool {
+    /// The block as the tool's tool-array entry carries it, every declared key with its declared
+    /// value: `{"kind": "computer", "display_width": <n>, "display_height": <n>}`.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind.as_str(),
+            "display_width": self.display_width,
+            "display_height": self.display_height,
+        })
+    }
+
+    /// [`parse_provider_tool`] over a manifest already parsed into a YAML value.
+    pub fn from_manifest_value(value: &Value) -> Result<Option<Self>, ManifestError> {
+        const FIELD: &str = PROVIDER_TOOL_KEY;
+        let Some(root) = value.as_mapping() else {
+            return Ok(None);
+        };
+        let Some(block) = root.get(Value::String(FIELD.to_string())) else {
+            return Ok(None);
+        };
+        let runtime = optional_string(root, "runtime").unwrap_or_default();
+        if matches!(runtime.as_str(), "driver" | "hook" | "skill") {
+            return Err(ManifestError::InvalidValue {
+                field: FIELD.to_string(),
+                message: format!(
+                    "is only valid on an artifact whose runtime is tool; this one is runtime: \
+                     {runtime}"
+                ),
+            });
+        }
+        let block = block
+            .as_mapping()
+            .ok_or_else(|| ManifestError::InvalidType {
+                field: FIELD.to_string(),
+                expected: "mapping".to_string(),
+                got: yaml_type_name(block),
+            })?;
+        let known_kinds = || {
+            ProviderToolKind::ALL
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let kind_value = block
+            .get(Value::String("kind".to_string()))
+            .ok_or_else(|| ManifestError::MissingField {
+                field: format!("{FIELD}.kind"),
+            })?;
+        let kind_text = kind_value
+            .as_str()
+            .ok_or_else(|| ManifestError::InvalidType {
+                field: format!("{FIELD}.kind"),
+                expected: "string".to_string(),
+                got: yaml_type_name(kind_value),
+            })?;
+        let kind =
+            ProviderToolKind::parse(kind_text).ok_or_else(|| ManifestError::InvalidValue {
+                field: format!("{FIELD}.kind"),
+                message: format!(
+                    "is '{kind_text}', which is not a provider tool kind; the known kinds are: {}",
+                    known_kinds()
+                ),
+            })?;
+        const COMPUTER_KEYS: [&str; 3] = ["kind", "display_width", "display_height"];
+        if let Some(extra) = block
+            .keys()
+            .find(|key| !key.as_str().is_some_and(|k| COMPUTER_KEYS.contains(&k)))
+        {
+            return Err(ManifestError::InvalidValue {
+                field: format!(
+                    "{FIELD}.{}",
+                    extra
+                        .as_str()
+                        .map_or_else(|| yaml_type_name(extra), str::to_string)
+                ),
+                message: format!(
+                    "is not a key of a {kind} provider tool; it holds kind, display_width and \
+                     display_height"
+                ),
+            });
+        }
+        let pixels = |name: &str| -> Result<u16, ManifestError> {
+            let field = format!("{FIELD}.{name}");
+            let value = block.get(Value::String(name.to_string())).ok_or_else(|| {
+                ManifestError::MissingField {
+                    field: field.clone(),
+                }
+            })?;
+            let count = value.as_u64().ok_or_else(|| ManifestError::InvalidType {
+                field: field.clone(),
+                expected: "integer".to_string(),
+                got: yaml_type_name(value),
+            })?;
+            u16::try_from(count)
+                .ok()
+                .filter(|count| *count >= 1)
+                .ok_or_else(|| ManifestError::InvalidValue {
+                    field,
+                    message: format!("must be an integer from 1 to {}", u16::MAX),
+                })
+        };
+        Ok(Some(Self {
+            kind,
+            display_width: pixels("display_width")?,
+            display_height: pixels("display_height")?,
+        }))
+    }
+}
+
+/// Reads the top-level `provider_tool:` block from an artifact's bundled manifest text.
+///
+/// `Ok(None)` means the manifest has no `provider_tool` key. `Err` names the dotted field at
+/// fault: the block declared on a `driver`, `hook` or `skill` artifact, or not a mapping; `kind`
+/// missing, not a string, or not one of [`ProviderToolKind::ALL`] (the message lists them); a key
+/// other than `kind`, `display_width` and `display_height`; a display size missing, not an
+/// integer, or outside `1..=65535`.
+pub fn parse_provider_tool(manifest_yaml: &str) -> Result<Option<ProviderTool>, ManifestError> {
+    ProviderTool::from_manifest_value(&parse_manifest_value(manifest_yaml)?)
+}
+
+#[cfg(test)]
+mod provider_tool_tests {
+    use super::*;
+
+    fn tool(block: &str) -> String {
+        format!("name: computer\nversion: 0.1.0\nruntime: tool\n{block}")
+    }
+
+    fn refusal(manifest: &str) -> String {
+        parse_provider_tool(manifest)
+            .expect_err("the block is refused")
+            .to_string()
+    }
+
+    const VALID: &str = "provider_tool:\n  kind: computer\n  display_width: 1280\n  \
+                         display_height: 800\n";
+
+    #[test]
+    fn provider_tool_absent_is_none() {
+        assert_eq!(parse_provider_tool(&tool("")).unwrap(), None);
+        assert_eq!(parse_provider_tool("").unwrap(), None);
+    }
+
+    #[test]
+    fn provider_tool_a_computer_block_parses_as_declared() {
+        let declared = parse_provider_tool(&tool(VALID)).unwrap().unwrap();
+        assert_eq!(
+            declared,
+            ProviderTool {
+                kind: ProviderToolKind::Computer,
+                display_width: 1280,
+                display_height: 800,
+            }
+        );
+        assert_eq!(
+            declared.to_json(),
+            serde_json::json!({"kind": "computer", "display_width": 1280, "display_height": 800})
+        );
+        let edges = parse_provider_tool(&tool(
+            "provider_tool:\n  kind: computer\n  display_width: 1\n  display_height: 65535\n",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!((edges.display_width, edges.display_height), (1, 65535));
+    }
+
+    #[test]
+    fn provider_tool_a_malformed_block_is_refused_naming_the_field() {
+        for (block, expected) in [
+            (
+                "provider_tool: computer\n",
+                "field 'provider_tool' has invalid type (expected mapping, got string)",
+            ),
+            (
+                "provider_tool:\n",
+                "field 'provider_tool' has invalid type (expected mapping, got null)",
+            ),
+            (
+                "provider_tool:\n  display_width: 1280\n  display_height: 800\n",
+                "missing required field 'provider_tool.kind'",
+            ),
+            (
+                "provider_tool:\n  kind: phone\n  display_width: 1280\n  display_height: 800\n",
+                "field 'provider_tool.kind' is 'phone', which is not a provider tool kind; the \
+                 known kinds are: computer",
+            ),
+            (
+                "provider_tool:\n  kind: 3\n  display_width: 1280\n  display_height: 800\n",
+                "field 'provider_tool.kind' has invalid type (expected string, got number)",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_height: 800\n",
+                "missing required field 'provider_tool.display_width'",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 1280\n",
+                "missing required field 'provider_tool.display_height'",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 0\n  display_height: 800\n",
+                "field 'provider_tool.display_width' must be an integer from 1 to 65535",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: \
+                 65536\n",
+                "field 'provider_tool.display_height' must be an integer from 1 to 65535",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 65536\n  display_height: 800\n",
+                "field 'provider_tool.display_width' must be an integer from 1 to 65535",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: \"1280\"\n  display_height: \
+                 800\n",
+                "field 'provider_tool.display_width' has invalid type (expected integer, got \
+                 string)",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 1280.5\n  display_height: \
+                 800\n",
+                "field 'provider_tool.display_width' has invalid type (expected integer, got \
+                 number)",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: \
+                 800.0\n",
+                "field 'provider_tool.display_height' has invalid type (expected integer, got \
+                 number)",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: -1\n  display_height: 800\n",
+                "field 'provider_tool.display_width' has invalid type (expected integer, got \
+                 number)",
+            ),
+            (
+                "provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: \
+                 800\n  dpi: 2\n",
+                "field 'provider_tool.dpi' is not a key of a computer provider tool; it holds \
+                 kind, display_width and display_height",
+            ),
+        ] {
+            let message = refusal(&tool(block));
+            assert!(message.contains(expected), "{block:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn provider_tool_on_a_driver_hook_or_skill_is_refused() {
+        for runtime in ["driver", "hook", "skill"] {
+            let message = refusal(&format!(
+                "name: x\nversion: 0.1.0\nruntime: {runtime}\n{VALID}"
+            ));
+            assert!(
+                message.contains(&format!(
+                    "field 'provider_tool' is only valid on an artifact whose runtime is tool; \
+                     this one is runtime: {runtime}"
+                )),
+                "{runtime}: {message}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +953,7 @@ mod model_limits_tests {
                 max_output_tokens: 131_072,
                 context_window: 200_000,
                 max_input_tokens: None,
+                vision: None,
             })
         );
         assert_eq!(table["GLM-5.3-2026"].context_window, u32::MAX);
@@ -633,6 +975,7 @@ mod model_limits_tests {
                 max_output_tokens: 128_000,
                 context_window: 1_050_000,
                 max_input_tokens: Some(922_000),
+                vision: None,
             }
         );
         assert_eq!(table["at-window"].max_input_tokens, Some(400_000));
@@ -679,7 +1022,7 @@ mod model_limits_tests {
                 "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
                  max_tokens: 5\n",
                 "field 'models.m.max_tokens' is not a model limit; an entry holds \
-                 max_output_tokens and context_window, and optionally max_input_tokens",
+                 max_output_tokens and context_window, and optionally max_input_tokens and vision",
             ),
             (
                 "models:\n  m:\n    max_output_tokens: 10\n    context_window: 1050000\n    \
@@ -709,6 +1052,39 @@ mod model_limits_tests {
         ] {
             let message = refusal(models);
             assert!(message.contains(expected), "{models:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn model_limits_an_entry_may_say_whether_the_model_reads_images() {
+        let table = parse_model_limits(&driver(
+            "models:\n  sees:\n    max_output_tokens: 10\n    context_window: 20\n    \
+             vision: true\n  blind:\n    max_output_tokens: 10\n    context_window: 20\n    \
+             vision: false\n  unsaid:\n    max_output_tokens: 10\n    context_window: 20\n",
+        ))
+        .unwrap();
+        assert_eq!(table["sees"].vision, Some(true));
+        assert_eq!(table["blind"].vision, Some(false));
+        assert_eq!(table["unsaid"].vision, None);
+    }
+
+    #[test]
+    fn model_limits_a_vision_that_is_not_a_boolean_is_refused() {
+        for (value, got) in [
+            ("\"no\"", "string"),
+            ("0", "number"),
+            ("[true]", "sequence"),
+        ] {
+            let message = refusal(&format!(
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
+                 vision: {value}\n"
+            ));
+            assert!(
+                message.contains(&format!(
+                    "field 'models.m.vision' has invalid type (expected boolean, got {got})"
+                )),
+                "{value}: {message}"
+            );
         }
     }
 

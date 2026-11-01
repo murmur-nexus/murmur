@@ -17,7 +17,10 @@
 //! 4. the payload: the stores first, the source only for a version no store holds; its hash, its
 //!    tier ([`install_grant::refuse_after_resolve`]), its fit against the served level, and the
 //!    scope's owner id against `murmur.lock`;
-//! 5. the lock entry an operator or an earlier pull already holds.
+//! 5. the lock entry an operator or an earlier pull already holds;
+//! 6. for a payload whose manifest declares `provider_tool:`, the terms staging holds a declared
+//!    one to: the `sealed` floor and no driver choice whose model is `vision: false`
+//!    ([`crate::provider_tool::ProviderToolTerms`]).
 //!
 //! Then it writes `tools/<tool>/` through the staging writes, compiles or installs the payload,
 //! pins it in `murmur.lock` with `origin: runtime` and, when known, the scope's owner id, and
@@ -66,6 +69,10 @@ const MAX_LISTED: usize = 50;
 const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001";
 /// The code a pull refused for its scope's owner carries, the one `mur install` uses.
 const E_REG_010: &str = "E-REG-010";
+/// The codes a provider tool pull is refused under, as staging renders the same refusals.
+const E_CAP_003: &str = "E-CAP-003";
+const E_RUN_057: &str = "E-RUN-057";
+const E_RUN_058: &str = "E-RUN-058";
 
 /// The input schema both tools declare.
 const ARTIFACT_INPUT_SCHEMA: &str =
@@ -818,6 +825,29 @@ impl CapsuleStoreState {
         Ok(())
     }
 
+    /// Refuses a payload whose manifest declares `provider_tool:` unless this session meets the
+    /// terms staging holds a declared one to: the `sealed` floor, and no driver choice whose model
+    /// is `vision: false`. The refusals are staging's, under their codes.
+    fn admit_provider_tool(
+        &self,
+        tool: &str,
+        label: &str,
+        manifest_yaml: &str,
+    ) -> Result<(), String> {
+        let refused = |code: &str, error: RuntimeError| format!("{NOT_FETCHED} [{code}] {error}");
+        let declared = crate::provider_tool::pulled_provider_tool(tool, label, manifest_yaml)
+            .map_err(|error| refused(E_RUN_058, error))?;
+        let Some(declared) = declared else {
+            return Ok(());
+        };
+        self.provider_tool_terms
+            .admit(&declared)
+            .map_err(|error| match error {
+                RuntimeError::ProviderToolNeedsVision { .. } => refused(E_RUN_057, error),
+                other => refused(E_CAP_003, other),
+            })
+    }
+
     /// Write, compile and pin a checked payload, then record it in the session.
     fn install_payload(
         &mut self,
@@ -851,6 +881,7 @@ impl CapsuleStoreState {
         // <runtime dir>/tools/<name>/ — nothing is written before every check above has passed.
         let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
             .map_err(|err| err.to_string())?;
+        self.admit_provider_tool(&tool, &format!("{name}@{version}"), &manifest_yaml)?;
         write_tool_manifest(&self.runtime_root, &tool, &manifest_yaml)
             .map_err(|err| err.to_string())?;
 
@@ -1402,6 +1433,121 @@ mod tests {
             "{err}"
         );
         assert_eq!(snapshot(&project, &state), before);
+    }
+
+    const COMPUTER: &str = "local/tool-computer";
+
+    /// A WASM tool whose manifest declares itself a computer.
+    fn publish_computer(project: &Project, version: &str) {
+        project.publish_at(
+            COMPUTER,
+            version,
+            RuntimeType::Wasm,
+            "tool",
+            zip_with_files(&[
+                (
+                    PACKED_MANIFEST_ENTRY,
+                    format!(
+                        "name: tool-computer\nversion: {version}\nruntime: tool\nprovider_tool:\n  \
+                         kind: computer\n  display_width: 1280\n  display_height: 800\n"
+                    )
+                    .as_bytes(),
+                ),
+                ("tool.wasm", &echo_tool()),
+            ]),
+        );
+    }
+
+    fn terms(
+        declared_floor: murmur_artifact::ContainmentClass,
+        no_vision: bool,
+    ) -> crate::provider_tool::ProviderToolTerms {
+        crate::provider_tool::ProviderToolTerms {
+            declared_floor,
+            host_can_back: murmur_artifact::ContainmentClass::Sealed,
+            no_vision: if no_vision {
+                vec![crate::provider_tool::NoVisionChoice {
+                    choice: "fallback".to_string(),
+                    model: "probe-model".to_string(),
+                    driver: "local/drv@0.1.0".to_string(),
+                }]
+            } else {
+                Vec::new()
+            },
+            declared: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_tool_pull_into_a_scoped_session_is_refused_and_writes_nothing() {
+        let project = Project::new();
+        publish_computer(&project, "1.0.0");
+        let mut state = project.session(&[], &["local/tool-*"]);
+        state.provider_tool_terms = terms(murmur_artifact::ContainmentClass::Scoped, false);
+        let before = snapshot(&project, &state);
+
+        let err = manage::Host::pull(&mut state, COMPUTER.to_string(), "1.0.0".to_string())
+            .expect_err("a computer tool needs a sealed session");
+
+        assert_eq!(
+            err,
+            "not-fetched: [E-CAP-003] tool 'tool-computer' (provider_tool: computer) declares a \
+             provider tool, which runs only under the 'sealed' containment floor, and the \
+             effective containment floor is 'scoped'"
+        );
+        assert_eq!(snapshot(&project, &state), before);
+        assert!(!project.workdir.join("tools/tool-computer").exists());
+    }
+
+    #[test]
+    fn provider_tool_pull_with_a_vision_false_choice_is_refused_and_writes_nothing() {
+        let project = Project::new();
+        publish_computer(&project, "1.0.0");
+        let mut state = project.session(&[], &["local/tool-*"]);
+        state.provider_tool_terms = terms(murmur_artifact::ContainmentClass::Sealed, true);
+        let before = snapshot(&project, &state);
+
+        let err = manage::Host::pull(&mut state, COMPUTER.to_string(), "1.0.0".to_string())
+            .expect_err("a computer tool needs every choice's model to see");
+
+        assert_eq!(
+            err,
+            "not-fetched: [E-RUN-057] tool 'tool-computer' is a computer (provider_tool: \
+             computer) but model 'probe-model' of driver choice 'fallback' has no vision: driver \
+             local/drv@0.1.0 declares vision: false for it"
+        );
+        assert_eq!(snapshot(&project, &state), before);
+        assert!(!project.workdir.join("tools/tool-computer").exists());
+    }
+
+    #[test]
+    fn provider_tool_pull_an_ordinary_tool_still_pulls_and_sealed_takes_a_computer() {
+        under_scratch_home("provider_tool_inner_an_ordinary_tool_still_pulls");
+    }
+
+    #[test]
+    #[ignore = "run by provider_tool_pull_an_ordinary_tool_still_pulls_and_sealed_takes_a_computer"]
+    fn provider_tool_inner_an_ordinary_tool_still_pulls() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = Project::new();
+        publish_tool(&project, EDITOR, "1.0.0", &echo_tool());
+        publish_computer(&project, "1.0.0");
+        let mut state = project.session(&[], &["local/tool-*"]);
+        state.provider_tool_terms = terms(murmur_artifact::ContainmentClass::Scoped, true);
+        state
+            .pull_artifact(EDITOR, Some("1.0.0"))
+            .expect("a tool that declares no provider tool pulls under any terms");
+
+        let project = Project::new();
+        publish_computer(&project, "1.0.0");
+        let mut state = project.session(&[], &["local/tool-*"]);
+        state.provider_tool_terms = terms(murmur_artifact::ContainmentClass::Sealed, false);
+        let pulled = state
+            .pull_artifact(COMPUTER, Some("1.0.0"))
+            .expect("a sealed session whose models see takes a computer tool");
+        assert_eq!(pulled.summary.name, COMPUTER);
     }
 
     #[test]

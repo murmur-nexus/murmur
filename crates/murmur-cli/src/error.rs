@@ -106,6 +106,8 @@ pub const E_RUN_053: &str = "E-RUN-053"; // the session reached its mur run --de
 pub const E_RUN_054: &str = "E-RUN-054"; // inference.compaction.max_tokens is above the primary driver's output ceiling for the compaction model
 pub const E_RUN_055: &str = "E-RUN-055"; // a driver choice's output cap, or inference.compaction.max_tokens, leaves no input budget in its context window
 pub const E_RUN_056: &str = "E-RUN-056"; // the running session an address resolved to is a script capsule, which binds no door
+pub const E_RUN_057: &str = "E-RUN-057"; // a computer tool is declared and a driver choice's model is vision: false
+pub const E_RUN_058: &str = "E-RUN-058"; // an installed artifact ships a malformed provider_tool: block
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -152,6 +154,7 @@ pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or co
 pub const E_BLD_003: &str = "E-BLD-003"; // packed entry set is not a launchable payload
 pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired block name
 pub const E_BLD_005: &str = "E-BLD-005"; // driver manifest's models: table is malformed or on a non-driver
+pub const E_BLD_006: &str = "E-BLD-006"; // artifact manifest's provider_tool: block is malformed or on a driver, hook or skill
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -726,6 +729,27 @@ impl From<RuntimeError> for CliError {
             // this one means the capsule's own declaration is too weak for what it asked for
             // (raise it, or drop the grant). Deciding it on the declared floor alone is why this
             // fires identically on a host that could deliver `sealed`.
+            // Decided on the declared floor alone, like E-CAP-004 below, so its remedy is to raise
+            // the floor; it shares E-CAP-003 because the floor a provider tool needs is not met.
+            error @ RuntimeError::ProviderToolRequiresSealed { host_can_back, .. } => {
+                let host = if host_can_back == murmur_artifact::ContainmentClass::Sealed {
+                    "this host can back 'sealed'".to_string()
+                } else {
+                    format!(
+                        "this host can back '{host_can_back}', so the capsule also needs a host \
+                         that provides 'sealed'"
+                    )
+                };
+                CliError::with_hint(
+                    E_CAP_003,
+                    error.to_string(),
+                    format!(
+                        "set `capabilities.containment: sealed` in murmur.yaml (or pass \
+                         `--containment sealed`); {host} — see {}",
+                        murmur_artifact::docs_reference_url!("containment/#provider-tools")
+                    ),
+                )
+            }
             error @ RuntimeError::StagedRuntimeRequiresSealed { .. } => CliError::with_hint(
                 E_CAP_004,
                 error.to_string(),
@@ -805,6 +829,25 @@ impl From<RuntimeError> for CliError {
                 "declare the driver artifact in murmur.yaml artifacts: and run `mur run` to install it",
             ),
             RuntimeError::ModelLimits(error) => model_limits_error(&error),
+            error @ RuntimeError::ProviderToolNeedsVision { .. } => CliError::with_hint(
+                E_RUN_057,
+                error.to_string(),
+                format!(
+                    "run that driver choice on a model that reads images, or remove the computer \
+                     tool from artifacts: — see {}",
+                    murmur_artifact::diagnostic_link("E-RUN-057")
+                ),
+            ),
+            error @ RuntimeError::ProviderToolMalformed { .. } => CliError::with_hint(
+                E_RUN_058,
+                error.to_string(),
+                format!(
+                    "provider_tool: holds kind: computer with display_width and display_height, \
+                     each an integer from 1 to 65535; install a version of the artifact that \
+                     ships a valid block, or remove it from artifacts: — see {}",
+                    murmur_artifact::diagnostic_link("E-RUN-058")
+                ),
+            ),
             error @ RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth { .. } => {
                 CliError::with_hint(
                     E_RUN_025,
@@ -1252,8 +1295,15 @@ impl From<BuildError> for CliError {
                 error.to_string(),
                 "models: is a driver's table of model id to max_output_tokens and \
                  context_window, and optionally max_input_tokens (at most context_window), each \
-                 an integer from 1 to 4294967295; a driver shipped with a malformed table is \
-                 refused at launch with E-RUN-052",
+                 an integer from 1 to 4294967295, and vision, a boolean; a driver shipped with a \
+                 malformed table is refused at launch with E-RUN-052",
+            ),
+            error @ BuildError::ProviderTool(_) => CliError::with_hint(
+                E_BLD_006,
+                error.to_string(),
+                "provider_tool: goes on a runtime: tool artifact and holds kind: computer with \
+                 display_width and display_height, each an integer from 1 to 65535; a tool \
+                 shipped with a malformed block is refused at launch with E-RUN-058",
             ),
         }
     }
@@ -1641,6 +1691,131 @@ mod tests {
         assert!(hint.contains("unset it"), "{hint}");
     }
 
+    fn computer_tool(tool: &str) -> capsule_runtime::provider_tool::ProviderToolUse {
+        capsule_runtime::provider_tool::ProviderToolUse {
+            tool: tool.to_string(),
+            kind: murmur_artifact::ProviderToolKind::Computer,
+        }
+    }
+
+    /// A declared-`sealed` `E-CAP-003` names each provider tool on a `required by:` line under
+    /// its message, and without one renders exactly as before.
+    #[test]
+    fn provider_tool_required_by_line_on_the_sealed_floor_refusal() {
+        use capsule_runtime::containment::ShortfallCause;
+        use murmur_artifact::ContainmentClass;
+        let render = |required_by| {
+            CliError::from(RuntimeError::ContainmentFloorUnmet {
+                declared: ContainmentClass::Sealed,
+                achieved: ContainmentClass::Scoped,
+                reason: "no mount namespace".to_string(),
+                cause: ShortfallCause::Host,
+                required_by,
+            })
+            .to_string()
+        };
+        let plain = "error[E-CAP-003]: declared containment class 'sealed' is not achievable on \
+                     this host (achieved: 'scoped'): no mount namespace\n  hint: lower the \
+                     declared floor to 'scoped' (capabilities.containment in murmur.yaml, \
+                     containment in .murmur/config.yaml, or --containment), or run on a host that \
+                     provides 'sealed'";
+        assert_eq!(render(Vec::new()), plain);
+        assert_eq!(
+            render(vec![computer_tool("computer"), computer_tool("screen")]),
+            plain.replace(
+                "no mount namespace\n",
+                "no mount namespace\n  required by: tool 'computer' (provider_tool: computer)\n  \
+                 required by: tool 'screen' (provider_tool: computer)\n"
+            )
+        );
+    }
+
+    /// `E-CAP-005` names each provider tool the same way, and without one renders exactly as
+    /// before.
+    #[test]
+    fn provider_tool_required_by_line_on_the_egress_namespace_refusal() {
+        use capsule_runtime::network_namespace::EgressNamespaceBlocker;
+        let render = |required_by| {
+            CliError::from(RuntimeError::EgressNamespaceUnavailable {
+                blocker: EgressNamespaceBlocker::KernelSupportMissing,
+                reason: "unshare failed".to_string(),
+                required_by,
+            })
+            .to_string()
+        };
+        let plain = format!(
+            "error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network \
+             namespace, so capabilities.network.allow cannot be enforced for it: unshare failed\n  \
+             hint: the refusal above names the exact remediation for this host. Run `mur doctor` \
+             to see what this machine can back — see {}",
+            murmur_artifact::diagnostic_link("E-CAP-005")
+        );
+        assert_eq!(render(Vec::new()), plain);
+        assert_eq!(
+            render(vec![computer_tool("computer")]),
+            plain.replace(
+                "unshare failed\n",
+                "unshare failed\n  required by: tool 'computer' (provider_tool: computer)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn provider_tool_refusals_render_under_their_codes() {
+        use murmur_artifact::ContainmentClass;
+        let sealed = CliError::from(RuntimeError::ProviderToolRequiresSealed {
+            tools: vec![("computer".to_string(), "computer".to_string())],
+            declared: ContainmentClass::Scoped,
+            host_can_back: ContainmentClass::Sealed,
+        });
+        assert_eq!(sealed.code, E_CAP_003);
+        assert_eq!(
+            sealed.message,
+            "tool 'computer' (provider_tool: computer) declares a provider tool, which runs only \
+             under the 'sealed' containment floor, and the effective containment floor is \
+             'scoped'"
+        );
+        let hint = sealed.hint.unwrap_or_default();
+        assert!(
+            hint.starts_with(
+                "set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment \
+                 sealed`); this host can back 'sealed'"
+            ),
+            "{hint}"
+        );
+        let weaker_host = CliError::from(RuntimeError::ProviderToolRequiresSealed {
+            tools: vec![
+                ("a".to_string(), "computer".to_string()),
+                ("b".to_string(), "computer".to_string()),
+            ],
+            declared: ContainmentClass::Advisory,
+            host_can_back: ContainmentClass::Scoped,
+        });
+        assert!(weaker_host
+            .message
+            .starts_with("tool 'a' (provider_tool: computer), tool 'b' (provider_tool: computer) declare a provider tool"));
+        assert!(weaker_host.hint.unwrap_or_default().contains(
+            "this host can back 'scoped', so the capsule also needs a host that provides 'sealed'"
+        ));
+        let vision = CliError::from(RuntimeError::ProviderToolNeedsVision {
+            tool: "computer".to_string(),
+            kind: murmur_artifact::ProviderToolKind::Computer,
+            model: "probe-model".to_string(),
+            choice: "primary".to_string(),
+            driver: "local/drv@0.1.0".to_string(),
+        });
+        assert_eq!(vision.code, E_RUN_057);
+        assert!(!vision.message.contains('\n'), "{}", vision.message);
+        let malformed = CliError::from(RuntimeError::ProviderToolMalformed {
+            artifact: "local/computer@0.1.0".to_string(),
+            reason: "murmur.yaml: field 'provider_tool.display_width' must be an integer from 1 \
+                     to 65535"
+                .to_string(),
+        });
+        assert_eq!(malformed.code, E_RUN_058);
+        assert!(malformed.message.contains("local/computer@0.1.0"));
+    }
+
     /// `E-CAP-003`'s hint names the change that meets the floor for the cause that missed it: a
     /// different host only when the host is what fell short.
     #[test]
@@ -1653,6 +1828,7 @@ mod tests {
                 achieved: ContainmentClass::Advisory,
                 reason: "a reason".to_string(),
                 cause,
+                required_by: Vec::new(),
             });
             assert_eq!(cli.code, E_CAP_003);
             cli.hint.unwrap_or_default()

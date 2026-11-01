@@ -80,6 +80,7 @@ pub mod plan;
 pub mod precompile;
 pub mod process_driver;
 pub(crate) mod protected_paths;
+pub mod provider_tool;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
 pub mod records_dir;

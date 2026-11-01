@@ -75,10 +75,10 @@ pub use lockfile::{
     MurmurLock, LOCK_VERSION,
 };
 pub use manifest::{
-    describe_yaml_shape, load_manifest, parse_model_limits, parse_upstream_auth,
-    refuse_retired_auth_block, Manifest, ManifestError, ModelLimits, UpstreamAuth,
-    REGISTRY_BLOCK_HINT, REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE, RETIRED_AUTH_BLOCK,
-    UPSTREAM_AUTH_KEY_PLACEHOLDER,
+    describe_yaml_shape, load_manifest, parse_model_limits, parse_provider_tool,
+    parse_upstream_auth, refuse_retired_auth_block, Manifest, ManifestError, ModelLimits,
+    ProviderTool, ProviderToolKind, UpstreamAuth, PROVIDER_TOOL_KEY, REGISTRY_BLOCK_HINT,
+    REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{

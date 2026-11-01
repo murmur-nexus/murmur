@@ -760,6 +760,9 @@ pub struct StagedSession {
     /// passes both to `sandbox::ShellEnforcement::resolve` rather than taking a new reading, so the
     /// mechanisms installed at launch are the ones [`Self::scope_report`] already claims.
     pub(crate) host_probe: crate::sandbox::HostProbe,
+    /// The provider tools this session staged with and what a runtime pull of one is checked
+    /// against. Its `declared` list is empty for a capsule that declares no provider tool.
+    pub(crate) provider_tool_terms: crate::provider_tool::ProviderToolTerms,
     /// Whether a literal `/tmp` reaches the session's temporary folder, decided once by
     /// `stage_session` from [`Self::host_probe`]: [`Self::scope_report`]'s `temp_dir` says it and
     /// `launch_session` hands it to the enforcement that installs it.

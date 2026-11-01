@@ -21,7 +21,8 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A skill ships supporting files by listing them here (`references/forms.md`); a skill folder with no `murmur.yaml` instead packs every file in it — see [`mur build` skill packaging](cli.md#skill-packaging-skill). A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 | `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
-| `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
+| `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens` and `vision`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
+| `provider_tool` | map | no | `runtime: tool` only. Says the tool is one the model's provider defines itself: `kind: computer` with `display_width` and `display_height`. Default: absent, an ordinary tool. A capsule that declares such a tool must run `sealed`. See [`provider_tool:` block](#provider-tool). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -94,10 +95,11 @@ models:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `models.<id>` | map | — | One entry per model id. The id is matched by exact string equality with `inference.model` or an alternate's `model`: no prefix, alias or case folding, so a driver that accepts a dated id and an alias lists both. Must not be empty. No key besides the three below |
+| `models.<id>` | map | — | One entry per model id. The id is matched by exact string equality with `inference.model` or an alternate's `model`: no prefix, alias or case folding, so a driver that accepts a dated id and an alias lists both. Must not be empty. No key besides the four below |
 | `models.<id>.max_output_tokens` | integer | yes | The most output tokens the model produces in one completion. `1` to `4294967295` |
 | `models.<id>.context_window` | integer | yes | The model's context window in tokens. `1` to `4294967295` |
 | `models.<id>.max_input_tokens` | integer | no | The most input tokens the provider accepts in one request for the model. `1` to `4294967295`, and at most `context_window`. With it, every call's [input budget](#inference-max-tokens) is at most this number |
+| `models.<id>.vision` | boolean | no | Whether the model reads images. Absent means unknown, and nothing is refused for it. `false` refuses a `transport: http` capsule that declares a [computer tool](#provider-tool) and runs this model on any driver choice, with [`E-RUN-057`](diagnostics.md#e-run-057) |
 
 | Case | Result |
 |---|---|
@@ -105,6 +107,41 @@ models:
 | A packed `murmur.yaml` whose `models:` is malformed | `mur install` and `mur publish` refuse with [`E-REG-011`](diagnostics.md#e-reg-011), naming `name@version` and the field, and write nothing to the store or `murmur.lock` |
 | A stored driver whose `models:` is malformed | `mur run` refuses with [`E-RUN-052`](diagnostics.md#e-run-052), naming the driver and the field |
 | The table lists no entry for a choice's model | The capsule's own `inference.max_tokens` and `context.max_tokens` apply; see [Output cap](#inference-max-tokens) |
+
+### `provider_tool:` block { #provider-tool }
+
+Declared in a `runtime: tool` artifact's own `murmur.yaml`, never in the capsule manifest. It says
+the tool is one the model's provider defines itself. The runtime adds the block, as declared, to
+the tool's entry in the tool array it hands the driver; which provider tool the driver sends for
+it is the driver's choice. See [Provider tools](wit-interfaces.md#provider-tools).
+
+```yaml
+name: computer
+version: "0.1.0"
+runtime: tool
+requires_files:
+  - tool.wasm
+provider_tool:
+  kind: computer
+  display_width: 1280
+  display_height: 800
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `provider_tool.kind` | string | yes | `computer`, the only kind: the tool operates a display, keyboard and pointer, and returns screenshots |
+| `provider_tool.display_width` | integer | yes | The display's width in pixels. `1` to `65535` |
+| `provider_tool.display_height` | integer | yes | The display's height in pixels. `1` to `65535` |
+
+No other key is accepted.
+
+| Case | Result |
+|---|---|
+| The block is malformed, or declared on a `driver`, `hook` or `skill` artifact | `mur build` refuses with [`E-BLD-006`](diagnostics.md#e-bld-006), naming the field |
+| A stored artifact whose block is malformed | `mur run` refuses with [`E-RUN-058`](diagnostics.md#e-run-058), naming `name@version` and the field |
+| The capsule's effective containment floor is below `sealed` | `mur run` refuses with [`E-CAP-003`](diagnostics.md#e-cap-003) before the session directory exists, naming every such tool — see [Provider tools](containment.md#provider-tools) |
+| A `transport: http` driver choice's model is [`vision: false`](#driver-models) | `mur run` refuses with [`E-RUN-057`](diagnostics.md#e-run-057) |
+| A running session pulls such a tool with `pull-artifact` | Refused on the same two terms, with nothing installed |
 
 ### `input_schema` { #input-schema }
 

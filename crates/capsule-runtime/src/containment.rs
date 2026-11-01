@@ -317,6 +317,7 @@ pub fn check_containment_floor(
             achieved,
             reason,
             cause,
+            required_by: Vec::new(),
         }),
     }
 }

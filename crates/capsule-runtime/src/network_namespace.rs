@@ -560,6 +560,7 @@ fn unavailable(failure: &EgressNamespaceFailure) -> crate::errors::RuntimeError 
     crate::errors::RuntimeError::EgressNamespaceUnavailable {
         blocker: failure.blocker,
         reason: failure.reason(),
+        required_by: Vec::new(),
     }
 }
 
@@ -1748,7 +1749,11 @@ mod tests {
             ProfileAttachment::Unconfined,
         );
         match check_egress_namespace(true, Some(&failure)) {
-            Err(crate::errors::RuntimeError::EgressNamespaceUnavailable { blocker, reason }) => {
+            Err(crate::errors::RuntimeError::EgressNamespaceUnavailable {
+                blocker,
+                reason,
+                ..
+            }) => {
                 assert_eq!(blocker, failure.blocker);
                 assert_eq!(reason, failure.reason());
             }

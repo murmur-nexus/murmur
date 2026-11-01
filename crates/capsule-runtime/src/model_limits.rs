@@ -175,6 +175,9 @@ pub struct ChoiceModelLimits {
     /// `W-RUN-009`'s text, code and link not included, when the driver's table does not list the
     /// model and the manifest does not set both keys.
     pub warning: Option<String>,
+    /// The table entry's `vision`; `None` when the entry does not say or the table does not list
+    /// the model.
+    pub vision: Option<bool>,
 }
 
 /// A driver choice's driver, as resolution reads it.
@@ -363,6 +366,7 @@ pub fn resolve_model_limits<'a>(
             driver: manifest.label.to_string(),
             limits,
             warning,
+            vision: declared.and_then(|declared| declared.vision),
         });
     }
     check_compaction_cap(inference, primary_driver, &tables, &resolved)?;
