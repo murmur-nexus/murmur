@@ -421,7 +421,7 @@ launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactl
 launch wrote.
 
 **It sits outside every work folder, and only the artifact that declared it can reach it.** A
-subtree of the work folder would be readable by anything that can reach the work folder — `murmur/tool-editor` and
+subtree of the work folder would be readable by anything that can reach the work folder — `murmur/tool-read` and
 `shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
 prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
 declares no artifact grant and reaches no store.

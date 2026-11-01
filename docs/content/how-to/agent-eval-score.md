@@ -34,8 +34,8 @@ The relevant manifest options are:
         capabilities:
           filesystem:
             records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
         runtime: tool
 
     capabilities:
@@ -63,7 +63,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [tool-editor]
+            expected: [tool-read]
     ```
 
 === "OpenAI"
@@ -85,8 +85,8 @@ The relevant manifest options are:
         capabilities:
           filesystem:
             records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
         runtime: tool
 
     capabilities:
@@ -114,7 +114,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [tool-editor]
+            expected: [tool-read]
     ```
 
 === "DeepSeek"
@@ -136,8 +136,8 @@ The relevant manifest options are:
         capabilities:
           filesystem:
             records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
         runtime: tool
 
     capabilities:
@@ -165,7 +165,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [tool-editor]
+            expected: [tool-read]
     ```
 
 **What each scorer does:**
@@ -202,7 +202,7 @@ Create one task file in the project root:
 Read murmur-runtime/MURMUR.md, then draft a one-sentence summary of the Murmur project. Reply with only the final sentence.
 ```
 
-The task starts with a tool call — the agent reads `MURMUR.md` (the capsule environment reference the runtime writes for every agent session, which `tool-editor` reads at `murmur-runtime/MURMUR.md`) before answering. This is important: `tool_sequence` applies to every case in the dataset, so every case must call the tool. Grounding the task in a file read makes that natural.
+The task starts with a tool call — the agent reads `MURMUR.md` (the capsule environment reference the runtime writes for every agent session, which `tool-read` reads at `murmur-runtime/MURMUR.md`) before answering. This is important: `tool_sequence` applies to every case in the dataset, so every case must call the tool. Grounding the task in a file read makes that natural.
 
 The same task runs for all four cases — what differs is the `case_id`, which names the scorer each case is primarily meant to verify.
 
@@ -215,7 +215,7 @@ Then create `eval.jsonl`:
 { "case_id": "tool-check",  "task_path": "task.md" }
 ```
 
-Each `task_path` points to a file that is copied to the session's `task.md` before the session starts. `exit-check` verifies `success_check` (clean exit); `turns-check` verifies `turn_limit` (read + answer takes two inference turns, well within five); `size-check` verifies `response_size` (MURMUR.md content adds roughly 1200 tokens to the second turn, bringing the total to ~2450, within the 3000-token budget); `tool-check` verifies `tool_order` (the editor was called before the answer).
+Each `task_path` points to a file that is copied to the session's `task.md` before the session starts. `exit-check` verifies `success_check` (clean exit); `turns-check` verifies `turn_limit` (read + answer takes two inference turns, well within five); `size-check` verifies `response_size` (MURMUR.md content adds roughly 1200 tokens to the second turn, bringing the total to ~2450, within the 3000-token budget); `tool-check` verifies `tool_order` (`tool-read` was called before the answer).
 
 The `case_id` is injected into the hook environment as `MURMUR_CASE_ID` and appears in every `dataset_run` record — it's how you identify each case in the output.
 
@@ -470,7 +470,7 @@ and the [eval-run record](../reference/observability-schemas.md#eval-run-record)
 |---|---|
 | Declare `murmur/hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
 | Grant it `capabilities.filesystem.records: true` on its own entry | Lets it write `eval.jsonl` into the records directory beside the trace; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
-| Declare `murmur/tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
+| Declare `murmur/tool-read` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |
 | `mur eval run` | Runs all cases against `eval.jsonl` and prints a pass/fail summary |

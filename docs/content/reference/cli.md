@@ -3276,9 +3276,9 @@ A call refused because its input lacked a field the tool's
 every missing field, followed by a `tool_call` row marked `✗` on both transports:
 
 ```text
-  turn 0  tool_call  tool-editor
-    tool_input_refused tool-editor  missing operation
-    tool_call  tool-editor  0ms  ✗
+  turn 0  tool_call  tool-write
+    tool_input_refused tool-write  missing content
+    tool_call  tool-write  0ms  ✗
 ```
 
 | Transport | Where the `tool_call` row comes from |

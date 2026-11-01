@@ -214,7 +214,7 @@ context:
 
 ## Step 7 — give the capsule a place to write its own notes
 
-The conversation record and the memory hook cover what the model *said*. For structured notes the agent writes on purpose — findings, decisions, anything worth keeping past the task that produced it — declare a durable state store instead. `murmur/tool-corpus` is the shipped implementation: an append-only, schema-validated record store the capsule's own `murmur/tool-editor` or shell grant cannot reach, because it lives outside the workdir entirely.
+The conversation record and the memory hook cover what the model *said*. For structured notes the agent writes on purpose — findings, decisions, anything worth keeping past the task that produced it — declare a durable state store instead. `murmur/tool-corpus` is the shipped implementation: an append-only, schema-validated record store the capsule's own `murmur/tool-read`, `murmur/tool-write` or shell grant cannot reach, because it lives outside the workdir entirely.
 
 ```yaml
 artifacts:
