@@ -59,7 +59,7 @@ the bare name:
 | Inside a session: the tool name the model calls, `tools/<name>/` in the [runtime directory](../reference/workdir.md#runtime-directory), skill names in `MURMUR.md` | `tool-git` |
 
 Because a session names each artifact by its bare name, two artifacts a capsule declares cannot
-share one: `murmur/tool-editor` and `ana/tool-editor` together are refused with
+share one: `murmur/tool-edit` and `ana/tool-edit` together are refused with
 [`E-CAP-020`](../reference/diagnostics.md#e-cap-020).
 
 ### Store layout { #store-layout }

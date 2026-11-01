@@ -263,8 +263,8 @@ artifacts:
   - name: murmur/tool-git
     version: "{{ v.murmur_tool_git }}"
     runtime: tool
-  - name: murmur/tool-editor
-    version: "{{ v.murmur_tool_editor }}"
+  - name: murmur/tool-edit
+    version: "{{ v.murmur_tool_edit }}"
     runtime: tool
     capabilities:
       network:
@@ -288,7 +288,7 @@ The effective grant is the intersection of what an artifact declares and the cei
 
 - **The driver** gets `network.allow: []` and reaches no host directly. Inference is unaffected: the runtime sends the driver's requests to the driver entry's `gateway.endpoint` itself and attaches `gateway.api_key` there, including for a driver call a hook's `run-inference` makes.
 - **The git tool** is a native tool, so it takes no per-artifact block: it runs under the capsule ceiling in the same sandbox as `bash`. It can run `git` because the ceiling's `shell.allow` names it. To fetch from or push to `github.com` it needs `https://github.com` in the ceiling's `network.allow` and, on Linux, an `interpreter_runtime` grant for `git` naming its helper directory (`/usr/lib/git-core` on Debian and Ubuntu): `git` runs its remote helpers from there, and the sandbox refuses them otherwise. See [Native tools](../reference/containment.md#native-tools).
-- **The editor tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
+- **The edit tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
 
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.
 

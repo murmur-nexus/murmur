@@ -150,7 +150,7 @@ JSON, or as a YAML mapping:
 
 ```yaml
 input_schema: |
-  {"type":"object","properties":{"operation":{"type":"string","enum":["write_file","replace_in_file"]},"dest_path":{"type":"string"},"content":{"type":"string"}},"required":["operation","dest_path"]}
+  {"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
 ```
 
 **Required fields are enforced.** Before a call to the tool runs, the runtime checks that every
@@ -159,13 +159,13 @@ of them is refused without running the tool — on `transport: http`, on `transp
 a [plan](#field-plan) `tool` step alike. The model is handed a failed tool result:
 
 ```text
-tool-editor: missing required field "operation"
+tool-write: missing required field "content"
 
-This call did not run. tool-editor's input_schema requires: "operation", "dest_path". Call it again with every one of them present. Only the presence of required fields is checked before a call runs — not their types, allowed values or nested contents.
+This call did not run. tool-write's input_schema requires: "path", "content". Call it again with every one of them present. Only the presence of required fields is checked before a call runs — not their types, allowed values or nested contents.
 ```
 
 With several fields missing, the first line names all of them: `missing required fields
-"operation", "dest_path"`. The trace records a
+"path", "content"`. The trace records a
 [`tool_input_refused`](observability-schemas.md#tool-input-refused) beside a `tool_call` with
 `status: "error"`; a plan step records the same text in its `plan_step` record's `error` instead. A
 refusal is an ordinary tool result: the turn continues, and every turn the model spends retrying

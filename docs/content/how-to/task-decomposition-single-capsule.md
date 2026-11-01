@@ -38,8 +38,11 @@ Six manifest fields work together to make the recursive pattern possible. Create
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
+        runtime: tool
+      - name: murmur/tool-write
+        version: "{{ v.murmur_tool_write }}"
         runtime: tool
 
     capabilities:
@@ -86,8 +89,11 @@ Six manifest fields work together to make the recursive pattern possible. Create
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
+        runtime: tool
+      - name: murmur/tool-write
+        version: "{{ v.murmur_tool_write }}"
         runtime: tool
 
     capabilities:
@@ -134,8 +140,11 @@ Six manifest fields work together to make the recursive pattern possible. Create
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur/tool-editor
-        version: "{{ v.murmur_tool_editor }}"
+      - name: murmur/tool-read
+        version: "{{ v.murmur_tool_read }}"
+        runtime: tool
+      - name: murmur/tool-write
+        version: "{{ v.murmur_tool_write }}"
         runtime: tool
 
     capabilities:
@@ -194,7 +203,7 @@ Create `instructions.md`:
 
 ```
 If this task starts with [EXECUTE]: strip the prefix, execute it directly,
-save all output using operation write_file to the named file, exit.
+save all output with tool-write to the named file, exit.
 
 Otherwise you are a router. The task is already in this message — do not read any files.
 Identify the ordered sequential steps in the goal, including any iteration or

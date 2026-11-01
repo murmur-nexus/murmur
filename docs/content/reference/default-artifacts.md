@@ -52,7 +52,7 @@ need a [`filesystem` grant](manifest.md#hook-capabilities).
 |---|---|---|
 | `murmur/hook-compact` | `on-compaction` | Summarizes conversation history when the session token threshold is reached, and replaces the context with the summary |
 | `murmur/hook-debug` | Every event except `on-stage` | Appends one JSON object per lifecycle event to `hook-debug.jsonl` |
-| `murmur/hook-diff-summary` | Every event | Snapshots files before each editor tool call and emits a unified-diff summary at the end of the turn |
+| `murmur/hook-diff-summary` | Every event | Snapshots files before each `tool-write` and `tool-edit` call and emits a unified-diff summary at the end of the turn |
 | `murmur/hook-eval` | Every event | Scores the session against the configured scorers and writes `eval.jsonl` |
 | `murmur/hook-grafana` | Every event | Emits OpenTelemetry spans for each lifecycle event to a Grafana Tempo OTLP/HTTP endpoint |
 | `murmur/hook-memory` | `on-task-start` | Seeds a task with the relevant, budget-bounded slice of the conversation record read so far |
@@ -139,11 +139,14 @@ files.
 | `murmur/tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
 | `murmur/tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
 | `murmur/tool-create` | Scaffolds a new tool artifact directory: `murmur.yaml`, a stub implementation and a README |
-| `murmur/tool-editor` | Reads, writes, patches and searches files without a shell grant |
+| `murmur/tool-edit` | Replaces exact text in a file, several edits at once, all or nothing |
+| `murmur/tool-find` | Searches file contents for a regex, optionally narrowed by a glob |
 | `murmur/tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
+| `murmur/tool-read` | Reads a file, or a range of its lines |
 | `murmur/tool-registry-search` | Searches the artifact index by keyword |
 | `murmur/tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
 | `murmur/tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
+| `murmur/tool-write` | Creates or replaces a file, and any missing directories |
 
 ### `murmur/tool-corpus` { #murmur-tool-corpus }
 

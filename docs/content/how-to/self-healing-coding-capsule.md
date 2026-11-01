@@ -89,11 +89,9 @@ The `install` block gives the model two tools, `pull-artifact` and `remove-artif
 mur install
 ```
 
-```
 --8<-- "includes/mur-pull-info.md"
-```
 
-`murmur/tool-editor` is not declared, so `mur install` does not install it. The capsule pulls it.
+`murmur/tool-edit` is not declared, so `mur install` does not install it. The capsule pulls it.
 
 ## Step 3 — write the task
 
@@ -132,33 +130,33 @@ The model lists what it may pull by passing a pattern ending in `*`:
 The result names each tool, its versions newest first, the version a pull would choose, and where it is held. A pattern pulls nothing:
 
 ```json
-{"pattern": "murmur/tool-*", "matches": [{"artifact": "murmur/tool-editor", "runtime": "tool", "description": "Structured file editing interface for Murmur capsules.", "versions": ["{{ v.murmur_tool_editor }}"], "newest_fitting": "{{ v.murmur_tool_editor }}", "held_in": ["github:murmur-nexus/default-artifacts"]}], "omitted": 0, "notes": []}
+{"pattern": "murmur/tool-*", "matches": [{"artifact": "murmur/tool-edit", "runtime": "tool", "description": "Replaces text in a file. Edits apply in order, each to the result of the one before; each old must match exactly once. All or nothing: if one fails, the file is unchanged and the error names its position, from 1. path is relative to the work folder; an absolute path is refused.\n", "versions": ["{{ v.murmur_tool_edit }}"], "newest_fitting": "{{ v.murmur_tool_edit }}", "held_in": ["github:murmur-nexus/default-artifacts"]}], "omitted": 0, "notes": []}
 ```
 
-It pulls the editor by name. With no version, the runtime takes the newest version that fits this `mur`:
+It pulls `tool-edit` by name. With no version, the runtime takes the newest version that fits this `mur`:
 
 ```json
-{"artifact": "murmur/tool-editor"}
+{"artifact": "murmur/tool-edit"}
 ```
 
 ```text
 <untrusted-content source=tool:pull-artifact>
-{"artifact":"murmur/tool-editor","fetched_from":"github:murmur-nexus/default-artifacts","runtime":"tool","tool_name":"tool-editor","version":"{{ v.murmur_tool_editor }}"}
+{"artifact":"murmur/tool-edit","fetched_from":"github:murmur-nexus/default-artifacts","runtime":"tool","tool_name":"tool-edit","version":"{{ v.murmur_tool_edit }}"}
 </untrusted-content>
-tool-editor is in your tool list from your next turn.
+tool-edit is in your tool list from your next turn.
 ```
 
-On its next turn the model is offered `tool-editor`, its description opening with `[origin: runtime, trust: untrusted]`, and calls it to patch the file. Once `cargo test` passes, it removes the tool:
+On its next turn the model is offered `tool-edit`, its description opening with `[origin: runtime, trust: untrusted]`, and calls it to patch the file. Once `cargo test` passes, it removes the tool:
 
 ```json
-{"artifact": "tool-editor"}
+{"artifact": "tool-edit"}
 ```
 
 ```text
 <untrusted-content source=tool:remove-artifact>
-{"artifact":"murmur/tool-editor","removed":true}
+{"artifact":"murmur/tool-edit","removed":true}
 </untrusted-content>
-tool-editor is gone from your tool list from your next turn; a call to it is refused.
+tool-edit is gone from your tool list from your next turn; a call to it is refused.
 ```
 
 A pull the grant does not admit, of a version that does not fit this `mur`, or of a hook or driver, comes back as a tool error opening with `not-granted:`, `not-found:`, `does-not-fit:` or `not-fetched:`, and writes nothing. The full list is in [`pull-artifact`](../reference/runtime-provided-tools.md#pull-artifact-refusals).
@@ -168,8 +166,8 @@ A pull the grant does not admit, of a version that does not fit this `mur`, or o
 While the tool was installed, `murmur.lock` held its pin, written by the runtime:
 
 ```yaml
-  - name: murmur/tool-editor
-    resolved_version: "{{ v.murmur_tool_editor }}"
+  - name: murmur/tool-edit
+    resolved_version: "{{ v.murmur_tool_edit }}"
     sha256:
       any: "<sha256>"
     origin: runtime
@@ -191,7 +189,7 @@ mur trace show
 
 ```
 ── Pulled at runtime ────────────────────────────
-  murmur/tool-editor@{{ v.murmur_tool_editor }}  tool  runtime/untrusted  from github:murmur-nexus/default-artifacts
+  murmur/tool-edit@{{ v.murmur_tool_edit }}  tool  runtime/untrusted  from github:murmur-nexus/default-artifacts
 ```
 
 `trace.jsonl` holds the detail: an `artifact_pulled` line with `fetched_from` and `owner_id`, and a `tools_refreshed` line with `trigger: "agent"` before each inference call whose tool list the model changed — see [Session trace](../reference/observability-schemas.md#tools-refreshed).
@@ -200,7 +198,7 @@ mur trace show
     The operator never vetted a pulled artifact. The model is told so in its tool list, and its results are fenced as untrusted data. Two controls sit on top of the grant:
 
     - An `on-tool-call` [policy hook](../concepts/hooks.md) decides on every `pull-artifact` call, as on any other tool call, so it can deny a pull by name or version.
-    - To make a pulled tool part of the capsule, declare it in `murmur.yaml` and run `mur install murmur/tool-editor@{{ v.murmur_tool_editor }}`. The install adopts the pin as `origin: operator`, and the tool is no longer marked untrusted.
+    - To make a pulled tool part of the capsule, declare it in `murmur.yaml` and run `mur install murmur/tool-edit@{{ v.murmur_tool_edit }}`. The install adopts the pin as `origin: operator`, and the tool is no longer marked untrusted.
 
 ---
 

@@ -66,8 +66,11 @@ artifacts:
   - name: murmur/driver-claude-code
     version: "{{ v.murmur_driver_claude_code }}"
     runtime: driver
-  - name: murmur/tool-editor
-    version: "{{ v.murmur_tool_editor }}"
+  - name: murmur/tool-read
+    version: "{{ v.murmur_tool_read }}"
+    runtime: tool
+  - name: murmur/tool-write
+    version: "{{ v.murmur_tool_write }}"
     runtime: tool
 
 capabilities:
@@ -97,9 +100,7 @@ Create an `instructions.md` file next to it with the agent's instructions. That 
 mur install
 ```
 
-```
 --8<-- "includes/mur-pull-info.md"
-```
 
 The driver is resolved like any other artifact. `mur run` then checks it three times before the harness starts, and refuses the launch on the first failure:
 
@@ -134,7 +135,7 @@ Two kinds of entry reach the model this way:
 
 | Declared as | Reaches the model as |
 |---|---|
-| A `runtime: tool` artifact, such as `murmur/tool-editor` | One tool per artifact, under the part of its name after the `/`: `tool-editor` |
+| A `runtime: tool` artifact, such as `murmur/tool-read` | One tool per artifact, under the part of its name after the `/`: `tool-read` |
 | A binary in [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | One tool per binary, running in the capsule workdir |
 
 `runtime: driver` and `runtime: hook` artifacts are not offered to the model, on this transport as on the other.
@@ -157,13 +158,9 @@ Watch what the harness actually called:
 mur trace show
 ```
 
-```
 --8<-- "includes/mur-trace-show-info.md"
-```
 
-```
 --8<-- "includes/mur-trace-explore.md"
-```
 
 The session's `harness_start` record names the driver, the harness, the absolute path of the binary spawned, the version it reported, and the capsule tool names the bridge offered. It records no argument values: a driver is free to put the tool server's bearer token in one.
 
@@ -218,9 +215,12 @@ artifacts:
   - name: murmur/driver-claude-code
     runtime: driver
     version: "{{ v.murmur_driver_claude_code }}"
-  - name: murmur/tool-editor
+  - name: murmur/tool-read
     runtime: tool
-    version: "{{ v.murmur_tool_editor }}"
+    version: "{{ v.murmur_tool_read }}"
+  - name: murmur/tool-edit
+    runtime: tool
+    version: "{{ v.murmur_tool_edit }}"
   - name: murmur/tool-code-graph
     runtime: tool
     version: "{{ v.murmur_tool_code_graph }}"

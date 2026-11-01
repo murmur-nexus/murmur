@@ -286,9 +286,9 @@ the runtime's note outside the fence:
 
 ```text
 <untrusted-content source=tool:pull-artifact>
-{"artifact":"murmur/tool-editor","fetched_from":"global store","runtime":"tool","tool_name":"tool-editor","version":"1.0.0"}
+{"artifact":"murmur/tool-edit","fetched_from":"global store","runtime":"tool","tool_name":"tool-edit","version":"1.0.0"}
 </untrusted-content>
-tool-editor is in your tool list from your next turn.
+tool-edit is in your tool list from your next turn.
 ```
 
 | Key | Value |

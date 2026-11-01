@@ -232,8 +232,8 @@ an artifact by its full name, `<scope>/<name>`. A bare name is refused, and the 
 scoped forms — see [Artifact names](../concepts/registry.md#artifact-names):
 
 ```text
-error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'tool-editor' is not a full artifact name: an artifact is named <scope>/<name>
-  hint: name it with its scope: 'murmur/tool-editor' for a Murmur default artifact, '<owner>/tool-editor' for one published from github.com/<owner>, or 'local/tool-editor' for one installed from a .mur.zip file
+error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'tool-edit' is not a full artifact name: an artifact is named <scope>/<name>
+  hint: name it with its scope: 'murmur/tool-edit' for a Murmur default artifact, '<owner>/tool-edit' for one published from github.com/<owner>, or 'local/tool-edit' for one installed from a .mur.zip file
 ```
 
 | Manifest | Refused because |
@@ -875,7 +875,7 @@ tool — refuses a version that does not fit before anything is written, as a to
 places the pull may use, or says none does:
 
 ```text
-does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 3, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 3 has murmur:tool-registry@0.2.0; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 3
+does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 3, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 3 has murmur:tool-registry@0.2.0; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 3
 ```
 
 | Situation | Hint |
@@ -1990,12 +1990,12 @@ after the `/`, and stages it under `tools/<tool name>/` in the session's
 tool name are refused, whatever their scopes:
 
 ```text
-error[E-CAP-020]: artifacts 'murmur/tool-editor' and 'ana/tool-editor' share the tool name 'tool-editor'; a capsule offers each artifact to the model by its tool name, so no two may share one
+error[E-CAP-020]: artifacts 'murmur/tool-edit' and 'ana/tool-edit' share the tool name 'tool-edit'; a capsule offers each artifact to the model by its tool name, so no two may share one
   hint: declare one of them: the model calls each artifact by the part of its name after the '/', so two scopes cannot both serve one tool name in a capsule — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-020
 ```
 
-A `source:` entry counts by its bare name, so `- name: tool-editor` with `source:` beside
-`murmur/tool-editor` is refused the same way. The check runs before any artifact is resolved, so
+A `source:` entry counts by its bare name, so `- name: tool-edit` with `source:` beside
+`murmur/tool-edit` is refused the same way. The check runs before any artifact is resolved, so
 nothing is resolved and no session directory is created. Declare one of the two.
 
 ## Conversation record errors
@@ -2536,8 +2536,8 @@ An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the s
 its scoped forms:
 
 ```text
-error[E-REG-007]: 'tool-editor' is not a full artifact name: an artifact is named <scope>/<name>
-  hint: name it with its scope: 'murmur/tool-editor' for a Murmur default artifact, '<owner>/tool-editor' for one published from github.com/<owner>, or 'local/tool-editor' for one installed from a .mur.zip file
+error[E-REG-007]: 'tool-edit' is not a full artifact name: an artifact is named <scope>/<name>
+  hint: name it with its scope: 'murmur/tool-edit' for a Murmur default artifact, '<owner>/tool-edit' for one published from github.com/<owner>, or 'local/tool-edit' for one installed from a .mur.zip file
 ```
 
 A name with more than one `/`, or a part the name rule refuses, is refused with the reason and no
