@@ -254,6 +254,11 @@ fn wasm_tool_png() {
 
 #[test]
 fn native_tool_png() {
+    // A native tool runs in the capsule's own network namespace, which a host refusing
+    // unprivileged user namespaces to this binary cannot make: staging refuses the launch there.
+    if capsule_runtime::skip_without_egress_namespace("native_tool_png") {
+        return;
+    }
     let Some(run) = run(
         "img-native",
         true,
@@ -352,7 +357,11 @@ fn refusals() {
     assert_eq!(run.blob_names().len(), 5);
     assert_eq!(run.shown_images().len(), 5);
 
-    // A native tool's entry that is not two strings is refused `malformed`.
+    // A native tool's entry that is not two strings is refused `malformed`. The native tool needs
+    // the capsule's network namespace, as in `native_tool_png`.
+    if capsule_runtime::skip_without_egress_namespace("refusals: a native tool's malformed entry") {
+        return;
+    }
     if let Some(native) = self::run(
         "img-malformed",
         true,
