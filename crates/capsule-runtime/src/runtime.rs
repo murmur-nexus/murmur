@@ -20,8 +20,7 @@ use murmur_artifact::{
     NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType, SkillFolderError,
     TaskAcceptance, LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008,
     W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
-    W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027,
-    W_SEC_030,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -2706,6 +2705,9 @@ pub fn stage_session(
     let capsule_name = request.capsule_name.clone();
     // (name, binary_bytes) for native tool artifacts — installed after workdir creation
     let mut native_binaries: Vec<(String, Vec<u8>)> = Vec::new();
+    // Only native tools whose entry declares `config:` or `capabilities.state` get an entry.
+    let mut native_tool_settings: HashMap<String, crate::types::NativeToolSettings> =
+        HashMap::new();
     // (name, files) for skill artifacts — installed after workdir creation
     let mut skill_files: Vec<(String, SkillFiles)> = Vec::new();
     // The inference driver's transport and artifact name. Its exports are checked against the
@@ -2830,16 +2832,17 @@ pub fn stage_session(
                 match implementation {
                     ArtifactImplementation::Native => {
                         // A native tool is a host subprocess, not a WASI guest: it never
-                        // reaches `invoke_tool_component`, so nothing would apply a
-                        // per-artifact grant to it. Say so rather than let the block read
-                        // as enforced.
+                        // reaches `invoke_tool_component`, so nothing applies a per-artifact
+                        // grant to it beyond its store. Say so rather than let the rest of the
+                        // block read as enforced.
                         warn_on_unenforceable_native_capabilities(
                             &full_name,
                             artifact.capabilities.as_ref(),
                         );
-                        // Same hazard, one layer over: config is delivered in the per-artifact
-                        // WASI environment, which a host subprocess never has.
-                        warn_on_inert_native_config(&full_name, artifact.config.as_ref());
+                        if let Some(settings) = stage_native_tool_settings(artifact, &capsule_name)?
+                        {
+                            native_tool_settings.insert(artifact.name.clone(), settings);
+                        }
                         let binary = extract_native_binary(
                             &artifact.name,
                             &resolved_version,
@@ -3570,6 +3573,7 @@ pub fn stage_session(
         capsule_component,
         tool_components,
         native_entrypoints,
+        native_tool_settings,
         process_driver: staged_process_driver,
         artifact_grants,
         hook_components,
@@ -4269,6 +4273,7 @@ fn launch(
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
         let native_entrypoints = staged.native_entrypoints;
+        let native_tool_settings = staged.native_tool_settings;
         let process_driver_for_state = staged.process_driver.clone();
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
@@ -4612,6 +4617,7 @@ fn launch(
                         murmur_md: murmur_md_inputs,
                         tool_components,
                         native_entrypoints,
+                        native_tool_settings,
                         process_driver: process_driver_for_state.clone(),
                         artifact_grants,
                         allowlisted_tools,
@@ -5632,6 +5638,7 @@ fn launch(
         murmur_md: None,
         tool_components: staged.tool_components,
         native_entrypoints: staged.native_entrypoints,
+        native_tool_settings: staged.native_tool_settings,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
         process_driver: None,
         artifact_grants: staged.artifact_grants,
@@ -7176,42 +7183,101 @@ fn warn_on_inert_tool_capabilities(
 
 /// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host subprocess
 /// under the capsule-wide grants, enforced by the same sandbox as a shell command, never through
-/// the WASI tool path per-artifact grants are applied on. A per-artifact block on one therefore
-/// narrows nothing, which is a sharper hazard than an inert sub-block and gets the same
-/// `W-SEC-008` treatment.
+/// the WASI tool path per-artifact grants are applied on. `capabilities.state` is the one
+/// sub-block applied to it ([`stage_native_tool_settings`]); any other narrows nothing, which is
+/// a sharper hazard than an inert sub-block and gets the same `W-SEC-008` treatment. A block that
+/// holds only `state` prints nothing.
 fn warn_on_unenforceable_native_capabilities(
     artifact_name: &str,
     capabilities: Option<&murmur_artifact::Capabilities>,
 ) {
-    if capabilities.is_none() {
+    let Some(capabilities) = capabilities else {
+        return;
+    };
+    // Every field but `state`, named so a sub-block added to `Capabilities` has to be placed.
+    let murmur_artifact::Capabilities {
+        network,
+        peer_fetch,
+        filesystem,
+        shell,
+        spawn,
+        env,
+        limits,
+        resources,
+        state: _,
+        task_io,
+        conversation,
+        plan,
+        install,
+        containment,
+    } = capabilities;
+    let unapplied: Vec<&str> = [
+        ("network", network.is_some()),
+        ("peer_fetch", peer_fetch.is_some()),
+        ("filesystem", filesystem.is_some()),
+        ("shell", shell.is_some()),
+        ("spawn", spawn.is_some()),
+        ("env", env.is_some()),
+        ("limits", limits.is_some()),
+        ("resources", resources.is_some()),
+        ("task_io", task_io.is_some()),
+        ("conversation", conversation.is_some()),
+        ("plan", plan.is_some()),
+        ("install", install.is_some()),
+        ("containment", containment.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+    if unapplied.is_empty() {
         return;
     }
 
     let link = security_warning_link(W_SEC_008);
     crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
-         per-artifact 'capabilities:' but ships a native implementation — it runs under the \
-         capsule-wide capabilities, enforced by the same sandbox as shell commands, and this \
-         block does not narrow them ({link})"
+         capabilities.{} but ships a native implementation — capabilities.state is the one \
+         sub-block that applies to a native tool, and the rest run under the capsule-wide \
+         capabilities, enforced by the same sandbox as shell commands, which this block does not \
+         narrow ({link})",
+        unapplied.join(", capabilities.")
     );
 }
 
-/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host subprocess
-/// under the capsule-wide shell environment, which is not per-artifact — nothing there would
-/// deliver `MURMUR_ARTIFACT_CONFIG`, and the runtime will not write an operator's config block
-/// into a capsule-wide environment to fake it. A declared block is therefore wholly inert, and
-/// gets the `W-SEC-015` treatment its `capabilities:` sibling above gets.
-fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_norway::Value>) {
-    if config.is_none() {
-        return;
+/// The settings a native tool's own entry hands it: `config:` lowered to compact JSON, refused
+/// with [`RuntimeError::InvalidArtifactConfig`] on the WASM path's terms, and the store
+/// `capabilities.state` names, resolved on the WASM path's name rule and created here. `None`
+/// when the entry declares neither, which stages nothing and creates nothing.
+///
+/// The config is lowered before the store is created, so a malformed block leaves no directory.
+/// The store is created at staging only; `mur run --explain-scope` reports it through
+/// [`crate::state_store::state_store_reports`] without creating it.
+fn stage_native_tool_settings(
+    artifact: &ArtifactRequest,
+    capsule_name: &str,
+) -> Result<Option<crate::types::NativeToolSettings>, RuntimeError> {
+    let config_json = artifact
+        .config
+        .as_ref()
+        .map(|config| crate::artifact_config::lower_artifact_config(&artifact.name, config))
+        .transpose()?;
+    let store = match artifact.capabilities.as_ref() {
+        Some(capabilities) => {
+            crate::network_policy::derive_state_store(capabilities, capsule_name)?
+        }
+        None => None,
+    };
+    if config_json.is_none() && store.is_none() {
+        return Ok(None);
     }
-
-    let link = security_warning_link(W_SEC_015);
-    crate::runtime_err!(
-        "[capsule-runtime] warning[{W_SEC_015}]: artifact '{artifact_name}' declares 'config:' \
-         but ships a native implementation — a native tool runs as a host subprocess and reads no \
-         per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered ({link})"
-    );
+    let state_dir = store
+        .as_deref()
+        .map(crate::state_store::ensure_state_store)
+        .transpose()?;
+    Ok(Some(crate::types::NativeToolSettings {
+        config_json,
+        state_dir,
+    }))
 }
 
 /// Builds the single `Engine` a session runs every guest on.
@@ -7853,6 +7919,10 @@ pub(crate) struct CapsuleStoreState {
     /// [`StagedSession::native_entrypoints`], and added to by a pull. A native tool is
     /// dispatched only through its entry here; see [`sandbox::NativeEntrypoint`].
     pub(crate) native_entrypoints: HashMap<String, sandbox::NativeEntrypoint>,
+    /// What each native tool's own manifest entry hands it, from
+    /// [`StagedSession::native_tool_settings`]. Removed with the tool's entrypoint; a pull adds
+    /// nothing here, because a pulled tool has no operator entry.
+    pub(crate) native_tool_settings: HashMap<String, crate::types::NativeToolSettings>,
     /// The `transport: process` driver this session drives its harness through, shared from
     /// [`StagedSession::process_driver`]. `None` on every other transport, and on the
     /// script-capsule path, which runs no agent loop.
@@ -9656,6 +9726,7 @@ impl CapsuleStoreState {
         if let Some(native_entrypoint) = native_entrypoint.filter(|_| {
             !self.tool_components.contains_key(name) && !self.removed_artifacts.contains(name)
         }) {
+            let settings = self.native_tool_settings.get(name).cloned();
             // On the blocking pool, like the shell branch: the wait on the child is a blocking
             // wait, and on the calling task it would stall every other future that task polls.
             let running = enforce_allowlist(&self.allowlisted_tools, name, || {
@@ -9668,6 +9739,7 @@ impl CapsuleStoreState {
                         &name,
                         input,
                         &native_entrypoint,
+                        settings.as_ref(),
                         &accessible_workdir,
                         &policy,
                         &enforcement,
@@ -12360,15 +12432,25 @@ pub(crate) fn native_env(guest_env: &[(String, String)]) -> Vec<(String, String)
 /// Spawned through [`sandbox::prepare_enforcement`], the one path every shell command takes, with
 /// the capsule-wide grants as its ceiling: it joins the session's network namespace, runs under
 /// the seccomp filter with its capabilities dropped, and on the Landlock tiers inside the
-/// capsule's Landlock scope (and composed root, on `sealed`). The only grant added for it is the
-/// exec closure of `entrypoint` itself — see [`sandbox::ShellEnforcement::for_native_entrypoint`].
+/// capsule's Landlock scope (and composed root, on `sealed`). The grants added for it are the
+/// exec closure of `entrypoint` itself and the store `settings` names — see
+/// [`sandbox::ShellEnforcement::for_native_entrypoint`].
+///
+/// `settings` is this tool's own record, from its operator entry: its config becomes
+/// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`] and its store
+/// [`crate::state_store::STATE_DIR_ENV`], each inserted after [`build_shell_env`] has removed
+/// both names, so the values reach this tool's process tree alone. An environment entry survives
+/// `execve` on every tier, into the composed root and on macOS, with no mount or rule behind it.
+/// `None` sets neither.
 ///
 /// A setup failure keeps [`ShellExecError`]'s session-fatal distinction, so a `sealed` composed
-/// root that cannot be built ends the session here exactly as it does for a shell command.
+/// root that cannot be built ends the session here exactly as it does for a shell command; a
+/// store that cannot be bound into it is one such failure.
 fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
     entrypoint: &sandbox::NativeEntrypoint,
+    settings: Option<&crate::types::NativeToolSettings>,
     accessible_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
@@ -12386,7 +12468,7 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(
+    let mut env = build_shell_env(
         policy,
         &[],
         enforcement.home_dir_path(),
@@ -12394,6 +12476,19 @@ fn dispatch_native_tool(
         enforcement.records_dir_path(),
         enforcement.tmpdir_value().as_deref(),
     )?;
+    let state_dir = settings.and_then(|settings| settings.state_dir.as_deref());
+    if let Some(config_json) = settings.and_then(|settings| settings.config_json.as_ref()) {
+        env.insert(
+            crate::artifact_config::ARTIFACT_CONFIG_ENV.to_string(),
+            config_json.clone(),
+        );
+    }
+    if let Some(state_dir) = state_dir {
+        env.insert(
+            crate::state_store::STATE_DIR_ENV.to_string(),
+            state_dir.to_string_lossy().into_owned(),
+        );
+    }
 
     let mut command = Command::new(entrypoint.path());
     command
@@ -12407,7 +12502,7 @@ fn dispatch_native_tool(
     // Fail-closed, as on the shell path: a setup failure returns here and nothing is spawned.
     let supervisor = sandbox::prepare_enforcement(
         &mut command,
-        &enforcement.for_native_entrypoint(entrypoint),
+        &enforcement.for_native_entrypoint(entrypoint, state_dir),
         accessible_workdir,
     )?;
 
@@ -18017,6 +18112,7 @@ inference:
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
             native_entrypoints: HashMap::new(),
+            native_tool_settings: HashMap::new(),
             process_driver: None,
             artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
@@ -20224,7 +20320,7 @@ inference:
         let script_path = dir.join(name);
         let echoes: String = env_vars
             .iter()
-            .map(|var| format!(r#"echo -n "{var}=${var} ""#))
+            .map(|var| format!(r#"echo -n "{var}=${{{var}-<unset>}} ""#))
             .collect::<Vec<_>>()
             .join("\n");
         let script = format!(
@@ -20300,6 +20396,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &declaring,
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
@@ -21208,6 +21305,7 @@ inference:
                     log_path: None,
                 },
                 &installed_native_tool(&binary, tmp.path()),
+                None,
                 tmp.path(),
                 &CapabilityPolicy::default(),
                 enforcement,
@@ -21289,6 +21387,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &CapabilityPolicy::default(),
             &kernel_full,
@@ -21333,6 +21432,7 @@ inference:
                     log_path: None,
                 },
                 &installed_native_tool(&binary, tmp.path()),
+                None,
                 tmp.path(),
                 &CapabilityPolicy::default(),
                 &sandbox::sealed_test_enforcement(),
@@ -21365,6 +21465,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &CapabilityPolicy::default(),
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
@@ -21985,6 +22086,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             workdir.path(),
             &policy,
             &enforcement,
@@ -22018,6 +22120,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             &workdir,
             &CapabilityPolicy::default(),
             &sandbox::ShellEnforcement::environment_only(),
@@ -22027,6 +22130,69 @@ inference:
         assert!(error.to_string().contains("no home folder"), "{error}");
         assert_eq!(fs::read_dir(&workdir).unwrap().count(), 0);
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    /// A native tool's own settings reach it as `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR`,
+    /// and a tool with none gets neither, though the host and `shell.baseline_env` name both.
+    #[test]
+    fn dispatch_native_tool_hands_its_settings_and_no_host_value() {
+        let tmp = TempDir::new().unwrap();
+        let names = [
+            crate::artifact_config::ARTIFACT_CONFIG_ENV,
+            crate::state_store::STATE_DIR_ENV,
+        ];
+        let binary = write_env_echo_native_tool(tmp.path(), "echo-settings", &names);
+        let policy = CapabilityPolicy {
+            shell_baseline_env: names.iter().map(|name| name.to_string()).collect(),
+            ..CapabilityPolicy::default()
+        };
+        let store = tmp.path().join("state").join("config-capsule");
+        let settings = crate::types::NativeToolSettings {
+            config_json: Some(r#"{"who":"manifest"}"#.to_string()),
+            state_dir: Some(store.clone()),
+        };
+        let enforcement = sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
+        let dispatch = |settings: Option<&crate::types::NativeToolSettings>| {
+            dispatch_native_tool(
+                "echo-settings",
+                murmur::tool::run::ToolInput {
+                    data: None,
+                    log_path: None,
+                },
+                &installed_native_tool(&binary, tmp.path()),
+                settings,
+                tmp.path(),
+                &policy,
+                &enforcement,
+            )
+            .unwrap()
+            .data
+            .unwrap_or_default()
+        };
+
+        for name in names {
+            std::env::set_var(name, "host-value");
+        }
+        let with = dispatch(Some(&settings));
+        let without = dispatch(None);
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        assert!(
+            with.contains(r#"MURMUR_ARTIFACT_CONFIG={"who":"manifest"} "#),
+            "{with}"
+        );
+        assert!(
+            with.contains(&format!("MURMUR_STATE_DIR={} ", store.display())),
+            "{with}"
+        );
+        assert!(
+            without.contains("MURMUR_ARTIFACT_CONFIG=<unset> "),
+            "{without}"
+        );
+        assert!(without.contains("MURMUR_STATE_DIR=<unset> "), "{without}");
+        assert!(!with.contains("host-value") && !without.contains("host-value"));
     }
 
     #[test]
@@ -22043,6 +22209,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
@@ -22071,6 +22238,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
@@ -22099,6 +22267,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
@@ -22131,6 +22300,7 @@ inference:
                 log_path: None,
             },
             &installed_native_tool(&binary, tmp.path()),
+            None,
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),

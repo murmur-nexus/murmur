@@ -141,9 +141,10 @@ tiers, inside the capsule's Landlock scope and composed root.
 
 Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.network.allow`,
 `capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
-to a shell command. The runtime adds one thing, the files the kernel itself executes to start the
-tool, each with read and execute and nothing else. It works them out once, when it installs the
-tool, from the artifact's own image:
+to a shell command. The runtime adds the tool's [store](#native-tool-settings) when its own entry
+declares `capabilities.state`, and the files the kernel itself executes to start the tool, each
+with read and execute and nothing else. It works those files out once, when it installs the tool,
+from the artifact's own image:
 
 1. The tool's entrypoint, `tools/<name>/<name>` in the session's
    [runtime directory](workdir.md#runtime-directory).
@@ -160,7 +161,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 |---|---|
 | Runs another program, such as `git` | That program in `capabilities.shell.allow` |
 | Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
-| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the read grants outside it are an allowlisted interpreter's [derived runtime](#derived-interpreter-runtime), the host's [trust store](#trust-store) when the capsule declares `capabilities.network.allow`, and a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
+| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir, the [session's temporary folder](#temp-folder), or the [store](#native-tool-settings) `capabilities.state` names on its own entry. Nothing grants a write anywhere else; the read grants outside it are an allowlisted interpreter's [derived runtime](#derived-interpreter-runtime), the host's [trust store](#trust-store) when the capsule declares `capabilities.network.allow`, and a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
 | Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
 | Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
 | Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
@@ -168,9 +169,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 What each [default artifact](default-artifacts.md#native-tool-needs) native tool needs is listed
 with the tools.
 
-A `capabilities:` block on a native tool's own artifact entry does not narrow these grants and
-prints [`W-SEC-008`](diagnostics.md#w-sec-008). A capsule whose only subprocess route is a native
-tool still needs a network namespace, and is refused with
+A capsule whose only subprocess route is a native tool still needs a network namespace, and is refused with
 [`E-CAP-005`](diagnostics.md#e-cap-005) on a host that cannot create one. A sealed composed root
 that cannot be built for a native tool ends the session with
 `E-RUN-014` (see [Containment class](#field-containment)), as it does for a shell command.
@@ -180,6 +179,33 @@ change on the Full and Sealed tiers: a command that overwrites, replaces or rena
 refused, so the tool that runs is the tool that was installed, a pulled one included. On the
 Seccomp-only and Environment-only tiers nothing protects it; see
 [What protects it](workdir.md#what-protects-it).
+
+### A native tool's own config and store { #native-tool-settings }
+
+Two keys on a native tool's own artifact entry reach that tool and the processes it starts, and
+nothing else:
+
+| Entry key | The tool gets |
+|---|---|
+| [`config:`](manifest.md#artifact-config) | `MURMUR_ARTIFACT_CONFIG`: the block as compact JSON, on every tier |
+| [`capabilities.state`](manifest.md#tool-capabilities) | `MURMUR_STATE_DIR`: the absolute path of its [durable store](workdir.md#state-store), `~/.murmur/state/<store>/`, created at launch |
+
+An entry without the key gets no such variable. The runtime sets both names and takes neither from
+the host: naming one in `capabilities.shell.baseline_env` or `capabilities.env.allow` passes
+nothing through. Shell commands and other native tools have neither, and a WASM component gets
+only its own `config:` and never `MURMUR_STATE_DIR`.
+
+Who else can open the store depends on the tier:
+
+| Tier | The store is reachable by |
+|---|---|
+| Sealed | The tool and the processes it starts. The store is bound into that tool's composed root at its own path, read and write, never execute. A store that cannot be bound ends the session with `E-RUN-014` |
+| Full | The tool and the processes it starts, read and write, never execute. Shell commands and other native tools are refused |
+| Seccomp-only | Every subprocess of the capsule, by path. The tier has no filesystem scope; the tool is handed the path |
+| Environment-only, macOS included | Every subprocess of the capsule, by path, as with any host file |
+
+Every other sub-block of a native tool's `capabilities:` narrows nothing: the tool runs under the
+capsule-wide grants above, and the entry prints [`W-SEC-008`](diagnostics.md#w-sec-008).
 
 ### Where the user namespace comes from { #userns-grant }
 

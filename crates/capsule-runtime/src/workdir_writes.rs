@@ -1121,6 +1121,13 @@ mod tests {
         ),
         (
             "sandbox.rs",
+            "open_state_dir",
+            "An `O_PATH` handle for a native tool's state store, `~/.murmur/state/<store>/`, \
+             created by the runtime outside every workdir and opened with no link followed at \
+             its own name; it reads and writes nothing.",
+        ),
+        (
+            "sandbox.rs",
             "open_host",
             "The ELF images of host binaries and libraries a shell grant or a derived interpreter \
              runtime names, opened to read their headers and dependencies.",

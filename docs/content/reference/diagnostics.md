@@ -174,7 +174,6 @@ section that explains it.
 | `W-SEC-012` | A compiler driver's helper binaries have no `Execute` grant under `sealed` | [W-SEC-012](#w-sec-012) |
 | `W-SEC-013` | Unprivileged user namespaces are unrestricted host-wide, not granted to `mur` by the shipped AppArmor profile | [W-SEC-013](#w-sec-013) |
 | `W-SEC-014` | A capsule-wide `capabilities.state` block grants nothing — a durable store is granted per artifact | [W-SEC-014](#w-sec-014) |
-| `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
 | `W-SEC-018` | An installed tool's `input_schema` leaves a path-shaped property undeclared, so calls naming it are judged by key name | [W-SEC-018](#w-sec-018) |
@@ -3157,21 +3156,24 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
   `env`, `limits`, `resources` or `containment` — a per-artifact grant only reads `network`,
   `filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
   `task_io` is honored as well); or
-- a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
-  all. A native tool runs under the capsule-wide `capabilities.filesystem`,
-  `capabilities.network.allow`, `capabilities.network.unix_sockets` and `capabilities.shell.allow`,
-  enforced by the same sandbox as a shell command; a per-artifact block does not narrow them.
+- a `runtime: tool` entry with a **native** (non-WASM) implementation declares any `capabilities:`
+  sub-block other than `state`. A native tool runs under the capsule-wide
+  `capabilities.filesystem`, `capabilities.network.allow`, `capabilities.network.unix_sockets` and
+  `capabilities.shell.allow`, enforced by the same sandbox as a shell command; a per-artifact block
+  does not narrow them. `capabilities.state` is the one sub-block that applies to a native tool
+  ([A native tool's own config and store](containment.md#native-tool-settings)), so a block that
+  holds only `state` prints nothing.
 
 ```text
-[capsule-runtime] warning[W-SEC-008]: artifact 'local/tool-fixture' declares per-artifact 'capabilities:' but ships a native implementation — it runs under the capsule-wide capabilities, enforced by the same sandbox as shell commands, and this block does not narrow them (https://docs.murmur.nexus/reference/diagnostics/#w-sec-008)
+[capsule-runtime] warning[W-SEC-008]: artifact 'local/tool-fixture' declares capabilities.network but ships a native implementation — capabilities.state is the one sub-block that applies to a native tool, and the rest run under the capsule-wide capabilities, enforced by the same sandbox as shell commands, which this block does not narrow (https://docs.murmur.nexus/reference/diagnostics/#w-sec-008)
 ```
 
 **Why it matters:** a declared-but-unapplied grant reads like a scoped artifact. In the native
 case the tool keeps the whole capsule ceiling despite an entry that looks like it narrowed it.
 
 **What to do:** for an inert sub-key, remove it and declare it in the top-level `capabilities:`
-block instead. For a native tool, narrow the capsule-wide block itself, or ship the tool as WASM if
-it needs grants narrower than the rest of the capsule's.
+block instead. For a native tool, keep `state` if it needs a store, narrow the capsule-wide block
+itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's.
 
 ---
 
@@ -3482,28 +3484,11 @@ what that artifact reaches.
 
 ---
 
-### W-SEC-015 — a `config:` block on a native tool delivers nothing { #w-sec-015 }
+### W-SEC-015 — retired { #w-sec-015 }
 
-**Fires when:** a `runtime: tool` entry declares [`config:`](manifest.md#artifact-config) and the
-artifact ships a native (non-WASM) implementation. Once per artifact, at staging, on stderr.
-
-**Why it matters:** config arrives in the environment the runtime builds for one WASM component.
-A native tool runs as a host subprocess under the capsule-wide shell environment, which is shared
-rather than per-artifact, so no `MURMUR_ARTIFACT_CONFIG` is delivered anywhere. Without this
-warning the only signal is a tool that behaves as though it were never configured.
-
-```text
-[capsule-runtime] warning[W-SEC-015]: artifact 'local/tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/reference/diagnostics/#w-sec-015)
-```
-
-**What the runtime does about it:** nothing is refused and no exit code changes, exactly as for a
-`capabilities:` block on the same entry ([`W-SEC-008`](#w-sec-008)). `mur run --explain-scope`
-still lists the artifact under `artifact config:`, because that reports what the manifest declares.
-
-**What to do:** move the settings into whatever the native tool already reads — its command-line
-arguments or a file it is pointed at — or drop the block. `config:` on a `runtime: tool` entry
-backed by a WASM component, on a `runtime: driver` entry, or on a `runtime: hook` entry is
-delivered normally.
+Nothing raises this code and nothing reuses it. A native tool receives its entry's `config:` block
+as `MURMUR_ARTIFACT_CONFIG`, as a WASM tool does — see
+[A native tool's own config and store](containment.md#native-tool-settings).
 
 ---
 

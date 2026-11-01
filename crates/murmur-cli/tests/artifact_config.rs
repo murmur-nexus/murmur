@@ -457,56 +457,512 @@ fn the_host_value_never_reaches_a_guest_however_a_manifest_allowlists_it() {
     );
 }
 
-/// A native tool is a host subprocess under the capsule-wide shell environment, which is not
-/// per-artifact — a `config:` block there is inert. Warned rather than refused, on the same terms
-/// `capabilities:` on a native tool is, and the launch still succeeds.
-///
-/// Config is delivered only in the per-artifact WASI environment built at tool dispatch, and a
-/// native tool never reaches that path at all: it is a host subprocess, so there is no per-artifact
-/// environment for the runtime to write into. What the capsule publishes therefore carries nothing
-/// from inside the block, which is asserted below rather than assumed.
+// ── Native tools ────────────────────────────────────────────────────────────────────
+//
+// A native tool is dispatched by the agent loop, never by a script capsule's `tool-registry`
+// invoke, so these scenarios run an agent capsule on a scripted model: each tool is called once,
+// in entry order, and what it reported is read back from the tool result the model was sent.
+
+const DRIVER: &str = "local/murmur-driver-anthropic";
+const DRIVER_VERSION: &str = "0.1.0";
+
+/// The retired inert-config warning code, spelled so the tree's only literal of it is the
+/// retirement comment in `security_warnings.rs`.
+const RETIRED_INERT_CONFIG_CODE: &str = concat!("W-SEC-", "015");
+
+/// A native tool's script: drain stdin with a builtin, run `body`, which sets `$v`, then print
+/// `$v` between `<<<` and `>>>` as the result's summary, escaped for a JSON string. Builtins only:
+/// on the Landlock tiers a native tool can execute nothing `shell.allow` does not name.
+fn native_script(body: &str) -> String {
+    format!(
+        "#!/bin/bash\nwhile read -r _; do :; done\n{body}\nv=${{v//\\\\/\\\\\\\\}}\nv=${{v//\\\"/\\\\\\\"}}\n\
+         printf '{{\"status\":\"passed\",\"summary\":\"<<<%s>>>\"}}' \"$v\"\n"
+    )
+}
+
+/// Reports `MURMUR_ARTIFACT_CONFIG`, or `absent`.
+const ECHO_CONFIG: &str = "v=${MURMUR_ARTIFACT_CONFIG:-absent}";
+
+/// Reports `<MURMUR_ARTIFACT_CONFIG>|<MURMUR_STATE_DIR>`, each `absent` when unset.
+const ECHO_BOTH: &str = "v=\"${MURMUR_ARTIFACT_CONFIG:-absent}|${MURMUR_STATE_DIR:-absent}\"";
+
+/// Appends a line to `$MURMUR_STATE_DIR/runs` and reports `<line count> <store>`.
+const COUNT_RUNS: &str = "if printf 'run\\n' >> \"$MURMUR_STATE_DIR/runs\"; then\n  n=0\n  \
+                          while read -r _; do n=$((n+1)); done < \"$MURMUR_STATE_DIR/runs\"\n  \
+                          v=\"$n $MURMUR_STATE_DIR\"\nelse\n  v=append-failed\nfi";
+
+/// Writes `$MURMUR_STATE_DIR/secret` and reports whether it could.
+const WRITE_SECRET: &str = "if printf 'the-secret\\n' > \"$MURMUR_STATE_DIR/secret\"; then \
+                            v=wrote; else v=write-failed; fi";
+
+/// `capabilities.state` on an artifact entry, with the capsule-name default.
+const STATE: &str = "\n      state: {}";
+
+/// The capsule-wide `containment: sealed` line.
+const SEALED: &str = "  containment: sealed\n";
+
+/// An artifact entry with `capabilities_yaml` spliced in under `capabilities:`.
+fn entry_with_capabilities(
+    name: &str,
+    config_yaml: Option<&str>,
+    capabilities_yaml: Option<&str>,
+) -> String {
+    let mut entry = artifact_entry(name, config_yaml);
+    if let Some(capabilities) = capabilities_yaml {
+        entry.push_str(&format!("    capabilities:{capabilities}\n"));
+    }
+    entry
+}
+
+/// Whether this host reaches `sealed`, printing a `[SKIP-HOST]` line when it does not.
+fn host_reaches_sealed(test: &str) -> bool {
+    let (decision, shortfall) =
+        capsule_runtime::detect_containment_decision(murmur_artifact::ContainmentClass::Sealed);
+    if decision.achieved() == murmur_artifact::ContainmentClass::Sealed {
+        return true;
+    }
+    eprintln!(
+        "[SKIP-HOST] {test}: this host cannot back sealed ({})",
+        shortfall
+            .map(|shortfall| shortfall.reason())
+            .unwrap_or_else(|| format!("it reaches {}", decision.achieved()))
+    );
+    false
+}
+
+fn end_turn_response() -> String {
+    serde_json::json!({
+        "id": "msg_end",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    .to_string()
+}
+
+/// An agent capsule named [`CAPSULE_NAME`] on a scripted model, declaring `entries` beside its
+/// driver, with `capabilities_yaml` (indented two spaces) added to its capsule-wide block.
+struct NativeCapsule {
+    home: TempDir,
+    project: TempDir,
+    fixture: TempDir,
+    entries: Vec<String>,
+    capabilities_yaml: String,
+}
+
+impl NativeCapsule {
+    /// Writes the manifest and installs the driver and one native tool per `(name, body)`.
+    fn new(entries: Vec<String>, capabilities_yaml: &str, tools: &[(&str, &str)]) -> Self {
+        let capsule = Self {
+            home: tempfile::tempdir().unwrap(),
+            project: tempfile::tempdir().unwrap(),
+            fixture: tempfile::tempdir().unwrap(),
+            entries,
+            capabilities_yaml: capabilities_yaml.to_string(),
+        };
+        // An endpoint nothing listens on, so `mur install` finds a project; every run rewrites it.
+        capsule.write_manifest("http://127.0.0.1:9");
+        let driver = common::create_driver_artifact(
+            capsule.fixture.path(),
+            DRIVER,
+            DRIVER_VERSION,
+            &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        );
+        common::install_artifact_to_project_with_home(
+            capsule.project.path(),
+            &capsule.home,
+            &driver,
+            &["--no-precompile"],
+        )
+        .success();
+        for (name, body) in tools {
+            let artifact = common::create_native_artifact(
+                capsule.fixture.path(),
+                name,
+                TOOL_VERSION,
+                &native_script(body),
+                Some("Reports what its own entry handed it."),
+                None,
+            );
+            common::install_artifact_to_project_with_home(
+                capsule.project.path(),
+                &capsule.home,
+                &artifact,
+                &[],
+            )
+            .success();
+        }
+        capsule
+    }
+
+    fn manifest(&self) -> PathBuf {
+        self.project.path().join("murmur.yaml")
+    }
+
+    fn write_manifest(&self, endpoint: &str) {
+        fs::write(
+            self.manifest(),
+            format!(
+                "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: {DRIVER}\n    version: \
+                 {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
+                 api_key: test-key\n{}capabilities:\n  network:\n    allow:\n      - {endpoint}\n{}\
+                 inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER}\n",
+                self.entries.concat(),
+                self.capabilities_yaml,
+            ),
+        )
+        .unwrap();
+    }
+
+    /// One `mur run --task` calling each tool in `tools` once, in order, with `env` set on `mur`
+    /// itself; required to finish `ok`. Returns what each tool reported, then `mur`'s stderr.
+    fn run(&self, tools: &[&str], env: &[(&str, &str)]) -> (Vec<String>, String) {
+        let mut responses: Vec<String> = tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                common::tool_use_response(&format!("call_{index}"), tool, serde_json::json!({}))
+            })
+            .collect();
+        responses.push(end_turn_response());
+        let server = common::ScriptedServer::start(responses);
+        self.write_manifest(&server.endpoint);
+
+        let mut cmd = Command::cargo_bin("mur").unwrap();
+        cmd.env("HOME", self.home.path())
+            .current_dir(self.project.path());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let output = cmd
+            .args([
+                "run",
+                "--manifest",
+                self.manifest().to_str().unwrap(),
+                "--task",
+                "Run each tool once.",
+                "--verbose",
+            ])
+            .timeout(std::time::Duration::from_secs(300))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("status:  ok"))
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        let requests = server.requests();
+        let reported = (0..tools.len())
+            .map(|index| {
+                let id = format!("call_{index}");
+                let text = common::tool_result_text(&requests, &id)
+                    .unwrap_or_else(|| panic!("no tool result for {id}; stderr: {stderr}"));
+                let start = text
+                    .find("<<<")
+                    .unwrap_or_else(|| panic!("{id} reported nothing: {text}"));
+                let end = text
+                    .rfind(">>>")
+                    .unwrap_or_else(|| panic!("{id} reported nothing: {text}"));
+                text[start + 3..end].to_string()
+            })
+            .collect();
+        (reported, stderr)
+    }
+
+    fn store(&self) -> PathBuf {
+        self.home.path().join(".murmur/state").join(CAPSULE_NAME)
+    }
+}
+
+/// The bare tool name the model calls `name` by.
+fn tool(name: &str) -> &str {
+    murmur_artifact::tool_name_of(name)
+}
+
+fn reads_its_config_block(test: &str, capabilities_yaml: &str) {
+    let capsule = NativeCapsule::new(
+        vec![artifact_entry(TOOL_NAME, Some(SAMPLE_CONFIG))],
+        capabilities_yaml,
+        &[(TOOL_NAME, ECHO_CONFIG)],
+    );
+
+    let (reported, stderr) = capsule.run(&[tool(TOOL_NAME)], &[]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reported[0]).unwrap_or_else(|err| panic!(
+            "{test}: the tool must observe JSON, got {:?}: {err}",
+            reported[0]
+        )),
+        serde_json::json!({
+            "types": {"utterance": {"schema": {"required": ["text"], "type": "object"}}},
+            "read_recent": {"default": 20, "max": 100},
+        })
+    );
+    assert!(!stderr.contains(RETIRED_INERT_CONFIG_CODE), "{stderr}");
+}
+
+/// A native tool reads its entry's block from `MURMUR_ARTIFACT_CONFIG` as the same JSON a WASM
+/// tool reads, with no warning.
 #[test]
-fn config_on_a_native_tool_warns_and_is_not_delivered() {
-    if capsule_runtime::skip_without_egress_namespace(
-        "config_on_a_native_tool_warns_and_is_not_delivered",
-    ) {
+fn a_native_tool_reads_its_config_block_as_json() {
+    const TEST: &str = "a_native_tool_reads_its_config_block_as_json";
+    if capsule_runtime::skip_without_egress_namespace(TEST) {
         return;
     }
+    reads_its_config_block(TEST, "");
+}
+
+/// The same under `sealed`, where the variable crosses into the composed root.
+#[test]
+fn a_native_tool_reads_its_config_block_as_json_when_sealed() {
+    const TEST: &str = "a_native_tool_reads_its_config_block_as_json_when_sealed";
+    if capsule_runtime::skip_without_egress_namespace(TEST) || !host_reaches_sealed(TEST) {
+        return;
+    }
+    reads_its_config_block(TEST, SEALED);
+}
+
+/// Neither runtime-owned name comes from the host: with both in `mur run`'s environment and in
+/// `shell.baseline_env`, the configured tool sees its own block and no store, and the unconfigured
+/// one sees neither variable.
+#[test]
+fn a_native_tool_without_config_gets_no_variable() {
+    const TEST: &str = "a_native_tool_without_config_gets_no_variable";
+    if capsule_runtime::skip_without_egress_namespace(TEST) {
+        return;
+    }
+    let capsule = NativeCapsule::new(
+        vec![
+            artifact_entry(TOOL_NAME, Some("\n      who: manifest")),
+            artifact_entry(SECOND_TOOL_NAME, None),
+        ],
+        "  shell:\n    allow: [true]\n    baseline_env: [MURMUR_ARTIFACT_CONFIG, MURMUR_STATE_DIR]\n",
+        &[(TOOL_NAME, ECHO_BOTH), (SECOND_TOOL_NAME, ECHO_BOTH)],
+    );
+
+    let (reported, _) = capsule.run(
+        &[tool(TOOL_NAME), tool(SECOND_TOOL_NAME)],
+        &[
+            ("MURMUR_ARTIFACT_CONFIG", r#"{"who":"host"}"#),
+            ("MURMUR_STATE_DIR", "/host/state"),
+        ],
+    );
+
+    assert_eq!(reported[0], r#"{"who":"manifest"}|absent"#);
+    assert_eq!(reported[1], "absent|absent");
+}
+
+/// A block the channel cannot carry refuses the launch on a native entry exactly as on a WASM
+/// one, before any work folder exists.
+#[test]
+fn a_malformed_config_on_a_native_tool_refuses_the_launch() {
     let home = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-
-    let script = "#!/bin/sh\nprintf '{\"summary\":\"%s\",\"status\":\"passed\"}' \
-                  \"${MURMUR_ARTIFACT_CONFIG:-absent}\"\n";
+    // A well-formed manifest first, so `mur install` can find the project root.
+    one_tool_project(project.path(), Some("\n      who: a"));
     let artifact = common::create_native_artifact(
         fixture.path(),
         TOOL_NAME,
         TOOL_VERSION,
-        script,
-        Some("Reports the artifact config it was handed."),
+        &native_script(ECHO_CONFIG),
+        None,
         None,
     );
-
-    let manifest = one_tool_project(project.path(), Some("\n      who: a"));
     common::install_artifact_to_project(project.path(), &artifact).success();
 
-    let assertion = common::run_capsule(&home, &manifest)
-        .success()
-        .stderr(predicate::str::contains("warning[W-SEC-015]"))
-        .stderr(predicate::str::contains(format!("artifact '{TOOL_NAME}'")))
-        .stderr(predicate::str::contains("host subprocess"));
-
-    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
-    let observed = published(&stdout, "result.txt");
+    let manifest = one_tool_project(project.path(), Some(" 7"));
+    common::run_capsule(&home, &manifest)
+        .failure()
+        .stderr(predicate::str::contains("error[E-CAP-010]"))
+        .stderr(predicate::str::contains(TOOL_NAME))
+        .stderr(predicate::str::contains("must be a mapping"));
     assert!(
-        !observed.contains("who"),
-        "nothing from inside the block may come back from a native tool: {observed}"
+        !project.path().join("workdir").exists(),
+        "the refusal must come before any work folder is created"
+    );
+}
+
+fn store_outlives_the_session(test: &str, capabilities_yaml: &str) {
+    let capsule = NativeCapsule::new(
+        vec![entry_with_capabilities(TOOL_NAME, None, Some(STATE))],
+        capabilities_yaml,
+        &[(TOOL_NAME, COUNT_RUNS)],
+    );
+    let store = capsule.store();
+
+    let (first, _) = capsule.run(&[tool(TOOL_NAME)], &[]);
+    assert_eq!(first[0], format!("1 {}", store.display()), "{test}");
+    let (second, _) = capsule.run(&[tool(TOOL_NAME)], &[]);
+    assert_eq!(
+        second[0],
+        format!("2 {}", store.display()),
+        "{test}: the store must outlive the session"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "{test}"
     );
 
-    // The declaration is still reported — it is what the operator wrote — and the warning is what
-    // says it reaches nothing.
     assert_eq!(
-        common::explain_scope_json(&home, &manifest)["configured_artifacts"],
-        serde_json::json!([TOOL_NAME])
+        common::explain_scope_json(&capsule.home, &capsule.manifest())["state_stores"],
+        serde_json::json!([{
+            "artifact": TOOL_NAME,
+            "store": CAPSULE_NAME,
+            "host_path": store.display().to_string(),
+        }]),
+        "{test}"
     );
+}
+
+/// `capabilities.state` on a native tool's entry hands it `~/.murmur/state/<capsule>/` as
+/// `MURMUR_STATE_DIR`, and what it writes there is there in the next session.
+#[test]
+fn a_native_tools_store_outlives_the_session() {
+    const TEST: &str = "a_native_tools_store_outlives_the_session";
+    if capsule_runtime::skip_without_egress_namespace(TEST) {
+        return;
+    }
+    store_outlives_the_session(TEST, "");
+}
+
+/// The same under `sealed`, where the store is bound into the composed root.
+#[test]
+fn a_native_tools_store_outlives_the_session_when_sealed() {
+    const TEST: &str = "a_native_tools_store_outlives_the_session_when_sealed";
+    if capsule_runtime::skip_without_egress_namespace(TEST) || !host_reaches_sealed(TEST) {
+        return;
+    }
+    store_outlives_the_session(TEST, SEALED);
+}
+
+fn store_reaches_the_declaring_tool_alone(test: &str, capabilities_yaml: &str) {
+    // The second tool's script names the store's absolute path, which depends on the scratch
+    // home, so the capsule is built in two steps: the home first, then the scripts.
+    let probe = NativeCapsule::new(Vec::new(), capabilities_yaml, &[]);
+    let secret = probe.store().join("secret");
+    let read_secret = format!(
+        "if {{ read -r line < '{}'; }} 2>/dev/null; then v=\"read:$line\"; else v=denied; fi",
+        secret.display()
+    );
+    let capsule = NativeCapsule {
+        entries: vec![
+            entry_with_capabilities(TOOL_NAME, None, Some(STATE)),
+            artifact_entry(SECOND_TOOL_NAME, None),
+        ],
+        ..probe
+    };
+    capsule.write_manifest("http://127.0.0.1:9");
+    for (name, body) in [
+        (TOOL_NAME, WRITE_SECRET),
+        (SECOND_TOOL_NAME, read_secret.as_str()),
+    ] {
+        let artifact = common::create_native_artifact(
+            capsule.fixture.path(),
+            name,
+            TOOL_VERSION,
+            &native_script(body),
+            Some("Reports what its own entry handed it."),
+            None,
+        );
+        common::install_artifact_to_project_with_home(
+            capsule.project.path(),
+            &capsule.home,
+            &artifact,
+            &[],
+        )
+        .success();
+    }
+
+    let tier = common::explain_scope_json(&capsule.home, &capsule.manifest())["enforcement_tier"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (reported, _) = capsule.run(&[tool(TOOL_NAME), tool(SECOND_TOOL_NAME)], &[]);
+    assert_eq!(reported[0], "wrote", "{test} at {tier}");
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap(),
+        "the-secret\n",
+        "{test} at {tier}"
+    );
+    match tier.as_str() {
+        "landlock+seccomp" | "mountns+pivot_root+landlock+seccomp" => assert_eq!(
+            reported[1], "denied",
+            "{test}: at {tier} an undeclared native tool must not read the store"
+        ),
+        "seccomp-only" | "none" => assert_eq!(
+            reported[1], "read:the-secret",
+            "{test}: at {tier} nothing is scoped, so the store is reachable by path"
+        ),
+        other => panic!("{test}: unexpected enforcement tier {other}"),
+    }
+}
+
+/// The store is the declaring tool's alone: on a Landlock tier another native tool pointed at its
+/// path cannot read it; on a tier with no filesystem scope it can, as documented.
+#[test]
+fn the_store_reaches_the_declaring_native_tool_alone() {
+    const TEST: &str = "the_store_reaches_the_declaring_native_tool_alone";
+    if capsule_runtime::skip_without_egress_namespace(TEST) {
+        return;
+    }
+    store_reaches_the_declaring_tool_alone(TEST, "");
+}
+
+/// The same under `sealed`, where the undeclared tool's composed root has no store in it at all.
+#[test]
+fn the_store_reaches_the_declaring_native_tool_alone_when_sealed() {
+    const TEST: &str = "the_store_reaches_the_declaring_native_tool_alone_when_sealed";
+    if capsule_runtime::skip_without_egress_namespace(TEST) || !host_reaches_sealed(TEST) {
+        return;
+    }
+    store_reaches_the_declaring_tool_alone(TEST, SEALED);
+}
+
+/// `capabilities.state` is the one sub-block applied to a native tool: alone it prints no
+/// `W-SEC-008`, and beside another sub-block the warning names that sub-block and says `state` is
+/// the one that applies. Neither prints the retired inert-config warning.
+#[test]
+fn native_tool_capabilities_warnings() {
+    const TEST: &str = "native_tool_capabilities_warnings";
+    if capsule_runtime::skip_without_egress_namespace(TEST) {
+        return;
+    }
+    for (capabilities, warns) in [
+        (STATE, false),
+        (
+            "\n      state: {}\n      network:\n        allow: [https://example.com]",
+            true,
+        ),
+    ] {
+        let capsule = NativeCapsule::new(
+            vec![entry_with_capabilities(TOOL_NAME, None, Some(capabilities))],
+            "",
+            &[(TOOL_NAME, ECHO_CONFIG)],
+        );
+        let (_, stderr) = capsule.run(&[tool(TOOL_NAME)], &[]);
+        assert!(!stderr.contains(RETIRED_INERT_CONFIG_CODE), "{stderr}");
+        let warning = stderr
+            .lines()
+            .find(|line| line.contains("warning[W-SEC-008]"));
+        if !warns {
+            assert_eq!(warning, None, "{stderr}");
+            continue;
+        }
+        let warning = warning.unwrap_or_else(|| panic!("W-SEC-008 must fire: {stderr}"));
+        assert!(
+            warning.contains(&format!("artifact '{TOOL_NAME}'")),
+            "{warning}"
+        );
+        assert!(warning.contains("capabilities.network"), "{warning}");
+        assert!(
+            warning.contains("capabilities.state is the one sub-block that applies"),
+            "{warning}"
+        );
+    }
 }

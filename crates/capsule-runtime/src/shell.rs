@@ -1235,6 +1235,8 @@ pub(crate) fn attribute_resource_limit(
 /// and then the runtime-owned names no entry before them can set — `HOME` and `USERPROFILE` from
 /// `home_dir`, `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and
 /// `records_dir`, and `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
+/// [`ARTIFACT_CONFIG_ENV`] and [`crate::state_store::STATE_DIR_ENV`] are removed whatever an
+/// earlier step supplied; a native tool's dispatch adds its own values to what this returns.
 ///
 /// `home_dir` is the session's home folder, `home/` in its records directory. `None` refuses the
 /// command: no command runs without it, and none is handed a home anywhere else.
@@ -1272,6 +1274,11 @@ pub(crate) fn build_shell_env(
     }
 
     strip_credential_shaped_vars(&mut env, &policy.shell_strip_env);
+
+    // Set per native tool by its dispatch, from that tool's own entry, and by nothing else: no
+    // override, baseline entry or host value reaches a shell command or an unconfigured tool.
+    env.remove(ARTIFACT_CONFIG_ENV);
+    env.remove(crate::state_store::STATE_DIR_ENV);
 
     // Inserted last so neither a guest-supplied `env_overrides` entry nor a
     // manifest-declared `shell_baseline_env` entry can resurrect the real host
@@ -1378,17 +1385,18 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// are the exception: they run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`,
 /// built by [`build_shell_env`].
 ///
-/// [`ARTIFACT_CONFIG_ENV`], a formation member's names
+/// [`ARTIFACT_CONFIG_ENV`], [`crate::state_store::STATE_DIR_ENV`], a formation member's names
 /// ([`crate::formation::is_member_grant_env`]) and [`crate::lifeline::SPAWNER_LIFELINE_ENV`] are
 /// reserved and never resolved from the host, whatever a manifest allowlists: the names are
-/// runtime-owned, and their values come from the declaring artifact's own `config:` block and from
-/// the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a
+/// runtime-owned, and their values come from the declaring artifact's own entry and from the
+/// session, or from nowhere. Skipped here rather than relied on being overwritten later, so a
 /// host value cannot reach a guest whose entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
         if key == ARTIFACT_CONFIG_ENV
+            || key == crate::state_store::STATE_DIR_ENV
             || crate::formation::is_member_grant_env(key)
             || key == crate::lifeline::SPAWNER_LIFELINE_ENV
             || key == crate::runtime_dir::RUNTIME_DIR_ENV
@@ -3457,6 +3465,39 @@ mod tests {
             build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
         assert!(!without.contains_key(crate::records_dir::RECORDS_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
+    }
+
+    /// `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR` never come from the host: a baseline
+    /// entry, an override and a host value naming either leave neither in a shell command's
+    /// environment, and `env.allow` resolves neither into a guest's.
+    #[test]
+    fn build_shell_env_drops_the_native_tool_settings_names_whatever_else_says() {
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        let names = [ARTIFACT_CONFIG_ENV, crate::state_store::STATE_DIR_ENV];
+        for name in names {
+            std::env::set_var(name, "/host/value");
+        }
+        let policy = CapabilityPolicy {
+            shell_baseline_env: names.iter().map(|name| name.to_string()).collect(),
+            env_allow: names.iter().map(|name| name.to_string()).collect(),
+            ..CapabilityPolicy::default()
+        };
+        let overrides: Vec<(String, String)> = names
+            .iter()
+            .map(|name| (name.to_string(), "/override".to_string()))
+            .collect();
+
+        let env =
+            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
+        let declared = build_declared_env(&policy);
+        for name in names {
+            std::env::remove_var(name);
+        }
+        for name in names {
+            assert!(!env.contains_key(name), "{name}: {env:?}");
+            assert!(!declared.contains_key(name), "{name}: {declared:?}");
+        }
     }
 
     /// `TMPDIR`, `TMP` and `TEMP` are runtime-owned: `/tmp` when the session maps it, the
