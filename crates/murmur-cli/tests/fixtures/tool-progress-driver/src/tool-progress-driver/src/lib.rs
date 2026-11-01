@@ -54,6 +54,7 @@ fn answer(response: serde_json::Value) -> ToolResult {
         data_path: None,
         truncated: false,
         metadata: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 

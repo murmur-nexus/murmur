@@ -658,7 +658,18 @@ pub(crate) fn run_run(
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?
         // What `session_start.effective_grants.parent_workdir` would record, so a child's report
         // is the object its launch writes.
-        .with_parent_workdir(parent_workdir_snapshot.clone());
+        .with_parent_workdir(parent_workdir_snapshot.clone())
+        .with_images(
+            runtime_manifest
+                .context
+                .as_ref()
+                .map(|context| context.images)
+                .unwrap_or_default(),
+            runtime_manifest
+                .inference
+                .as_ref()
+                .map(|inference| inference.transport.as_str()),
+        );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(

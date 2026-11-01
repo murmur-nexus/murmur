@@ -91,6 +91,56 @@ resolves the name beneath that directory and refuses anything that leaves it:
 
 A result carrying `data` uses it verbatim and never opens `data-path`.
 
+### Returning an image { #tool-attachments }
+
+A tool returns an image by writing the file into the [work folder](workdir.md#work-folder) and
+naming it in the result's `attachments` list, one `attachment { media-type, path }` per image, in
+the order the model should see them. An inference driver returns an empty list.
+
+The runtime checks each attachment before the model sees it:
+
+| Check | Refusal code |
+|---|---|
+| `media-type` is `image/png`, `image/jpeg`, `image/gif` or `image/webp` | `media_type_not_allowed` |
+| `path` and `media-type` are both non-empty | `malformed` |
+| `path` is a regular file under the work folder, reached through no symlink | `not_found`, `outside_root`, `symlink_refused`, `not_a_regular_file`, `io_error` |
+| The file is at most [`context.images.max_bytes`](manifest.md#context-images) | `too_large` |
+| Its first bytes are those of `media-type` | `content_mismatch` |
+| This model turn's tool calls have returned fewer than `context.images.max_per_turn` images | `turn_limit` |
+| Its bytes could be stored | `store_failed` |
+
+An accepted image is stored once, by its sha256, in the conversation's `blobs/` directory and
+recorded as a reference: see [The conversation record](workdir.md#the-conversation-record). A refused
+one adds one line to the result the model reads, after the tool's own output:
+
+```text
+attachment 'note.png' was not attached: declared image/png but the bytes are not an image of any allowed type (content_mismatch)
+```
+
+A refusal never changes the call's `status`. Under `transport: process` the runtime runs the same
+checks, stores nothing, and adds `[image attached: <path>, <media type>, <n> bytes; not shown to this model]`
+for each accepted image instead.
+
+### Native tool result { #native-tool-result }
+
+A [native tool](../language-guides/python-native.md) reads one JSON object on stdin and writes one
+on stdout. The stdout object carries the same fields as a `tool-result`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `"passed"`, `"failed"`, other | Any other value, or none, is `error` |
+| `summary` | string | Optional. The result text when `data` is absent |
+| `data` | string or any JSON value | Optional. A non-string value is passed on serialized |
+| `attachments` | array of `{"media_type": <string>, "path": <string>}` | Optional. The images the call returns, checked as [Returning an image](#tool-attachments) describes. An entry that is not an object of two strings, or an `attachments` that is not an array, is refused `malformed` |
+
+```json
+{"status": "passed", "summary": "took a screenshot", "data": "saved shot.png",
+ "attachments": [{"media_type": "image/png", "path": "shot.png"}]}
+```
+
+Stdout that is not JSON becomes the result text as it is, and an empty stdout reports the exit
+status.
+
 ### Stateful driver continuation { #stateful-driver-continuation }
 
 By default the runtime resends the full conversation history on every turn. A driver holding
@@ -1043,8 +1093,8 @@ serve it.
 
 | Package | Version |
 |---|---|
-| `murmur:tool` | `0.1.0` |
-| `murmur:tool-registry` | `0.1.0` |
+| `murmur:tool` | `0.2.0` |
+| `murmur:tool-registry` | `0.2.0` |
 | `murmur:capsule` | `0.1.0` |
 | `murmur:artifact-manager` | `0.1.0` |
 | `murmur:shell` | `0.1.0` |

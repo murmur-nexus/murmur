@@ -507,7 +507,7 @@ pub enum RuntimeError {
     CapsuleExportMissing,
 
     #[error(
-        "tool component '{name}' missing export murmur:tool/run@0.1.0#run; rebuild the artifact against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
+        "tool component '{name}' missing export murmur:tool/run@0.2.0#run; rebuild the artifact against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )]
     ToolExportMissing { name: String },
 

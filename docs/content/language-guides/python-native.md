@@ -80,6 +80,30 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
+The fields the runtime reads from stdout are listed under
+[Native tool result](../reference/wit-interfaces.md#native-tool-result).
+
+### Return an image
+
+To show the model a picture, write it into the work folder, the tool's current directory, and name
+it in `attachments`:
+
+```python
+with open("chart.png", "wb") as out:
+    out.write(png_bytes)
+
+result = {
+    "status": "passed",
+    "summary": "drew the chart",
+    "data": "saved chart.png",
+    "attachments": [{"media_type": "image/png", "path": "chart.png"}],
+}
+```
+
+The media type is `image/png`, `image/jpeg`, `image/gif` or `image/webp`, and must match the file's
+bytes. An image the runtime refuses adds one line to the result text naming why; see
+[Returning an image](../reference/wit-interfaces.md#tool-attachments).
+
 ---
 
 ## Step 3 — Build an executable

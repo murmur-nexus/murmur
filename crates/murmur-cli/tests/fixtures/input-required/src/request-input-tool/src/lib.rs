@@ -21,6 +21,7 @@ impl exports::murmur::tool::run::Guest for RequestInputTool {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

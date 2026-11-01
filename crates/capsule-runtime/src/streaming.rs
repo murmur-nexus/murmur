@@ -151,6 +151,20 @@ pub(crate) struct StreamArtifact {
     /// The tool result's `truncated` flag, passed through unchanged: a tool's declaration that its
     /// output was cut short. The shell tool sets it when output exceeds its capture limit.
     pub truncated: bool,
+    /// The images the call returned that the runtime accepted, in the order the call named them;
+    /// empty for every other frame. A refused attachment is not listed.
+    pub attachments: Vec<StreamAttachment>,
+}
+
+/// One image an `artifact` frame's call returned: what it is, and where the door serves its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StreamAttachment {
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    /// `/attachments/<task-id>/<sha256>`, relative to the door.
+    pub url: String,
 }
 
 // Every field above is serialized on every frame, `null` included, for the reason
@@ -179,7 +193,14 @@ impl StreamArtifact {
             duration_ms: Some(duration_ms),
             exit_code,
             truncated,
+            attachments: Vec::new(),
         }
+    }
+
+    /// This frame with `attachments` listed.
+    pub(crate) fn with_attachments(mut self, attachments: Vec<StreamAttachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     /// The frame forwarding one hook artifact. No tool call is behind it, so it has no id, no
@@ -196,6 +217,7 @@ impl StreamArtifact {
             duration_ms: None,
             exit_code: None,
             truncated: false,
+            attachments: Vec::new(),
         }
     }
 }
@@ -854,7 +876,7 @@ mod tests {
         )));
         assert_eq!(
             json,
-            r#"{"frame":"artifact","toolName":"bash","content":"hello","fenceSource":"tool:bash","toolCallId":"call_1","isError":false,"durationMs":12,"exitCode":0,"truncated":false}"#
+            r#"{"frame":"artifact","toolName":"bash","content":"hello","fenceSource":"tool:bash","toolCallId":"call_1","isError":false,"durationMs":12,"exitCode":0,"truncated":false,"attachments":[]}"#
         );
     }
 
@@ -939,7 +961,7 @@ mod tests {
                 "my-hook".into(),
                 r#"{"reviewed":true}"#.into(),
             )),
-            r#"{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}"#
+            r#"{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false,"attachments":[]}"#
         );
     }
 

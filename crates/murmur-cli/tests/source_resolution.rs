@@ -726,7 +726,7 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
     assert_contains(
         &stderr,
         &[
-            "no version of ana/tool-none in github:ana/fits fits WIT level 2, the level this mur \
+            "no version of ana/tool-none in github:ana/fits fits WIT level 3, the level this mur \
              serves",
             &format!(
                 "ana/tool-none: 1.0.0 needs murmur:tool/run@9.9.9, this mur serves \
@@ -850,11 +850,11 @@ fn assert_does_not_fit(stderr: &str) {
     assert_contains(
         stderr,
         &[
-            "error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 2, the \
+            "error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 3, the \
              level this mur serves: ",
             "murmur:tool/run@9.9.9",
             "hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that \
-             fits level 2; pin it in murmur.yaml and run `mur install`, or run `mur install \
+             fits level 3; pin it in murmur.yaml and run `mur install`, or run `mur install \
              ana/tool-x@1.0.0`",
         ],
     );

@@ -284,7 +284,7 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
         .collect();
     recorded.sort();
     recorded.dedup();
-    assert_eq!(recorded, ["murmur:tool/run@0.1.0"]);
+    assert_eq!(recorded, ["murmur:tool/run@0.2.0"]);
     assert_eq!(echo["versions"][0]["interfaces"], json!(recorded));
 
     let hook = artifact(&index, "hook-old");
@@ -929,7 +929,7 @@ fn merge_keeps_every_version_the_directory_does_not_hold() {
     let new: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     // Kept verbatim, but for the derived built-at level a version recording none is given.
     let mut gone = artifact(&old, "tool-gone").clone();
-    gone["versions"][0]["built_at_level"] = json!(2);
+    gone["versions"][0]["built_at_level"] = json!(capsule_runtime::served_wit_level().level);
     assert_eq!(artifact(&new, "tool-gone"), &gone);
     let versions = artifact(&new, "tool-x")["versions"].as_array().unwrap();
     let listed: Vec<(&str, &str)> = versions

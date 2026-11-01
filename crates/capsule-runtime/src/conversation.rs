@@ -250,6 +250,12 @@ impl ConversationRecord {
         self.dir.join(RECORD_FILE_NAME)
     }
 
+    /// `<home>/.murmur/conversations/<record>/<context-id>`: the directory holding the record and
+    /// the `blobs/` its image blocks name.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Every message the record already holds, oldest first, and never appended again.
     ///
     /// The agent loop starts a `threaded` task's message list from this. Each message keeps the
@@ -1437,6 +1443,7 @@ mod tests {
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             retain: None,
+            images: murmur_artifact::ContextImagesConfig::default(),
         };
         assert_eq!(resolve_record_name(Some(&off), "capsule"), None);
 

@@ -384,6 +384,7 @@ On a process capsule the harness runs the turn, so its `artifact` frames differ 
 |---|---|---|
 | `fenceSource` | Always `null` | The harness receives tool output unfenced |
 | `exitCode`, `truncated` | Always `null` and `false` | A process driver reports no exit status or truncation flag |
+| `attachments` | Always `[]` | The harness's model is shown no image, and nothing is stored |
 
 A provider retry writes no event on either transport; the driver reports it to the trace as
 `harness_retry`.
@@ -553,6 +554,7 @@ Every key is present on every frame, in this order. A key that does not apply to
 | `durationMs` | u64 \| null | Time the dispatch took, equal to the `duration_ms` on the call's trace event. `null` on a hook artifact |
 | `exitCode` | i32 \| null | The exit status of the subprocess the call ran to completion. `null` for a WASM tool, a skill, a command moved to the background, a call that never reached a tool, and a hook artifact |
 | `truncated` | bool | The tool result's own `truncated` flag, unchanged. `false` on a call that never reached a tool and on a hook artifact |
+| `attachments` | array | The images the call [returned](wit-interfaces.md#tool-attachments) that the runtime accepted, in the order the call named them, each `{"mediaType", "sizeBytes", "sha256", "url"}`. `url` is `/attachments/<task-id>/<sha256>`, where the door serves the bytes: see [Attachment bytes](#attachment-bytes). A refused attachment is not listed. `[]` on every other frame |
 
 `isError` and `exitCode` are separate facts. A shell command that runs to completion is a
 successful call whatever its exit status, so `bash` reports `"isError":false` beside
@@ -560,9 +562,26 @@ successful call whatever its exit status, so `bash` reports `"isError":false` be
 
 | Frame | Example |
 |---|---|
-| A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\nExit code: 0\nStdout:\nhello\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false}` |
-| A call that never reached a tool | `{"frame":"artifact","toolName":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fenceSource":null,"toolCallId":"toolu_03","isError":true,"durationMs":0,"exitCode":null,"truncated":false}` |
-| A hook artifact | `{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}` |
+| A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\nExit code: 0\nStdout:\nhello\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false,"attachments":[]}` |
+| A call that never reached a tool | `{"frame":"artifact","toolName":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fenceSource":null,"toolCallId":"toolu_03","isError":true,"durationMs":0,"exitCode":null,"truncated":false,"attachments":[]}` |
+| A tool call that returned an image | `{"frame":"artifact","toolName":"screenshot","content":"<untrusted-content source=tool:screenshot>\nsaved shot.png\n</untrusted-content>","fenceSource":"tool:screenshot","toolCallId":"toolu_02","isError":false,"durationMs":40,"exitCode":null,"truncated":false,"attachments":[{"mediaType":"image/png","sizeBytes":48213,"sha256":"9f2c…","url":"/attachments/tsk_0199c4e2…/9f2c…"}]}` |
+| A hook artifact | `{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false,"attachments":[]}` |
+
+### Attachment bytes { #attachment-bytes }
+
+`GET /attachments/<task-id>/<sha256>` answers with the bytes of an image a tool call of that task
+returned, the `url` its `artifact` frame lists. On a capsule declaring
+[`network.authentication`](manifest.md#field-network-authentication) it takes a token holding the
+`GetTask` scope, and reaches only the tasks that token [sees](agent-card.md#task-access); a public
+door serves it as it serves `GetTask`.
+
+| Request | Status | Body |
+|---|---|---|
+| A task the caller sees, and an image one of its tool calls returned | `200`, `content-type` the image's media type, and `content-length` | The image's bytes |
+| No token, or one that is not valid | `401` | The door's refusal |
+| A token without the `GetTask` scope | `403` | The door's refusal |
+| A task the registry does not hold or the caller does not see, or a hash none of its calls returned | `404` | Empty |
+| Any method but `GET` | `405`, `allow: GET` | Empty |
 
 ---
 

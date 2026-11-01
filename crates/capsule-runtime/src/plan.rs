@@ -1650,6 +1650,7 @@ mod tests {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

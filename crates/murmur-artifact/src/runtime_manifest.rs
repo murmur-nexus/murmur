@@ -1439,6 +1439,43 @@ pub struct ContextConfig {
     /// What bounds this capsule's conversation records. `None` — the `retain:` block was absent
     /// — keeps every record whole and forever. Inert when [`Self::record`] is `false`.
     pub retain: Option<ContextRetainConfig>,
+    /// The `context.images` block: how many images a tool may return and the driver is shown.
+    /// Always populated; [`ContextImagesConfig::default`] when the block is absent.
+    pub images: ContextImagesConfig,
+}
+
+/// `context.images.keep` when the key is absent.
+pub const DEFAULT_IMAGES_KEEP: u32 = 5;
+/// `context.images.max_bytes` when the key is absent: 5 MiB.
+pub const DEFAULT_IMAGES_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// `context.images.max_per_turn` when the key is absent.
+pub const DEFAULT_IMAGES_MAX_PER_TURN: u32 = 5;
+
+/// The `context.images` block: the limits on images a tool returns or an A2A message carries.
+///
+/// Every key is optional and at least 1. A capsule with no `context:` block, or no `images:`
+/// block in it, gets [`Self::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextImagesConfig {
+    /// How many of the newest images in the conversation the driver receives as bytes. Each older
+    /// image reaches it as one line naming the image. Read only on `transport: http`, where the
+    /// runtime holds the conversation.
+    pub keep: u32,
+    /// The largest image, in bytes, a tool result or an A2A message may carry.
+    pub max_bytes: u64,
+    /// How many images one model turn's tool calls may return between them, and one A2A
+    /// message may carry. Read only on `transport: http`.
+    pub max_per_turn: u32,
+}
+
+impl Default for ContextImagesConfig {
+    fn default() -> Self {
+        Self {
+            keep: DEFAULT_IMAGES_KEEP,
+            max_bytes: DEFAULT_IMAGES_MAX_BYTES,
+            max_per_turn: DEFAULT_IMAGES_MAX_PER_TURN,
+        }
+    }
 }
 
 // Both fractions are validated to 0.0..=1.0 at parse time, so NaN is impossible.
@@ -2310,6 +2347,22 @@ struct RawContextConfig {
     /// as an invalid `context.retain` rather than as a serde message about a struct field.
     #[serde(default, deserialize_with = "present_yaml_value")]
     retain: Option<serde_norway::Value>,
+    #[serde(default)]
+    images: Option<RawContextImages>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+/// Untyped values, so `10MB` or `-1` reaches [`parse_context_images`] and is reported as an
+/// invalid `context.images.*` naming the key rather than as a serde type error.
+#[derive(Debug, Deserialize)]
+struct RawContextImages {
+    #[serde(default)]
+    keep: Option<serde_norway::Value>,
+    #[serde(default)]
+    max_bytes: Option<serde_norway::Value>,
+    #[serde(default)]
+    max_per_turn: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3051,7 +3104,21 @@ impl RawBlock for RawContextConfig {
         "seed_budget",
         "seed_overflow_margin",
         "retain",
+        "images",
     ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(images) = &self.images {
+            collect_block(images, &child_path(path, "images"), out);
+        }
+    }
+}
+
+impl RawBlock for RawContextImages {
+    const KNOWN_KEYS: &'static [&'static str] = &["keep", "max_bytes", "max_per_turn"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -5992,7 +6059,60 @@ fn parse_context(
             DEFAULT_SEED_OVERFLOW_MARGIN,
         )?,
         retain: parse_context_retain(raw.retain)?,
+        images: parse_context_images(raw.images)?,
     }))
+}
+
+/// The `context.images` block, each absent key at its default.
+fn parse_context_images(
+    raw: Option<RawContextImages>,
+) -> Result<ContextImagesConfig, RuntimeManifestError> {
+    let defaults = ContextImagesConfig::default();
+    let Some(raw) = raw else {
+        return Ok(defaults);
+    };
+    let invalid = |field: &str, message: String| RuntimeManifestError::InvalidInferenceConfig {
+        field: field.to_string(),
+        message,
+    };
+    let count = |field: &str, value: Option<serde_norway::Value>, default: u32| match value {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| {
+                invalid(
+                    field,
+                    format!("must be a whole number of at least 1, got '{value:?}'"),
+                )
+            }),
+    };
+    let max_bytes = match raw.max_bytes {
+        None => defaults.max_bytes,
+        Some(value) => {
+            let field = "context.images.max_bytes";
+            let text = scalar_text(&value)
+                .ok_or_else(|| invalid(field, format!("'{value:?}' {BYTE_SIZE_ACCEPTED_FORM}")))?;
+            let parsed = parse_byte_size(&text).map_err(|message| invalid(field, message))?;
+            if parsed == 0 {
+                return Err(invalid(
+                    field,
+                    format!("must be greater than zero; {BYTE_SIZE_ACCEPTED_FORM}"),
+                ));
+            }
+            parsed
+        }
+    };
+    Ok(ContextImagesConfig {
+        keep: count("context.images.keep", raw.keep, defaults.keep)?,
+        max_bytes,
+        max_per_turn: count(
+            "context.images.max_per_turn",
+            raw.max_per_turn,
+            defaults.max_per_turn,
+        )?,
+    })
 }
 
 /// The keys `trace.retain` accepts, in the order an error lists them.
@@ -6869,6 +6989,86 @@ mod tests {
                 max_sessions: Some(50),
                 max_age_secs: Some(14 * 86_400),
             })
+        );
+    }
+
+    fn context_images_of(block: &str) -> Result<ContextImagesConfig, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\ncontext:\n  record: on\n{block}"
+        ))
+        .map(|manifest| manifest.context.unwrap().images)
+    }
+
+    #[test]
+    fn context_images_defaults_apply_without_the_block_and_to_each_absent_key() {
+        let defaults = ContextImagesConfig {
+            keep: 5,
+            max_bytes: 5 * 1024 * 1024,
+            max_per_turn: 5,
+        };
+        assert_eq!(ContextImagesConfig::default(), defaults);
+        assert_eq!(context_images_of("").unwrap(), defaults);
+        assert_eq!(
+            context_images_of("  images:\n    keep: 2\n").unwrap(),
+            ContextImagesConfig {
+                keep: 2,
+                ..defaults
+            }
+        );
+    }
+
+    #[test]
+    fn context_images_parses_every_key() {
+        assert_eq!(
+            context_images_of("  images:\n    keep: 1\n    max_bytes: 1Ki\n    max_per_turn: 9\n")
+                .unwrap(),
+            ContextImagesConfig {
+                keep: 1,
+                max_bytes: 1024,
+                max_per_turn: 9,
+            }
+        );
+        assert_eq!(
+            context_images_of("  images:\n    max_bytes: 4096\n")
+                .unwrap()
+                .max_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn context_images_refuses_zero_and_a_decimal_byte_suffix() {
+        for (block, field) in [
+            ("  images:\n    keep: 0\n", "context.images.keep"),
+            (
+                "  images:\n    max_per_turn: 0\n",
+                "context.images.max_per_turn",
+            ),
+            ("  images:\n    max_bytes: 0\n", "context.images.max_bytes"),
+            (
+                "  images:\n    max_bytes: 10MB\n",
+                "context.images.max_bytes",
+            ),
+            ("  images:\n    keep: many\n", "context.images.keep"),
+        ] {
+            match context_images_of(block) {
+                Err(RuntimeManifestError::InvalidInferenceConfig { field: got, .. }) => {
+                    assert_eq!(got, field, "{block}")
+                }
+                other => panic!("{block}: expected a refusal naming {field}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn context_images_unknown_key_is_suggested() {
+        assert_eq!(
+            unknown_keys_of("name: cap\nversion: 0.1.0\ncontext:\n  images:\n    kep: 3\n"),
+            vec![(
+                "kep".to_string(),
+                "context.images".to_string(),
+                Some("keep".to_string())
+            )]
         );
     }
 

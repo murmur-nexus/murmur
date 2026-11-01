@@ -31,8 +31,8 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:stream", "0.1.0"),
     ("murmur:task", "0.1.0"),
     ("murmur:task-io", "0.1.0"),
-    ("murmur:tool", "0.1.0"),
-    ("murmur:tool-registry", "0.1.0"),
+    ("murmur:tool", "0.2.0"),
+    ("murmur:tool-registry", "0.2.0"),
 ];
 
 /// The repository path of the committed WIT level table, for messages that name it.
@@ -149,8 +149,62 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_2() {
-        assert_eq!(served_wit_level().level, 2);
+    fn wit_levels_served_level_is_level_3() {
+        assert_eq!(served_wit_level().level, 3);
+    }
+
+    /// Level 3 moved `murmur:tool` and `murmur:tool-registry` together, for `tool-result`'s
+    /// `attachments` field. A level-2 tool or driver exporting `murmur:tool/run@0.1.0` does not
+    /// fit level 3, and a hook, which names neither package, fits both levels unchanged.
+    #[test]
+    fn wit_levels_level_3_moves_the_tool_packages() {
+        use murmur_artifact::{
+            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
+        };
+        let levels = wit_levels();
+        let (two, three) = (&levels[1], &levels[2]);
+        let moved: Vec<_> = two
+            .packages
+            .iter()
+            .zip(&three.packages)
+            .filter(|(before, after)| before != after)
+            .collect();
+        let package = |name: &str, version: &str| (name.to_string(), version.to_string());
+        assert_eq!(
+            moved,
+            [
+                (
+                    &package("murmur:tool", "0.1.0"),
+                    &package("murmur:tool", "0.2.0")
+                ),
+                (
+                    &package("murmur:tool-registry", "0.1.0"),
+                    &package("murmur:tool-registry", "0.2.0")
+                ),
+            ]
+        );
+
+        let contracts = |exports: &[&str], imports: &[&str]| WitContracts {
+            exports: exports.iter().map(|e| e.to_string()).collect(),
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level, current_platform())
+                == VersionFit::Fits
+        };
+        let old_tool = || contracts(&["murmur:tool/run@0.1.0"], &["murmur:stream/events@0.1.0"]);
+        assert!(fits(old_tool(), two));
+        assert!(!fits(old_tool(), three));
+        let tool = contracts(&["murmur:tool/run@0.2.0"], &["murmur:stream/events@0.1.0"]);
+        assert!(fits(tool, three));
+        let hook = || {
+            contracts(
+                &["murmur:hook/lifecycle@0.9.0"],
+                &["murmur:task-io/read@0.1.0"],
+            )
+        };
+        assert!(fits(hook(), two));
+        assert!(fits(hook(), three));
     }
 
     /// Level 2 moved `murmur:driver` alone, so an artifact built at level 1 whose interfaces name

@@ -19,6 +19,7 @@ description: |
   | netns              |                     | ok, netns or error        |
   | rlimit_nofile      |                     | ok, soft, hard or error   |
   | open_until_refused | max?                | ok, opened, error         |
+  | image              | path?, index?, malformed? | path; one PNG attachment |
 
   The last eight are sandbox probes: they report the attempt's outcome in
   `data` and always pass.
@@ -29,7 +30,7 @@ description: |
 # Inline JSON, matching the style capsule-runtime uses for its own synthesised
 # shell tool manifests (crates/capsule-runtime/src/shell.rs). The `repo`
 # property is what the inventory -> input_schema mapping test asserts on.
-input_schema: '{"type":"object","properties":{"operation":{"type":"string","enum":["create_dir","list_entries","read","write","connect","unix_socket","exec","netns","rlimit_nofile","open_until_refused"],"description":"Operation to perform."},"repo":{"type":"string","description":"Base directory the operation runs against. Defaults to the working directory."},"path":{"type":"string","description":"Path to create or list, resolved against repo."},"label":{"type":"string","description":"Optional marker text written into the created directory as label.txt."},"text":{"type":"string","description":"Text the write probe writes."},"host":{"type":"string","description":"Host the connect probe connects to."},"port":{"type":"integer","description":"Port the connect probe connects to."},"send":{"type":"string","description":"Bytes the connect probe sends before reading."},"args":{"type":"array","items":{"type":"string"},"description":"Arguments for the exec probe."},"max":{"type":"integer","description":"Most descriptors the open_until_refused probe opens. Defaults to 200."}},"required":["operation"]}'
+input_schema: '{"type":"object","properties":{"operation":{"type":"string","enum":["create_dir","list_entries","read","write","connect","unix_socket","exec","netns","rlimit_nofile","open_until_refused","image"],"description":"Operation to perform."},"repo":{"type":"string","description":"Base directory the operation runs against. Defaults to the working directory."},"path":{"type":"string","description":"Path to create or list, resolved against repo."},"label":{"type":"string","description":"Optional marker text written into the created directory as label.txt."},"text":{"type":"string","description":"Text the write probe writes."},"host":{"type":"string","description":"Host the connect probe connects to."},"port":{"type":"integer","description":"Port the connect probe connects to."},"send":{"type":"string","description":"Bytes the connect probe sends before reading."},"args":{"type":"array","items":{"type":"string"},"description":"Arguments for the exec probe."},"max":{"type":"integer","description":"Most descriptors the open_until_refused probe opens. Defaults to 200."},"index":{"type":"integer","description":"Number the image operation writes into its PNG, so each index is a distinct image."},"malformed":{"type":"boolean","description":"Whether the image operation returns a malformed attachment entry instead."}},"required":["operation"]}'
 
 capabilities:
   filesystem:

@@ -1024,6 +1024,10 @@ pub struct ScopeReport {
     /// a grant: it opens nothing and changes no class, floor or tier. Its `restriction` is
     /// [`Self::filesystem_boundary`]'s, keyed on the same applied tier.
     pub parent_workdir: Option<crate::workdir_snapshot::ParentWorkdirReport>,
+    /// The `context.images` limits this session applies, and whether `keep` and `max_per_turn`
+    /// apply at all. Set by the caller that knows the transport, through [`Self::with_images`];
+    /// `null` until then. Always serialized.
+    pub images: Option<ImagesReport>,
     /// `capabilities.env.allow`, verbatim.
     pub env_allow: Vec<String>,
     /// `capabilities.plan.submit` — whether the model is offered the `submit-plan` tool. Always
@@ -1294,6 +1298,10 @@ impl ScopeReport {
             out.push_str(&render_parent_workdir(parent));
         }
 
+        if let Some(images) = &self.images {
+            out.push_str(&render_images(images));
+        }
+
         out.push_str("\nResource plane\n");
         match &self.exports_files {
             None => out.push_str("  exports.files: <none>\n"),
@@ -1358,7 +1366,39 @@ impl ScopeReport {
     }
 }
 
+/// The `Images` block of the scope report: the limits on images a tool returns or an A2A message
+/// carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ImagesReport {
+    /// `context.images.keep`: the newest images the driver receives as bytes.
+    pub keep: u32,
+    /// `context.images.max_bytes`: the largest image accepted.
+    pub max_bytes: u64,
+    /// `context.images.max_per_turn`: images accepted per model turn.
+    pub max_per_turn: u32,
+    /// Whether `keep` and `max_per_turn` do anything: `false` on `inference.transport: process`,
+    /// whose harness holds the conversation.
+    pub keep_applies: bool,
+}
+
 impl ScopeReport {
+    /// This report with [`Self::images`] set from `images`, for a capsule on `transport`; `None`
+    /// is a capsule with no `inference:` block.
+    #[must_use]
+    pub fn with_images(
+        mut self,
+        images: murmur_artifact::ContextImagesConfig,
+        transport: Option<&str>,
+    ) -> Self {
+        self.images = Some(ImagesReport {
+            keep: images.keep,
+            max_bytes: images.max_bytes,
+            max_per_turn: images.max_per_turn,
+            keep_applies: transport != Some("process"),
+        });
+        self
+    }
+
     /// This report with [`Self::parent_workdir`] set from `snapshot`, the restriction read off
     /// [`Self::filesystem_boundary`] so the two cannot disagree about one tier. `None` leaves it
     /// `null`.
@@ -1375,6 +1415,27 @@ impl ScopeReport {
             });
         self
     }
+}
+
+/// The `Images` block of `mur run --explain-scope`. Starts with a blank line and ends with a newline.
+#[must_use]
+pub fn render_images(images: &ImagesReport) -> String {
+    let mut out = String::from("\nImages\n");
+    out.push_str(&format!("  max_bytes:     {}\n", images.max_bytes));
+    if images.keep_applies {
+        out.push_str(&format!("  keep:          {}\n", images.keep));
+        out.push_str(&format!("  max_per_turn:  {}\n", images.max_per_turn));
+    } else {
+        out.push_str(&format!(
+            "  keep:          {} (does nothing here: the harness holds the conversation)\n",
+            images.keep
+        ));
+        out.push_str(&format!(
+            "  max_per_turn:  {} (does nothing here: the harness holds the conversation)\n",
+            images.max_per_turn
+        ));
+    }
+    out
 }
 
 /// The `Parent work folder` block of `mur run --explain-scope`, for a delegated child whose work
@@ -1715,6 +1776,8 @@ pub(crate) fn scope_report_for_tier(
         // Set by the caller that knows it, through `with_parent_workdir`: the snapshot is what
         // the launching parent did, not something the policy declares.
         parent_workdir: None,
+        // Set through `with_images` by the caller that holds the manifest's transport.
+        images: None,
         env_allow: policy.env_allow.clone(),
         plan_submit: policy.plan_submit,
         install_skill: policy.install_skill.clone(),

@@ -107,7 +107,7 @@ fn a_published_tool_records_the_interface_it_exports() {
     publish(&home, &artifact).success();
 
     let contracts = contracts(&home, "contract-tool", "0.1.0");
-    assert!(strings(&contracts["exports"]).contains(&"murmur:tool/run@0.1.0".to_string()));
+    assert!(strings(&contracts["exports"]).contains(&"murmur:tool/run@0.2.0".to_string()));
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn a_capsule_records_both_directions_sorted_and_deduplicated() {
     let imports = strings(&contracts["imports"]);
 
     assert!(exports.contains(&"murmur:capsule/run@0.1.0".to_string()));
-    assert!(imports.contains(&"murmur:tool-registry/invoke@0.1.0".to_string()));
+    assert!(imports.contains(&"murmur:tool-registry/invoke@0.2.0".to_string()));
 
     for names in [&exports, &imports] {
         let mut sorted = names.clone();
@@ -313,10 +313,10 @@ fn contract_filter_selects_artifacts_touching_the_package_in_either_direction() 
         .success()
         .stdout(predicate::str::contains("CONTRACTS"))
         .stdout(predicate::str::contains("contract-tool"))
-        .stdout(predicate::str::contains("murmur:tool/run@0.1.0"))
+        .stdout(predicate::str::contains("murmur:tool/run@0.2.0"))
         .stdout(predicate::str::contains("contract-capsule"))
         .stdout(predicate::str::contains(
-            "murmur:tool-registry/invoke@0.1.0",
+            "murmur:tool-registry/invoke@0.2.0",
         ))
         .stdout(predicate::str::contains("contract-skill").not());
 }

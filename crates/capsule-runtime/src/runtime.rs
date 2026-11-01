@@ -126,15 +126,15 @@ use crate::{
 /// resolves — the legacy unversioned fallback was removed after the dual-accept
 /// runtime shipped (see `wit/VERSIONING.md`).
 pub(crate) const WIT_CAPSULE_IFACE_VERSIONED: &str = "murmur:capsule/run@0.1.0";
-/// Versioned instance export name a guest built against `murmur:tool@0.1.0`
+/// Versioned instance export name a guest built against `murmur:tool@0.2.0`
 /// carries. Only name the host resolves; see `WIT_CAPSULE_IFACE_VERSIONED`.
-pub(crate) const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.1.0";
+pub(crate) const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.2.0";
 
 /// The host provides its guest-facing *import* interfaces under the versioned
 /// instance name only. The legacy unversioned provisions were dropped after the
 /// dual-accept runtime shipped; a guest importing only the
 /// unversioned name now fails to link. See `wit/VERSIONING.md`.
-pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
+pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.2.0";
 pub(crate) const WIT_STREAM_EVENTS_IFACE: &str = "murmur:stream/events@0.1.0";
 pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
@@ -1261,6 +1261,7 @@ fn fence_done_check_output(body: String) -> String {
         data_path: None,
         truncated: false,
         metadata: Vec::new(),
+        attachments: Vec::new(),
     };
     fence_result(crate::fence::done_check_source(), &mut result);
     result.data.unwrap_or_default()
@@ -2550,7 +2551,18 @@ pub fn stage_session(
         // `prepare_scope`'s real write outcome before `session_start` is written.
         crate::cgroup::IoMaxReport::default(),
     )
-    .with_parent_workdir(request.parent_workdir_snapshot.clone());
+    .with_parent_workdir(request.parent_workdir_snapshot.clone())
+    .with_images(
+        request
+            .context
+            .as_ref()
+            .map(|context| context.images)
+            .unwrap_or_default(),
+        request
+            .inference
+            .as_ref()
+            .map(|inference| inference.transport.as_str()),
+    );
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
     // sleep` withdraws that bound on purpose. Once withdrawn, the declared lifetime is the only
@@ -2865,6 +2877,12 @@ pub fn stage_session(
                             &resolved.bytes,
                             &resolved.sha256,
                         )?;
+                        crate::process_driver::check_component_level(
+                            &full_name,
+                            &resolved_version,
+                            murmur_contracts(&engine, &tool_component),
+                            crate::served_wit_level(),
+                        )?;
                         tool_components.insert(artifact.name.clone(), tool_component);
                     }
                 }
@@ -2940,6 +2958,14 @@ pub fn stage_session(
                     None => Ok(()),
                 };
                 driver_refusal(stream, driver)?;
+                if let Some(contracts) = contracts {
+                    crate::process_driver::check_component_level(
+                        &full_name,
+                        &resolved_version,
+                        contracts,
+                        crate::served_wit_level(),
+                    )?;
+                }
                 let tool_component = compiled_forms
                     .compile(&engine, &resolved.sha256, &tool_wasm)
                     .map_err(|err| RuntimeError::ToolComponentCompile {
@@ -3200,6 +3226,17 @@ pub fn stage_session(
                     .map_err(|err| RuntimeError::CapsuleCompile(err.to_string()))?,
             )
         };
+    if let Some(component) = &capsule_component {
+        crate::process_driver::check_component_level(
+            request
+                .capsule_artifact
+                .as_deref()
+                .unwrap_or(&request.capsule_name),
+            &request.capsule_version,
+            murmur_contracts(&engine, component),
+            crate::served_wit_level(),
+        )?;
+    }
 
     let accessible_workdir = if let Some(ref user_dir) = request.workdir {
         let user_dir = if user_dir.is_absolute() {
@@ -4182,10 +4219,20 @@ fn launch(
         };
 
         // --- A2A task registry and incoming channel ---
-        let task_registry: Arc<Mutex<TaskRegistry>> = Arc::new(Mutex::new(TaskRegistry::new(
-            effective_lifecycle.queue_depth,
-            effective_lifecycle.task_acceptance.clone(),
-        )));
+        let task_registry: Arc<Mutex<TaskRegistry>> = Arc::new(Mutex::new(
+            TaskRegistry::new(
+                effective_lifecycle.queue_depth,
+                effective_lifecycle.task_acceptance.clone(),
+            )
+            .with_image_policy(crate::a2a::ImagePolicy::for_transport(
+                &inference.transport,
+                staged
+                    .context
+                    .as_ref()
+                    .map(|context| context.images)
+                    .unwrap_or_default(),
+            )),
+        ));
         let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<IncomingTask>(queue_capacity);
 
         // Demoted shell commands and the channel their completions come back on. Unbounded, so
@@ -4636,6 +4683,12 @@ fn launch(
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
+                        image_limits: staged
+                            .context
+                            .as_ref()
+                            .map(|context| context.images)
+                            .unwrap_or_default(),
+                        current_task_images: Vec::new(),
                         current_context_id: None,
                         current_forget_harness_session: None,
                         live_delegations: Arc::clone(&live_delegations),
@@ -5126,7 +5179,7 @@ fn launch(
                                 .await;
                         }
                         let _ = trace
-                            .write_task_start(
+                            .write_task_start_with_attachments(
                                 &incoming.task_id,
                                 &incoming.context_id,
                                 incoming.source,
@@ -5134,6 +5187,13 @@ fn launch(
                                 incoming.message_text.len() as u64,
                                 &incoming.part_kinds,
                                 &incoming.reference_task_ids,
+                                incoming
+                                    .images
+                                    .iter()
+                                    .map(|(part, image)| {
+                                        image.trace_record(&format!("message.parts[{part}]"))
+                                    })
+                                    .collect(),
                             )
                             .await;
                         let seed = hooks
@@ -5158,6 +5218,8 @@ fn launch(
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
+                        state.current_task_images =
+                            incoming.images.iter().map(|(_, image)| image.clone()).collect();
                         state.current_context_id = Some(incoming.context_id.clone());
                         // A launch's own task carries `mur run --forget-session`; every other
                         // task carries what its message asked.
@@ -5487,7 +5549,7 @@ fn launch(
     wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
 
-    // `murmur:tool-registry/invoke@0.1.0` is the one host-provided interface a
+    // `murmur:tool-registry/invoke@0.2.0` is the one host-provided interface a
     // capsule guest imports. Register it by hand against the same `invoke::Host`
     // impl on `CapsuleStoreState` (the generated `invoke::add_to_linker` would do
     // the same, but this keeps the registration alongside the tool-side ones).
@@ -5662,6 +5724,8 @@ fn launch(
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent,
         current_task_provenance: None,
+        image_limits: murmur_artifact::ContextImagesConfig::default(),
+        current_task_images: Vec::new(),
         current_context_id: None,
         current_forget_harness_session: None,
         live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
@@ -7995,6 +8059,12 @@ pub(crate) struct CapsuleStoreState {
     /// script-capsule path, which runs no task loop and so has no task in scope — that stamps
     /// `untrusted`, the safe class.
     pub(crate) current_task_provenance: Option<TaskProvenance>,
+    /// The capsule's `context.images` limits, the defaults when it declares none. Read by the
+    /// agent loop for each tool result's attachments and by the process transport's bridge.
+    pub(crate) image_limits: murmur_artifact::ContextImagesConfig,
+    /// The images the message that started the task now in scope carried, set beside
+    /// `current_task_provenance`. A fresh attempt's task message carries them after its text.
+    pub(crate) current_task_images: Vec<crate::images::CheckedImage>,
     /// The conversation the task now in scope runs under, set beside `current_task_provenance`
     /// at every task-activation site. A demoted command's completion is enqueued under this id,
     /// so the result joins the conversation the command was started from.
@@ -8932,7 +9002,7 @@ impl ToolA2aWiring {
 }
 
 /// Instantiate `component` in a fresh `Linker`/`Store` and call its
-/// `murmur:tool/run@0.1.0#run` export.
+/// `murmur:tool/run@0.2.0#run` export.
 ///
 /// This is the single WASM-tool (and therefore inference-driver) invocation
 /// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] and
@@ -9823,6 +9893,7 @@ impl CapsuleStoreState {
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             }));
         }
 
@@ -10135,6 +10206,7 @@ impl CapsuleStoreState {
             data_path: None,
             truncated: result.truncated,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -10302,6 +10374,7 @@ impl CapsuleStoreState {
                     data_path: None,
                     truncated: false,
                     metadata: Vec::new(),
+                    attachments: Vec::new(),
                 };
                 Ok((result, Some(note)))
             }
@@ -10341,6 +10414,7 @@ impl CapsuleStoreState {
                     data_path: None,
                     truncated: false,
                     metadata: Vec::new(),
+                    attachments: Vec::new(),
                 };
                 Ok((result, Some(note)))
             }
@@ -10368,6 +10442,7 @@ impl CapsuleStoreState {
                     data_path: None,
                     truncated,
                     metadata: Vec::new(),
+                    attachments: Vec::new(),
                 };
                 Ok((
                     result,
@@ -10416,6 +10491,7 @@ impl CapsuleStoreState {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         };
         let note = format!(
             "[{END_WITHOUT_ANSWER_TOOL}] This task ends without an answer once this turn's tool \
@@ -10447,6 +10523,7 @@ impl CapsuleStoreState {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -10593,6 +10670,7 @@ impl CapsuleStoreState {
                     data_path: None,
                     truncated: false,
                     metadata: Vec::new(),
+                    attachments: Vec::new(),
                 })
             }
             Err(refused) => {
@@ -10853,6 +10931,7 @@ impl CapsuleStoreState {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -11198,6 +11277,7 @@ fn json_tool_result(summary: String, data: serde_json::Value) -> murmur::tool::r
         data_path: None,
         truncated: false,
         metadata: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 
@@ -12552,6 +12632,7 @@ fn dispatch_native_tool(
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         });
     }
 
@@ -12582,6 +12663,7 @@ fn dispatch_native_tool(
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: native_attachments(json.get("attachments")),
             })
         }
         Err(_) => Ok(murmur::tool::run::ToolResult {
@@ -12595,7 +12677,53 @@ fn dispatch_native_tool(
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }),
+    }
+}
+
+/// The `attachments` of a native tool's stdout envelope: an array of
+/// `{"media_type": <string>, "path": <string>}` objects, in order.
+///
+/// An entry that is not an object of two strings keeps whatever string it does carry and an empty
+/// string for the rest, and a value that is not an array is one such entry; the agent loop then
+/// refuses each as `malformed` rather than dropping it unseen. An absent or `null` value is no
+/// attachments.
+fn native_attachments(value: Option<&serde_json::Value>) -> Vec<murmur::tool::run::Attachment> {
+    let entry = |value: &serde_json::Value| {
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        murmur::tool::run::Attachment {
+            media_type: field("media_type"),
+            path: field("path"),
+        }
+    };
+    match value {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(entries)) => entries.iter().map(entry).collect(),
+        Some(other) => vec![entry(other)],
+    }
+}
+
+/// The `murmur:*` instance names `component` exports and imports, read from its compiled type
+/// rather than by parsing its bytes again.
+fn murmur_contracts(engine: &Engine, component: &Component) -> murmur_artifact::WitContracts {
+    let ty = component.component_type();
+    let murmur = |name: &str| name.starts_with("murmur:").then(|| name.to_string());
+    murmur_artifact::WitContracts {
+        exports: ty
+            .exports(engine)
+            .filter_map(|(name, _)| murmur(name))
+            .collect(),
+        imports: ty
+            .imports(engine)
+            .filter_map(|(name, _)| murmur(name))
+            .collect(),
     }
 }
 
@@ -12617,6 +12745,7 @@ fn native_tool_outcome(
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             })
         },
     }
@@ -12723,6 +12852,7 @@ fn dispatch_shell_tool(
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             });
         }
     };
@@ -12810,6 +12940,7 @@ fn dispatch_shell_tool(
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             })
         },
     }
@@ -12878,6 +13009,7 @@ fn shell_result_to_tool_result(result: ShellResult) -> murmur::tool::run::ToolRe
         data_path: None,
         truncated: result.truncated,
         metadata,
+        attachments: Vec::new(),
     }
 }
 
@@ -13610,6 +13742,7 @@ fn enqueue_launch_task(
         caller: None,
         reference_task_ids: Vec::new(),
         part_kinds: Vec::new(),
+        images: Vec::new(),
     };
     task_registry
         .lock()
@@ -13668,6 +13801,7 @@ async fn enqueue_detached_report(
                 caller: None,
                 reference_task_ids: Vec::new(),
                 part_kinds: Vec::new(),
+                images: Vec::new(),
             };
             let _ = trace
                 .write_shell_completed(&completion, &task.task_id)
@@ -13690,6 +13824,7 @@ async fn enqueue_detached_report(
             caller: None,
             reference_task_ids: Vec::new(),
             part_kinds: Vec::new(),
+            images: Vec::new(),
         },
     };
 
@@ -18132,6 +18267,8 @@ inference:
                 .with_test_session_dirs(),
             current_traceparent: None,
             current_task_provenance: None,
+            image_limits: murmur_artifact::ContextImagesConfig::default(),
+            current_task_images: Vec::new(),
             current_context_id: None,
             current_forget_harness_session: None,
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
@@ -21731,6 +21868,7 @@ inference:
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -21866,6 +22004,7 @@ inference:
             data_path: Some("out/log.txt".to_string()),
             truncated: true,
             metadata: vec![("state_effect".to_string(), "read".to_string())],
+            attachments: Vec::new(),
         };
         fence_result(&crate::fence::tool_source("probe"), &mut result);
         assert!(matches!(result.status, murmur::tool::run::Status::Error));

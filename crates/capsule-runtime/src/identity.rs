@@ -1003,6 +1003,19 @@ async fn handle_connection(
         return;
     }
 
+    // The images a task's tool calls returned, read under the scope that reads the task itself
+    // and hidden by the same visibility rule, so a caller that cannot see a task cannot learn
+    // which images it holds.
+    if let Some(rest) = path.strip_prefix(ATTACHMENT_PATH_PREFIX) {
+        if let Some(refused) = refuse_scope(DoorMethod::GetTask.wire_name()) {
+            write_refusal(writer_half, reader, &refused).await;
+            return;
+        }
+        let response = attachment_response(&task_registry, &method, rest, &caller);
+        let _ = writer_half.write_all(&framed_bytes(&response)).await;
+        return;
+    }
+
     if method == "POST" && (path == "/" || path.is_empty()) && is_json && content_length > 0 {
         let mut body = vec![0u8; content_length];
         if reader.read_exact(&mut body).await.is_err() {
@@ -1274,6 +1287,49 @@ async fn write_refusal<R: tokio::io::AsyncRead + Unpin>(
         }
     };
     let _ = tokio::time::timeout(REFUSAL_DRAIN_GRACE, drain).await;
+}
+
+/// The door's route to the images a task's tool calls returned: `/attachments/<task-id>/<sha256>`.
+pub(crate) const ATTACHMENT_PATH_PREFIX: &str = "/attachments/";
+
+/// The answer to a request for `<task-id>/<sha256>` under [`ATTACHMENT_PATH_PREFIX`]: `200` with
+/// the image's bytes and its media type, `404` for a task or hash the registry does not hold or a
+/// task [`visible_to`] hides from `caller`, and `405` for any method but `GET`.
+fn attachment_response(
+    task_registry: &Mutex<TaskRegistry>,
+    method: &str,
+    rest: &str,
+    caller: &TaskCaller,
+) -> ResourceResponse {
+    let not_found = || ResourceResponse::framed(404, Vec::new(), Vec::new());
+    if method != "GET" {
+        return ResourceResponse::framed(
+            405,
+            vec![("allow".to_string(), "GET".to_string())],
+            Vec::new(),
+        );
+    }
+    let Some((task_id, sha256)) = rest.split_once('/') else {
+        return not_found();
+    };
+    let indexed = {
+        let reg = task_registry.lock().unwrap();
+        if !visible_to(&reg, task_id, caller) {
+            return not_found();
+        }
+        match reg.attachment(task_id, sha256) {
+            Some(indexed) => indexed.clone(),
+            None => return not_found(),
+        }
+    };
+    match crate::images::read_blob(&indexed.blob) {
+        Some(bytes) => ResourceResponse::framed(
+            200,
+            vec![("content-type".to_string(), indexed.media_type)],
+            bytes,
+        ),
+        None => not_found(),
+    }
 }
 
 /// One plane response as bytes on the wire. `connection: close` is appended here rather than by
@@ -2052,6 +2108,9 @@ enum MessageRoute {
 /// | an `input-required` task in another `contextId` | `-32602` |
 /// | an `input-required` task | [`MessageRoute::Continued`]: the text goes to its waiter, and capacity is not consulted |
 ///
+/// A message whose image parts [`crate::a2a::message_images`] refuses is answered `-32602` before
+/// any of the routes above, which includes every image part on a message that names a `taskId`.
+///
 /// The text delivered is [`IncomingMessage::agent_text`] followed by the
 /// [`TaskRegistry::reference_block`] for its `referenceTaskIds`, rendered under the same lock, so
 /// each referenced task is named as it stood when the message arrived. `id` is the request's.
@@ -2062,6 +2121,13 @@ fn route_message(
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
 ) -> MessageRoute {
+    // Decoded and checked outside the lock the rest of the route holds: an image can be megabytes
+    // of base64, and no other door request should wait on it.
+    let image_policy = task_registry.lock().unwrap().image_policy();
+    let images = match crate::a2a::message_images(&message, image_policy) {
+        Ok(images) => images,
+        Err(refusal) => return MessageRoute::Refused(refusal.into_response(id.clone())),
+    };
     let mut reg = task_registry.lock().unwrap();
     let caller = &sender.caller;
     let mut text = message.agent_text();
@@ -2072,7 +2138,7 @@ fn route_message(
     }
 
     let Some(task_id) = message.task_id.clone() else {
-        return start_task(id, message, text, &mut reg, task_tx, sender);
+        return start_task(id, message, text, images, &mut reg, task_tx, sender);
     };
     let Some((state, task_context)) = reg
         .history
@@ -2133,6 +2199,7 @@ fn start_task(
     id: &Value,
     message: IncomingMessage,
     text: String,
+    images: Vec<(usize, crate::images::CheckedImage)>,
     reg: &mut TaskRegistry,
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
@@ -2185,6 +2252,7 @@ fn start_task(
         caller: Some(sender.caller),
         reference_task_ids: message.reference_task_ids,
         part_kinds,
+        images,
     };
     // Capacity was checked under this lock, so the channel has room; a failure is unexpected and
     // takes the task back out of the registry.

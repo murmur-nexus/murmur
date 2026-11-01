@@ -130,6 +130,7 @@ fn result(status: Status, data: String, metadata: Vec<(String, String)>) -> Tool
         data_path: None,
         truncated: false,
         metadata,
+        attachments: Vec::new(),
     }
 }
 

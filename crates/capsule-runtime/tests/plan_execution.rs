@@ -120,6 +120,7 @@ fn tool_result(status: ToolStatus, data: Option<String>, summary: Option<String>
         data_path: None,
         truncated: false,
         metadata: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 
@@ -132,6 +133,7 @@ fn tool_result_with_path(data: Option<String>, data_path: &str) -> ToolResult {
         data_path: Some(data_path.to_string()),
         truncated: false,
         metadata: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 
@@ -1875,6 +1877,7 @@ fn test_a_tool_step_carries_the_metadata_the_tool_declared() {
                 ("state_effect".to_string(), "read".to_string()),
                 ("resource_id".to_string(), "src/lib.rs".to_string()),
             ],
+            attachments: Vec::new(),
         })
     };
     let plan = write_plan(

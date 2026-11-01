@@ -370,6 +370,12 @@ pub(crate) fn run_conversation_truncate(
         outcome.kept,
         outcome.oldest_surviving_id
     );
+    if outcome.blobs_removed > 0 {
+        capsule_runtime::report_println!(
+            "removed {} image blobs no kept message names",
+            outcome.blobs_removed
+        );
+    }
     Ok(())
 }
 

@@ -1059,6 +1059,11 @@ mod tests {
         ),
         (
             "retention.rs",
+            "sweep_orphan_blobs",
+            "Image blobs beside a conversation record being truncated, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
             "stage_with_mode",
             "`StagedRewrite`, the sibling-file rewrite of a file under `~/.murmur` — a conversation record or a private file — outside every workdir.",
         ),

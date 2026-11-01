@@ -1,4 +1,4 @@
-package murmur:tool@0.1.0;
+package murmur:tool@0.2.0;
 
 interface run {
   enum status {
@@ -10,6 +10,21 @@ interface run {
   record tool-input {
     data: option<string>,
     log-path: option<string>,
+  }
+
+  /// An image a tool returns alongside its text: a file it wrote into the
+  /// work folder, named relative to that folder.
+  ///
+  /// `media-type` is one of `image/png`, `image/jpeg`, `image/gif` or
+  /// `image/webp`. The host reads the file beneath the work folder, refusing
+  /// a link or a path outside it, checks that its leading bytes match
+  /// `media-type` and that it is no larger than the capsule's
+  /// `context.images.max_bytes`, and stores the bytes once by their sha256
+  /// beside the conversation. A refused attachment adds a note to the call's
+  /// result and never changes its `status`.
+  record attachment {
+    media-type: string,
+    path: string,
   }
 
   record tool-result {
@@ -80,6 +95,9 @@ interface run {
     /// failed inference call; if the list carries more than one `transient`
     /// tuple, the host uses the first in list order.
     metadata: list<tuple<string, string>>,
+    /// Images the call returns, in the order the model sees them. Empty for
+    /// a call that returns none, and for every inference driver's result.
+    attachments: list<attachment>,
   }
 
   run: func(input: tool-input) -> tool-result;

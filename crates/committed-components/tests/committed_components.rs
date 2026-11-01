@@ -88,14 +88,14 @@ fn write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
-/// A scratch repository holding the committed `echo-tool` component (which exports
+/// A scratch repository holding the frozen `tool-v1` component (which exports
 /// `murmur:tool/run@0.1.0`) under three lines: one checked against a tree that declares
 /// `murmur:tool@0.1.0`, one against a tree bumped to `0.2.0`, and a frozen one against the bumped
 /// tree. A stray `.wasm` sits beside them, and two more sit where the scan must not look.
 #[test]
 fn a_bump_names_the_stale_component_and_its_rebuild_command_and_an_unlisted_wasm() {
     let echo_tool = fs::read(
-        repo_root().join("crates/murmur-cli/tests/fixtures/run/components/echo-tool.wasm"),
+        repo_root().join("crates/murmur-cli/tests/fixtures/tool-v1/tool/jsonl-line-count-v1.wasm"),
     )
     .unwrap();
     let repo = tempfile::tempdir().unwrap();

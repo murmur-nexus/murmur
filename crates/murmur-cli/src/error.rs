@@ -1732,7 +1732,7 @@ mod tests {
             cli.message
         );
         assert!(
-            cli.message.contains("murmur:tool/run@0.1.0"),
+            cli.message.contains("murmur:tool/run@0.2.0"),
             "message should name the versioned interface: {}",
             cli.message
         );

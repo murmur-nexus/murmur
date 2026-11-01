@@ -129,6 +129,7 @@ mod tests {
             caller: Some(crate::identity::TaskCaller::Operator),
             reference_task_ids: Vec::new(),
             part_kinds: Vec::new(),
+            images: Vec::new(),
         }
     }
 

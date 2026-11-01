@@ -89,6 +89,8 @@ pub struct TruncationOutcome {
     pub oldest_surviving_id: String,
     /// The `msg_` id of the newest dropped message, empty when nothing dropped carried one.
     pub last_dropped_id: String,
+    /// Image blobs removed from the record's `blobs/` because no surviving line refers to them.
+    pub blobs_removed: u64,
 }
 
 /// Where one message id turned up, and in what state.
@@ -450,6 +452,9 @@ pub fn prune_records(
 /// preserved, so truncating never transfers ownership of a record between capsules.
 ///
 /// A record already at or under `keep` is left untouched and reported as `dropped: 0`.
+///
+/// Once the rewrite commits, every blob in the record's `blobs/` that no surviving line's image
+/// block names is removed, and counted in `blobs_removed`. A blob a kept line still names stays.
 pub fn truncate_record(path: &Path, keep: u32, capsule: &str) -> Result<TruncationOutcome, String> {
     match stage_truncation(path, keep, capsule, now_ms())? {
         None => Ok(TruncationOutcome {
@@ -457,12 +462,55 @@ pub fn truncate_record(path: &Path, keep: u32, capsule: &str) -> Result<Truncati
             kept: count_messages(path),
             oldest_surviving_id: String::new(),
             last_dropped_id: String::new(),
+            blobs_removed: 0,
         }),
-        Some((staged, outcome)) => {
+        Some((staged, mut outcome)) => {
             staged.commit()?;
+            outcome.blobs_removed = sweep_orphan_blobs(path);
             Ok(outcome)
         }
     }
+}
+
+/// Remove every blob in `blobs/` beside the record at `path` that none of its lines' image blocks
+/// names, returning how many were removed. A record with no `blobs/` directory removes nothing; a
+/// name that is not a sha256, and a blob that cannot be removed, are left where they are.
+fn sweep_orphan_blobs(path: &Path) -> u64 {
+    let Some(blobs) = path
+        .parent()
+        .map(|dir| dir.join(crate::trace_blobs::BLOB_DIR_NAME))
+    else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&blobs) else {
+        return 0;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let referenced: std::collections::HashSet<String> = raw
+        .lines()
+        .filter_map(parse_message_line)
+        .flat_map(|message| {
+            crate::images::referenced_blobs(&message)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !crate::images::is_sha256_hex(name) || referenced.contains(name) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// The half of [`truncate_record`] that touches nothing the reader can see: the rewritten record
@@ -553,6 +601,7 @@ pub(crate) fn stage_truncation(
             kept: keep as u64,
             oldest_surviving_id,
             last_dropped_id,
+            blobs_removed: 0,
         },
     )))
 }
@@ -1263,6 +1312,58 @@ mod tests {
         }
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// A record line whose tool message carries one image block per sha in `shas`.
+    fn image_line(id: &str, shas: &[&str]) -> String {
+        let mut content = vec![serde_json::json!({"type": "text", "text": "shot"})];
+        for sha in shas {
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": {"type": "file", "sha256": sha, "media_type": "image/png", "bytes": 4},
+            }));
+        }
+        serde_json::json!({"id": id, "role": "tool", "content": content}).to_string()
+    }
+
+    /// A blob only dropped lines name is removed after the rewrite; one a kept line still names
+    /// stays, and so does a file whose name is no sha256.
+    #[test]
+    fn truncation_removes_blobs_no_surviving_line_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RECORD_FILE_NAME);
+        let (old, shared, new) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let lines = [
+            image_line(&msg(NOW - 3000, 1), &[&old, &shared]),
+            image_line(&msg(NOW - 2000, 2), &[&old]),
+            image_line(&msg(NOW - 1000, 3), &[&shared]),
+            image_line(&msg(NOW, 4), &[&new]),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let blobs = dir.path().join("blobs");
+        std::fs::create_dir(&blobs).unwrap();
+        for name in [&old, &shared, &new, &"notes.txt".to_string()] {
+            std::fs::write(blobs.join(name), b"\x89PNG").unwrap();
+        }
+
+        let outcome = truncate_record(&path, 2, "capsule").unwrap();
+        assert_eq!(outcome.dropped, 2);
+        assert_eq!(outcome.blobs_removed, 1);
+        assert!(!blobs.join(&old).exists());
+        assert!(blobs.join(&shared).exists(), "a kept line still names it");
+        assert!(blobs.join(&new).exists());
+        assert!(blobs.join("notes.txt").exists());
+    }
+
+    /// A record with no `blobs/` truncates exactly as before and removes nothing.
+    #[test]
+    fn truncation_without_blobs_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_record(dir.path(), Some("capsule"), 5);
+        let outcome = truncate_record(&path, 2, "capsule").unwrap();
+        assert_eq!(outcome.dropped, 3);
+        assert_eq!(outcome.blobs_removed, 0);
+        assert!(!dir.path().join("blobs").exists());
     }
 
     /// the newest N survive with their ids intact, the file is a header plus exactly N

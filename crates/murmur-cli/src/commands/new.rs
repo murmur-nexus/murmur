@@ -1357,12 +1357,28 @@ mod tests {
         }
     }
 
-    /// Over the committed copy of a default-artifacts release's index, the generator pins the
-    /// newest fitting version of each artifact that index lists.
+    /// Over the committed copy of a default-artifacts release's index, its `murmur:tool` and
+    /// `murmur:tool-registry` interfaces moved to WIT level 3 as a level-3 release publishes
+    /// them, the generator pins the newest fitting version of each artifact that index lists.
     #[test]
     fn generator_versions_resolve_from_the_index() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/published-index/artifacts-index.json");
+        let committed = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/published-index/artifacts-index.json"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifacts-index.json");
+        std::fs::write(
+            &path,
+            committed
+                .replace("murmur:tool/run@0.1.0", "murmur:tool/run@0.2.0")
+                .replace(
+                    "murmur:tool-registry/invoke@0.1.0",
+                    "murmur:tool-registry/invoke@0.2.0",
+                ),
+        )
+        .unwrap();
         let index = GeneratorIndex::resolve(Some(path.to_str().unwrap()))
             .unwrap()
             .default_versions()

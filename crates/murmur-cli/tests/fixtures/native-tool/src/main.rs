@@ -33,6 +33,12 @@
 //!   rlimit_nofile —                       -> {ok, soft, hard} | {ok: false, error}
 //!   open_until_refused — max? (default 200) -> {ok, opened, error: <text> | null}
 //! A relative `path` resolves against the working directory.
+//!
+//! Image operation, for the attachment tests:
+//!   image       — path? (default native.png), index?, malformed?
+//!                 writes a valid 1x1 PNG at `path` and returns it in the envelope's
+//!                 `attachments`; with `malformed: true` the one entry is `{"path": 42}`
+//!                 instead, which names no media type and no string path.
 
 use std::{
     fs,
@@ -110,6 +116,7 @@ fn run(raw: &str) -> Value {
         "netns" => probe(op_netns()),
         "rlimit_nofile" => probe(op_rlimit_nofile()),
         "open_until_refused" => probe(Ok(op_open_until_refused(&op))),
+        "image" => op_image(&op),
         other => failed(format!("unknown operation '{other}'")),
     }
 }
@@ -327,5 +334,70 @@ fn failed(summary: impl Into<String>) -> Value {
         "status": "failed",
         "summary": summary.into(),
         "data": Value::Null,
+    })
+}
+
+const PNG_1X1: [u8; 67] = [
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A valid 1x1 PNG with a `tEXt` chunk `native\0<index>` before `IEND`.
+fn png(index: u64) -> Vec<u8> {
+    let iend = PNG_1X1.len() - 12;
+    let mut chunk = b"tEXt".to_vec();
+    chunk.extend_from_slice(format!("native\0{index}").as_bytes());
+    let mut out = PNG_1X1[..iend].to_vec();
+    out.extend_from_slice(&((chunk.len() - 4) as u32).to_be_bytes());
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&crc32(&chunk).to_be_bytes());
+    out.extend_from_slice(&PNG_1X1[iend..]);
+    out
+}
+
+fn op_image(op: &Value) -> Value {
+    let path = op
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("native.png");
+    let index = op.get("index").and_then(Value::as_u64).unwrap_or(1);
+    if op
+        .get("malformed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return json!({
+            "status": "passed",
+            "summary": "returned a malformed attachment",
+            "data": {"path": path},
+            "attachments": [{"path": 42}],
+        });
+    }
+    if let Err(err) = fs::write(path, png(index)) {
+        return failed(format!("writing {path}: {err}"));
+    }
+    json!({
+        "status": "passed",
+        "summary": format!("wrote {path}"),
+        "data": {"path": path},
+        "attachments": [{"media_type": "image/png", "path": path}],
     })
 }

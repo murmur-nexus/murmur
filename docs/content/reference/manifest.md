@@ -1283,6 +1283,10 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `context.retain` { #context-retain } | block | no | What bounds this capsule's [conversation records](workdir.md#the-conversation-record). Omitted, nothing is ever deleted. See [Retention](#retention). |
 | `context.retain.max_messages` | integer ≥ 1 | no | Messages to keep. At each launch, the record that launch opens — the context named by `mur run --context` — is truncated to its newest N; the older ones are dropped and the [header line](workdir.md#record-header) records the drop. A launch with no `--context` mints a context per task and opens no record to truncate; bound those with `context.retain.max_age`. |
 | `context.retain.max_age` | duration | no | Age beyond which a record this capsule owns is removed whole, measured from the last write to its `conversation.jsonl`. |
+| `context.images` { #context-images } | block | no | Limits on the images a tool returns and an A2A message carries. Omitted, every key below takes its default. See [Returning an image](wit-interfaces.md#tool-attachments). |
+| `context.images.keep` | integer ≥ 1 | no | Default: `5`. How many of the newest images in the conversation the driver receives as image bytes. Each older one reaches it as one line naming its media type, size and sha256. Does nothing under `transport: process`, where the harness holds the conversation. |
+| `context.images.max_bytes` | byte size | no | Default: `5Mi`. The largest image accepted, as a bare number of bytes or with a `Ki`, `Mi` or `Gi` suffix; `10MB` is refused. Must be > 0. A larger tool attachment is refused `too_large`; a larger A2A image refuses the message with `-32602`. |
+| `context.images.max_per_turn` | integer ≥ 1 | no | Default: `5`. How many images one model turn's tool calls may return between them, and one A2A message may carry. Past it, a tool attachment is refused `turn_limit` and an A2A message is refused with `-32602`. Does nothing under `transport: process`. |
 
 #### `observability` { #field-observability }
 

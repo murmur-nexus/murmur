@@ -23,6 +23,7 @@ impl Guest for StallDriver {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

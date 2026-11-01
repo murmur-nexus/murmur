@@ -386,6 +386,11 @@ hash to its body by joining the two: `cat <records dir>/blobs/<the sha the line 
 | Write policy | Write-once. A path that already exists is never rewritten, so a system prompt unchanged across a session costs one file |
 | Lifetime | Session-scoped. Readable exactly as long as the session directory is; nothing prunes it |
 
+A message blob holds the message as the conversation record holds it: an image is its reference
+block, `{"type":"image","source":{"type":"file","sha256":…}}`, never its bytes, and the image
+itself is the conversation's `blobs/<sha256>` — see
+[The conversation record](workdir.md#the-conversation-record).
+
 `system_prompt_sha256` from `session_start` resolves the same way, to the resolved prompt before
 the `[Capsule]` block was prepended, and so does `message_sha256` from
 [`a2a_task_received`](#a2a-task-received), to the message text of a task the door let in.
@@ -411,6 +416,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `error` | string | The runtime's own text when it could not run the call, such as a native tool or shell command whose sandbox setup failed before exec. Written under every [`trace.capture`](manifest.md#field-trace) mode, with peer handle tokens redacted, and capped at 2,000 bytes. Absent when the tool ran, including when the tool reported its own failure |
 | `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
 | `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
+| `attachments` | array of objects | The images the call [returned](wit-interfaces.md#tool-attachments), in the order it named them. An accepted one is `{"path", "media_type", "bytes", "sha256"}`, where `sha256` names its blob in the conversation's `blobs/`; a refused one is `{"path", "media_type", "refused"}`, where `refused` is the refusal code. Never holds image bytes. Absent when the call returned none |
 
 A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_call` for every
 `murmur:tool-registry/invoke` call, a refused one included:
@@ -710,8 +716,9 @@ one after the `pull-artifact` call that made it.
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
 | `message_parts_bytes` | u64 | Byte length of the task message text: for an A2A task, the text the agent reads, with each data part fenced and the referenced-tasks block appended — see [Parts](agent-card.md#parts) |
-| `part_kinds` | array of strings | `"text"` \| `"data"` for each part of the A2A message the task arrived as, in order. Absent on a task that did not arrive over the door |
+| `part_kinds` | array of strings | `"text"` \| `"data"` \| `"raw"` for each part of the A2A message the task arrived as, in order. `"raw"` is an image part. Absent on a task that did not arrive over the door |
 | `reference_task_ids` | array of strings | The message's [`referenceTaskIds`](agent-card.md#reference-task-ids), each once, in first-occurrence order. Absent when it referenced none |
+| `attachments` | array of objects | The images the message's `raw` parts carried, each `{"path", "media_type", "bytes", "sha256"}` with `path` as `message.parts[<i>]`. Never holds image bytes. Absent when it carried none |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks. Only an `"a2a"` task has an
 `a2a_task_received` line: the others are enqueued on the door by the runtime itself. A `"task_md"`
