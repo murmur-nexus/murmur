@@ -141,9 +141,10 @@ tiers, inside the capsule's Landlock scope and composed root.
 
 Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.network.allow`,
 `capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
-to a shell command. The runtime adds one thing, the files the kernel itself executes to start the
-tool, each with read and execute and nothing else. It works them out once, when it installs the
-tool, from the artifact's own image:
+to a shell command. The runtime adds the tool's [store](#native-tool-settings) when its own entry
+declares `capabilities.state`, and the files the kernel itself executes to start the tool, each
+with read and execute and nothing else. It works those files out once, when it installs the tool,
+from the artifact's own image:
 
 1. The tool's entrypoint, `tools/<name>/<name>` in the session's
    [runtime directory](workdir.md#runtime-directory).
@@ -191,7 +192,8 @@ nothing else:
 
 An entry without the key gets no such variable. The runtime sets both names and takes neither from
 the host: naming one in `capabilities.shell.baseline_env` or `capabilities.env.allow` passes
-nothing through, and no shell command, other native tool or WASM component has either.
+nothing through. Shell commands and other native tools have neither, and a WASM component gets
+only its own `config:` and never `MURMUR_STATE_DIR`.
 
 Who else can open the store depends on the tier:
 
