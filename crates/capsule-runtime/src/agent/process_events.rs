@@ -2314,6 +2314,17 @@ mod tests {
         assert_eq!(inference.len(), 1);
         assert_eq!(inference[0]["input_tokens"], 10);
         assert_eq!(inference[0]["output_tokens"], 2);
+        // The spend is what the same turn settles with nothing after its terminal event.
+        let mut alone = Harness::new(10).await;
+        alone
+            .feed(vec![
+                usage(&[("in", 10), ("out", 2)]),
+                text("answer"),
+                Event::TurnEnd("answer".into()),
+            ])
+            .await;
+        assert!(alone.spend.used() > 0);
+        assert_eq!(h.spend.used(), alone.spend.used());
         assert_eq!(
             std::fs::read_to_string(h.workdir.join("out/result.txt")).unwrap(),
             "answer"

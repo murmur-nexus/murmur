@@ -1795,8 +1795,10 @@ struct HarnessRetryEvent {
     reason: String,
 }
 
+/// A task-node record whose payload is one line of text: `harness_note` and
+/// `harness_suggestion`.
 #[derive(Serialize)]
-struct HarnessNoteEvent {
+struct HarnessTextEvent {
     event_type: &'static str,
     event_id: String,
     parent_id: Option<String>,
@@ -1830,17 +1832,6 @@ struct HarnessQuotaEvent<'a> {
     timestamp: u64,
     task_id: Option<String>,
     windows: Vec<HarnessQuotaWindow<'a>>,
-}
-
-#[derive(Serialize)]
-struct HarnessSuggestionEvent {
-    event_type: &'static str,
-    event_id: String,
-    parent_id: Option<String>,
-    session_id: String,
-    timestamp: u64,
-    task_id: Option<String>,
-    text: String,
 }
 
 #[derive(Serialize)]
@@ -4131,7 +4122,7 @@ impl TraceWriter {
     /// Record a diagnostic the driver produced for the trace alone — a line it could not read,
     /// or a result the runtime could not pair with a call.
     pub(crate) async fn write_harness_note(&mut self, text: &str) -> std::io::Result<()> {
-        let event = HarnessNoteEvent {
+        let event = HarnessTextEvent {
             event_type: "harness_note",
             event_id: new_event_id(),
             parent_id: self.task_parent(),
@@ -4177,7 +4168,7 @@ impl TraceWriter {
 
     /// Record the harness's prediction of what the person will ask next.
     pub(crate) async fn write_harness_suggestion(&mut self, text: &str) -> std::io::Result<()> {
-        let event = HarnessSuggestionEvent {
+        let event = HarnessTextEvent {
             event_type: "harness_suggestion",
             event_id: new_event_id(),
             parent_id: self.task_parent(),

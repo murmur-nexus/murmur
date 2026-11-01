@@ -2618,7 +2618,7 @@ mod tests {
                 "murmur:driver/process@0.1.0",
                 ContractDirection::Export,
                 Some("0.1.0"),
-                Some("0.3.0"),
+                Some("0.4.0"),
             ),
             unserved(
                 "murmur:text/chunks@0.1.0",

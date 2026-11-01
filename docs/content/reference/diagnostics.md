@@ -874,7 +874,7 @@ error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 2, th
 ```
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 2, the level this mur serves: it exports murmur:driver/process@0.4.0, and level 2 has murmur:driver@0.4.0
+error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 2, the level this mur serves: it exports murmur:driver/process@0.3.0, and level 2 has murmur:driver@0.4.0
 ```
 
 A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
