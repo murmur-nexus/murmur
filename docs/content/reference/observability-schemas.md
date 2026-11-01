@@ -409,14 +409,14 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `tool_call_id` | string \| null | The provider's own id for this call, recorded verbatim and never parsed. It is what pairs this line with the tool-result message the runtime sent back. `null` when the provider named none |
 | `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
-| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](untrusted-fence.md) the model received it inside. Written only under [`trace.capture: content`](manifest.md#field-trace) |
-| `output_bytes` | u64 | Byte length of the tool output text, fence markers included |
+| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](untrusted-fence.md) the model received it inside. Under `transport: process`, each image the tool server returned is replaced wherever the harness's result repeats its bytes, by `[image: <media_type>, <n> bytes, sha256 <hex>]`. Written only under [`trace.capture: content`](manifest.md#field-trace) |
+| `output_bytes` | u64 | Byte length of the tool output text, fence markers included, after any image replacement |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
 | `error` | string | The runtime's own text when it could not run the call, such as a native tool or shell command whose sandbox setup failed before exec. Written under every [`trace.capture`](manifest.md#field-trace) mode, with peer handle tokens redacted, and capped at 2,000 bytes. Absent when the tool ran, including when the tool reported its own failure |
 | `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
 | `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
-| `attachments` | array of objects | The images the call [returned](wit-interfaces.md#tool-attachments), in the order it named them. An accepted one is `{"path", "media_type", "bytes", "sha256"}`, where `sha256` names its blob in the conversation's `blobs/`; a refused one is `{"path", "media_type", "refused"}`, where `refused` is the refusal code. Never holds image bytes. Absent when the call returned none |
+| `attachments` | array of objects | The images the call [returned](wit-interfaces.md#tool-attachments), in the order it named them. An accepted one is `{"path", "media_type", "bytes", "sha256"}`, where `sha256` names its blob in the conversation's `blobs/`; a refused one is `{"path", "media_type", "refused"}`, where `refused` is the refusal code. Written on both transports; under `transport: process` an accepted entry names no blob, since nothing is stored. Never holds image bytes. Absent when the call returned none |
 
 A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_call` for every
 `murmur:tool-registry/invoke` call, a refused one included:

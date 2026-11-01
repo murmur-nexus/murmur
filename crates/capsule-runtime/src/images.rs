@@ -534,33 +534,65 @@ pub(crate) fn decode_raw_part(
     check_image(media_type, bytes, max_bytes)
 }
 
-/// The line the process transport's bridge appends to a tool result for one attachment it checked
-/// and accepted. Nothing is stored on that transport and the harness's model is not shown the image.
+/// The line the process transport's bridge appends to a tool result's text for one attachment it
+/// checked and accepted, ahead of the image item it returns for it. It names the image for a
+/// harness that drops image items.
 pub(crate) fn bridged_attachment_line(path: &str, image: &CheckedImage) -> String {
     format!(
-        "[image attached: {path}, {}, {} bytes; not shown to this model]",
+        "[image attached: {path}, {}, {} bytes]",
         image.media_type,
         image.len()
     )
 }
 
-/// One line per attachment for a tool result the process transport's bridge returns: an
-/// [`bridged_attachment_line`] for each that passes the type and size checks, a [`refusal_note`]
-/// for each that does not. Nothing is stored, and no per-turn limit applies.
-pub(crate) fn bridged_attachment_lines<'a>(
+/// What one bridged tool call's attachments came to on the process transport.
+#[derive(Debug, Default)]
+pub(crate) struct BridgedAttachments {
+    /// One line per attachment, in the order the call named them: a [`bridged_attachment_line`]
+    /// for each accepted image, a [`refusal_note`] for each refused one.
+    pub(crate) lines: Vec<String>,
+    /// Every accepted image, holding the bytes its checks ran on, in the order the call named them.
+    pub(crate) images: Vec<CheckedImage>,
+    /// The trace's `attachments`, accepted and refused, in the order the call named them.
+    pub(crate) trace: Vec<AttachmentRecord>,
+}
+
+/// Check a bridged tool call's `attachments`, each a `(media_type, path)` pair, as
+/// [`accept_attachments`] does, and store nothing: the harness holds the conversation.
+///
+/// Each file is read once, with `limits.max_bytes` as the read's cap, and an accepted image keeps
+/// that buffer, so what the bridge returns is exactly what was checked. `limits.max_per_turn`
+/// counts the images of this one call: the bridge sees calls, not model turns. An attachment past
+/// it is refused with `turn_limit` without being read.
+pub(crate) fn check_bridged_attachments<'a>(
     attachments: impl IntoIterator<Item = (&'a str, &'a str)>,
     workdir: &WorkdirRoot,
-    max_bytes: u64,
-) -> Vec<String> {
-    attachments
-        .into_iter()
-        .map(
-            |(media_type, path)| match read_attachment(workdir, path, media_type, max_bytes) {
-                Ok(image) => bridged_attachment_line(path, &image),
-                Err(refusal) => refusal_note(path, &refusal),
-            },
-        )
-        .collect()
+    limits: &ContextImagesConfig,
+) -> BridgedAttachments {
+    let mut outcome = BridgedAttachments::default();
+    for (media_type, path) in attachments {
+        let checked = if outcome.images.len() as u64 >= u64::from(limits.max_per_turn) {
+            Err(ImageRefusal::TurnLimit {
+                max_per_turn: limits.max_per_turn,
+            })
+        } else {
+            read_attachment(workdir, path, media_type, limits.max_bytes)
+        };
+        match checked {
+            Ok(image) => {
+                outcome.lines.push(bridged_attachment_line(path, &image));
+                outcome.trace.push(image.trace_record(path));
+                outcome.images.push(image);
+            }
+            Err(refusal) => {
+                outcome.lines.push(refusal_note(path, &refusal));
+                outcome
+                    .trace
+                    .push(refused_trace_record(path, media_type, &refusal));
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]

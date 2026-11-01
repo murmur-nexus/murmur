@@ -117,9 +117,18 @@ one adds one line to the result the model reads, after the tool's own output:
 attachment 'note.png' was not attached: declared image/png but the bytes are not an image of any allowed type (content_mismatch)
 ```
 
-A refusal never changes the call's `status`. Under `transport: process` the runtime runs the same
-checks, stores nothing, and adds `[image attached: <path>, <media type>, <n> bytes; not shown to this model]`
-for each accepted image instead.
+A refusal never changes the call's `status`.
+
+Under `transport: process` the runtime runs the same checks, with `max_per_turn` counted per tool
+call, and stores nothing. The tool server's answer is the result's text, with one line per
+attachment after the tool's own output, then one MCP `image` item per accepted image, in order:
+
+| Attachment | Line in the text | Item after the text |
+|---|---|---|
+| Accepted | `[image attached: <path>, <media type>, <n> bytes]` | `{"type": "image", "data": <base64>, "mimeType": <media type>}` |
+| Refused | The refusal line above | None |
+
+Whether the model sees the image is up to the harness.
 
 ### Native tool result { #native-tool-result }
 

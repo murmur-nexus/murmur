@@ -35,12 +35,17 @@
 //!   mirroring `identity.rs`, not a full server stack.
 //! - Tool calls run concurrently, up to [`MAX_IN_FLIGHT_CALLS`] at once: a shell command that
 //!   runs for minutes does not hold up the harness's other calls.
+//! - An image a tool attaches to its result is returned as an MCP `image` content item after the
+//!   result's text, under the `context.images` checks, and stored nowhere: the harness holds the
+//!   conversation. Each call that named an attachment sends one [`AttachmentReport`] to the task
+//!   driving the harness, for the `tool_call` record it writes.
 
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use tokio::{
@@ -51,9 +56,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    bindings::host::murmur::tool::run::{Status, ToolInput},
+    bindings::host::murmur::tool::run::{Attachment, Status, ToolInput},
     detached::AbandonSignal,
+    images::CheckedImage,
     runtime::CapsuleStoreState,
+    trace::AttachmentRecord,
 };
 
 /// How many `tools/call` dispatches the bridge runs at once.
@@ -230,6 +237,68 @@ fn error_result(text: String) -> Value {
     })
 }
 
+/// What one bridged call's attachments came to, for the `tool_call` record the task driving the
+/// harness writes from the harness's own report of the result.
+///
+/// That record is written from the harness's `tool-result` event, which carries nothing tying it
+/// to this bridge's request, so the report names the call the way the event sink can match it: by
+/// the bare tool name and the arguments. Sent only for a call that named at least one attachment,
+/// before its answer is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AttachmentReport {
+    /// The tool's bare name, as the harness asked for it.
+    pub(super) tool_name: String,
+    /// The call's arguments, serialised exactly as dispatch received them.
+    pub(super) input_json: String,
+    /// The record's `attachments`, accepted and refused, in the order the tool named them.
+    pub(super) trace: Vec<AttachmentRecord>,
+    /// Every image the answer carries, in order.
+    pub(super) images: Vec<SentImage>,
+}
+
+/// One image a bridged answer carries as an MCP `image` content item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SentImage {
+    /// The item's `data`: standard, padded base64 of the bytes that were checked.
+    pub(super) base64: String,
+    pub(super) media_type: String,
+    pub(super) bytes: u64,
+    /// Lowercase-hex sha256 of the bytes.
+    pub(super) sha256: String,
+}
+
+impl SentImage {
+    fn encode(image: &CheckedImage) -> Self {
+        Self {
+            base64: base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+            media_type: image.media_type.clone(),
+            bytes: image.len(),
+            sha256: image.sha256.clone(),
+        }
+    }
+
+    /// What a trace record says in place of [`Self::base64`] wherever a harness's report of the
+    /// result repeats it: `[image: <media_type>, <n> bytes, sha256 <hex>]`.
+    pub(super) fn placeholder(&self) -> String {
+        format!(
+            "[image: {}, {} bytes, sha256 {}]",
+            self.media_type, self.bytes, self.sha256
+        )
+    }
+}
+
+/// A tool-server result: `text` as one text item, then one `image` item per entry of `images`.
+fn tool_result(text: String, is_error: bool, images: &[SentImage]) -> Value {
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    content.extend(images.iter().map(
+        |image| json!({ "type": "image", "data": image.base64, "mimeType": image.media_type }),
+    ));
+    json!({
+        "content": content,
+        "isError": is_error
+    })
+}
+
 /// Everything the process runner needs to hand a freshly-bound bridge to the driver.
 pub(super) struct BridgeHandle {
     pub(super) listener: TcpListener,
@@ -333,11 +402,15 @@ impl BridgeHandle {
     /// `gate` is where every admitted `tools/call` asks whether it may run. The answering side
     /// runs the required-field check on each call and then, only for a capsule with a policy hook
     /// or a `read_only` path, the manifest's `read_only` check and the policy hook.
+    ///
+    /// `reports` gets one [`AttachmentReport`] per dispatched call whose tool named an attachment,
+    /// sent before that call's answer is written.
     pub(super) async fn serve(
         &self,
         store: &CapsuleStoreState,
         gate: &mpsc::UnboundedSender<GateRequest>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
+        reports: &mpsc::UnboundedSender<AttachmentReport>,
         on_request: &dyn Fn(),
     ) {
         let in_flight = AtomicUsize::new(0);
@@ -349,7 +422,9 @@ impl BridgeHandle {
                         return;
                     };
                     on_request();
-                    open.push(self.handle_connection(stream, store, gate, notes, &in_flight));
+                    open.push(self.handle_connection(
+                        stream, store, gate, notes, reports, &in_flight,
+                    ));
                 }
                 Some(()) = open.next(), if !open.is_empty() => {}
             }
@@ -364,6 +439,7 @@ impl BridgeHandle {
         store: &CapsuleStoreState,
         gate: &mpsc::UnboundedSender<GateRequest>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
+        reports: &mpsc::UnboundedSender<AttachmentReport>,
         in_flight: &AtomicUsize,
     ) {
         let (reader_half, mut writer) = stream.into_split();
@@ -445,7 +521,15 @@ impl BridgeHandle {
                     () = peer_closed(&mut reader) => None,
                 };
                 match result {
-                    Some(result) => write_json_rpc(&mut writer, &id, result, None).await,
+                    Some((result, report)) => {
+                        // Sent before the answer is written: the harness reports the call's
+                        // result only after reading the answer, so the report always reaches the
+                        // driving task ahead of that result.
+                        if let Some(report) = report {
+                            let _ = reports.send(report);
+                        }
+                        write_json_rpc(&mut writer, &id, result, None).await;
+                    }
                     None => {
                         // The dispatch future is already dropped. A shell command it left on the
                         // blocking pool reads this at its next poll and demotes.
@@ -541,6 +625,9 @@ impl BridgeHandle {
     ///
     /// `abandon` is raised by the caller if the harness goes away; see
     /// [`CapsuleStoreState::dispatch_bridged_tool_async`].
+    ///
+    /// Returns the result with the [`AttachmentReport`] of a dispatched call whose tool named an
+    /// attachment.
     async fn dispatch_tool_call(
         &self,
         name: &str,
@@ -549,7 +636,7 @@ impl BridgeHandle {
         gate: &mpsc::UnboundedSender<GateRequest>,
         abandon: AbandonSignal,
         decided: &AtomicBool,
-    ) -> Value {
+    ) -> (Value, Option<AttachmentReport>) {
         // A refusal means nothing ran, and its trace line is written on the answering side. The
         // harness still reports the failure as a tool result of its own, which the event sink
         // records as a `tool_call` with `status: error`: this request carries no id tying it to
@@ -557,14 +644,14 @@ impl BridgeHandle {
         let refusal = ask_gate(gate, name, &input_json).await;
         decided.store(true, Ordering::SeqCst);
         if let Some(refusal) = refusal {
-            return error_result(refusal);
+            return (error_result(refusal), None);
         }
 
         match store
             .dispatch_bridged_tool_async(
                 name,
                 ToolInput {
-                    data: Some(input_json),
+                    data: Some(input_json.clone()),
                     log_path: None,
                 },
                 abandon,
@@ -578,46 +665,53 @@ impl BridgeHandle {
                 // for an external harness process and owns no murmur session to end. The
                 // failure still reaches the caller in full — `result.data` carries the same named
                 // text (`RuntimeError`'s Display) that the agent loop would end the session with.
-                let text = with_attachment_lines(
-                    store,
-                    outcome
-                        .result
-                        .data
-                        .or(outcome.result.summary)
-                        .unwrap_or_else(|| "tool returned no data".to_string()),
-                    &attachments,
-                );
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": is_error
-                })
+                let text = outcome
+                    .result
+                    .data
+                    .or(outcome.result.summary)
+                    .unwrap_or_else(|| "tool returned no data".to_string());
+                answer(store, name, input_json, text, is_error, &attachments)
             }
-            Err(err) => error_result(format!("tool '{name}' failed: {err}")),
+            Err(err) => (error_result(format!("tool '{name}' failed: {err}")), None),
         }
     }
 }
 
-/// `text` with one line per attachment the tool returned, after the fence's closing marker.
+/// The result of a dispatched call whose tool returned `text`, and its [`AttachmentReport`] when
+/// the tool named any `attachments`.
 ///
-/// The harness's model is shown no image on this transport, so the bridge checks each attachment's
-/// type and size, stores nothing, and says what it found: `[image attached: …]` for one that
-/// passes, the refusal note for one that does not.
-fn with_attachment_lines(
+/// Each attachment adds one line after the fence's closing marker: `[image attached: …]` for one
+/// that passes the `context.images` checks, the refusal note for one that does not. Each accepted
+/// one also becomes an `image` item after the text item, carried whatever `is_error` says. With no
+/// attachment the result is the text item alone. Nothing is stored.
+fn answer(
     store: &CapsuleStoreState,
+    name: &str,
+    input_json: String,
     mut text: String,
-    attachments: &[crate::bindings::host::murmur::tool::run::Attachment],
-) -> String {
-    for line in crate::images::bridged_attachment_lines(
+    is_error: bool,
+    attachments: &[Attachment],
+) -> (Value, Option<AttachmentReport>) {
+    let checked = crate::images::check_bridged_attachments(
         attachments
             .iter()
             .map(|attachment| (attachment.media_type.as_str(), attachment.path.as_str())),
         &store.accessible_root,
-        store.image_limits.max_bytes,
-    ) {
+        &store.image_limits,
+    );
+    for line in &checked.lines {
         text.push('\n');
-        text.push_str(&line);
+        text.push_str(line);
     }
-    text
+    let images: Vec<SentImage> = checked.images.iter().map(SentImage::encode).collect();
+    let result = tool_result(text, is_error, &images);
+    let report = (!checked.trace.is_empty()).then(|| AttachmentReport {
+        tool_name: name.to_string(),
+        input_json,
+        trace: checked.trace,
+        images,
+    });
+    (result, report)
 }
 
 /// A `tools/call`'s tool name and its arguments serialised for dispatch.
@@ -727,43 +821,61 @@ mod tests {
         assert!(mcp[0].get("parameters").is_none());
     }
 
-    /// An attachment that passes the checks becomes the `[image attached: …]` line and one that
-    /// does not its refusal note, and the bridge stores nothing: no `blobs/` and no conversation
-    /// record appear anywhere under the session.
-    #[test]
-    fn claude_bridge_attachment_lines_check_and_store_nothing() {
-        use crate::bindings::host::murmur::tool::run::Attachment;
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::runtime::build_test_state(
+    fn test_store(dir: &tempfile::TempDir) -> CapsuleStoreState {
+        crate::runtime::build_test_state(
             Arc::new(murmur_artifact::LocalRegistry::new(
                 dir.path().join("registry"),
             )),
             dir.path().to_path_buf(),
             dir.path().join("murmur.lock"),
-        );
-        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
-        std::fs::write(store.accessible_root.host_path("shot.png"), png).unwrap();
+        )
+    }
+
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+
+    fn png(index: u8) -> Vec<u8> {
+        let mut bytes = PNG.to_vec();
+        bytes.push(index);
+        bytes
+    }
+
+    fn attachment(media_type: &str, path: &str) -> Attachment {
+        Attachment {
+            media_type: media_type.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    fn decoded(item: &Value) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(item["data"].as_str().expect("a data string"))
+            .expect("standard base64")
+    }
+
+    /// An attachment that passes the checks becomes the `[image attached: …]` line and one that
+    /// does not its refusal note, and the bridge stores nothing: no `blobs/` and no conversation
+    /// record appear anywhere under the session.
+    #[test]
+    fn claude_bridge_attachment_lines_check_and_store_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        std::fs::write(store.accessible_root.host_path("shot.png"), PNG).unwrap();
         std::fs::write(store.accessible_root.host_path("note.png"), b"not an image").unwrap();
-        let text = with_attachment_lines(
+        let (result, _) = answer(
             &store,
+            "t",
+            "{}".to_string(),
             "fenced result".to_string(),
+            false,
             &[
-                Attachment {
-                    media_type: "image/png".to_string(),
-                    path: "shot.png".to_string(),
-                },
-                Attachment {
-                    media_type: "image/png".to_string(),
-                    path: "note.png".to_string(),
-                },
+                attachment("image/png", "shot.png"),
+                attachment("image/png", "note.png"),
             ],
         );
+        let text = result["content"][0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "fenced result");
-        assert_eq!(
-            lines[1],
-            "[image attached: shot.png, image/png, 10 bytes; not shown to this model]"
-        );
+        assert_eq!(lines[1], "[image attached: shot.png, image/png, 10 bytes]");
         assert!(
             lines[2].starts_with("attachment 'note.png' was not attached: ")
                 && lines[2].ends_with("(content_mismatch)"),
@@ -778,6 +890,195 @@ mod tests {
             })
             .collect();
         assert!(written.is_empty(), "the bridge stored {written:?}");
+    }
+
+    /// An accepted PNG is the text item and then one MCP image item holding exactly its bytes, and
+    /// the report carries the same base64 with the trace entry.
+    #[test]
+    fn an_accepted_png_follows_the_text_as_an_image_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        std::fs::write(store.accessible_root.host_path("a.png"), PNG).unwrap();
+        let (result, report) = answer(
+            &store,
+            "png-tool",
+            r#"{"a":1}"#.to_string(),
+            "fenced".to_string(),
+            false,
+            &[attachment("image/png", "a.png")],
+        );
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{result}");
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("[image attached: a.png, image/png, 10 bytes]"));
+        let keys: Vec<&String> = content[1].as_object().unwrap().keys().collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["data", "mimeType", "type"]);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(decoded(&content[1]), PNG);
+        assert_eq!(result["isError"], false);
+
+        let report = report.expect("a call with an attachment is reported");
+        assert_eq!(report.tool_name, "png-tool");
+        assert_eq!(report.input_json, r#"{"a":1}"#);
+        let sha = murmur_artifact::sha256_hex(PNG);
+        assert_eq!(
+            report.trace,
+            [AttachmentRecord {
+                path: "a.png".to_string(),
+                media_type: "image/png".to_string(),
+                bytes: Some(10),
+                sha256: Some(sha.clone()),
+                refused: None,
+            }]
+        );
+        assert_eq!(report.images.len(), 1);
+        assert_eq!(report.images[0].base64, content[1]["data"]);
+        assert_eq!(report.images[0].sha256, sha);
+        assert_eq!(
+            report.images[0].placeholder(),
+            format!("[image: image/png, 10 bytes, sha256 {sha}]")
+        );
+    }
+
+    #[test]
+    fn two_attachments_are_two_image_items_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        std::fs::write(store.accessible_root.host_path("one.png"), png(1)).unwrap();
+        std::fs::write(store.accessible_root.host_path("two.png"), png(2)).unwrap();
+        let (result, _) = answer(
+            &store,
+            "t",
+            "{}".to_string(),
+            "fenced".to_string(),
+            false,
+            &[
+                attachment("image/png", "one.png"),
+                attachment("image/png", "two.png"),
+            ],
+        );
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(decoded(&content[1]), png(1));
+        assert_eq!(decoded(&content[2]), png(2));
+    }
+
+    #[test]
+    fn a_failed_call_still_carries_its_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        std::fs::write(store.accessible_root.host_path("a.png"), PNG).unwrap();
+        let (result, report) = answer(
+            &store,
+            "t",
+            "{}".to_string(),
+            "it failed".to_string(),
+            true,
+            &[attachment("image/png", "a.png")],
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][1]["type"], "image");
+        assert!(report.is_some());
+    }
+
+    /// A tool that attaches nothing gets exactly the result the bridge built before images
+    /// existed, and no report.
+    #[test]
+    fn without_attachments_the_result_is_the_text_item_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        for is_error in [false, true] {
+            let (result, report) = answer(
+                &store,
+                "t",
+                "{}".to_string(),
+                "fenced result".to_string(),
+                is_error,
+                &[],
+            );
+            assert_eq!(
+                result.to_string(),
+                json!({
+                    "content": [{ "type": "text", "text": "fenced result" }],
+                    "isError": is_error
+                })
+                .to_string()
+            );
+            assert!(report.is_none());
+        }
+    }
+
+    /// A file over `context.images.max_bytes` is refused `too_large` and returned as no item; a
+    /// refusal alone is still reported, as the trace's refused entry.
+    #[test]
+    fn a_file_over_max_bytes_is_refused_and_not_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = test_store(&dir);
+        store.image_limits.max_bytes = 1024;
+        let mut big = PNG.to_vec();
+        big.resize(2048, 0);
+        std::fs::write(store.accessible_root.host_path("big.png"), &big).unwrap();
+        let (result, report) = answer(
+            &store,
+            "t",
+            "{}".to_string(),
+            "fenced".to_string(),
+            false,
+            &[attachment("image/png", "big.png")],
+        );
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("2048 bytes is over context.images.max_bytes of 1024 bytes")
+                && text.ends_with("(too_large)"),
+            "{text}"
+        );
+        let report = report.expect("a refused attachment is reported");
+        assert!(report.images.is_empty());
+        assert_eq!(report.trace[0].refused, Some("too_large"));
+    }
+
+    /// `context.images.max_per_turn` bounds the image items of one call.
+    #[test]
+    fn the_image_past_max_per_turn_in_one_call_is_refused_with_turn_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        let mut attachments = Vec::new();
+        for index in 0..6u8 {
+            let name = format!("{index}.png");
+            std::fs::write(store.accessible_root.host_path(&name), png(index)).unwrap();
+            attachments.push(attachment("image/png", &name));
+        }
+        let (result, report) = answer(
+            &store,
+            "t",
+            "{}".to_string(),
+            "fenced".to_string(),
+            false,
+            &attachments,
+        );
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 6, "one text item and five images");
+        for (index, item) in content[1..].iter().enumerate() {
+            assert_eq!(decoded(item), png(index as u8));
+        }
+        let text = content[0]["text"].as_str().unwrap();
+        let last = text.lines().last().unwrap();
+        assert!(
+            last.starts_with("attachment '5.png' was not attached: ")
+                && last.ends_with("(turn_limit)"),
+            "{last}"
+        );
+        let report = report.unwrap();
+        assert_eq!(report.images.len(), 5);
+        assert_eq!(report.trace.len(), 6);
+        assert_eq!(report.trace[5].refused, Some("turn_limit"));
     }
 
     fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -946,13 +1247,15 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, _note_rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
         let accepted = AtomicUsize::new(0);
         let on_request = || {
             accepted.fetch_add(1, Ordering::SeqCst);
         };
-        let serve = fixture
-            .handle
-            .serve(&fixture.store, &gate_tx, &note_tx, &on_request);
+        let serve =
+            fixture
+                .handle
+                .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &on_request);
 
         let body = async {
             let parked = client.call_in_background("A");
@@ -1001,9 +1304,10 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, _note_rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
         let serve = fixture
             .handle
-            .serve(&fixture.store, &gate_tx, &note_tx, &|| {});
+            .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
 
         let body = async {
             let call_a = client.call_in_background("A");
@@ -1036,9 +1340,10 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
         let serve = fixture
             .handle
-            .serve(&fixture.store, &gate_tx, &note_tx, &|| {});
+            .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
 
         let body = async {
             let call_a = client.call_in_background("A");
@@ -1099,9 +1404,10 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
         let serve = fixture
             .handle
-            .serve(&fixture.store, &gate_tx, &note_tx, &|| {});
+            .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
 
         let body = async {
             let connection = client.send(tool_call("A")).await;
@@ -1134,11 +1440,13 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, _note_rx) = mpsc::unbounded_channel();
-        let mut serve = Box::pin(
-            fixture
-                .handle
-                .serve(&fixture.store, &gate_tx, &note_tx, &|| {}),
-        );
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
+        let mut serve =
+            Box::pin(
+                fixture
+                    .handle
+                    .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {}),
+            );
 
         let _connection = client.send(tool_call("A")).await;
         let a = tokio::select! {
@@ -1151,6 +1459,50 @@ mod tests {
             a.reply.is_closed(),
             "dropping serve drops the call waiting on this verdict"
         );
+    }
+
+    /// A call refused by the decision point, one refused at the in-flight bound, and one whose
+    /// dispatch fails each answer with the one text item, and none sends a report.
+    #[tokio::test]
+    async fn refused_and_failed_calls_carry_no_image_and_send_no_report() {
+        let mut fixture = Fixture::new().await;
+        fixture.handle.max_in_flight_calls = 1;
+        let client = fixture.client();
+        let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
+        let (note_tx, _note_rx) = mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel::<AttachmentReport>();
+        let serve = fixture
+            .handle
+            .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
+
+        let body = async {
+            let refused = client.call_in_background("A");
+            let a = next_gate(&mut gate_rx).await;
+            let at_capacity = within("the second call", client.post(tool_call("B"))).await;
+            let _ = a.reply.send(Some("refused-A".to_string()));
+            let refused = within("call A", refused).await.unwrap();
+
+            // No `echo-tool` is installed in the fixture's store, so its dispatch fails.
+            let failed = client.call_in_background("C");
+            let c = next_gate(&mut gate_rx).await;
+            let _ = c.reply.send(None);
+            let failed = within("call C", failed).await.unwrap();
+
+            for answer in [&refused, &at_capacity, &failed] {
+                let content = answer["result"]["content"].as_array().unwrap();
+                assert_eq!(content.len(), 1, "{answer}");
+                assert_eq!(content[0]["type"], "text");
+                assert_eq!(answer["result"]["isError"], true, "{answer}");
+            }
+            assert!(
+                matches!(report_rx.try_recv(), Err(TryRecvError::Empty)),
+                "no call named an attachment"
+            );
+        };
+        tokio::select! {
+            () = serve => panic!("serve returned"),
+            () = body => {}
+        }
     }
 
     #[tokio::test]
