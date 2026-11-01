@@ -1193,11 +1193,10 @@ async fn drive_harness(
                 let _ = trace.write_harness_note(&note.text()).await;
                 continue;
             }
-            // After the bridge arm and ahead of the output arm, so a report is queued before the
-            // result line it belongs to is read. The bridge sends a call's report before writing
-            // its answer, and the harness can report the call's result only after reading that
-            // answer: a report sent while the bridge was polled in this pass is taken here before
-            // the output arm is polled, and one sent in an earlier pass was taken then.
+            // Must stay ahead of the output arm, so a report is queued before the result line it
+            // belongs to is read. The bridge sends a call's report before writing its answer, and
+            // the harness can report the call's result only after reading that answer: whenever
+            // the output arm is polled, this arm was polled just before it in the same pass.
             report = next_attachment_report(&mut report_rx) => {
                 sink.queue_report(report);
                 continue;

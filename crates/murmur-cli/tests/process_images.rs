@@ -274,8 +274,7 @@ fn bridged_png_answers_text_then_image() {
     assert!(!output.contains(&b64), "{output}");
     assert_eq!(call["output_bytes"], output.len());
 
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-    let conversations = home.join(".murmur").join("conversations");
+    let conversations = common::process_home().join(".murmur").join("conversations");
     for path in files_under(&session.records_dir)
         .into_iter()
         .chain(files_under(&conversations))

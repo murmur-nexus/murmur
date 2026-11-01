@@ -409,7 +409,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `tool_call_id` | string \| null | The provider's own id for this call, recorded verbatim and never parsed. It is what pairs this line with the tool-result message the runtime sent back. `null` when the provider named none |
 | `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
-| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](untrusted-fence.md) the model received it inside. Under `transport: process`, each image the tool server returned is replaced wherever the harness's result repeats its bytes, by `[image: <media_type>, <n> bytes, sha256 <hex>]`. Written only under [`trace.capture: content`](manifest.md#field-trace) |
+| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](untrusted-fence.md) the model received it inside. Under `transport: process`, wherever the harness's result repeats an image the tool server returned, the image is replaced by `[image: <media_type>, <n> bytes, sha256 <hex>]`. Written only under [`trace.capture: content`](manifest.md#field-trace) |
 | `output_bytes` | u64 | Byte length of the tool output text, fence markers included, after any image replacement |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
