@@ -1367,7 +1367,7 @@ bodies can be large, and a blob holds the wire payload or the received message a
 | `lifecycle.task_acceptance` | `none \| single \| queue` | no | Default: `single`. How the capsule accepts incoming A2A tasks — see [`lifecycle.task_acceptance`](#lifecycle-task-acceptance). |
 | `lifecycle.after_task` | `exit \| sleep` | no | Default: `exit`. What the capsule does after completing a task — see [`lifecycle.after_task`](#lifecycle-after-task). |
 | `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`, where it is at least `1`: `0` there is refused with [`E-MAN-003`](diagnostics.md#e-man-003). Under `single` and `none` it has no effect. A task beyond this limit is answered in [`TASK_STATE_REJECTED`](agent-card.md#task-states). For a [roster](roster.md) member, [`W-ROS-001`](diagnostics.md#w-ros-001) warns when more members may call it than it holds at once. |
-| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `SendMessage` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
+| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `SendMessage` reply after a tool component calls `request-input`, or to a driver's [safety checks](wit-interfaces.md#safety-checks) on a tool call. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `lifecycle.shell_grace_secs` | integer | no | Default: not set — a command runs in the foreground until it exits. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
@@ -2629,7 +2629,9 @@ them. To have queued work run, declare `task_acceptance: queue` with `after_task
 ### `lifecycle.input_timeout_secs` { #lifecycle-input-timeout-secs }
 
 Controls how long the capsule waits for a `SendMessage` reply after a WASM tool component calls
-`murmur:task/task#request-input`.
+`murmur:task/task#request-input`, or after a driver attaches
+[safety checks](wit-interfaces.md#safety-checks) to a tool call. A safety check that times out
+leaves its call unrun.
 
 | Value | Behaviour |
 |---|---|

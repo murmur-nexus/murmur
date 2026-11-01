@@ -154,7 +154,7 @@ pub(crate) fn build_tool_inventory(
         }
 
         // Staging refused a block that does not parse, so one that fails here is left off rather
-        // than guessed at. An entry without the key serializes as it always has.
+        // than guessed at. An entry without the key gains no member.
         if matches!(runtime, ArtifactRuntime::Tool) && value.get(PROVIDER_TOOL_KEY).is_some() {
             if let Ok(Some(provider_tool)) = ProviderTool::from_manifest_value(&value) {
                 tool[PROVIDER_TOOL_KEY] = provider_tool.to_json();

@@ -317,8 +317,8 @@ provider asks a person to acknowledge before the action runs:
 any tool call. Once the capsule's capability checks and any `on-tool-call` policy hook let the call
 through, and before it runs:
 
-1. The runtime puts the task in `input-required` with this prompt, one line per check (`-` for a
-   check with no `code`):
+1. The runtime puts the task in `TASK_STATE_INPUT_REQUIRED` with this prompt, one line per check
+   (`-` for a check with no `code`):
 
     ```text
     safety check on tool call '<tool>' (<call id>):
@@ -510,8 +510,8 @@ is expected to reply.
 It is available in the `tool` world only, and only while the capsule is running an A2A task.
 Called anywhere else, it returns an error immediately.
 
-A driver's [safety checks](#safety-checks) on a tool call raise `input-required` the same way,
-with the same reply and the same timeout.
+A driver's [safety checks](#safety-checks) on a tool call put the task in
+`TASK_STATE_INPUT_REQUIRED` the same way, with the same reply and the same timeout.
 
 **Timeout:** `lifecycle.input_timeout_secs` in the manifest (see
 [lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,

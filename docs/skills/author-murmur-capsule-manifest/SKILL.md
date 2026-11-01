@@ -383,7 +383,7 @@ capabilities:
   containment: sealed
 ```
 
-only when the workload requires that minimum class and the deployment host can provide it. Valid floors are `advisory`, `scoped`, and `sealed` in ascending strength.
+only when the workload requires that minimum class and the deployment host can provide it. Valid floors are `advisory`, `scoped`, and `sealed` in ascending strength. A capsule that declares a computer tool — a tool artifact whose own `murmur.yaml` carries a `provider_tool:` block — [requires `sealed`](https://docs.murmur.nexus/reference/containment/#provider-tools); below it the launch is refused with [`E-CAP-003`](https://docs.murmur.nexus/reference/diagnostics/#e-cap-003).
 
 Do not claim a stronger posture than another field makes possible. In particular, `workdir_exec: true` collapses the achieved posture to `advisory`.
 

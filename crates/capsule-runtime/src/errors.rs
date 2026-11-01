@@ -303,8 +303,8 @@ pub enum RuntimeError {
         /// Why the floor is unmet, which decides what the operator is told to change.
         cause: crate::containment::ShortfallCause,
         /// The declared provider tools that need the floor, each named on a `required by:` line.
-        /// Filled only for a declared `sealed` floor; empty otherwise, and then the message is
-        /// unchanged.
+        /// Filled only for a declared `sealed` floor; empty otherwise, and then the message has
+        /// no `required by:` line.
         required_by: Vec<crate::provider_tool::ProviderToolUse>,
     },
     /// A capsule declares an `exports.files.root` that, once resolved against the session's
@@ -446,12 +446,12 @@ pub enum RuntimeError {
     #[error(
         "{} declare{} a provider tool, which runs only under the 'sealed' containment floor, and \
          the effective containment floor is '{declared}'",
-        .tools.iter().map(|(tool, kind)| format!("tool '{tool}' (provider_tool: {kind})")).collect::<Vec<_>>().join(", "),
+        .tools.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         if .tools.len() == 1 { "s" } else { "" }
     )]
     ProviderToolRequiresSealed {
-        /// `(tool name, kind)` for each tool, in staging order.
-        tools: Vec<(String, String)>,
+        /// Each such tool, in staging order.
+        tools: Vec<crate::provider_tool::ProviderToolUse>,
         declared: murmur_artifact::ContainmentClass,
         host_can_back: murmur_artifact::ContainmentClass,
     },
@@ -547,7 +547,7 @@ pub enum RuntimeError {
         blocker: crate::network_namespace::EgressNamespaceBlocker,
         reason: String,
         /// The declared provider tools, each named on a `required by:` line; empty without one,
-        /// and then the message is unchanged.
+        /// and then the message has no `required by:` line.
         required_by: Vec<crate::provider_tool::ProviderToolUse>,
     },
 

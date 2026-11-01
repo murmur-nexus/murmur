@@ -421,8 +421,8 @@ Neither means the declared floor was wrong; `E-CAP-003` covers that.
 
 **A provider tool below `sealed` names the manifest.** A capsule declaring a tool whose artifact
 carries a [`provider_tool:` block](manifest.md#provider-tool) needs the `sealed` floor whatever the
-host can back. Decided against the effective declared floor, after the artifacts are read and
-before the session directory exists or any driver is called; the floor is never raised for it:
+host can back. It is decided against the effective declared floor, after the artifacts are read
+and before the session directory exists or any driver is called; the floor is never raised for it:
 
 ```text
 error[E-CAP-003]: tool 'computer' (provider_tool: computer) declares a provider tool, which runs only under the 'sealed' containment floor, and the effective containment floor is 'scoped'

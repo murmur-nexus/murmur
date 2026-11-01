@@ -724,11 +724,6 @@ impl From<RuntimeError> for CliError {
                     murmur_artifact::docs_reference_url!("resource-plane/")
                 ),
             ),
-            // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
-            // one means the host is too weak for the declared floor (lower it, or move hosts),
-            // this one means the capsule's own declaration is too weak for what it asked for
-            // (raise it, or drop the grant). Deciding it on the declared floor alone is why this
-            // fires identically on a host that could deliver `sealed`.
             // Decided on the declared floor alone, like E-CAP-004 below, so its remedy is to raise
             // the floor; it shares E-CAP-003 because the floor a provider tool needs is not met.
             error @ RuntimeError::ProviderToolRequiresSealed { host_can_back, .. } => {
@@ -750,6 +745,11 @@ impl From<RuntimeError> for CliError {
                     ),
                 )
             }
+            // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
+            // one means the host is too weak for the declared floor (lower it, or move hosts),
+            // this one means the capsule's own declaration is too weak for what it asked for
+            // (raise it, or drop the grant). Deciding it on the declared floor alone is why this
+            // fires identically on a host that could deliver `sealed`.
             error @ RuntimeError::StagedRuntimeRequiresSealed { .. } => CliError::with_hint(
                 E_CAP_004,
                 error.to_string(),
@@ -1699,7 +1699,7 @@ mod tests {
     }
 
     /// A declared-`sealed` `E-CAP-003` names each provider tool on a `required by:` line under
-    /// its message, and without one renders exactly as before.
+    /// its message, and without one renders with no such line.
     #[test]
     fn provider_tool_required_by_line_on_the_sealed_floor_refusal() {
         use capsule_runtime::containment::ShortfallCause;
@@ -1730,8 +1730,8 @@ mod tests {
         );
     }
 
-    /// `E-CAP-005` names each provider tool the same way, and without one renders exactly as
-    /// before.
+    /// `E-CAP-005` names each provider tool the same way, and without one renders with no
+    /// such line.
     #[test]
     fn provider_tool_required_by_line_on_the_egress_namespace_refusal() {
         use capsule_runtime::network_namespace::EgressNamespaceBlocker;
@@ -1764,7 +1764,7 @@ mod tests {
     fn provider_tool_refusals_render_under_their_codes() {
         use murmur_artifact::ContainmentClass;
         let sealed = CliError::from(RuntimeError::ProviderToolRequiresSealed {
-            tools: vec![("computer".to_string(), "computer".to_string())],
+            tools: vec![computer_tool("computer")],
             declared: ContainmentClass::Scoped,
             host_can_back: ContainmentClass::Sealed,
         });
@@ -1784,10 +1784,7 @@ mod tests {
             "{hint}"
         );
         let weaker_host = CliError::from(RuntimeError::ProviderToolRequiresSealed {
-            tools: vec![
-                ("a".to_string(), "computer".to_string()),
-                ("b".to_string(), "computer".to_string()),
-            ],
+            tools: vec![computer_tool("a"), computer_tool("b")],
             declared: ContainmentClass::Advisory,
             host_can_back: ContainmentClass::Scoped,
         });

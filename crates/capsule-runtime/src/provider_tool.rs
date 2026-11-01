@@ -1,10 +1,10 @@
 //! Tools that are a provider's own tools, and the safety checks a driver attaches to a call.
 //!
 //! A `runtime: tool` artifact whose bundled `murmur.yaml` declares `provider_tool:`
-//! ([`murmur_artifact::ProviderTool`]) is one the model's provider defines itself; today the only
-//! kind is `computer`. The runtime reads the block, checks it, and passes it to the driver on the
-//! tool's tool-array entry. It names no provider: which tool a driver sends for the block is the
-//! driver's to decide.
+//! ([`murmur_artifact::ProviderTool`]) is one the model's provider defines itself, of a kind in
+//! [`ProviderToolKind::ALL`]. The runtime reads the block, checks it, and passes it to the driver
+//! on the tool's tool-array entry. It names no provider: which tool a driver sends for the block is
+//! the driver's to decide.
 //!
 //! Declaring one constrains the launch:
 //!
@@ -182,10 +182,7 @@ pub(crate) fn check_sealed(
         return Ok(());
     }
     Err(RuntimeError::ProviderToolRequiresSealed {
-        tools: tools
-            .iter()
-            .map(|tool| (tool.tool.clone(), tool.kind.as_str().to_string()))
-            .collect(),
+        tools: tools.to_vec(),
         declared,
         host_can_back,
     })

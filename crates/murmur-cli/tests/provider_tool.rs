@@ -506,7 +506,7 @@ fn vision_false_is_refused_and_true_or_absent_runs() {
         assert_completed(&run);
     }
 
-    // `vision: false` without a computer tool starts as it always has.
+    // `vision: false` without a computer tool is not refused.
     let run = run(
         publish_fixtures(Some(false)),
         &manifest("blind-plain", &[PLAIN], &alternate, CONTROL),
