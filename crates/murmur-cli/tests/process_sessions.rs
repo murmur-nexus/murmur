@@ -65,6 +65,9 @@ struct Built {
     queue: bool,
     record: bool,
     hooks: String,
+    /// Lines appended under `inference:`, and top-level lines appended after it.
+    inference_extra: String,
+    trailer: String,
 }
 
 impl Built {
@@ -74,7 +77,19 @@ impl Built {
             queue: false,
             record: true,
             hooks: String::new(),
+            inference_extra: String::new(),
+            trailer: String::new(),
         }
+    }
+
+    fn inference_extra(mut self, yaml: &str) -> Self {
+        self.inference_extra = yaml.to_string();
+        self
+    }
+
+    fn trailer(mut self, yaml: &str) -> Self {
+        self.trailer = yaml.to_string();
+        self
     }
 
     fn stateless(mut self) -> Self {
@@ -159,8 +174,11 @@ impl Built {
                  version: {DRIVER_VERSION}\n    runtime: driver\n{hooks}\
                  lifecycle:\n{acceptance}{conversation}{context}\
                  capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
-                 inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n",
+                 inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n\
+                 {inference_extra}{trailer}",
                 hooks = self.hooks,
+                inference_extra = self.inference_extra,
+                trailer = self.trailer,
             ),
         )
         .unwrap();
@@ -384,11 +402,17 @@ const GRACE_MS: &str = "4000";
 
 impl LiveCapsule {
     fn start(capsule: Capsule, profile: &str) -> Self {
+        Self::start_with_args(capsule, profile, &[])
+    }
+
+    /// [`Self::start`] with more `mur run` arguments.
+    fn start_with_args(capsule: Capsule, profile: &str, args: &[&str]) -> Self {
         capsule.set_profile(profile);
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
             .args(["run", "--manifest"])
             .arg(&capsule.manifest)
             .arg("--json")
+            .args(args)
             .current_dir(capsule.project.path())
             .env_clear()
             .env("HOME", capsule.home.path())
@@ -727,6 +751,56 @@ fn a_second_message_in_one_context_resumes_the_harness_session() {
         live.capsule.harness_sessions().len(),
         1,
         "the harness kept one conversation, not one per message"
+    );
+}
+
+/// `inference.instruction_files` reaches the process driver: the prompt it is handed holds the
+/// fact lines, then the manifest prompt, then the block, last. It is composed once at staging,
+/// so both harness runs of one session are handed the same bytes.
+#[test]
+fn instruction_files_reach_the_process_driver_identically_on_every_run() {
+    let capsule = Built::new()
+        .queueing()
+        .inference_extra("  system_prompt: \"MANIFEST PROMPT\"\n  instruction_files: [AGENTS.md]\n")
+        .trailer("trace:\n  capture: content\n")
+        .build();
+    let workdir = capsule.project.path().join("work");
+    fs::create_dir_all(&workdir).unwrap();
+    fs::write(
+        workdir.join("AGENTS.md"),
+        "Run the tests before you commit.\n",
+    )
+    .unwrap();
+    let live =
+        LiveCapsule::start_with_args(capsule, "memory", &["--workdir", workdir.to_str().unwrap()]);
+
+    live.send("m1", "ctx_rules", SECRET_TASK, 1);
+    live.send("m2", "ctx_rules", RECALL_TASK, 2);
+
+    let launches = live.launches();
+    assert_eq!(launches.len(), 2, "{launches:#?}");
+    let sha = launches[0]["system_prompt_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("harness_start names the prompt: {}", launches[0]));
+    assert_eq!(launches[1]["system_prompt_sha256"], sha);
+    let prompt = fs::read_to_string(live.records_dir.join("blobs").join(sha)).unwrap();
+    assert!(prompt.starts_with("Work folder: ./"), "{prompt}");
+    assert!(
+        prompt.ends_with(
+            "\n\nMANIFEST PROMPT\n\n[Instruction file: AGENTS.md]\nRun the tests before you commit."
+        ),
+        "{prompt}"
+    );
+
+    let start = live
+        .events()
+        .into_iter()
+        .find(|event| event["event_type"] == "session_start")
+        .unwrap();
+    assert_eq!(start["instruction_files"][0]["status"], "read", "{start}");
+    assert_eq!(
+        start["system_prompt_sha256"],
+        murmur_artifact::sha256_hex(b"MANIFEST PROMPT")
     );
 }
 

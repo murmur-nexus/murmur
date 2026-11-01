@@ -54,6 +54,7 @@ pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub(crate) mod inference_retry;
 pub(crate) mod install_grant;
+pub(crate) mod instruction_files;
 pub(crate) mod interpreter_runtime;
 pub(crate) mod keep_working;
 pub mod lanes;

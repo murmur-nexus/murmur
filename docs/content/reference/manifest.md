@@ -291,6 +291,7 @@ inference:
   system_prompt: |              # optional; injected as `system` on every API call
     Always begin responses with CONFIRMED:
   # system_prompt_file: conventions.md  # alternative: load from file
+  # instruction_files: [AGENTS.md, CLAUDE.md]  # optional; work-folder files appended to the prompt
   # max_turns: 50               # optional; default: no cap
 
 # Alternative: run a harness CLI as a subprocess (no ANTHROPIC_API_KEY required)
@@ -1126,6 +1127,7 @@ model. These fields are read under both transports:
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
 | `inference.system_prompt_artifact` | string | no | The `name`, as written, of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
+| `inference.instruction_files` | list of strings | no | Default: none. Files in the work folder appended to the system prompt at launch, each as one labelled block after the manifest's own prompt. Each entry must be a relative path with no `..` component; an empty, absolute or escaping entry fails with `E-MAN-003`. See [`inference.instruction_files`](#inference-instruction-files). |
 
 These fields are read under `transport: http`. Setting any of them except `inference.model` under
 `transport: process` is a manifest error:
@@ -2016,6 +2018,73 @@ Rules:
 - With no prompt source set, no `system` parameter is emitted.
 - **A run can override whatever is declared here.** [`mur run --system-prompt`](cli.md#mur-run)
   replaces all three sources for that invocation only and leaves `murmur.yaml` untouched.
+
+### `inference.instruction_files` { #inference-instruction-files }
+
+`inference.instruction_files` lists files in the work folder that become part of the system prompt.
+Repositories keep their conventions for coding agents in files such as `AGENTS.md` and `CLAUDE.md`;
+listing them hands those conventions to the agent on both transports.
+
+```yaml
+inference:
+  system_prompt: "You review pull requests."
+  instruction_files: [AGENTS.md, CLAUDE.md]
+```
+
+A listed file becomes part of the system prompt, so list a file only for a repository you trust.
+Its text is not marked as untrusted content.
+
+At launch the runtime reads each listed file once and appends one block per file to the system
+prompt, after the manifest's own prompt (or the [`mur run --system-prompt`](cli.md#mur-run) text
+that replaces it), in manifest order. Every task of the session gets the same prompt. An edit to a
+listed file applies from the next session.
+
+Each block is a header line and the file's text, with trailing line endings removed:
+
+| Case | Header |
+|---|---|
+| Read whole | `[Instruction file: AGENTS.md]` |
+| The same file listed again under another name | `[Instruction file: AGENTS.md (also listed as CLAUDE.md)]` |
+| Larger than 32 KiB | `[Instruction file: AGENTS.md, first 32768 of 51200 bytes]` |
+| Both | `[Instruction file: AGENTS.md (also listed as CLAUDE.md), first 32768 of 51200 bytes]` |
+
+Each entry resolves against the work folder. What happens to it:
+
+| Entry | Result | `status` in the trace |
+|---|---|---|
+| A UTF-8 text file in the work folder, or a link to one | Read; contributes a block | `read` |
+| No such path, or a link whose target does not exist | Skipped | `missing` |
+| A file an earlier entry already read, under another name | Named in the earlier block's header | `same_file` |
+| A link that leads outside the work folder | Not read | `outside_work_folder` |
+| A directory, FIFO, socket or device | Skipped | `not_a_file` |
+| Bytes that are not UTF-8 | Skipped | `not_utf8` |
+| Nothing but whitespace | Skipped | `empty` |
+| Any other read failure | Skipped | `unreadable` |
+
+Rules:
+
+- **Entries are relative to the work folder.** An empty entry, an absolute path or any `..`
+  component fails the launch with `E-MAN-003`, naming `inference.instruction_files[<index>]` and
+  the entry. `./AGENTS.md` and `AGENTS.md` name the same file.
+- **32 KiB per file.** A larger file is cut at the last whole character at or below 32768 bytes,
+  and its header gives both sizes. The limit matches the default of Codex's `project_doc_max_bytes`,
+  so a file Codex loads whole loads whole here. It is fixed, not a manifest field.
+- **Only the listed paths are read.** A file with a listed name in a subdirectory is not loaded;
+  the session's `MURMUR.md` lists where such files are, in its `## Instruction Files` section,
+  which is present only when this field is set.
+- **`@path` imports inside a listed file are not followed.** The text is used as written.
+- **Nothing outside the work folder is read**, including the host user's own `~/.claude/CLAUDE.md`
+  or `~/.codex/AGENTS.md`, and no parent directory of the work folder is searched.
+- **The trace records every entry.** `session_start.instruction_files` gives each entry's status,
+  and for a read file its size, the bytes included and their SHA-256. See
+  [`session_start`](observability-schemas.md#session-trace-tracejsonl).
+- **An empty list reads nothing** and is recorded as `[]`. Without the field the system prompt is
+  exactly what the prompt fields make it.
+
+On `transport: process` the composed prompt is what the process driver is handed. The
+`driver-claude-code` driver keeps Claude Code's own loading of `CLAUDE.md` off, so these blocks are
+the only project instructions the harness gets — see
+[Run a capsule on a subscription](../how-to/run-capsule-on-subscription.md).
 
 ---
 

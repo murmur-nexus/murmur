@@ -854,6 +854,7 @@ async fn run_harness(
         call: "launch".to_string(),
         message,
     };
+    let launch_system_prompt = request.system_prompt.clone();
     let plan: LaunchPlan = driver.launch(request).await?.map_err(launch_error)?;
 
     let files_dir = FilesDir::create(&store_state.runtime_dirs.harness).map_err(launch_error)?;
@@ -897,6 +898,8 @@ async fn run_harness(
             .unwrap_or_default(),
         stdin_bytes,
         keep_stdin_open: plan.keep_stdin_open,
+        system_prompt_sha256: murmur_artifact::sha256_hex(launch_system_prompt.as_bytes()),
+        system_prompt: launch_system_prompt,
     };
 
     let mut sink = ProcessEventSink::new(
@@ -1904,6 +1907,7 @@ mod tests {
     #[test]
     fn process_system_prompt_states_no_limit_when_none_is_set() {
         let inference = InferenceConfig {
+            instruction_files: None,
             max_turns: None,
             max_session_tokens: None,
             ..process_inference("m", None)
@@ -1957,6 +1961,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
+            instruction_files: None,
             max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
@@ -2196,6 +2201,38 @@ mod tests {
         assert_eq!(request.harness_version.as_deref(), Some("harness 1.0.0"));
         assert_eq!(request.task, "do the thing");
         assert!(request.bridge.is_none());
+    }
+
+    /// The instruction-file blocks the launch composed after the manifest prompt reach the driver
+    /// after the fact lines, unchanged and last.
+    #[test]
+    fn build_launch_request_hands_the_composed_prompt_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Run the tests first.\n").unwrap();
+        let files = crate::instruction_files::InstructionFiles::read(
+            dir.path(),
+            &["AGENTS.md".to_string()],
+        );
+        let composed =
+            crate::instruction_files::compose_system_prompt(Some("MANIFEST PROMPT"), Some(&files));
+        let request = build_launch_request(
+            &process_inference("m", None),
+            composed.as_deref(),
+            &process_facts(false),
+            None,
+            new_session("sess-1"),
+            None,
+            "t".to_string(),
+            Some("murmur.yaml"),
+        );
+        let facts = build_process_system_prompt(None, &process_facts(false), Some("murmur.yaml"));
+        assert_eq!(
+            request.system_prompt,
+            format!(
+                "{facts}\n\nMANIFEST PROMPT\n\n[Instruction file: AGENTS.md]\nRun the tests \
+                 first."
+            )
+        );
     }
 
     #[test]

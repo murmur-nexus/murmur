@@ -5760,6 +5760,7 @@ mod tests {
             ..crate::types::CapabilityPolicy::default()
         };
         let inference = InferenceConfig {
+            instruction_files: None,
             max_turns: Some(7),
             max_session_tokens: Some(50_000),
             ..crate::capsule_facts::test_http_inference()
@@ -5823,6 +5824,7 @@ mod tests {
     #[test]
     fn augmented_system_prompt_states_no_turn_limit_when_none_is_set() {
         let inference = murmur_artifact::InferenceConfig {
+            instruction_files: None,
             max_turns: None,
             ..crate::capsule_facts::test_http_inference()
         };
