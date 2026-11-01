@@ -1011,7 +1011,7 @@ async fn handle_connection(
             write_refusal(writer_half, reader, &refused).await;
             return;
         }
-        let response = attachment_response(&task_registry, &method, rest, &caller);
+        let response = attachment_response(&task_registry, &method, rest, &caller).await;
         let _ = writer_half.write_all(&framed_bytes(&response)).await;
         return;
     }
@@ -1295,7 +1295,7 @@ pub(crate) const ATTACHMENT_PATH_PREFIX: &str = "/attachments/";
 /// The answer to a request for `<task-id>/<sha256>` under [`ATTACHMENT_PATH_PREFIX`]: `200` with
 /// the image's bytes and its media type, `404` for a task or hash the registry does not hold or a
 /// task [`visible_to`] hides from `caller`, and `405` for any method but `GET`.
-fn attachment_response(
+async fn attachment_response(
     task_registry: &Mutex<TaskRegistry>,
     method: &str,
     rest: &str,
@@ -1322,7 +1322,14 @@ fn attachment_response(
             None => return not_found(),
         }
     };
-    match crate::images::read_blob(&indexed.blob) {
+    // A blob can be megabytes, so it is read off the door's async workers, as the resource
+    // plane reads its files.
+    let blob = indexed.blob;
+    let bytes = tokio::task::spawn_blocking(move || crate::images::read_blob(&blob))
+        .await
+        .ok()
+        .flatten();
+    match bytes {
         Some(bytes) => ResourceResponse::framed(
             200,
             vec![("content-type".to_string(), indexed.media_type)],

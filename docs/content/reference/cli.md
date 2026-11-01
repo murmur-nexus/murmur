@@ -607,7 +607,7 @@ mur build [source] [--output <path-or-dir>]
 
 ```bash
 mur build .
-# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 2)
+# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 3)
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
@@ -946,8 +946,8 @@ Example output (`mur list -g --contract murmur:tool`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
-murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.1.0
-murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.1.0
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.2.0
+murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.2.0
 ```
 
 ---
@@ -1316,17 +1316,17 @@ payload. The check never writes to either store.
 
 ```text
 WIT level
-  this mur serves WIT level 2:
+  this mur serves WIT level 3:
     PACKAGE                  VERSION
     murmur:artifact-manager  0.1.0
     murmur:capsule           0.1.0
     ...
-    murmur:tool-registry     0.1.0
+    murmur:tool-registry     0.2.0
 
   installed:
-    local/built-tool@0.1.0   global    built at 2                fits level 2
-    local/notes@0.1.0        global    built at 2 (derived)      fits level 2
-    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 2
+    local/built-tool@0.1.0   global    built at 3                fits level 3
+    local/notes@0.1.0        global    built at 3 (derived)      fits level 3
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 3
   ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
@@ -4029,7 +4029,7 @@ murmur/tool-editor  0.7.0    tool     Read, write and patch files in the workdir
 murmur/tool-git     0.2.0    tool     Structured git interface.
 
 murmur/hook-old: 1.0.0 needs murmur:hook/lifecycle@0.8.0, this mur serves murmur:hook@0.9.0
-murmur/tool-editor: 0.8.0 needs murmur:tool/run@0.2.0, this mur serves murmur:tool@0.1.0
+murmur/tool-editor: 0.8.0 needs murmur:tool/run@0.3.0, this mur serves murmur:tool@0.2.0
 murmur/tool-git: 0.3.0 has no payload for linux-x86_64
 ```
 
@@ -4158,13 +4158,13 @@ mur version [--json]
 ```text
 mur 1.1.0-dev
 commit 0123456789abcdef0123456789abcdef01234567
-WIT level 2
+WIT level 3
 
 PACKAGE                  VERSION
 murmur:artifact-manager  0.1.0
 murmur:capsule           0.1.0
 ...
-murmur:tool-registry     0.1.0
+murmur:tool-registry     0.2.0
 ```
 
 The second line is `commit unknown` for a build made without a git checkout or a
@@ -4177,7 +4177,7 @@ padded to its widest cell plus two spaces.
 {
   "mur_version": "1.1.0-dev",
   "commit": "0123456789abcdef0123456789abcdef01234567",
-  "wit_level": 1,
+  "wit_level": 3,
   "packages": [
     {
       "package": "murmur:artifact-manager",

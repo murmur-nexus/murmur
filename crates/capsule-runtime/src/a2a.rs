@@ -1010,8 +1010,8 @@ impl MessageRefusal {
                     id,
                     A2aError::ContentTypeNotSupported,
                     &format!(
-                        "message.parts[{part_index}] is a {kind} part; this agent reads text and \
-                         data parts only"
+                        "message.parts[{part_index}] is a {kind} part; this agent reads text parts, \
+                         data parts and image raw parts only"
                     ),
                     &metadata,
                 )

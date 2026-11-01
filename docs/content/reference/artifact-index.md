@@ -32,7 +32,7 @@ tool with one payload per platform:
           "version": "0.7.0",
           "release": "v1.1.0",
           "interfaces": [
-            "murmur:tool/run@0.1.0"
+            "murmur:tool/run@0.2.0"
           ],
           "assets": [
             {
@@ -45,7 +45,7 @@ tool with one payload per platform:
           "version": "0.6.0",
           "release": "v1.0.0",
           "interfaces": [
-            "murmur:tool/run@0.1.0"
+            "murmur:tool/run@0.2.0"
           ],
           "assets": [
             {

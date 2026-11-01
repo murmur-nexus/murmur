@@ -6082,10 +6082,11 @@ fn parse_context_images(
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| *n >= 1)
             .ok_or_else(|| {
-                invalid(
-                    field,
-                    format!("must be a whole number of at least 1, got '{value:?}'"),
-                )
+                let message = match scalar_text(&value) {
+                    Some(text) => format!("must be a whole number of at least 1, got '{text}'"),
+                    None => "must be a whole number of at least 1".to_string(),
+                };
+                invalid(field, message)
             }),
     };
     let max_bytes = match raw.max_bytes {
@@ -7058,6 +7059,11 @@ mod tests {
                 other => panic!("{block}: expected a refusal naming {field}, got {other:?}"),
             }
         }
+        let error = context_images_of("  images:\n    keep: 0\n").unwrap_err();
+        assert!(
+            error.to_string().contains("got '0'"),
+            "the value is named as written: {error}"
+        );
     }
 
     #[test]

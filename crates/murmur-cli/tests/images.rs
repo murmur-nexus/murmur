@@ -639,7 +639,7 @@ fn a2a_image_part() {
         json!([{"path": "message.parts[1]", "media_type": "image/png", "bytes": 67, "sha256": sha}])
     );
 
-    // A `raw` part of another type keeps today's refusal.
+    // A `raw` part of any other type is refused `-32005`.
     let other = send(
         &door,
         None,

@@ -131,7 +131,7 @@ on stdout. The stdout object carries the same fields as a `tool-result`:
 | `status` | `"passed"`, `"failed"`, other | Any other value, or none, is `error` |
 | `summary` | string | Optional. The result text when `data` is absent |
 | `data` | string or any JSON value | Optional. A non-string value is passed on serialized |
-| `attachments` | array of `{"media_type": <string>, "path": <string>}` | Optional. The images the call returns, checked as [Returning an image](#tool-attachments) describes. An entry that is not an object of two strings, or an `attachments` that is not an array, is refused `malformed` |
+| `attachments` | array of `{"media_type": <string>, "path": <string>}` | Optional. The images the call returns, checked as [Returning an image](#tool-attachments) describes. A single object in place of the array is read as a one-entry list. An entry that is not an object of two strings, and any other value that is not an array, is refused `malformed` |
 
 ```json
 {"status": "passed", "summary": "took a screenshot", "data": "saved shot.png",
@@ -319,7 +319,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-editor@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 2, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 2` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 3, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 3` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-editor@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with

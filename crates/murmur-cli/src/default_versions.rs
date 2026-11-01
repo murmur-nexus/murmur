@@ -381,8 +381,8 @@ mod tests {
         DefaultVersions::load(Some(path.to_str().unwrap())).unwrap()
     }
 
-    /// The committed release was built for WIT level 2, whose `murmur:tool` this mur no longer
-    /// serves: a WASM tool or driver it lists fits nothing until a level-3 release is published,
+    /// The committed release was built for WIT level 2, whose `murmur:tool@0.1.0` this mur does
+    /// not serve: a WASM tool or driver it lists fits nothing until a level-3 release is published,
     /// and the refusal names the package.
     #[test]
     fn the_committed_level_2_index_lists_no_wasm_artifact_this_mur_fits() {

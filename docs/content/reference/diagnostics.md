@@ -850,7 +850,7 @@ tool — refuses a version that does not fit before anything is written, as a to
 places the pull may use, or says none does:
 
 ```text
-does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 2, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 2 has murmur:tool-registry@0.1.0; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 2
+does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 3, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 3 has murmur:tool-registry@0.2.0; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 3
 ```
 
 | Situation | Hint |
@@ -868,12 +868,12 @@ At staging:
 The message names the artifact, the served level, and one clause per interface that does not fit:
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 2, the level this mur serves: it names murmur:tool/run@9.9.9, and level 2 has murmur:tool@0.1.0
-  hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 2; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
+error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 3, the level this mur serves: it names murmur:tool/run@9.9.9, and level 3 has murmur:tool@0.2.0
+  hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 3; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
 ```
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 2, the level this mur serves: it exports murmur:driver/process@0.3.0, and level 2 has murmur:driver@0.4.0
+error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 3, the level this mur serves: it exports murmur:driver/process@0.3.0, and level 3 has murmur:driver@0.4.0
 ```
 
 A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
@@ -894,11 +894,11 @@ served level. Finding it downloads no payload:
 | The artifact was installed from a file (`local/`) | `` local/<name> was installed from a file, so no source's index can name a version of it that fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file `` |
 
 ```text
-  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 2; pin it in murmur.yaml and run `mur install`, or run `mur install ana/process-driver@1.1.0`
-  hint: no version of ana/process-driver in github:ana/drivers's index fits level 2; rebuild it against level 2's packages (`mur version` lists them)
-  hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 2's packages (`mur version` lists them)
-  hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 2; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 2's packages (`mur version` lists them)
-  hint: local/process-driver was installed from a file, so no source's index can name a version of it that fits level 2; rebuild it against level 2's packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file
+  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 3; pin it in murmur.yaml and run `mur install`, or run `mur install ana/process-driver@1.1.0`
+  hint: no version of ana/process-driver in github:ana/drivers's index fits level 3; rebuild it against level 3's packages (`mur version` lists them)
+  hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 3's packages (`mur version` lists them)
+  hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 3; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 3's packages (`mur version` lists them)
+  hint: local/process-driver was installed from a file, so no source's index can name a version of it that fits level 3; rebuild it against level 3's packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file
 ```
 
 `mur doctor` lists every installed artifact that does not fit, under its
@@ -2611,7 +2611,7 @@ into the report.
 
 ```text
   installed:
-    ana/stale-hook@0.3.0   global    built at none (derived)   does not fit level 2
+    ana/stale-hook@0.3.0   global    built at none (derived)   does not fit level 3
   ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 ```
