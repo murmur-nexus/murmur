@@ -11,9 +11,9 @@ Current versions:
 | Package                  | Version  |
 | ------------------------ | -------- |
 | `murmur:hook`            | `0.9.0`  |
-| `murmur:tool`            | `0.1.0`  |
+| `murmur:tool`            | `0.2.0`  |
 | `murmur:capsule`         | `0.1.0`  |
-| `murmur:tool-registry`   | `0.1.0`  |
+| `murmur:tool-registry`   | `0.2.0`  |
 | `murmur:artifact-manager`| `0.1.0`  |
 | `murmur:shell`           | `0.1.0`  |
 | `murmur:message`         | `0.1.0`  |
@@ -372,6 +372,52 @@ that a driver sends either case: both are optional for a driver, as
 `tool-call-started` is, so nothing needs to declare them. Every other package
 stays where level 1 had it, so an artifact whose interfaces are all outside
 `murmur:driver` fits level 2 unchanged.
+
+`murmur:tool` then went to `0.2.0`, WIT level 3, when `tool-result` gained
+`attachments: list<attachment>`, with the new `record attachment { media-type:
+string, path: string }`. A tool names in it the image files it wrote into the
+work folder; the host checks each one's type and size, stores it beside the
+conversation, and shows it to the model. Before this, a tool's only channels
+back were text, so no model in a capsule could see a screenshot or a picture.
+The field is appended last, after `metadata`. Adding a field to an existing
+record is always a breaking change under the rule below: the canonical ABI lays
+the record out by position, so a host lifting the seven-field record cannot
+call a guest returning six, nor the reverse. Its instance name is now
+`murmur:tool/run@0.2.0`.
+
+`murmur:tool-registry` went to `0.2.0` in the same step, because its
+`invoke` returns `result<tool-result, string>` and that record changed shape:
+the same reasoning as the `murmur:conversation@0.2.0` and
+`murmur:runtime@0.4.0` moves beside `murmur:hook@0.9.0`. Its instance name is
+now `murmur:tool-registry/invoke@0.2.0`.
+
+`murmur:runtime-guest` and `murmur:host` did not move. Each is a package of
+worlds only: neither declares an interface, so its version is part of no
+instance name any component imports or exports, and no host lookup reads it.
+Their worlds were retargeted at `murmur:tool/run@0.2.0` and
+`murmur:tool-registry/invoke@0.2.0`, which changes what a component built from
+them carries, and that change is already recorded by the two bumps above. This
+is the same decision the `0.8.0` entry above records for a package that only
+`use`s another: the references move, the package does not.
+
+The cost was paid knowingly. The `driver` world exports `murmur:tool/run`, so
+every inference driver implements `tool-result` as well as every tool, and every
+script capsule imports `murmur:tool-registry/invoke`. Every WASM tool, driver
+and script capsule built for level 2 is refused at staging with
+`E-WIT-LEVEL-001` the moment `mur` upgrades: it does not fit WIT level 3, it
+exports `murmur:tool/run@0.1.0` or imports `murmur:tool-registry/invoke@0.1.0`,
+and level 3 has `murmur:tool@0.2.0` and `murmur:tool-registry@0.2.0`. That is
+every such artifact in the default-artifacts release current at the bump, until
+it publishes level-3 builds; hooks and process drivers name neither package and
+fit level 3 unchanged. One `@0.1.0` tool stays committed under
+`crates/murmur-cli/tests/fixtures/tool-v1/`, so the refusal stays testable.
+
+Nothing else was bundled with it. The image a tool returns is a file it names,
+not bytes in the record: the record stays small whatever the image weighs, and
+the host reads the file under the work folder's own rules. Media types beyond
+the four the host checks, and a placement hint for the driver, were declined:
+each would be a field nobody yet needs, and the next one is a breaking bump of
+its own.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

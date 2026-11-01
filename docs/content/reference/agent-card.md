@@ -96,7 +96,7 @@ Every key below is present on every card this runtime serves.
 | `capabilities` | object | See [`capabilities`](#capabilities) |
 | `securitySchemes` | object | `{}`, or the `bearer` scheme on an authenticated door — see [Security](#security) |
 | `securityRequirements` | array | `[]`, or one requirement on an authenticated door — see [Security](#security) |
-| `defaultInputModes` | array of strings | `["text/plain", "application/json"]`. The door reads text parts and data parts — see [Parts](#parts) |
+| `defaultInputModes` | array of strings | `["text/plain", "application/json"]`. The door reads text parts, data parts and image parts — see [Parts](#parts) |
 | `defaultOutputModes` | array of strings | `["text/plain", "application/json"]`. The door writes text parts, and data parts in a cancel's `residue` artifact |
 | `skills` | array of objects | See [`skills`](#skills). Empty under `lifecycle.task_acceptance: none` |
 
@@ -352,7 +352,8 @@ Inside the methods it serves, the door refuses these requests:
 
 | Request | Answer |
 |---|---|
-| A message with a `raw` or `url` file part | [`-32005`](#parts) |
+| A message with a `url` part, or a `raw` part that is not an image | [`-32005`](#parts) |
+| A message whose image part breaks a limit, continues a task, or reaches a capsule on `inference.transport: process` | [`-32602`](#image-parts) |
 | `SendStreamingMessage` or `SubscribeToTask` to a door that starts no task | [`-32004`](#capabilities) |
 | `SubscribeToTask` naming a task that has ended | [`-32004`](#subscribe-to-task) |
 | A message whose `taskId` names a task that is not in `TASK_STATE_INPUT_REQUIRED` | [`-32004`](#task-id) |
@@ -514,7 +515,7 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 | `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` or `TASK_STATE_CANCELED` |
 | `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | On the four push config methods, and on a message asking for push — see [Push notifications](#push-notifications) | `{}` |
 | `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, and on `SendStreamingMessage` and `SubscribeToTask` to a door that starts no task, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id). On `SubscribeToTask` naming a task that has ended | `taskId` and `state`, on a message or a `SubscribeToTask` naming a task |
-| `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | On a message carrying a `raw` or `url` part — see [Parts](#parts) | `partIndex`, the first file part's 0-based index; `mediaType`, when that part declared one |
+| `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | On a message carrying a `url` part, or a `raw` part that is not an image — see [Parts](#parts) | `partIndex`, the first refused part's 0-based index; `mediaType`, when that part declared one |
 | `-32006` | `InvalidAgentResponseError` | `INVALID_AGENT_RESPONSE` | Never | — |
 | `-32007` | `ExtendedAgentCardNotConfiguredError` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` | Never | — |
 | `-32008` | `ExtensionSupportRequiredError` | `EXTENSION_SUPPORT_REQUIRED` | Never | — |
@@ -533,7 +534,7 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 ```json
 {"jsonrpc": "2.0", "id": 4,
  "error": {"code": -32005,
-           "message": "message.parts[1] is a url part; this agent reads text and data parts only",
+           "message": "message.parts[1] is a url part; this agent reads text parts, data parts and image raw parts only",
            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                      "reason": "CONTENT_TYPE_NOT_SUPPORTED",
                      "domain": "a2a-protocol.org",
@@ -644,12 +645,13 @@ The checks run in this order, and the first failure answers:
    [`forgetSession`](#forget-session).
 7. A `configuration.returnImmediately` that is present, not `null` and not a boolean — see
    [Answers](#send-message-response).
-8. The first `raw` or `url` part: [`-32005`](#errors).
+8. The first `url` part, or `raw` part that is not an image: [`-32005`](#errors).
 9. A `configuration.taskPushNotificationConfig` that is present and not `null`:
    [`-32003`](#push-notifications).
 10. A `forgetSession: true` to a capsule not on `inference.transport: process`: `-32602`.
+11. The image parts, in order: see [Image parts](#image-parts).
 
-Steps 1 to 7 and 10 answer `-32602`. Every refusal comes before the door looks up a task or starts
+Steps 1 to 7, 10 and 11 answer `-32602`. Every refusal comes before the door looks up a task or starts
 one: a refused message starts no task, writes no trace record, reaches no model and delivers nothing
 to a waiting task. Unknown fields are ignored.
 
@@ -659,7 +661,8 @@ to a waiting task. Unknown fields are ignored.
 |---|---|---|
 | `{"text": "…"}` | Reads it, whatever its `mediaType` | The text |
 | `{"data": <any JSON>}` | Reads it, `null` included, whatever its `mediaType` | The value in a fenced block — see below |
-| `{"raw": "…"}`, `{"url": "…"}` | Refuses the message with `-32005` | Nothing |
+| `{"raw": "…"}` with `mediaType` `image/png`, `image/jpeg`, `image/gif` or `image/webp` | Checks it — see [Image parts](#image-parts) | An image after the message's text |
+| Any other `{"raw": "…"}`, and every `{"url": "…"}` | Refuses the message with `-32005` | Nothing |
 
 | Part field | The agent receives |
 |---|---|
@@ -690,6 +693,27 @@ has the whole text, fence included, wrapped in the [untrusted fence](untrusted-f
 
 Every text part the door writes has `mediaType` `text/plain`, and every data part
 `application/json`.
+
+#### Image parts { #image-parts }
+
+An image part is a `raw` part, its base64 bytes in `raw`, whose `mediaType` is `image/png`,
+`image/jpeg`, `image/gif` or `image/webp`. The agent receives each image after the message's text,
+in part order, stored and shown to the model as a tool's [returned image](wit-interfaces.md#tool-attachments)
+is. A message carrying only images starts a task.
+
+The door refuses the whole message with `-32602`, naming `message.parts[<i>]`, when an image part:
+
+| Refusal | Limit or rule |
+|---|---|
+| Its `raw` is not base64 | — |
+| Its bytes are not an image of its `mediaType` | The first bytes must be those of the declared type |
+| It is larger than the limit | [`context.images.max_bytes`](manifest.md#context-images) |
+| It is one image more than the limit | [`context.images.max_per_turn`](manifest.md#context-images) images per message |
+| Its message names a `taskId` | Images go on the message that starts a task |
+| The capsule runs on `inference.transport: process` | The harness takes no images from the door |
+
+The task's [`task_start`](observability-schemas.md#task-start-record) record lists each image under
+`attachments`.
 
 #### Continuing a task { #task-id }
 
@@ -1386,7 +1410,7 @@ door that declared `protocolVersion` `0.3` changes these:
 | `role: "user"`, `role: "agent"` | `ROLE_USER`, `ROLE_AGENT`. A message with `role: "user"` is refused |
 | `message/send` answering a bare task | `SendMessage` answering [`{"task": …}`](#send-message-response) |
 | A reply reaching whichever task waited for input | A reply names its task in [`taskId`](#task-id) |
-| A part with `kind`, and a file or data part skipped | A part sets one of `text`, `raw`, `url` or `data`. A data part is [read](#parts); a file part is refused with `-32005` |
+| A part with `kind`, and a file or data part skipped | A part sets one of `text`, `raw`, `url` or `data`. A data part is [read](#parts), and so is an [image part](#image-parts); any other file part is refused with `-32005` |
 | Artifacts without an id | Every artifact carries an [`artifactId`](#send-message-response) |
 | `tasks/get` without an `id` answering the active task | `GetTask` requires an [`id`](#tasks-get) |
 | `stream/watch` | [`murmur.WatchSession`](#watch-session) |

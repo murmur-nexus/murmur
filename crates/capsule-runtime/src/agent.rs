@@ -701,6 +701,152 @@ impl Continuation {
     }
 }
 
+/// The image store an attempt writes and renders through, opened into `slot` on first use.
+///
+/// `Err` carries why the conversation's context directory could not be opened; an image that
+/// meets it is refused `store_failed`, and a render that meets it shows each image as unavailable.
+fn image_store_for<'a>(
+    slot: &'a mut Option<crate::images::ImageStore>,
+    record: Option<&crate::conversation::ConversationRecord>,
+    records_root: &WorkdirRoot,
+) -> Result<&'a crate::images::ImageStore, String> {
+    if slot.is_none() {
+        *slot = Some(crate::images::ImageStore::open(
+            record.map(crate::conversation::ConversationRecord::dir),
+            records_root,
+        )?);
+    }
+    Ok(slot.as_ref().expect("set just above"))
+}
+
+/// Accept one tool call's `attachments` into `store`, or refuse every one `store_failed` when the
+/// store could not be opened.
+async fn accept_tool_attachments(
+    attachments: &[crate::bindings::host::murmur::tool::run::Attachment],
+    workdir: &WorkdirRoot,
+    limits: &murmur_artifact::ContextImagesConfig,
+    turn_images: &mut u32,
+    store: Result<&crate::images::ImageStore, String>,
+) -> crate::images::AcceptedAttachments {
+    let pairs = attachments
+        .iter()
+        .map(|attachment| (attachment.media_type.as_str(), attachment.path.as_str()));
+    match store {
+        Ok(store) => {
+            crate::images::accept_attachments(pairs, workdir, limits, turn_images, store).await
+        }
+        Err(reason) => {
+            let refusal = crate::images::ImageRefusal::StoreFailed(format!(
+                "the conversation's image store could not be opened: {reason}"
+            ));
+            let mut outcome = crate::images::AcceptedAttachments::default();
+            for (media_type, path) in pairs {
+                outcome
+                    .notes
+                    .push(crate::images::refusal_note(path, &refusal));
+                outcome.trace.push(crate::images::refused_trace_record(
+                    path, media_type, &refusal,
+                ));
+            }
+            outcome
+        }
+    }
+}
+
+/// Add each of a task's images after its first user message's text, storing it first. An image
+/// whose blob cannot be stored is replaced by its refusal note, named by its position among the
+/// task's images. An empty text block before the images is dropped.
+async fn attach_task_images(
+    task: &mut Value,
+    images: &[crate::images::CheckedImage],
+    store: Result<&crate::images::ImageStore, String>,
+) {
+    let Some(content) = task.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    content.retain(|block| block.get("text").and_then(Value::as_str) != Some(""));
+    for (index, image) in images.iter().enumerate() {
+        let stored = match &store {
+            Ok(store) => store.put(image).await,
+            Err(reason) => Err(crate::images::ImageRefusal::StoreFailed(reason.clone())),
+        };
+        content.push(match stored {
+            Ok(()) => image.record_block(),
+            Err(refusal) => json!({
+                "type": "text",
+                "text": crate::images::refusal_note(&format!("image {}", index + 1), &refusal),
+            }),
+        });
+    }
+}
+
+/// The door's view of each image a tool call returned: indexed under `task_id` so the door serves
+/// its bytes, and listed for the call's `artifact` frame. Empty without a task or an image.
+fn index_attachments(
+    store_state: &CapsuleStoreState,
+    task_id: Option<&str>,
+    images: &[crate::images::CheckedImage],
+    store: Option<&crate::images::ImageStore>,
+) -> Vec<crate::streaming::StreamAttachment> {
+    let (Some(task_id), Some(store)) = (task_id, store) else {
+        return Vec::new();
+    };
+    if images.is_empty() {
+        return Vec::new();
+    }
+    if let Some(registry) = &store_state.a2a_task_registry {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for image in images {
+            registry.index_attachment(
+                task_id,
+                &image.sha256,
+                &image.media_type,
+                store.blob_path(&image.sha256),
+            );
+        }
+    }
+    images
+        .iter()
+        .map(|image| crate::streaming::StreamAttachment {
+            media_type: image.media_type.clone(),
+            size_bytes: image.len(),
+            sha256: image.sha256.clone(),
+            url: format!(
+                "{}{task_id}/{}",
+                crate::identity::ATTACHMENT_PATH_PREFIX,
+                image.sha256
+            ),
+        })
+        .collect()
+}
+
+/// The payload the driver is handed for one call when it differs from `payload_json`, or `None`
+/// when it does not.
+///
+/// While `images_in_context` is false this returns `None` and builds nothing, so the driver gets
+/// `payload_json` byte for byte. Otherwise it renders `messages` for the driver
+/// ([`crate::images::render_for_driver`], keeping `keep` images) and builds the call again through
+/// `build` from the rendered list. A store that cannot be opened renders every image unavailable
+/// rather than failing the call.
+pub(crate) fn rendered_driver_payload<'s>(
+    images_in_context: bool,
+    messages: &[Value],
+    keep: u32,
+    store: impl FnOnce() -> Result<&'s crate::images::ImageStore, String>,
+    build: impl FnOnce(&[Value]) -> Value,
+) -> Option<String> {
+    if !images_in_context {
+        return None;
+    }
+    let rendered = match store() {
+        Ok(store) => crate::images::render_for_driver(messages, keep, store),
+        Err(_) => crate::images::render_unavailable(messages, keep),
+    };
+    serde_json::to_string(&build(&rendered)).ok()
+}
+
 /// A user message carrying task text, fenced on the task's own provenance and labelled with the
 /// fence source when it was wrapped.
 ///
@@ -782,8 +928,9 @@ pub(crate) async fn run_agent_loop(
     // A fresh attempt with nothing to say fails before either transport starts: the http path
     // would otherwise load history, which may compact through the driver, and then send an empty
     // user message. The raw text is checked, because an untrusted task's fence is never empty.
-    let blank_task =
-        continuation.is_none() && fresh_task_text(&store_state.runtime_root).trim().is_empty();
+    let blank_task = continuation.is_none()
+        && store_state.current_task_images.is_empty()
+        && fresh_task_text(&store_state.runtime_root).trim().is_empty();
     // The attempt-start checkpoint, on both transports: a `task.md` that is a link reads as blank
     // and is refused, and the refusal, not the blank task, is what ends the attempt.
     if let Some((error, reason)) = fail_on_workdir_refusals(store_state, trace).await {
@@ -991,6 +1138,13 @@ pub(crate) async fn run_agent_loop(
     // and is read by nothing else.
     let mut session_tokens = SessionOccupancy::estimate(0);
 
+    // Whether any message in the context holds an image block in record form. While it is false
+    // the driver is handed `payload_json` exactly; it is set only where such a block enters the
+    // context: an accepted attachment, an A2A image, a threaded reload, or a hook's commit.
+    let mut images_in_context = false;
+    // Opened on the first image this attempt stores or renders, and not before.
+    let mut image_store: Option<crate::images::ImageStore> = None;
+
     // The task's own message list, worked on in place for the whole attempt: every way out of
     // this function leaves it as it stood, which is what a reopened attempt continues from.
     // `reported` travels with it, so a continued attempt measures only what it adds.
@@ -1023,6 +1177,7 @@ pub(crate) async fn run_agent_loop(
                 reported,
                 load_recorded_history(record.as_mut(), &mode, resume.is_some()),
             );
+            images_in_context |= crate::images::has_file_image(messages);
 
             // `--resume-mode compact`: the same hook, the same commit site and the same record
             // rules the per-turn threshold trigger uses, reached from a second place — as the
@@ -1058,6 +1213,9 @@ pub(crate) async fn run_agent_loop(
                 match compacted {
                     Ok(outcome) => {
                         compaction_committed |= outcome == CompactionOutcome::Committed;
+                        if outcome == CompactionOutcome::Committed {
+                            images_in_context = crate::images::has_file_image(messages);
+                        }
                     }
                     Err(CompactionFailure::Hook(text)) => {
                         return Err(RuntimeError::AgentLoopFailed(text))
@@ -1078,10 +1236,19 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            let task = task_user_message(
+            let mut task = task_user_message(
                 store_state.current_task_provenance,
                 fresh_task_text(&store_state.runtime_root),
             );
+            if !store_state.current_task_images.is_empty() {
+                attach_task_images(
+                    &mut task,
+                    &store_state.current_task_images,
+                    image_store_for(&mut image_store, record.as_ref(), &records_root),
+                )
+                .await;
+                images_in_context = true;
+            }
             append_to_record(record.as_mut(), std::slice::from_ref(&task));
             messages.push(task.clone());
             *task_message = Some(task);
@@ -1105,6 +1272,7 @@ pub(crate) async fn run_agent_loop(
                     record.as_mut(),
                 )
                 .await;
+                images_in_context |= crate::images::has_file_image(messages);
             }
         }
     }
@@ -1313,6 +1481,30 @@ pub(crate) async fn run_agent_loop(
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
             RuntimeError::AgentLoopFailed(format!("failed to encode driver payload: {e}"))
         })?;
+        // What the driver is handed instead of `payload_json` once an image is in the context:
+        // the same call with each image's reference rendered for the driver. The estimate, the
+        // spend admission, the trace and the occupancy count all keep reading the reference form.
+        let image_slot = &mut image_store;
+        let record_ref = record.as_ref();
+        let records_ref = &records_root;
+        let driver_json = rendered_driver_payload(
+            images_in_context,
+            messages,
+            store_state.image_limits.keep,
+            move || image_store_for(image_slot, record_ref, records_ref),
+            |rendered| {
+                build_call_payload(
+                    &choice.model,
+                    max_output_tokens,
+                    rendered,
+                    tools,
+                    &augmented_system,
+                    active_continuation,
+                    Some(prompt_cache_key.as_str()),
+                    view.as_ref(),
+                )
+            },
+        );
 
         // The request's estimate always measures the full logical `messages` array, never the
         // (possibly smaller) incremental wire payload, so it is the same whether or not a
@@ -1435,7 +1627,9 @@ pub(crate) async fn run_agent_loop(
                         dispatched = store_state.dispatch_driver_async(
                             &choice,
                             ToolInput {
-                                data: Some(payload_json.clone()),
+                                data: Some(
+                                    driver_json.clone().unwrap_or_else(|| payload_json.clone()),
+                                ),
                                 log_path: None,
                             },
                         ) => Some(dispatched),
@@ -1446,7 +1640,9 @@ pub(crate) async fn run_agent_loop(
                         .dispatch_driver_async(
                             &choice,
                             ToolInput {
-                                data: Some(payload_json.clone()),
+                                data: Some(
+                                    driver_json.clone().unwrap_or_else(|| payload_json.clone()),
+                                ),
                                 log_path: None,
                             },
                         )
@@ -1903,6 +2099,7 @@ pub(crate) async fn run_agent_loop(
             .await;
             if compacted == Ok(CompactionOutcome::Committed) {
                 compaction_committed = true;
+                images_in_context = crate::images::has_file_image(messages);
             }
             // A declared compaction hook that returned `Err` ends the session the
             // same way a driver inference error does — there is no fallback
@@ -1982,6 +2179,9 @@ pub(crate) async fn run_agent_loop(
                 }
 
                 let mut tool_messages = Vec::new();
+                // Images accepted from this turn's tool calls so far, against
+                // `context.images.max_per_turn`.
+                let mut turn_images = 0u32;
 
                 for block in tool_blocks {
                     let tool_call_id = block
@@ -2076,7 +2276,7 @@ pub(crate) async fn run_agent_loop(
                             })?;
                         }
                     }
-                    let (is_error, text, fence_source) = match dispatched {
+                    let (is_error, text, fence_source, image_blocks) = match dispatched {
                         Ok(mut outcome) => {
                             // Taken before the result is consumed below; acted on at the end of
                             // this arm so the failed call is traced and hooked like any other
@@ -2091,11 +2291,39 @@ pub(crate) async fn run_agent_loop(
                             let state_effect = extract_state_effect(&outcome.result.metadata);
                             let resource_id = extract_resource_id(&outcome.result.metadata);
                             let truncated = outcome.result.truncated;
-                            let text = outcome
+                            let attachments = std::mem::take(&mut outcome.result.attachments);
+                            let mut text = outcome
                                 .result
                                 .data
                                 .or(outcome.result.summary)
                                 .unwrap_or_else(|| "tool returned no data".to_string());
+                            // Accepted before the result is observed, so the hook, the trace,
+                            // the frame and the message all see the same notes and images. A
+                            // refusal's note goes after the fence's closing marker, like a
+                            // `runtime_note`, and never changes the call's status.
+                            let accepted = if attachments.is_empty() {
+                                crate::images::AcceptedAttachments::default()
+                            } else {
+                                accept_tool_attachments(
+                                    &attachments,
+                                    accessible_workdir,
+                                    &store_state.image_limits,
+                                    &mut turn_images,
+                                    image_store_for(
+                                        &mut image_store,
+                                        record.as_ref(),
+                                        &records_root,
+                                    ),
+                                )
+                                .await
+                            };
+                            for note in &accepted.notes {
+                                text.push('\n');
+                                text.push_str(note);
+                            }
+                            if !accepted.images.is_empty() {
+                                images_in_context = true;
+                            }
                             let status = if is_error { "error" } else { "ok" }.to_string();
                             let duration_ms =
                                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -2133,7 +2361,7 @@ pub(crate) async fn run_agent_loop(
                                     })?;
                             } else {
                                 trace
-                                    .write_tool_call(
+                                    .write_tool_call_with_attachments(
                                         turn_u32,
                                         tool_name.clone(),
                                         Some(tool_call_id.clone()),
@@ -2146,6 +2374,7 @@ pub(crate) async fn run_agent_loop(
                                         state_effect.clone(),
                                         resource_id.clone(),
                                         outcome.runtime_error.as_deref(),
+                                        accepted.trace.clone(),
                                     )
                                     .await
                                     .map_err(|e| {
@@ -2211,21 +2440,31 @@ pub(crate) async fn run_agent_loop(
                             if let Some(detached) = outcome.detached {
                                 record_demotion(trace, turn_u32, &detached).await;
                             }
+                            // The door serves each accepted image for the task the frame names.
+                            let stream_attachments = index_attachments(
+                                store_state,
+                                task_id.as_deref(),
+                                &accepted.images,
+                                image_store.as_ref(),
+                            );
                             // Emit artifact event after tool call returns
                             if let Some(task) = &stream_task {
                                 emit_frame(
                                     &sse,
                                     task,
-                                    MurmurFrame::Artifact(StreamArtifact::tool_call(
-                                        tool_name.clone(),
-                                        text.clone(),
-                                        fence_source.clone(),
-                                        &tool_call_id,
-                                        is_error,
-                                        duration_ms,
-                                        exit_code,
-                                        truncated,
-                                    )),
+                                    MurmurFrame::Artifact(
+                                        StreamArtifact::tool_call(
+                                            tool_name.clone(),
+                                            text.clone(),
+                                            fence_source.clone(),
+                                            &tool_call_id,
+                                            is_error,
+                                            duration_ms,
+                                            exit_code,
+                                            truncated,
+                                        )
+                                        .with_attachments(stream_attachments),
+                                    ),
                                 );
                             }
                             // A session-fatal dispatch failure ends the run here rather than
@@ -2239,7 +2478,7 @@ pub(crate) async fn run_agent_loop(
                             if let Some(fatal) = fatal {
                                 return Err(fatal);
                             }
-                            (is_error, text, fence_source)
+                            (is_error, text, fence_source, accepted.blocks)
                         }
                         Err(error) => {
                             let duration_ms =
@@ -2311,16 +2550,20 @@ pub(crate) async fn run_agent_loop(
                                     )),
                                 );
                             }
-                            (true, error, None)
+                            (true, error, None, Vec::new())
                         }
                     };
 
+                    // Each accepted image follows the result's text, in the order the call named
+                    // it, in record form.
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    content.extend(image_blocks);
                     tool_messages.push(with_fence_source(
                         with_new_id(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "is_error": is_error,
-                            "content": [{"type": "text", "text": text}],
+                            "content": content,
                         })),
                         fence_source,
                     ));
@@ -5487,6 +5730,44 @@ fn extract_text_content(content: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While no image is in the context the driver is handed `payload_json` itself, byte for byte:
+    /// nothing is rendered and no store is opened. Once one is, the image's reference is rendered.
+    #[test]
+    fn the_driver_gets_payload_json_exactly_while_no_image_is_in_the_context() {
+        let messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "task"}]}),
+            json!({"role": "tool", "content": [
+                {"type": "text", "text": "result"},
+                {"type": "image", "source": {"type": "file", "sha256": "a".repeat(64),
+                    "media_type": "image/png", "bytes": 4}}
+            ]}),
+        ];
+        let build = |messages: &[Value]| json!({"model": "m", "messages": messages});
+        let payload_json = serde_json::to_string(&build(&messages)).unwrap();
+
+        let mut opened = false;
+        let driver = rendered_driver_payload(
+            false,
+            &messages,
+            5,
+            || {
+                opened = true;
+                Err("not opened".to_string())
+            },
+            build,
+        );
+        assert_eq!(driver, None);
+        assert!(!opened, "no store is opened while the flag is false");
+        let handed = driver.unwrap_or_else(|| payload_json.clone());
+        assert_eq!(handed.as_bytes(), payload_json.as_bytes());
+
+        let rendered =
+            rendered_driver_payload(true, &messages, 5, || Err("no store".to_string()), build)
+                .unwrap();
+        assert_ne!(rendered, payload_json);
+        assert!(rendered.contains("[image unavailable: image/png, 4 bytes, sha256 aaaa"));
+    }
 
     /// The output cap the payload and occupancy tests build with.
     const OUTPUT_CAP: u32 = 8192;

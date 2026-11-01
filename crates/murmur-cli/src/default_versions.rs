@@ -218,14 +218,14 @@ mod tests {
         DefaultVersions::load(Some(path.to_str().unwrap())).unwrap()
     }
 
-    /// `murmur:stream/events@0.1.0` and `murmur:tool/run@0.1.0`, which this mur serves.
-    const SERVED: [&str; 2] = ["murmur:stream/events@0.1.0", "murmur:tool/run@0.1.0"];
+    /// `murmur:stream/events@0.1.0` and `murmur:tool/run@0.2.0`, which this mur serves.
+    const SERVED: [&str; 2] = ["murmur:stream/events@0.1.0", "murmur:tool/run@0.2.0"];
 
     /// [`SERVED`] and a package version this mur does not serve, sorted.
     const UNSERVED: [&str; 3] = [
         "murmur:driver/process@9.9.9",
         "murmur:stream/events@0.1.0",
-        "murmur:tool/run@0.1.0",
+        "murmur:tool/run@0.2.0",
     ];
 
     fn version(
@@ -357,9 +357,50 @@ mod tests {
         );
     }
 
+    /// [`committed_index`] with every `murmur:tool/run` and `murmur:tool-registry/invoke`
+    /// interface moved to the version WIT level 3 serves: the index a release built for level 3
+    /// publishes.
+    fn level_3_index() -> DefaultVersions {
+        let committed = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/published-index/artifacts-index.json"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifacts-index.json");
+        std::fs::write(
+            &path,
+            committed
+                .replace("murmur:tool/run@0.1.0", "murmur:tool/run@0.2.0")
+                .replace(
+                    "murmur:tool-registry/invoke@0.1.0",
+                    "murmur:tool-registry/invoke@0.2.0",
+                ),
+        )
+        .unwrap();
+        DefaultVersions::load(Some(path.to_str().unwrap())).unwrap()
+    }
+
+    /// The committed release was built for WIT level 2, whose `murmur:tool@0.1.0` this mur does
+    /// not serve: a WASM tool or driver it lists fits nothing until a level-3 release is published,
+    /// and the refusal names the package.
+    #[test]
+    fn the_committed_level_2_index_lists_no_wasm_artifact_this_mur_fits() {
+        let index = committed_index();
+        for full_name in ["murmur/tool-editor", "murmur/driver-anthropic"] {
+            let error = index.newest_fitting(full_name).unwrap_err();
+            assert_eq!(error.code, E_NEW_007, "{full_name}");
+            assert!(
+                error.message.contains("this mur serves murmur:tool@0.2.0"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     fn the_committed_index_names_the_versions_it_lists() {
-        let index = committed_index();
+        let index = level_3_index();
         for (full_name, expected) in [
             ("murmur/tool-registry-search", "0.2.0"),
             ("murmur/tool-editor", "0.6.0"),

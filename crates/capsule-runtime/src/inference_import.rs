@@ -749,7 +749,7 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
 pub(crate) mod test_support {
     use wasmtime::component::Component;
 
-    /// A hand-authored `murmur:tool/run@0.1.0` component double standing in for
+    /// A hand-authored `murmur:tool/run@0.2.0` component double standing in for
     /// an inference driver: it ignores its input entirely and returns `response`
     /// as the `tool-result.data` string with the given `status`.
     ///
@@ -758,7 +758,8 @@ pub(crate) mod test_support {
     /// lifecycle doubles. `run`'s result exceeds one flat value, so the core
     /// function returns an i32 pointer to a `tool-result` it lays out by hand;
     /// the offsets below are the canonical ABI's (record align 4: `status` 0,
-    /// `summary` 4, `data` 16, `data-path` 28, `truncated` 40, `metadata` 44).
+    /// `summary` 4, `data` 16, `data-path` 28, `truncated` 40, `metadata` 44,
+    /// `attachments` 52).
     pub(crate) fn driver_double(
         engine: &wasmtime::Engine,
         status: u32,
@@ -767,15 +768,15 @@ pub(crate) mod test_support {
         driver_double_with_metadata(engine, status, response, &[])
     }
 
-    /// A `murmur:tool/run@0.1.0` component whose `run` executes `unreachable`: a driver that
+    /// A `murmur:tool/run@0.2.0` component whose `run` executes `unreachable`: a driver that
     /// traps on every call.
     pub(crate) fn trapping_driver_double(engine: &wasmtime::Engine) -> Component {
         bare_driver_double(engine, "unreachable")
     }
 
-    /// A `murmur:tool/run@0.1.0` component whose `run` answers `status: passed` with neither
+    /// A `murmur:tool/run@0.2.0` component whose `run` answers `status: passed` with neither
     /// `data` nor `summary`. The result is the zeroed memory at offset 128, which the canonical
-    /// ABI reads as `passed`, every option `none`, and an empty `metadata` list.
+    /// ABI reads as `passed`, every option `none`, and empty `metadata` and `attachments` lists.
     pub(crate) fn no_data_driver_double(engine: &wasmtime::Engine) -> Component {
         bare_driver_double(engine, "(i32.const 128)")
     }
@@ -800,22 +801,27 @@ pub(crate) mod test_support {
   (type $tool-input (record
     (field "data" (option string))
     (field "log-path" (option string))))
+  (type $attachment (record
+    (field "media-type" string)
+    (field "path" string)))
   (type $tool-result (record
     (field "status" $status)
     (field "summary" (option string))
     (field "data" (option string))
     (field "data-path" (option string))
     (field "truncated" bool)
-    (field "metadata" (list (tuple string string)))))
+    (field "metadata" (list (tuple string string)))
+    (field "attachments" (list $attachment))))
   (type $ft (func (param "input" $tool-input) (result $tool-result)))
   (func $run (type $ft)
     (canon lift (core func $i "run") (memory $mem) (realloc $realloc) string-encoding=utf8))
   (instance $ti
     (export "status" (type $status))
     (export "tool-input" (type $tool-input))
+    (export "attachment" (type $attachment))
     (export "tool-result" (type $tool-result))
     (export "run" (func $run)))
-  (export "murmur:tool/run@0.1.0" (instance $ti))
+  (export "murmur:tool/run@0.2.0" (instance $ti))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("bare driver double WAT parses");
@@ -891,6 +897,8 @@ pub(crate) mod test_support {
       (i32.store8 (i32.const 168) (i32.const 0))
       (i32.store  (i32.const 172) (i32.const 0))
       (i32.store  (i32.const 176) (i32.const 0))
+      (i32.store  (i32.const 180) (i32.const 0))
+      (i32.store  (i32.const 184) (i32.const 0))
       (i32.const 128))
     (data (i32.const 2048) "{marker_data}")
     (data (i32.const {before_at}) "{before_data}")
@@ -904,22 +912,27 @@ pub(crate) mod test_support {
   (type $tool-input (record
     (field "data" (option string))
     (field "log-path" (option string))))
+  (type $attachment (record
+    (field "media-type" string)
+    (field "path" string)))
   (type $tool-result (record
     (field "status" $status)
     (field "summary" (option string))
     (field "data" (option string))
     (field "data-path" (option string))
     (field "truncated" bool)
-    (field "metadata" (list (tuple string string)))))
+    (field "metadata" (list (tuple string string)))
+    (field "attachments" (list $attachment))))
   (type $ft (func (param "input" $tool-input) (result $tool-result)))
   (func $run (type $ft)
     (canon lift (core func $i "run") (memory $mem) (realloc $realloc) string-encoding=utf8))
   (instance $ti
     (export "status" (type $status))
     (export "tool-input" (type $tool-input))
+    (export "attachment" (type $attachment))
     (export "tool-result" (type $tool-result))
     (export "run" (func $run)))
-  (export "murmur:tool/run@0.1.0" (instance $ti))
+  (export "murmur:tool/run@0.2.0" (instance $ti))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("switching driver double WAT parses");
@@ -989,6 +1002,8 @@ pub(crate) mod test_support {
       (i32.store8 (i32.const 168) (i32.const 0))
       (i32.store  (i32.const 172) (i32.const {metadata_ptr}))
       (i32.store  (i32.const 176) (i32.const {metadata_len}))
+      (i32.store  (i32.const 180) (i32.const 0))
+      (i32.store  (i32.const 184) (i32.const 0))
 {metadata_stores}      (i32.const 128))
     (data (i32.const 4096) "{escaped}")
 {metadata_data}
@@ -1001,22 +1016,27 @@ pub(crate) mod test_support {
   (type $tool-input (record
     (field "data" (option string))
     (field "log-path" (option string))))
+  (type $attachment (record
+    (field "media-type" string)
+    (field "path" string)))
   (type $tool-result (record
     (field "status" $status)
     (field "summary" (option string))
     (field "data" (option string))
     (field "data-path" (option string))
     (field "truncated" bool)
-    (field "metadata" (list (tuple string string)))))
+    (field "metadata" (list (tuple string string)))
+    (field "attachments" (list $attachment))))
   (type $ft (func (param "input" $tool-input) (result $tool-result)))
   (func $run (type $ft)
     (canon lift (core func $i "run") (memory $mem) (realloc $realloc) string-encoding=utf8))
   (instance $ti
     (export "status" (type $status))
     (export "tool-input" (type $tool-input))
+    (export "attachment" (type $attachment))
     (export "tool-result" (type $tool-result))
     (export "run" (func $run)))
-  (export "murmur:tool/run@0.1.0" (instance $ti))
+  (export "murmur:tool/run@0.2.0" (instance $ti))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("driver double WAT parses");

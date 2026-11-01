@@ -201,6 +201,21 @@ fn level_interface(level: &WitLevel, package: &str, interface: &str) -> Option<S
         .map(|version| format!("{package}/{interface}@{version}"))
 }
 
+/// Refuses a WASM tool, driver or script capsule whose `murmur:*` exports and imports do not all
+/// fit `level`, with [`RuntimeError::WitLevelMismatch`] naming each one that does not. A component
+/// built for an earlier level would otherwise stage and fail on its first call.
+pub(crate) fn check_component_level(
+    name: &str,
+    version: &str,
+    contracts: WitContracts,
+    level: &WitLevel,
+) -> Result<(), RuntimeError> {
+    match level_mismatch(name, version, level, contracts.exports, contracts.imports) {
+        Some(mismatch) => Err(mismatch),
+        None => Ok(()),
+    }
+}
+
 /// [`RuntimeError::WitLevelMismatch`] for the refused names among `exports` and `imports` that do
 /// not fit `level`, or `None` when every one of them does.
 fn level_mismatch(
@@ -659,7 +674,7 @@ mod tests {
 
     #[test]
     fn process_driver_interface_process_transport_refuses_a_tool_export() {
-        let c = contracts(&["murmur:tool/run@0.1.0"]);
+        let c = contracts(&["murmur:tool/run@0.2.0"]);
         let err = check_driver_interface("process", "d", "1.0.0", Some(&c), served()).unwrap_err();
         match &err {
             RuntimeError::ProcessDriverInterfaceMissing { expected, .. } => {
@@ -749,13 +764,13 @@ mod tests {
 
     #[test]
     fn process_driver_interface_http_transport_accepts_a_tool_export() {
-        let c = contracts(&["murmur:tool/run@0.1.0"]);
+        let c = contracts(&["murmur:tool/run@0.2.0"]);
         assert!(check_driver_interface("http", "d", "1.0.0", Some(&c), served()).is_ok());
     }
 
     fn importing(imports: &[&str]) -> WitContracts {
         WitContracts {
-            exports: vec!["murmur:tool/run@0.1.0".to_string()],
+            exports: vec!["murmur:tool/run@0.2.0".to_string()],
             imports: imports.iter().map(|i| i.to_string()).collect(),
         }
     }
@@ -786,7 +801,7 @@ mod tests {
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(
             message.contains(
-                "it imports murmur:text/chunks@0.1.0, and level 2 has no version of murmur:text"
+                "it imports murmur:text/chunks@0.1.0, and level 3 has no version of murmur:text"
             ),
             "{message}"
         );

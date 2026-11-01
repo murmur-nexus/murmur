@@ -55,7 +55,7 @@ my-tool/
 Create `my-tool/wit/tool.wit`:
 
 ```wit
-package murmur:tool@0.1.0;
+package murmur:tool@0.2.0;
 
 interface run {
   enum status {
@@ -69,6 +69,11 @@ interface run {
     log-path: option<string>,
   }
 
+  record attachment {
+    media-type: string,
+    path: string,
+  }
+
   record tool-result {
     status: status,
     summary: option<string>,
@@ -76,6 +81,7 @@ interface run {
     data-path: option<string>,
     truncated: bool,
     metadata: list<tuple<string, string>>,
+    attachments: list<attachment>,
   }
 
   run: func(input: tool-input) -> tool-result;
@@ -90,7 +96,7 @@ Notes:
 
 - Keep only this file in the `wit/` directory for this quickstart.
 - Pass the `wit/` directory to `--wit-path`.
-- The `@0.1.0` on the `package` line matches the version the host's `murmur:tool`
+- The `@0.2.0` on the `package` line matches the version the host's `murmur:tool`
   WIT ships (see [WIT Interfaces](../reference/wit-interfaces.md)). The host
   resolves a tool's `murmur:tool/run` export by versioned name and nothing else,
   so an unversioned `package murmur:tool;` fails to load. Always pin the version.
@@ -132,6 +138,7 @@ class Run(exports.Run):
                 data_path=None,
                 truncated=False,
                 metadata=[],
+                attachments=[],
             )
         except OSError as e:
             return run.ToolResult(
@@ -141,6 +148,7 @@ class Run(exports.Run):
                 data_path=None,
                 truncated=False,
                 metadata=[],
+                attachments=[],
             )
 ```
 
@@ -149,6 +157,8 @@ Key points:
 - Class name must be `Run`
 - Method must be `run(self, input)` and return `ToolResult`
 - On failures, return `status = error` rather than crashing
+- `attachments` lists image files the tool wrote into the work folder for the model to see; an
+  empty list returns none. See [Returning an image](../reference/wit-interfaces.md#tool-attachments)
 
 ---
 

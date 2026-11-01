@@ -210,10 +210,32 @@ fn store_key(scratch: &Scratch, step: &str, key_var: &str) {
     assert!(!set.stdout.contains(TEST_KEY) && !set.stderr.contains(TEST_KEY));
 }
 
-/// The committed verbatim copy of a default-artifacts release's index.
+/// The committed verbatim copy of a default-artifacts release's index, with every
+/// `murmur:tool/run` and `murmur:tool-registry/invoke` interface moved to the version WIT level 3
+/// serves: the index a release built for level 3 publishes. The release it copies was built for
+/// level 2, so read as committed it lists no driver this mur fits.
 fn committed_index() -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/published-index/artifacts-index.json")
+    static LEVEL_3: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    LEVEL_3
+        .get_or_init(|| {
+            let committed = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/published-index/artifacts-index.json"),
+            )
+            .unwrap();
+            let rebuilt = committed
+                .replace("murmur:tool/run@0.1.0", "murmur:tool/run@0.2.0")
+                .replace(
+                    "murmur:tool-registry/invoke@0.1.0",
+                    "murmur:tool-registry/invoke@0.2.0",
+                );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("artifacts-index.json");
+            std::fs::write(&path, rebuilt).unwrap();
+            // Held for the process: every test in it reads this one file.
+            std::mem::forget(dir);
+            path
+        })
         .display()
         .to_string()
 }
@@ -1382,10 +1404,10 @@ const MURMUR_OWNER_ID: u64 = 190_196_424;
 
 /// An interface list naming a package version this mur does not serve, sorted.
 const UNSERVED: &str =
-    r#"["murmur:driver/process@9.9.9", "murmur:stream/events@0.1.0", "murmur:tool/run@0.1.0"]"#;
+    r#"["murmur:driver/process@9.9.9", "murmur:stream/events@0.1.0", "murmur:tool/run@0.2.0"]"#;
 
 /// Interfaces this mur serves.
-const SERVED: &str = r#"["murmur:stream/events@0.1.0", "murmur:tool/run@0.1.0"]"#;
+const SERVED: &str = r#"["murmur:stream/events@0.1.0", "murmur:tool/run@0.2.0"]"#;
 
 /// A schema 2 index of `scope` listing `name` at each `(version, interfaces)`, newest first.
 fn index_json(scope: &str, name: &str, versions: &[(&str, &str)]) -> String {

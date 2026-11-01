@@ -234,6 +234,7 @@ pub(crate) fn demotion_tool_result(
         data_path: None,
         truncated: false,
         metadata: vec![("work_id".to_string(), work_id.to_string())],
+        attachments: Vec::new(),
     }
 }
 

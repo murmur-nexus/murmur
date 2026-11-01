@@ -607,7 +607,7 @@ mur build [source] [--output <path-or-dir>]
 
 ```bash
 mur build .
-# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 2)
+# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 3)
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
@@ -946,8 +946,8 @@ Example output (`mur list -g --contract murmur:tool`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
-murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.1.0
-murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.1.0
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.2.0
+murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.2.0
 ```
 
 ---
@@ -1316,17 +1316,17 @@ payload. The check never writes to either store.
 
 ```text
 WIT level
-  this mur serves WIT level 2:
+  this mur serves WIT level 3:
     PACKAGE                  VERSION
     murmur:artifact-manager  0.1.0
     murmur:capsule           0.1.0
     ...
-    murmur:tool-registry     0.1.0
+    murmur:tool-registry     0.2.0
 
   installed:
-    local/built-tool@0.1.0   global    built at 2                fits level 2
-    local/notes@0.1.0        global    built at 2 (derived)      fits level 2
-    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 2
+    local/built-tool@0.1.0   global    built at 3                fits level 3
+    local/notes@0.1.0        global    built at 3 (derived)      fits level 3
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 3
   ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
@@ -1443,7 +1443,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`). The resolved value is the one [`W-SEC-024`](diagnostics.md#w-sec-024) reports, so `--explain-scope` previews the warning this override produces; a value outside the two is refused there as on a real run |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
-| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the work folder in a `Runtime writes` block — the line `paths are relative to the work folder`, then `- peer-in (directory, peer-fetch)` and `- out (directory, script-session)` — and as `runtime_writes` under `--json`; see [What the capsule changed](workdir.md#what-the-capsule-changed). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
+| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the work folder in a `Runtime writes` block — the line `paths are relative to the work folder`, then `- peer-in (directory, peer-fetch)` and `- out (directory, script-session)` — and as `runtime_writes` under `--json`; see [What the capsule changed](workdir.md#what-the-capsule-changed). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary`. An `Images` block reports the [`context.images`](manifest.md#context-images) limits, as `images` under `--json` — see [The Images block](#explain-scope-images) |
 | `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Under `--capsule` the manifest checked is the one inside the artifact, so an installed capsule with no `inference:` block fails the same way. With `--roster`, the formation's one deadline, counted from the launcher's start |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The files [`inference.instruction_files`](manifest.md#inference-instruction-files) lists are still appended after it. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Inert under `--explain-scope`. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
 
@@ -1533,6 +1533,32 @@ Current runtime constraints:
   - otherwise requires exactly one root `*.wasm`
   - under `--capsule`, the root component of the artifact archive, with no project directory searched
 - Agent capsules require `inference.driver.artifact` in `murmur.yaml` on both transports: an [http driver](manifest.md#transport-http) under `transport: http`, a [process driver](manifest.md#process-driver) under `transport: process`. A missing driver exits with `error[E-RUN-005]`; a `transport: process` harness binary that cannot be resolved exits with `error[E-RUN-006]`
+
+### The Images block { #explain-scope-images }
+
+`mur run --explain-scope` prints the [`context.images`](manifest.md#context-images) limits the
+session applies:
+
+```text
+Images
+  max_bytes:     5242880
+  keep:          5
+  max_per_turn:  5
+```
+
+Under `transport: process` the harness holds the conversation, so `keep` and `max_per_turn` do
+nothing there, and the block says so:
+
+```text
+Images
+  max_bytes:     5242880
+  keep:          5 (does nothing here: the harness holds the conversation)
+  max_per_turn:  5 (does nothing here: the harness holds the conversation)
+```
+
+`--json` carries the same facts as `images`: `{"keep", "max_bytes", "max_per_turn", "keep_applies"}`,
+with `keep_applies` `false` under `transport: process`. The launch writes the same object into
+`session_start.effective_grants`.
 
 ### Status and exit code { #mur-run-status }
 
@@ -2820,7 +2846,16 @@ nothing is `mur conversation rm`.
 
 The rewrite is atomic: the kept tail plus a [header line](workdir.md#record-header) recording the
 drop is staged beside the record and renamed over it, so an interrupted truncation leaves the
-original whole. Every surviving message keeps the exact `id` it carried.
+original whole. Every surviving message keeps the exact `id` it carried. Once the rewrite is in
+place, every image blob in the record's `blobs/` that no kept message names is removed.
+
+```text
+dropped 2 messages from /home/me/.murmur/conversations/shey/ctx-1/conversation.jsonl (2 kept; oldest surviving is msg_0199f2a1c3…)
+removed 1 image blobs no kept message names
+```
+
+The second line is printed only when a blob was removed. A record already at or under `N` prints
+`<path> already holds <n> messages; nothing dropped`.
 
 ---
 
@@ -3994,7 +4029,7 @@ murmur/tool-editor  0.7.0    tool     Read, write and patch files in the workdir
 murmur/tool-git     0.2.0    tool     Structured git interface.
 
 murmur/hook-old: 1.0.0 needs murmur:hook/lifecycle@0.8.0, this mur serves murmur:hook@0.9.0
-murmur/tool-editor: 0.8.0 needs murmur:tool/run@0.2.0, this mur serves murmur:tool@0.1.0
+murmur/tool-editor: 0.8.0 needs murmur:tool/run@0.3.0, this mur serves murmur:tool@0.2.0
 murmur/tool-git: 0.3.0 has no payload for linux-x86_64
 ```
 
@@ -4123,13 +4158,13 @@ mur version [--json]
 ```text
 mur 1.1.0-dev
 commit 0123456789abcdef0123456789abcdef01234567
-WIT level 2
+WIT level 3
 
 PACKAGE                  VERSION
 murmur:artifact-manager  0.1.0
 murmur:capsule           0.1.0
 ...
-murmur:tool-registry     0.1.0
+murmur:tool-registry     0.2.0
 ```
 
 The second line is `commit unknown` for a build made without a git checkout or a
@@ -4142,7 +4177,7 @@ padded to its widest cell plus two spaces.
 {
   "mur_version": "1.1.0-dev",
   "commit": "0123456789abcdef0123456789abcdef01234567",
-  "wit_level": 1,
+  "wit_level": 3,
   "packages": [
     {
       "package": "murmur:artifact-manager",

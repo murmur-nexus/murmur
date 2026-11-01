@@ -571,17 +571,22 @@ impl BridgeHandle {
             )
             .await
         {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 let is_error = !matches!(outcome.result.status, Status::Passed);
+                let attachments = std::mem::take(&mut outcome.result.attachments);
                 // `outcome.fatal` is deliberately not acted on here: this bridge is a tool server
                 // for an external harness process and owns no murmur session to end. The
                 // failure still reaches the caller in full — `result.data` carries the same named
                 // text (`RuntimeError`'s Display) that the agent loop would end the session with.
-                let text = outcome
-                    .result
-                    .data
-                    .or(outcome.result.summary)
-                    .unwrap_or_else(|| "tool returned no data".to_string());
+                let text = with_attachment_lines(
+                    store,
+                    outcome
+                        .result
+                        .data
+                        .or(outcome.result.summary)
+                        .unwrap_or_else(|| "tool returned no data".to_string()),
+                    &attachments,
+                );
                 json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": is_error
@@ -590,6 +595,29 @@ impl BridgeHandle {
             Err(err) => error_result(format!("tool '{name}' failed: {err}")),
         }
     }
+}
+
+/// `text` with one line per attachment the tool returned, after the fence's closing marker.
+///
+/// The harness's model is shown no image on this transport, so the bridge checks each attachment's
+/// type and size, stores nothing, and says what it found: `[image attached: …]` for one that
+/// passes, the refusal note for one that does not.
+fn with_attachment_lines(
+    store: &CapsuleStoreState,
+    mut text: String,
+    attachments: &[crate::bindings::host::murmur::tool::run::Attachment],
+) -> String {
+    for line in crate::images::bridged_attachment_lines(
+        attachments
+            .iter()
+            .map(|attachment| (attachment.media_type.as_str(), attachment.path.as_str())),
+        &store.accessible_root,
+        store.image_limits.max_bytes,
+    ) {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    text
 }
 
 /// A `tools/call`'s tool name and its arguments serialised for dispatch.
@@ -697,6 +725,74 @@ mod tests {
         assert_eq!(mcp[0]["description"], "edits files");
         assert_eq!(mcp[0]["inputSchema"]["type"], "object");
         assert!(mcp[0].get("parameters").is_none());
+    }
+
+    /// An attachment that passes the checks becomes the `[image attached: …]` line and one that
+    /// does not its refusal note, and the bridge stores nothing: no `blobs/` and no conversation
+    /// record appear anywhere under the session.
+    #[test]
+    fn claude_bridge_attachment_lines_check_and_store_nothing() {
+        use crate::bindings::host::murmur::tool::run::Attachment;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::build_test_state(
+            Arc::new(murmur_artifact::LocalRegistry::new(
+                dir.path().join("registry"),
+            )),
+            dir.path().to_path_buf(),
+            dir.path().join("murmur.lock"),
+        );
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        std::fs::write(store.accessible_root.host_path("shot.png"), png).unwrap();
+        std::fs::write(store.accessible_root.host_path("note.png"), b"not an image").unwrap();
+        let text = with_attachment_lines(
+            &store,
+            "fenced result".to_string(),
+            &[
+                Attachment {
+                    media_type: "image/png".to_string(),
+                    path: "shot.png".to_string(),
+                },
+                Attachment {
+                    media_type: "image/png".to_string(),
+                    path: "note.png".to_string(),
+                },
+            ],
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "fenced result");
+        assert_eq!(
+            lines[1],
+            "[image attached: shot.png, image/png, 10 bytes; not shown to this model]"
+        );
+        assert!(
+            lines[2].starts_with("attachment 'note.png' was not attached: ")
+                && lines[2].ends_with("(content_mismatch)"),
+            "{}",
+            lines[2]
+        );
+        let written: Vec<_> = walk(dir.path())
+            .into_iter()
+            .filter(|path| {
+                path.components()
+                    .any(|c| c.as_os_str() == "blobs" || c.as_os_str() == "conversations")
+            })
+            .collect();
+        assert!(written.is_empty(), "the bridge stored {written:?}");
+    }
+
+    fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                found.push(path);
+            }
+        }
+        found
     }
 
     #[test]

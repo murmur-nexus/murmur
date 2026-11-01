@@ -51,6 +51,7 @@ mod host_facts;
 pub mod host_warnings;
 pub(crate) mod http_client;
 pub(crate) mod identity;
+pub(crate) mod images;
 pub(crate) mod inference_import;
 pub(crate) mod inference_retry;
 pub(crate) mod install_grant;
@@ -132,7 +133,7 @@ pub use containment::{
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
     render_records_dir, render_runtime_dir, render_temp_dir, resolve_runtime_dir_reach,
     resolve_runtime_dir_reaches, ContainmentDecision, DoctorDirReports, ExportsFilesReport,
-    FilesystemBoundaryReport, FilesystemRestriction, PreopenReport, PreopenSurface,
+    FilesystemBoundaryReport, FilesystemRestriction, ImagesReport, PreopenReport, PreopenSurface,
     RuntimeDirReach, RuntimeDirReport, ScopeReport, ShortfallCause, StateStoreReport,
     TempDirReport,
 };

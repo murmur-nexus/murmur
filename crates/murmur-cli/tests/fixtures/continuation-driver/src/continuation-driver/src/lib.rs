@@ -71,6 +71,7 @@ impl Guest for ContinuationDriver {
                 data_path: None,
                 truncated: false,
                 metadata,
+                attachments: Vec::new(),
             };
         }
 
@@ -89,6 +90,7 @@ impl Guest for ContinuationDriver {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

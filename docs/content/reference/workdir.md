@@ -517,6 +517,25 @@ before the messages go to a driver:
 
 `inserted_by` is set by the runtime when it commits the hook's output, whatever `role` the message has and whatever the hook claimed. A message a compaction hook hands back unchanged keeps the value it already had, so a person's task message stays without one.
 
+An image a tool returned, or an A2A message carried, is one `image` block after the message's text
+block, holding a reference rather than the image:
+
+```json
+{"type":"image","source":{"type":"file","sha256":"9f2c…","media_type":"image/png","bytes":48213}}
+```
+
+The bytes are in `blobs/<sha256>` beside `conversation.jsonl`, written once however many messages
+name them, in a directory only the owner can read. A conversation that keeps no record stores them
+in the session's [records directory](#records-directory) `blobs/` instead. The driver receives the
+newest [`context.images.keep`](manifest.md#context-images) images as image bytes and each older one
+as a line naming it:
+
+| The driver receives | When |
+|---|---|
+| The image's bytes | It is one of the newest `context.images.keep` images in the conversation |
+| `[image not shown: <media type>, <n> bytes, sha256 <hex>; the <keep> newer images in this conversation are shown instead]` | It is older |
+| `[image unavailable: <media type>, <n> bytes, sha256 <hex>]` | Its blob is missing or holds another number of bytes |
+
 The record holds every message that enters the context, in the order it enters: the task's user
 message, each committed `seed-context` message, each assistant message, each tool result, each
 user message the runtime adds to continue the task — a reopen's feedback, handed-off work's
@@ -557,7 +576,7 @@ that opens it under `mur run --context` writes the header and applies its policy
 | Policy | Removed |
 |---|---|
 | [`trace.retain`](manifest.md#trace-retain) | A whole session: its [records directory](#records-directory), with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>` |
-| [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`. The file, the directory and every surviving `id` stay |
+| [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`, then every `blobs/<sha256>` no surviving line's image block names. The file, the directory, every surviving `id` and every image a kept line names stay |
 | [`context.retain.max_age`](manifest.md#context-retain) | A whole `<context-id>/` directory under the record store |
 | [`mur trace rm`](cli.md#mur-trace-rm) | One ended session, named by the operator: its [records directory](#records-directory), its work folder when the runtime created it under `./workdir`, and a running-capsule record left by a process that is gone. A `--workdir` folder and the conversation record stay |
 

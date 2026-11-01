@@ -416,7 +416,8 @@ impl Role {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PartContent {
     Text(String),
-    /// Base64 file bytes, as ProtoJSON spells `bytes`. The door refuses a message carrying one.
+    /// Base64 file bytes, as ProtoJSON spells `bytes`. The door reads one only as an image, whose
+    /// `mediaType` is one of [`crate::images::ALLOWED_MEDIA_TYPES`], and refuses every other.
     Raw(String),
     /// A file by reference. The door refuses a message carrying one.
     Url(String),
@@ -453,6 +454,15 @@ pub(crate) struct Part {
 }
 
 impl Part {
+    /// Whether this is a `raw` part whose `mediaType` is an image type the runtime accepts.
+    pub(crate) fn is_image(&self) -> bool {
+        matches!(self.content, PartContent::Raw(_))
+            && self
+                .media_type
+                .as_deref()
+                .is_some_and(crate::images::is_allowed_media_type)
+    }
+
     /// A text part with `mediaType` [`TEXT_MEDIA_TYPE`].
     pub(crate) fn text(text: impl Into<String>) -> Self {
         Self::of(PartContent::Text(text.into()), TEXT_MEDIA_TYPE)
@@ -947,7 +957,8 @@ pub(crate) struct IncomingMessage {
     pub task_id: Option<String>,
     /// `referenceTaskIds` with duplicates collapsed to their first occurrence.
     pub reference_task_ids: Vec<String>,
-    /// Text and data parts only: a message carrying any other part is refused.
+    /// Text and data parts, and `raw` parts declaring an image media type: a message carrying any
+    /// other part is refused.
     pub parts: Vec<Part>,
     /// Whether `metadata` carries the door extension's key, [`DOOR_EXTENSION_URI`]: the message
     /// used that extension, so a response that serves it lists the URI in
@@ -999,8 +1010,8 @@ impl MessageRefusal {
                     id,
                     A2aError::ContentTypeNotSupported,
                     &format!(
-                        "message.parts[{part_index}] is a {kind} part; this agent reads text and \
-                         data parts only"
+                        "message.parts[{part_index}] is a {kind} part; this agent reads text parts, \
+                         data parts and image raw parts only"
                     ),
                     &metadata,
                 )
@@ -1032,7 +1043,8 @@ pub(crate) fn push_notification_not_supported(id: Value) -> JsonRpcResponse {
 /// [`MAX_REFERENCE_TASK_IDS`] distinct tasks; `metadata[DOOR_EXTENSION_URI]` is an object where
 /// present; its `forgetSession` is a boolean where present; `forgetSession: true` names no
 /// `taskId`; `configuration.returnImmediately` is a boolean where present and not `null`. Then the
-/// first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`], and a
+/// first `url` part, or `raw` part whose `mediaType` is not an image type the runtime accepts, is
+/// [`MessageRefusal::ContentTypeNotSupported`], and a
 /// `configuration.taskPushNotificationConfig` that is present and not `null` is
 /// [`MessageRefusal::PushNotificationNotSupported`]. The rest of `configuration` and unknown
 /// fields are ignored, a `configuration` that is not an object, a `metadata` that is not an object
@@ -1141,11 +1153,10 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
         Some(Value::Bool(immediately)) => *immediately,
         Some(_) => return invalid("configuration.returnImmediately must be a boolean".to_string()),
     };
-    if let Some((part_index, part)) = parts
-        .iter()
-        .enumerate()
-        .find(|(_, part)| matches!(part.content, PartContent::Raw(_) | PartContent::Url(_)))
-    {
+    if let Some((part_index, part)) = parts.iter().enumerate().find(|(_, part)| {
+        matches!(part.content, PartContent::Url(_))
+            || (matches!(part.content, PartContent::Raw(_)) && !part.is_image())
+    }) {
         return Err(MessageRefusal::ContentTypeNotSupported {
             part_index,
             kind: part.content.kind(),
@@ -1177,31 +1188,123 @@ impl IncomingMessage {
     pub(crate) fn agent_text(&self) -> String {
         self.parts
             .iter()
-            .map(|part| match &part.content {
-                PartContent::Text(text) => text.clone(),
-                PartContent::Data(value) => {
-                    let mut label = "data".to_string();
-                    if let Some(media_type) = &part.media_type {
-                        label.push_str(&format!(" media-type={}", fence_label_value(media_type)));
+            .filter_map(|part| {
+                Some(match &part.content {
+                    PartContent::Text(text) => text.clone(),
+                    PartContent::Data(value) => {
+                        let mut label = "data".to_string();
+                        if let Some(media_type) = &part.media_type {
+                            label.push_str(&format!(
+                                " media-type={}",
+                                fence_label_value(media_type)
+                            ));
+                        }
+                        if let Some(filename) = &part.filename {
+                            label.push_str(&format!(" filename={}", fence_label_value(filename)));
+                        }
+                        let body = serde_json::to_string_pretty(value).unwrap_or_default();
+                        code_fence(&label, &body)
                     }
-                    if let Some(filename) = &part.filename {
-                        label.push_str(&format!(" filename={}", fence_label_value(filename)));
-                    }
-                    let body = serde_json::to_string_pretty(value).unwrap_or_default();
-                    code_fence(&label, &body)
-                }
-                PartContent::Raw(_) | PartContent::Url(_) => {
-                    unreachable!("read_send_params refuses every file part")
-                }
+                    // An image reaches the agent as an image block, not as text: see
+                    // [`message_images`].
+                    PartContent::Raw(_) => return None,
+                    PartContent::Url(_) => unreachable!("read_send_params refuses every url part"),
+                })
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// The kind of each part, in order: `text` or `data`.
+    /// The kind of each part, in order: `text`, `data` or `raw`.
     pub(crate) fn part_kinds(&self) -> Vec<&'static str> {
         self.parts.iter().map(|part| part.content.kind()).collect()
     }
+}
+
+/// Whether, and within which limits, the door takes an image part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImagePolicy {
+    /// An image part is checked against these limits and reaches the task's first user message.
+    Accept(murmur_artifact::ContextImagesConfig),
+    /// A capsule on `inference.transport: process`, whose harness holds the conversation: every
+    /// image part is refused.
+    ProcessTransport,
+}
+
+impl ImagePolicy {
+    /// The policy for a capsule on `transport` with `limits`.
+    pub(crate) fn for_transport(
+        transport: &str,
+        limits: murmur_artifact::ContextImagesConfig,
+    ) -> Self {
+        if transport == "process" {
+            Self::ProcessTransport
+        } else {
+            Self::Accept(limits)
+        }
+    }
+}
+
+impl Default for ImagePolicy {
+    fn default() -> Self {
+        Self::Accept(murmur_artifact::ContextImagesConfig::default())
+    }
+}
+
+/// The images `message`'s `raw` parts carry, each with its part index, decoded and checked under
+/// `policy`, or the `-32602` refusing the whole message.
+///
+/// A message is refused, naming `message.parts[<i>]`, when an image is malformed base64, its bytes
+/// do not match its `mediaType`, it is over `context.images.max_bytes`, it is one more than
+/// `context.images.max_per_turn`, it continues a task, or the capsule runs on the process
+/// transport. A message with no image part is never refused here.
+pub(crate) fn message_images(
+    message: &IncomingMessage,
+    policy: ImagePolicy,
+) -> Result<Vec<(usize, crate::images::CheckedImage)>, MessageRefusal> {
+    let mut images = Vec::new();
+    for (index, part) in message.parts.iter().enumerate() {
+        let PartContent::Raw(data) = &part.content else {
+            continue;
+        };
+        let media_type = part.media_type.as_deref().unwrap_or_default();
+        let limits = match policy {
+            ImagePolicy::ProcessTransport => {
+                return Err(MessageRefusal::InvalidParams(format!(
+                    "message.parts[{index}] is an image, and this capsule runs on \
+                     inference.transport: process, whose harness takes no images from the door"
+                )))
+            }
+            ImagePolicy::Accept(limits) => limits,
+        };
+        if let Some(task_id) = &message.task_id {
+            return Err(MessageRefusal::InvalidParams(format!(
+                "message.parts[{index}] is an image; a message continuing task {task_id} carries \
+                 text only, so send images on the message that starts a task"
+            )));
+        }
+        if images.len() as u32 >= limits.max_per_turn {
+            return Err(MessageRefusal::InvalidParams(format!(
+                "message.parts[{index}] is image {} of this message; context.images.max_per_turn \
+                 is {}",
+                images.len() + 1,
+                limits.max_per_turn
+            )));
+        }
+        match crate::images::decode_raw_part(media_type, data, limits.max_bytes) {
+            Ok(image) => images.push((index, image)),
+            Err(refusal) => {
+                return Err(MessageRefusal::InvalidParams(format!(
+                    "message.parts[{index}] was not attached: {} ({}); context.images.max_bytes \
+                     is {} bytes",
+                    refusal.reason(),
+                    refusal.code(),
+                    limits.max_bytes
+                )))
+            }
+        }
+    }
+    Ok(images)
 }
 
 /// `body` in a Markdown code fence whose opening line is the fence followed by `label`. The fence
@@ -1373,6 +1476,18 @@ pub(crate) struct TaskRegistry {
     /// Tasks the session deadline's cancel was accepted for; read by
     /// [`Self::canceled_at_deadline`].
     canceled_at_deadline: HashSet<String>,
+    /// Whether the door takes image parts, and within which limits.
+    image_policy: ImagePolicy,
+    /// The images each task's tool calls returned, by sha256: what the door serves at
+    /// `/attachments/<task-id>/<sha256>`. Filled by the agent loop as it accepts them.
+    attachments: HashMap<String, HashMap<String, IndexedAttachment>>,
+}
+
+/// One image the door serves for a task: its media type and the blob holding its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedAttachment {
+    pub(crate) media_type: String,
+    pub(crate) blob: std::path::PathBuf,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -1411,7 +1526,45 @@ impl TaskRegistry {
             standing_answers: HashSet::new(),
             stopped_at_deadline: HashSet::new(),
             canceled_at_deadline: HashSet::new(),
+            image_policy: ImagePolicy::default(),
+            attachments: HashMap::new(),
         }
+    }
+
+    /// This registry with the door taking image parts under `policy`.
+    pub(crate) fn with_image_policy(mut self, policy: ImagePolicy) -> Self {
+        self.image_policy = policy;
+        self
+    }
+
+    pub(crate) fn image_policy(&self) -> ImagePolicy {
+        self.image_policy
+    }
+
+    /// Serve the image `sha256`, stored at `blob`, for `task_id` at the door's attachment route.
+    pub(crate) fn index_attachment(
+        &mut self,
+        task_id: &str,
+        sha256: &str,
+        media_type: &str,
+        blob: std::path::PathBuf,
+    ) {
+        self.attachments
+            .entry(task_id.to_string())
+            .or_default()
+            .insert(
+                sha256.to_string(),
+                IndexedAttachment {
+                    media_type: media_type.to_string(),
+                    blob,
+                },
+            );
+    }
+
+    /// The image `sha256` a tool call of `task_id` returned, or `None` when it returned none by
+    /// that hash.
+    pub(crate) fn attachment(&self, task_id: &str, sha256: &str) -> Option<&IndexedAttachment> {
+        self.attachments.get(task_id)?.get(sha256)
     }
 
     /// A handle on the generation counter, for a reader that must not take this registry's lock.
@@ -2051,6 +2204,9 @@ pub(crate) struct IncomingTask {
     /// The kind of each part of the message, recorded as `task_start.part_kinds`. Empty for every
     /// task that did not arrive over the door.
     pub part_kinds: Vec<&'static str>,
+    /// The images the message's `raw` parts carried, each with its part index, already checked by
+    /// [`message_images`]. Empty for every task that did not arrive over the door.
+    pub images: Vec<(usize, crate::images::CheckedImage)>,
 }
 
 /// The `source` of a task that arrived over the A2A door.

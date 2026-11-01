@@ -16,6 +16,7 @@ impl exports::murmur::tool::run::Guest for JsonlLineCount {
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             };
         };
 
@@ -34,6 +35,7 @@ impl exports::murmur::tool::run::Guest for JsonlLineCount {
                     data_path: None,
                     truncated: false,
                     metadata: Vec::new(),
+                    attachments: Vec::new(),
                 }
             }
             Err(error) => exports::murmur::tool::run::ToolResult {
@@ -43,6 +45,7 @@ impl exports::murmur::tool::run::Guest for JsonlLineCount {
                 data_path: None,
                 truncated: false,
                 metadata: Vec::new(),
+                attachments: Vec::new(),
             },
         }
     }

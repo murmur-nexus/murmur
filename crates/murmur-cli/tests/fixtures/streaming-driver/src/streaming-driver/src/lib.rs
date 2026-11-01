@@ -28,6 +28,7 @@ impl exports::murmur::tool::run::Guest for StreamingDriver {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

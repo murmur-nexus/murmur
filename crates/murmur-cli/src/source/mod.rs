@@ -1686,8 +1686,8 @@ mod tests {
         assert_eq!(cli.code, crate::error::E_WIT_LEVEL_001);
         assert!(
             cli.message.starts_with(
-                "artifact 'ana/tool-x@0.3.0' does not fit WIT level 2, the level this mur serves: \
-                 it names murmur:tool/run@9.9.9, and level 2 has murmur:tool@0.1.0"
+                "artifact 'ana/tool-x@0.3.0' does not fit WIT level 3, the level this mur serves: \
+                 it names murmur:tool/run@9.9.9, and level 3 has murmur:tool@0.2.0"
             ),
             "{}",
             cli.message
@@ -1696,7 +1696,7 @@ mod tests {
             cli.hint.as_deref(),
             Some(
                 "ana/tool-x@0.1.1 is the newest version in github:ana/fits's index that fits \
-                 level 2; pin it in murmur.yaml and run `mur install`, or run `mur install \
+                 level 3; pin it in murmur.yaml and run `mur install`, or run `mur install \
                  ana/tool-x@0.1.1`"
             )
         );
@@ -1731,7 +1731,7 @@ mod tests {
         assert_eq!(cli.code, E_REG_001);
         assert!(
             cli.message.contains(
-                "fits WIT level 2, the level this mur serves; the newest is ana/tool-none: 1.0.0 \
+                "fits WIT level 3, the level this mur serves; the newest is ana/tool-none: 1.0.0 \
                  needs murmur:tool/run@9.9.9, this mur serves murmur:tool@"
             ),
             "{}",

@@ -717,6 +717,27 @@ struct ToolCallEvent {
     /// guessing the resource from the call's input. See `wit/tool.wit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_id: Option<String>,
+    /// The images the call returned, accepted or refused, in the order it named them. Absent
+    /// when it returned none. Never holds image bytes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<AttachmentRecord>,
+}
+
+/// One image a tool call returned or a task message carried, as the trace records it.
+///
+/// An accepted image carries `bytes` and `sha256`, the name of its blob beside the conversation;
+/// a refused one carries `refused`, the refusal code its note ends with. `path` is the work-folder
+/// path a tool named, or `message.parts[<i>]` for an image an A2A message carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct AttachmentRecord {
+    pub(crate) path: String,
+    pub(crate) media_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refused: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1197,13 +1218,17 @@ struct TaskStartEvent {
     /// tasks ran in is answerable from the trace alone.
     lane: String,
     message_parts_bytes: u64,
-    /// The kind of each part of the A2A message the task arrived as, `text` or `data`, in order.
-    /// Absent for a task that did not arrive over the door.
+    /// The kind of each part of the A2A message the task arrived as, `text`, `data` or `raw`, in
+    /// order. Absent for a task that did not arrive over the door.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     part_kinds: Vec<&'static str>,
     /// The message's `referenceTaskIds`, each once. Absent when it referenced none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reference_task_ids: Vec<String>,
+    /// The images the message's `raw` parts carried, each with its `path` as
+    /// `message.parts[<i>]`. Absent when it carried none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<AttachmentRecord>,
 }
 
 #[derive(Serialize)]
@@ -3092,6 +3117,42 @@ impl TraceWriter {
         turn: u32,
         tool_name: String,
         tool_call_id: Option<String>,
+        input: Value,
+        input_bytes: u64,
+        output: &str,
+        output_bytes: u64,
+        duration_ms: u64,
+        status: String,
+        state_effect: Option<String>,
+        resource_id: Option<String>,
+        error: Option<&str>,
+    ) -> std::io::Result<()> {
+        self.write_tool_call_with_attachments(
+            turn,
+            tool_name,
+            tool_call_id,
+            input,
+            input_bytes,
+            output,
+            output_bytes,
+            duration_ms,
+            status,
+            state_effect,
+            resource_id,
+            error,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::write_tool_call`] for a call that returned images: `attachments` becomes the
+    /// record's `attachments` field, which an empty list omits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_tool_call_with_attachments(
+        &mut self,
+        turn: u32,
+        tool_name: String,
+        tool_call_id: Option<String>,
         mut input: Value,
         input_bytes: u64,
         output: &str,
@@ -3101,6 +3162,7 @@ impl TraceWriter {
         state_effect: Option<String>,
         resource_id: Option<String>,
         error: Option<&str>,
+        attachments: Vec<AttachmentRecord>,
     ) -> std::io::Result<()> {
         // A peer handle reaches this event by an ordinary route — it is an argument the model
         // passed to `fetch-peer-file`, and every call's arguments are recorded. It is also a
@@ -3135,6 +3197,7 @@ impl TraceWriter {
             }),
             state_effect,
             resource_id,
+            attachments,
         };
         self.write_event(&event).await?;
         self.total_tool_calls = self.total_tool_calls.saturating_add(1);
@@ -3422,6 +3485,7 @@ impl TraceWriter {
 
     /// `part_kinds` and `reference_task_ids` describe the A2A message the task arrived as, and are
     /// empty for any other task.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_task_start(
         &mut self,
@@ -3432,6 +3496,33 @@ impl TraceWriter {
         message_parts_bytes: u64,
         part_kinds: &[&'static str],
         reference_task_ids: &[String],
+    ) -> std::io::Result<()> {
+        self.write_task_start_with_attachments(
+            task_id,
+            context_id,
+            source,
+            provenance,
+            message_parts_bytes,
+            part_kinds,
+            reference_task_ids,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// The `task_start` record. `attachments` lists the images the task's message carried, and an
+    /// empty list omits the field.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_task_start_with_attachments(
+        &mut self,
+        task_id: &str,
+        context_id: &str,
+        source: &str,
+        provenance: TaskProvenance,
+        message_parts_bytes: u64,
+        part_kinds: &[&'static str],
+        reference_task_ids: &[String],
+        attachments: Vec<AttachmentRecord>,
     ) -> std::io::Result<()> {
         // Drained under the ids in force before this task, which the lines below replace.
         self.write_call_deadlines().await?;
@@ -3474,6 +3565,7 @@ impl TraceWriter {
             message_parts_bytes,
             part_kinds: part_kinds.to_vec(),
             reference_task_ids: reference_task_ids.to_vec(),
+            attachments,
         };
         self.write_event(&event).await
     }

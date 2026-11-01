@@ -243,6 +243,7 @@ pub(crate) fn render(
         data_path: None,
         truncated,
         metadata,
+        attachments: Vec::new(),
     };
     (result, (!notes.is_empty()).then(|| notes.join("\n")))
 }

@@ -427,6 +427,7 @@ fn activated_stream_adds_murmur_frames_and_echoes_the_extension() {
         "durationMs",
         "exitCode",
         "truncated",
+        "attachments",
     ];
     let mut sorted = keys.clone();
     sorted.sort_unstable();
