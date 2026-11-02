@@ -499,6 +499,27 @@ fn ps_rows(stdout: &str) -> Vec<&str> {
         .collect()
 }
 
+/// `rows` with the UPTIME value (`HH:MM:SS`, after `<days>d` past a day) left out: it ticks
+/// between two `mur ps` calls, so two listings of the same sessions differ only there.
+fn without_uptime(rows: &[&str]) -> Vec<String> {
+    let is_uptime = |field: &str| {
+        let days = field
+            .strip_suffix('d')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let clock = field.matches(':').count() == 2
+            && field.bytes().all(|b| b.is_ascii_digit() || b == b':');
+        days || clock
+    };
+    rows.iter()
+        .map(|row| {
+            row.split_whitespace()
+                .filter(|field| !is_uptime(field))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
 fn wait_for_requests(server: &common::ScriptedServer, count: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while server.requests().len() < count {
@@ -663,7 +684,11 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
 
     write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
     let (verbose, stderr) = ps_output_verbose(home.path());
-    assert_eq!(ps_rows(&verbose), rows, "{verbose}");
+    assert_eq!(
+        without_uptime(&ps_rows(&verbose)),
+        without_uptime(&rows),
+        "{verbose}"
+    );
     assert!(pruned_summaries(&stderr).is_empty(), "{stderr}");
     let pruned = pruned_lines(&stderr);
     assert_eq!(pruned.len(), 1, "one unlink, one line: {stderr}");
@@ -2878,7 +2903,7 @@ fn pruning_summary_counts_hundreds_of_stale_records_in_one_line() {
 
     let (again, stderr) = ps_output(home.path());
     assert!(stderr.is_empty(), "{stderr}");
-    assert_eq!(ps_rows(&again), rows);
+    assert_eq!(without_uptime(&ps_rows(&again)), without_uptime(&rows));
 }
 
 /// `--verbose` names every removal and summarises every formation a removed record names, in the

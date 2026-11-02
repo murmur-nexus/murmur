@@ -461,17 +461,19 @@ pub(super) fn build_harness_env(
 }
 
 /// The environment an unconfined session's harness starts with, in the order each source is
-/// applied: this process's whole environment as [`shell::build_unconfined_env`] leaves it (the
-/// lineage names and whatever `capabilities.shell.strip_env` matches removed), then the plan's
-/// `env-set`, then `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
+/// applied: `base` (this process's whole environment, [`std::env::vars_os`], in production) as
+/// [`shell::build_unconfined_env`] leaves it (the lineage names and whatever
+/// `capabilities.shell.strip_env` matches removed), then the plan's `env-set`, then
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
 pub(super) fn build_unconfined_harness_env(
     policy: &CapabilityPolicy,
+    base: impl IntoIterator<Item = (OsString, OsString)>,
     env_set: &[(String, String)],
     files_dir: &str,
     runtime_dir: &Path,
     records_dir: Option<&Path>,
 ) -> Result<BTreeMap<OsString, OsString>, String> {
-    let mut env = shell::build_unconfined_env(policy, &[], None, None);
+    let mut env = shell::build_unconfined_env(policy, base, &[], None, None);
     for (name, value) in env_set {
         if !crate::process_driver::is_usable_env_name(name) {
             return Err(format!(
@@ -914,6 +916,7 @@ async fn run_harness(
     {
         build_unconfined_harness_env(
             &store_state.capability_policy,
+            std::env::vars_os(),
             &plan.env_set,
             &files_dir_path,
             store_state.runtime_root.path(),
@@ -2548,15 +2551,22 @@ mod tests {
             env.get(std::ffi::OsStr::new(name))
                 .map(|value| value.to_string_lossy().into_owned())
         };
-        for name in shell::LINEAGE_ENV {
-            std::env::set_var(name, "host-value");
-        }
-        std::env::set_var(crate::lifeline::FORMATION_LIFELINE_ENV, "9");
-        std::env::set_var("MURMUR_TEST_UNCONFINED", "present");
-        std::env::set_var("HOME", "/home/operator");
-        std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value");
+        // A made-up host environment: the test process's own is never changed, so tests running
+        // beside this one keep their real `HOME`, lineage names and lifeline.
+        let host: BTreeMap<OsString, OsString> = shell::LINEAGE_ENV
+            .iter()
+            .map(|name| (*name, "host-value"))
+            .chain([
+                (crate::lifeline::FORMATION_LIFELINE_ENV, "9"),
+                ("MURMUR_TEST_UNCONFINED", "present"),
+                ("HOME", "/home/operator"),
+                (crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value"),
+            ])
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
         let env = build_unconfined_harness_env(
             &CapabilityPolicy::default(),
+            host,
             &[
                 ("PLAN_SET".to_string(), format!("{FILES_DIR_TOKEN}/x")),
                 (
