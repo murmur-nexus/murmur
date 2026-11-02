@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn manifest_declares_the_containment_class_under_test() {
         let case = cases::find("read-etc-shadow").unwrap();
-        for class in ContainmentClass::ALL {
+        for class in ContainmentClass::DECLARABLE {
             let yaml = manifest_yaml(case, &config(), class, &log());
             assert!(
                 yaml.contains(&format!("containment: {class}\n")),
@@ -1204,7 +1204,7 @@ mod tests {
                 Profile::TightResources => profiles_seen.1 = true,
             }
             let driver_log = driver_log_path(&config.work_root.join(case.id));
-            for class in ContainmentClass::ALL {
+            for class in ContainmentClass::DECLARABLE {
                 let yaml = manifest_yaml(case, &config, class, &driver_log);
                 let id = case.id;
                 let manifest = match RuntimeManifest::from_yaml_str(&yaml) {

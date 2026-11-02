@@ -12,17 +12,17 @@ use std::{
 use capsule_runtime::session_status::{DeadlineSource, SessionDeadline};
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session_handling_sigterm, preopen_reports, probe_scope, requires_process_bounding,
-    stage_session, state_store_reports, AfterTask, ArtifactRequest, LaunchEnding,
-    LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
-    TaskAcceptance, WorkdirError,
+    explain_scope_probe, launch_session_handling_sigterm, preopen_reports, stage_session,
+    state_store_reports, AfterTask, ArtifactRequest, LaunchEnding, LifecycleOverride,
+    LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
+    WorkdirError,
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
-    current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
-    read_lockfile, registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactName,
-    ArtifactRuntime, ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact,
-    LockfileError, MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
+    registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactName, ArtifactRuntime,
+    ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError,
+    MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 use murmur_artifact::{runtime_warning_link, W_RUN_007};
 
@@ -178,6 +178,7 @@ pub(crate) fn run_run(
     bind_addr: &str,
     no_env_file: bool,
     containment_arg: Option<&str>,
+    stance_flags: crate::stance::StanceFlags,
     explain_scope_only: bool,
 ) -> Result<(), CliError> {
     // Read first, so the runtime's deadline is never later than a launcher's own timeout started
@@ -255,6 +256,15 @@ pub(crate) fn run_run(
         }
     };
     workdir = project_dir.join("workdir");
+
+    // Decided from the flags alone, ahead of the spawn approval's read and every other side
+    // effect: a launch the runtime started contained never runs unconfined.
+    crate::stance::refuse_unconfined_contained_launch(
+        stance_flags.unconfined,
+        stance_flags.contained_launch,
+        spawn_grant_stdin,
+    )
+    .map_err(|error| fail(&session_id, &workdir, error, json))?;
 
     // Read before anything else this launch does, and read exactly once: the parent's runtime
     // writes one line and closes the pipe, so a launch that deferred the read past a refusal
@@ -527,9 +537,9 @@ pub(crate) fn run_run(
     )
     .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
-    // The containment floor is the strongest class any of the three sources asked for. This is
-    // one of two reasons `mur run` reads a MurConfig at all; the machine spend ceiling below is
-    // the other.
+    // The stance — unconfined, or contained at the strongest floor any source asked for — from
+    // the flags, both config files and the manifest (`crate::stance`). This is one of two reasons
+    // `mur run` reads a MurConfig at all; the machine spend ceiling below is the other.
     let cli_containment = parse_containment_flag(containment_arg, &session_id, &workdir, json)?;
     let effective_config = load_effective_mur_config_if_any_exists()
         .map_err(|error| fail(&session_id, &workdir, error, json))?;
@@ -551,15 +561,24 @@ pub(crate) fn run_run(
         .as_ref()
         .and_then(|config| config.spend.as_ref())
         .and_then(|spend| spend.machine_tokens_per_day);
-    let workspace_containment = effective_config.and_then(|config| config.containment);
-    let declared_containment_floor = effective_containment_floor(
-        workspace_containment,
-        runtime_manifest
+    let containment_config = crate::config::load_containment_config()
+        .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    let stance = crate::stance::resolve_stance(crate::stance::StanceInputs {
+        unconfined_flag: stance_flags.unconfined,
+        containment_flag: cli_containment,
+        contained_launch: stance_flags.contained_launch,
+        spawn_grant_stdin,
+        global: containment_config.global,
+        project: containment_config.project,
+        manifest: runtime_manifest
             .capabilities
             .as_ref()
             .and_then(|capabilities| capabilities.containment),
-        cli_containment,
-    );
+    })
+    .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    let declared_containment_floor = stance.declared_floor();
+    // As `stage_session` sets it, so the scope and the io.max report below describe this launch.
+    capability_policy.containment_floor = declared_containment_floor;
 
     // A diagnostic, not an enforcement gate: it reports even when the floor is unmet and exits
     // 0. Placed ahead of every side effect — no PATH pre-flight, no registry, no workdir, no
@@ -638,11 +657,7 @@ pub(crate) fn run_run(
         // being spelled out here, because `session_start.effective_grants` must be the
         // byte-for-byte object this prints — `trace.rs`'s
         // `session_start_effective_grants_match_explain_scope_json` asserts exactly that.
-        let scope_probe = probe_scope(
-            requires_process_bounding(&capability_policy, false),
-            &capability_policy.resources,
-            &workdir,
-        );
+        let scope_probe = explain_scope_probe(&capability_policy, &workdir);
         // The interpreter runtimes and trust store `stage_session` would derive, through the same
         // functions and with the same trees excluded, so the report names the paths a launch
         // grants.
@@ -1325,7 +1340,7 @@ fn check_artifacts_installed(
     ))
 }
 
-/// Validates `--containment` against the three class names, with the same shape as
+/// Validates `--containment` against the declarable class names, with the same shape as
 /// `parse_lifecycle_override` below: a bad value is an `E-IO-003` naming the accepted set and
 /// the offending input, not a bespoke error code for this one flag. `None` in means the flag was
 /// not passed, which contributes nothing to the floor.
@@ -1339,17 +1354,9 @@ fn parse_containment_flag(
         return Ok(None);
     };
 
-    value
-        .parse::<ContainmentClass>()
+    crate::stance::parse_containment_value(value)
         .map(Some)
-        .map_err(|error| {
-            fail(
-                session_id,
-                workdir,
-                CliError::new(E_IO_003, format!("--containment {error}")),
-                json,
-            )
-        })
+        .map_err(|error| fail(session_id, workdir, error, json))
 }
 
 /// Applies `--system-prompt` to the manifest's inference config, returning the config to stage

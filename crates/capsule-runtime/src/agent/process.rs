@@ -37,6 +37,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -459,6 +460,49 @@ pub(super) fn build_harness_env(
     Ok(env)
 }
 
+/// The environment an unconfined session's harness starts with, in the order each source is
+/// applied: this process's whole environment as [`shell::build_unconfined_env`] leaves it (the
+/// lineage names and whatever `capabilities.shell.strip_env` matches removed), then the plan's
+/// `env-set`, then `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
+pub(super) fn build_unconfined_harness_env(
+    policy: &CapabilityPolicy,
+    env_set: &[(String, String)],
+    files_dir: &str,
+    runtime_dir: &Path,
+    records_dir: Option<&Path>,
+) -> Result<BTreeMap<OsString, OsString>, String> {
+    let mut env = shell::build_unconfined_env(policy, &[], None, None);
+    for (name, value) in env_set {
+        if !crate::process_driver::is_usable_env_name(name) {
+            return Err(format!(
+                "the launch plan's env-set names {name:?}, which is not a usable variable name"
+            ));
+        }
+        if shell::LINEAGE_ENV.contains(&name.as_str())
+            || crate::formation::is_member_grant_env(name)
+        {
+            continue;
+        }
+        env.insert(
+            OsString::from(name),
+            OsString::from(substitute_files_dir(value, files_dir)),
+        );
+    }
+    // Last, so no `env-set` entry displaces either.
+    env.insert(
+        OsString::from(crate::runtime_dir::RUNTIME_DIR_ENV),
+        runtime_dir.as_os_str().to_owned(),
+    );
+    env.remove(std::ffi::OsStr::new(crate::records_dir::RECORDS_DIR_ENV));
+    if let Some(records_dir) = records_dir {
+        env.insert(
+            OsString::from(crate::records_dir::RECORDS_DIR_ENV),
+            records_dir.as_os_str().to_owned(),
+        );
+    }
+    Ok(env)
+}
+
 /// A driver file name must name a file inside the run's private directory and nothing else.
 fn check_driver_file_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
@@ -865,15 +909,31 @@ async fn run_harness(
         .iter()
         .map(|arg| substitute_files_dir(arg, &files_dir_path))
         .collect();
-    let env = build_harness_env(
-        &store_state.capability_policy,
-        &account,
-        &plan.env_set,
-        &files_dir_path,
-        store_state.runtime_root.path(),
-        Some(store_state.records_root.path()),
-    )
-    .map_err(launch_error)?;
+    let env: BTreeMap<OsString, OsString> = if store_state.capability_policy.containment_floor
+        == murmur_artifact::ContainmentClass::Unconfined
+    {
+        build_unconfined_harness_env(
+            &store_state.capability_policy,
+            &plan.env_set,
+            &files_dir_path,
+            store_state.runtime_root.path(),
+            Some(store_state.records_root.path()),
+        )
+        .map_err(launch_error)?
+    } else {
+        build_harness_env(
+            &store_state.capability_policy,
+            &account,
+            &plan.env_set,
+            &files_dir_path,
+            store_state.runtime_root.path(),
+            Some(store_state.records_root.path()),
+        )
+        .map_err(launch_error)?
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+    };
 
     let stdin_bytes = plan.stdin.as_ref().map(Vec::len).unwrap_or(0);
     // Written by `drive_harness`, immediately before the spawn: a task stopped while the driver
@@ -889,7 +949,10 @@ async fn run_harness(
         harness_session_id: session.id().to_string(),
         session_mode: session_mode_name(session.mode()).to_string(),
         args_count: args.len(),
-        env_names: env.keys().cloned().collect(),
+        env_names: env
+            .keys()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect(),
         account_env_unset: account.unset().to_vec(),
         files,
         bridge_tools: bridge
@@ -975,7 +1038,7 @@ async fn drive_harness(
     staged: &StagedProcessDriver,
     bridge: Option<&claude_bridge::BridgeHandle>,
     args: &[String],
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
     cwd: &Path,
     plan: &LaunchPlan,
     start: HarnessStart,
@@ -997,9 +1060,9 @@ async fn drive_harness(
     let spawned_at = Instant::now();
     let mut child = Command::new(&staged.binary)
         .args(args)
-        // The environment is exactly what was built: no host variable reaches the harness unless
-        // `capabilities.env.allow` declared it, the driver's plan set it, or it is the host's
-        // `USER` or `LOGNAME`.
+        // The environment is exactly what was built: on a contained session no host variable
+        // reaches the harness unless `capabilities.env.allow` declared it, the driver's plan set
+        // it, or it is the host's `USER` or `LOGNAME`; on an unconfined one it is the operator's.
         .env_clear()
         .envs(env)
         .current_dir(cwd)
@@ -2473,6 +2536,62 @@ mod tests {
         assert!(
             !env.contains_key("MURMUR_TEST_HARNESS_API_KEY"),
             "a credential-shaped host name reached the harness: {env:?}"
+        );
+    }
+
+    /// An unconfined session's harness starts from this process's whole environment — an
+    /// undeclared variable and `HOME` included — minus the lineage names, then the plan's
+    /// `env-set`, which cannot set a lineage name, then this session's runtime directories.
+    #[test]
+    fn unconfined_harness_env_inherits_everything_but_the_lineage_names() {
+        let get = |env: &BTreeMap<OsString, OsString>, name: &str| {
+            env.get(std::ffi::OsStr::new(name))
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        for name in shell::LINEAGE_ENV {
+            std::env::set_var(name, "host-value");
+        }
+        std::env::set_var(crate::lifeline::FORMATION_LIFELINE_ENV, "9");
+        std::env::set_var("MURMUR_TEST_UNCONFINED", "present");
+        std::env::set_var("HOME", "/home/operator");
+        std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value");
+        let env = build_unconfined_harness_env(
+            &CapabilityPolicy::default(),
+            &[
+                ("PLAN_SET".to_string(), format!("{FILES_DIR_TOKEN}/x")),
+                (
+                    crate::delegation::SPAWNER_ENV.to_string(),
+                    "plan".to_string(),
+                ),
+                (
+                    crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+                    "/plan/value".to_string(),
+                ),
+            ],
+            "/files",
+            std::path::Path::new("/runtime"),
+            Some(std::path::Path::new("/records")),
+        )
+        .unwrap();
+        for name in shell::LINEAGE_ENV
+            .iter()
+            .chain([&crate::lifeline::FORMATION_LIFELINE_ENV])
+        {
+            assert_eq!(get(&env, name), None, "{name} reached the harness");
+        }
+        assert_eq!(
+            get(&env, "MURMUR_TEST_UNCONFINED").as_deref(),
+            Some("present")
+        );
+        assert_eq!(get(&env, "HOME").as_deref(), Some("/home/operator"));
+        assert_eq!(get(&env, "PLAN_SET").as_deref(), Some("/files/x"));
+        assert_eq!(
+            get(&env, crate::runtime_dir::RUNTIME_DIR_ENV).as_deref(),
+            Some("/runtime")
+        );
+        assert_eq!(
+            get(&env, crate::records_dir::RECORDS_DIR_ENV).as_deref(),
+            Some("/records")
         );
     }
 

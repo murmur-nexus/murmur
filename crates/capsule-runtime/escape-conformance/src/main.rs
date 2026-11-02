@@ -125,9 +125,16 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
         match arg.as_str() {
             "--class" => {
                 let raw = value("--class")?;
-                options.class = Some(ContainmentClass::from_str(&raw).map_err(|_| {
-                    format!("--class: unknown containment class {raw:?} (expected advisory, scoped or sealed)")
-                })?);
+                let class = ContainmentClass::from_str(&raw)
+                    .ok()
+                    .filter(|class| ContainmentClass::DECLARABLE.contains(class))
+                    .ok_or_else(|| {
+                        format!(
+                            "--class: unknown containment class {raw:?} (expected advisory, \
+                             scoped or sealed)"
+                        )
+                    })?;
+                options.class = Some(class);
             }
             "--record-dir" => options.record_dir = PathBuf::from(value("--record-dir")?),
             "--work-root" => options.work_root = Some(PathBuf::from(value("--work-root")?)),

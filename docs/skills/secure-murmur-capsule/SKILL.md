@@ -168,7 +168,7 @@ Keep these facts separate in the assessment:
 - **routes outside the class:** the class confines shell commands, plan shell steps and native tools only. WASM tools, drivers, hooks and an `inference.transport: process` harness run outside it — read the `Routes` block / `routes` rows (`under_class: false`, `mechanism: host-process`), and expect `W-SEC-034` for a `scoped` or `sealed` floor;
 - **cgroup scope:** whether a launch gets the cgroup scope a subprocess-capable capsule needs (`cgroup scope:` / `cgroup_scope`); `unavailable` predicts an `E-RUN-012` refusal.
 
-A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest class. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
+A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest declarable class, and lets the operator run the capsule [unconfined](https://docs.murmur.nexus/reference/containment/#unconfined); any declared floor, `advisory` included, refuses that. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
 
 Do not overstate guarantees. Filesystem mediation may govern read/write/execute operations without hiding path metadata. Strong root isolation can make outside paths absent, yet under `sealed` a process can still learn that another process exists, its owner and start time (`stat(2)` on `/proc/<pid>`), and can signal processes of the same user. Record exceptions that matter to the workload.
 
@@ -208,6 +208,7 @@ Treat these diagnostics as security-significant:
 - `W-SEC-035`: a `host_paths` entry in `~/.murmur/config.yaml` reaches a credential location (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.murmur`, …), so every contained capsule on the host can read it; lend a narrower folder.
 - `E-CFG-004`: a `host_paths` entry is malformed, sits in a project config, or cannot be honoured on this host (missing, `/`, a system path, read-write over `~/.murmur` or over a folder the session runs binaries from at `scoped`); fix or remove the entry rather than dropping containment.
 - `E-IO-004`: `HOME` is unset, relative, or cannot hold `~/.murmur`; set it to an absolute directory you own.
+- `W-SEC-036`: the capsule runs unconfined (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`): its commands run as the operator with their `HOME`, environment, filesystem, network and `sudo`, so no containment claim holds. Declare `capabilities.containment` to refuse that stance (`E-RUN-059`).
 
 Warnings are the difference between intended and effective policy. Capture them in automation; do not suppress, ignore, or “fix” them by renaming an equally powerful primitive.
 

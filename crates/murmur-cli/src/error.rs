@@ -108,6 +108,8 @@ pub const E_RUN_055: &str = "E-RUN-055"; // a driver choice's output cap, or inf
 pub const E_RUN_056: &str = "E-RUN-056"; // the running session an address resolved to is a script capsule, which binds no door
 pub const E_RUN_057: &str = "E-RUN-057"; // a computer tool is declared and a driver choice's model is vision: false
 pub const E_RUN_058: &str = "E-RUN-058"; // an installed artifact ships a malformed provider_tool: block
+pub const E_RUN_059: &str = "E-RUN-059"; // the unconfined stance was chosen for a capsule some source declares a containment floor for
+pub const E_RUN_060: &str = "E-RUN-060"; // --unconfined was given to a launch the runtime started contained (--contained-launch or --spawn-grant-stdin)
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -183,6 +185,7 @@ pub const E_CFG_001: &str = "E-CFG-001"; // inference provider not configured; w
 pub const E_CFG_002: &str = "E-CFG-002"; // `mur config set` given an unsupported dotted key
 pub const E_CFG_003: &str = "E-CFG-003"; // registry: in a config file cannot be used: a removed key, a repo that is not <owner>/<repo>, a reserved scope claimed, or two sources for one scope
 pub const E_CFG_004: &str = "E-CFG-004"; // a host_paths entry is malformed, named outside ~/.murmur/config.yaml, or cannot be honoured on this host
+pub const E_CFG_005: &str = "E-CFG-005"; // a project config says containment: unconfined, which only the global config may
 
 #[derive(Debug, Clone)]
 pub struct CliError {

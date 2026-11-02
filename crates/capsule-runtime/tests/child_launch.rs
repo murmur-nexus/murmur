@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG;
 use capsule_runtime::session_status::{SessionDeadline, INHERITED_DEADLINE_FLAG};
 use capsule_runtime::{
     child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
@@ -676,6 +677,14 @@ fn a_child_is_handed_its_parents_deadline_as_its_own() {
         "{:?}",
         unbounded.argv
     );
+    // Every launch is contained: the unconfined stance never spreads to a child.
+    for argv in [&child.argv, &unbounded.argv] {
+        assert!(
+            argv.iter().any(|arg| arg == CONTAINED_LAUNCH_FLAG),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|arg| arg == "--unconfined"), "{argv:?}");
+    }
 }
 
 // ── 3. A child cannot reach out of its own directory ──────────────────────────

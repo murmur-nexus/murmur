@@ -157,6 +157,22 @@ struct TraceRecord {
     event: TraceEvent,
 }
 
+/// The part of `session_start.effective_grants` `mur trace show` reads.
+#[derive(Debug, Default, Clone, Deserialize)]
+struct TraceGrants {
+    #[serde(default)]
+    unconfined: Option<TraceUnconfined>,
+}
+
+/// `effective_grants.unconfined`: who an unconfined session's commands ran as.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
+struct TraceUnconfined {
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    home: Option<String>,
+}
+
 /// The two keys every trace line carries, read for the first and last line of a trace whose
 /// ending is not recorded.
 #[derive(Debug, Default, Deserialize)]
@@ -200,6 +216,9 @@ struct SessionStartEvent {
     containment_declared: Option<String>,
     #[serde(default)]
     containment_achieved: Option<String>,
+    /// The scope report, read for its `unconfined` object alone.
+    #[serde(default)]
+    effective_grants: Option<TraceGrants>,
     #[serde(default)]
     workdir_exec: Option<bool>,
     /// Where the host's permission to create an unprivileged user namespace came from;
@@ -1624,6 +1643,8 @@ struct TraceMetrics {
     tools_declared: Vec<String>,
     containment_declared: Option<String>,
     containment_achieved: Option<String>,
+    /// Who an unconfined session's commands ran as; `None` on a contained one.
+    unconfined: Option<TraceUnconfined>,
     workdir_exec: Option<bool>,
     userns_grant: Option<String>,
     system_prompt_source: Option<String>,
@@ -3081,6 +3102,7 @@ fn compute_metrics(
             tools_declared: ss.tools_declared,
             containment_declared: ss.containment_declared,
             containment_achieved: ss.containment_achieved,
+            unconfined: ss.effective_grants.and_then(|grants| grants.unconfined),
             workdir_exec: ss.workdir_exec,
             userns_grant: ss.userns_grant,
             system_prompt_source: ss.system_prompt_source,
@@ -3515,7 +3537,21 @@ fn print_show(m: &TraceMetrics) {
     // tier's, not the most this host could back. A launch refuses a floor it cannot meet, so a
     // recorded `achieved` below `declared` is a trace from a runtime that did not.
     if let (Some(declared), Some(achieved)) = (&m.containment_declared, &m.containment_achieved) {
-        capsule_runtime::report_println!("{:<11} {} → {}", "containment:", declared, achieved);
+        // An unconfined session's commands ran as the operator: the line says as whom.
+        let as_whom = match &m.unconfined {
+            Some(unconfined) => format!(
+                " (commands ran as {} with HOME {})",
+                unconfined.user.as_deref().unwrap_or("<unknown user>"),
+                unconfined.home.as_deref().unwrap_or("<unset>")
+            ),
+            None => String::new(),
+        };
+        capsule_runtime::report_println!(
+            "{:<11} {} → {}{as_whom}",
+            "containment:",
+            declared,
+            achieved
+        );
     }
     if let Some(exec) = m.workdir_exec {
         capsule_runtime::report_println!(

@@ -293,13 +293,16 @@ impl CheckRunner {
             .records_root
             .open_beneath(crate::records_dir::HOME_SUBDIR)
             .map_err(|error| error.to_string())?;
-        let workdir_guard = crate::resources::WorkdirGuard::spawn(
-            &self.accessible_root,
-            temp.as_ref(),
-            home.as_ref(),
-            Some(&self.records_root),
-            self.policy.resources.workdir_max_bytes,
-        );
+        let workdir_guard =
+            crate::resources::workdir_guard_max_bytes(&self.policy).map(|max_bytes| {
+                crate::resources::WorkdirGuard::spawn(
+                    &self.accessible_root,
+                    temp.as_ref(),
+                    home.as_ref(),
+                    Some(&self.records_root),
+                    max_bytes,
+                )
+            });
         let sessions_dir = match &self.sessions_dir {
             Some(dir) => dir.clone(),
             None => crate::runtime_dir::sessions_dir().map_err(|error| error.to_string())?,
@@ -319,7 +322,7 @@ impl CheckRunner {
         }
         let enforcement =
             ShellEnforcement::resolve(&self.policy, &self.containment, self.host_probe.clone())?
-                .with_host_bounding(prepared.scope, Some(workdir_guard))
+                .with_host_bounding(prepared.scope, workdir_guard)
                 .with_runtime_dir(roots, None)
                 .with_temp_mapping(self.temp_mapping);
         Ok((enforcement, runtime_dir))

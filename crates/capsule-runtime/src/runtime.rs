@@ -99,8 +99,8 @@ use crate::{
     sealed::UsernsGrant,
     session_status::SESSION_STATUS_TOOL,
     shell::{
-        build_declared_env, build_shell_env, is_shell_interpreter, run_shell,
-        shell_tool_manifest_yaml, split_shell_words, ShellExecError, ShellOutcome, ShellResult,
+        build_declared_env, is_shell_interpreter, run_shell, shell_tool_manifest_yaml,
+        split_shell_words, ShellExecError, ShellOutcome, ShellResult,
     },
     spawn_credential::SpawnCredential,
     spend::{MachineLedger, SpendMeter},
@@ -2417,6 +2417,11 @@ pub fn stage_session(
         workdir_exec,
         runtime_dir_placement.inside_workdir(),
     );
+    // The combined floor, from here on: every reader of the policy below — the cgroup scope, the
+    // workdir guard and the subprocess environments — tells an unconfined session by it.
+    request.capability_policy.containment_floor = request.declared_containment_floor;
+    let unconfined =
+        request.declared_containment_floor == murmur_artifact::ContainmentClass::Unconfined;
     check_containment_floor(
         containment.declared(),
         containment.achieved(),
@@ -2633,8 +2638,9 @@ pub fn stage_session(
     // capsule has one is known only from `staged.installed_artifacts`, after the registry is
     // resolved, so a capsule whose only route is a declared native tool is refused by `launch`
     // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
+    // An unconfined session's subprocesses run in no namespace, so none is needed.
     crate::network_namespace::check_egress_namespace(
-        has_subprocess_route_at_staging(&request.capability_policy),
+        has_subprocess_route_at_staging(&request.capability_policy) && !unconfined,
         host_probe.egress_namespace_failure().as_ref(),
     )
     .map_err(|error| {
@@ -2657,10 +2663,14 @@ pub fn stage_session(
     // Same seam, same reason: a capsule-wide declaration whose cost the operator should see stated
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
-    warn_on_workdir_exec(workdir_exec);
-    // Past the floor check, so it fires only for a launch that goes ahead with a runtime directory
-    // its commands can change.
-    warn_on_runtime_dir_inside_workdir(&runtime_dir_placement);
+    // Neither applies to an unconfined session, whose commands can already start and change
+    // anything the operator can; `W-SEC-036` says so at launch.
+    if !unconfined {
+        warn_on_workdir_exec(workdir_exec);
+        // Past the floor check, so it fires only for a launch that goes ahead with a runtime
+        // directory its commands can change.
+        warn_on_runtime_dir_inside_workdir(&runtime_dir_placement);
+    }
     // Ordered beside the other capsule-wide declarations whose cost the operator should read
     // before the session starts, and after the refusals above so a manifest that will be rejected
     // is not first warned about.
@@ -3939,13 +3949,16 @@ fn launch(
             .is_some(),
     );
     let cgroup_scope = prepared_scope.scope;
-    let workdir_guard = Some(resources::WorkdirGuard::spawn(
-        &staged.accessible_root,
-        staged.runtime_dirs.temp.as_ref(),
-        staged.runtime_dirs.home.as_ref(),
-        Some(&staged.records_root),
-        staged.capability_policy.resources.workdir_max_bytes,
-    ));
+    let workdir_guard =
+        resources::workdir_guard_max_bytes(&staged.capability_policy).map(|max_bytes| {
+            resources::WorkdirGuard::spawn(
+                &staged.accessible_root,
+                staged.runtime_dirs.temp.as_ref(),
+                staged.runtime_dirs.home.as_ref(),
+                Some(&staged.records_root),
+                max_bytes,
+            )
+        });
 
     let shell_enforcement = sandbox::ShellEnforcement::resolve(
         &staged.capability_policy,
@@ -4222,6 +4235,9 @@ fn launch(
             &staged.scope_report.routes,
             Some(&records_root),
         );
+        if let Some(unconfined) = &staged.scope_report.unconfined {
+            crate::containment::warn_unconfined_launch(&records_root, unconfined);
+        }
         sandbox::warn_for_missing_aggregate_bounding(
             &records_root,
             requires_process_bounding,
@@ -6144,6 +6160,7 @@ fn running_record_for(
             .spawner
             .as_ref()
             .map(|spawner| spawner.session_id.clone()),
+        unconfined: staged.scope_report.unconfined.is_some(),
     }
 }
 
@@ -6628,13 +6645,8 @@ pub(crate) fn prepare_launch_scope(
     session_id: &str,
     workdir: &Path,
 ) -> Result<cgroup::PreparedScope, RuntimeError> {
-    cgroup::prepare_scope(
-        cgroup::requires_process_bounding(policy, has_native_artifact),
-        &policy.resources,
-        session_id,
-        workdir,
-    )
-    .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
+    cgroup::prepare_policy_scope(policy, has_native_artifact, session_id, workdir)
+        .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
 }
 
 /// Whether `stage_session` can already tell the capsule may start a native subprocess: a
@@ -12644,8 +12656,9 @@ fn check_native_artifact_egress_namespace(
     failure: Option<&crate::network_namespace::EgressNamespaceFailure>,
 ) -> Result<(), RuntimeError> {
     let checked_at_staging = has_subprocess_route_at_staging(policy);
+    let unconfined = policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined;
     crate::network_namespace::check_egress_namespace(
-        has_native_artifact && !checked_at_staging,
+        has_native_artifact && !checked_at_staging && !unconfined,
         failure,
     )
 }
@@ -12705,25 +12718,18 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let mut env = build_shell_env(
-        policy,
-        &[],
-        enforcement.home_dir_path(),
-        enforcement.runtime_dir_path(),
-        enforcement.records_dir_path(),
-        enforcement.tmpdir_value().as_deref(),
-    )?;
+    let mut env = crate::shell::subprocess_env(policy, &[], enforcement)?;
     let state_dir = settings.and_then(|settings| settings.state_dir.as_deref());
     if let Some(config_json) = settings.and_then(|settings| settings.config_json.as_ref()) {
         env.insert(
-            crate::artifact_config::ARTIFACT_CONFIG_ENV.to_string(),
-            config_json.clone(),
+            crate::artifact_config::ARTIFACT_CONFIG_ENV.into(),
+            config_json.clone().into(),
         );
     }
     if let Some(state_dir) = state_dir {
         env.insert(
-            crate::state_store::STATE_DIR_ENV.to_string(),
-            state_dir.to_string_lossy().into_owned(),
+            crate::state_store::STATE_DIR_ENV.into(),
+            state_dir.to_string_lossy().into_owned().into(),
         );
     }
 
@@ -20676,7 +20682,7 @@ inference:
         // the host, and the shell tool and a native tool are not handed the session's value.
         let declared = build_declared_env(&declaring);
         let tmp = TempDir::new().unwrap();
-        let shell = build_shell_env(
+        let shell = crate::shell::build_shell_env(
             &declaring,
             &native_env(&agent),
             Some(tmp.path()),

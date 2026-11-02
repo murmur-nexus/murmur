@@ -25,7 +25,7 @@ Where both files set a value, the effective config is built per field:
 | `credentials` | Always the global map. A non-empty `credentials:` in the project file is ignored, with a warning naming that file — see [`credentials:` section](#credentials) |
 | `registry.sources` | Union by scope: a project entry for a scope the global file also serves replaces the global entry; every other entry of both files is kept |
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
-| `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. See [Containment class](containment.md#field-containment) |
+| `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. `unconfined` is global-only: in the global file it chooses the [unconfined stance](containment.md#unconfined) and takes no part in the merge, and in a project file it is refused with [`E-CFG-005`](diagnostics.md#e-cfg-005). See [Containment class](containment.md#field-containment) |
 | `spend.machine_tokens_per_day` | **Lowest wins**: a project file may lower the ceiling, never raise it. See [`spend:` section](#spend) |
 | `host_paths` | Always the global list. A project file holding the key at all, `host_paths: []` included, is refused with [`E-CFG-004`](diagnostics.md#e-cfg-004) by every command that reads the config — see [`host_paths:` section](#host-paths) |
 
@@ -392,7 +392,7 @@ A run that cannot create or open the ledger refuses to start with
 | Beta gating — which beta subcommands `mur --help` lists, and `mur beta list`'s enabled column | `beta.enabled` |
 | `mur install` — the source of each scope | `registry.sources`, each file checked on its own |
 | `mur search` | `registry.index_url` |
-| `mur run`, `mur doctor` — the containment floor | `containment` |
+| `mur run`, `mur doctor` — the containment floor, and the global file's `unconfined` stance | `containment` |
 | `mur run` — the key for each `gateway.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-027` | `credentials`, from the global file only |
 | `mur run` — the machine spend ceiling; `mur run` and `mur doctor` — [`W-SEC-026`](diagnostics.md#w-sec-026) | `spend.machine_tokens_per_day` |
 | `mur run`, `mur run --explain-scope`, `mur doctor` — the host folders a contained capsule reaches | `host_paths`, from the global file only |

@@ -65,6 +65,8 @@ pub enum NotMappedReason {
     NoMountNamespace,
     /// The accessible workdir is `/tmp` itself, which a bind over `/tmp` would hide.
     WorkdirIsTmp,
+    /// The session runs unconfined: commands see `mur run`'s own `TMPDIR` and the host's `/tmp`.
+    Unconfined,
 }
 
 impl TempMapping {
@@ -84,13 +86,17 @@ impl TempMapping {
         }
     }
 
-    /// The value of `TMPDIR`, `TMP` and `TEMP` for a session whose folder is at `folder`.
+    /// The value of `TMPDIR` the commands of a session whose folder is at `folder` see. On an
+    /// unconfined session the runtime sets none, so it is `mur run`'s own `TMPDIR`, or `/tmp`
+    /// when it had none.
     #[must_use]
     pub fn tmpdir_value(self, folder: &Path) -> String {
-        if self.is_mapped() {
-            TMP_PATH.to_string()
-        } else {
-            folder.to_string_lossy().into_owned()
+        match self {
+            Self::NotMapped(NotMappedReason::Unconfined) => std::env::var_os("TMPDIR")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| TMP_PATH.to_string()),
+            _ if self.is_mapped() => TMP_PATH.to_string(),
+            _ => folder.to_string_lossy().into_owned(),
         }
     }
 }
@@ -117,6 +123,10 @@ impl NotMappedReason {
                 "the workdir is /tmp itself, which mapping /tmp would hide; TMPDIR names the \
                  session's temporary folder"
             }
+            Self::Unconfined => {
+                "the session runs unconfined, so commands see the TMPDIR mur run was started with \
+                 and the host's own /tmp"
+            }
         }
     }
 }
@@ -139,6 +149,7 @@ pub(crate) fn tier_temp_mapping(applied: EnforcementTier) -> TempMapping {
         EnforcementTier::EnvironmentOnly => {
             TempMapping::NotMapped(NotMappedReason::NoKernelContainment)
         }
+        EnforcementTier::Unconfined => TempMapping::NotMapped(NotMappedReason::Unconfined),
     }
 }
 

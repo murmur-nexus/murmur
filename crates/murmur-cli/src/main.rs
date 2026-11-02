@@ -19,6 +19,7 @@ mod live_address;
 mod residue;
 mod session_address;
 mod source;
+mod stance;
 mod stores;
 mod wit_level;
 
@@ -510,9 +511,25 @@ enum Commands {
         /// Combined with capabilities.containment in murmur.yaml and containment in
         /// .murmur/config.yaml by taking the strongest — this flag can raise the floor
         /// but never lower one another source already set. `mur run` refuses to launch
-        /// when the host's kernel cannot provide the resulting class.
+        /// when the host's kernel cannot provide the resulting class. Overrides
+        /// `containment: unconfined` in ~/.murmur/config.yaml for this run.
         #[arg(long, value_name = "CLASS")]
         containment: Option<String>,
+
+        /// Run the capsule on the host as you: its shell commands, plan shell steps, native
+        /// tools and process harness get your HOME, your whole environment, the host filesystem
+        /// and network, and no no_new_privs, so sudo works where your sudoers allows it.
+        /// Refused when the manifest or a config file declares a containment floor. Never
+        /// spreads: a delegated child or plan capsule step runs contained. With --roster, every
+        /// member is passed --unconfined.
+        #[arg(long, conflicts_with = "containment")]
+        unconfined: bool,
+
+        /// Set by every launch the runtime makes on the operator's behalf (a delegated child, a
+        /// plan capsule step, a contained roster member, a deployed capsule): this launch runs
+        /// contained, whatever the global config says, and refuses --unconfined.
+        #[arg(long, hide = true)]
+        contained_launch: bool,
 
         /// Print the effective grant set and the declared/achieved containment classes,
         /// then exit 0 without staging or launching anything. Read-only: it reports even
@@ -806,6 +823,8 @@ fn main() {
             verbose,
             no_env_file,
             containment,
+            unconfined,
+            contained_launch,
             deadline,
             ..
         } => match run_roster(RosterLaunch {
@@ -815,6 +834,8 @@ fn main() {
             verbose,
             no_env_file,
             containment: containment.as_deref(),
+            unconfined,
+            contained_launch,
             deadline,
         }) {
             // Every member has been stopped and reaped by the time a status comes back, so this
@@ -850,6 +871,8 @@ fn main() {
             bind,
             no_env_file,
             containment,
+            unconfined,
+            contained_launch,
             explain_scope,
         } => run_run(
             &manifest,
@@ -877,6 +900,10 @@ fn main() {
             &bind,
             no_env_file,
             containment.as_deref(),
+            stance::StanceFlags {
+                unconfined,
+                contained_launch,
+            },
             explain_scope,
         ),
         Commands::Conversation { command } => match command {

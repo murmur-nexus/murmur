@@ -34,6 +34,8 @@
 //! **The approval travels on the child's standard input.** Not on the argument vector and not in
 //! the environment: both are readable from `/proc/<pid>` by any process running as the same user,
 //! which is exactly what a sibling capsule's shell tool is.
+//!
+//! [`SPAWNER_LIFELINE_ENV`]: crate::lifeline::SPAWNER_LIFELINE_ENV
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -47,8 +49,6 @@ use crate::delegation::{
 };
 use crate::errors::RuntimeError;
 use crate::formation::{FormationId, FORMATION_ID_ENV};
-use crate::host_warnings::HOST_WARNINGS_REPORTED_ENV;
-use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 use crate::workdir_fs::WorkdirRoot;
@@ -77,6 +77,13 @@ pub const WORKDIR_IDENTITY_FLAG: &str = "--workdir-identity";
 /// a grant: the child's staging records it as `session_start.effective_grants.parent_workdir` and
 /// in `MURMUR.md`, and holds nothing more because of it.
 pub const PARENT_WORKDIR_SNAPSHOT_FLAG: &str = "--parent-workdir-snapshot";
+
+/// The hidden `mur run` flag every launch the runtime makes on the operator's behalf carries: a
+/// delegated child, a plan `capsule` step, a contained roster member and a deployed capsule. A
+/// launch carrying it runs contained, whatever `containment: unconfined` the global config says,
+/// and refuses `--unconfined` (`E-RUN-060`), so the unconfined stance never spreads to a capsule
+/// the operator did not launch unconfined themselves.
+pub const CONTAINED_LAUNCH_FLAG: &str = "--contained-launch";
 
 /// `(st_dev, st_ino)` in [`WORKDIR_IDENTITY_FLAG`]'s `<dev>:<ino>` form.
 #[must_use]
@@ -625,6 +632,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         READINESS_TOKENS_FLAG.to_string(),
         "--no-env-file".to_string(),
         "--spawn-grant-stdin".to_string(),
+        CONTAINED_LAUNCH_FLAG.to_string(),
     ];
     if let Some(deadline) = request.deadline {
         argv.push(crate::session_status::INHERITED_DEADLINE_FLAG.to_string());
@@ -1074,6 +1082,9 @@ fn watch_for_completion(
 /// * [`SPAWNER_LIFELINE_ENV`]: a value here names a descriptor of this process's own, the lifeline
 ///   its own spawner handed it. The child holds a spawner lifeline of its own instead, which
 ///   [`launch_child_capsule`] hands it alongside this environment.
+///
+/// [`HOST_WARNINGS_REPORTED_ENV`]: crate::host_warnings::HOST_WARNINGS_REPORTED_ENV
+/// [`SPAWNER_LIFELINE_ENV`]: crate::lifeline::SPAWNER_LIFELINE_ENV
 pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -1085,12 +1096,9 @@ pub(crate) fn child_environment(
         }
     }
     env.retain(|(key, _)| {
-        !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
+        !matches!(key.as_str(), "PATH" | "HOME")
             && !crate::shell::ACCOUNT_ENV.contains(&key.as_str())
-            && key != SPAWNER_ENV
-            && key != FORMATION_ID_ENV
-            && key != SPAWNER_LIFELINE_ENV
-            && key != HOST_WARNINGS_REPORTED_ENV
+            && !crate::shell::LINEAGE_ENV.contains(&key.as_str())
             && !crate::formation::is_member_grant_env(key)
     });
 
@@ -1495,6 +1503,7 @@ pub(crate) fn relay_readiness_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_warnings::HOST_WARNINGS_REPORTED_ENV;
 
     #[test]
     fn a_child_directory_is_unique_per_delegation() {

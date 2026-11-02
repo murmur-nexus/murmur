@@ -205,6 +205,8 @@ struct ListedCapsule {
     formation_member: Option<String>,
     /// `true` for the entry member of a formation, `false` for every other session.
     formation_entry: bool,
+    /// `true` for a session running unconfined, whose commands run as the operator.
+    unconfined: bool,
 }
 
 /// `mur ps --json`: the rows `mur ps` would print, and the formations they name, as one
@@ -269,6 +271,7 @@ fn listed_capsule(record: RunningRecord, status: &'static str) -> ListedCapsule 
             .map(|id| id.as_str().to_string()),
         formation_member: record.formation_member,
         formation_entry: record.formation_entry,
+        unconfined: record.unconfined,
         session_id: record.session_id,
     }
 }
@@ -334,6 +337,19 @@ fn print_table(rows: &[(RunningRecord, &str)], with_formation: bool) {
             record.url.as_deref().unwrap_or("-"),
         );
     }
+    // Below the table rather than a column, so the table every script reads keeps its shape.
+    for (record, _) in rows.iter().filter(|(record, _)| record.unconfined) {
+        capsule_runtime::report_println!("{}", unconfined_row_note(record));
+    }
+}
+
+/// The line below the table naming one unconfined session.
+fn unconfined_row_note(record: &RunningRecord) -> String {
+    format!(
+        "{} runs unconfined: its commands run as you, with your HOME, environment, filesystem, \
+         network and sudo",
+        record.session_id
+    )
 }
 
 /// `rows`, in session id descending order, regrouped so each formation's rows are contiguous.
@@ -727,6 +743,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         };
         (record, STATUS_RUNNING)
     }
@@ -939,7 +956,9 @@ mod tests {
         );
         let text = serde_json::to_string(&capsule).unwrap();
         assert!(
-            text.ends_with(r#""formation_member":null,"formation_entry":false}"#),
+            text.ends_with(
+                r#""formation_member":null,"formation_entry":false,"unconfined":false}"#
+            ),
             "{text}"
         );
 
@@ -950,6 +969,21 @@ mod tests {
         let value = serde_json::to_value(listed_capsule(entry, status)).unwrap();
         assert_eq!(value["formation_member"], "lead");
         assert_eq!(value["formation_entry"], true);
+    }
+
+    /// Every capsule entry says whether it runs unconfined, and the table names an unconfined
+    /// session on a line of its own.
+    #[test]
+    fn every_listed_capsule_says_whether_it_is_unconfined() {
+        let (mut record, status) = row("ses_3", None);
+        record.unconfined = true;
+        assert_eq!(
+            unconfined_row_note(&record),
+            "ses_3 runs unconfined: its commands run as you, with your HOME, environment, \
+             filesystem, network and sudo"
+        );
+        let value = serde_json::to_value(listed_capsule(record, status)).unwrap();
+        assert_eq!(value["unconfined"], true);
     }
 
     /// A formation's `entry_member` is the roster name of the record that says it is the entry

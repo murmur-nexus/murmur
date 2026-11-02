@@ -157,6 +157,9 @@ pub struct RunningRecord {
     /// spawner's lifeline and ends with it. Absent for a session nothing delegated to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<String>,
+    /// The session runs unconfined: its commands run as the operator. Absent when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unconfined: bool,
 }
 
 /// A process named so that a recycled pid is never mistaken for it: its pid, and its start time as
@@ -979,6 +982,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         };
         let token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
         let record_guard = RunningGuard::write(&record).unwrap();
@@ -1026,6 +1030,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         }
     }
 
@@ -1339,6 +1344,7 @@ mod tests {
             "formation_lifeline",
             "formation_launcher",
             "spawned_by",
+            "unconfined",
         ] {
             assert!(!body.contains(key), "{key} in {body}");
         }
@@ -1813,6 +1819,7 @@ mod home_tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         }
     }
 

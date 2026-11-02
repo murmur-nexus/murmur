@@ -80,6 +80,9 @@ pub(crate) struct ExecFacts {
     /// `capabilities.filesystem.workdir_exec`. The session's `$HOME` and `$TMPDIR` carry the work
     /// folder's rights, `Execute` included, so the section names all three together.
     pub(crate) workdir_exec: bool,
+    /// `Some` when the session runs unconfined, holding the `HOME` its commands see (`None` when
+    /// `mur run` had none): the section then states that commands run as the operator.
+    pub(crate) unconfined: Option<Option<String>>,
 }
 
 impl ExecFacts {
@@ -93,8 +96,12 @@ impl ExecFacts {
 
         let enforced = match applied_tier {
             EnforcementTier::KernelSealed | EnforcementTier::KernelFull => true,
-            EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => false,
+            EnforcementTier::KernelSeccompOnly
+            | EnforcementTier::EnvironmentOnly
+            | EnforcementTier::Unconfined => false,
         };
+        let unconfined = (applied_tier == EnforcementTier::Unconfined)
+            .then(|| std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned()));
         let mut runtime_dirs: Vec<String> = Vec::new();
         let interpreter_dirs =
             crate::sandbox::resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime)
@@ -111,6 +118,7 @@ impl ExecFacts {
             enforced,
             runtime_dirs,
             workdir_exec: policy.workdir_exec_allowed,
+            unconfined,
         }
     }
 }
@@ -593,7 +601,17 @@ fn build_shell_section(shell_allow: &[String], exec: &ExecFacts) -> String {
         ));
     }
 
-    if exec.enforced {
+    if let Some(home) = &exec.unconfined {
+        let home = match home {
+            Some(home) => format!("`$HOME` is {}", sanitize_description(home)),
+            None => "`$HOME` is unset".to_string(),
+        };
+        out.push_str(&format!(
+            "Commands run unconfined, as the operator's own account on this host: {home}, the \
+             environment is the operator's, and no containment applies to what a command starts, \
+             reads, writes or connects to.\n\n"
+        ));
+    } else if exec.enforced {
         out.push_str(&format!(
             "Programs a command can start: {}",
             shell_allow.join(", ")
@@ -746,6 +764,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
             enforced: true,
             runtime_dirs: Vec::new(),
             workdir_exec: false,
+            unconfined: None,
         },
         parent_workdir: None,
         instruction_files: None,
@@ -1549,6 +1568,32 @@ mod tests {
         assert!(!section.contains("Call it directly"), "{section}");
     }
 
+    /// An unconfined session's section states who commands run as and prescribes nothing.
+    #[test]
+    fn shell_section_states_an_unconfined_session_runs_as_the_operator() {
+        let section = shell_section_of(
+            &["bash"],
+            ExecFacts {
+                enforced: false,
+                unconfined: Some(Some("/home/operator".to_string())),
+                ..enforced()
+            },
+        );
+        assert!(
+            section.contains(
+                "Commands run unconfined, as the operator's own account on this host: `$HOME` is \
+                 /home/operator, the environment is the operator's, and no containment applies \
+                 to what a command starts, reads, writes or connects to."
+            ),
+            "{section}"
+        );
+        assert!(
+            !section.contains("Programs a command can start"),
+            "{section}"
+        );
+        assert!(!section.contains("does not restrict"), "{section}");
+    }
+
     #[test]
     fn shell_section_says_not_enabled_when_empty() {
         for exec in [
@@ -1654,6 +1699,7 @@ mod tests {
                     "/opt/tool".to_string(),
                 ],
                 workdir_exec: true,
+                unconfined: None,
             }
         );
         let section = shell_section_of(&["python3"], exec);

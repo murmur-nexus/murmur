@@ -286,6 +286,12 @@ pub struct CapabilityPolicy {
     /// inside its wasmtime store, this bounds the processes the host forks. See
     /// [`crate::resources`].
     pub resources: crate::resources::HostResourceLimits,
+    /// The manifest's own `capabilities.resources` block, every omitted field still `None`.
+    /// [`Self::resources`] is what a contained session applies; an unconfined session (a
+    /// [`Self::containment_floor`] of `ContainmentClass::Unconfined`) applies only what this
+    /// declares, creates a cgroup scope only when it declares a `cgroup_*` field and runs the
+    /// workdir guard only when it declares `workdir_max_bytes`.
+    pub declared_resources: murmur_artifact::ResourceCapabilities,
     /// The containment class this capsule asked for, from `capabilities.containment`.
     ///
     /// Unlike every other field here it is a *requirement*, not a grant — and unlike
@@ -1069,6 +1075,7 @@ pub fn capability_policy_from_runtime_manifest(
         env_allow,
         limits,
         resources,
+        declared_resources: caps.and_then(|c| c.resources).unwrap_or_default(),
         containment_floor: caps.and_then(|c| c.containment).unwrap_or_default(),
         state_declared,
         conversation_declared,

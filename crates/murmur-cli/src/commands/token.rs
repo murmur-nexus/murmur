@@ -84,6 +84,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         }
     }
 

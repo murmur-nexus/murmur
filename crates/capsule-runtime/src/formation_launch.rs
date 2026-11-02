@@ -138,6 +138,11 @@ pub struct FormationLaunchOptions {
     pub no_env_file: bool,
     /// `--containment <class>`, passed to every member.
     pub containment: Option<String>,
+    /// The roster's own stance resolved unconfined (`--unconfined`, or `containment: unconfined`
+    /// in the global config with no `--containment`): every member is passed `--unconfined` and
+    /// resolves it against its own manifest. `false` passes every member
+    /// [`child_launch::CONTAINED_LAUNCH_FLAG`] instead.
+    pub unconfined: bool,
     /// Each member's deadline to become ready, from its spawn. [`MEMBER_READY_TIMEOUT`] in
     /// production.
     pub ready_timeout: Duration,
@@ -164,6 +169,7 @@ impl FormationLaunchOptions {
             verbose: false,
             no_env_file: false,
             containment: None,
+            unconfined: false,
             ready_timeout: MEMBER_READY_TIMEOUT,
             stop_grace: MEMBER_STOP_GRACE,
             deadline: None,
@@ -860,6 +866,11 @@ fn pass_through(args: &mut Vec<String>, options: &FormationLaunchOptions) {
     if let Some(class) = &options.containment {
         args.push("--containment".to_string());
         args.push(class.clone());
+    }
+    if options.unconfined {
+        args.push("--unconfined".to_string());
+    } else {
+        args.push(child_launch::CONTAINED_LAUNCH_FLAG.to_string());
     }
     if let Some(deadline) = &options.deadline {
         args.push(INHERITED_DEADLINE_FLAG.to_string());
@@ -1974,6 +1985,7 @@ mod tests {
                 "--readiness-tokens",
                 "--bind",
                 "127.0.0.1",
+                child_launch::CONTAINED_LAUNCH_FLAG,
             ]
         );
         options.task = Some("probe".to_string());
@@ -1997,6 +2009,7 @@ mod tests {
                 "--no-env-file",
                 "--containment",
                 "scoped",
+                child_launch::CONTAINED_LAUNCH_FLAG,
             ]
         );
         assert!(
@@ -2009,7 +2022,8 @@ mod tests {
         assert!(peer.ends_with(&[
             "--no-env-file".to_string(),
             "--containment".to_string(),
-            "scoped".to_string()
+            "scoped".to_string(),
+            child_launch::CONTAINED_LAUNCH_FLAG.to_string(),
         ]));
         assert!(!peer.iter().any(|arg| arg == "--task" || arg == "--verbose"));
         assert!(
@@ -2036,6 +2050,7 @@ mod tests {
                 "--no-env-file",
                 "--containment",
                 "scoped",
+                child_launch::CONTAINED_LAUNCH_FLAG,
             ]
         );
         assert_eq!(peer_args(&coder, &options, &workdir), peer);
@@ -2063,6 +2078,43 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A contained roster passes every member the contained-launch flag; an unconfined one passes
+    /// every member `--unconfined` instead, and never both.
+    #[test]
+    fn every_member_carries_the_rosters_stance() {
+        let mut options = options(MEMBER_READY_TIMEOUT);
+        let coder = member("coder");
+        let workdir = PathBuf::from("/home/u/.murmur/formations/frm_x/coder");
+        for args in [
+            peer_args(&coder, &options, &workdir),
+            entry_args(&member("planner"), &options),
+        ] {
+            assert!(
+                args.iter()
+                    .any(|arg| arg == child_launch::CONTAINED_LAUNCH_FLAG),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|arg| arg == "--unconfined"), "{args:?}");
+        }
+        options.unconfined = true;
+        for args in [
+            peer_args(&coder, &options, &workdir),
+            entry_args(&member("planner"), &options),
+        ] {
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--unconfined").count(),
+                1,
+                "{args:?}"
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == child_launch::CONTAINED_LAUNCH_FLAG),
+                "{args:?}"
+            );
+        }
     }
 
     /// Serializes the tests that point `MURMUR_MUR_BINARY` at a stand-in; the variable is
@@ -2960,6 +3012,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         }
     }
 

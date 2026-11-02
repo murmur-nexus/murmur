@@ -326,6 +326,95 @@ pub(crate) fn apply_hard_rlimits(
     apply_per_process_rlimits(limits)
 }
 
+/// The rlimits of an unconfined spawn: exactly the fields `declared` names, each as a hard limit
+/// on [`apply_hard_rlimits`]'s terms, and nothing else — no `RLIMIT_CORE`, no default for an
+/// undeclared field, so an undeclared limit stays the one this process inherited.
+/// `RLIMIT_NPROC` is set only when `max_processes` is declared, and then as
+/// [`apply_nproc_bound`] sets it. Same `pre_exec` restrictions as [`apply_hard_rlimits`].
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn apply_declared_rlimits(
+    declared: &murmur_artifact::ResourceCapabilities,
+    nproc: NprocBound,
+) -> std::io::Result<()> {
+    if let (Some(max_processes), NprocBound::Headroom { baseline }) =
+        (declared.max_processes, nproc)
+    {
+        set_hard_rlimit(
+            libc::RLIMIT_NPROC as u32,
+            baseline.saturating_add(max_processes),
+        )?;
+    }
+    if let Some(max_open_files) = declared.max_open_files {
+        set_hard_rlimit(libc::RLIMIT_NOFILE as u32, max_open_files)?;
+    }
+    if let Some(max_file_size_bytes) = declared.max_file_size_bytes {
+        set_hard_rlimit(libc::RLIMIT_FSIZE as u32, max_file_size_bytes)?;
+    }
+    if let Some(cpu_seconds) = declared.cpu_seconds {
+        set_cpu_rlimit(cpu_seconds)?;
+    }
+    if let Some(memory_bytes) = declared.memory_bytes {
+        #[cfg(target_os = "linux")]
+        set_hard_rlimit(libc::RLIMIT_AS as u32, memory_bytes)?;
+        // See `apply_per_process_rlimits` for why macOS tolerates this failing.
+        #[cfg(not(target_os = "linux"))]
+        let _ = set_hard_rlimit(libc::RLIMIT_DATA as u32, memory_bytes);
+    }
+    Ok(())
+}
+
+/// Whether `declared` names any cgroup field, the condition for an unconfined session to have a
+/// cgroup scope at all.
+pub(crate) fn declares_cgroup_limit(declared: &murmur_artifact::ResourceCapabilities) -> bool {
+    declared.cgroup_memory_bytes.is_some()
+        || declared.cgroup_pids_max.is_some()
+        || declared.cgroup_cpu_percent.is_some()
+        || declared.cgroup_io_bytes_per_sec.is_some()
+}
+
+/// The workdir ceiling a session's guard enforces, or `None` when it runs no guard: a contained
+/// session always guards at the resolved [`HostResourceLimits::workdir_max_bytes`], an unconfined
+/// one only when `capabilities.resources.workdir_max_bytes` is declared.
+pub(crate) fn workdir_guard_max_bytes(policy: &crate::types::CapabilityPolicy) -> Option<u64> {
+    if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined {
+        policy.declared_resources.workdir_max_bytes
+    } else {
+        Some(policy.resources.workdir_max_bytes)
+    }
+}
+
+/// The names of the `capabilities.resources` fields `declared` sets, in declaration order: what
+/// an unconfined session's limits are, as its scope report lists them.
+pub(crate) fn declared_resource_fields(
+    declared: &murmur_artifact::ResourceCapabilities,
+) -> Vec<&'static str> {
+    [
+        ("max_processes", declared.max_processes.is_some()),
+        ("max_open_files", declared.max_open_files.is_some()),
+        (
+            "max_file_size_bytes",
+            declared.max_file_size_bytes.is_some(),
+        ),
+        ("cpu_seconds", declared.cpu_seconds.is_some()),
+        ("memory_bytes", declared.memory_bytes.is_some()),
+        (
+            "cgroup_memory_bytes",
+            declared.cgroup_memory_bytes.is_some(),
+        ),
+        ("cgroup_pids_max", declared.cgroup_pids_max.is_some()),
+        ("cgroup_cpu_percent", declared.cgroup_cpu_percent.is_some()),
+        (
+            "cgroup_io_bytes_per_sec",
+            declared.cgroup_io_bytes_per_sec.is_some(),
+        ),
+        ("workdir_max_bytes", declared.workdir_max_bytes.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect()
+}
+
 /// The `RLIMIT_NPROC` half of [`apply_hard_rlimits`]: set for [`NprocBound::Headroom`], left
 /// alone for [`NprocBound::CgroupPidsMax`]. Same `pre_exec` restrictions.
 ///
@@ -872,6 +961,47 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an unconfined session applies is what the manifest declares, field by field: the
+    /// workdir guard only for a declared `workdir_max_bytes`, a scope only for a `cgroup_*` field,
+    /// and the report lists exactly the declared names. A contained session keeps the resolved
+    /// limits.
+    #[test]
+    fn an_unconfined_session_applies_only_the_declared_limits() {
+        use murmur_artifact::{ContainmentClass, ResourceCapabilities};
+        let empty = ResourceCapabilities::default();
+        assert!(declared_resource_fields(&empty).is_empty());
+        assert!(!declares_cgroup_limit(&empty));
+        let declared = ResourceCapabilities {
+            max_open_files: Some(256),
+            cgroup_pids_max: Some(64),
+            workdir_max_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        assert_eq!(
+            declared_resource_fields(&declared),
+            vec!["max_open_files", "cgroup_pids_max", "workdir_max_bytes"]
+        );
+        assert!(declares_cgroup_limit(&declared));
+
+        let policy = |containment_floor, declared_resources| crate::types::CapabilityPolicy {
+            containment_floor,
+            declared_resources,
+            ..Default::default()
+        };
+        assert_eq!(
+            workdir_guard_max_bytes(&policy(ContainmentClass::Unconfined, empty)),
+            None
+        );
+        assert_eq!(
+            workdir_guard_max_bytes(&policy(ContainmentClass::Unconfined, declared)),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            workdir_guard_max_bytes(&policy(ContainmentClass::Advisory, empty)),
+            Some(DEFAULT_WORKDIR_MAX_BYTES)
+        );
+    }
 
     #[test]
     fn resolve_uses_defaults_when_manifest_is_silent() {

@@ -1864,15 +1864,19 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // Computed once here rather than inside the `staged_runtime` branch it used to live in,
     // because the two reachability checks below need it for *every* capsule, not only one
     // declaring a grant.
-    let declared_floor = effective_containment_floor(
-        effective_config
-            .as_ref()
-            .and_then(|config| config.containment),
-        runtime_manifest
-            .capabilities
-            .as_ref()
-            .and_then(|capabilities| capabilities.containment),
-        None,
+    let manifest_floor = runtime_manifest
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.containment);
+    let containment_config = crate::config::load_containment_config()?;
+    let declared_floor = doctor_containment_stance(
+        containment_config,
+        manifest_floor,
+        effective_containment_floor(
+            effective_config.as_ref().and_then(|config| config.containment),
+            manifest_floor,
+            None,
+        ),
     );
     let staged_runtime = runtime_manifest
         .capabilities
@@ -1930,7 +1934,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let spawn_allows = capabilities
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
-    let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy);
+    // An unconfined launch's subprocesses run in no namespace, so none is needed.
+    let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy)
+        && declared_floor != murmur_artifact::ContainmentClass::Unconfined;
     // One reading of the host for the whole checklist: the `E-CAP-005` warnings, the `AppArmor /
     // user namespaces` block, the native tools' mechanism and the runtime directory sections below
     // cannot describe two different hosts.
@@ -2429,6 +2435,50 @@ fn report_host_paths(
     if let Err(refusal) = check_policy_execute_roots(&policy, mechanism) {
         refuse(crate::error::host_path_refusal_to_cli(&refusal));
     }
+}
+
+/// The containment stance `mur run` with no flags would resolve for this capsule, reported, and
+/// the floor the rest of the checklist reads: `unconfined` when the global config chooses it,
+/// `contained` otherwise. When the global config chooses `unconfined` and a floor is declared too,
+/// `mur run` refuses with `E-RUN-059`, which is said here as a warning, and the checklist reads
+/// the contained floor a `--containment` launch would run at.
+fn doctor_containment_stance(
+    config: crate::config::ContainmentConfig,
+    manifest: Option<murmur_artifact::ContainmentClass>,
+    contained_floor: murmur_artifact::ContainmentClass,
+) -> murmur_artifact::ContainmentClass {
+    let stance = crate::stance::resolve_stance(crate::stance::StanceInputs {
+        global: config.global,
+        project: config.project,
+        manifest,
+        ..crate::stance::StanceInputs::default()
+    });
+    match stance {
+        Ok(crate::stance::Stance::Unconfined(source)) => {
+            capsule_runtime::report_println!("{}", unconfined_stance_line(source.describe()));
+            murmur_artifact::ContainmentClass::Unconfined
+        }
+        Ok(crate::stance::Stance::Contained(floor)) => floor,
+        Err(error) => {
+            capsule_runtime::report_eprintln!(
+                "[mur doctor] warning[{}]: {}\n  `mur run` will refuse this capsule; {}",
+                error.code,
+                error.message,
+                error.hint.as_deref().unwrap_or_default()
+            );
+            contained_floor
+        }
+    }
+}
+
+/// The `Containment stance` line for an unconfined launch chosen by `source`.
+fn unconfined_stance_line(source: &str) -> String {
+    format!(
+        "Containment stance: unconfined ({source}) — shell commands, plan shell steps, native \
+         tools and the process harness run as you, with your HOME, your whole environment, the \
+         host filesystem and network, and sudo; no Landlock, seccomp, namespaces or \
+         no_new_privs, and resource limits only where capabilities.resources declares them"
+    )
 }
 
 #[cfg(test)]

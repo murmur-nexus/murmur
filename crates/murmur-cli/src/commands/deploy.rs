@@ -942,14 +942,16 @@ fn precompile_warnings(
 /// deploy only discovers as a 120s `tail -f` timeout. Artifacts are pre-staged
 /// by the upload step before this runs, so no fetch flag belongs here.
 fn build_start_script(remote_deploy_dir: &str, remote_manifest: &str) -> String {
+    // A deployed capsule is contained whatever the remote host's global config says.
     format!(
         "{}> /tmp/mur-start.json; \
          nohup /usr/local/bin/mur run --manifest {remote_manifest} \
          --workdir {remote_deploy_dir} \
-         --json \
+         --json {contained} \
          >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
          timeout 120 tail -f /tmp/mur-start.json | head -n 1",
-        remote_env_prefix(remote_deploy_dir)
+        remote_env_prefix(remote_deploy_dir),
+        contained = capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG,
     )
 }
 
@@ -2000,6 +2002,8 @@ mod tests {
         );
         assert!(script.contains("--workdir /root/mur-abc123"), "{script}");
         assert!(script.contains("--json"), "{script}");
+        assert!(script.contains("--contained-launch"), "{script}");
+        assert!(!script.contains("--unconfined"), "{script}");
     }
 
     #[test]
@@ -2009,7 +2013,7 @@ mod tests {
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
              > /tmp/mur-start.json; \
              nohup /usr/local/bin/mur run --manifest /root/mur-abc123/murmur.yaml \
-             --workdir /root/mur-abc123 --json \
+             --workdir /root/mur-abc123 --json --contained-launch \
              >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
              timeout 120 tail -f /tmp/mur-start.json | head -n 1"
         );
