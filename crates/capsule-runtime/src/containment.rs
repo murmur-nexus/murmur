@@ -1088,6 +1088,11 @@ pub struct ScopeReport {
     /// `network.allow` is empty or the host has none of the locations
     /// [`crate::trust_store`] checks.
     pub trust_store: Vec<String>,
+    /// Every host folder `~/.murmur/config.yaml`'s `host_paths:` lends this session, in config
+    /// order, with what the applied tier does with it (see [`crate::host_paths`]). Always
+    /// serialized, `[]` with none. A grant from the operator's global config, never the manifest,
+    /// and it changes no class, floor or tier.
+    pub host_paths: Vec<crate::host_paths::HostPathReport>,
     /// The read-only file surface `exports.files` declares, or `null` when the capsule declares
     /// none. Always serialized (never skipped), so a consumer can tell "this runtime predates
     /// exports" from "this capsule declined to export anything" by the field's presence rather
@@ -1312,6 +1317,15 @@ impl ScopeReport {
             &self.derived_interpreter_runtime,
         );
         push_list(&mut out, "trust store", &self.trust_store);
+        push_list(
+            &mut out,
+            "host paths",
+            &self
+                .host_paths
+                .iter()
+                .map(crate::host_paths::HostPathReport::render)
+                .collect::<Vec<_>>(),
+        );
         push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
         push_list(
             &mut out,
@@ -1903,6 +1917,12 @@ pub(crate) fn scope_report_for_tier(
                 format!("{}{listable}", entry.path.display())
             })
             .collect(),
+        // Keyed on the applied tier, like `filesystem_boundary`: what scopes a host path is the
+        // mechanism this session installs, not the class it achieves.
+        host_paths: crate::host_paths::host_path_reports(
+            &policy.host_paths,
+            crate::host_paths::HostPathMechanism::for_enforcement_tier(decision.enforcement_tier()),
+        ),
         staged_runtime_grants: policy
             .shell_staged_runtime
             .iter()
@@ -4479,6 +4499,7 @@ mod tests {
                 "derived_interpreter_runtime",
             ),
             ("shell_trust_store", "trust_store"),
+            ("host_paths", "host_paths"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),
             ("plan_submit", "plan_submit"),

@@ -40,6 +40,7 @@ section that explains it.
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-CFG-003` | `registry:` in a config file cannot be used: a removed `default:` key, a source's `name:`, `type:` or `url:`, a `repo` that is not `<owner>/<repo>`, a reserved scope claimed, or two sources for one scope | [E-CFG-003](#e-cfg-003) |
+| `E-CFG-004` | A `host_paths` entry cannot be used: it is malformed, it is named outside `~/.murmur/config.yaml`, or it cannot be honoured on this host | [E-CFG-004](#e-cfg-004) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy run`](cli.md#mur-deploy-run) |
@@ -193,6 +194,7 @@ section that explains it.
 | `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
 | `W-SEC-033` | The session's runtime or records directory lies inside the workdir, so the capsule's commands can change the files the runtime owns or the records it keeps | [W-SEC-033](#w-sec-033) |
 | `W-SEC-034` | A capsule declaring a `scoped` or `sealed` floor runs code on a route that class does not confine | [W-SEC-034](#w-sec-034) |
+| `W-SEC-035` | A `host_paths` entry reaches a credential location, so every contained capsule on the host can read it | [W-SEC-035](#w-sec-035) |
 
 ---
 
@@ -2301,6 +2303,32 @@ error[E-CFG-003]: /home/ana/.murmur/config.yaml sets registry.default, which thi
 | `repo '…' names no usable scope` | The owner is not a valid scope; name another repository |
 | `registry.sources[N] (…) and registry.sources[M] (…) both serve scope '…'` | Keep one of them |
 
+### E-CFG-004 — a `host_paths` entry cannot be used { #e-cfg-004 }
+
+[`host_paths:`](config.md#host-paths) is read from `~/.murmur/config.yaml` only, and `mur run`
+refuses an entry it cannot honour rather than launch without it. The refusal names the entry's
+index, its path as written, the directory it resolves to when it has one, and the reason. Nothing
+is staged. `mur run --explain-scope` refuses the same entries, and `mur doctor` prints each as a
+warning and continues.
+
+```text
+error[E-CFG-004]: ~/.murmur/config.yaml: host_paths[1] (~/tools, resolved to /home/ana/tools): is read-write over /home/ana/tools/bin, a folder this session may run /home/ana/tools/bin/fmt from, so the capsule could rewrite what it runs; at scoped nothing prevents that. Name a folder that does not contain it, make the entry `access: read`, or declare containment: sealed, which binds it read-only
+```
+
+| Message names | Why it is refused | Fix |
+|---|---|---|
+| `<cwd>/.murmur/config.yaml sets host_paths:` | Only the operator's global config lends a host folder; a project file holding the key at all, `host_paths: []` included, is refused by every command that reads the config | Move the entries to `~/.murmur/config.yaml` |
+| `the entry has no path`, `access is required`, `access '…' is neither` | Every entry needs both keys, and `access` has no default. An unquoted `path: ~` is YAML's null, so it reads as no path | Write `path:` (`"~"` quoted for the home folder itself) and `access: read` or `access: read-write` |
+| `is relative` | Only `/…`, `~` and `~/…` are understood; `~user` and `$VAR` are not expanded | Write the absolute path |
+| `names /`, `resolves to /` | The whole host filesystem is not a folder | Name the folder the capsule needs |
+| `does not exist`, `is not a directory` | An entry names an existing folder | Create the folder, or fix the path |
+| `lies under /usr` (or `/bin`, `/sbin`, `/lib*`, `/etc`, `/proc`, `/sys`, `/dev`, `/tmp`) | A composed root carries its own copy of these or replaces them, and the private `/tmp` replaces `/tmp`, so the entry would not reach the host's folder on every tier | Name a folder outside them |
+| `is read-write over murmur's own home` | `~/.murmur` holds this file, whose `host_paths` and `containment` grant every later session, and every session's records; a capsule that could write it would widen what the next capsule gets | Use `access: read`, or name a folder that does not contain `~/.murmur` |
+| `lies inside the work folder` | The capsule already reaches its work folder read-write, so a `read` entry there would not be read-only | Remove the entry |
+| `names the same directory as`, `resolves to the same directory as` | One directory, one entry | Keep one entry |
+| `is read-write inside …, a folder this session may run … from` | On `sealed` the folder's read-only bind would hide the entry; on `scoped` the capsule could write a file there and run it | Name a folder outside it, or use `access: read` |
+| `is read-write over …, a folder this session may run … from` | At `scoped` nothing keeps the capsule from rewriting a binary it may run in place. Refused at `scoped` only: `sealed` binds that folder read-only on top of the entry | Name a folder that does not contain it, use `access: read`, or declare `containment: sealed` |
+
 ---
 
 ## Index errors
@@ -3046,6 +3074,7 @@ Where a warning is written depends on whether the session's records directory ex
 | `W-SEC-032` — decided at staging by `mur run`, by `mur doctor`, and by `mur deploy run` once the port is published | stderr from `mur run` and `mur deploy run`; stdout from `mur doctor` |
 | `W-SEC-033` — decided at staging by `mur run`, and by `mur doctor` | stderr |
 | `W-SEC-034` — from `mur doctor` | stderr |
+| `W-SEC-035` — decided before staging by `mur run`, and by `mur doctor` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -4098,3 +4127,40 @@ allowlist; the process harness and its tools run with your authority.
 
 **What to do:** read the `Routes` block of `mur run --explain-scope` for what holds each route,
 and give each WASM tool, driver and hook only the `capabilities:` it needs.
+
+### W-SEC-035 — a host path reaches a credential location { #w-sec-035 }
+
+**Fires when:** a [`host_paths`](config.md#host-paths) entry is, lies under, or contains one of
+these locations, and that location exists in the `HOME` `mur` runs with:
+
+| Location | Credential backstop pattern for the same credential |
+|---|---|
+| `~/.ssh`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials` | — |
+| `~/.aws` | `AWS_*` |
+| `~/.config/gh` | `GITHUB_TOKEN`, `GH_TOKEN` |
+| `~/.docker` | `DOCKER_*` |
+| `~/.kube` | `KUBECONFIG` |
+| `~/.npmrc` | `NPM_TOKEN` |
+| `~/.pypirc` | `PYPI_TOKEN` |
+| `~/.cargo/credentials.toml`, `~/.cargo/credentials` | `CARGO_REGISTRY_TOKEN` |
+| `~/.config/gcloud` | `GOOGLE_API_KEY` |
+| `~/.cache/huggingface` | `HUGGING_FACE_HUB_TOKEN` |
+| `~/.murmur` | Provider keys in `config.yaml` |
+
+| From | When |
+|---|---|
+| `mur run` | Once per entry per launch, before staging |
+| `mur doctor` | Once per entry |
+
+```text
+[capsule-runtime] warning[W-SEC-035]: host_paths entry ~/.cargo (read-write) reaches the credential location ~/.cargo/credentials.toml, so every scoped or sealed capsule on this host can read and change it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-035)
+```
+
+**Why it matters:** the [credential backstop](#e-cap-016) keeps these
+credentials out of a command's environment, and a host path hands the file that holds them to every
+contained capsule on the host.
+
+**What the runtime does about it:** the launch runs. The entry's
+`effective_grants.host_paths[i].credential_location` names the location.
+
+**What to do:** lend a narrower folder that does not hold the credential, or accept the warning.

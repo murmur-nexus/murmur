@@ -205,6 +205,8 @@ Treat these diagnostics as security-significant:
 - `E-CAP-002`: an artifact filesystem scope used an absolute path or escaped its allowed root.
 - `W-SEC-033`: the runtime directory (`~/.murmur/sessions`) or the session records directory (`~/.murmur/records/…`) lies inside the workdir, so the capsule's commands can change its task, `MURMUR.md`, plans and installed tools, or its trace, logs, eval score and delegation outcome; run with a `--workdir` that does not contain `~/.murmur`.
 - `W-SEC-034`: a `scoped` or `sealed` capsule runs code on a route the class does not confine (WASM tools, drivers, hooks, a process harness); give each such artifact only the `capabilities:` it needs.
+- `W-SEC-035`: a `host_paths` entry in `~/.murmur/config.yaml` reaches a credential location (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.murmur`, …), so every contained capsule on the host can read it; lend a narrower folder.
+- `E-CFG-004`: a `host_paths` entry is malformed, sits in a project config, or cannot be honoured on this host (missing, `/`, a system path, read-write over `~/.murmur` or over a folder the session runs binaries from at `scoped`); fix or remove the entry rather than dropping containment.
 - `E-IO-004`: `HOME` is unset, relative, or cannot hold `~/.murmur`; set it to an absolute directory you own.
 
 Warnings are the difference between intended and effective policy. Capture them in automation; do not suppress, ignore, or “fix” them by renaming an equally powerful primitive.

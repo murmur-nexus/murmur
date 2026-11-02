@@ -313,6 +313,13 @@ pub const W_SEC_033: &str = "W-SEC-033";
 /// once per launch, from `mur run` (stderr and the bootstrap log) and from `mur doctor`.
 pub const W_SEC_034: &str = "W-SEC-034";
 
+/// A `host_paths` entry in `~/.murmur/config.yaml` is, lies under, or contains a credential
+/// location that exists on this host (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.murmur`, …), so every
+/// scoped or sealed capsule on the host can read it, and change it when the entry is
+/// `read-write`. Never a refusal: lending such a folder is the operator's call. Fires once per entry
+/// from `mur run` and from `mur doctor`, naming the entry and the location.
+pub const W_SEC_035: &str = "W-SEC-035";
+
 /// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.
 pub fn security_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -330,7 +337,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_016, W_SEC_017,
             W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_028,
-            W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033, W_SEC_034,
+            W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033, W_SEC_034, W_SEC_035,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

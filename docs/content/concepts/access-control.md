@@ -71,6 +71,25 @@ declared scope, and one of three surfaces: `whole-workdir`, `scoped-subtree` or 
 list is recorded on each session as `effective_grants.preopens` in
 [`trace.jsonl`](../reference/observability-schemas.md#session-trace-tracejsonl).
 
+### Widening a contained capsule's reach { #host-paths }
+
+A `scoped` or `sealed` capsule's commands, plan shell steps and native tools reach their work
+folder and the runtime's own folders, and no other host folder. Only the operator widens that, and
+only in one place: the [`host_paths:`](../reference/config.md#host-paths) list in
+`~/.murmur/config.yaml`.
+
+| Who | Can lend a host folder |
+|---|---|
+| The operator, in `~/.murmur/config.yaml` | Yes: each entry is one directory, `read` or `read-write`, for every contained capsule on the host |
+| A project's `.murmur/config.yaml` | No: refused with `E-CFG-004` |
+| A manifest, a roster or an artifact | No: a manifest naming `host_paths` is refused with `E-MAN-003` |
+| An environment variable or a `mur run` flag | No |
+
+A host folder is never executable: `capabilities.shell.allow` stays the whole list of what a
+contained capsule can run. WASM tools keep their own preopens and do not reach host paths. What
+each tier does with an entry, and every entry `mur run` refuses, is in
+[Host paths](../reference/containment.md#host-paths).
+
 ## Hook capabilities { #hook-capabilities }
 
 A hook runs default-deny, and only the capsule operator can widen it. A hook artifact's own

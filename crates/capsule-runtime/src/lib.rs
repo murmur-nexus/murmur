@@ -48,6 +48,7 @@ pub(crate) mod gateway_credential;
 pub(crate) mod harness_session;
 pub(crate) mod hooks;
 mod host_facts;
+pub mod host_paths;
 pub mod host_warnings;
 pub(crate) mod http_client;
 pub(crate) mod identity;

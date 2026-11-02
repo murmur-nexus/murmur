@@ -7,7 +7,7 @@ use std::{
 use murmur_artifact::ContainmentClass;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{CliError, E_IO_001, E_IO_003};
+use crate::error::{CliError, E_CFG_004, E_IO_001, E_IO_003};
 
 /// Runtime feature flag state. Persisted under `beta:` in ~/.murmur/config.yaml.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -63,6 +63,14 @@ pub struct MurConfig {
     /// [`merge_spend`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<SpendConfig>,
+    /// Host folders every contained capsule on this host may reach (see
+    /// [`capsule_runtime::host_paths`]). Read from the global file only: a project file in which
+    /// the key is present at all is refused by [`load_effective_mur_config_if_any_exists`]. `None`
+    /// is the key absent; `Some(vec![])` is `host_paths: []`, which a project file may not hold
+    /// either. Each entry is checked when a command uses it ([`launch_host_paths`]), so a malformed
+    /// one names itself rather than failing the whole file's parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_paths: Option<Vec<capsule_runtime::host_paths::HostPathEntry>>,
 }
 
 /// The `spend:` section.
@@ -86,6 +94,7 @@ impl Default for MurConfig {
             containment: None,
             credentials: BTreeMap::new(),
             spend: None,
+            host_paths: None,
         }
     }
 }
@@ -205,6 +214,7 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
     }
 
     if let Some(project) = &project_opt {
+        refuse_project_host_paths(&project_mur_config_path()?, project)?;
         warn_if_project_api_key_literal(project)?;
         if let Some(warning) = project_credentials_warning(&project_mur_config_path()?, project) {
             capsule_runtime::report_eprintln!("{warning}");
@@ -240,7 +250,75 @@ pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurCo
         containment: merge_containment(global.containment, project.containment),
         credentials: global.credentials,
         spend: merge_spend(global.spend, project.spend),
+        host_paths: global.host_paths,
     }
+}
+
+/// `E-CFG-004` when the project-level file at `path` holds a `host_paths` key at all, an empty
+/// list included: only the operator's global config may lend a contained capsule a host folder.
+pub(crate) fn refuse_project_host_paths(path: &Path, project: &MurConfig) -> Result<(), CliError> {
+    if project.host_paths.is_none() {
+        return Ok(());
+    }
+    Err(CliError::with_hint(
+        E_CFG_004,
+        format!(
+            "{} sets host_paths:, but host_paths is read from the global config \
+             (~/.murmur/config.yaml) only",
+            path.display()
+        ),
+        format!(
+            "remove host_paths from {}; an operator lends a host folder in ~/.murmur/config.yaml \
+             — see {}",
+            path.display(),
+            murmur_artifact::diagnostic_link("E-CFG-004")
+        ),
+    ))
+}
+
+/// The base `~` in a `host_paths` entry expands against: the home [`mur_config_path`] finds the
+/// global config in, or `None` when `HOME` (and `USERPROFILE`) is unset or empty.
+fn host_paths_home() -> Option<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())?;
+    absolute_home(home.into()).ok()
+}
+
+/// The global config's `host_paths`, shape-checked and `~` expanded (`E-CFG-004` naming the
+/// entry). Empty without the key.
+pub(crate) fn declared_host_paths(
+    config: Option<&MurConfig>,
+) -> Result<Vec<capsule_runtime::host_paths::DeclaredHostPath>, CliError> {
+    let Some(entries) = config.and_then(|config| config.host_paths.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    capsule_runtime::host_paths::declare_host_paths(entries, host_paths_home().as_deref())
+        .map_err(|refusal| crate::error::host_path_refusal_to_cli(&refusal))
+}
+
+/// The global config's `host_paths`, checked on this host for a session whose work folder root
+/// is `workdir`, as `mur run` grants them: every launch refusal is `E-CFG-004` naming the entry.
+/// What `mur run`, `mur run --explain-scope` and `mur doctor` call.
+pub(crate) fn launch_host_paths(
+    config: Option<&MurConfig>,
+    workdir: &Path,
+) -> Result<Vec<capsule_runtime::host_paths::HostPath>, CliError> {
+    let declared = declared_host_paths(config)?;
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = host_paths_home();
+    let murmur_home = home.as_ref().map(|home| home.join(".murmur"));
+    capsule_runtime::host_paths::resolve_host_paths(
+        &declared,
+        &capsule_runtime::host_paths::HostPathContext {
+            home: home.as_deref(),
+            murmur_home: murmur_home.as_deref(),
+            workdir,
+        },
+    )
+    .map_err(|refusal| crate::error::host_path_refusal_to_cli(&refusal))
 }
 
 /// Merges the two `spend` sections, keeping the **lower** `machine_tokens_per_day`, deliberately
@@ -506,20 +584,25 @@ pub fn mur_config_path() -> Result<PathBuf, CliError> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .ok_or_else(|| CliError::new(E_IO_001, "could not determine home directory"))?;
+    Ok(absolute_home(home.into())?
+        .join(".murmur")
+        .join("config.yaml"))
+}
 
-    let mut base = PathBuf::from(home);
-    if !base.is_absolute() {
-        base = env::current_dir()
-            .map_err(|source| {
-                CliError::new(
-                    E_IO_003,
-                    format!("failed to determine current working directory: {source}"),
-                )
-            })?
-            .join(base);
+/// `home` made absolute against the working directory, as [`mur_config_path`] and
+/// [`host_paths_home`] both read it.
+fn absolute_home(home: PathBuf) -> Result<PathBuf, CliError> {
+    if home.is_absolute() {
+        return Ok(home);
     }
-
-    Ok(base.join(".murmur").join("config.yaml"))
+    env::current_dir()
+        .map(|cwd| cwd.join(home))
+        .map_err(|source| {
+            CliError::new(
+                E_IO_003,
+                format!("failed to determine current working directory: {source}"),
+            )
+        })
 }
 
 /// `<cwd>/.murmur/config.yaml`. Lookup is cwd-only by design — see the module doc on
@@ -1079,5 +1162,143 @@ mod tests {
             effective.registry.sources.len()
         );
         assert_eq!(baseline.beta.enabled, effective.beta.enabled);
+    }
+
+    /// A scratch directory outside `/tmp`, which a host path may not be under, and its canonical
+    /// path: the working directory and `HOME` are compared as the process sees them.
+    fn host_paths_scratch() -> (tempfile::TempDir, PathBuf) {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let base = if target.is_dir() {
+            target
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        };
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        (dir, canonical)
+    }
+
+    const HOST_PATHS_YAML: &str = "host_paths:\n  - path: ~/.cargo\n    access: read-write\n  \
+                                   - path: ~/data\n    access: read\n";
+
+    #[test]
+    fn host_paths_parse_expand_against_home_and_survive_a_round_trip() {
+        let (_home_dir, home) = host_paths_scratch();
+        let (_cwd_dir, cwd) = host_paths_scratch();
+        let _env = test_env::EnvGuard::set_up(&home, &cwd);
+        std::fs::create_dir_all(home.join(".murmur")).unwrap();
+        std::fs::write(home.join(".murmur/config.yaml"), HOST_PATHS_YAML).unwrap();
+
+        let config = load_mur_config().unwrap();
+        let entries = config.host_paths.clone().unwrap();
+        assert_eq!(entries.len(), 2);
+        let declared = declared_host_paths(Some(&config)).unwrap();
+        assert_eq!(declared[0].expanded, home.join(".cargo"));
+        assert_eq!(
+            declared[0].access,
+            capsule_runtime::host_paths::HostPathAccess::ReadWrite
+        );
+        assert_eq!(declared[1].expanded, home.join("data"));
+
+        save_mur_config(&config).unwrap();
+        let reread = load_mur_config().unwrap();
+        assert_eq!(reread.host_paths, Some(entries));
+    }
+
+    #[test]
+    fn host_paths_merge_keeps_the_global_entries_and_never_the_projects() {
+        let global = MurConfig {
+            host_paths: Some(vec![capsule_runtime::host_paths::HostPathEntry {
+                path: Some("/srv/global".to_string()),
+                access: Some("read".to_string()),
+            }]),
+            ..MurConfig::default()
+        };
+        let project = MurConfig {
+            host_paths: Some(vec![capsule_runtime::host_paths::HostPathEntry {
+                path: Some("/srv/project".to_string()),
+                access: Some("read-write".to_string()),
+            }]),
+            ..MurConfig::default()
+        };
+        let merged = merge_mur_configs(global.clone(), Some(project));
+        assert_eq!(merged.host_paths, global.host_paths);
+        let merged = merge_mur_configs(
+            MurConfig::default(),
+            Some(MurConfig {
+                host_paths: Some(Vec::new()),
+                ..MurConfig::default()
+            }),
+        );
+        assert_eq!(merged.host_paths, None);
+    }
+
+    #[test]
+    fn host_paths_malformed_entries_are_refused_with_e_cfg_004_naming_the_entry() {
+        let (_home_dir, home) = host_paths_scratch();
+        let (_cwd_dir, cwd) = host_paths_scratch();
+        let _env = test_env::EnvGuard::set_up(&home, &cwd);
+        let cases = [
+            (
+                "  - path: relative/dir\n    access: read\n",
+                "host_paths[0] (relative/dir)",
+            ),
+            (
+                "  - path: ~user/x\n    access: read\n",
+                "host_paths[0] (~user/x)",
+            ),
+            ("  - path: /\n    access: read\n", "host_paths[0] (/)"),
+            (
+                "  - path: /home/..\n    access: read\n",
+                "host_paths[0] (/home/..)",
+            ),
+            ("  - path: /srv\n", "access is required"),
+            ("  - path: /srv\n    access: write\n", "access 'write'"),
+            (
+                "  - path: /srv\n    access: read\n  - path: /srv\n    access: read\n",
+                "host_paths[1] (/srv)",
+            ),
+        ];
+        for (entries, expected) in cases {
+            let config: MurConfig =
+                serde_norway::from_str(&format!("host_paths:\n{entries}")).unwrap();
+            let error = declared_host_paths(Some(&config)).unwrap_err();
+            assert_eq!(error.code, E_CFG_004, "{entries}");
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn host_paths_in_a_project_config_are_refused_even_empty() {
+        for entries in [
+            "host_paths:\n  - path: /srv\n    access: read\n",
+            "host_paths: []\n",
+        ] {
+            let (_home_dir, home) = host_paths_scratch();
+            let (_cwd_dir, cwd) = host_paths_scratch();
+            let _env = test_env::EnvGuard::set_up(&home, &cwd);
+            std::fs::create_dir_all(cwd.join(".murmur")).unwrap();
+            std::fs::write(cwd.join(".murmur/config.yaml"), entries).unwrap();
+            let error = load_effective_mur_config_if_any_exists().unwrap_err();
+            assert_eq!(error.code, E_CFG_004);
+            assert!(
+                error
+                    .message
+                    .contains(&cwd.join(".murmur/config.yaml").display().to_string()),
+                "{}",
+                error.message
+            );
+            assert!(
+                error.message.contains("~/.murmur/config.yaml) only"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn host_paths_absent_from_a_file_are_absent_from_its_rewrite() {
+        let serialized = serde_norway::to_string(&MurConfig::default()).unwrap();
+        assert!(!serialized.contains("host_paths"), "{serialized}");
     }
 }

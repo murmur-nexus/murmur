@@ -594,7 +594,7 @@ fn resolve_within_workdir(workdir: &Path, candidate: &str) -> Option<String> {
 
 /// Lexically normalize an absolute path: drop `.`, apply `..` against what is already accumulated.
 /// No filesystem access, so it is safe to run on a path that does not exist.
-fn normalize_absolute(path: &Path) -> PathBuf {
+pub(crate) fn normalize_absolute(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

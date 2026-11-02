@@ -262,6 +262,13 @@ pub struct CapabilityPolicy {
     /// [`crate::trust_store::derive_trust_store`]. Each becomes a readable, non-executable
     /// Landlock grant (`sandbox::resolve_trust_store_grants`), listable for a directory.
     pub shell_trust_store: Vec<crate::trust_store::TrustStorePath>,
+    /// The host folders `~/.murmur/config.yaml`'s `host_paths:` lends every contained capsule on
+    /// this host, checked on this host, in config order (see [`crate::host_paths`]). Not a
+    /// manifest field: empty from [`capability_policy_from_runtime_manifest`], filled by `mur run`
+    /// (and `--explain-scope`) from the global config alone. On `landlock+seccomp` each becomes a
+    /// Landlock rule for commands, plan shell steps and native tools; on `sealed` also a required
+    /// bind at its own path. Never executable. WASM tools' preopens do not include them.
+    pub host_paths: Vec<crate::host_paths::HostPath>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -1058,6 +1065,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_staged_runtime,
         shell_derived_interpreter_runtime: Vec::new(),
         shell_trust_store: Vec::new(),
+        host_paths: Vec::new(),
         env_allow,
         limits,
         resources,

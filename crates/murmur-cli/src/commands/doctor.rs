@@ -1865,7 +1865,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // because the two reachability checks below need it for *every* capsule, not only one
     // declaring a grant.
     let declared_floor = effective_containment_floor(
-        effective_config.and_then(|config| config.containment),
+        effective_config
+            .as_ref()
+            .and_then(|config| config.containment),
         runtime_manifest
             .capabilities
             .as_ref()
@@ -2358,10 +2360,75 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
+    // The host folders the global config lends, checked as `mur run` checks them, for the default
+    // workdir and the tier this capsule's floor applies here.
+    capsule_runtime::report_println!();
+    report_host_paths(
+        effective_config.as_ref(),
+        &project_root.join("workdir"),
+        &capability_policy,
+        applied_mechanism(&host_probe, declared_floor),
+    );
+
     capsule_runtime::report_println!();
 
     print_tally(total_pass, &fixes, &warnings);
     Ok(())
+}
+
+/// The `Host paths` section: each `host_paths` entry of the global config resolved, its access and
+/// what `enforcement_tier` does with it, each `W-SEC-035`, and each refusal `mur run` would make
+/// as an `E-CFG-004` warning. The checklist continues either way.
+fn report_host_paths(
+    config: Option<&crate::config::MurConfig>,
+    workdir: &Path,
+    policy: &capsule_runtime::CapabilityPolicy,
+    enforcement_tier: &str,
+) {
+    use capsule_runtime::host_paths::{
+        check_policy_execute_roots, credential_warning, HostPathMechanism,
+    };
+    let mechanism = HostPathMechanism::for_enforcement_tier(enforcement_tier);
+    capsule_runtime::report_println!("Host paths");
+    let refuse = |error: CliError| {
+        capsule_runtime::report_eprintln!(
+            "[mur doctor] warning[{}]: {}\n  `mur run` will refuse to launch until that entry is \
+             fixed or removed from ~/.murmur/config.yaml.",
+            error.code,
+            error.message
+        );
+    };
+    let host_paths = match crate::config::launch_host_paths(config, workdir) {
+        Ok(host_paths) => host_paths,
+        Err(error) => {
+            capsule_runtime::report_println!("  unavailable — an entry is refused (below)");
+            refuse(error);
+            return;
+        }
+    };
+    if host_paths.is_empty() {
+        capsule_runtime::report_println!("  <none>");
+        return;
+    }
+    for host_path in &host_paths {
+        capsule_runtime::report_println!(
+            "  {} → {} ({}): {}",
+            host_path.declared,
+            host_path.path.display(),
+            host_path.access,
+            mechanism.describe(host_path.access)
+        );
+    }
+    for host_path in &host_paths {
+        if let Some(warning) = credential_warning(host_path) {
+            capsule_runtime::report_eprintln!("[mur doctor] {warning}");
+        }
+    }
+    let mut policy = policy.clone();
+    policy.host_paths = host_paths;
+    if let Err(refusal) = check_policy_execute_roots(&policy, mechanism) {
+        refuse(crate::error::host_path_refusal_to_cli(&refusal));
+    }
 }
 
 #[cfg(test)]

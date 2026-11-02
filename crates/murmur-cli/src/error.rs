@@ -182,6 +182,7 @@ pub const E_CNV_003: &str = "E-CNV-003"; // --keep is not a usable number of mes
 pub const E_CFG_001: &str = "E-CFG-001"; // inference provider not configured; wizard requires TTY
 pub const E_CFG_002: &str = "E-CFG-002"; // `mur config set` given an unsupported dotted key
 pub const E_CFG_003: &str = "E-CFG-003"; // registry: in a config file cannot be used: a removed key, a repo that is not <owner>/<repo>, a reserved scope claimed, or two sources for one scope
+pub const E_CFG_004: &str = "E-CFG-004"; // a host_paths entry is malformed, named outside ~/.murmur/config.yaml, or cannot be honoured on this host
 
 #[derive(Debug, Clone)]
 pub struct CliError {
@@ -282,6 +283,22 @@ pub(crate) fn path_refused_hint(place: RefusedPlace, refused_at: &str) -> String
              it, or replace it with the directory it stands in for, and run again"
         ),
     }
+}
+
+/// `E-CFG-004` for a `host_paths` entry that cannot be honoured, naming the entry, with the
+/// file the key belongs in.
+pub(crate) fn host_path_refusal_to_cli(
+    refusal: &capsule_runtime::host_paths::HostPathRefusal,
+) -> CliError {
+    CliError::with_hint(
+        E_CFG_004,
+        format!("~/.murmur/config.yaml: {refusal}"),
+        format!(
+            "fix or remove this entry under host_paths: in ~/.murmur/config.yaml; mur run refuses \
+             a host folder it cannot honour rather than launch without it — see {}",
+            murmur_artifact::diagnostic_link("E-CFG-004")
+        ),
+    )
 }
 
 /// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
@@ -587,6 +604,7 @@ impl From<RuntimeError> for CliError {
                     murmur_artifact::diagnostic_link("E-CAP-016")
                 ),
             ),
+            RuntimeError::HostPathRefused(refusal) => host_path_refusal_to_cli(&refusal),
             error @ RuntimeError::RuntimeProvidedToolNotReserved { .. } => CliError::with_hint(
                 E_CAP_013,
                 error.to_string(),

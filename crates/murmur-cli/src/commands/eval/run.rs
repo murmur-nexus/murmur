@@ -406,7 +406,18 @@ fn prepare_arm(
     let eval_config_json = eval.and_then(|e| serde_json::to_string(e).ok());
     let dataset_id = eval.and_then(|e| e.dataset_id.clone());
 
-    let capability_policy = capability_policy_from_runtime_manifest(&manifest);
+    let mut capability_policy = capability_policy_from_runtime_manifest(&manifest);
+    // The host folders `~/.murmur/config.yaml` lends, checked as `mur run` checks them, so an eval
+    // arm runs with every host path a launch of the same capsule would get, or refuses.
+    capability_policy.host_paths = crate::config::launch_host_paths(
+        crate::config::load_mur_config_if_exists()?.as_ref(),
+        &project_dir.join("workdir"),
+    )?;
+    for host_path in &capability_policy.host_paths {
+        if let Some(warning) = capsule_runtime::host_paths::credential_warning(host_path) {
+            capsule_runtime::report_eprintln!("{warning}");
+        }
+    }
     let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)?;
 
     let mut allowlisted_tools = HashSet::new();

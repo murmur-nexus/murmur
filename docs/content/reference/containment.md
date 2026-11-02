@@ -131,9 +131,10 @@ tool, and the answer is `unavailable`.
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
-is granted wholesale and the only writable paths outside the workdir are `/dev/null` (see
-[the fixed capsule device set](#capsule-device-set)), the
-[session's temporary folder](#temp-folder) and its [home folder](#home-folder). An allowlisted CPython or Perl interpreter also gets
+but a [host path](#host-paths) is granted wholesale, and the only writable paths outside the workdir
+are `/dev/null` (see [the fixed capsule device set](#capsule-device-set)), the
+[session's temporary folder](#temp-folder), its [home folder](#home-folder) and any `read-write`
+host path. An allowlisted CPython or Perl interpreter also gets
 read-only grants on the directories it reports on its own import path (see
 [Derived interpreter runtimes](#derived-interpreter-runtime)), and a capsule that declares
 `capabilities.network.allow` gets a read-only grant on the host's TLS trust store (see
@@ -863,6 +864,88 @@ Every session has a private home folder: `home/` in its
 
 As with the temporary folder, no record can be moved or hard-linked into the home folder, and the
 folder itself cannot be renamed.
+
+## Host paths { #host-paths }
+
+A host path is a host directory the operator lends every contained capsule on the host, through
+[`host_paths:`](config.md#host-paths) in `~/.murmur/config.yaml`. No other file, manifest,
+roster, artifact, environment variable or flag can name one. It reaches the session's shell
+commands, plan shell steps and native tools; WASM tools keep exactly their own
+[preopens](#artifact-boundary) and do not reach host paths.
+
+| Tier | What an entry gets |
+|---|---|
+| Sealed | A verified, required bind into the composed root at the directory's own absolute path, read-only for `read` and read-write for `read-write`, plus the Landlock rule below. A host path that cannot be bound ends the session with `E-RUN-014` |
+| Full | One Landlock rule over the host's own directory: `ReadFile` and `ReadDir` for `read`; the work folder's rights without `Execute` for `read-write` |
+| Seccomp-only, Environment-only, macOS included | Nothing: these tiers scope no filesystem, so every host folder is already reachable. The entry is still checked and reported |
+
+Nothing is executable from a host path: no rule carries `Execute`, so
+[`capabilities.shell.allow`](manifest.md#shell-allow) stays the complete list of what a
+`scoped` or `sealed` capsule can run. A host path that can no longer be opened when a command or
+native tool starts fails that start, naming the path; a configured host path is never silently
+dropped.
+
+`HOME` stays the session's [home folder](#home-folder). A tool finds `~/.cargo` and `~/.rustup`
+through `CARGO_HOME` and `RUSTUP_HOME`, which pass from `mur run`'s own environment to every
+command, so start `mur run` with them set.
+
+An entry is resolved at launch, symlinks followed. The rule and the bind are taken on the directory
+it resolves to, and the reports carry both the path as written and the resolved one; under `sealed`
+the resolved path is the one that exists inside the composed root.
+
+An entry nested inside another keeps its own access. A runtime folder beneath an entry keeps its
+own access too: under a `read` entry the work folder stays writable, and the records directory
+stays read-only.
+
+### What `mur run` refuses { #host-path-refusals }
+
+Every refusal is [`E-CFG-004`](diagnostics.md#e-cfg-004), names the entry's index, its path as
+written, its resolved path when it has one, and the reason, and happens before anything is staged.
+`mur run --explain-scope` refuses the same entries.
+
+| Entry | Why |
+|---|---|
+| Relative, `/`, missing, or not a directory | A host path names one existing folder |
+| Is or lies under `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/etc`, `/proc`, `/sys`, `/dev` or `/tmp` | A composed root carries its own copy of these or replaces them, and the private `/tmp` replaces `/tmp`, so the entry would not reach the host's folder on every tier |
+| `read-write`, and is, lies under, or contains `~/.murmur` | It holds this config, whose `host_paths` and `containment` grant every later session, and every session's records. A `read` entry there is allowed and warned about |
+| Is or lies under the work folder | The capsule already reaches it read-write, so a `read` entry would not be read-only |
+| The same resolved directory as an earlier entry | One directory, one entry |
+| `read-write`, and is or lies under a folder the session may run from | On `sealed` that folder's read-only bind would hide it; on `scoped` the capsule could write a file there and run it |
+| `read-write`, and contains a folder the session may run from, at `scoped` only | Nothing keeps the capsule from rewriting a binary it may run in place |
+
+A folder the session may run from is:
+
+- the folder of each `shell.allow` binary, for every match on `mur run`'s `PATH`, and of its
+  dynamic loader and shared libraries;
+- each `interpreter_runtime` directory;
+- each `staged_runtime` tree.
+
+On `sealed` a `read-write` entry that contains one is allowed: that folder is bound read-only on
+top of the entry, so the capsule cannot write it while the rest of the entry stays writable. Below `landlock+seccomp`
+neither rule applies.
+
+### What an entry lends { #host-path-reach }
+
+| Fact | Consequence |
+|---|---|
+| An entry reaching a credential location (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`, `~/.murmur`, …) | Allowed, with [`W-SEC-035`](diagnostics.md#w-sec-035) naming the entry and the location, from `mur run` and `mur doctor` |
+| A `read-write` entry holding a project's `murmur.yaml` | The capsule can change that project's next run |
+| `~/.cargo` `read-write` while `~/.cargo/bin` is on `mur run`'s `PATH` | Every `PATH` match of a `shell.allow` name is a folder the session may run from, so `cargo` and `rustc` make `~/.cargo/bin` (the rustup proxies) one even when a toolchain's `bin` comes first. At `scoped` the entry is refused; take `~/.cargo/bin` off `mur run`'s `PATH`, or declare `sealed`, which binds `~/.cargo/bin` read-only |
+| A delegated child, plan `capsule` step, formation member or roost spawn | Each is its own `mur run` started with the operator's `HOME`, so it reads the same global config and gets the same host paths |
+
+The entries appear in `session_start.effective_grants.host_paths`, in `mur run --explain-scope`
+(a `host paths` section, and `host_paths` in `--json`) and in `mur doctor` (a `Host paths`
+section). Each element of `host_paths`:
+
+| Key | Value |
+|---|---|
+| `path` | The directory the entry resolved to |
+| `declared` | The entry's `path` as written |
+| `access` | `read` or `read-write` |
+| `mechanism` | `landlock` on `landlock+seccomp`, `bind` on `mountns+pivot_root+landlock+seccomp`, `none` below |
+| `credential_location` | The credential locations it reaches, joined with `, `, or `null` |
+
+Every key is always present, and `host_paths` is `[]` without the config key.
 
 ## Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 

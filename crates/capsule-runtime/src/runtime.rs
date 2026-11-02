@@ -2552,6 +2552,13 @@ pub fn stage_session(
         &request.capability_policy.network_allow,
         &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
     );
+    // A read-write host path over something the session may run, checked on the tier this
+    // session applies, before the report so a refused launch records nothing.
+    crate::host_paths::check_policy_execute_roots(
+        &request.capability_policy,
+        sandbox::host_path_mechanism(containment.applied_tier()),
+    )
+    .map_err(RuntimeError::HostPathRefused)?;
     let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         &containment,

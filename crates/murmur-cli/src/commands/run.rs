@@ -533,6 +533,20 @@ pub(crate) fn run_run(
     let cli_containment = parse_containment_flag(containment_arg, &session_id, &workdir, json)?;
     let effective_config = load_effective_mur_config_if_any_exists()
         .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    // The host folders the operator's global config lends a contained capsule, checked on this
+    // host before anything is staged: an entry that cannot be honoured refuses the launch (and
+    // `--explain-scope`) naming it, and one reaching a credential location warns.
+    let host_paths = crate::config::launch_host_paths(
+        effective_config.as_ref(),
+        &workdir_root(&project_dir, workdir_arg.as_deref()),
+    )
+    .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    for host_path in &host_paths {
+        if let Some(warning) = capsule_runtime::host_paths::credential_warning(host_path) {
+            capsule_runtime::report_eprintln!("{warning}");
+        }
+    }
+    capability_policy.host_paths = host_paths;
     let machine_tokens_per_day = effective_config
         .as_ref()
         .and_then(|config| config.spend.as_ref())
@@ -683,6 +697,22 @@ pub(crate) fn run_run(
                 .map(|inference| inference.transport.as_str()),
         )
         .with_cgroup_scope(scope_probe.cgroup_scope);
+        // The staging check on the tier this report names, so a read-write host path over
+        // something the capsule may run refuses here as the launch would.
+        capsule_runtime::host_paths::check_policy_execute_roots(
+            &capability_policy,
+            capsule_runtime::host_paths::HostPathMechanism::for_enforcement_tier(
+                report.enforcement_tier,
+            ),
+        )
+        .map_err(|refusal| {
+            fail(
+                &session_id,
+                &workdir,
+                crate::error::host_path_refusal_to_cli(&refusal),
+                json,
+            )
+        })?;
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(

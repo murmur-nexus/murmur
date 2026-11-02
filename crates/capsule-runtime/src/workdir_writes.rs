@@ -1133,6 +1133,13 @@ mod tests {
         ),
         (
             "sandbox.rs",
+            "open_host_path",
+            "An `O_PATH` handle on a host path from `~/.murmur/config.yaml`, a directory launch \
+             refuses when it is or lies under the work folder, opened with no link followed at \
+             its resolved name; it reads and writes nothing.",
+        ),
+        (
+            "sandbox.rs",
             "open_host",
             "The ELF images of host binaries and libraries a shell grant or a derived interpreter \
              runtime names, opened to read their headers and dependencies.",
