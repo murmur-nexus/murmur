@@ -434,8 +434,169 @@ impl IoMaxReport {
     }
 }
 
+/// Whether this session's subprocesses get a delegated cgroup v2 scope, the precondition every
+/// capsule that can run a native subprocess is refused without (`E-RUN-012`).
+///
+/// [`Self::NotProbed`] is the `Default` so a report nobody filled in claims nothing, on
+/// [`IoMaxStatus`]'s terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CgroupScopeStatus {
+    /// A child cgroup was created under the delegated base: at launch the session's scope, under
+    /// `--explain-scope` and `mur doctor` a throwaway one removed again.
+    Delegated,
+    /// No child cgroup could be created, so a launch of a capsule that needs one is refused with
+    /// `E-RUN-012`. Never seen at launch: a refused launch writes no `session_start`.
+    Unavailable,
+    /// No scope was asked for: the capsule declares no way to run a native subprocess, or this is
+    /// not Linux.
+    NotRequired,
+    /// Nobody asked. The `Default`.
+    #[default]
+    NotProbed,
+}
+
+/// What became of this session's cgroup scope, carried into `--explain-scope`, into
+/// `session_start.effective_grants.cgroup_scope` and into `mur doctor`'s `cgroup scope:` line.
+///
+/// Filled from a performed operation, never inferred: at launch from [`prepare_scope`]'s outcome,
+/// under `--explain-scope` and `mur doctor` from [`probe_scope`], which creates and removes a
+/// child cgroup through the same calls a launch makes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct CgroupScopeReport {
+    /// What happened.
+    pub status: CgroupScopeStatus,
+    /// The symbolic errno of the call that failed, for [`CgroupScopeStatus::Unavailable`] when
+    /// that call left one (`EROFS`, `EACCES`, …). Absent from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errno: Option<String>,
+    /// Why, for [`CgroupScopeStatus::Unavailable`] and [`CgroupScopeStatus::NotRequired`]. For
+    /// `unavailable` it is the reason text `E-RUN-012` prints on the same host. Absent from the
+    /// JSON for `delegated`, which carries no path because the path differs between processes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CgroupScopeReport {
+    /// A child cgroup was created.
+    fn delegated() -> Self {
+        Self {
+            status: CgroupScopeStatus::Delegated,
+            errno: None,
+            reason: None,
+        }
+    }
+
+    /// No child cgroup could be created, for the reason `error` gives.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn unavailable(error: &CgroupError) -> Self {
+        Self {
+            status: CgroupScopeStatus::Unavailable,
+            errno: error.errno.map(crate::network_namespace::errno_label),
+            reason: Some(error.message.clone()),
+        }
+    }
+
+    /// No scope was asked for, for `reason`.
+    fn not_required(reason: &str) -> Self {
+        Self {
+            status: CgroupScopeStatus::NotRequired,
+            errno: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    /// No scope is required because this capsule can reach no native subprocess. Public on
+    /// [`IoMaxReport::no_scope_required`]'s terms.
+    #[must_use]
+    pub fn no_scope_required() -> Self {
+        Self::not_required(NO_CGROUP_SCOPE_REASON)
+    }
+
+    /// The report for a scope [`prepare_scope`] returned: delegated when it created one, not
+    /// required otherwise.
+    fn of_prepared(scope: Option<&Arc<CgroupScope>>, required: bool) -> Self {
+        match (scope, required) {
+            (Some(_), _) => Self::delegated(),
+            (None, false) => Self::no_scope_required(),
+            (None, true) => Self::not_required(NOT_LINUX_CGROUP_REASON),
+        }
+    }
+}
+
+/// The `cgroup scope:` line `--explain-scope` and `mur doctor` print, without indentation or a
+/// trailing newline, so the two cannot word one answer differently.
+#[must_use]
+pub fn render_cgroup_scope(report: &CgroupScopeReport) -> String {
+    let status = match report.status {
+        CgroupScopeStatus::Delegated => "delegated",
+        CgroupScopeStatus::Unavailable => "unavailable",
+        CgroupScopeStatus::NotRequired => "not-required",
+        CgroupScopeStatus::NotProbed => "not-probed",
+    };
+    match (&report.errno, &report.reason) {
+        (Some(errno), Some(reason)) => {
+            format!("cgroup scope: {status} ({errno}) \u{2014} {reason}")
+        }
+        (Some(errno), None) => format!("cgroup scope: {status} ({errno})"),
+        (None, Some(reason)) => format!("cgroup scope: {status} \u{2014} {reason}"),
+        (None, None) => format!("cgroup scope: {status}"),
+    }
+}
+
+/// Why a cgroup operation failed: the message an operator reads inside `E-RUN-012`, and the errno
+/// of the call that failed when it left one.
+///
+/// Displays as [`Self::message`] alone, so carrying the errno out changes no refusal's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CgroupError {
+    /// The reason, verbatim as `E-RUN-012` prints it.
+    pub(crate) message: String,
+    /// `raw_os_error()` of the failing call, `None` where the failure was no system call.
+    pub(crate) errno: Option<i32>,
+}
+
+impl CgroupError {
+    /// `message`, caused by `error`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn io(message: String, error: &std::io::Error) -> Self {
+        Self {
+            message,
+            errno: error.raw_os_error(),
+        }
+    }
+}
+
+impl std::fmt::Display for CgroupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for CgroupError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            errno: None,
+        }
+    }
+}
+
+impl From<CgroupError> for String {
+    fn from(error: CgroupError) -> Self {
+        error.message
+    }
+}
+
+/// [`CgroupScopeReport::reason`] for the two `not-required` causes, worded for the scope rather
+/// than for the I/O ceiling [`NO_SCOPE_REASON`] speaks of.
+const NO_CGROUP_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so \
+     a launch creates no cgroup scope for it";
+const NOT_LINUX_CGROUP_REASON: &str =
+    "cgroups are a Linux mechanism and this host has none, so a launch creates no cgroup scope";
+
 /// Reason text for the two [`IoMaxStatus::NotRequired`] causes, in one place so `prepare_scope`
-/// and [`probe_io_max`] cannot word the same finding differently.
+/// and [`probe_scope`] cannot word the same finding differently.
 const NO_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so it is \
      given no cgroup scope and there is no process tree for an I/O ceiling to apply to";
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -505,6 +666,8 @@ pub(crate) struct PreparedScope {
     /// Whether the declared `io.max` ceiling applied, established by performing the write rather
     /// than by inferring it.
     pub(crate) io_max: IoMaxReport,
+    /// What [`Self::scope`] is, as `session_start.effective_grants.cgroup_scope` records it.
+    pub(crate) cgroup_scope: CgroupScopeReport,
 }
 
 /// Decide-and-create entry point, called once per launch before any WASM is instantiated.
@@ -531,6 +694,7 @@ pub(crate) fn prepare_scope(
         return Ok(PreparedScope {
             scope: None,
             io_max: IoMaxReport::no_scope_required(limits.cgroup_io_bytes_per_sec),
+            cgroup_scope: CgroupScopeReport::of_prepared(None, false),
         });
     }
     #[cfg(target_os = "linux")]
@@ -540,8 +704,10 @@ pub(crate) fn prepare_scope(
             return Err("forced: delegation refused by the test seam".to_string());
         }
         let (scope, io_max) = CgroupScope::create(limits, session_id, workdir)?;
+        let scope = Arc::new(scope);
         Ok(PreparedScope {
-            scope: Some(Arc::new(scope)),
+            cgroup_scope: CgroupScopeReport::of_prepared(Some(&scope), true),
+            scope: Some(scope),
             io_max,
         })
     }
@@ -551,59 +717,117 @@ pub(crate) fn prepare_scope(
         Ok(PreparedScope {
             scope: None,
             io_max: IoMaxReport::not_required(limits.cgroup_io_bytes_per_sec, NOT_LINUX_REASON),
+            cgroup_scope: CgroupScopeReport::of_prepared(None, true),
         })
     }
 }
 
-/// Answers "would the declared `io.max` ceiling apply on this host?" by performing the write,
-/// against a throwaway cgroup created and removed inside this call.
+/// What [`probe_scope`] found: whether a launch would get its cgroup scope here, and whether the
+/// declared `io.max` ceiling would apply on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeProbe {
+    /// Whether a child cgroup could be created under the delegated base.
+    pub cgroup_scope: CgroupScopeReport,
+    /// Whether the `io.max` write succeeded on it.
+    pub io_max: IoMaxReport,
+}
+
+/// Answers "would a launch get its cgroup scope here, and would the declared `io.max` ceiling
+/// apply on it?" by doing what a launch does, against a throwaway cgroup created and removed
+/// inside this call: [`delegated_base`], then the scope directory through the same
+/// [`create_scope_dir`] [`prepare_scope`] calls, then the `io.max` write.
 ///
-/// The diagnostic half of [`prepare_scope`], for `mur run --explain-scope`, which runs before any
-/// workdir exists and before any session is staged. Inferring the answer from "is the `io`
-/// controller delegated" is wrong: the write can fail for a device the block layer will not
-/// accept (tmpfs, overlayfs, a device-mapper stack) on a host whose `io` controller is delegated
-/// perfectly well. Only performing the write answers it.
+/// The diagnostic half of [`prepare_scope`], for `mur run --explain-scope` and `mur doctor`, which
+/// run before any workdir exists and before any session is staged. `required` is
+/// [`requires_process_bounding`] for the capsule: without it nothing is attempted and both answers
+/// are `not-required`, the reports a launch writes for such a capsule. A failure carries the
+/// reason `E-RUN-012` prints, so `--explain-scope` and the refusal word it identically.
+///
+/// Inferring the `io.max` answer from "is the `io` controller delegated" is wrong: the write can
+/// fail for a device the block layer will not accept (tmpfs, overlayfs, a device-mapper stack) on
+/// a host whose `io` controller is delegated perfectly well. Only performing the write answers it.
 ///
 /// `workdir` need not exist. The device is resolved from its nearest existing ancestor, so the
 /// probe names the device a launch would use without creating anything.
 ///
-/// Off Linux it reports [`IoMaxStatus::NotRequired`]. Whatever the outcome, the throwaway
-/// directory does not survive the call.
+/// Off Linux both answers are `not-required`. Whatever the outcome, the throwaway directory does
+/// not survive the call. Never run at launch: a launch learns the same answer from
+/// [`prepare_scope`].
 #[must_use]
-pub fn probe_io_max(limits: &HostResourceLimits, workdir: &Path) -> IoMaxReport {
+pub fn probe_scope(required: bool, limits: &HostResourceLimits, workdir: &Path) -> ScopeProbe {
     let declared = limits.cgroup_io_bytes_per_sec;
+    if !required {
+        return ScopeProbe {
+            cgroup_scope: CgroupScopeReport::no_scope_required(),
+            io_max: IoMaxReport::no_scope_required(declared),
+        };
+    }
     #[cfg(target_os = "linux")]
     {
         let base = match delegated_base() {
             Ok(base) => base,
-            Err(reason) => {
-                return IoMaxReport::unavailable(
-                    declared,
-                    format!("no delegated cgroup base to write io.max into: {reason}"),
-                )
+            Err(error) => {
+                return ScopeProbe {
+                    cgroup_scope: CgroupScopeReport::unavailable(&error),
+                    io_max: IoMaxReport::unavailable(
+                        declared,
+                        format!("no delegated cgroup base to write io.max into: {error}"),
+                    ),
+                }
             }
         };
         let path = base.join(scope_dir_name("explain-scope"));
-        if let Err(error) = std::fs::create_dir(&path) {
-            return IoMaxReport::unavailable(
-                declared,
-                format!(
-                    "could not create a throwaway cgroup at {}: {error}",
-                    path.display()
+        if let Err(error) = create_scope_dir(&path) {
+            return ScopeProbe {
+                cgroup_scope: CgroupScopeReport::unavailable(&scope_dir_refusal(&path, &error)),
+                io_max: IoMaxReport::unavailable(
+                    declared,
+                    format!(
+                        "could not create a throwaway cgroup at {}: {error}",
+                        path.display()
+                    ),
                 ),
-            );
+            };
         }
-        let report = write_io_max(&path, declared, workdir);
+        let io_max = write_io_max(&path, declared, workdir);
         // Best-effort by necessity and not by preference: the scope holds no tasks, so the only
         // way this fails is a host that took the directory away underneath us.
         let _ = std::fs::remove_dir(&path);
-        report
+        ScopeProbe {
+            cgroup_scope: CgroupScopeReport::delegated(),
+            io_max,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = workdir;
-        IoMaxReport::not_required(declared, NOT_LINUX_REASON)
+        ScopeProbe {
+            cgroup_scope: CgroupScopeReport::not_required(NOT_LINUX_CGROUP_REASON),
+            io_max: IoMaxReport::not_required(declared, NOT_LINUX_REASON),
+        }
     }
+}
+
+/// `mkdir` of a scope directory, an existing one accepted: the one call [`prepare_scope`] and
+/// [`probe_scope`] both make to learn whether a child cgroup can be created.
+#[cfg(target_os = "linux")]
+fn create_scope_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The `E-RUN-012` reason for a scope directory [`create_scope_dir`] could not create.
+#[cfg(target_os = "linux")]
+fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
+    CgroupError::io(
+        format!(
+            "could not create cgroup scope at {}: {error}",
+            path.display()
+        ),
+        error,
+    )
 }
 
 /// Does this policy give the capsule any way to run a native subprocess at all?
@@ -1395,14 +1619,7 @@ impl CgroupScope {
         let base = delegated_base()?;
 
         let path = base.join(scope_dir_name(session_id));
-        if let Err(error) = std::fs::create_dir(&path) {
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(format!(
-                    "could not create cgroup scope at {}: {error}",
-                    path.display()
-                ));
-            }
-        }
+        create_scope_dir(&path).map_err(|error| scope_dir_refusal(&path, &error))?;
 
         let scope = Self {
             path,
@@ -1482,7 +1699,7 @@ impl CgroupScope {
 /// Writes `io.max` into `scope_path` for the device behind `workdir`, and says what happened.
 ///
 /// The one place the `io.max` line is composed, shared by [`CgroupScope::apply_io_max`] at launch
-/// and by [`probe_io_max`] under `--explain-scope`, so the diagnostic exercises the identical
+/// and by [`probe_scope`] under `--explain-scope`, so the diagnostic exercises the identical
 /// write the launch performs rather than a paraphrase of it.
 ///
 /// The device comes from [`io_max_device`], which resolves it from the nearest *existing*
@@ -1748,7 +1965,7 @@ pub(crate) fn resolve_delegated_base_in_background() {
 /// makes concurrent first-callers agree on that root instead of racing to relocate each other.
 /// Only success is cached: a host that is not delegated must keep reporting so on every attempt.
 #[cfg(target_os = "linux")]
-fn delegated_base() -> Result<PathBuf, String> {
+fn delegated_base() -> Result<PathBuf, CgroupError> {
     static BASE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
     // A poisoned lock guards no invariant worth honouring here: the cache is either populated or
@@ -1906,9 +2123,10 @@ fn await_scope_membership(unit: &str) -> Result<(), String> {
 /// [`crate::errors::RuntimeError::CgroupDelegationUnavailable`], so it names the delegation
 /// requirement rather than only the failed syscall.
 #[cfg(target_os = "linux")]
-fn probe_delegation() -> Result<PathBuf, String> {
-    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup")
-        .map_err(|error| format!("could not read /proc/self/cgroup: {error}"))?;
+fn probe_delegation() -> Result<PathBuf, CgroupError> {
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| {
+        CgroupError::io(format!("could not read /proc/self/cgroup: {error}"), &error)
+    })?;
     let relative = parse_unified_cgroup_path(&self_cgroup).ok_or_else(|| {
         "this host has no cgroup v2 unified hierarchy (no `0::` line in /proc/self/cgroup); \
          cgroup v1-only and hybrid hosts cannot be delegated a v2 scope"
@@ -1926,14 +2144,18 @@ fn probe_delegation() -> Result<PathBuf, String> {
         return Err(format!(
             "delegated cgroup directory {} does not exist",
             base.display()
-        ));
+        )
+        .into());
     }
 
     let controllers =
         std::fs::read_to_string(base.join("cgroup.controllers")).map_err(|error| {
-            format!(
-                "could not read {}/cgroup.controllers: {error}",
-                base.display()
+            CgroupError::io(
+                format!(
+                    "could not read {}/cgroup.controllers: {error}",
+                    base.display()
+                ),
+                &error,
             )
         })?;
     let unavailable = missing_controllers(&controllers, REQUIRED_CONTROLLERS);
@@ -1943,7 +2165,8 @@ fn probe_delegation() -> Result<PathBuf, String> {
              `Delegate=yes` (or `Delegate=memory pids cpu io`)",
             unavailable.join(", "),
             base.display()
-        ));
+        )
+        .into());
     }
 
     // The probe must confirm we can actually *create* a child here, not just read the directory:
@@ -1952,10 +2175,13 @@ fn probe_delegation() -> Result<PathBuf, String> {
     let probe_dir = base.join(format!("murmur-delegation-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir(&probe_dir);
     std::fs::create_dir(&probe_dir).map_err(|error| {
-        format!(
-            "cannot create a child cgroup under {} ({error}); the unit `mur` runs under needs \
-             `Delegate=yes` for memory, pids, cpu and io",
-            base.display()
+        CgroupError::io(
+            format!(
+                "cannot create a child cgroup under {} ({error}); the unit `mur` runs under needs \
+                 `Delegate=yes` for memory, pids, cpu and io",
+                base.display()
+            ),
+            &error,
         )
     })?;
     let _ = std::fs::remove_dir(&probe_dir);
@@ -1970,7 +2196,7 @@ fn probe_delegation() -> Result<PathBuf, String> {
 /// "no internal processes" rule; the recovery is to move this process into its own leaf and try
 /// once more. That relocation stays entirely inside the delegated subtree.
 #[cfg(target_os = "linux")]
-fn enable_controllers(base: &Path) -> Result<(), String> {
+fn enable_controllers(base: &Path) -> Result<(), CgroupError> {
     let subtree_control = base.join("cgroup.subtree_control");
     let current = std::fs::read_to_string(&subtree_control).unwrap_or_default();
 
@@ -2027,13 +2253,16 @@ fn enable_controllers(base: &Path) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    Err(format!(
-        "could not enable controllers [{}] in {} ({}); the unit `mur` runs under needs \
-         `Delegate=yes` for memory, pids, cpu and io",
-        missing.join(", "),
-        subtree_control.display(),
-        last_error.map_or_else(|| "still occupied".to_string(), |error| error.to_string()),
-    ))
+    Err(CgroupError {
+        errno: last_error.as_ref().and_then(std::io::Error::raw_os_error),
+        message: format!(
+            "could not enable controllers [{}] in {} ({}); the unit `mur` runs under needs \
+             `Delegate=yes` for memory, pids, cpu and io",
+            missing.join(", "),
+            subtree_control.display(),
+            last_error.map_or_else(|| "still occupied".to_string(), |error| error.to_string()),
+        ),
+    })
 }
 
 /// Walk up out of any `murmur-supervisor` leaves the path ends in.
@@ -2056,13 +2285,16 @@ fn ascend_out_of_supervisor_leaves(mut base: PathBuf) -> PathBuf {
 
 /// Move this process into `<base>/murmur-supervisor`, creating it if needed.
 #[cfg(target_os = "linux")]
-fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), String> {
+fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), CgroupError> {
     let leaf = base.join(SUPERVISOR_LEAF);
     if let Err(error) = std::fs::create_dir(&leaf) {
         if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(format!(
-                "could not create {} to vacate the delegated cgroup: {error}",
-                leaf.display()
+            return Err(CgroupError::io(
+                format!(
+                    "could not create {} to vacate the delegated cgroup: {error}",
+                    leaf.display()
+                ),
+                &error,
             ));
         }
     }
@@ -2071,9 +2303,12 @@ fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), String> {
         format!("{}\n", std::process::id()),
     )
     .map_err(|error| {
-        format!(
-            "could not move this process into {} to vacate the delegated cgroup: {error}",
-            leaf.display()
+        CgroupError::io(
+            format!(
+                "could not move this process into {} to vacate the delegated cgroup: {error}",
+                leaf.display()
+            ),
+            &error,
         )
     })
 }
@@ -2393,7 +2628,13 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let report = probe_io_max(&HostResourceLimits::default(), &temp.path().join("workdir"));
+        let probe = probe_scope(
+            true,
+            &HostResourceLimits::default(),
+            &temp.path().join("workdir"),
+        );
+        assert_eq!(probe.cgroup_scope, CgroupScopeReport::delegated());
+        let report = probe.io_max;
         assert!(
             matches!(
                 report.status,
@@ -2403,7 +2644,7 @@ mod tests {
         );
 
         // Counted by name rather than by directory count: this binary's other tests create and
-        // remove scopes under the same base concurrently, and only `probe_io_max` names one
+        // remove scopes under the same base concurrently, and only `probe_scope` names one
         // `explain-scope`.
         let leftovers: Vec<String> = std::fs::read_dir(delegated_base().expect("a delegated base"))
             .unwrap()
@@ -2414,6 +2655,86 @@ mod tests {
             leftovers.is_empty(),
             "the throwaway cgroup outlived the probe: {leftovers:?}"
         );
+    }
+
+    /// A probe for a capsule that needs no scope attempts nothing and reports the `not-required`
+    /// answers a launch writes for it, byte for byte.
+    #[test]
+    fn a_probe_that_is_not_required_reports_what_a_launch_writes() {
+        let limits = HostResourceLimits::default();
+        let probe = probe_scope(false, &limits, Path::new("/nonexistent/workdir"));
+        let prepared = prepare_scope(false, &limits, "s", Path::new("/nonexistent/workdir"))
+            .expect("no scope is required");
+        assert_eq!(probe.cgroup_scope, prepared.cgroup_scope);
+        assert_eq!(probe.io_max, prepared.io_max);
+        assert_eq!(probe.cgroup_scope.status, CgroupScopeStatus::NotRequired);
+        assert_eq!(
+            serde_json::to_value(&probe.cgroup_scope).unwrap(),
+            serde_json::json!({"status": "not-required", "reason": NO_CGROUP_SCOPE_REASON})
+        );
+    }
+
+    /// `unavailable` carries the failing call's errno by name and the reason verbatim; `delegated`
+    /// carries neither key; the error displays as its message alone, so `E-RUN-012`'s text does
+    /// not change with the errno carried beside it.
+    #[test]
+    fn the_cgroup_scope_report_serializes_each_status() {
+        let error = CgroupError::io(
+            "cannot create a child cgroup under /sys/fs/cgroup/x (Read-only file system (os \
+             error 30))"
+                .to_string(),
+            &std::io::Error::from_raw_os_error(libc::EROFS),
+        );
+        assert_eq!(error.to_string(), error.message);
+        assert_eq!(String::from(error.clone()), error.message);
+        let unavailable = CgroupScopeReport::unavailable(&error);
+        assert_eq!(
+            serde_json::to_value(&unavailable).unwrap(),
+            serde_json::json!({
+                "status": "unavailable",
+                "errno": "EROFS",
+                "reason": error.message,
+            })
+        );
+        assert_eq!(
+            render_cgroup_scope(&unavailable),
+            format!(
+                "cgroup scope: unavailable (EROFS) \u{2014} {}",
+                error.message
+            )
+        );
+        let delegated = CgroupScopeReport::delegated();
+        assert_eq!(
+            serde_json::to_value(&delegated).unwrap(),
+            serde_json::json!({"status": "delegated"})
+        );
+        assert_eq!(render_cgroup_scope(&delegated), "cgroup scope: delegated");
+        assert_eq!(
+            serde_json::to_value(CgroupScopeReport::default()).unwrap(),
+            serde_json::json!({"status": "not-probed"})
+        );
+        let no_errno = CgroupScopeReport::unavailable(&CgroupError::from("no v2".to_string()));
+        assert_eq!(no_errno.errno, None);
+    }
+
+    /// A launch that created its scope records `delegated`; one that needed none records
+    /// `not-required`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_prepared_scope_reports_delegated() {
+        if skip_without_host_support("a_prepared_scope_reports_delegated") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = prepare_scope(
+            true,
+            &HostResourceLimits::default(),
+            "cgroup-scope-report",
+            &temp.path().join("workdir"),
+        )
+        .expect("a delegated host creates the scope");
+        assert!(prepared.scope.is_some());
+        assert_eq!(prepared.cgroup_scope, CgroupScopeReport::delegated());
     }
 
     #[test]

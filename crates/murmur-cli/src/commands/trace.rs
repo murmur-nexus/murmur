@@ -193,8 +193,9 @@ struct SessionStartEvent {
     /// Names of the tools offered to the model.
     #[serde(default)]
     tools_declared: Vec<String>,
-    /// The strongest containment class asked for, and the class this host could enforce.
-    /// Absent on a trace from a runtime predating the keys.
+    /// The strongest containment class asked for, and the class the session's commands ran under:
+    /// the class of the tier the session applied, which a declaration below `sealed` keeps below
+    /// what the host could back. Absent on a trace from a runtime predating the keys.
     #[serde(default)]
     containment_declared: Option<String>,
     #[serde(default)]
@@ -3510,8 +3511,9 @@ fn print_show(m: &TraceMetrics) {
     if let Some(line) = runtime_pins_line(&m.runtime_artifacts) {
         capsule_runtime::report_println!("{line}");
     }
-    // What was asked for against what this host could enforce. The two are read together:
-    // a capsule that declared `sealed` and achieved `advisory` ran with neither.
+    // What was asked for against the class the session's commands ran under — the applied
+    // tier's, not the most this host could back. A launch refuses a floor it cannot meet, so a
+    // recorded `achieved` below `declared` is a trace from a runtime that did not.
     if let (Some(declared), Some(achieved)) = (&m.containment_declared, &m.containment_achieved) {
         capsule_runtime::report_println!("{:<11} {} → {}", "containment:", declared, achieved);
     }

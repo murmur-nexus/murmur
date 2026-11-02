@@ -348,24 +348,27 @@ fn grant_cause(
     use crate::sealed::{
         ProfileAttachment, UsernsGrant, SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
     };
-    const CONTAINER_REMEDY: &str = "Inside a container, run it with a seccomp policy that \
-         permits unshare(CLONE_NEWUSER), or with `--cap-add SYS_ADMIN`, or create the network \
-         namespace outside the container and run mur inside it.";
+    const CONTAINER_REMEDY: &str = "Inside a container, the container runtime's seccomp \
+         profile is the usual blocker: it refuses unshare(CLONE_NEWUSER) and setns whatever \
+         capabilities the container holds. Run the container with a seccomp profile that permits \
+         them (Docker: `--security-opt seccomp=<file>`; Kubernetes: `seccompProfile: \
+         Localhost`), or create the network namespace outside the container and run mur inside \
+         it.";
     match (userns_grant, attachment) {
         (UsernsGrant::ApparmorAbsent, _) => format!(
             "Likely cause: not AppArmor, which is not enabled on this host — a container \
-             runtime's seccomp filter or a missing CAP_SYS_ADMIN, or another security module's \
-             policy. {CONTAINER_REMEDY} On a bare host, check the policy of the security module \
-             in use."
+             runtime's seccomp profile, or another security module's policy. \
+             {CONTAINER_REMEDY} On a bare host, check the policy of the security module in use."
         ),
         (_, ProfileAttachment::Other { profile }) => format!(
             "Likely cause: the AppArmor profile `{profile}` confines mur. \
              kernel.apparmor_restrict_unprivileged_userns does not govern a process another \
-             profile confines: that profile, and a container runtime's seccomp filter and \
-             capabilities, decide whether it may create a user namespace. Run the container with \
-             an AppArmor profile and seccomp policy that permit unshare(CLONE_NEWUSER), or with \
-             `--cap-add SYS_ADMIN`, or create the network namespace outside the container and run \
-             mur inside it."
+             profile confines: that profile, and a container runtime's seccomp profile, decide \
+             whether it may create a user namespace. Run the container with an AppArmor profile \
+             and a seccomp profile that permit unshare(CLONE_NEWUSER) and setns (Docker: \
+             `--security-opt apparmor=<profile> --security-opt seccomp=<file>`; Kubernetes: \
+             `appArmorProfile` and `seccompProfile: Localhost`), or create the network namespace \
+             outside the container and run mur inside it."
         ),
         (UsernsGrant::ProfileConfining, _) | (_, ProfileAttachment::Sealed { .. }) => format!(
             "Likely cause: the {SEALED_APPARMOR_PROFILE_NAME} AppArmor profile confines mur and \
@@ -376,8 +379,8 @@ fn grant_cause(
         ),
         (UsernsGrant::RestrictionDisabledHostWide, _) => format!(
             "Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host \
-             — a container runtime's seccomp filter or a missing CAP_SYS_ADMIN, or another \
-             security module's policy. {CONTAINER_REMEDY}"
+             — a container runtime's seccomp profile, or another security module's policy. \
+             {CONTAINER_REMEDY}"
         ),
         (UsernsGrant::Withheld, _) => format!(
             "Likely cause: AppArmor's unprivileged-userns restriction \
@@ -433,6 +436,9 @@ pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
         libc::EADDRINUSE => "EADDRINUSE",
         libc::EMFILE => "EMFILE",
         libc::ENFILE => "ENFILE",
+        libc::EROFS => "EROFS",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EBUSY => "EBUSY",
         _ => return None,
     })
 }
@@ -1821,8 +1827,13 @@ mod tests {
         )
         .reason();
         assert!(reason.contains("`docker-default`"), "{reason}");
-        assert!(reason.contains("--cap-add SYS_ADMIN"), "{reason}");
-        assert!(reason.contains("seccomp"), "{reason}");
+        assert!(!reason.contains("--cap-add"), "{reason}");
+        assert!(reason.contains("seccomp profile"), "{reason}");
+        assert!(
+            reason.contains("unshare(CLONE_NEWUSER) and setns"),
+            "{reason}"
+        );
+        assert!(reason.contains("seccompProfile: Localhost"), "{reason}");
         assert!(
             !reason.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
             "{reason}"
@@ -1872,7 +1883,17 @@ mod tests {
                     "{reason}"
                 );
                 assert!(!reason.contains("apparmor_parser"), "{reason}");
-                assert!(reason.contains("--cap-add SYS_ADMIN"), "{reason}");
+                assert!(!reason.contains("--cap-add"), "{reason}");
+                assert!(!reason.contains("CAP_SYS_ADMIN"), "{reason}");
+                assert!(
+                    reason.contains("seccomp profile is the usual blocker"),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("unshare(CLONE_NEWUSER) and setns"),
+                    "{reason}"
+                );
+                assert!(reason.contains("--security-opt seccomp=<file>"), "{reason}");
                 assert!(
                     reason.contains(&format!("Host readings: {readings};")),
                     "{reason}"

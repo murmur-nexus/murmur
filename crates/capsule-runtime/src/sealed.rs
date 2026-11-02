@@ -458,11 +458,13 @@ impl SealedBlocker {
             ),
             SealedBlocker::NamespaceCreationDenied => {
                 "sealed requires an unprivileged user namespace, which this host refused to create. \
-                 This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the \
-                 container's own seccomp filter blocks unshare(2). Either add `--cap-add \
-                 SYS_ADMIN` to the container invocation, or establish the mount namespace outside \
-                 the container and run mur inside it. The runtime will not fall back to a weaker \
-                 class."
+                 This is the usual answer inside a container: the container runtime's seccomp \
+                 profile refuses unshare(CLONE_NEWUSER), and refuses setns, mount, umount2 and \
+                 pivot_root, which sealed needs next. Run the container with a seccomp profile \
+                 that permits those calls (Docker: `--security-opt seccomp=<file>`; Kubernetes: \
+                 `seccompProfile: Localhost`), or create the namespaces outside the container and \
+                 run mur inside them. Adding capabilities does not lift a seccomp refusal. The \
+                 runtime will not fall back to a weaker class."
                     .to_string()
             }
             SealedBlocker::IdMapDenied => {
@@ -478,8 +480,11 @@ impl SealedBlocker {
                 "sealed created a user+mount namespace but mount(2) inside it was refused, which \
                  is what a confinement that permits userns_create and then denies CAP_SYS_ADMIN \
                  looks like. On an AppArmor host, load the shipped profile: `sudo apparmor_parser \
-                 -r {path}`. Inside a container, add `--cap-add SYS_ADMIN` to the container \
-                 invocation, or establish the mount namespace outside the container.",
+                 -r {path}`. Inside a container, the container runtime's seccomp profile refuses \
+                 mount, umount2 and pivot_root whatever capabilities the container holds: run it \
+                 with a seccomp profile that permits them (Docker: `--security-opt \
+                 seccomp=<file>`; Kubernetes: `seccompProfile: Localhost`), or establish the \
+                 mount namespace outside the container.",
                 path = SEALED_APPARMOR_PROFILE_PATH,
             ),
             SealedBlocker::PivotRootDenied => format!(
@@ -488,9 +493,11 @@ impl SealedBlocker {
                  working while pivot_root(2) does not is what a policy that grants one and not \
                  the other looks like: on an AppArmor host, check that the loaded profile carries \
                  a `pivot_root,` rule and reload it with `sudo apparmor_parser -r {path}`; inside \
-                 a container, pivot_root(2) is commonly absent from the runtime's seccomp \
-                 allowlist even where CAP_SYS_ADMIN is granted, so establish the mount namespace \
-                 outside the container instead. The runtime will not fall back to a weaker class.",
+                 a container, the container runtime's seccomp profile refuses pivot_root whatever \
+                 capabilities the container holds, so run it with a seccomp profile that permits \
+                 pivot_root (Docker: `--security-opt seccomp=<file>`; Kubernetes: \
+                 `seccompProfile: Localhost`), or establish the mount namespace outside the \
+                 container instead. The runtime will not fall back to a weaker class.",
                 path = SEALED_APPARMOR_PROFILE_PATH,
             ),
             SealedBlocker::KernelUnsupported => {
@@ -1133,7 +1140,7 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// `docs/content/reference/sealed-containment-manual-verification.md`).
 ///
 /// They are still tried first, and in this order, because they *do* succeed where the process has
-/// that privilege — as root, and inside a container run with `--cap-add SYS_ADMIN` — and because
+/// that privilege — as root, and inside a container granted `CAP_SYS_ADMIN` — and because
 /// a later PID-namespace slice makes them succeed everywhere without touching this list.
 ///
 /// When they all fail the executor binds the host's `/proc` instead. The capsule can then
@@ -4138,16 +4145,42 @@ mod tests {
         #[test]
         fn each_blocker_keeps_its_own_remedy() {
             let container = SealedBlocker::NamespaceCreationDenied.reason();
-            assert!(container.contains("--cap-add SYS_ADMIN"), "{container}");
+            assert!(!container.contains("--cap-add"), "{container}");
+            assert!(container.contains("seccomp profile"), "{container}");
+            for call in [
+                "unshare(CLONE_NEWUSER)",
+                "setns",
+                "mount",
+                "umount2",
+                "pivot_root",
+            ] {
+                assert!(container.contains(call), "{call}: {container}");
+            }
+            assert!(
+                container.contains("--security-opt seccomp=<file>")
+                    && container.contains("seccompProfile: Localhost"),
+                "{container}"
+            );
             assert!(container.contains("outside the container"), "{container}");
+            let mount = SealedBlocker::MountDenied.reason();
+            assert!(!mount.contains("--cap-add"), "{mount}");
+            assert!(
+                mount.contains("seccomp profile")
+                    && mount.contains("mount, umount2 and pivot_root")
+                    && mount.contains("--security-opt seccomp=<file>")
+                    && mount.contains("apparmor_parser -r"),
+                "{mount}"
+            );
             let map = SealedBlocker::IdMapDenied.reason();
             assert!(map.contains("uid_map"), "{map}");
             assert!(!map.contains("--cap-add"), "{map}");
             let pivot = SealedBlocker::PivotRootDenied.reason();
             assert!(
-                pivot.contains("pivot_root(2)") && pivot.contains("seccomp"),
+                pivot.contains("pivot_root(2)") && pivot.contains("seccomp profile"),
                 "{pivot}"
             );
+            assert!(!pivot.contains("CAP_SYS_ADMIN"), "{pivot}");
+            assert!(pivot.contains("seccompProfile: Localhost"), "{pivot}");
             assert_ne!(pivot, SealedBlocker::MountDenied.reason());
             let network = SealedBlocker::NetworkNamespaceUnavailable.reason();
             assert!(network.contains("E-CAP-005"), "{network}");

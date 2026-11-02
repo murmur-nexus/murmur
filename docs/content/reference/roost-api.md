@@ -90,8 +90,10 @@ The daemon's own environment holds no provider credential — see
 A parent capsule launches its children as processes of its own runtime, so the daemon, the parent
 and every child it delegates to run in one container:
 
-1. Run the container with a seccomp and AppArmor policy that permits `unshare(CLONE_NEWUSER)`, or
-   with `--cap-add SYS_ADMIN`. A capsule that declares `capabilities.spawn.allow` or
+1. Run the container with a seccomp profile and an AppArmor policy that permit
+   `unshare(CLONE_NEWUSER)` and `setns`, which the container runtime's default seccomp profile
+   refuses whatever capabilities the container holds (Docker `--security-opt seccomp=<file>`,
+   Kubernetes `seccompProfile: Localhost`). A capsule that declares `capabilities.spawn.allow` or
    `capabilities.shell.allow` needs a network namespace of its own, and a container that refuses
    one refuses the launch with [`E-CAP-005`](diagnostics.md#e-cap-005).
 2. Install `mur` and `mur-roost` in the image, and publish or install the parent and its

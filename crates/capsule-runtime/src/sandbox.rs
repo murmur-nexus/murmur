@@ -2916,9 +2916,12 @@ namespace pivoted onto a composed root (host runtime bind-mounted read-only, the
 its temporary folder at /tmp and its home folder at $HOME the only writable paths, a private /dev \
 tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
-rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
-private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
-so host process metadata stays visible there exactly as it is under scoped.";
+rather than denied — with one documented exception: /proc is a bind of the host's, because this \
+tier creates no PID namespace and mounting a private procfs unprivileged needs one. Landlock \
+refuses reading host /proc content at both scoped and sealed, so another process's command line, \
+environment and memory maps cannot be read; what still reaches outside the capsule is stat(2) on \
+/proc/<pid>, which shows that a process exists, its owner and its start time, and kill(2), which \
+delivers a signal to any process of the same user.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -8391,6 +8394,36 @@ mod tests {
             Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE))
         );
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
+    }
+
+    /// The sealed notice states what `/proc` leaks: Landlock refuses reading host
+    /// `/proc` content at both classes, and only `stat(2)` on `/proc/<pid>` and same-user signals
+    /// reach outside the capsule.
+    #[test]
+    fn tier_warning_kernel_sealed_states_what_proc_still_leaks() {
+        let (code, notice) = tier_warning(EnforcementTier::KernelSealed, false).unwrap();
+        assert_eq!(code, W_SEC_005);
+        assert!(!notice.contains("stays visible"), "{notice}");
+        assert!(
+            !notice.contains("exactly as it is under scoped"),
+            "{notice}"
+        );
+        assert!(notice.contains("no PID namespace"), "{notice}");
+        assert!(
+            notice
+                .contains("Landlock refuses reading host /proc content at both scoped and sealed"),
+            "{notice}"
+        );
+        assert!(notice.contains("stat(2) on /proc/<pid>"), "{notice}");
+        assert!(
+            notice.contains("exists, its owner and its start time"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("kill(2)") && notice.contains("any process of the same user"),
+            "{notice}"
+        );
+        assert_eq!(tier_warning(EnforcementTier::KernelSealed, true), None);
     }
 
     #[test]

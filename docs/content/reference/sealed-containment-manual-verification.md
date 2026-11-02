@@ -67,8 +67,9 @@ Concretely, this page checks four things by hand:
 2. **The happy path** — the capsule launches, and `stat`/`ls`/`cat` against a fixed target list
    outside the root fail with `No such file or directory` (not `Permission denied`).
 3. **`trace.jsonl`** records `"containment_achieved":"sealed"` on the `session_start` event.
-4. **The container refusal** — the identical capsule inside a plain `docker run` (no
-   `--cap-add SYS_ADMIN`) refuses with the container remediation, and never runs at a weaker class.
+4. **The container refusal** — the identical capsule inside a plain `docker run`, under the
+   container runtime's default seccomp profile, refuses with the container remediation, and never
+   runs at a weaker class.
 
 `No such file or directory` versus `Permission denied` is the whole point of the exercise and is
 worth stating before the commands: under `scoped`, `stat /etc/shadow` fails with `EACCES` because
@@ -633,28 +634,34 @@ on the second line is the host's:
     real fix is to fork so the child becomes PID 1, which changes reaping and signal semantics for
     the whole capsule subprocess tree and is deliberately out of scope here.
 
-    What this costs, stated plainly: host PIDs are enumerable and `/proc/<pid>/cmdline`,
-    `/proc/<pid>/root` and `/proc/<pid>/cwd` are nameable from inside the composed root. `/proc` is
-    the **one** part of the root where "outside does not exist" degrades to `scoped`'s "outside is
-    denied" — Landlock's ruleset covers no path under `/proc`, so opens through it are refused, and
-    `ptrace_may_access` gates the rest. Every other axis (steps 3a–3d) is absolute. Verify it
-    yourself here rather than taking this paragraph's word for it:
+    What this costs, stated plainly: `/proc` is the **one** part of the root where "outside does
+    not exist" degrades to `scoped`'s "outside is denied". Landlock refuses reading host `/proc`
+    content at both `scoped` and `sealed`, so another process's command line, environment and
+    memory maps cannot be read. What still reaches outside the capsule:
+
+    | Call | What it reaches |
+    |---|---|
+    | `stat(2)` on `/proc/<pid>` | That a host process exists, its owner and its start time |
+    | `kill(2)` | Signal delivery to any process of the same user |
+
+    Every other axis (steps 3a–3d) is absolute. Verify it yourself here rather than taking this
+    paragraph's word for it:
 
     ```sh
-    cat /proc/1/cmdline; echo
-    cat /proc/1/environ 2>&1 | head -c 60; echo
+    cat /proc/1/cmdline 2>&1 | head -c 60; echo
+    stat -c '%U %y' /proc/1
     ```
 
-    Expected — the host's init is *nameable* but its environment is not readable:
+    Expected — the host's init cannot be read, and `stat` still answers:
 
     ```text
-    /sbin/init splash
-    cat: /proc/1/environ: Permission denied
+    cat: /proc/1/cmdline: Permission denied
+    root <start time>
     ```
 
-    On a host where `mount -t proc` *does* succeed (running as root, or in a container started with
-    `--cap-add SYS_ADMIN`), the mountinfo line reads `- proc proc rw,hidepid=...` instead and the
-    pid count drops to the capsule's own processes. Record which of the two you got.
+    On a host where `mount -t proc` *does* succeed (running as root, or in a container granted
+    `CAP_SYS_ADMIN` whose seccomp profile permits `mount`), the mountinfo line reads
+    `- proc proc rw,hidepid=...` instead and the pid count drops to the capsule's own processes. Record which of the two you got.
 
 ## Step 4 — `trace.jsonl`
 
@@ -699,7 +706,7 @@ docker run --rm -v "$PWD":/work -w /work -v "$(command -v mur)":/usr/local/bin/m
 Expected — a refusal naming both remediations, and **no session**:
 
 ```text
-error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user namespace, which this host refused to create. This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the container's own seccomp filter blocks unshare(2). Either add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run mur inside it. The runtime will not fall back to a weaker class. The probe's unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: docker-default.
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user namespace, which this host refused to create. This is the usual answer inside a container: the container runtime's seccomp profile refuses unshare(CLONE_NEWUSER), and refuses setns, mount, umount2 and pivot_root, which sealed needs next. Run the container with a seccomp profile that permits those calls (Docker: `--security-opt seccomp=<file>`; Kubernetes: `seccompProfile: Localhost`), or create the namespaces outside the container and run mur inside them. Adding capabilities does not lift a seccomp refusal. The runtime will not fall back to a weaker class. The probe's unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: docker-default.
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 exit=1
 ```
@@ -708,10 +715,12 @@ The reason string may instead be the `MountDenied` variant, naming `making / MS_
 the nested namespace`, if this container's runtime lets `unshare` through and refuses the
 subsequent `mount(2)`. Both are correct; record which one you got, with its readings line.
 
-Then confirm the stated remediation actually works:
+Then confirm the stated remediation actually works. `sealed.json` is the container runtime's
+default seccomp profile with `unshare`, `setns`, `mount`, `umount2` and `pivot_root` added to its
+allowed calls:
 
 ```sh
-docker run --rm --cap-add SYS_ADMIN -v "$PWD":/work -w /work \
+docker run --rm --security-opt seccomp=sealed.json -v "$PWD":/work -w /work \
   -v "$(command -v mur)":/usr/local/bin/mur:ro ubuntu:24.04 mur run --explain-scope
 ```
 
@@ -725,8 +734,8 @@ Containment
   mechanism: mountns+pivot_root+landlock+seccomp
 ```
 
-If it still refuses with `--cap-add SYS_ADMIN`, the container's own seccomp profile is blocking
-`unshare(2)`; add `--security-opt seccomp=unconfined` and record that you needed it.
+If it still refuses with `MountDenied`, the container's AppArmor profile (`docker-default`) is
+refusing `mount(2)`; add `--security-opt apparmor=unconfined` and record that you needed it.
 
 ## Step 6 — negative control
 

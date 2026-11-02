@@ -235,9 +235,21 @@ Containment
   host can back: sealed
   floor met: yes
   mechanism: landlock+seccomp
-  covers:    shell commands, plan shell steps, native tools
   userns grant: profile_confining
   landlock ABI: 3
+  cgroup scope: delegated
+
+Routes
+  shell commands    present  landlock+seccomp
+  plan shell steps  absent   landlock+seccomp
+  native tools      present  landlock+seccomp (murmur/tool-git)
+  WASM tools        absent   host process, not confined by the class
+  drivers           present  host process, not confined by the class (murmur/driver-anthropic)
+    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+  hooks             present  host process, not confined by the class (ana/hook-telemetry)
+    Runs inside the mur process, held only by the preopens and network grants its own capabilities block declares.
+  process harness   absent   host process, not confined by the class
+  harness tools     absent   host process, not confined by the class
 
 Runtime directory
   path:      /home/dev/.murmur/sessions/<session-id>/runtime
@@ -293,10 +305,17 @@ the composed root; on the same host every other capsule runs on `landlock+seccom
 | `seccomp-only` | `advisory` | Linux without a usable Landlock ABI: seccomp only, filesystem scope by convention |
 | `none` | `advisory` | No kernel sandboxing primitive (macOS and every non-Linux target) |
 
-`covers:` names what that mechanism confines: every shell command the model runs, every shell step
-of a submitted plan, and every native tool, such as `murmur/tool-git` here, which runs `git` because
-`shell allow:` names it. A native tool runs with the capsule's grants above; see
-[Native tools](../reference/containment.md#native-tools).
+`Routes` names every way this capsule runs code and what holds each. The mechanism confines shell
+commands, shell steps of a submitted plan, and native tools, such as `murmur/tool-git` here, which
+runs `git` because `shell allow:` names it. WASM tools, drivers and hooks run inside the `mur`
+process, held by their own preopens and network grants, and a process harness runs as a child of
+`mur` outside the class. See
+[Routes and what holds each](../reference/containment.md#routes).
+
+`cgroup scope:` says whether a launch here gets the cgroup scope a capsule that runs subprocesses
+needs. `unavailable` means `mur run` would refuse the capsule with `E-RUN-012`, and the report ends
+with a line saying so. See
+[Whether the launch gets its cgroup scope](../reference/containment.md#cgroup-scope).
 
 Add `--json` for one machine-readable line instead, which is the same object `trace.jsonl` records as `effective_grants` on every session:
 
