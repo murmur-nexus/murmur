@@ -241,21 +241,13 @@ impl ProtectedPaths {
     /// into a protected subtree resolves to the rule that covers its target. Matching is
     /// component-wise: a rule names a subtree of the workdir root, not a path fragment, so `tests`
     /// covers `tests/a` and does not cover `tests2`.
-    #[cfg(test)]
+    ///
+    /// `roots` are the extra roots of the tool naming the candidate, empty for a shell call and
+    /// for a tool holding none: a `murmur-host/…` candidate a root covers is also matched at the
+    /// host path it reaches ([`crate::guest_roots::map_guest_path`]), so a protected subtree
+    /// reached through a root is refused like one named directly. The candidate as written is
+    /// matched too, so holding a root can only add a refusal.
     pub(crate) fn covering_rule(
-        &self,
-        workdir: &Path,
-        candidate: &str,
-    ) -> Option<(&ProtectedPathRule, String)> {
-        self.covering_rule_through(workdir, &[], candidate)
-    }
-
-    /// [`Self::covering_rule`] for a candidate a tool holding `roots` names: a `murmur-host/…`
-    /// candidate a root covers is also matched at the host path it reaches
-    /// ([`crate::guest_roots::map_guest_path`]), so a protected subtree reached through a root is
-    /// refused like one named directly. The candidate as written is matched too, so holding a root
-    /// can only add a refusal.
-    fn covering_rule_through(
         &self,
         workdir: &Path,
         roots: &[GuestRoot],
@@ -379,7 +371,7 @@ impl ProtectedPaths {
 
     fn check_segment(&self, workdir: &Path, segment: &Segment) -> Option<ProtectedPathRefusal> {
         for (operator, target) in &segment.redirections {
-            if let Some((rule, path)) = self.covering_rule_through(workdir, &[], target) {
+            if let Some((rule, path)) = self.covering_rule(workdir, &[], target) {
                 return Some(ProtectedPathRefusal {
                     rule: rule.declared().to_string(),
                     path,
@@ -395,7 +387,7 @@ impl ProtectedPaths {
             .find(|(name, _)| *name == binary)
             .map(|(_, targets)| *targets)?;
         for candidate in write_target_arguments(targets, &segment.args) {
-            if let Some((rule, path)) = self.covering_rule_through(workdir, &[], &candidate) {
+            if let Some((rule, path)) = self.covering_rule(workdir, &[], &candidate) {
                 return Some(ProtectedPathRefusal {
                     rule: rule.declared().to_string(),
                     path,
@@ -450,7 +442,7 @@ impl ProtectedPaths {
     ) -> Option<ProtectedPathRefusal> {
         for location in annotations.destinations() {
             for candidate in location.resolve(value) {
-                if let Some((rule, path)) = self.covering_rule_through(workdir, roots, candidate) {
+                if let Some((rule, path)) = self.covering_rule(workdir, roots, candidate) {
                     return Some(ProtectedPathRefusal {
                         rule: rule.declared().to_string(),
                         path,
@@ -479,7 +471,7 @@ impl ProtectedPaths {
     ) -> Option<ProtectedPathRefusal> {
         for derived in annotations.derived() {
             for candidate in derived.candidates(value) {
-                if let Some((rule, path)) = self.covering_rule_through(workdir, roots, &candidate) {
+                if let Some((rule, path)) = self.covering_rule(workdir, roots, &candidate) {
                     return Some(ProtectedPathRefusal {
                         rule: rule.declared().to_string(),
                         path,
@@ -517,7 +509,7 @@ impl ProtectedPaths {
                     if !matches_key(TOOL_DESTINATION_KEYS, key) {
                         continue;
                     }
-                    if let Some((rule, path)) = self.covering_rule_through(workdir, roots, text) {
+                    if let Some((rule, path)) = self.covering_rule(workdir, roots, text) {
                         return Some(ProtectedPathRefusal {
                             rule: rule.declared().to_string(),
                             path,
@@ -535,8 +527,7 @@ impl ProtectedPaths {
                         if !matches_key(TOOL_PATH_KEYS, key) {
                             continue;
                         }
-                        if let Some((rule, path)) = self.covering_rule_through(workdir, roots, text)
-                        {
+                        if let Some((rule, path)) = self.covering_rule(workdir, roots, text) {
                             return Some(ProtectedPathRefusal {
                                 rule: rule.declared().to_string(),
                                 path,
@@ -997,7 +988,7 @@ mod tests {
         assert!(ProtectedPaths::from_declared(&[]).unwrap().is_empty());
         assert!(!paths(&["tests"]).is_empty());
         assert!(paths(&["./tests/../tests"])
-            .covering_rule(Path::new("/nowhere"), "tests/a")
+            .covering_rule(Path::new("/nowhere"), &[], "tests/a")
             .is_some());
     }
 
@@ -1010,13 +1001,13 @@ mod tests {
         let workdir = Path::new("/nowhere/work");
         for covered in ["tests", "tests/a", "tests/a/b", "./tests/a"] {
             assert!(
-                protected.covering_rule(workdir, covered).is_some(),
+                protected.covering_rule(workdir, &[], covered).is_some(),
                 "must be covered: {covered}"
             );
         }
         for uncovered in ["tests2", "testsuite/a", "atests", "build/tests"] {
             assert!(
-                protected.covering_rule(workdir, uncovered).is_none(),
+                protected.covering_rule(workdir, &[], uncovered).is_none(),
                 "must not be covered: {uncovered}"
             );
         }
@@ -1032,12 +1023,14 @@ mod tests {
         let protected = paths(&["tests"]);
 
         assert!(protected
-            .covering_rule(&workdir, "../elsewhere/x.py")
+            .covering_rule(&workdir, &[], "../elsewhere/x.py")
             .is_none());
         assert!(protected
-            .covering_rule(&workdir, "../work/tests/x")
+            .covering_rule(&workdir, &[], "../work/tests/x")
             .is_none());
-        assert!(protected.covering_rule(&workdir, "/etc/passwd").is_none());
+        assert!(protected
+            .covering_rule(&workdir, &[], "/etc/passwd")
+            .is_none());
     }
 
     /// An absolute path and a symlink both resolve to the rule that covers the real file, and both
@@ -1052,7 +1045,7 @@ mod tests {
 
         let absolute = workdir.join("tests/test_foo.py");
         let (rule, path) = protected
-            .covering_rule(workdir, absolute.to_str().unwrap())
+            .covering_rule(workdir, &[], absolute.to_str().unwrap())
             .expect("absolute path resolves");
         assert_eq!(rule.declared(), "tests");
         assert_eq!(path, "tests/test_foo.py");
@@ -1061,7 +1054,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(workdir.join("tests"), workdir.join("link")).unwrap();
             let (rule, path) = protected
-                .covering_rule(workdir, "link/test_foo.py")
+                .covering_rule(workdir, &[], "link/test_foo.py")
                 .expect("a symlink into a protected subtree does not evade the rule");
             assert_eq!(rule.declared(), "tests");
             assert_eq!(path, "tests/test_foo.py");
@@ -1071,7 +1064,7 @@ mod tests {
             // spelling the same file through a link would evade the rule that covers it.
             let via_link = workdir.join("link/test_foo.py");
             let (rule, path) = protected
-                .covering_rule(workdir, via_link.to_str().unwrap())
+                .covering_rule(workdir, &[], via_link.to_str().unwrap())
                 .expect("an absolute path through a symlink resolves to the rule");
             assert_eq!(rule.declared(), "tests");
             assert_eq!(path, "tests/test_foo.py");

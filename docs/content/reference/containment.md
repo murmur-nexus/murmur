@@ -698,7 +698,7 @@ describes.
 | Execute | Never: a WASM tool cannot run a program |
 | A symlink inside a root | A relative link whose target stays inside the same root is followed. An absolute link is never followed, even through the unconfined `murmur-host`: opening it fails in the tool with `Operation not permitted`. Open its target by its own path instead |
 | A root that can no longer be opened | Fails that tool call, naming the path; a configured root is never silently left out |
-| [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) | Holds through a root: a write into a protected work-folder subtree is refused before dispatch whether the call names it relatively, by an absolute path, or through `murmur-host/` |
+| [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) | Holds through a root: a write into a protected work-folder subtree is refused before dispatch whether the call names it relatively, by the work folder's absolute host path, or through `murmur-host/` |
 | A tool narrowed to `capabilities.filesystem.scope`, a driver, a hook, the capsule itself | No extra roots |
 | A native tool | No extra roots: it is a host process, and reaches host paths through its own [grants](#native-tools), and the whole host when unconfined |
 

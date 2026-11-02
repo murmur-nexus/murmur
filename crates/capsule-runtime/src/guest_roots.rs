@@ -47,17 +47,6 @@ pub enum GuestRootSource {
     HostPaths,
 }
 
-impl GuestRootSource {
-    /// The spelling in every report.
-    #[must_use]
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Unconfined => "unconfined",
-            Self::HostPaths => "host_paths",
-        }
-    }
-}
-
 /// One host directory preopened into a WASM tool beyond its usual folders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestRoot {
@@ -256,7 +245,7 @@ mod tests {
         }
     }
 
-    fn summary(roots: &[GuestRoot]) -> Vec<(String, String, &'static str, &'static str)> {
+    fn summary(roots: &[GuestRoot]) -> Vec<(String, String, &'static str, String)> {
         roots
             .iter()
             .map(|root| {
@@ -264,7 +253,11 @@ mod tests {
                     root.guest_path.clone(),
                     root.host_path.display().to_string(),
                     root.access.wire_name(),
-                    root.source.wire_name(),
+                    serde_json::to_value(root.source)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
                 )
             })
             .collect()
@@ -414,7 +407,7 @@ mod tests {
             "murmur-host".to_string(),
             "/".to_string(),
             "read-write",
-            "unconfined",
+            "unconfined".to_string(),
         )];
         let plain = extra_guest_roots(&policy(ContainmentClass::Unconfined, Vec::new()));
         assert_eq!(summary(&plain), expected);
@@ -446,13 +439,13 @@ mod tests {
                         "murmur-host/a".to_string(),
                         "/a".to_string(),
                         "read",
-                        "host_paths"
+                        "host_paths".to_string()
                     ),
                     (
                         "murmur-host/a/b".to_string(),
                         "/a/b".to_string(),
                         "read-write",
-                        "host_paths"
+                        "host_paths".to_string()
                     ),
                 ]
             );
