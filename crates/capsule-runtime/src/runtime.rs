@@ -104,7 +104,6 @@ use crate::{
     },
     spawn_credential::SpawnCredential,
     spend::{MachineLedger, SpendMeter},
-    state_store::STATE_PREOPEN_NAME,
     stream_events::{self, StreamEventsTarget},
     streaming::{
         emit_input_required, emit_status, emit_task_ending, SseBroadcast, SseEventBuffer,
@@ -2525,7 +2524,7 @@ pub fn stage_session(
     // the identical inputs, so all three describe one preopen set. An escaping scope refuses the
     // launch here, before any registry pull or workdir creation, on the same terms a malformed
     // store name does.
-    let preopens =
+    let mut preopens =
         crate::network_policy::preopen_reports(request.artifacts.iter().map(|artifact| {
             (
                 artifact.name.as_str(),
@@ -2533,6 +2532,11 @@ pub fn stage_session(
                 artifact.capabilities.as_ref(),
             )
         }))?;
+    // The roots each WASM tool's dispatch preopens, from the policy `extra_roots_preopen` reads.
+    crate::containment::attach_extra_roots(
+        &mut preopens,
+        &crate::guest_roots::extra_guest_roots(&request.capability_policy),
+    );
     // Whether a literal `/tmp` reaches the session's temporary folder, decided once: the report
     // below says it and `launch_session` hands it to the enforcement that installs it.
     let temp_mapping = crate::temp_dir::temp_mapping(
@@ -4731,8 +4735,9 @@ fn launch(
                             &all_env,
                             &capability_policy,
                             // The capsule's own store runs no tool, so it is not handed the
-                            // runtime directory.
+                            // runtime directory, nor any extra root.
                             None,
+                            &[],
                         )?,
                         http: WasiHttpCtx::new(),
                         // The capsule's own store holds no gateway: it is no artifact, and a
@@ -5691,8 +5696,10 @@ fn launch(
         &inference_env,
         &staged.capability_policy,
         // A script capsule reads its task, like a whole-workdir tool reads `MURMUR.md`, from the
-        // read-only runtime directory at `murmur-runtime/`.
+        // read-only runtime directory at `murmur-runtime/`. Extra roots are a tool's, and the
+        // capsule component is none.
         Some(&staged.runtime_dir),
+        &[],
     )?;
 
     // Script capsule uses a multi-thread runtime so block_in_place works inside the host
@@ -7494,10 +7501,10 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 /// [`ToolCapabilityGrant::derive`] at staging time.
 ///
 /// `state_dir` is the artifact's durable state store, already created at `0700` by the staging
-/// path. `Some(dir)` adds a *second* preopen at the guest path [`STATE_PREOPEN_NAME`], so the
-/// guest reaches it as `state/<file>`; it is a host path outside every workdir, and the only one
-/// a guest can name. `None` — every caller without a `capabilities.state` grant — adds nothing,
-/// leaving the workdir preopen as the guest's only filesystem reach.
+/// path. `Some(dir)` adds a *second* preopen at the guest path
+/// [`crate::state_store::STATE_PREOPEN_NAME`], so the guest reaches it as `state/<file>`; it is a
+/// host path outside every workdir. `None` — every caller without a `capabilities.state` grant —
+/// adds nothing.
 ///
 /// `config_json` is this artifact's `config:` block, already lowered to compact JSON at staging.
 /// `Some` sets exactly one variable, [`ARTIFACT_CONFIG_ENV`]; `None` — every caller whose entry
@@ -7505,6 +7512,12 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 /// than present and empty. It is injected after the host allowlist and before `extra_env`, which
 /// is what makes it runtime-owned: `capabilities.env.allow` cannot supply it (the allowlist skips
 /// the name outright) and cannot shadow it either.
+///
+/// `extra_roots` are the host folders preopened after every other directory, each at its
+/// `murmur-host…` guest path ([`crate::guest_roots`]). Empty for every caller but a tool dispatch
+/// that also passes `runtime_dir`. A root that cannot be opened fails the context, naming its path:
+/// a configured root is never silently absent.
+#[allow(clippy::too_many_arguments)]
 fn build_wasi_ctx(
     workdir: &Path,
     filesystem_scope: Option<&str>,
@@ -7513,6 +7526,7 @@ fn build_wasi_ctx(
     extra_env: &[(String, String)],
     policy: &CapabilityPolicy,
     runtime_dir: Option<&Path>,
+    extra_roots: &[crate::guest_roots::GuestRoot],
 ) -> Result<WasiCtx, RuntimeError> {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
@@ -7533,26 +7547,17 @@ fn build_wasi_ctx(
         Some(scope) => resolve_scoped_dir(workdir, scope)?,
     };
 
-    builder
-        .preopened_dir(&preopen_root, ".", FsPerms::ReadWrite)
-        .map_err(|err| RuntimeError::wasi(preopen_root, err.to_string()))?;
-
-    if let Some(state_dir) = state_dir {
+    let planned =
+        crate::guest_roots::planned_preopens(&preopen_root, state_dir, runtime_dir, extra_roots);
+    for preopen in planned {
+        let perms = if preopen.read_only {
+            FsPerms::ReadOnly
+        } else {
+            FsPerms::ReadWrite
+        };
         builder
-            .preopened_dir(state_dir, STATE_PREOPEN_NAME, FsPerms::ReadWrite)
-            .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
-    }
-
-    // Read-only: the guest reads `MURMUR.md`, `task.md`, plans and installed tools there and
-    // changes none of them.
-    if let Some(runtime_dir) = runtime_dir {
-        builder
-            .preopened_dir(
-                runtime_dir,
-                crate::runtime_dir::RUNTIME_DIR_GUEST_PATH,
-                FsPerms::ReadOnly,
-            )
-            .map_err(|err| RuntimeError::wasi(runtime_dir.to_path_buf(), err.to_string()))?;
+            .preopened_dir(&preopen.host_path, &preopen.guest_path, perms)
+            .map_err(|err| RuntimeError::wasi(preopen.host_path.clone(), err.to_string()))?;
     }
 
     Ok(builder.build())
@@ -9095,6 +9100,9 @@ pub(crate) struct ToolInvokeEnv<'a> {
     /// `runtime: tool` with no `capabilities.filesystem.scope`; `None` for every other guest.
     /// Decided by [`CapsuleStoreState::runtime_dir_preopen`].
     pub(crate) runtime_dir: Option<&'a Path>,
+    /// The host folders preopened under `murmur-host` for the same guests that get `runtime_dir`
+    /// ([`crate::guest_roots::tool_extra_roots`]); empty for every other guest.
+    pub(crate) extra_roots: &'a [crate::guest_roots::GuestRoot],
     pub(crate) inference_env: &'a [(String, String)],
     pub(crate) capability_policy: &'a CapabilityPolicy,
     /// The capsule-wide ceiling. What actually gets enforced is this, clamped by
@@ -9171,6 +9179,7 @@ pub(crate) async fn invoke_tool_component(
         engine,
         accessible_workdir,
         runtime_dir,
+        extra_roots,
         inference_env,
         capability_policy,
         network_allow_rules,
@@ -9331,6 +9340,7 @@ pub(crate) async fn invoke_tool_component(
             &guest_env,
             capability_policy,
             runtime_dir,
+            extra_roots,
         )
         .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
         http: WasiHttpCtx::new(),
@@ -9567,6 +9577,30 @@ impl CapsuleStoreState {
         gets.then(|| self.runtime_root.path())
     }
 
+    /// The extra roots `name`'s guest is preopened into under `murmur-host`
+    /// ([`crate::guest_roots::tool_extra_roots`]): the session's, for exactly the WASM guests
+    /// [`Self::runtime_dir_preopen`] hands the runtime directory; none for every other, a native
+    /// tool included.
+    pub(crate) fn extra_roots_preopen(&self, name: &str) -> Vec<crate::guest_roots::GuestRoot> {
+        let scoped = self.declares_filesystem_scope(name);
+        self.installed_artifacts
+            .iter()
+            .find(|artifact| {
+                murmur_artifact::tool_name_of(&artifact.name) == name
+                    && artifact.implementation
+                        != Some(murmur_artifact::ArtifactImplementation::Native)
+                    && crate::runtime_dir::gets_runtime_dir_preopen(&artifact.runtime, scoped)
+            })
+            .map(|artifact| {
+                crate::guest_roots::tool_extra_roots(
+                    &artifact.runtime,
+                    scoped,
+                    &self.capability_policy,
+                )
+            })
+            .unwrap_or_default()
+    }
+
     async fn dispatch_component_with_env(
         &self,
         name: &str,
@@ -9579,11 +9613,13 @@ impl CapsuleStoreState {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
         };
+        let extra_roots = self.extra_roots_preopen(name);
         invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
                 runtime_dir: self.runtime_dir_preopen(name),
+                extra_roots: &extra_roots,
                 inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
@@ -9685,13 +9721,22 @@ impl CapsuleStoreState {
     ///
     /// Grants nothing and widens nothing: the only outcome it can produce is that a call does not
     /// happen. Runs on this session's own workdir, which is the root every declared entry is
-    /// relative to.
+    /// relative to, and reads a tool call's `murmur-host/…` paths through the extra roots that
+    /// tool's guest holds.
     pub(crate) fn check_protected_paths(
         &self,
         call: &ResolvedCall,
     ) -> Option<ProtectedPathRefusal> {
-        self.protected_paths
-            .check_call(&self.accessible_workdir, call, &self.tool_annotations)
+        let roots = match call {
+            ResolvedCall::Tool { tool_name, .. } => self.extra_roots_preopen(tool_name),
+            ResolvedCall::Shell { .. } => Vec::new(),
+        };
+        self.protected_paths.check_call(
+            &self.accessible_workdir,
+            &roots,
+            call,
+            &self.tool_annotations,
+        )
     }
 
     /// Whether `input` carries every name the called tool's `input_schema` lists in its
@@ -18366,6 +18411,7 @@ inference:
             &[],
             &CapabilityPolicy::default(),
             None,
+            &[],
         )
         .unwrap();
         // One root for both, as `stage_session` holds them without `--workdir`: one latch.
@@ -22947,7 +22993,8 @@ inference:
                 None,
                 &[],
                 &CapabilityPolicy::default(),
-                None
+                None,
+                &[],
             )
             .is_err(),
             "an unscoped tool preopens the workdir, which must exist"
@@ -22960,12 +23007,57 @@ inference:
             &[],
             &CapabilityPolicy::default(),
             None,
+            &[],
         )
         .expect("an existing workdir preopens as before");
         assert!(
             !missing.exists(),
             "the unscoped path must not create anything"
         );
+    }
+
+    /// An extra root that cannot be opened fails the context naming its path; one that can is
+    /// preopened after the work folder.
+    #[test]
+    fn tool_extra_root_that_cannot_be_opened_fails_the_context() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("gone");
+        let extra = |host_path: &Path| crate::guest_roots::GuestRoot {
+            guest_path: crate::guest_roots::guest_path_for(host_path),
+            host_path: host_path.to_path_buf(),
+            access: crate::host_paths::HostPathAccess::Read,
+            source: crate::guest_roots::GuestRootSource::HostPaths,
+        };
+        let workdir = root.path().join("work");
+        std::fs::create_dir(&workdir).unwrap();
+        let err = match build_wasi_ctx(
+            &workdir,
+            None,
+            None,
+            None,
+            &[],
+            &CapabilityPolicy::default(),
+            None,
+            &[extra(&missing)],
+        ) {
+            Ok(_) => panic!("a missing root must fail the context"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "the error names the root: {err}"
+        );
+        build_wasi_ctx(
+            &workdir,
+            None,
+            None,
+            None,
+            &[],
+            &CapabilityPolicy::default(),
+            None,
+            &[extra(root.path())],
+        )
+        .expect("an existing root is preopened");
     }
 
     /// With a scope the preopened root is `<workdir>/<scope>`, created if absent. Sibling
@@ -22983,6 +23075,7 @@ inference:
             &[],
             &CapabilityPolicy::default(),
             None,
+            &[],
         )
         .expect("a granted scope is created and preopened");
 
@@ -23005,7 +23098,16 @@ inference:
         std::fs::write(root.path().join("cache"), b"not a directory").unwrap();
 
         let policy = CapabilityPolicy::default();
-        let err = match build_wasi_ctx(root.path(), Some("cache"), None, None, &[], &policy, None) {
+        let err = match build_wasi_ctx(
+            root.path(),
+            Some("cache"),
+            None,
+            None,
+            &[],
+            &policy,
+            None,
+            &[],
+        ) {
             Ok(_) => panic!("an uncreatable scope must fail loudly"),
             Err(err) => err,
         };
@@ -23036,6 +23138,7 @@ inference:
                 ToolInvokeEnv {
                     engine: &engine,
                     runtime_dir: None,
+                    extra_roots: &[],
                     accessible_workdir: workdir.path(),
                     inference_env: &[],
                     capability_policy: &CapabilityPolicy::default(),
@@ -23084,6 +23187,7 @@ inference:
                 ToolInvokeEnv {
                     engine: &engine,
                     runtime_dir: None,
+                    extra_roots: &[],
                     accessible_workdir: workdir.path(),
                     inference_env: &[],
                     capability_policy: &CapabilityPolicy::default(),

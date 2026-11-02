@@ -6708,6 +6708,13 @@ mod tests {
                 scope: None,
                 surface: crate::containment::PreopenSurface::WholeWorkdir,
                 runtime_dir_reach: Some(crate::containment::RuntimeDirReach::MurmurRuntime),
+                // Populated for the same reason as `state_stores` above.
+                extra_roots: vec![crate::containment::ExtraRootReport {
+                    guest_path: "murmur-host/home/dev/.cargo".to_string(),
+                    path: "/home/dev/.cargo".to_string(),
+                    access: crate::host_paths::HostPathAccess::Read,
+                    source: crate::guest_roots::GuestRootSource::HostPaths,
+                }],
             }],
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
@@ -6778,6 +6785,12 @@ mod tests {
                 "scope": null,
                 "surface": "whole-workdir",
                 "runtime_dir_reach": "murmur-runtime",
+                "extra_roots": [{
+                    "guest_path": "murmur-host/home/dev/.cargo",
+                    "path": "/home/dev/.cargo",
+                    "access": "read",
+                    "source": "host_paths",
+                }],
             }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");

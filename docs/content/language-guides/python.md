@@ -159,6 +159,10 @@ Key points:
 - On failures, return `status = error` rather than crashing
 - `attachments` lists image files the tool wrote into the work folder for the model to see; an
   empty list returns none. See [Returning an image](../reference/wit-interfaces.md#tool-attachments)
+- A relative path, like `input.jsonl` here, opens in the work folder. An absolute host path opens
+  only where the operator gave the session more of the host, at `murmur-host` followed by that
+  path, and only when a folder the tool holds covers it. Check that before opening: see
+  [The folders a WASM tool is handed](../reference/wit-interfaces.md#wasm-tool-folders)
 
 ---
 

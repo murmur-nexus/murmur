@@ -8,5 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.46"
+wasi = "0.14.7"
 
 [workspace]

@@ -41,6 +41,19 @@ A `sealed` capsule adds nothing to this list: its `/tmp` is the
 [session's temporary folder](containment.md#temp-folder), its `$HOME` is the session's home folder,
 both in the records directory, and its synthetic `/etc` files are beside the runtime directory.
 
+### Folder names a WASM tool sees elsewhere { #wasm-tool-folder-names }
+
+A WASM tool sees the work folder as its current directory. Three top-level names lead it somewhere
+else instead, so a work-folder folder of the same name is hidden from that tool:
+
+| Name | What the tool reaches there | Held by |
+|---|---|---|
+| `murmur-runtime/` | The [runtime directory](#runtime-directory), read-only | A `runtime: tool` with no `capabilities.filesystem.scope` |
+| `state/` | Its [durable state store](#state-store) | A tool whose entry grants a store |
+| `murmur-host/` | Host folders: the host's `/` under `mur run --unconfined`, each [`host_paths`](config.md#host-paths) entry otherwise. See [Extra roots](containment.md#wasm-extra-roots) | A `runtime: tool` with no `capabilities.filesystem.scope`, in a session that grants any |
+
+Shell commands, plan shell steps and native tools see every work-folder folder under its own name.
+
 ### What the capsule changed { #what-the-capsule-changed }
 
 To find what the *capsule* changed, diff the work folder and subtract what the runtime wrote there.

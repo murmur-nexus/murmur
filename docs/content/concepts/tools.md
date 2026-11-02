@@ -12,6 +12,15 @@ contract: a **WASM path** (tool exposed through typed WIT interfaces) and a **na
 (tool launched as a subprocess and normalized into the same result envelope). The goal is
 consistent agent behavior regardless of tool implementation language.
 
+## Files a WASM tool opens { #wasm-tool-files }
+
+A WASM tool opens files only in the folders opened for it. A relative path always opens in the
+work folder. An absolute host path opens only where the operator gave the session more of the
+host — the whole host under `mur run --unconfined`, or the folders `host_paths` names — at
+`murmur-host` followed by that path, and only when a folder the tool holds covers it. A tool lists
+its folders and checks a path before opening it: see
+[The folders a WASM tool is handed](../reference/wit-interfaces.md#wasm-tool-folders).
+
 ## Tool dispatch
 
 Each tool call is resolved in a fixed precedence order:

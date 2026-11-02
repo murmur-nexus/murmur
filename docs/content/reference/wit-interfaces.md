@@ -130,6 +130,68 @@ attachment after the tool's own output, then one MCP `image` item per accepted i
 
 Whether the model sees the image is up to the harness.
 
+### The folders a WASM tool is handed { #wasm-tool-folders }
+
+A WASM tool reaches files only through the folders opened for it. Their names are the paths the
+tool opens them at:
+
+| Folder | Opened for | Access |
+|---|---|---|
+| `.` | Every tool: the work folder, or the entry's [`capabilities.filesystem.scope`](manifest.md#tool-capabilities). It is the tool's current directory | Read and write |
+| `state` | A tool whose entry grants a [store](workdir.md#state-store) | Read and write |
+| `murmur-runtime` | A `runtime: tool` with no `capabilities.filesystem.scope`: the [runtime directory](workdir.md#runtime-directory) | Read |
+| `murmur-host…` | The same tools, when the operator gave the session the [whole host or host folders](containment.md#wasm-extra-roots) | `read` or `read-write`, per root |
+
+The `murmur-host…` folders are *extra roots*. Each is `murmur-host` followed by the absolute host
+path it opens:
+
+| Host folder | Folder name |
+|---|---|
+| `/`, under `mur run --unconfined` | `murmur-host` |
+| `/home/op/.cargo`, a `host_paths` entry | `murmur-host/home/op/.cargo` |
+
+**Listing them.** `wasi:filesystem/preopens.get-directories` returns every folder above as a
+descriptor and its name. That list is the only place a tool learns its roots, and it holds exactly
+what the tool can open.
+
+**Opening an absolute path.** A relative path always resolves in the work folder. To open an
+absolute host path `P`:
+
+1. Find a held root whose name, without `murmur-host`, is empty (the whole host) or a
+   component-wise prefix of `P`: `/home/op/.cargo` covers `/home/op/.cargo/bin/x` and not
+   `/home/op/.cargo2`.
+2. If there is one, open `murmur-host` followed by `P`. If there is none, refuse the path.
+
+Check before opening: a `murmur-host/…` path no held root covers resolves into the work folder,
+where a write creates a stray `murmur-host/` folder. An absolute path opened without the prefix
+resolves into the work folder too, not onto the host.
+
+Whether a root is writable is its descriptor's `get-flags`, or the outcome of the write: a write
+under a `read` root fails in the tool. A work-folder folder named `murmur-host` is hidden from a
+tool holding a root, as `murmur-runtime` and `state` are from the tools holding those.
+
+In Rust, with the `wasi` crate and `std::fs`:
+
+```rust
+use std::path::{Path, PathBuf};
+
+/// Where to open absolute host path `path`, or `None` when no held root covers it.
+fn host_path(path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix("/").ok()?;
+    let covered = wasi::filesystem::preopens::get_directories()
+        .into_iter()
+        .filter_map(|(_, name)| name.strip_prefix("murmur-host").map(str::to_string))
+        .any(|root| root.is_empty() || path.starts_with(&root));
+    covered.then(|| Path::new("murmur-host").join(relative))
+}
+
+// std::fs::read_to_string(host_path(Path::new("/home/op/notes.txt"))?)
+```
+
+`Path::starts_with` compares whole components. The roots appear in
+[`preopens[].extra_roots`](observability-schemas.md#preopens) of `mur run --explain-scope --json`
+and `session_start`.
+
 ### Native tool result { #native-tool-result }
 
 A [native tool](../language-guides/python-native.md) reads one JSON object on stdin and writes one

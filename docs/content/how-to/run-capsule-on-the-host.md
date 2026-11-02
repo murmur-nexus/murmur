@@ -36,7 +36,10 @@ Read this before you choose it.
 | The trace and the records directory are read-only to commands where the host can enforce it | Commands can change them |
 
 A process a command moves out of its process group, with `setsid` for example, can outlive the
-session. WASM artifacts keep their own boundary either way.
+session. A WASM tool with no `capabilities.filesystem.scope` is also handed your whole filesystem,
+read and write, under `murmur-host/`; see
+[Extra roots](../reference/containment.md#wasm-extra-roots). Drivers, hooks and scoped tools keep
+their own boundary.
 
 ## Step 1 — create murmur.yaml
 
@@ -188,7 +191,8 @@ refused with [E-RUN-059](../reference/diagnostics.md#e-run-059): a declared floo
 | `mur run --unconfined` | Runs this launch as you: your `HOME`, environment, filesystem, network and `sudo` |
 | `containment: unconfined` in `~/.murmur/config.yaml` | Runs every launch you make unconfined; `--containment <class>` runs one contained |
 | A declared floor | Refuses the unconfined stance with `E-RUN-059` |
-| What stays on | The trace, spend ceilings, `inference.max_turns`, deadlines, policy hooks, the untrusted-content fence and WASM artifacts' boundaries |
+| What stays on | The trace, spend ceilings, `inference.max_turns`, deadlines, policy hooks, the untrusted-content fence, and the boundaries of drivers, hooks and scoped WASM tools |
+| What a WASM tool gains | An unscoped WASM tool is handed the whole host at `murmur-host/` |
 | What never spreads | Delegated children, plan `capsule` steps and deployed capsules run contained |
 
 See [Running unconfined](../reference/containment.md#unconfined) for every rule.

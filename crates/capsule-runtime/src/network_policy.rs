@@ -614,6 +614,7 @@ where
             scope,
             surface,
             runtime_dir_reach,
+            extra_roots: Vec::new(),
         });
     }
 
@@ -1185,6 +1186,7 @@ mod tests {
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
                     runtime_dir_reach: Some(crate::containment::RuntimeDirReach::Unresolved),
+                    extra_roots: Vec::new(),
                 },
                 PreopenReport {
                     artifact: "anthropic-driver".to_string(),
@@ -1192,6 +1194,7 @@ mod tests {
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
                     runtime_dir_reach: None,
+                    extra_roots: Vec::new(),
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
@@ -1199,6 +1202,7 @@ mod tests {
                     scope: None,
                     surface: PreopenSurface::Nothing,
                     runtime_dir_reach: None,
+                    extra_roots: Vec::new(),
                 },
             ]
         );
@@ -1228,6 +1232,7 @@ mod tests {
                     scope: Some("cache".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
                     runtime_dir_reach: None,
+                    extra_roots: Vec::new(),
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
@@ -1235,6 +1240,7 @@ mod tests {
                     scope: Some("hook-state".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
                     runtime_dir_reach: None,
+                    extra_roots: Vec::new(),
                 },
             ]
         );
