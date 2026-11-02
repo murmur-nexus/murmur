@@ -91,9 +91,21 @@ Containment
   host can back: scoped
   floor met: yes
   mechanism: unconfined
-  covers:    nothing
   userns grant: shipped_profile
   landlock ABI: n/a
+  cgroup scope: not-required — this session runs unconfined and capabilities.resources declares no cgroup field, so a launch creates no cgroup scope for it
+
+Routes
+  shell commands    present  unconfined
+    Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing holds it.
+  plan shell steps  absent   unconfined
+  native tools      absent   unconfined
+  WASM tools        absent   host process, not confined by the class
+  drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
+    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+  hooks             absent   host process, not confined by the class
+  process harness   absent   unconfined
+  harness tools     absent   host process, not confined by the class
 
 Unconfined
   user:      ana

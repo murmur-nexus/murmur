@@ -634,9 +634,10 @@ pub(crate) fn run_run(
         };
         capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, locked_implementation_of);
         // Answered by doing what a launch does, not by inferring it from a delegated controller
-        // list: `probe_scope` resolves the delegated base and creates a throwaway cgroup through
-        // the calls `prepare_scope` makes, writes the same `io.max` line a launch writes, and
-        // removes the directory again. A base or scope it cannot create is reported with the
+        // list: `explain_scope_probe` applies the unconfined stance's rules, then `probe_scope`
+        // resolves the delegated base and creates a throwaway cgroup through the calls
+        // `prepare_scope` makes, writes the same `io.max` line a launch writes, and removes the
+        // directory again. A base or scope it cannot create is reported with the
         // reason `E-RUN-012` would print. The would-be workdir does not exist yet — this block
         // runs ahead of every side effect — so the probe resolves the backing device from its
         // nearest existing ancestor.

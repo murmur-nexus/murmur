@@ -223,6 +223,37 @@ fn flat_deploy_form_is_rejected_by_the_parser() {
     );
 }
 
+/// What `mur deploy` asks the target's `mur` before starting the capsule: `mur run
+/// --contained-launch --help` exits 0 on a `mur` that knows the flag, and an unknown flag in the
+/// same place exits 2 before `--help` is read, which is what a `mur` predating the flag does.
+#[test]
+fn the_contained_launch_probe_separates_a_mur_that_knows_the_flag() {
+    let dir = tempdir().unwrap();
+    let knows = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["run", "--contained-launch", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        knows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&knows.stderr)
+    );
+    let unknown = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["run", "--no-such-launch-flag", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
 // ─── mur destroy ──────────────────────────────────────────────────────────────
 
 /// `mur destroy` accepts an unambiguous prefix but must clean up under the matched record's full

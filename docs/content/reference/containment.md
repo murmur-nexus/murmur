@@ -77,8 +77,13 @@ Each row has these keys:
 | `present` | boolean | Whether this capsule has the route |
 | `under_class` | boolean | Whether the session's class covers the route |
 | `mechanism` | string | The `enforcement_tier` wire name when `under_class` is `true`; `host-process` when it is `false` |
-| `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true` |
+| `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true`, except on the Unconfined tier |
 | `artifacts` | array of strings | The tool, driver or hook entries on the route, in manifest order; `[]` for a route no artifact names |
+
+On the [Unconfined tier](#unconfined) the `shell`, `plan-shell-steps`, `native-tools` and
+`process-harness` rows read `under_class: true` and `mechanism: unconfined`, with the note
+`Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing
+holds it.` The other four rows are unchanged.
 
 Whether a tool is native is read off the installed artifact at launch, and off `murmur.lock` under
 `--explain-scope` and `mur doctor`; a tool `murmur.lock` does not pin is reported under
@@ -113,7 +118,7 @@ Linux is refused with [`E-RUN-012`](resource-limits.md#platform-behavior) when i
 |---|---|---|---|
 | `delegated` | A child cgroup was created under the delegated base: at launch the session's scope, under `--explain-scope` and `mur doctor` a throwaway one removed again | absent | absent |
 | `unavailable` | No child cgroup could be created, so a launch of this capsule is refused with `E-RUN-012` | the failing call's errno by name, such as `EROFS`; absent when no call left one | the reason text `E-RUN-012` prints on the same host |
-| `not-required` | No scope is created: the capsule declares no way to run a native subprocess, or the host is not Linux | absent | which of the two |
+| `not-required` | No scope is created: the capsule declares no way to run a native subprocess, the session runs [unconfined](#unconfined) and `capabilities.resources` declares no `cgroup_*` field, or the host is not Linux | absent | which of the three |
 | `not-probed` | Nobody asked | absent | absent |
 
 `--explain-scope` answers by doing what a launch does — resolving the delegated base, then creating
@@ -127,9 +132,6 @@ report closes with the line saying `mur run` would refuse to launch with `E-RUN-
 check — no `All checks passed.`, a `Fix:` line and exit status `1` — when the capsule declares
 `capabilities.shell.allow`, `capabilities.spawn.allow` or `capabilities.install.tool`, or a native
 tool, and the answer is `unavailable`.
-
-On the Unconfined tier the mechanism confines nothing, so `mechanism_covers` is `[]` and `covers:`
-prints `nothing`.
 
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
@@ -601,7 +603,9 @@ allowlist do not change.
 **It never spreads.** Every launch the runtime makes on the operator's behalf runs contained: a
 delegated child, a plan `capsule` step, a roster member of a contained `mur run --roster`, a
 capsule `mur deploy` starts, and a launch redeeming a roost spawn approval. Such a launch refuses
-`--unconfined` with [`E-RUN-060`](diagnostics.md#e-run-060). `mur run --roster --unconfined` passes
+`--unconfined` with [`E-RUN-060`](diagnostics.md#e-run-060). `mur deploy` asks the target's `mur`
+first and starts it this way only when it knows how; a `mur` from before the unconfined stance
+always runs contained. `mur run --roster --unconfined` passes
 `--unconfined` to every member, and each member resolves it against its own manifest.
 
 **Reporting.** `mur run` prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line per launch
