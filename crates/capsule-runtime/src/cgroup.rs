@@ -857,7 +857,6 @@ enum IoMaxWrite {
     Undeclared(u64),
 }
 
-
 /// What [`probe_scope`] found: whether a launch would get its cgroup scope here, and whether the
 /// declared `io.max` ceiling would apply on it.
 #[derive(Debug, Clone, PartialEq, Eq)]

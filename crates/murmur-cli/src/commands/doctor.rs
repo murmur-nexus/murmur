@@ -1873,7 +1873,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         containment_config,
         manifest_floor,
         effective_containment_floor(
-            effective_config.as_ref().and_then(|config| config.containment),
+            effective_config
+                .as_ref()
+                .and_then(|config| config.containment),
             manifest_floor,
             None,
         ),
