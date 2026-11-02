@@ -128,5 +128,5 @@ holds.
 | Delegation outcome | Every [`delegate-task`](roost-api.md#how-the-outcome-arrives) outcome delivered into the task that delegated, whatever that task's trust | `delegation:<capsule>` |
 
 Every boundary applies on `inference.transport: http` and `inference.transport: process`. A
-`process` capsule keeps no conversation record and emits no A2A `artifact` frame, so its fenced
-content is labelled only by the markers themselves.
+`process` capsule keeps no conversation record. Its A2A `artifact` frames name the fence in
+`fenceSource`, as [Streaming Protocol](streaming-protocol.md#event-artifact) describes.

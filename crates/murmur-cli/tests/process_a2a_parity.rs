@@ -857,6 +857,17 @@ fn text_a_tool_call_and_an_answer_write_the_same_frames() {
             "{transport}: {artifact}"
         );
         assert_eq!(
+            artifact["fenceSource"],
+            format!("tool:{TOOL}"),
+            "{transport}: {artifact}"
+        );
+        assert!(
+            artifact["content"].as_str().is_some_and(
+                |content| content.contains("<untrusted-content source=tool:echo-tool>")
+            ),
+            "{transport}: {artifact}"
+        );
+        assert_eq!(
             final_status(events)["status"]["response"],
             "PARITY-ANSWER",
             "{transport}"

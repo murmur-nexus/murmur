@@ -383,7 +383,7 @@ On a process capsule the harness runs the turn, so its `artifact` frames differ 
 | Key | On a process capsule | Why |
 |---|---|---|
 | `content` | The harness's report of the result, with each image the tool server returned replaced by `[image: <media_type>, <n> bytes, sha256 <hex>]` | Image bytes never reach a frame |
-| `fenceSource` | Always `null` | The harness receives tool output unfenced |
+| `fenceSource` | `tool:<name>`, or `skill:<name>` for a skill whose `murmur.lock` origin is `runtime`, when murmur's tool server fenced the result and the harness's report of it still holds that fence's opening marker. `null` for a call the tool server refused or could not dispatch, an operator-pinned skill, a result the runtime cannot match to a tool-server call by tool name and arguments, and the harness's own built-in tools | The harness reports results with no reference to the tool-server call, so the runtime matches them by tool name and arguments, and names a fence only when `content` carries it |
 | `exitCode`, `truncated` | Always `null` and `false` | A process driver reports no exit status or truncation flag |
 | `attachments` | Always `[]` | Nothing is stored, so there is no address to fetch an image from |
 

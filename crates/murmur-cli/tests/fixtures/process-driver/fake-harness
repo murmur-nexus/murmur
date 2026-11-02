@@ -445,7 +445,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "started s1 subscription"
     echo "text working on it"
     echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping\"}"
-    answer="$(call_bridge)"
+    answer="$(call_bridge echo-tool '{"msg":"ping"}')"
     echo "result c1 ok $answer"
     echo "text PARITY-ANSWER"
     echo "end PARITY-ANSWER"

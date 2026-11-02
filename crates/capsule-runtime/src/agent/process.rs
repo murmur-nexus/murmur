@@ -1078,9 +1078,10 @@ async fn drive_harness(
     // What the bridge saw that belongs in the trace: calls the harness walked away from, and
     // calls refused at the in-flight bound.
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<claude_bridge::BridgeNote>();
-    // What each bridged call's attachments came to, for the `tool_call` record the sink writes
-    // when the harness reports that call's result.
-    let (report_tx, mut report_rx) = mpsc::unbounded_channel::<claude_bridge::AttachmentReport>();
+    // What each bridged call's attachments came to and which fence its result carries, for the
+    // `tool_call` record and the `artifact` frame the sink writes when the harness reports that
+    // call's result.
+    let (report_tx, mut report_rx) = mpsc::unbounded_channel::<claude_bridge::CallReport>();
 
     // One long-lived future: re-creating it per iteration would drop a connection mid tool call.
     // Dropping it when this function returns is what ends every call still in flight.
@@ -1197,7 +1198,7 @@ async fn drive_harness(
             // belongs to is read. The bridge sends a call's report before writing its answer, and
             // the harness can report the call's result only after reading that answer: whenever
             // the output arm is polled, this arm was polled just before it in the same pass.
-            report = next_attachment_report(&mut report_rx) => {
+            report = next_call_report(&mut report_rx) => {
                 sink.queue_report(report);
                 continue;
             }
@@ -1403,10 +1404,11 @@ async fn next_bridge_note(
     }
 }
 
-/// The report arm's future: what the next bridged call that named an attachment came to.
-async fn next_attachment_report(
-    reports: &mut mpsc::UnboundedReceiver<claude_bridge::AttachmentReport>,
-) -> claude_bridge::AttachmentReport {
+/// The report arm's future: what the next bridged call that named an attachment or was fenced
+/// came to.
+async fn next_call_report(
+    reports: &mut mpsc::UnboundedReceiver<claude_bridge::CallReport>,
+) -> claude_bridge::CallReport {
     // Parks rather than returning on a closed channel, for the reason `next_gate_request` gives.
     match reports.recv().await {
         Some(report) => report,

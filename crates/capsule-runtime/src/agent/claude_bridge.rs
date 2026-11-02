@@ -37,8 +37,10 @@
 //!   runs for minutes does not hold up the harness's other calls.
 //! - An image a tool attaches to its result is returned as an MCP `image` content item after the
 //!   result's text, under the `context.images` checks, and stored nowhere: the harness holds the
-//!   conversation. Each call that named an attachment sends one [`AttachmentReport`] to the task
-//!   driving the harness, for the `tool_call` record it writes.
+//!   conversation.
+//! - Each dispatched call that named an attachment or whose result was fenced sends one
+//!   [`CallReport`] to the task driving the harness, for the `tool_call` record and the A2A
+//!   `artifact` frame it writes.
 
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -237,15 +239,16 @@ fn error_result(text: String) -> Value {
     })
 }
 
-/// What one bridged call's attachments came to, for the `tool_call` record the task driving the
-/// harness writes from the harness's own report of the result.
+/// What one bridged call's attachments came to and which fence its result went back under, for
+/// the `tool_call` record and the A2A `artifact` frame the task driving the harness writes from the
+/// harness's own report of the result.
 ///
-/// That record is written from the harness's `tool-result` event, which carries nothing tying it
-/// to this bridge's request, so the report names the call the way the event sink can match it: by
-/// the bare tool name and the arguments. Sent only for a call that named at least one attachment,
-/// before its answer is written.
+/// Both are written from the harness's `tool-result` event, which carries nothing tying it to this
+/// bridge's request, so the report names the call the way the event sink can match it: by the bare
+/// tool name and the arguments. Sent only for a dispatched call that named at least one attachment
+/// or whose result was fenced, before its answer is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AttachmentReport {
+pub(super) struct CallReport {
     /// The tool's bare name, as the harness asked for it.
     pub(super) tool_name: String,
     /// The call's arguments, serialised exactly as dispatch received them.
@@ -254,6 +257,9 @@ pub(super) struct AttachmentReport {
     pub(super) trace: Vec<AttachmentRecord>,
     /// Every image the answer carries, in order.
     pub(super) images: Vec<SentImage>,
+    /// The source the result was fenced under, as [`crate::types::DispatchOutcome::fence_source`]
+    /// names it; `None` for an operator-pinned skill, whose result goes back unfenced.
+    pub(super) fence_source: Option<String>,
 }
 
 /// One image a bridged answer carries as an MCP `image` content item.
@@ -403,14 +409,15 @@ impl BridgeHandle {
     /// runs the required-field check on each call and then, only for a capsule with a policy hook
     /// or a `read_only` path, the manifest's `read_only` check and the policy hook.
     ///
-    /// `reports` gets one [`AttachmentReport`] per dispatched call whose tool named an attachment,
-    /// sent before that call's answer is written.
+    /// `reports` gets one [`CallReport`] per dispatched call whose tool named an attachment or
+    /// whose result was fenced, sent before that call's answer is written. A call refused at the
+    /// decision point or at the in-flight bound, and one whose dispatch failed, sends none.
     pub(super) async fn serve(
         &self,
         store: &CapsuleStoreState,
         gate: &mpsc::UnboundedSender<GateRequest>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
-        reports: &mpsc::UnboundedSender<AttachmentReport>,
+        reports: &mpsc::UnboundedSender<CallReport>,
         on_request: &dyn Fn(),
     ) {
         let in_flight = AtomicUsize::new(0);
@@ -439,7 +446,7 @@ impl BridgeHandle {
         store: &CapsuleStoreState,
         gate: &mpsc::UnboundedSender<GateRequest>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
-        reports: &mpsc::UnboundedSender<AttachmentReport>,
+        reports: &mpsc::UnboundedSender<CallReport>,
         in_flight: &AtomicUsize,
     ) {
         let (reader_half, mut writer) = stream.into_split();
@@ -626,8 +633,8 @@ impl BridgeHandle {
     /// `abandon` is raised by the caller if the harness goes away; see
     /// [`CapsuleStoreState::dispatch_bridged_tool_async`].
     ///
-    /// Returns the result with the [`AttachmentReport`] of a dispatched call whose tool named an
-    /// attachment.
+    /// Returns the result with the [`CallReport`] of a dispatched call whose tool named an
+    /// attachment or whose result was fenced.
     async fn dispatch_tool_call(
         &self,
         name: &str,
@@ -636,7 +643,7 @@ impl BridgeHandle {
         gate: &mpsc::UnboundedSender<GateRequest>,
         abandon: AbandonSignal,
         decided: &AtomicBool,
-    ) -> (Value, Option<AttachmentReport>) {
+    ) -> (Value, Option<CallReport>) {
         // A refusal means nothing ran, and its trace line is written on the answering side. The
         // harness still reports the failure as a tool result of its own, which the event sink
         // records as a `tool_call` with `status: error`: this request carries no id tying it to
@@ -661,6 +668,7 @@ impl BridgeHandle {
             Ok(mut outcome) => {
                 let is_error = !matches!(outcome.result.status, Status::Passed);
                 let attachments = std::mem::take(&mut outcome.result.attachments);
+                let fence_source = outcome.fence_source.take();
                 // `outcome.fatal` is deliberately not acted on here: this bridge is a tool server
                 // for an external harness process and owns no murmur session to end. The
                 // failure still reaches the caller in full — `result.data` carries the same named
@@ -670,17 +678,25 @@ impl BridgeHandle {
                     .data
                     .or(outcome.result.summary)
                     .unwrap_or_else(|| "tool returned no data".to_string());
-                answer(store, name, input_json, text, is_error, &attachments)
+                answer(
+                    store,
+                    name,
+                    input_json,
+                    text,
+                    is_error,
+                    &attachments,
+                    fence_source,
+                )
             }
             Err(err) => (error_result(format!("tool '{name}' failed: {err}")), None),
         }
     }
 }
 
-/// The result of a dispatched call whose tool returned `text`, and its [`AttachmentReport`] when
-/// the tool named any `attachments`.
+/// The result of a dispatched call whose tool returned `text`, and its [`CallReport`] when the
+/// tool named any `attachments` or the result was fenced under `fence_source`.
 ///
-/// Each attachment adds one line after the fence's closing marker: `[image attached: …]` for one
+/// `fence_source` reaches the report only: the result is the same whatever it says. Each attachment adds one line after the fence's closing marker: `[image attached: …]` for one
 /// that passes the `context.images` checks, the refusal note for one that does not. Each accepted
 /// one also becomes an `image` item after the text item, carried whatever `is_error` says. With no
 /// attachment the result is the text item alone. Nothing is stored.
@@ -691,7 +707,8 @@ fn answer(
     mut text: String,
     is_error: bool,
     attachments: &[Attachment],
-) -> (Value, Option<AttachmentReport>) {
+    fence_source: Option<String>,
+) -> (Value, Option<CallReport>) {
     let checked = crate::images::check_bridged_attachments(
         attachments
             .iter()
@@ -705,11 +722,12 @@ fn answer(
     }
     let images: Vec<SentImage> = checked.images.iter().map(SentImage::encode).collect();
     let result = tool_result(text, is_error, &images);
-    let report = (!checked.trace.is_empty()).then(|| AttachmentReport {
+    let report = (!checked.trace.is_empty() || fence_source.is_some()).then(|| CallReport {
         tool_name: name.to_string(),
         input_json,
         trace: checked.trace,
         images,
+        fence_source,
     });
     (result, report)
 }
@@ -871,6 +889,7 @@ mod tests {
                 attachment("image/png", "shot.png"),
                 attachment("image/png", "note.png"),
             ],
+            None,
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -906,6 +925,7 @@ mod tests {
             "fenced".to_string(),
             false,
             &[attachment("image/png", "a.png")],
+            None,
         );
         let content = result["content"].as_array().unwrap();
         assert_eq!(content.len(), 2, "{result}");
@@ -962,6 +982,7 @@ mod tests {
                 attachment("image/png", "one.png"),
                 attachment("image/png", "two.png"),
             ],
+            None,
         );
         let content = result["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
@@ -981,13 +1002,15 @@ mod tests {
             "it failed".to_string(),
             true,
             &[attachment("image/png", "a.png")],
+            None,
         );
         assert_eq!(result["isError"], true);
         assert_eq!(result["content"][1]["type"], "image");
         assert!(report.is_some());
     }
 
-    /// A tool that attaches nothing gets the text item alone, byte for byte, and no report.
+    /// A tool that attaches nothing and was not fenced gets the text item alone, byte for byte,
+    /// and no report.
     #[test]
     fn without_attachments_the_result_is_the_text_item_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1000,6 +1023,7 @@ mod tests {
                 "fenced result".to_string(),
                 is_error,
                 &[],
+                None,
             );
             assert_eq!(
                 result.to_string(),
@@ -1010,6 +1034,42 @@ mod tests {
                 .to_string()
             );
             assert!(report.is_none());
+        }
+    }
+
+    /// A fenced result with no attachment is reported with its fence source and nothing else,
+    /// and the harness's answer is the one an unfenced call gets.
+    #[test]
+    fn a_fenced_call_is_reported_without_changing_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        let text = "<untrusted-content source=tool:t>\ndone\n</untrusted-content>".to_string();
+        for is_error in [false, true] {
+            let call = |fence_source: Option<String>| {
+                answer(
+                    &store,
+                    "t",
+                    r#"{"a":1}"#.to_string(),
+                    text.clone(),
+                    is_error,
+                    &[],
+                    fence_source,
+                )
+            };
+            let (unlabelled, none) = call(None);
+            let (result, report) = call(Some("tool:t".to_string()));
+            assert_eq!(result, unlabelled);
+            assert!(none.is_none());
+            assert_eq!(
+                report,
+                Some(CallReport {
+                    tool_name: "t".to_string(),
+                    input_json: r#"{"a":1}"#.to_string(),
+                    trace: Vec::new(),
+                    images: Vec::new(),
+                    fence_source: Some("tool:t".to_string()),
+                })
+            );
         }
     }
 
@@ -1030,6 +1090,7 @@ mod tests {
             "fenced".to_string(),
             false,
             &[attachment("image/png", "big.png")],
+            None,
         );
         assert_eq!(result["content"].as_array().unwrap().len(), 1);
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -1061,6 +1122,7 @@ mod tests {
             "fenced".to_string(),
             false,
             &attachments,
+            None,
         );
         let content = result["content"].as_array().unwrap();
         assert_eq!(content.len(), 6, "one text item and five images");
@@ -1469,7 +1531,7 @@ mod tests {
         let client = fixture.client();
         let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
         let (note_tx, _note_rx) = mpsc::unbounded_channel();
-        let (report_tx, mut report_rx) = mpsc::unbounded_channel::<AttachmentReport>();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel::<CallReport>();
         let serve = fixture
             .handle
             .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
@@ -1497,6 +1559,63 @@ mod tests {
                 matches!(report_rx.try_recv(), Err(TryRecvError::Empty)),
                 "no call named an attachment"
             );
+        };
+        tokio::select! {
+            () = serve => panic!("serve returned"),
+            () = body => {}
+        }
+    }
+
+    /// A call the decision point lets through and a tool answers sends the harness the fenced
+    /// result, and reports it under the bare name and arguments with the source it was fenced
+    /// under. `session-status` is the runtime's own tool, so the fixture's store can answer it.
+    #[tokio::test]
+    async fn a_dispatched_call_reports_the_fence_its_answer_carries() {
+        let mut fixture = Fixture::new().await;
+        fixture.store.session_status = Some(Arc::new(crate::session_status::SessionStatus::new(
+            Instant::now(),
+            true,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )));
+        let client = fixture.client();
+        let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
+        let (note_tx, _note_rx) = mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel::<CallReport>();
+        let serve = fixture
+            .handle
+            .serve(&fixture.store, &gate_tx, &note_tx, &report_tx, &|| {});
+
+        let body = async {
+            let (answered, answer) = oneshot::channel();
+            let call = client.clone();
+            tokio::spawn(async move {
+                let response = call
+                    .post(json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "session-status", "arguments": {}}
+                    }))
+                    .await;
+                let _ = answered.send(response);
+            });
+            let gate = next_gate(&mut gate_rx).await;
+            let _ = gate.reply.send(None);
+            let response = within("the call", answer).await.unwrap();
+
+            let text = text_of(&response);
+            assert!(
+                text.starts_with("<untrusted-content source=tool:session-status>\n"),
+                "{text}"
+            );
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let report = report_rx.try_recv().expect("the call is reported");
+            assert_eq!(report.tool_name, "session-status");
+            assert_eq!(report.input_json, "{}");
+            assert_eq!(report.fence_source.as_deref(), Some("tool:session-status"));
+            assert!(report.trace.is_empty() && report.images.is_empty());
         };
         tokio::select! {
             () = serve => panic!("serve returned"),
