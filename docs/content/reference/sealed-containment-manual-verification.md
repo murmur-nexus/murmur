@@ -649,7 +649,7 @@ on the second line is the host's:
 
     ```sh
     cat /proc/1/cmdline 2>&1 | head -c 60; echo
-    stat -c '%U %w' /proc/1
+    stat -c '%U %y' /proc/1
     ```
 
     Expected — the host's init cannot be read, and `stat` still answers:
@@ -660,8 +660,8 @@ on the second line is the host's:
     ```
 
     On a host where `mount -t proc` *does* succeed (running as root, or in a container granted
-    `CAP_SYS_ADMIN` whose seccomp profile permits `mount`), the mountinfo line reads `- proc proc rw,hidepid=...` instead and the
-    pid count drops to the capsule's own processes. Record which of the two you got.
+    `CAP_SYS_ADMIN` whose seccomp profile permits `mount`), the mountinfo line reads
+    `- proc proc rw,hidepid=...` instead and the pid count drops to the capsule's own processes. Record which of the two you got.
 
 ## Step 4 — `trace.jsonl`
 

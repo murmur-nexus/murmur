@@ -41,8 +41,7 @@ pub const W_SEC_004: &str = "W-SEC-004";
 /// sealed one with its own notice: there `/proc` is a bind of the host's, because the tier creates
 /// no PID namespace. Landlock refuses reading host `/proc` content at both `scoped` and `sealed`;
 /// what still reaches outside the capsule is `stat(2)` on `/proc/<pid>` (existence, owner, start
-/// time) and signal delivery to any process of the same user. The sealed column was measured on
-/// bare metal on 2026-08-09 and again on 2026-11-01.
+/// time) and signal delivery to any process of the same user.
 pub const W_SEC_005: &str = "W-SEC-005";
 
 /// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,

@@ -8396,7 +8396,7 @@ mod tests {
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
     }
 
-    /// The sealed notice states what `/proc` leaks as measured: Landlock refuses reading host
+    /// The sealed notice states what `/proc` leaks: Landlock refuses reading host
     /// `/proc` content at both classes, and only `stat(2)` on `/proc/<pid>` and same-user signals
     /// reach outside the capsule.
     #[test]

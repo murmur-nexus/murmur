@@ -4073,15 +4073,10 @@ reports `read_only_to_commands: false` for the directory that lies inside. A `sc
 
 ### W-SEC-034 — a route this capsule runs code on is outside its class { #w-sec-034 }
 
-**Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present
-[route](containment.md#routes) the class does not cover:
-
-| Route | Present when |
-|---|---|
-| WASM tools | a `runtime: tool` entry is WASM, or `capabilities.install.tool` is non-empty |
-| drivers | any `runtime: driver` entry |
-| hooks | any `runtime: hook` entry |
-| the process harness and harness tools | `inference.transport: process` |
+**Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present route
+the class does not cover: WASM tools, drivers, hooks, or the `inference.transport: process`
+harness and its tools. [Routes and what holds each](containment.md#routes) says when each is
+present.
 
 Every agent capsule has a driver, so every agent capsule at `scoped` or `sealed` gets it. One
 warning names every such route and the artifacts on it:

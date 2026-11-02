@@ -187,9 +187,9 @@ pub use sealed::{
 pub use streaming::STREAM_EXTENSION_URI;
 // `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the
 // three test-support probes from its integration tests, the cgroup scope and `io.max` reporting
-// from `mur run --explain-scope` and `mur doctor`, and the swap-bound reporting from `mur doctor`, each of which has to
-// answer the question a launch does without staging a session. Re-exported here rather than
-// duplicating a probe once per crate that needs it.
+// from `mur run --explain-scope` and `mur doctor`, and the swap-bound reporting from `mur doctor`,
+// each of which has to answer the question a launch does without staging a session. Re-exported
+// here rather than duplicating a probe once per crate that needs it.
 pub use cgroup::{
     active_swap_areas, cgroup_delegation_available, io_max_device_available, probe_scope,
     probe_swap_control, render_cgroup_scope, requires_process_bounding, skip_without_host_support,

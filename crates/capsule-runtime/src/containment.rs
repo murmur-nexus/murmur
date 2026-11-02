@@ -2030,8 +2030,9 @@ impl Route {
     }
 
     /// Whether the session's class covers this route: exactly the routes spawned through
-    /// `sandbox::prepare_enforcement`, the one path that installs the session's tier. Where each
-    /// route is spawned today, not a policy; confining another route flips its arm here.
+    /// `sandbox::prepare_enforcement`, the one path that installs the session's tier. This follows
+    /// where each route is spawned, not a policy: confining another route means flipping its arm
+    /// here.
     #[must_use]
     pub fn under_class(self) -> bool {
         match self {

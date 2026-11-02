@@ -479,7 +479,6 @@ pub struct CgroupScopeReport {
 
 impl CgroupScopeReport {
     /// A child cgroup was created.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn delegated() -> Self {
         Self {
             status: CgroupScopeStatus::Delegated,
@@ -593,7 +592,6 @@ impl From<CgroupError> for String {
 /// than for the I/O ceiling [`NO_SCOPE_REASON`] speaks of.
 const NO_CGROUP_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so \
      a launch creates no cgroup scope for it";
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 const NOT_LINUX_CGROUP_REASON: &str =
     "cgroups are a Linux mechanism and this host has none, so a launch creates no cgroup scope";
 
