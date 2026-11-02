@@ -108,7 +108,7 @@ pub(crate) const NO_HOME_FOLDER_REFUSAL: &str =
 /// whether they came from the host process env, `env_overrides`, or
 /// `policy.shell_baseline_env`. Supports exact match, trailing `*` (prefix) and
 /// leading `*` (suffix) via `env_name_matches_pattern`.
-const CREDENTIAL_ENV_PATTERNS: &[&str] = &[
+pub(crate) const CREDENTIAL_ENV_PATTERNS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",

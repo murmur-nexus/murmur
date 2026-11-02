@@ -1341,6 +1341,57 @@ pub(crate) fn resolve_sealed_bind_dirs(
     dirs
 }
 
+/// Every directory this session may run something out of, for the host-path check
+/// ([`crate::host_paths::check_execute_roots`]): the directory of each file its Landlock grants
+/// mark executable (each resolved `shell.allow` binary, its ELF interpreter and `DT_NEEDED`
+/// closure) and each executable directory grant (`interpreter_runtime` directories,
+/// `staged_runtime` trees). Called by `stage_session` and `mur run --explain-scope`.
+pub(crate) fn host_path_execute_roots(
+    policy: &CapabilityPolicy,
+) -> Vec<crate::host_paths::ExecuteRoot> {
+    let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+    execute_roots_from(&resolve_landlock_grants(&exec_allow_paths), policy)
+}
+
+/// [`host_path_execute_roots`] from an already-resolved executable closure.
+fn execute_roots_from(
+    closure: &[PathBuf],
+    policy: &CapabilityPolicy,
+) -> Vec<crate::host_paths::ExecuteRoot> {
+    let mut roots: Vec<crate::host_paths::ExecuteRoot> = Vec::new();
+    let mut push = |dir: PathBuf, because: PathBuf| {
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        if dir.is_absolute() && !roots.iter().any(|root| root.dir == dir) {
+            roots.push(crate::host_paths::ExecuteRoot { dir, because });
+        }
+    };
+    for file in closure {
+        if let Some(parent) = file.parent() {
+            push(parent.to_path_buf(), file.clone());
+        }
+    }
+    for grant in &policy.shell_interpreter_runtime {
+        for dir in &grant.dirs {
+            push(PathBuf::from(&dir.path), PathBuf::from(&dir.path));
+        }
+    }
+    for dir in resolve_staged_runtime_dirs(policy) {
+        push(dir.clone(), dir);
+    }
+    roots
+}
+
+/// What `tier` does with a host path.
+pub(crate) fn host_path_mechanism(tier: EnforcementTier) -> crate::host_paths::HostPathMechanism {
+    match tier {
+        EnforcementTier::KernelSealed => crate::host_paths::HostPathMechanism::Bind,
+        EnforcementTier::KernelFull => crate::host_paths::HostPathMechanism::Landlock,
+        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
+            crate::host_paths::HostPathMechanism::None
+        }
+    }
+}
+
 /// Adds `candidate` to `dirs` as an optional composed-root bind unless it is relative, already
 /// inside a fixed [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, or already listed. The one filter
 /// [`resolve_sealed_bind_dirs`] and [`ShellEnforcement::for_native_entrypoint`] share.
@@ -2447,6 +2498,20 @@ pub(crate) struct ShellEnforcement {
     /// reaches it as every subprocess there reaches every host file.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) native_state_dir: Option<PathBuf>,
+    /// The host folders `~/.murmur/config.yaml` lends this session ([`CapabilityPolicy::host_paths`]),
+    /// in config order. On `KernelFull` and `KernelSealed` each gets a Landlock rule, `ReadFile |
+    /// ReadDir` for `read` and the workdir's rights without `Execute` for `read-write`, taken on a
+    /// descriptor opened at every spawn, fail-closed: a host path that can no longer be opened
+    /// fails the spawn naming it. On `KernelSealed` each is also a required, verified bind at its
+    /// own absolute path. Nothing is added on the tiers with no filesystem scope.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) host_paths: Vec<crate::host_paths::HostPath>,
+    /// On `KernelSealed` only: every execute root (see [`host_path_execute_roots`]) inside a
+    /// `read-write` host path, bound read-only and required on top of it so the capsule cannot
+    /// rewrite what it may run. Empty on every other tier, where such an entry is refused at
+    /// staging instead.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) host_path_read_only_binds: Vec<PathBuf>,
 }
 
 impl ShellEnforcement {
@@ -2481,8 +2546,18 @@ impl ShellEnforcement {
         // read-only grant per entry a recognised interpreter reported on its own import path at
         // staging. A directory neither the manifest names nor an allowlisted interpreter reports
         // never receives a rule, regardless of what it holds.
-        let mut landlock_grants =
-            LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
+        let closure = resolve_landlock_grants(&exec_allow_paths);
+        // Re-checked here, not only at staging: a plan step or a session check resolves its own
+        // enforcement, and none may install a read-write host path over what it runs on
+        // `KernelFull`. On `KernelSealed` the execute roots inside one come back to be bound
+        // read-only on top of it.
+        let host_path_read_only_binds = crate::host_paths::check_execute_roots(
+            &policy.host_paths,
+            &execute_roots_from(&closure, policy),
+            host_path_mechanism(tier),
+        )
+        .map_err(|refusal| refusal.to_string())?;
+        let mut landlock_grants = LandlockGrant::non_listable_files(closure);
         landlock_grants.extend(resolve_interpreter_runtime_grants(
             &policy.shell_interpreter_runtime,
         ));
@@ -2529,6 +2604,8 @@ impl ShellEnforcement {
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(tier),
             native_state_dir: None,
+            host_paths: policy.host_paths.clone(),
+            host_path_read_only_binds,
         })
     }
 
@@ -2736,6 +2813,8 @@ impl ShellEnforcement {
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(EnforcementTier::EnvironmentOnly),
             native_state_dir: None,
+            host_paths: Vec::new(),
+            host_path_read_only_binds: Vec::new(),
         }
     }
 
@@ -2804,6 +2883,22 @@ impl ShellEnforcement {
         if self.tier == EnforcementTier::KernelSealed {
             if let Some(dir) = entrypoint.interpreter.as_deref().and_then(Path::parent) {
                 push_sealed_bind_dir(&mut enforcement.sealed_bind_dirs, dir.to_path_buf());
+                // An interpreter inside a read-write host path is bound read-only on top of it,
+                // as the session's own execute roots are.
+                let inside_read_write = self.host_paths.iter().any(|host_path| {
+                    host_path.access == crate::host_paths::HostPathAccess::ReadWrite
+                        && dir.starts_with(&host_path.path)
+                });
+                if inside_read_write
+                    && !enforcement
+                        .host_path_read_only_binds
+                        .iter()
+                        .any(|bound| bound == dir)
+                {
+                    enforcement
+                        .host_path_read_only_binds
+                        .push(dir.to_path_buf());
+                }
             }
         }
         enforcement
@@ -3349,6 +3444,27 @@ pub(crate) fn prepare_enforcement(
         })
         .map(|path| linux_enforce::open_state_dir(path).map(|fd| (Arc::new(fd), path)))
         .transpose()?;
+    // Every host path, on the store's terms: opened on both Landlock tiers and on no other, and
+    // fail-closed. A configured host path that can no longer be opened fails this spawn naming
+    // it; it is never dropped.
+    let host_path_fds: Vec<HostPathFd> = if matches!(
+        enforcement.tier,
+        EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+    ) {
+        enforcement
+            .host_paths
+            .iter()
+            .map(|host_path| {
+                linux_enforce::open_host_path(&host_path.path).map(|fd| HostPathFd {
+                    fd: Arc::new(fd),
+                    path: host_path.path.clone(),
+                    read_write: host_path.access == crate::host_paths::HostPathAccess::ReadWrite,
+                })
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
 
     // The descriptors a rule and a bind share on `KernelSealed`: the temporary folder and the
     // runtime and records directories, each taken once, with no link followed, from a held
@@ -3431,6 +3547,10 @@ pub(crate) fn prepare_enforcement(
                 state_dir_fd: state_dir_fd.map(|(fd, _)| fd),
                 runtime_dir_fd,
                 records_dir_fd,
+                host_path_fds: host_path_fds
+                    .iter()
+                    .map(|host_path| (Arc::clone(&host_path.fd), host_path.read_write))
+                    .collect(),
             },
         )?)
     } else {
@@ -3448,6 +3568,8 @@ pub(crate) fn prepare_enforcement(
             sources,
             &enforcement.sealed_bind_dirs,
             &enforcement.staged_runtime_dirs,
+            &host_path_fds,
+            &enforcement.host_path_read_only_binds,
         )?),
         None => None,
     };
@@ -3718,6 +3840,15 @@ fn ensure_sealed_identity_files(
     Ok(written)
 }
 
+/// One host path's descriptor, opened in the parent at each spawn: its Landlock rule's fd on both
+/// Landlock tiers and, on `KernelSealed`, the identity its bind verifies.
+#[cfg(target_os = "linux")]
+pub(crate) struct HostPathFd {
+    fd: Arc<std::os::fd::OwnedFd>,
+    path: PathBuf,
+    read_write: bool,
+}
+
 /// The descriptors a composed root's runtime-provided binds are verified against and its Landlock
 /// rules are taken on, opened in the parent before the fork.
 #[cfg(target_os = "linux")]
@@ -3838,6 +3969,8 @@ fn build_sealed_root(
     sources: &SealedSourceFds,
     extra_read_only: &[PathBuf],
     staged_runtime_read_only: &[PathBuf],
+    host_paths: &[HostPathFd],
+    host_path_read_only: &[PathBuf],
 ) -> Result<crate::sealed::SealedRootSpec, String> {
     use crate::sealed;
 
@@ -3852,15 +3985,30 @@ fn build_sealed_root(
         ));
     }
 
+    let host_path_binds = host_paths
+        .iter()
+        .map(|host_path| {
+            SealedSourceFds::identity_of(&host_path.fd).map(|identity| sealed::HostPathBind {
+                path: host_path.path.clone(),
+                identity,
+                read_only: !host_path.read_write,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let host_path_dirs: Vec<PathBuf> = host_paths
+        .iter()
+        .map(|host_path| host_path.path.clone())
+        .collect();
     let base = sealed::choose_root_base(
         accessible_workdir,
+        &host_path_dirs,
         sealed::SEALED_ROOT_BASE_CANDIDATES,
         |path| path.is_dir(),
     )
     .ok_or_else(|| {
         format!(
             "sealed: no usable base directory for the composed root; none of {:?} exists outside \
-             the session workdir's own path",
+             the session workdir's own path and every host path's",
             sealed::SEALED_ROOT_BASE_CANDIDATES
         )
     })?;
@@ -3895,6 +4043,8 @@ fn build_sealed_root(
                     SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
                 })
                 .transpose()?,
+            host_paths: &host_path_binds,
+            host_path_read_only,
         },
         &base,
         extra_read_only,
@@ -4008,6 +4158,9 @@ mod linux_enforce {
         /// none of them. `None` outside a session. On `KernelSealed` the same descriptor is the
         /// read-only bind's source.
         records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// Every host path's descriptor and whether it is `read-write`, in config order: one rule
+        /// each, with [`host_path_access_rights`]. Opened fail-closed by `prepare_enforcement`.
+        host_path_fds: Vec<(std::sync::Arc<OwnedFd>, bool)>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
@@ -4142,6 +4295,18 @@ mod linux_enforce {
             WORKDIR_ACCESS_RIGHTS_NO_EXEC | AccessFs::Execute
         } else {
             WORKDIR_ACCESS_RIGHTS_NO_EXEC
+        }
+    }
+
+    /// A host path's `PathBeneath` rights: `ReadFile | ReadDir` for `read`, and
+    /// [`workdir_access_rights`]`(false)` for `read-write` — the native tool store's right-set.
+    /// Never `Execute`, whatever `workdir_exec` grants the workdir: a host path makes files
+    /// reachable, never runnable, so `shell.allow` stays the whole list of what can run.
+    pub(super) fn host_path_access_rights(read_write: bool) -> BitFlags<AccessFs> {
+        if read_write {
+            workdir_access_rights(false)
+        } else {
+            AccessFs::ReadFile | AccessFs::ReadDir
         }
     }
 
@@ -5056,6 +5221,18 @@ mod linux_enforce {
                 })?;
         }
 
+        // Every host path the operator's global config lends this session. A runtime folder
+        // beneath one keeps its own rule below; on `KernelSealed` its bind is what keeps it
+        // read-only, since Landlock rights accumulate down the tree.
+        for (host_path_fd, read_write) in &fds.host_path_fds {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    host_path_fd.as_fd(),
+                    host_path_access_rights(*read_write) & handled,
+                ))
+                .map_err(|error| format!("landlock: add_rule for a host path failed: {error}"))?;
+        }
+
         // The runtime directory: readable and listable, never writable or executable. A native
         // tool's entrypoint inside it runs through its own pinned `Execute` grant.
         if let Some(runtime_dir_fd) = &fds.runtime_dir_fd {
@@ -5164,6 +5341,9 @@ mod linux_enforce {
         pub(super) runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The records directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// Every host path's descriptor, from [`open_host_path`], and whether it is
+        /// `read-write`. Carried into [`LandlockChildFds::host_path_fds`].
+        pub(super) host_path_fds: Vec<(std::sync::Arc<OwnedFd>, bool)>,
     }
 
     impl<'a> LandlockFdRequest<'a> {
@@ -5183,6 +5363,7 @@ mod linux_enforce {
                 state_dir_fd: None,
                 runtime_dir_fd: None,
                 records_dir_fd: None,
+                host_path_fds: Vec::new(),
             }
         }
     }
@@ -5215,6 +5396,7 @@ mod linux_enforce {
             state_dir_fd,
             runtime_dir_fd,
             records_dir_fd,
+            host_path_fds,
         } = request;
         let workdir_fd = open_o_path(accessible_workdir)
             .map(OwnedFd::from)
@@ -5296,6 +5478,7 @@ mod linux_enforce {
             sealed_identity_fds,
             runtime_dir_fd,
             records_dir_fd,
+            host_path_fds,
             grants,
             devices,
         })
@@ -5331,6 +5514,25 @@ mod linux_enforce {
             .map_err(|error| {
                 format!(
                     "sandbox: failed to open the native tool's state store {}: {error}",
+                    path.display()
+                )
+            })
+    }
+
+    /// An `O_PATH` handle on a host path, its Landlock rule's fd and its sealed bind's identity.
+    /// `O_NOFOLLOW | O_DIRECTORY` on the directory the entry resolved to at launch: a link planted
+    /// at its name since, or anything but a directory, fails the spawn naming the path.
+    pub(super) fn open_host_path(path: &Path) -> Result<OwnedFd, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map(OwnedFd::from)
+            .map_err(|error| {
+                format!(
+                    "sandbox: failed to open host path {} (host_paths in ~/.murmur/config.yaml): \
+                     {error}",
                     path.display()
                 )
             })
@@ -6692,6 +6894,57 @@ mod tests {
     /// differences are the point: a path inside a fixed runtime path is kept (dropping it would
     /// silently make a required grant depend on an unrelated list), duplicates collapse, and a
     /// relative path — which cannot be re-based under the composed root at all — is skipped.
+    /// The execute roots a host path is checked against include each `interpreter_runtime`
+    /// directory and each `staged_runtime` tree: a read-write entry inside the first is refused on
+    /// both Landlock mechanisms, and one containing the second is refused at `scoped` and bound
+    /// read-only beneath on `sealed`. Pure: none of the paths need exist.
+    #[test]
+    fn host_path_execute_roots_include_interpreter_runtime_dirs_and_staged_trees() {
+        use crate::host_paths::{check_execute_roots, HostPath, HostPathAccess, HostPathMechanism};
+        let policy = CapabilityPolicy {
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: "/nonexistent-host-path-test/interp".to_string(),
+                    list_dir: true,
+                }],
+            }],
+            shell_staged_runtime: vec![murmur_artifact::StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/nonexistent-host-path-test/opt/py".to_string(),
+                pin: "pin-1".to_string(),
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let roots = execute_roots_from(&[], &policy);
+        let dirs: Vec<&Path> = roots.iter().map(|root| root.dir.as_path()).collect();
+        assert_eq!(
+            dirs,
+            [
+                Path::new("/nonexistent-host-path-test/interp"),
+                Path::new("/nonexistent-host-path-test/opt/py"),
+            ]
+        );
+        let read_write = |path: &str| HostPath {
+            declared: path.to_string(),
+            path: PathBuf::from(path),
+            access: HostPathAccess::ReadWrite,
+            credential_locations: Vec::new(),
+        };
+
+        let inside_interpreter = [read_write("/nonexistent-host-path-test/interp/cache")];
+        for mechanism in [HostPathMechanism::Landlock, HostPathMechanism::Bind] {
+            assert!(check_execute_roots(&inside_interpreter, &roots, mechanism).is_err());
+        }
+
+        let holding_staged = [read_write("/nonexistent-host-path-test/opt")];
+        assert!(check_execute_roots(&holding_staged, &roots, HostPathMechanism::Landlock).is_err());
+        assert_eq!(
+            check_execute_roots(&holding_staged, &roots, HostPathMechanism::Bind).unwrap(),
+            [PathBuf::from("/nonexistent-host-path-test/opt/py")]
+        );
+    }
+
     #[test]
     fn staged_runtime_dirs_keep_fixed_path_overlaps_and_drop_only_duplicates_and_relatives() {
         use murmur_artifact::StagedRuntimeGrant;
@@ -12739,5 +12992,380 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert_eq!(result.stdout.trim(), "loaded");
+    }
+
+    // ---------------------------------------------------------------- host paths
+
+    /// The rights each host-path rule is built with: `ReadFile | ReadDir` for `read`, the
+    /// native tool store's right-set for `read-write`, and `Execute` never.
+    #[test]
+    fn host_path_landlock_rights_are_read_list_or_the_workdir_set_without_execute() {
+        use landlock::AccessFs;
+        assert_eq!(
+            linux_enforce::host_path_access_rights(false),
+            AccessFs::ReadFile | AccessFs::ReadDir
+        );
+        assert_eq!(
+            linux_enforce::host_path_access_rights(true),
+            linux_enforce::workdir_access_rights(false)
+        );
+        for read_write in [false, true] {
+            assert!(!linux_enforce::host_path_access_rights(read_write).contains(AccessFs::Execute));
+        }
+    }
+
+    /// `ro/` holding `in.txt`, `rw/` and `outside/` holding `secret.txt`, under `HOME` (never
+    /// `/tmp`, which a host path may not be under), with the two host paths a test lends.
+    struct HostPathDirs {
+        _base: tempfile::TempDir,
+        ro: PathBuf,
+        rw: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl HostPathDirs {
+        fn new() -> Self {
+            let base = home_tempdir();
+            let root = std::fs::canonicalize(base.path()).unwrap();
+            let (ro, rw, outside) = (root.join("ro"), root.join("rw"), root.join("outside"));
+            for dir in [&ro, &rw, &outside] {
+                std::fs::create_dir(dir).unwrap();
+            }
+            std::fs::write(ro.join("in.txt"), "lent\n").unwrap();
+            std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+            Self {
+                _base: base,
+                ro,
+                rw,
+                outside,
+            }
+        }
+
+        fn host_paths(&self) -> Vec<crate::host_paths::HostPath> {
+            use crate::host_paths::{HostPath, HostPathAccess};
+            vec![
+                HostPath {
+                    declared: self.ro.display().to_string(),
+                    path: self.ro.clone(),
+                    access: HostPathAccess::Read,
+                    credential_locations: Vec::new(),
+                },
+                HostPath {
+                    declared: self.rw.display().to_string(),
+                    path: self.rw.clone(),
+                    access: HostPathAccess::ReadWrite,
+                    credential_locations: Vec::new(),
+                },
+            ]
+        }
+
+        /// The four builtin-only commands of S6, run on `enforcement`, each asserted.
+        fn assert_reach(&self, enforcement: &ShellEnforcement, policy: &CapabilityPolicy) {
+            let workdir = tempfile::tempdir().unwrap();
+            let read = run_bash_in(
+                workdir.path(),
+                &format!(
+                    "read -r line < '{}/in.txt' && echo \"$line\"",
+                    self.ro.display()
+                ),
+                policy,
+                enforcement,
+            );
+            assert_eq!(read.exit_code, 0, "{}", read.stderr);
+            assert!(
+                read.stdout.lines().any(|line| line == "lent"),
+                "{}",
+                read.stdout
+            );
+
+            let write_ro = run_bash_in(
+                workdir.path(),
+                &format!("echo x > '{}/new'", self.ro.display()),
+                policy,
+                enforcement,
+            );
+            assert_ne!(write_ro.exit_code, 0);
+            assert!(
+                write_ro.stderr.contains("Permission denied")
+                    || write_ro.stderr.contains("Read-only file system"),
+                "{}",
+                write_ro.stderr
+            );
+            assert!(!self.ro.join("new").exists());
+
+            let write_rw = run_bash_in(
+                workdir.path(),
+                &format!("echo written > '{}/new'", self.rw.display()),
+                policy,
+                enforcement,
+            );
+            assert_eq!(write_rw.exit_code, 0, "{}", write_rw.stderr);
+            assert_eq!(
+                std::fs::read_to_string(self.rw.join("new")).unwrap(),
+                "written\n"
+            );
+
+            let outside = run_bash_in(
+                workdir.path(),
+                &format!("read -r line < '{}/secret.txt'", self.outside.display()),
+                policy,
+                enforcement,
+            );
+            assert_ne!(outside.exit_code, 0, "outside/secret.txt was read");
+        }
+    }
+
+    /// The enforcement a capsule declaring `class` gets here with `host_paths`, holding a session's
+    /// directories, or `None` after a skip line when this host does not reach `tier`.
+    fn host_path_enforcement(
+        test: &str,
+        policy: &CapabilityPolicy,
+        class: murmur_artifact::ContainmentClass,
+        tier: EnforcementTier,
+    ) -> Option<(ShellEnforcement, tempfile::TempDir)> {
+        if crate::network_namespace::skip_without_egress_namespace(test) {
+            return None;
+        }
+        let probe = HostProbe::probe();
+        let reaches = match tier {
+            EnforcementTier::KernelSealed => probe.tier() == EnforcementTier::KernelSealed,
+            _ => matches!(
+                probe.tier(),
+                EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+            ),
+        };
+        if !reaches {
+            eprintln!(
+                "SKIP — PROVES NOTHING ON THIS HOST: {test} needs {tier:?}; detected {:?}",
+                probe.tier()
+            );
+            return None;
+        }
+        let runtime = home_tempdir();
+        let enforcement = ShellEnforcement::resolve_declared(policy, class, probe)
+            .expect("the enforcement resolves")
+            .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+        assert_eq!(enforcement.tier, tier);
+        eprintln!("{test}: tier {tier:?}");
+        Some((enforcement, runtime))
+    }
+
+    /// [`ShellEnforcement::resolve`] for a capsule declaring `class` on a host of `tier`, from no
+    /// probe: a resolution test that spawns nothing.
+    fn resolve_on_tier(
+        policy: &CapabilityPolicy,
+        tier: EnforcementTier,
+        class: murmur_artifact::ContainmentClass,
+    ) -> Result<ShellEnforcement, String> {
+        let decision = crate::containment::ContainmentDecision::decide(tier, class, false, false);
+        let probe = HostProbe::from_parts(
+            None,
+            crate::namespace_probe::NamespaceReading {
+                network: Err(crate::network_namespace::NamespaceAttemptError::Creator(
+                    "not probed".to_string(),
+                )),
+                mount: crate::namespace_probe::MountAttempt::NotAttempted,
+                sealed_root: crate::namespace_probe::MountAttempt::NotAttempted,
+                userns_grant: crate::sealed::UsernsGrant::Withheld,
+                attachment: crate::sealed::ProfileAttachment::NotReported,
+            },
+        );
+        ShellEnforcement::resolve(policy, &decision, probe)
+    }
+
+    #[test]
+    fn host_paths_on_kernel_full_read_write_and_outside() {
+        const TEST: &str = "host_paths_on_kernel_full_read_write_and_outside";
+        let dirs = HostPathDirs::new();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            host_paths: dirs.host_paths(),
+            ..CapabilityPolicy::default()
+        };
+        let Some((enforcement, _runtime)) = host_path_enforcement(
+            TEST,
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+        ) else {
+            return;
+        };
+        dirs.assert_reach(&enforcement, &policy);
+    }
+
+    #[test]
+    fn host_paths_on_kernel_sealed_are_bound_at_their_own_path() {
+        const TEST: &str = "host_paths_on_kernel_sealed_are_bound_at_their_own_path";
+        let dirs = HostPathDirs::new();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            host_paths: dirs.host_paths(),
+            ..CapabilityPolicy::default()
+        };
+        let Some((enforcement, _runtime)) = host_path_enforcement(
+            TEST,
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            EnforcementTier::KernelSealed,
+        ) else {
+            return;
+        };
+        dirs.assert_reach(&enforcement, &policy);
+        // Outside is not denied but absent: the composed root does not hold it.
+        let workdir = tempfile::tempdir().unwrap();
+        let absent = run_bash_in(
+            workdir.path(),
+            &format!(
+                "[ -e '{}/secret.txt' ] && echo present || echo absent",
+                dirs.outside.display()
+            ),
+            &policy,
+            &enforcement,
+        );
+        assert!(
+            absent.stdout.lines().any(|line| line == "absent"),
+            "{}",
+            absent.stdout
+        );
+    }
+
+    /// A read-write host path holding a folder the session may run from: refused when resolving
+    /// a `KernelFull` enforcement, and on `KernelSealed` that folder is bound read-only on top,
+    /// so the capsule cannot rewrite what it runs while the rest of the entry stays writable.
+    #[test]
+    fn a_read_write_host_path_over_an_execute_root_is_refused_scoped_and_protected_sealed() {
+        const TEST: &str =
+            "a_read_write_host_path_over_an_execute_root_is_refused_scoped_and_protected_sealed";
+        let base = home_tempdir();
+        let tools = std::fs::canonicalize(base.path()).unwrap().join("tools");
+        let bin = tools.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool"), "#!/bin/bash\necho tool ran\n").unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "bash".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: bin.display().to_string(),
+                    list_dir: true,
+                }],
+            }],
+            host_paths: vec![crate::host_paths::HostPath {
+                declared: tools.display().to_string(),
+                path: tools.clone(),
+                access: crate::host_paths::HostPathAccess::ReadWrite,
+                credential_locations: Vec::new(),
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let error = resolve_on_tier(
+            &policy,
+            EnforcementTier::KernelFull,
+            murmur_artifact::ContainmentClass::Scoped,
+        )
+        .expect_err("scoped refuses a read-write host path over an execute root");
+        assert!(error.contains(&bin.display().to_string()), "{error}");
+
+        let Some((enforcement, _runtime)) = host_path_enforcement(
+            TEST,
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            EnforcementTier::KernelSealed,
+        ) else {
+            return;
+        };
+        assert_eq!(enforcement.host_path_read_only_binds, vec![bin.clone()]);
+        let workdir = tempfile::tempdir().unwrap();
+        let rewrite = run_bash_in(
+            workdir.path(),
+            &format!("echo x > '{}/tool'", bin.display()),
+            &policy,
+            &enforcement,
+        );
+        assert_ne!(rewrite.exit_code, 0);
+        assert!(
+            rewrite.stderr.contains("Read-only file system"),
+            "{}",
+            rewrite.stderr
+        );
+        let add = run_bash_in(
+            workdir.path(),
+            &format!("echo x > '{}/new'", bin.display()),
+            &policy,
+            &enforcement,
+        );
+        assert_ne!(add.exit_code, 0);
+        assert!(
+            add.stderr.contains("Read-only file system"),
+            "{}",
+            add.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.join("tool")).unwrap(),
+            "#!/bin/bash\necho tool ran\n"
+        );
+        assert!(!bin.join("new").exists());
+        let elsewhere = run_bash_in(
+            workdir.path(),
+            &format!("echo kept > '{}/notes'", tools.display()),
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(elsewhere.exit_code, 0, "{}", elsewhere.stderr);
+        assert_eq!(
+            std::fs::read_to_string(tools.join("notes")).unwrap(),
+            "kept\n"
+        );
+    }
+
+    /// A host path that can no longer be opened fails the spawn naming it, on both Landlock tiers.
+    #[test]
+    fn a_vanished_host_path_fails_the_spawn_naming_it() {
+        let base = home_tempdir();
+        let gone = std::fs::canonicalize(base.path()).unwrap().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let host_paths = vec![crate::host_paths::HostPath {
+            declared: gone.display().to_string(),
+            path: gone.clone(),
+            access: crate::host_paths::HostPathAccess::Read,
+            credential_locations: Vec::new(),
+        }];
+        std::fs::remove_dir(&gone).unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            let enforcement = ShellEnforcement {
+                tier,
+                host_paths: host_paths.clone(),
+                ..host_bounding_base().with_test_session_dirs()
+            };
+            let mut command = std::process::Command::new("bash");
+            let Err(error) = prepare_enforcement(&mut command, &enforcement, workdir.path()) else {
+                panic!("{tier:?}: a vanished host path must fail the spawn");
+            };
+            assert!(
+                error.contains(&gone.display().to_string()),
+                "{tier:?}: {error}"
+            );
+        }
+    }
+
+    /// No host path, no change: no rule, no bind, no base restriction.
+    #[test]
+    fn no_host_paths_add_nothing_to_the_enforcement() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            let class = if tier == EnforcementTier::KernelSealed {
+                murmur_artifact::ContainmentClass::Sealed
+            } else {
+                murmur_artifact::ContainmentClass::Scoped
+            };
+            let enforcement = resolve_on_tier(&policy, tier, class).unwrap();
+            assert_eq!(enforcement.tier, tier);
+            assert!(enforcement.host_paths.is_empty());
+            assert!(enforcement.host_path_read_only_binds.is_empty());
+        }
     }
 }

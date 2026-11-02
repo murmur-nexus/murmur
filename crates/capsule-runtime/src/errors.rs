@@ -374,6 +374,13 @@ pub enum RuntimeError {
         entries: Vec<crate::runtime::StrippedEnvAllowEntry>,
     },
 
+    /// A `host_paths` entry in `~/.murmur/config.yaml` cannot be honoured for this session: at
+    /// launch (missing, not a directory, a system path, read-write over murmur's own home, inside
+    /// the work folder, the same directory twice) or at staging, read-write over a folder the
+    /// session may run something from. A configured host path is never silently dropped.
+    #[error("{0}")]
+    HostPathRefused(crate::host_paths::HostPathRefusal),
+
     /// A synthetic tool manifest was written under a name absent from
     /// [`crate::runtime::RESERVED_TOOL_NAMES`].
     ///

@@ -681,6 +681,83 @@ fn setup_grants_tool(home: &tempfile::TempDir, artifact_dir: &tempfile::TempDir)
     common::publish_local(home, &tool).success();
 }
 
+/// [`session_start_effective_grants_match_explain_scope_json`] for the one field a staged
+/// request never carries: `host_paths` comes from the operator's `~/.murmur/config.yaml`, which
+/// only `mur run` reads, so this launches the real binary. The `host_paths` a session records is
+/// byte-for-byte the `host_paths` `--explain-scope --json` prints for the same `HOME` and project.
+#[test]
+fn session_start_host_paths_match_explain_scope_json() {
+    let server = common::ScriptedServer::start(vec![end_turn_response()]);
+    // Outside `/tmp`, which a host path may not be under.
+    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let artifact_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    setup_driver(&home, &artifact_dir);
+    setup_grants_tool(&home, &artifact_dir);
+    fs::create_dir_all(home.path().join("lent")).unwrap();
+    fs::create_dir_all(home.path().join("shared")).unwrap();
+    fs::write(
+        home.path().join(".murmur/config.yaml"),
+        "host_paths:\n  - path: ~/lent\n    access: read\n  - path: ~/shared\n    access: read-write\n",
+    )
+    .unwrap();
+    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+
+    let explain_stdout = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--explain-scope",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_report: Value =
+        serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
+
+    let run_stdout = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "run",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--task",
+            "Report and stop.",
+            "--verbose",
+        ])
+        .timeout(std::time::Duration::from_secs(300))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let records = common::parse_records_from_stdout(&String::from_utf8(run_stdout).unwrap());
+    let events = parse_events(&records);
+    let session_start = events
+        .iter()
+        .find(|e| e["event_type"] == "session_start")
+        .expect("session_start");
+
+    let recorded = &session_start["effective_grants"]["host_paths"];
+    assert_eq!(
+        recorded.to_string(),
+        explain_report["host_paths"].to_string(),
+        "session_start.effective_grants.host_paths must be what --explain-scope --json prints"
+    );
+    assert_eq!(recorded[0]["declared"], json!("~/lent"));
+    assert_eq!(recorded[1]["access"], json!("read-write"));
+    assert_eq!(recorded.as_array().map(Vec::len), Some(2));
+}
+
 /// Headline property, end to end: `session_start.effective_grants` in a real
 /// `trace.jsonl` equals, field for field, the object `mur run --explain-scope --json` prints for
 /// the same manifest on the same host.

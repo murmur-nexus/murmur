@@ -2087,6 +2087,15 @@ pub enum RuntimeManifestError {
     /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
     #[error("{}", REGISTRY_BLOCK_MESSAGE)]
     RegistryBlock,
+    /// The manifest names [`HOST_PATHS_KEY`] at the top level, under `capabilities`, under
+    /// `capabilities.filesystem`, or under an artifact entry's `capabilities`; `field` is the
+    /// dotted path. Only the operator's `~/.murmur/config.yaml` lends a host folder.
+    #[error(
+        "{}: '{field}' cannot be declared in a manifest — host folders are lent by the operator, \
+         never asked for by a capsule",
+        MANIFEST_FILENAME
+    )]
+    HostPathsDeclared { field: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
     /// `keyless: true`. Decided on what the manifest wrote, so it fires identically with and
     /// without secret resolution.
@@ -3697,6 +3706,8 @@ impl RuntimeManifest {
         if raw.unknown.contains_key(REGISTRY_BLOCK_KEY) {
             return Err(RuntimeManifestError::RegistryBlock);
         }
+        // Neither is `host_paths`, in any block a capsule could write it in.
+        check_no_host_paths(&raw)?;
 
         // Collected before any field is moved out of `raw`, so the walk sees the whole document
         // rather than the part validation happens to reach before its first refusal.
@@ -4866,6 +4877,46 @@ fn check_network_destination_shape(entry: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The `~/.murmur/config.yaml` key that lends contained capsules a host folder, refused wherever a
+/// manifest writes it.
+pub const HOST_PATHS_KEY: &str = "host_paths";
+
+/// Refuses [`HOST_PATHS_KEY`] at the top level, under `capabilities` and `capabilities.filesystem`,
+/// and under each artifact entry's `capabilities` and `capabilities.filesystem`. No field claims
+/// the key, so it is found in each block's unknown-key map before any warning is built from it.
+fn check_no_host_paths(raw: &RawRuntimeManifest) -> Result<(), RuntimeManifestError> {
+    fn in_capabilities(capabilities: Option<&RawCapabilities>, prefix: &str) -> Option<String> {
+        let capabilities = capabilities?;
+        if capabilities.unknown.contains_key(HOST_PATHS_KEY) {
+            return Some(format!("{prefix}.{HOST_PATHS_KEY}"));
+        }
+        capabilities
+            .filesystem
+            .as_ref()
+            .filter(|filesystem| filesystem.unknown.contains_key(HOST_PATHS_KEY))
+            .map(|_| format!("{prefix}.filesystem.{HOST_PATHS_KEY}"))
+    }
+    let field = if raw.unknown.contains_key(HOST_PATHS_KEY) {
+        Some(HOST_PATHS_KEY.to_string())
+    } else {
+        in_capabilities(raw.capabilities.as_ref(), "capabilities").or_else(|| {
+            raw.artifacts
+                .iter()
+                .enumerate()
+                .find_map(|(index, artifact)| {
+                    in_capabilities(
+                        artifact.capabilities.as_ref(),
+                        &format!("artifacts[{index}].capabilities"),
+                    )
+                })
+        })
+    };
+    match field {
+        Some(field) => Err(RuntimeManifestError::HostPathsDeclared { field }),
+        None => Ok(()),
+    }
 }
 
 fn parse_capabilities(
@@ -15549,5 +15600,74 @@ mod inference_retry_tests {
             .map(|key| (key.key.as_str(), key.block_path.as_str()))
             .collect();
         assert_eq!(keys, vec![("jitter", "inference.retry")]);
+    }
+}
+
+#[cfg(test)]
+mod host_paths_tests {
+    use super::*;
+
+    const ENTRY: &str = "  - path: ~/.cargo\n    access: read-write\n";
+
+    /// The dotted field both entry points refuse `input` for; they must agree.
+    fn refused_field(input: &str) -> String {
+        let fields: Vec<String> = [
+            RuntimeManifest::from_yaml_str(input),
+            RuntimeManifest::from_yaml_str_without_secrets(input),
+        ]
+        .into_iter()
+        .map(|result| match result {
+            Err(RuntimeManifestError::HostPathsDeclared { field }) => field,
+            other => panic!("expected HostPathsDeclared, got {other:?}"),
+        })
+        .collect();
+        assert_eq!(
+            fields[0], fields[1],
+            "both entry points refuse the same field"
+        );
+        fields[0].clone()
+    }
+
+    #[test]
+    fn host_paths_is_refused_wherever_a_manifest_writes_it() {
+        let top = format!("name: cap\nversion: 0.0.1\nartifacts: []\nhost_paths:\n{ENTRY}");
+        assert_eq!(refused_field(&top), "host_paths");
+
+        let capabilities = format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  host_paths:\n  {}",
+            ENTRY.replace('\n', "\n  ").trim_end()
+        );
+        assert_eq!(refused_field(&capabilities), "capabilities.host_paths");
+
+        let filesystem = "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  \
+                          filesystem:\n    host_paths: []\n";
+        assert_eq!(
+            refused_field(filesystem),
+            "capabilities.filesystem.host_paths"
+        );
+
+        let artifact = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/tool-a\n    \
+                        version: 0.1.0\n    runtime: tool\n  - name: murmur/tool-b\n    \
+                        version: 0.1.0\n    runtime: tool\n    capabilities:\n      \
+                        host_paths: []\n";
+        assert_eq!(
+            refused_field(artifact),
+            "artifacts[1].capabilities.host_paths"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_field_and_is_never_an_unknown_key_warning() {
+        let input = "name: cap\nversion: 0.0.1\nartifacts: []\nhost_paths: []\n";
+        let error = RuntimeManifest::from_yaml_str(input).unwrap_err();
+        assert!(error.to_string().contains("'host_paths'"), "{error}");
+        assert!(error.to_string().contains("murmur.yaml"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_without_host_paths_parses_unchanged() {
+        let input = "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  filesystem:\n    \
+                     workdir_exec: false\n";
+        assert!(RuntimeManifest::from_yaml_str(input).is_ok());
     }
 }

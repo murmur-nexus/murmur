@@ -178,12 +178,19 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         error @ RuntimeManifestError::RegistryBlock => {
             CliError::with_hint(E_MAN_003, error.to_string(), REGISTRY_BLOCK_HINT)
         }
+        error @ RuntimeManifestError::HostPathsDeclared { .. } => {
+            CliError::with_hint(E_MAN_003, error.to_string(), HOST_PATHS_IN_MANIFEST_HINT)
+        }
         RuntimeManifestError::Io { path, source } => CliError::new(
             E_IO_003,
             format!("failed to read {MANIFEST_FILENAME} at {path}: {source}"),
         ),
     }
 }
+
+/// The hint under a manifest that names `host_paths`: the one file the key belongs in.
+const HOST_PATHS_IN_MANIFEST_HINT: &str = "remove it from murmur.yaml; an operator lends a \
+     contained capsule a host folder under host_paths: in ~/.murmur/config.yaml";
 
 /// The hint under a `capabilities.shell.allow` entry that is not a bare binary name. The
 /// session finds each allowed binary on the `PATH` `mur run` was started with.

@@ -27,6 +27,7 @@ Where both files set a value, the effective config is built per field:
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
 | `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. See [Containment class](containment.md#field-containment) |
 | `spend.machine_tokens_per_day` | **Lowest wins**: a project file may lower the ceiling, never raise it. See [`spend:` section](#spend) |
+| `host_paths` | Always the global list. A project file holding the key at all, `host_paths: []` included, is refused with [`E-CFG-004`](diagnostics.md#e-cfg-004) by every command that reads the config — see [`host_paths:` section](#host-paths) |
 
 The base of the merge is the global file, or an empty config when `~/.murmur/config.yaml` is
 absent. The source of the `murmur` scope, `murmur-nexus/default-artifacts`, is built in and is
@@ -282,6 +283,31 @@ A name this build does not compile in has no effect until a build that includes 
 [`mur beta list`](cli.md#mur-beta) prints the features this build has, and `mur beta enable`
 warns when the name is not one of them.
 
+### `host_paths:` section { #host-paths }
+
+Host folders every contained capsule on this host may reach: each entry is one host directory and
+an access. Read from `~/.murmur/config.yaml` only. What a `scoped` and a `sealed` capsule get from
+an entry, and every entry `mur run` refuses, is in
+[Host paths](containment.md#host-paths).
+
+```yaml
+host_paths:
+  - path: ~/.cargo
+    access: read-write
+  - path: ~/.config/gh
+    access: read
+```
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | An absolute path, or `~` / `~/…`, expanded against the `HOME` `mur` runs with. Write `~` alone quoted, `"~"`: unquoted it is YAML's null. `~user` and `$VAR` are not expanded, so such a path is relative and refused. Must name an existing directory |
+| `access` | string | yes | `read` or `read-write`. No default |
+
+`mur config set` does not write this key: it is an unsupported key (`E-CFG-002`). Edit the file.
+A malformed entry is refused with [`E-CFG-004`](diagnostics.md#e-cfg-004), naming its index and
+its path as written, by `mur run` and `mur run --explain-scope`; `mur doctor` reports it as a
+warning.
+
 ### `spend:` section { #spend }
 
 A machine-wide ceiling on inference spend, counted in tokens per UTC day.
@@ -369,6 +395,7 @@ A run that cannot create or open the ledger refuses to start with
 | `mur run`, `mur doctor` — the containment floor | `containment` |
 | `mur run` — the key for each `gateway.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-027` | `credentials`, from the global file only |
 | `mur run` — the machine spend ceiling; `mur run` and `mur doctor` — [`W-SEC-026`](diagnostics.md#w-sec-026) | `spend.machine_tokens_per_day` |
+| `mur run`, `mur run --explain-scope`, `mur doctor` — the host folders a contained capsule reaches | `host_paths`, from the global file only |
 
 `mur new` and `mur deploy` read `~/.murmur/config.yaml` only; a project-level file does not
 affect them. `mur deploy` builds each scope's source from that file's `registry.sources`.

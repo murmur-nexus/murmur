@@ -1100,6 +1100,21 @@ pub(crate) struct SealedBindSources<'a> {
     /// after [`Self::home_dir`], so `$MURMUR_STATE_DIR` names it inside the root. `None` for every
     /// spawn but the declaring tool's.
     pub(crate) state_dir: Option<(&'a Path, (u64, u64))>,
+    /// The host paths `~/.murmur/config.yaml` lends the session, in config order, each bound
+    /// verified and required at its own absolute path before everything else.
+    pub(crate) host_paths: &'a [HostPathBind],
+    /// Every execute root inside a `read-write` host path, bound read-only and required on top of
+    /// it so the capsule cannot rewrite what it may run.
+    pub(crate) host_path_read_only: &'a [PathBuf],
+}
+
+/// One host path's bind: the directory the entry resolved to, the `(st_dev, st_ino)` of the
+/// descriptor the parent took on it, and whether it is bound read-only (`access: read`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostPathBind {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: (u64, u64),
+    pub(crate) read_only: bool,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1266,17 +1281,25 @@ pub(crate) struct ComposedRootPlan {
 /// Picks the directory the new-root `tmpfs` is mounted over.
 ///
 /// Rejects any candidate that is the workdir or an ancestor of it — overmounting an ancestor of
-/// the workdir would hide the very directory the plan then has to bind-mount — and any candidate
-/// the host does not have. Pure apart from the injected `exists` predicate.
+/// the workdir would hide the very directory the plan then has to bind-mount — on the same terms
+/// any candidate that is a host path or an ancestor of one, and any candidate the host does not
+/// have. Pure apart from the injected `exists` predicate.
 pub(crate) fn choose_root_base(
     workdir: &Path,
+    host_paths: &[PathBuf],
     candidates: &[&str],
     exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     candidates
         .iter()
         .map(Path::new)
-        .find(|candidate| !workdir.starts_with(candidate) && exists(candidate))
+        .find(|candidate| {
+            !workdir.starts_with(candidate)
+                && !host_paths
+                    .iter()
+                    .any(|host_path| host_path.starts_with(candidate))
+                && exists(candidate)
+        })
         .map(Path::to_path_buf)
 }
 
@@ -1301,6 +1324,21 @@ pub(crate) fn plan_composed_root(
     host: &dyn HostLayout,
 ) -> ComposedRootPlan {
     let mut builder = PlanBuilder::new(base);
+
+    // -1. Host paths from `~/.murmur/config.yaml`, verified and REQUIRED, shallowest first so a
+    //     nested entry inside another lands on top of it; then every execute root inside a
+    //     read-write one, read-only and REQUIRED on top of that, so the capsule cannot rewrite
+    //     what it may run. First because a host path is disjoint from every fixed path the root
+    //     binds: every runtime folder beneath one (the workdir, the runtime, records and home
+    //     folders, a native tool's store) is bound later, on top, and keeps its own access.
+    let mut host_paths: Vec<&HostPathBind> = sources.host_paths.iter().collect();
+    host_paths.sort_by_key(|host_path| host_path.path.components().count());
+    for host_path in &host_paths {
+        builder.host_path_bind(host_path);
+    }
+    for path in sources.host_path_read_only {
+        builder.require_bind(path);
+    }
 
     // 0. Declared `staged_runtime` trees, read-only and REQUIRED — before everything else.
     //
@@ -1327,6 +1365,11 @@ pub(crate) fn plan_composed_root(
     {
         builder.mirror(path, host, /* required */ false);
     }
+
+    //    A step-0 or step-1 bind that landed over a directory holding a host path (a host path
+    //    inside an `interpreter_runtime` directory or a staged tree) hid it, so each such host path
+    //    and its read-only execute roots are bound again, on top.
+    builder.rebind_covered_host_paths(&host_paths, sources.host_path_read_only);
 
     // 2. The narrow /etc allowlist, read-only. Everything else under /etc simply does not exist.
     //
@@ -1528,6 +1571,12 @@ struct PlanBuilder {
     /// Directories already scheduled for creation, so a shared prefix (`/usr`, `/etc`) is not
     /// `mkdir`ed once per entry under it.
     made: std::collections::HashSet<PathBuf>,
+    /// Directories in [`Self::made`] only because a host path lies beneath them: a later bind of
+    /// one of these is still planned, rather than skipped as already made.
+    host_path_ancestors: std::collections::HashSet<PathBuf>,
+    /// Targets bound over a host path ancestor, which [`Self::rebind_covered_host_paths`] binds
+    /// the hidden host paths again on top of.
+    covering: Vec<PathBuf>,
 }
 
 impl PlanBuilder {
@@ -1538,6 +1587,89 @@ impl PlanBuilder {
             base: base.to_path_buf(),
             steps: Vec::new(),
             made,
+            host_path_ancestors: std::collections::HashSet::new(),
+            covering: Vec::new(),
+        }
+    }
+
+    /// Schedules one host path's verified, required bind at its own absolute path.
+    fn host_path_bind(&mut self, host_path: &HostPathBind) {
+        let target = rebase(&self.base, &host_path.path);
+        let mut current = self.base.clone();
+        if let Ok(relative) = target.strip_prefix(&self.base) {
+            let components: Vec<_> = relative.components().collect();
+            for component in &components[..components.len().saturating_sub(1)] {
+                current = current.join(component);
+                if !self.made.contains(&current) {
+                    self.host_path_ancestors.insert(current.clone());
+                }
+            }
+        }
+        self.mkdir_p(&target);
+        self.host_path_ancestors.remove(&target);
+        self.push(
+            RootOp::BindVerified {
+                source: host_path.path.clone(),
+                target,
+                read_only: host_path.read_only,
+                identity: host_path.identity,
+            },
+            /* required */ true,
+        );
+    }
+
+    /// Whether a bind at `target` is skipped: something already owns it. A directory made only as
+    /// a host path's ancestor does not count, and binding over one is recorded in
+    /// [`Self::covering`].
+    fn already_owned(&mut self, target: &Path) -> bool {
+        if !self.made.contains(target) {
+            return false;
+        }
+        if self.host_path_ancestors.remove(target) {
+            self.covering.push(target.to_path_buf());
+            return false;
+        }
+        true
+    }
+
+    /// Binds again, on top, every host path (and every read-only execute root) a bind in
+    /// [`Self::covering`] hid.
+    fn rebind_covered_host_paths(&mut self, host_paths: &[&HostPathBind], read_only: &[PathBuf]) {
+        if self.covering.is_empty() {
+            return;
+        }
+        let covering = std::mem::take(&mut self.covering);
+        let hidden = |target: &Path| {
+            covering
+                .iter()
+                .any(|cover| target != cover && target.starts_with(cover))
+        };
+        for host_path in host_paths {
+            let target = rebase(&self.base, &host_path.path);
+            if hidden(&target) {
+                self.push(
+                    RootOp::BindVerified {
+                        source: host_path.path.clone(),
+                        target,
+                        read_only: host_path.read_only,
+                        identity: host_path.identity,
+                    },
+                    true,
+                );
+            }
+        }
+        for path in read_only {
+            let target = rebase(&self.base, path);
+            if hidden(&target) {
+                self.push(
+                    RootOp::Bind {
+                        source: path.clone(),
+                        target,
+                        read_only: true,
+                    },
+                    true,
+                );
+            }
         }
     }
 
@@ -1585,7 +1717,7 @@ impl PlanBuilder {
     /// `made`, so a later `mirror` of the same path is the one that no-ops, never this.
     fn require_bind(&mut self, source: &Path) {
         let target = rebase(&self.base, source);
-        if self.made.contains(&target) {
+        if self.already_owned(&target) {
             return;
         }
         self.mkdir_p(&target);
@@ -1606,7 +1738,7 @@ impl PlanBuilder {
             return;
         };
         let target = rebase(&self.base, source);
-        if self.made.contains(&target) {
+        if self.already_owned(&target) {
             return;
         }
         match kind {
@@ -2604,6 +2736,8 @@ mod tests {
             records_dir: None,
             home_dir: None,
             state_dir: None,
+            host_paths: &[],
+            host_path_read_only: &[],
         }
     }
 
@@ -2626,15 +2760,19 @@ mod tests {
     fn base_selection_skips_any_ancestor_of_the_workdir() {
         // The default case: a workdir under the user's home, so `/tmp` is free.
         assert_eq!(
-            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| {
-                true
-            }),
+            choose_root_base(
+                Path::new("/home/u/w"),
+                &[],
+                SEALED_ROOT_BASE_CANDIDATES,
+                |_| { true }
+            ),
             Some(PathBuf::from("/tmp"))
         );
         // A workdir under /tmp — overmounting /tmp would hide the workdir before it can be bound.
         assert_eq!(
             choose_root_base(
                 Path::new("/tmp/session/w"),
+                &[],
                 SEALED_ROOT_BASE_CANDIDATES,
                 |_| true
             ),
@@ -2644,17 +2782,215 @@ mod tests {
         assert_eq!(
             choose_root_base(
                 Path::new("/home/u/w"),
+                &[],
                 SEALED_ROOT_BASE_CANDIDATES,
                 |path| { path != Path::new("/tmp") && path != Path::new("/run") }
             ),
             Some(PathBuf::from("/var/tmp"))
         );
         assert_eq!(
-            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| {
-                false
-            }),
+            choose_root_base(
+                Path::new("/home/u/w"),
+                &[],
+                SEALED_ROOT_BASE_CANDIDATES,
+                |_| { false }
+            ),
             None
         );
+    }
+
+    #[test]
+    fn base_selection_skips_any_ancestor_of_a_host_path() {
+        assert_eq!(
+            choose_root_base(
+                Path::new("/home/u/w"),
+                &[PathBuf::from("/run/media/data")],
+                &["/run", "/var/tmp"],
+                |_| true
+            ),
+            Some(PathBuf::from("/var/tmp"))
+        );
+        assert_eq!(
+            choose_root_base(
+                Path::new("/home/u/w"),
+                &[PathBuf::from("/var/tmp")],
+                &["/var/tmp", "/mnt"],
+                |_| true
+            ),
+            Some(PathBuf::from("/mnt"))
+        );
+        // No host path, no restriction.
+        assert_eq!(
+            choose_root_base(Path::new("/home/u/w"), &[], &["/run"], |_| true),
+            Some(PathBuf::from("/run"))
+        );
+    }
+
+    fn host_bind(path: &str, read_only: bool, ino: u64) -> HostPathBind {
+        HostPathBind {
+            path: PathBuf::from(path),
+            identity: (70, ino),
+            read_only,
+        }
+    }
+
+    fn host_path_plan(
+        host_paths: &[HostPathBind],
+        read_only: &[PathBuf],
+        extra_read_only: &[PathBuf],
+    ) -> ComposedRootPlan {
+        let mut host = FakeHost::usrmerge();
+        for path in extra_read_only {
+            host.0.insert(path.clone(), PathKind::Dir);
+        }
+        plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                home_dir: Some((Path::new("/home/u/.murmur/records/x/home"), (64, 9))),
+                state_dir: Some((Path::new("/home/u/.murmur/state/s"), (64, 10))),
+                host_paths,
+                host_path_read_only: read_only,
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            extra_read_only,
+            &[PathBuf::from("/opt/staged")],
+            &host,
+        )
+    }
+
+    fn position(plan: &ComposedRootPlan, matches: impl Fn(&RootStep) -> bool) -> usize {
+        plan.steps
+            .iter()
+            .position(matches)
+            .expect("the plan holds the step")
+    }
+
+    #[test]
+    fn host_paths_are_planned_first_shallowest_first_verified_and_required() {
+        let host_paths = [
+            host_bind("/home/u/data/inner", false, 2),
+            host_bind("/home/u/data", true, 1),
+        ];
+        let plan = host_path_plan(&host_paths, &[], &[]);
+        let outer = position(&plan, |step| {
+            step.op
+                == RootOp::BindVerified {
+                    source: PathBuf::from("/home/u/data"),
+                    target: PathBuf::from("/tmp/home/u/data"),
+                    read_only: true,
+                    identity: (70, 1),
+                }
+                && step.required
+        });
+        let inner = position(&plan, |step| {
+            step.op
+                == RootOp::BindVerified {
+                    source: PathBuf::from("/home/u/data/inner"),
+                    target: PathBuf::from("/tmp/home/u/data/inner"),
+                    read_only: false,
+                    identity: (70, 2),
+                }
+                && step.required
+        });
+        assert!(outer < inner, "the shallower entry is bound first");
+        // Before every other step that binds anything: staged runtime, runtime tree, /tmp, the
+        // workdir, runtime directory, records, home and store.
+        let first_other_bind = position(&plan, |step| {
+            matches!(
+                &step.op,
+                RootOp::Bind { .. }
+                    | RootOp::BindVerified { .. }
+                    | RootOp::Symlink { .. }
+                    | RootOp::Tmpfs { .. }
+            ) && !matches!(&step.op, RootOp::BindVerified { source, .. } if source.starts_with("/home/u/data"))
+        });
+        assert!(inner < first_other_bind);
+        for source in [
+            "/opt/staged",
+            "/home/u/w",
+            TEST_RUNTIME_DIR,
+            "/home/u/.murmur/records/x/home",
+            "/home/u/.murmur/state/s",
+        ] {
+            let at = position(&plan, |step| match &step.op {
+                RootOp::Bind { source: s, .. } | RootOp::BindVerified { source: s, .. } => {
+                    s == Path::new(source)
+                }
+                _ => false,
+            });
+            assert!(inner < at, "{source} is bound after every host path");
+        }
+    }
+
+    #[test]
+    fn an_execute_root_inside_a_read_write_host_path_is_bound_read_only_and_required_on_top() {
+        let host_paths = [host_bind("/home/u/tools", false, 1)];
+        let plan = host_path_plan(
+            &host_paths,
+            &[PathBuf::from("/home/u/tools/bin")],
+            &[PathBuf::from("/home/u/tools/bin")],
+        );
+        let host = position(
+            &plan,
+            |step| matches!(&step.op, RootOp::BindVerified { source, read_only: false, .. } if source == Path::new("/home/u/tools")),
+        );
+        let protect = position(&plan, |step| {
+            step.op
+                == RootOp::Bind {
+                    source: PathBuf::from("/home/u/tools/bin"),
+                    target: PathBuf::from("/tmp/home/u/tools/bin"),
+                    read_only: true,
+                }
+                && step.required
+        });
+        assert!(host < protect);
+        // The optional mirror of the same directory adds nothing: the required bind owns it.
+        let binds_of_bin = plan
+            .steps
+            .iter()
+            .filter(|step| matches!(&step.op, RootOp::Bind { source, .. } if source == Path::new("/home/u/tools/bin")))
+            .count();
+        assert_eq!(binds_of_bin, 1);
+    }
+
+    #[test]
+    fn a_host_path_inside_a_later_bound_directory_is_bound_again_on_top() {
+        let host_paths = [host_bind("/home/u/py/site/data", true, 1)];
+        let plan = host_path_plan(&host_paths, &[], &[PathBuf::from("/home/u/py")]);
+        let cover = position(
+            &plan,
+            |step| matches!(&step.op, RootOp::Bind { source, .. } if source == Path::new("/home/u/py")),
+        );
+        let binds: Vec<usize> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| matches!(&step.op, RootOp::BindVerified { source, .. } if source == Path::new("/home/u/py/site/data")))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(binds.len(), 2, "{:#?}", plan.steps);
+        assert!(binds[0] < cover && cover < binds[1]);
+    }
+
+    #[test]
+    fn no_host_paths_add_no_step() {
+        let without = host_path_plan(&[], &[], &[]);
+        let baseline = plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                home_dir: Some((Path::new("/home/u/.murmur/records/x/home"), (64, 9))),
+                state_dir: Some((Path::new("/home/u/.murmur/state/s"), (64, 10))),
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            &[],
+            &[PathBuf::from("/opt/staged")],
+            &FakeHost::usrmerge(),
+        );
+        assert_eq!(without, baseline);
     }
 
     #[test]
@@ -3209,7 +3545,9 @@ mod tests {
 
         // A workdir under /tmp forces a base other than /tmp, so both mounts are still expressible.
         assert_eq!(
-            choose_root_base(Path::new(workdir), SEALED_ROOT_BASE_CANDIDATES, |_| true),
+            choose_root_base(Path::new(workdir), &[], SEALED_ROOT_BASE_CANDIDATES, |_| {
+                true
+            }),
             Some(PathBuf::from("/run")),
         );
 
