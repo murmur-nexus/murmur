@@ -31,6 +31,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::errors::RuntimeError;
+use crate::guest_roots::GuestRoot;
 use crate::hooks::ResolvedCall;
 use crate::tool_annotations::{LocationStep, ToolAnnotationMap, ToolAnnotations};
 
@@ -240,17 +241,45 @@ impl ProtectedPaths {
     /// into a protected subtree resolves to the rule that covers its target. Matching is
     /// component-wise: a rule names a subtree of the workdir root, not a path fragment, so `tests`
     /// covers `tests/a` and does not cover `tests2`.
+    #[cfg(test)]
     pub(crate) fn covering_rule(
         &self,
         workdir: &Path,
         candidate: &str,
     ) -> Option<(&ProtectedPathRule, String)> {
-        let relative = resolve_within_workdir(workdir, candidate)?;
-        let rule = self
-            .rules
-            .iter()
-            .find(|rule| starts_with_components(&relative, &rule.relative))?;
-        Some((rule, display_relative(&relative)))
+        self.covering_rule_through(workdir, &[], candidate)
+    }
+
+    /// [`Self::covering_rule`] for a candidate a tool holding `roots` names: a `murmur-host/…`
+    /// candidate a root covers is also matched at the host path it reaches
+    /// ([`crate::guest_roots::map_guest_path`]), so a protected subtree reached through a root is
+    /// refused like one named directly. The candidate as written is matched too, so holding a root
+    /// can only add a refusal.
+    fn covering_rule_through(
+        &self,
+        workdir: &Path,
+        roots: &[GuestRoot],
+        candidate: &str,
+    ) -> Option<(&ProtectedPathRule, String)> {
+        let mapped = crate::guest_roots::map_guest_path(roots, candidate);
+        let spellings = mapped
+            .as_deref()
+            .and_then(Path::to_str)
+            .into_iter()
+            .chain(std::iter::once(candidate));
+        for spelling in spellings {
+            let Some(relative) = resolve_within_workdir(workdir, spelling) else {
+                continue;
+            };
+            if let Some(rule) = self
+                .rules
+                .iter()
+                .find(|rule| starts_with_components(&relative, &rule.relative))
+            {
+                return Some((rule, display_relative(&relative)));
+            }
+        }
+        None
     }
 
     /// The absolute subtree roots, shortest covering root per declaration, in declaration order
@@ -292,9 +321,14 @@ impl ProtectedPaths {
     /// `annotations` is consulted for a tool call only, and only to decide *where* the analyser
     /// looks: a shell call never reaches it, and no entry in it can make a path the analyser looks
     /// at be permitted.
+    ///
+    /// `roots` are the called tool's extra roots ([`crate::guest_roots::tool_extra_roots`]), read
+    /// for a tool call only: empty for a tool holding none, and never read for a shell call, whose
+    /// paths are host paths.
     pub(crate) fn check_call(
         &self,
         workdir: &Path,
+        roots: &[GuestRoot],
         call: &ResolvedCall,
         annotations: &ToolAnnotationMap,
     ) -> Option<ProtectedPathRefusal> {
@@ -310,7 +344,7 @@ impl ProtectedPaths {
             } => self.check_shell(workdir, binary, argv, script.as_deref()),
             ResolvedCall::Tool {
                 tool_name, input, ..
-            } => self.check_tool(workdir, input, annotations.for_tool(tool_name)),
+            } => self.check_tool(workdir, roots, input, annotations.for_tool(tool_name)),
         }
     }
 
@@ -345,7 +379,7 @@ impl ProtectedPaths {
 
     fn check_segment(&self, workdir: &Path, segment: &Segment) -> Option<ProtectedPathRefusal> {
         for (operator, target) in &segment.redirections {
-            if let Some((rule, path)) = self.covering_rule(workdir, target) {
+            if let Some((rule, path)) = self.covering_rule_through(workdir, &[], target) {
                 return Some(ProtectedPathRefusal {
                     rule: rule.declared().to_string(),
                     path,
@@ -361,7 +395,7 @@ impl ProtectedPaths {
             .find(|(name, _)| *name == binary)
             .map(|(_, targets)| *targets)?;
         for candidate in write_target_arguments(targets, &segment.args) {
-            if let Some((rule, path)) = self.covering_rule(workdir, &candidate) {
+            if let Some((rule, path)) = self.covering_rule_through(workdir, &[], &candidate) {
                 return Some(ProtectedPathRefusal {
                     rule: rule.declared().to_string(),
                     path,
@@ -387,17 +421,20 @@ impl ProtectedPaths {
     fn check_tool(
         &self,
         workdir: &Path,
+        roots: &[GuestRoot],
         input: &str,
         annotations: &ToolAnnotations,
     ) -> Option<ProtectedPathRefusal> {
         let value: serde_json::Value = serde_json::from_str(input).ok()?;
-        if let Some(refusal) = self.check_declared_destinations(workdir, &value, annotations) {
+        if let Some(refusal) = self.check_declared_destinations(workdir, roots, &value, annotations)
+        {
             return Some(refusal);
         }
-        if let Some(refusal) = self.check_derived_destinations(workdir, &value, annotations) {
+        if let Some(refusal) = self.check_derived_destinations(workdir, roots, &value, annotations)
+        {
             return Some(refusal);
         }
-        self.walk_json(workdir, &value, &mut Vec::new(), annotations)
+        self.walk_json(workdir, roots, &value, &mut Vec::new(), annotations)
     }
 
     /// Every location the schema declared a destination, checked wherever in the input it sits.
@@ -407,12 +444,13 @@ impl ProtectedPaths {
     fn check_declared_destinations(
         &self,
         workdir: &Path,
+        roots: &[GuestRoot],
         value: &serde_json::Value,
         annotations: &ToolAnnotations,
     ) -> Option<ProtectedPathRefusal> {
         for location in annotations.destinations() {
             for candidate in location.resolve(value) {
-                if let Some((rule, path)) = self.covering_rule(workdir, candidate) {
+                if let Some((rule, path)) = self.covering_rule_through(workdir, roots, candidate) {
                     return Some(ProtectedPathRefusal {
                         rule: rule.declared().to_string(),
                         path,
@@ -435,12 +473,13 @@ impl ProtectedPaths {
     fn check_derived_destinations(
         &self,
         workdir: &Path,
+        roots: &[GuestRoot],
         value: &serde_json::Value,
         annotations: &ToolAnnotations,
     ) -> Option<ProtectedPathRefusal> {
         for derived in annotations.derived() {
             for candidate in derived.candidates(value) {
-                if let Some((rule, path)) = self.covering_rule(workdir, &candidate) {
+                if let Some((rule, path)) = self.covering_rule_through(workdir, roots, &candidate) {
                     return Some(ProtectedPathRefusal {
                         rule: rule.declared().to_string(),
                         path,
@@ -459,6 +498,7 @@ impl ProtectedPaths {
     fn walk_json(
         &self,
         workdir: &Path,
+        roots: &[GuestRoot],
         value: &serde_json::Value,
         at: &mut Vec<LocationStep>,
         annotations: &ToolAnnotations,
@@ -477,7 +517,7 @@ impl ProtectedPaths {
                     if !matches_key(TOOL_DESTINATION_KEYS, key) {
                         continue;
                     }
-                    if let Some((rule, path)) = self.covering_rule(workdir, text) {
+                    if let Some((rule, path)) = self.covering_rule_through(workdir, roots, text) {
                         return Some(ProtectedPathRefusal {
                             rule: rule.declared().to_string(),
                             path,
@@ -495,7 +535,8 @@ impl ProtectedPaths {
                         if !matches_key(TOOL_PATH_KEYS, key) {
                             continue;
                         }
-                        if let Some((rule, path)) = self.covering_rule(workdir, text) {
+                        if let Some((rule, path)) = self.covering_rule_through(workdir, roots, text)
+                        {
                             return Some(ProtectedPathRefusal {
                                 rule: rule.declared().to_string(),
                                 path,
@@ -509,7 +550,7 @@ impl ProtectedPaths {
                 }
                 map.iter().find_map(|(key, entry)| {
                     at.push(LocationStep::Key(key.clone()));
-                    let refusal = self.walk_json(workdir, entry, at, annotations);
+                    let refusal = self.walk_json(workdir, roots, entry, at, annotations);
                     at.pop();
                     refusal
                 })
@@ -518,7 +559,7 @@ impl ProtectedPaths {
                 at.push(LocationStep::Element);
                 let refusal = items
                     .iter()
-                    .find_map(|entry| self.walk_json(workdir, entry, at, annotations));
+                    .find_map(|entry| self.walk_json(workdir, roots, entry, at, annotations));
                 at.pop();
                 refusal
             }
@@ -571,19 +612,27 @@ fn resolve_within_workdir(workdir: &Path, candidate: &str) -> Option<String> {
         return None;
     }
     let candidate_path = Path::new(candidate);
+    let canonical_workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
     let lexical = if candidate_path.is_absolute() {
+        // Matched against the workdir as spelled, then canonically: a tool holding a root can
+        // name the workdir through either spelling of a symlinked parent, and both reach it.
         let normalized = normalize_absolute(candidate_path);
         let root = normalize_absolute(workdir);
-        normalized.strip_prefix(&root).ok()?.to_path_buf()
+        match normalized.strip_prefix(&root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => canonicalize_existing_prefix(&normalized)
+                .strip_prefix(&canonical_workdir)
+                .ok()?
+                .to_path_buf(),
+        }
     } else {
         lower_declared_entry(candidate).ok()?
     };
 
     // The deepest existing ancestor is canonicalized before matching, so a pre-existing symlink
     // into a protected subtree resolves to the subtree it points at rather than to its own name.
-    let canonical_workdir = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
     let resolved = canonicalize_existing_prefix(&canonical_workdir.join(&lexical));
     let relative = resolved
         .strip_prefix(&canonical_workdir)
@@ -894,7 +943,7 @@ impl ProtectedPaths {
         workdir: &Path,
         call: &ResolvedCall,
     ) -> Option<ProtectedPathRefusal> {
-        self.check_call(workdir, call, &ToolAnnotationMap::default())
+        self.check_call(workdir, &[], call, &ToolAnnotationMap::default())
     }
 }
 
@@ -1344,7 +1393,9 @@ mod tests {
             "noter",
             serde_json::json!({"note": {"file": "tests/test_foo.py", "text": "protected"}}),
         );
-        assert!(protected.check_call(workdir, &call, &annotations).is_none());
+        assert!(protected
+            .check_call(workdir, &[], &call, &annotations)
+            .is_none());
         assert!(
             protected.check_unannotated(workdir, &call).is_some(),
             "the same input without the declaration is refused, which is what the declaration is for"
@@ -1365,6 +1416,7 @@ mod tests {
         let refusal = protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool(
                     "mislabeled",
                     serde_json::json!({"path": "tests/test_foo.py", "content": "x"}),
@@ -1395,6 +1447,7 @@ mod tests {
         let refusal = protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool(
                     "batcher",
                     serde_json::json!({"edits": [{"path": "tests/test_foo.py"}]}),
@@ -1425,7 +1478,7 @@ mod tests {
 
         let call = named_tool("renderer", serde_json::json!({"sink": "tests/test_foo.py"}));
         let refusal = protected
-            .check_call(workdir, &call, &annotations)
+            .check_call(workdir, &[], &call, &annotations)
             .expect("the declared sink is a destination");
         assert_eq!(
             refusal.signal,
@@ -1459,6 +1512,7 @@ mod tests {
         let refusal = protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool(
                     "sneaky",
                     serde_json::json!({
@@ -1480,6 +1534,7 @@ mod tests {
         let refusal = protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool(
                     "buried",
                     serde_json::json!({"body": {"sink": "tests/test_foo.py"}}),
@@ -1510,6 +1565,7 @@ mod tests {
             protected
                 .check_call(
                     workdir,
+                    &[],
                     &named_tool(
                         "wholesale",
                         serde_json::json!({"path": "tests/test_foo.py", "content": "x"}),
@@ -1523,6 +1579,7 @@ mod tests {
         let refusal = protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool(
                     "wholesale",
                     serde_json::json!({"sink": "tests/test_foo.py"}),
@@ -1552,6 +1609,7 @@ mod tests {
             protected
                 .check_call(
                     workdir,
+                    &[],
                     &named_tool(
                         "other",
                         serde_json::json!({"note": {"file": "tests/test_foo.py", "text": "x"}}),
@@ -1575,7 +1633,7 @@ mod tests {
         let call = named_tool("grapher", serde_json::json!({"repo_path": "repo"}));
 
         let refusal = paths(&["repo"])
-            .check_call(workdir, &call, &annotations)
+            .check_call(workdir, &[], &call, &annotations)
             .expect("the derived destination falls under the rule");
         assert_eq!(refusal.rule, "repo");
         assert_eq!(refusal.path, "repo/.murmur");
@@ -1592,7 +1650,7 @@ mod tests {
 
         assert!(
             paths(&["tests"])
-                .check_call(workdir, &call, &annotations)
+                .check_call(workdir, &[], &call, &annotations)
                 .is_none(),
             "a derived destination outside every rule is not a refusal"
         );
@@ -1614,7 +1672,7 @@ mod tests {
         );
 
         let refusal = protected
-            .check_call(workdir, &call, &annotations)
+            .check_call(workdir, &[], &call, &annotations)
             .expect("declaring no destination permits nothing");
         assert_eq!(
             refusal.signal,
@@ -1643,6 +1701,7 @@ mod tests {
         assert!(protected
             .check_call(
                 workdir,
+                &[],
                 &named_tool("grapher", serde_json::json!({"repo_path": "repo"})),
                 &annotations,
             )
@@ -1661,6 +1720,7 @@ mod tests {
         assert!(protected
             .check_call(
                 workdir,
+                &[],
                 &shell("echo broken > tests/test_foo.py"),
                 &annotations
             )
@@ -1677,5 +1737,174 @@ mod tests {
         for binary in ["rm", "tee", "cargo", "jq"] {
             assert!(!is_advisory_interpreter(binary), "{binary}");
         }
+    }
+
+    // ── extra roots ──────────────────────────────────────────────────────────
+
+    /// A work folder reached through a symlinked parent: `(tmp, symlinked workdir, canonical
+    /// workdir)`, with `tests/keep.txt` inside.
+    #[cfg(unix)]
+    fn symlinked_workdir() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("work/tests")).unwrap();
+        fs::write(real.join("work/tests/keep.txt"), "kept").unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let symlinked = tmp.path().join("link/work");
+        let canonical = real.join("work").canonicalize().unwrap();
+        (tmp, symlinked, canonical)
+    }
+
+    fn whole_host() -> Vec<GuestRoot> {
+        crate::guest_roots::extra_guest_roots_for(
+            murmur_artifact::ContainmentClass::Unconfined,
+            &[],
+        )
+    }
+
+    fn host_folder(path: &Path) -> Vec<GuestRoot> {
+        crate::guest_roots::extra_guest_roots_for(
+            murmur_artifact::ContainmentClass::Advisory,
+            &[crate::host_paths::HostPath {
+                declared: path.display().to_string(),
+                path: path.to_path_buf(),
+                access: crate::host_paths::HostPathAccess::ReadWrite,
+                credential_locations: Vec::new(),
+            }],
+        )
+    }
+
+    fn write_to(path: &str) -> ResolvedCall {
+        tool(serde_json::json!({"path": path, "content": "x"}))
+    }
+
+    fn guest(host: &Path) -> String {
+        crate::guest_roots::guest_path_for(host)
+    }
+
+    /// Every spelling a tool holding the whole host can give a protected work-folder file is
+    /// refused naming the rule, whichever spelling of the work folder the session holds.
+    #[cfg(unix)]
+    #[test]
+    fn protected_paths_every_spelling_through_a_root_is_refused() {
+        let (_tmp, symlinked, canonical) = symlinked_workdir();
+        let protected = paths(&["tests"]);
+        let roots = whole_host();
+        for workdir in [&symlinked, &canonical] {
+            for candidate in [
+                format!("{}/tests/a", guest(&canonical)),
+                format!("{}/tests/keep.txt", guest(&symlinked)),
+                format!("/{}/tests/a", guest(&canonical)),
+                format!("{}/tests/a", canonical.display()),
+                format!("{}/tests/keep.txt", symlinked.display()),
+                "tests/a".to_string(),
+            ] {
+                let refusal = protected
+                    .check_call(
+                        workdir,
+                        &roots,
+                        &write_to(&candidate),
+                        &ToolAnnotationMap::default(),
+                    )
+                    .unwrap_or_else(|| panic!("{candidate} in {}", workdir.display()));
+                assert_eq!(refusal.rule, "tests", "{candidate}");
+                assert!(refusal.path.starts_with("tests/"), "{refusal:?}");
+            }
+            let free = format!("{}/free.txt", guest(&canonical));
+            assert!(protected
+                .check_call(
+                    workdir,
+                    &roots,
+                    &write_to(&free),
+                    &ToolAnnotationMap::default()
+                )
+                .is_none());
+        }
+    }
+
+    /// A host folder holding the work folder refuses through its own root the same way.
+    #[cfg(unix)]
+    #[test]
+    fn protected_paths_a_host_folder_around_the_workdir_is_refused_through() {
+        let (tmp, symlinked, canonical) = symlinked_workdir();
+        let protected = paths(&["tests"]);
+        let roots = host_folder(&tmp.path().canonicalize().unwrap());
+        let candidate = format!("{}/tests/keep.txt", guest(&canonical));
+        let refusal = protected
+            .check_call(
+                &symlinked,
+                &roots,
+                &write_to(&candidate),
+                &ToolAnnotationMap::default(),
+            )
+            .expect("refused through the host folder");
+        assert_eq!(refusal.rule, "tests");
+        assert_eq!(refusal.path, "tests/keep.txt");
+    }
+
+    /// A `murmur-host/…` path no held root covers, and every `murmur-host/…` path of a tool holding
+    /// no root, is read as work-folder-relative, which is where the guest's libc resolves it.
+    #[cfg(unix)]
+    #[test]
+    fn protected_paths_an_uncovered_murmur_host_path_is_work_folder_relative() {
+        let (tmp, _symlinked, canonical) = symlinked_workdir();
+        let protected = paths(&["murmur-host/tests"]);
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let elsewhere_roots = host_folder(&elsewhere.canonicalize().unwrap());
+        for roots in [elsewhere_roots.as_slice(), &[]] {
+            let refusal = protected
+                .check_call(
+                    &canonical,
+                    roots,
+                    &write_to("murmur-host/tests/a"),
+                    &ToolAnnotationMap::default(),
+                )
+                .expect("read in the work folder");
+            assert_eq!(refusal.rule, "murmur-host/tests");
+            assert_eq!(refusal.path, "murmur-host/tests/a");
+        }
+
+        let protected = paths(&["tests"]);
+        let through = format!("{}/tests/a", guest(&canonical));
+        assert!(
+            protected
+                .check_call(
+                    &canonical,
+                    &[],
+                    &write_to(&through),
+                    &ToolAnnotationMap::default()
+                )
+                .is_none(),
+            "a tool holding no root resolves {through} inside the work folder, under no rule"
+        );
+    }
+
+    /// A shell call's paths are host paths: `murmur-host/…` means nothing to it, and the canonical
+    /// spelling of the work folder is matched like any absolute path.
+    #[cfg(unix)]
+    #[test]
+    fn protected_paths_shell_calls_read_no_roots() {
+        let (_tmp, symlinked, canonical) = symlinked_workdir();
+        let protected = paths(&["tests"]);
+        let through = format!("echo x > {}/tests/a", guest(&canonical));
+        assert!(protected
+            .check_call(
+                &symlinked,
+                &whole_host(),
+                &shell(&through),
+                &ToolAnnotationMap::default()
+            )
+            .is_none());
+        let canonical_write = format!("echo x > {}/tests/a", canonical.display());
+        let refusal = protected
+            .check_call(
+                &symlinked,
+                &whole_host(),
+                &shell(&canonical_write),
+                &ToolAnnotationMap::default(),
+            )
+            .expect("the canonical spelling is the work folder");
+        assert_eq!(refusal.rule, "tests");
     }
 }

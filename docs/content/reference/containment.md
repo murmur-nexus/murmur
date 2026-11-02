@@ -590,13 +590,18 @@ unconfined command starts is a fresh top-level session.
 **What stays on.** The `capabilities.shell.allow` dispatch check (under unconfined, a listed binary
 may start anything), `capabilities.filesystem.read_only`, policy hooks, the trace, the spend
 ceilings, `inference.max_turns`, deadlines, the untrusted-content fence, the credential gateway,
-and every [WASM artifact's boundary](#artifact-boundary): its preopens, environment and network
-allowlist do not change.
+and every [WASM artifact's](#artifact-boundary) environment and network allowlist.
+
+**What a WASM tool gains.** Every `runtime: tool` WASM artifact whose entry declares no
+`capabilities.filesystem.scope` is also handed the host's `/`, read and write, at the guest folder
+`murmur-host` ([extra roots](#wasm-extra-roots)). A tool narrowed to a scope, a driver and a hook
+keep exactly their own preopens.
 
 **What is not protected.**
 
-- The trace and the records directory are written as always, but the capsule's commands run as the
-  operator and can change them.
+- The trace, the records directory and `~/.murmur/config.yaml` are written as always, but the
+  capsule's commands, and its unscoped WASM tools through `murmur-host`, act as the operator and
+  can change them.
 - A process an unconfined command moves out of its process group, with `setsid` for example, can
   outlive the session.
 
@@ -657,6 +662,50 @@ That entry is the whole of what `report-writer` reaches:
 - **Outbound HTTP is allowlist-gated**, and an artifact's own declaration only ever subtracts from
   the capsule ceiling — here to zero, so every request is refused. An artifact holds no raw
   sockets, and has no way to run a command.
+
+### Extra roots: host folders a WASM tool reaches { #wasm-extra-roots }
+
+A WASM tool runs inside `mur`, which no containment tier confines, so the folders opened for it
+are its only fence on every host and every tier. A `runtime: tool` WASM artifact whose entry
+declares no `capabilities.filesystem.scope` is handed:
+
+| Session | Folders the tool is handed |
+|---|---|
+| Contained, no `host_paths` | The work folder as its current directory, [`murmur-runtime/`](workdir.md#runtime-directory) read-only, and `state/` when its entry grants a [store](workdir.md#state-store) |
+| Contained, with [`host_paths`](#host-paths) | The same, plus each entry under `murmur-host/`, `read` entries read-only and `read-write` entries read and write, on every tier, `advisory` included |
+| [Unconfined](#unconfined) | The same, plus the host's `/`, read and write, at `murmur-host` |
+
+Under `--unconfined`, `host_paths` entries add nothing: the whole host is already there.
+
+These extra folders are *extra roots*. Each sits under the one reserved folder `murmur-host`,
+followed by its absolute host path:
+
+| Host folder | Folder in the tool |
+|---|---|
+| `/` (unconfined) | `murmur-host` |
+| `/home/op/.cargo` | `murmur-host/home/op/.cargo` |
+
+An entry is opened at the directory it resolves to: a `~/.cargo` that is a symlink to
+`/data/cargo` is at `murmur-host/data/cargo`. A tool lists the roots it holds, and finds which
+absolute paths it may open, as the [WIT reference](wit-interfaces.md#wasm-tool-folders)
+describes.
+
+| Property | Value |
+|---|---|
+| Relative paths | Resolve in the work folder for every tool, whatever roots it holds |
+| A work-folder folder named `murmur-host` | Hidden from a tool that holds a root, as `murmur-runtime` and `state` are hidden from the tools that hold those |
+| `read` roots | Read-only inside the tool: a write fails in the tool |
+| Execute | Never: a WASM tool cannot run a program |
+| A symlink inside a root | A relative link whose target stays inside the same root is followed. An absolute link is never followed, even through the unconfined `murmur-host`: opening it fails in the tool with `Operation not permitted`. Open its target by its own path instead |
+| A root that can no longer be opened | Fails that tool call, naming the path; a configured root is never silently left out |
+| [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) | Holds through a root: a write into a protected work-folder subtree is refused before dispatch whether the call names it relatively, by an absolute path, or through `murmur-host/` |
+| A tool narrowed to `capabilities.filesystem.scope`, a driver, a hook, the capsule itself | No extra roots |
+| A native tool | No extra roots: it is a host process, and reaches host paths through its own [grants](#native-tools), and the whole host when unconfined |
+
+`mur run --explain-scope`, `mur doctor` and `session_start.effective_grants.preopens` list each
+tool's roots: `; whole host read-write under murmur-host/` or
+`; host folders under murmur-host/: <path> (<access>), …` on the tool's preopen line, and
+[`extra_roots`](observability-schemas.md#preopens) in JSON.
 
 ---
 
@@ -954,8 +1003,8 @@ folder itself cannot be renamed.
 A host path is a host directory the operator lends every contained capsule on the host, through
 [`host_paths:`](config.md#host-paths) in `~/.murmur/config.yaml`. No other file, manifest,
 roster, artifact, environment variable or flag can name one. It reaches the session's shell
-commands, plan shell steps and native tools; WASM tools keep exactly their own
-[preopens](#artifact-boundary) and do not reach host paths.
+commands, plan shell steps and native tools, and every unscoped WASM tool under `murmur-host/`
+([extra roots](#wasm-extra-roots)).
 
 | Tier | What an entry gets |
 |---|---|

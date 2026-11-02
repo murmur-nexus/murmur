@@ -1,6 +1,7 @@
 // A tool that reports what its WASI preopens let it do with one path: `{"op":"read","path":…}`
-// reads the file, `{"op":"write","path":…}` tries to replace it, and `{"op":"list","path":…}`
-// lists a directory. The outcome is the summary — `ok`, or `err: <message>` — and a read's bytes
+// reads the file, `{"op":"write","path":…}` tries to replace it, `{"op":"list","path":…}` lists a
+// directory, and `{"op":"roots"}` lists the guest path of every preopened directory, sorted, one
+// per line. The outcome is the summary — `ok`, or `err: <message>` — and a read's bytes or the list
 // are the data, so a test reads what the guest could reach rather than inferring it from a trap.
 wit_bindgen::generate!({
     path: "../../../../../../capsule-runtime/wit/guest",
@@ -18,6 +19,14 @@ impl exports::murmur::tool::run::Guest for RuntimeDirProbe {
         let outcome = match op.as_str() {
             "read" => std::fs::read_to_string(&path).map(Some),
             "write" => std::fs::write(&path, b"written by the probe").map(|()| None),
+            "roots" => {
+                let mut names: Vec<String> = wasi::filesystem::preopens::get_directories()
+                    .into_iter()
+                    .map(|(_, guest_path)| guest_path)
+                    .collect();
+                names.sort();
+                Ok(Some(names.join("\n")))
+            }
             "list" => std::fs::read_dir(&path).map(|entries| {
                 let mut names: Vec<String> = entries
                     .filter_map(Result::ok)

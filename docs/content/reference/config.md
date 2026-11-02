@@ -288,7 +288,8 @@ warns when the name is not one of them.
 Host folders every contained capsule on this host may reach: each entry is one host directory and
 an access. Read from `~/.murmur/config.yaml` only. What a `scoped` and a `sealed` capsule get from
 an entry, and every entry `mur run` refuses, is in
-[Host paths](containment.md#host-paths).
+[Host paths](containment.md#host-paths); what a WASM tool gets is in
+[Extra roots](containment.md#wasm-extra-roots).
 
 ```yaml
 host_paths:

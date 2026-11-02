@@ -618,6 +618,11 @@ pub(crate) fn run_run(
             )
         }))
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        // From the policy the launch stages with: its floor and its `host_paths`, both set above.
+        capsule_runtime::attach_extra_roots(
+            &mut preopens,
+            &capsule_runtime::guest_roots::extra_guest_roots(&capability_policy),
+        );
         // Whether a tool reaches the runtime directory through its preopen or its environment is
         // a property of the installed artifact, which this block reads no store to learn. The
         // project's `murmur.lock` says it for every locked entry: only a native payload is pinned

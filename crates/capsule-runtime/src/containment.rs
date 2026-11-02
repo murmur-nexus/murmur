@@ -469,6 +469,50 @@ pub struct PreopenReport {
     /// the installed artifact is. `None` — serialized `null` — for every other entry, which has
     /// no reach.
     pub runtime_dir_reach: Option<RuntimeDirReach>,
+    /// The host folders the guest is also preopened into, under `murmur-host`
+    /// ([`crate::guest_roots`]), in preopen order. Filled for exactly the entries that reach the
+    /// runtime directory, from the session's unconfined stance or `host_paths`; cleared once the
+    /// entry is known to be native, whose host process reaches host paths through its own
+    /// grants. Always serialized: `[]` for every other entry.
+    pub extra_roots: Vec<ExtraRootReport>,
+}
+
+/// One extra root as [`PreopenReport::extra_roots`] carries it. Every key is always present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExtraRootReport {
+    /// Where the guest opens it: `murmur-host` followed by [`Self::path`].
+    pub guest_path: String,
+    /// The canonical host directory.
+    pub path: String,
+    /// `read` or `read-write`.
+    pub access: crate::host_paths::HostPathAccess,
+    /// `unconfined` or `host_paths`.
+    pub source: crate::guest_roots::GuestRootSource,
+}
+
+impl From<&crate::guest_roots::GuestRoot> for ExtraRootReport {
+    fn from(root: &crate::guest_roots::GuestRoot) -> Self {
+        Self {
+            guest_path: root.guest_path.clone(),
+            path: root.host_path.display().to_string(),
+            access: root.access,
+            source: root.source,
+        }
+    }
+}
+
+/// Every report that reaches the runtime directory given `roots`, the session's extra roots
+/// ([`crate::guest_roots::extra_guest_roots`]). Called before [`resolve_runtime_dir_reaches`],
+/// which clears them from a native entry; `stage_session`, `mur run --explain-scope` and
+/// `mur doctor` all call both, so the three agree.
+pub fn attach_extra_roots(reports: &mut [PreopenReport], roots: &[crate::guest_roots::GuestRoot]) {
+    for report in reports {
+        report.extra_roots = if report.runtime_dir_reach.is_some() {
+            roots.iter().map(ExtraRootReport::from).collect()
+        } else {
+            Vec::new()
+        };
+    }
 }
 
 /// How one artifact reaches the runtime directory, as [`PreopenReport::runtime_dir_reach`]
@@ -501,7 +545,8 @@ pub fn resolve_runtime_dir_reach(
 }
 
 /// Every report's [`PreopenReport::runtime_dir_reach`] resolved through `implementation_of`, the
-/// implementation of the artifact a report names, or `None` where it is not known.
+/// implementation of the artifact a report names, or `None` where it is not known. A native
+/// entry's [`PreopenReport::extra_roots`] are cleared: it holds no preopen.
 pub fn resolve_runtime_dir_reaches(
     reports: &mut [PreopenReport],
     implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
@@ -511,6 +556,12 @@ pub fn resolve_runtime_dir_reaches(
             report.runtime_dir_reach,
             implementation_of(&report.artifact),
         );
+        if !matches!(
+            report.runtime_dir_reach,
+            Some(RuntimeDirReach::MurmurRuntime | RuntimeDirReach::Unresolved)
+        ) {
+            report.extra_roots.clear();
+        }
     }
 }
 
@@ -546,16 +597,47 @@ impl PreopenReport {
                  commands can change on this host"
             ),
         };
+        let extra_roots = self.render_extra_roots();
         match &self.scope {
             Some(scope) => format!(
                 "{artifact} ({role}): {surface} — capabilities.filesystem.scope: \
-                 {scope}{runtime_dir}"
+                 {scope}{runtime_dir}{extra_roots}"
             ),
             None => format!(
                 "{artifact} ({role}): {surface} — no capabilities.filesystem.scope \
-                 declared{runtime_dir}"
+                 declared{runtime_dir}{extra_roots}"
             ),
         }
+    }
+
+    /// The `; …` fragment naming [`Self::extra_roots`], empty when there are none. An entry whose
+    /// implementation is unresolved holds them only if it is WASM, and says so.
+    fn render_extra_roots(&self) -> String {
+        if self.extra_roots.is_empty() {
+            return String::new();
+        }
+        let guest = crate::guest_roots::HOST_ROOT_GUEST_PATH;
+        let qualifier = if self.runtime_dir_reach == Some(RuntimeDirReach::Unresolved) {
+            " if WASM"
+        } else {
+            ""
+        };
+        let whole_host = self
+            .extra_roots
+            .iter()
+            .any(|root| root.source == crate::guest_roots::GuestRootSource::Unconfined);
+        if whole_host {
+            return format!("; whole host read-write under {guest}/{qualifier}");
+        }
+        let folders: Vec<String> = self
+            .extra_roots
+            .iter()
+            .map(|root| format!("{} ({})", root.path, root.access))
+            .collect();
+        format!(
+            "; host folders under {guest}/{qualifier}: {}",
+            folders.join(", ")
+        )
     }
 }
 
@@ -4412,6 +4494,153 @@ mod tests {
         );
     }
 
+    fn extra_roots_preopen(artifact: &str, role: &str, scope: Option<&str>) -> PreopenReport {
+        PreopenReport {
+            artifact: artifact.to_string(),
+            role: role.to_string(),
+            scope: scope.map(str::to_string),
+            surface: if scope.is_some() {
+                PreopenSurface::ScopedSubtree
+            } else {
+                PreopenSurface::WholeWorkdir
+            },
+            runtime_dir_reach: (role == "tool" && scope.is_none())
+                .then_some(RuntimeDirReach::Unresolved),
+            extra_roots: Vec::new(),
+        }
+    }
+
+    fn two_host_folders() -> Vec<crate::guest_roots::GuestRoot> {
+        let host_path = |path: &str, access| crate::host_paths::HostPath {
+            declared: path.to_string(),
+            path: std::path::PathBuf::from(path),
+            access,
+            credential_locations: Vec::new(),
+        };
+        crate::guest_roots::extra_guest_roots_for(
+            ContainmentClass::Advisory,
+            &[
+                host_path("/data/ref", crate::host_paths::HostPathAccess::Read),
+                host_path("/data/out", crate::host_paths::HostPathAccess::ReadWrite),
+            ],
+        )
+    }
+
+    /// Every extra root serializes with its four keys, and an entry holding none serializes `[]`.
+    #[test]
+    fn extra_roots_serialize_with_four_keys_always_present() {
+        let mut reports = vec![
+            extra_roots_preopen("probe", "tool", None),
+            extra_roots_preopen("cache-tool", "tool", Some("cache")),
+            extra_roots_preopen("driver", "driver", None),
+        ];
+        attach_extra_roots(&mut reports, &two_host_folders());
+        let json = serde_json::to_value(&reports).unwrap();
+        assert_eq!(
+            json[0]["extra_roots"],
+            serde_json::json!([
+                {
+                    "guest_path": "murmur-host/data/ref",
+                    "path": "/data/ref",
+                    "access": "read",
+                    "source": "host_paths",
+                },
+                {
+                    "guest_path": "murmur-host/data/out",
+                    "path": "/data/out",
+                    "access": "read-write",
+                    "source": "host_paths",
+                },
+            ])
+        );
+        assert_eq!(json[1]["extra_roots"], serde_json::json!([]));
+        assert_eq!(json[2]["extra_roots"], serde_json::json!([]));
+
+        let mut reports = vec![extra_roots_preopen("probe", "tool", None)];
+        attach_extra_roots(
+            &mut reports,
+            &crate::guest_roots::extra_guest_roots_for(ContainmentClass::Unconfined, &[]),
+        );
+        assert_eq!(
+            serde_json::to_value(&reports[0].extra_roots).unwrap(),
+            serde_json::json!([{
+                "guest_path": "murmur-host",
+                "path": "/",
+                "access": "read-write",
+                "source": "unconfined",
+            }])
+        );
+    }
+
+    /// A native entry's roots are cleared once its implementation is known; a WASM entry keeps
+    /// them, and an unresolved one keeps them and says "if WASM".
+    #[test]
+    fn extra_roots_clear_for_native_and_qualify_when_unresolved() {
+        let mut reports = vec![
+            extra_roots_preopen("wasm-tool", "tool", None),
+            extra_roots_preopen("native-tool", "tool", None),
+            extra_roots_preopen("unknown-tool", "tool", None),
+        ];
+        attach_extra_roots(&mut reports, &two_host_folders());
+        resolve_runtime_dir_reaches(&mut reports, |name| match name {
+            "wasm-tool" => Some(murmur_artifact::ArtifactImplementation::Wasm),
+            "native-tool" => Some(murmur_artifact::ArtifactImplementation::Native),
+            _ => None,
+        });
+        assert_eq!(reports[0].extra_roots.len(), 2);
+        assert!(reports[1].extra_roots.is_empty());
+        assert_eq!(reports[2].extra_roots.len(), 2);
+
+        assert!(
+            reports[0].render(true).ends_with(
+                "; runtime directory read-only at murmur-runtime/; host folders under \
+                 murmur-host/: /data/ref (read), /data/out (read-write)"
+            ),
+            "{}",
+            reports[0].render(true)
+        );
+        assert!(!reports[1].render(true).contains("murmur-host"));
+        assert!(
+            reports[2].render(true).ends_with(
+                "; host folders under murmur-host/ if WASM: /data/ref (read), /data/out \
+                 (read-write)"
+            ),
+            "{}",
+            reports[2].render(true)
+        );
+
+        let mut whole = vec![extra_roots_preopen("wasm-tool", "tool", None)];
+        attach_extra_roots(
+            &mut whole,
+            &crate::guest_roots::extra_guest_roots_for(ContainmentClass::Unconfined, &[]),
+        );
+        let unresolved = whole[0].render(true);
+        assert!(
+            unresolved.ends_with("; whole host read-write under murmur-host/ if WASM"),
+            "{unresolved}"
+        );
+        resolve_runtime_dir_reaches(&mut whole, |_| {
+            Some(murmur_artifact::ArtifactImplementation::Wasm)
+        });
+        assert!(whole[0].render(true).ends_with(
+            "; runtime directory read-only at murmur-runtime/; whole host read-write \
+                        under murmur-host/"
+        ));
+    }
+
+    /// Without roots the line is exactly the one a session without extra roots renders.
+    #[test]
+    fn extra_roots_absent_leave_the_line_unchanged() {
+        let mut reports = vec![extra_roots_preopen("wasm-tool", "tool", None)];
+        attach_extra_roots(&mut reports, &[]);
+        assert_eq!(
+            reports[0].render(true),
+            "wasm-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
+             declared; runtime directory read-only at murmur-runtime/ if WASM, at \
+             $MURMUR_RUNTIME_DIR if native"
+        );
+    }
+
     /// The preopen set is reported and moves nothing else, on the same terms the state-store
     /// report beside it is held to. It is also the field that answers what `filesystem_scope`
     /// does not: a capsule-wide scope is joined into no guest preopen root, so both can be
@@ -4426,6 +4655,7 @@ mod tests {
                 scope: None,
                 surface: PreopenSurface::WholeWorkdir,
                 runtime_dir_reach: Some(RuntimeDirReach::MurmurRuntime),
+                extra_roots: Vec::new(),
             },
             PreopenReport {
                 artifact: "cache-tool".to_string(),
@@ -4433,6 +4663,7 @@ mod tests {
                 scope: Some("cache".to_string()),
                 surface: PreopenSurface::ScopedSubtree,
                 runtime_dir_reach: None,
+                extra_roots: Vec::new(),
             },
             PreopenReport {
                 artifact: "telemetry-hook".to_string(),
@@ -4440,6 +4671,7 @@ mod tests {
                 scope: None,
                 surface: PreopenSurface::Nothing,
                 runtime_dir_reach: None,
+                extra_roots: Vec::new(),
             },
         ];
 
@@ -4522,6 +4754,7 @@ mod tests {
                     "scope": null,
                     "surface": "whole-workdir",
                     "runtime_dir_reach": "murmur-runtime",
+                    "extra_roots": [],
                 },
                 {
                     "artifact": "cache-tool",
@@ -4529,6 +4762,7 @@ mod tests {
                     "scope": "cache",
                     "surface": "scoped-subtree",
                     "runtime_dir_reach": null,
+                    "extra_roots": [],
                 },
                 {
                     "artifact": "telemetry-hook",
@@ -4536,6 +4770,7 @@ mod tests {
                     "scope": null,
                     "surface": "nothing",
                     "runtime_dir_reach": null,
+                    "extra_roots": [],
                 },
             ])
         );
@@ -5231,6 +5466,7 @@ mod tests {
             scope: None,
             surface: PreopenSurface::WholeWorkdir,
             runtime_dir_reach: None,
+            extra_roots: Vec::new(),
         };
         let preopens = vec![
             preopen("fs-tool", "tool"),
@@ -5325,6 +5561,7 @@ mod tests {
             scope: None,
             surface: PreopenSurface::WholeWorkdir,
             runtime_dir_reach: None,
+            extra_roots: Vec::new(),
         }];
         let report = report_for(
             &sample_policy(),

@@ -640,12 +640,15 @@ fn report_home_unusable(error: &capsule_runtime::HomeUnusable) {
 /// the checklist over one manifest line would hide every artifact problem behind it.
 ///
 /// How each tool reaches the runtime directory is read off the project's `murmur.lock`, as
-/// `--explain-scope` reads it; an unlocked tool is reported unresolved.
+/// `--explain-scope` reads it; an unlocked tool is reported unresolved. Each WASM tool's extra
+/// roots come from `declared_floor` and the global config's `host_paths` checked for the default
+/// workdir; a refused `host_paths` entry adds none here and is reported under `Host paths`.
 fn report_preopens(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
     project_root: &Path,
     host_probe: &HostProbe,
     declared_floor: murmur_artifact::ContainmentClass,
+    config: Option<&crate::config::MurConfig>,
 ) -> Vec<PreopenReport> {
     capsule_runtime::report_println!("Filesystem preopens");
     let lock = read_optional_lockfile(project_root).ok().flatten();
@@ -661,6 +664,12 @@ fn report_preopens(
         )
     }))
     .map(|mut preopens| {
+        let host_paths = crate::config::launch_host_paths(config, &project_root.join("workdir"))
+            .unwrap_or_default();
+        capsule_runtime::attach_extra_roots(
+            &mut preopens,
+            &capsule_runtime::guest_roots::extra_guest_roots_for(declared_floor, &host_paths),
+        );
         capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, |name| {
             lock.as_ref()
                 .and_then(|lock| lock.artifact_for(name))
@@ -1981,6 +1990,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         &project_root,
         &host_probe,
         declared_floor,
+        effective_config.as_ref(),
     );
 
     // Every route the capsule runs code on and what holds each, from the table `--explain-scope`

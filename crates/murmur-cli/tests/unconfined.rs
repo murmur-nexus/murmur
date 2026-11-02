@@ -947,10 +947,11 @@ fn mur_doctor_states_the_unconfined_stance() {
     assert!(err.contains("`mur run` will refuse this capsule"), "{err}");
 }
 
-/// A WASM tool's preopens, environment, network allowlist and state stores are the same
-/// with and without `--unconfined`.
+/// A WASM tool's environment, network allowlist and state stores are the same with and without
+/// `--unconfined`, and so are its preopens but for one key: an unscoped WASM tool's `extra_roots`
+/// gain the host's `/` at `murmur-host`, while a tool narrowed to a subtree keeps exactly it.
 #[test]
-fn wasm_tool_grants_are_unchanged_by_unconfined() {
+fn wasm_tool_grants_differ_only_in_extra_roots_when_unconfined() {
     let fixture = Fixture::new();
     fixture.manifest(
         "http://127.0.0.1:9",
@@ -960,15 +961,48 @@ fn wasm_tool_grants_are_unchanged_by_unconfined() {
          \x20   capabilities:\n\
          \x20     filesystem:\n\
          \x20       scope: data\n\
-         \x20     state: {}\n",
+         \x20     state: {}\n\
+         \x20 - name: local/whole-tool\n\
+         \x20   version: 0.1.0\n\
+         \x20   runtime: tool\n",
         "  env:\n    allow:\n      - MURMUR_TEST_UNCONFINED\n",
         "",
     );
     let contained = fixture.explain(&[]);
     let unconfined = fixture.explain(&["--unconfined"]);
-    for key in ["preopens", "env_allow", "network_allow", "state_stores"] {
+    for key in ["env_allow", "network_allow", "state_stores"] {
         assert_eq!(contained[key], unconfined[key], "{key}");
     }
+    let without_roots = |report: &Value| {
+        let mut preopens = report["preopens"].clone();
+        for preopen in preopens.as_array_mut().unwrap() {
+            preopen.as_object_mut().unwrap().remove("extra_roots");
+        }
+        preopens
+    };
+    assert_eq!(without_roots(&contained), without_roots(&unconfined));
+    let roots_of = |report: &Value, artifact: &str| {
+        report["preopens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|preopen| preopen["artifact"] == artifact)
+            .unwrap_or_else(|| panic!("no {artifact} in {report}"))["extra_roots"]
+            .clone()
+    };
+    for report in [&contained, &unconfined] {
+        assert_eq!(roots_of(report, "local/scoped-tool"), json!([]), "{report}");
+    }
+    assert_eq!(roots_of(&contained, "local/whole-tool"), json!([]));
+    assert_eq!(
+        roots_of(&unconfined, "local/whole-tool"),
+        json!([{
+            "guest_path": "murmur-host",
+            "path": "/",
+            "access": "read-write",
+            "source": "unconfined",
+        }])
+    );
     assert!(
         contained["preopens"]
             .as_array()

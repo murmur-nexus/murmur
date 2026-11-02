@@ -86,7 +86,8 @@ only in one place: the [`host_paths:`](../reference/config.md#host-paths) list i
 | An environment variable or a `mur run` flag | No |
 
 A host folder is never executable: `capabilities.shell.allow` stays the whole list of what a
-contained capsule can run. WASM tools keep their own preopens and do not reach host paths. What
+contained capsule can run. A WASM tool with no `capabilities.filesystem.scope` reaches each entry
+under `murmur-host/`; see [Extra roots](../reference/containment.md#wasm-extra-roots). What
 each tier does with an entry, and every entry `mur run` refuses, is in
 [Host paths](../reference/containment.md#host-paths).
 
