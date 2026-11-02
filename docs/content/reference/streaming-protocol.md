@@ -383,7 +383,7 @@ On a process capsule the harness runs the turn, so its `artifact` frames differ 
 | Key | On a process capsule | Why |
 |---|---|---|
 | `content` | The harness's report of the result, with each image the tool server returned replaced by `[image: <media_type>, <n> bytes, sha256 <hex>]` | Image bytes never reach a frame |
-| `fenceSource` | Always `null` | The harness receives tool output unfenced |
+| `fenceSource` | The source murmur's tool server fenced the result under, as on an http capsule, when the harness's report of the result still holds that fence's opening marker. `null` for a call the tool server refused or could not dispatch, an operator-pinned skill, a result whose tool name and arguments match no tool-server call, a report that dropped the fence, and the harness's own built-in tools. So `content` can be fenced while `fenceSource` is `null` | The harness reports a result with no reference to the tool-server call, so the runtime matches the two by tool name and arguments |
 | `exitCode`, `truncated` | Always `null` and `false` | A process driver reports no exit status or truncation flag |
 | `attachments` | Always `[]` | Nothing is stored, so there is no address to fetch an image from |
 
@@ -548,8 +548,8 @@ Every key is present on every frame, in this order. A key that does not apply to
 |---|---|---|
 | `frame` | string | `artifact` |
 | `toolName` | string | The tool, skill or hook the frame reports |
-| `content` | string | Exactly the bytes the model received, never truncated. Fenced when `fenceSource` is a string, unfenced when it is `null`. The fence grammar is in [Untrusted Fence](untrusted-fence.md#grammar) |
-| `fenceSource` | string \| null | `tool:<name>` for an ordinary tool result. `null` for a skill result, a call that never reached a tool, and a hook artifact |
+| `content` | string | Exactly the bytes the model received, never truncated. Fenced when `fenceSource` is a string. On an http capsule it is unfenced when `fenceSource` is `null`; on a process capsule it can be fenced either way, see [Transports](#transports). The fence grammar is in [Untrusted Fence](untrusted-fence.md#grammar) |
+| `fenceSource` | string \| null | `tool:<name>` for a tool result, `skill:<name>` for a skill whose `murmur.lock` origin is `runtime`. `null` for an operator-pinned skill, a call that never reached a tool, and a hook artifact. A process capsule names it in fewer cases, listed under [Transports](#transports) |
 | `toolCallId` | string \| null | The provider's id for the call. `null` on a hook artifact, and on a call the provider gave no id or an empty one |
 | `isError` | bool | `true` when the tool returned a status other than `passed`, or the call never reached a tool. Matches `"status":"error"` on the call's `tool_call` or `skill_call` [trace event](observability-schemas.md#session-trace-tracejsonl). `false` on a hook artifact |
 | `durationMs` | u64 \| null | Time the dispatch took, equal to the `duration_ms` on the call's trace event. `null` on a hook artifact |
