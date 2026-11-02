@@ -42,8 +42,8 @@
 //!     Outside the workdir, alongside the derived
 //!     read+execute grants, a fixed three-device set is granted unconditionally — see
 //!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary and home
-//!     folders, the only writable paths outside the workdir), `/dev/zero` and `/dev/urandom`
-//!     read-only, and no other device at all.
+//!     folders and any `read-write` host path, the only writable paths outside the workdir),
+//!     `/dev/zero` and `/dev/urandom` read-only, and no other device at all.
 //!
 //! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
 //! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
@@ -2975,7 +2975,8 @@ impl Drop for EndSessionOnDrop {
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
 /// dynamically link, and the only writable paths outside the workdir are the session's temporary
-/// and home folders and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
+/// and home folders, any `read-write` host path ([`crate::host_paths`]) and `/dev/null`, one of the
+/// three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
 /// additionally refuses the `socket(2)` domains in `denied_socket_domains` — closing the
 /// `/var/run/docker.sock` path, which no Landlock ABI mediates for pathname sockets. The forked
 /// shell child also drops every Linux capability before `execve` (see
@@ -2987,10 +2988,11 @@ resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now gra
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable), read-only access to the directories an allowlisted \
 CPython or Perl interpreter reports on its own import path, read-only access to the host's TLS \
-trust store when capabilities.network.allow is also non-empty, and no other directory granted \
+trust store when capabilities.network.allow is also non-empty, each host_paths entry in \
+~/.murmur/config.yaml at its own access, never executable, and no other directory granted \
 wholesale, plus a fixed device set \
 every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
-folders, the only writable paths outside the workdir), \
+folders and any read-write host_paths entry, the only writable paths outside the workdir), \
 /dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \
 raw block devices stay denied. The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
@@ -3008,8 +3010,9 @@ denied, not absent: stat, access and readlink on an ungranted path still succeed
 const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
 namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir, \
-its temporary folder at /tmp and its home folder at $HOME the only writable paths, a private /dev \
-tmpfs carrying the OCI default device set), with Landlock \
+its temporary folder at /tmp, its home folder at $HOME and any read-write host_paths entry the only \
+writable paths, each host_paths entry in ~/.murmur/config.yaml bound at its own path, a private \
+/dev tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, because this \
 tier creates no PID namespace and mounting a private procfs unprivileged needs one. Landlock \
@@ -6890,10 +6893,6 @@ mod tests {
         );
     }
 
-    /// Staged trees are resolved by a different rule than `sealed_bind_dirs` above, and the
-    /// differences are the point: a path inside a fixed runtime path is kept (dropping it would
-    /// silently make a required grant depend on an unrelated list), duplicates collapse, and a
-    /// relative path — which cannot be re-based under the composed root at all — is skipped.
     /// The execute roots a host path is checked against include each `interpreter_runtime`
     /// directory and each `staged_runtime` tree: a read-write entry inside the first is refused on
     /// both Landlock mechanisms, and one containing the second is refused at `scoped` and bound
@@ -6945,6 +6944,10 @@ mod tests {
         );
     }
 
+    /// Staged trees are resolved by a different rule than `sealed_bind_dirs` above, and the
+    /// differences are the point: a path inside a fixed runtime path is kept (dropping it would
+    /// silently make a required grant depend on an unrelated list), duplicates collapse, and a
+    /// relative path — which cannot be re-based under the composed root at all — is skipped.
     #[test]
     fn staged_runtime_dirs_keep_fixed_path_overlaps_and_drop_only_duplicates_and_relatives() {
         use murmur_artifact::StagedRuntimeGrant;
@@ -13059,7 +13062,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             ]
         }
 
-        /// The four builtin-only commands of S6, run on `enforcement`, each asserted.
+        /// Four builtin-only commands — read `ro/`, write `ro/`, write `rw/`, read `outside/` — run
+        /// on `enforcement`, each asserted.
         fn assert_reach(&self, enforcement: &ShellEnforcement, policy: &CapabilityPolicy) {
             let workdir = tempfile::tempdir().unwrap();
             let read = run_bash_in(

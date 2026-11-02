@@ -276,18 +276,13 @@ pub(crate) fn refuse_project_host_paths(path: &Path, project: &MurConfig) -> Res
     ))
 }
 
-/// The `HOME` `mur` runs with, made absolute against the working directory: the base `~` in a
-/// `host_paths` entry expands against, the same one [`mur_config_path`] uses.
+/// The base `~` in a `host_paths` entry expands against: the home [`mur_config_path`] finds the
+/// global config in, or `None` when `HOME` (and `USERPROFILE`) is unset or empty.
 fn host_paths_home() -> Option<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .filter(|home| !home.is_empty())?;
-    let home = PathBuf::from(home);
-    if home.is_absolute() {
-        Some(home)
-    } else {
-        env::current_dir().ok().map(|cwd| cwd.join(home))
-    }
+    absolute_home(home.into()).ok()
 }
 
 /// The global config's `host_paths`, shape-checked and `~` expanded (`E-CFG-004` naming the
@@ -589,20 +584,25 @@ pub fn mur_config_path() -> Result<PathBuf, CliError> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .ok_or_else(|| CliError::new(E_IO_001, "could not determine home directory"))?;
+    Ok(absolute_home(home.into())?
+        .join(".murmur")
+        .join("config.yaml"))
+}
 
-    let mut base = PathBuf::from(home);
-    if !base.is_absolute() {
-        base = env::current_dir()
-            .map_err(|source| {
-                CliError::new(
-                    E_IO_003,
-                    format!("failed to determine current working directory: {source}"),
-                )
-            })?
-            .join(base);
+/// `home` made absolute against the working directory, as [`mur_config_path`] and
+/// [`host_paths_home`] both read it.
+fn absolute_home(home: PathBuf) -> Result<PathBuf, CliError> {
+    if home.is_absolute() {
+        return Ok(home);
     }
-
-    Ok(base.join(".murmur").join("config.yaml"))
+    env::current_dir()
+        .map(|cwd| cwd.join(home))
+        .map_err(|source| {
+            CliError::new(
+                E_IO_003,
+                format!("failed to determine current working directory: {source}"),
+            )
+        })
 }
 
 /// `<cwd>/.murmur/config.yaml`. Lookup is cwd-only by design — see the module doc on

@@ -131,9 +131,10 @@ tool, and the answer is `unavailable`.
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
-is granted wholesale and the only writable paths outside the workdir are `/dev/null` (see
-[the fixed capsule device set](#capsule-device-set)), the
-[session's temporary folder](#temp-folder) and its [home folder](#home-folder). An allowlisted CPython or Perl interpreter also gets
+but a [host path](#host-paths) is granted wholesale, and the only writable paths outside the workdir
+are `/dev/null` (see [the fixed capsule device set](#capsule-device-set)), the
+[session's temporary folder](#temp-folder), its [home folder](#home-folder) and any `read-write`
+host path. An allowlisted CPython or Perl interpreter also gets
 read-only grants on the directories it reports on its own import path (see
 [Derived interpreter runtimes](#derived-interpreter-runtime)), and a capsule that declares
 `capabilities.network.allow` gets a read-only grant on the host's TLS trust store (see
@@ -892,10 +893,9 @@ An entry is resolved at launch, symlinks followed. The rule and the bind are tak
 it resolves to, and the reports carry both the path as written and the resolved one; under `sealed`
 the resolved path is the one that exists inside the composed root.
 
-On `sealed`, host paths are bound first, shallowest first, so a nested entry lands on top of the
-one holding it; every runtime folder beneath one — the work folder, the runtime and records
-directories, the home folder, a native tool's store — is bound later and keeps its own access, and
-the composed root is never based on a directory that holds a host path.
+An entry nested inside another keeps its own access. A runtime folder beneath an entry keeps its
+own access too: under a `read` entry the work folder stays writable, and the records directory
+stays read-only.
 
 ### What `mur run` refuses { #host-path-refusals }
 
@@ -913,11 +913,15 @@ written, its resolved path when it has one, and the reason, and happens before a
 | `read-write`, and is or lies under a folder the session may run from | On `sealed` that folder's read-only bind would hide it; on `scoped` the capsule could write a file there and run it |
 | `read-write`, and contains a folder the session may run from, at `scoped` only | Nothing keeps the capsule from rewriting a binary it may run in place |
 
-A folder the session may run from is the directory of each file its Landlock grants mark
-executable — each resolved `shell.allow` binary, its ELF interpreter and shared libraries — and each
-`interpreter_runtime` directory and `staged_runtime` tree. On `sealed` a `read-write` entry that
-contains one is allowed: that folder is bound read-only on top of the entry, a required bind, so
-the capsule cannot write it while the rest of the entry stays writable. Below `landlock+seccomp`
+A folder the session may run from is:
+
+- the folder of each `shell.allow` binary, for every match on `mur run`'s `PATH`, and of its
+  dynamic loader and shared libraries;
+- each `interpreter_runtime` directory;
+- each `staged_runtime` tree.
+
+On `sealed` a `read-write` entry that contains one is allowed: that folder is bound read-only on
+top of the entry, so the capsule cannot write it while the rest of the entry stays writable. Below `landlock+seccomp`
 neither rule applies.
 
 ### What an entry lends { #host-path-reach }

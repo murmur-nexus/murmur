@@ -22,7 +22,7 @@
 //! `target_os = "linux"` gates as every other rule.
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -369,7 +369,7 @@ pub fn declare_host_paths(
             })?,
         };
         let expanded = expand_home(path, home).map_err(refuse)?;
-        let expanded = fold_lexically(&expanded);
+        let expanded = crate::protected_paths::normalize_absolute(&expanded);
         if expanded == Path::new("/") {
             return Err(refuse(
                 "names /, the whole host filesystem; name the folder the capsule needs".to_string(),
@@ -419,45 +419,13 @@ fn expand_home(path: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// `path` with `.` dropped and each `..` removing the component before it, without touching the
-/// filesystem. `..` at the root stays at the root.
-fn fold_lexically(path: &Path) -> PathBuf {
-    let mut folded = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => folded.push(part),
-            Component::ParentDir => {
-                folded.pop();
-            }
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
-        }
-    }
-    folded
-}
-
-/// `path` canonicalized through its nearest existing ancestor, with the rest appended: for a
-/// directory that may not exist yet, such as a workdir root before its first run.
-#[must_use]
-pub fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
-    let path = fold_lexically(path);
-    let mut existing = path.as_path();
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(canonical) = std::fs::canonicalize(existing) {
-            let mut resolved = canonical;
-            for part in rest.iter().rev() {
-                resolved.push(part);
-            }
-            return resolved;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
-                existing = parent;
-            }
-            _ => return path,
-        }
-    }
+/// `path` folded lexically, then canonicalized through its nearest existing ancestor: for a
+/// directory that may not exist yet, such as a workdir root before its first run. Folded first so
+/// a `..` beneath the missing part cannot defeat a `starts_with` comparison.
+fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
+    crate::protected_paths::canonicalize_existing_prefix(
+        &crate::protected_paths::normalize_absolute(path),
+    )
 }
 
 /// What [`resolve_host_paths`] checks each entry against.

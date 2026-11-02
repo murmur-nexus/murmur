@@ -1200,6 +1200,14 @@ and `<manifest-dir>/workdir` — see [Runtime directory](workdir.md#runtime-dire
 workdir it also prints [`W-SEC-033`](diagnostics.md#w-sec-033) to stderr. Neither changes the exit
 code.
 
+### Host paths { #doctor-host-paths }
+
+A `Host paths` block follows: each [`host_paths:`](config.md#host-paths) entry in
+`~/.murmur/config.yaml`, the folder it resolves to, its access, and what this host's tier does with
+it for the project's declared containment, or `<none>`. An entry reaching a credential location
+prints [`W-SEC-034`](diagnostics.md#w-sec-034), and an entry `mur run` would refuse prints
+`warning[E-CFG-004]` naming it; both go to stderr, and neither changes the exit code.
+
 ### Murmur home { #doctor-murmur-home }
 
 Once the manifest loads, `mur doctor` prints a `Murmur home` block: the mode of `~/.murmur` and of

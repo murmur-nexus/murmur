@@ -297,7 +297,7 @@ fn report_tier(capsule: &Capsule, test: &str, expected: &str) {
 const SCOPED_TIER: &str = "landlock+seccomp";
 const SEALED_TIER: &str = "mountns+pivot_root+landlock+seccomp";
 
-// ── S2, S3, S4: refusals ───────────────────────────────────────────────────────────────
+// ── refusals ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn a_project_config_naming_host_paths_is_refused_before_staging() {
@@ -364,7 +364,7 @@ fn a_root_or_missing_host_path_refuses_the_run_and_explain_scope_naming_it() {
     }
 }
 
-// ── S5: credential locations warn ──────────────────────────────────────────────────────
+// ── credential locations warn ──────────────────────────────────────────────────────────
 
 #[test]
 fn a_credential_location_warns_and_launches() {
@@ -434,7 +434,7 @@ fn a_credential_location_warns_and_launches() {
     }
 }
 
-// ── S6, S7, S8, S12: reach ─────────────────────────────────────────────────────────────
+// ── reach ──────────────────────────────────────────────────────────────────────────────
 
 /// `ro/` holding `in.txt`, `rw/` and `outside/` holding `secret.txt`, beside the project.
 struct Dirs {
@@ -481,7 +481,7 @@ fn reach_body(dirs: &Dirs) -> String {
     )
 }
 
-/// S6, S7 and S12 on one containment class: the runtime's `bash` tool and a native tool reach
+/// One containment class: the runtime's `bash` tool and a native tool reach
 /// `ro/` read-only, `rw/` read-write and not `outside/`; `HOME` is the session's and
 /// `CARGO_HOME` the value `mur run` was started with.
 fn reach_on(test: &str, containment: &str, tier: &str) {
@@ -653,7 +653,7 @@ fn sealed_home_lent_read_keeps_the_workdir_writable_and_the_records_read_only() 
     );
 }
 
-// ── S9: a read-write entry over something the session may run ──────────────────────────
+// ── a read-write entry over something the session may run ──────────────────────────────
 
 /// `tools/bin/tool`, an executable `#!/bin/bash` script, and the `PATH` that finds it first.
 struct Tools {
@@ -809,7 +809,7 @@ fn a_read_write_host_path_inside_what_it_may_run_is_refused_on_both_tiers() {
     }
 }
 
-// ── S10, S11: reports ──────────────────────────────────────────────────────────────────
+// ── reports ────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn host_paths_appear_in_explain_scope_text_json_and_doctor() {

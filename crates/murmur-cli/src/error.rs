@@ -285,7 +285,6 @@ pub(crate) fn path_refused_hint(place: RefusedPlace, refused_at: &str) -> String
     }
 }
 
-/// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
 /// `E-CFG-004` for a `host_paths` entry that cannot be honoured, naming the entry, with the
 /// file the key belongs in.
 pub(crate) fn host_path_refusal_to_cli(
@@ -302,6 +301,7 @@ pub(crate) fn host_path_refusal_to_cli(
     )
 }
 
+/// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
 pub(crate) fn home_unusable(error: &capsule_runtime::HomeUnusable) -> CliError {
     CliError::with_hint(
         E_IO_004,
