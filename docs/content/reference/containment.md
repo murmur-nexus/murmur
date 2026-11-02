@@ -605,8 +605,9 @@ delegated child, a plan `capsule` step, a roster member of a contained `mur run 
 capsule `mur deploy` starts, and a launch redeeming a roost spawn approval. Such a launch refuses
 `--unconfined` with [`E-RUN-060`](diagnostics.md#e-run-060). `mur deploy` asks the target's `mur`
 first and starts it this way only when it knows how; a `mur` from before the unconfined stance
-always runs contained. `mur run --roster --unconfined` passes
-`--unconfined` to every member, and each member resolves it against its own manifest.
+always runs contained. A deploy that cannot ask stops with `E-DEPLOY-003`.
+`mur run --roster --unconfined` passes `--unconfined` to every member, and each member resolves it
+against its own manifest.
 
 **Reporting.** `mur run` prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line per launch
 instead of the tier warnings. The stance is recorded and reported everywhere:

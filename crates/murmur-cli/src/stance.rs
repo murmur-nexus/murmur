@@ -164,12 +164,8 @@ pub(crate) fn resolve_stance(inputs: StanceInputs) -> Result<Stance, CliError> {
         ];
         return unconfined_unless_floored(UnconfinedSource::GlobalConfig, &floors);
     }
-    let workspace = match (global_floor, inputs.project) {
-        (Some(global), Some(project)) => Some(global.max(project)),
-        (one, None) | (None, one) => one,
-    };
     Ok(Stance::Contained(effective_containment_floor(
-        workspace,
+        crate::config::merge_containment(inputs.global, inputs.project),
         inputs.manifest,
         inputs.containment_flag,
     )))

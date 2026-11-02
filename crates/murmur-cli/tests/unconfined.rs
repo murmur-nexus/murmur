@@ -210,24 +210,15 @@ fn own_status(field: &str) -> String {
         .to_string()
 }
 
-/// This process's soft and hard `RLIMIT_NOFILE`, as `ulimit -Sn` and `ulimit -Hn` print them.
+/// This process's soft and hard `RLIMIT_NOFILE`, as `ulimit -Sn` and `ulimit -Hn` print them: a
+/// child started without changing its limits inherits both.
 fn own_nofile() -> String {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live local the call writes into.
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    assert_eq!(rc, 0);
-    let show = |value: libc::rlim_t| {
-        if value == libc::RLIM_INFINITY {
-            "unlimited".to_string()
-        } else {
-            value.to_string()
-        }
-    };
-    format!("{} {}", show(limit.rlim_cur), show(limit.rlim_max))
+    let output = std::process::Command::new("bash")
+        .args(["-c", "echo \"$(ulimit -Sn) $(ulimit -Hn)\""])
+        .output()
+        .expect("bash runs");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 fn count(text: &str, needle: &str) -> usize {

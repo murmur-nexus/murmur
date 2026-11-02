@@ -1816,15 +1816,15 @@ pub(crate) fn run_deploy(
     // ── 8. Start capsule ──────────────────────────────────────────────────────
     activate_step(&start_pb, &spinner_style, "→ starting capsule...");
 
-    // An ssh failure here reads as `refused`: the start script then omits the flag, and the start
-    // over the same connection reports the failure.
-    let accepts_contained_launch = ssh_exec_output(
+    // Fail closed: the probe always exits 0 on the target, so a non-zero status is ssh itself
+    // failing, and it stops the deploy here. Reading it as `refused` would start a `mur` that
+    // knows the flag without it, unconfined if the target's global config says so.
+    let accepts_contained_launch = read_contained_launch_probe(&ssh_exec(
         host,
         key_ref,
         ssh_user,
         &build_contained_launch_probe(REMOTE_MUR),
-    )
-    .is_ok_and(|output| read_contained_launch_probe(&String::from_utf8_lossy(&output.stdout)));
+    )?);
     let start_script = build_start_script(
         &remote_deploy_dir,
         &remote_manifest,
