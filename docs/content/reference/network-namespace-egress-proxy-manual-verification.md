@@ -292,8 +292,9 @@ kernel's `ptrace_may_access` check:
 
 The runtime process marks itself non-dumpable at startup and every subprocess inherits that flag
 and keeps it. With no reader, nothing needs a dumpable subprocess or `CAP_SYS_PTRACE`. What a
-container does need is `--cap-add SYS_ADMIN`, to create the capsule's network namespace; without it
-the launch refuses with `E-CAP-005`.
+container does need is a seccomp profile that permits `unshare(CLONE_NEWUSER)` and `setns`, to
+create the capsule's network namespace; under the container runtime's default profile the launch
+refuses with `E-CAP-005`.
 
 ### 6a — the capability matrix, without a container runtime { #scenario-6a }
 
@@ -333,18 +334,19 @@ matter. On a host with a container runtime:
 
 ```bash
 # A: with the capability.
-docker run --rm -it --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+docker run --rm -it --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined -v "$PWD":/w -w /w murmur-bench:latest \
   bash -lc 'mur run'
 
 # B: identical, minus SYS_PTRACE.
-docker run --rm -it --cap-add SYS_ADMIN \
+docker run --rm -it \
   --security-opt seccomp=unconfined -v "$PWD":/w -w /w murmur-bench:latest \
   bash -lc 'mur run'
 ```
 
-**Expected:** both arms launch and run the capsule identically. `--cap-add SYS_ADMIN` is required in
-**both**: without it the launch refuses with `E-CAP-005` before the comparison is reached.
+**Expected:** both arms launch and run the capsule identically. A seccomp profile that permits
+`unshare(CLONE_NEWUSER)` and `setns` — `seccomp=unconfined` here — is required in **both**: under the
+default profile the launch refuses with `E-CAP-005` before the comparison is reached.
 
 ---
 
@@ -357,7 +359,7 @@ readings, and never run the subprocess without the namespace.
 | Reason | Host condition | The message names |
 |---|---|---|
 | Capability grant missing, bare host | AppArmor's `restrict_unprivileged_userns` is on and the `mur-sealed` profile is not confining `mur` | The failed call and its `errno`, the `apparmor_parser` command, the checkout-build script, and the readings line with `kernel.apparmor_restrict_unprivileged_userns=1` |
-| Capability grant missing, container | `unshare` is refused inside a container confined by its own AppArmor profile | The failed call and its `errno`, the container's profile by name, `--cap-add SYS_ADMIN`, and the readings line naming that profile |
+| Capability grant missing, container | `unshare` is refused inside a container confined by its own AppArmor profile | The failed call and its `errno`, the container's profile by name, the seccomp-profile remedy (`--security-opt seccomp=<file>`, `seccompProfile: Localhost`), and the readings line naming that profile |
 | Kernel support missing | `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` | `unshare(CLONE_NEWUSER \| CLONE_NEWNET) failed with ENOSPC` and `user.max_user_namespaces`, or `EINVAL` and `CONFIG_USER_NS` |
 
 On an AppArmor host, with the profile unloaded:

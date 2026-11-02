@@ -95,7 +95,7 @@ section that explains it.
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read | [`inference.system_prompt`](manifest.md#inference-system-prompt) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
-| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Platform behavior](resource-limits.md#platform-behavior) |
+| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only). `mur run --explain-scope` reports it ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |
 | `E-RUN-013` | The work folder, `$HOME` and `$TMPDIR` together grew past `capabilities.resources.workdir_max_bytes` | [Size ceiling](workdir.md#work-folder-ceiling) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
@@ -192,6 +192,7 @@ section that explains it.
 | `W-SEC-031` | A `transport: process` harness session reports it is authenticating as something other than a subscription | [W-SEC-031](#w-sec-031) |
 | `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
 | `W-SEC-033` | The session's runtime or records directory lies inside the workdir, so the capsule's commands can change the files the runtime owns or the records it keeps | [W-SEC-033](#w-sec-033) |
+| `W-SEC-034` | A capsule declaring a `scoped` or `sealed` floor runs code on a route that class does not confine | [W-SEC-034](#w-sec-034) |
 
 ---
 
@@ -374,10 +375,10 @@ the class sentence alone. The runtime never falls back to a weaker class, whiche
 |---|---|
 | This platform has no mount namespace and never will | Nothing — macOS and every other non-Linux host stay at `advisory` permanently |
 | AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary. Reported only when the network namespace was refused at `unshare` or `writing uid_map/gid_map` with `EPERM` or `EACCES`, the setting reads `1` and `mur` is unconfined | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. Running a checkout build out of `./target`, which no shipped profile attaches to: `sudo scripts/install-dev-apparmor.sh`. Last resort, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which removes unprivileged-userns hardening from every program on the machine and reports [`W-SEC-013`](#w-sec-013) |
-| A user namespace was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it |
+| A user namespace was refused — the usual answer inside a container, whose runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)`, and `setns`, `mount`, `umount2` and `pivot_root` after it | Run the container with a seccomp profile that permits those calls (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespaces outside the container and run `mur` inside them. Adding capabilities does not lift a seccomp refusal |
 | The namespace was created but its identity `uid_map`/`gid_map` could not be written, so the process cannot own it | Check that `/proc/sys/user/max_user_namespaces` is non-zero, that no LSM policy blocks `uid_map` writes for this binary, and that `mur` is not already running inside an unmapped user namespace |
-| The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN` | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, add `--cap-add SYS_ADMIN`, or establish the mount namespace outside it |
-| The namespace was created and mounted inside, but `pivot_root(2)` was refused | On an AppArmor host, check the loaded profile carries a `pivot_root,` rule and reload it; inside a container, `pivot_root(2)` is commonly absent from the runtime's seccomp allowlist, so establish the mount namespace outside the container |
+| The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN`, or a container runtime's seccomp profile | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, whose seccomp profile refuses `mount`, `umount2` and `pivot_root` whatever capabilities it holds, run it with a profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or establish the mount namespace outside it |
+| The namespace was created and mounted inside, but `pivot_root(2)` was refused | On an AppArmor host, check the loaded profile carries a `pivot_root,` rule and reload it; inside a container, whose seccomp profile refuses `pivot_root` whatever capabilities it holds, run it with a profile that permits `pivot_root` (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or establish the mount namespace outside the container |
 | `sealed` is built inside the capsule's network namespace, and this host could not create or enter it | Fix the network namespace first: [`E-CAP-005`](#e-cap-005) names the step that failed and its remedy |
 | The probe could not run, so whether this host can back `sealed` is unknown; refused rather than assumed | Re-run once the process or descriptor limit or memory is relieved, or allow the probe's syscalls |
 | The kernel provides no unprivileged user namespaces at all (`CONFIG_USER_NS=n`, or `user.max_user_namespaces=0`) | `sudo sysctl -w user.max_user_namespaces=10000` if the sysctl is merely zeroed, otherwise run on a kernel built with `CONFIG_USER_NS=y` |
@@ -1607,8 +1608,8 @@ host condition:
 | Failed call and `errno` | Readings line | Host condition | What to do |
 |---|---|---|---|
 | `writing uid_map/gid_map` or `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | `=1`; profile `unconfined` or `not reported` | AppArmor's restriction applies to `mur`, and no `mur-sealed` profile confines it. Ubuntu lets the `unshare` through and refuses the identity map that follows, so the failed call is usually `writing uid_map/gid_map` | Install and load the AppArmor profile shipped with `mur`; for a checkout build, run `scripts/install-dev-apparmor.sh`. The refusal gives both commands. Setting the restriction to `0` host-wide is the last resort |
-| Any call, usually `unshare(…)` with `EPERM` | Profile is another name, such as `docker-default` | A container confined by its own AppArmor profile; that profile, the container runtime's seccomp filter and its capabilities refused the namespace. The restriction setting does not govern it | Run the container with an AppArmor profile and seccomp policy that permit `unshare(CLONE_NEWUSER)`, or with `--cap-add SYS_ADMIN`, or create the network namespace outside the container and run `mur` inside it |
-| Any call, usually `unshare(…)` with `EPERM` | `=0`, or `AppArmor not enabled` | A container runtime's seccomp filter or a missing `CAP_SYS_ADMIN`, or another security module such as SELinux | The container remedies in the row above; on a bare host, the policy of the security module in use |
+| Any call, usually `unshare(…)` with `EPERM` | Profile is another name, such as `docker-default` | A container confined by its own AppArmor profile; that profile and the container runtime's seccomp profile refused the namespace. The restriction setting does not govern it | Run the container with an AppArmor profile and a seccomp profile that permit `unshare(CLONE_NEWUSER)` and `setns` (Docker `--security-opt apparmor=<profile> --security-opt seccomp=<file>`, Kubernetes `appArmorProfile` and `seccompProfile: Localhost`), or create the network namespace outside the container and run `mur` inside it |
+| Any call, usually `unshare(…)` with `EPERM` | `=0`, or `AppArmor not enabled` | A container runtime's seccomp profile, which refuses `unshare(CLONE_NEWUSER)` and `setns` whatever capabilities the container holds, or another security module such as SELinux | Run the container with a seccomp profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the network namespace outside the container; on a bare host, the policy of the security module in use |
 | Any call | Profile `mur-sealed` | The `mur-sealed` profile confines `mur` and the namespace still failed: the loaded profile may be out of date | `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, then compare the installed profile in `mur doctor` |
 | `writing uid_map/gid_map`, `bringing lo up` or `installing the local default route` | Any other | The namespace was created and then could not be owned (`uid_map`) or configured (`lo`, route) — a confinement that withholds capabilities inside the namespace | As the row matching the readings line |
 | `unshare(…)`, `ENOSPC`, `EINVAL`, `ENOSYS` or `EUSERS` | Any | The kernel does not provide the mechanism: `user.max_user_namespaces` is `0` or exhausted (`ENOSPC`), the kernel is built with `CONFIG_USER_NS=n` (`EINVAL`, `ENOSYS`), or the nesting limit for user namespaces is reached (`EUSERS`) | Raise `user.max_user_namespaces`, run on a kernel built with `CONFIG_USER_NS=y`, or run `mur` fewer user namespaces deep |
@@ -3038,12 +3039,13 @@ Where a warning is written depends on whether the session's records directory ex
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-023` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-023`, `W-SEC-034` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the records directory exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
 | `W-SEC-032` — decided at staging by `mur run`, by `mur doctor`, and by `mur deploy run` once the port is published | stderr from `mur run` and `mur deploy run`; stdout from `mur doctor` |
 | `W-SEC-033` — decided at staging by `mur run`, and by `mur doctor` | stderr |
+| `W-SEC-034` — from `mur doctor` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -3145,9 +3147,14 @@ imply it has none.
 the `socket(2)` domain deny and the default-deny syscall allowlist cover — see
 [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers) for the full grant. On
 the Sealed tier it names what the composed root adds and states its one exception: `/proc` is a bind
-of the host's rather than a masked private procfs, because mounting one unprivileged needs a PID
-namespace this tier does not create, so host process metadata stays visible inside the root exactly
-as it is under `scoped`.
+of the host's, because this tier creates no PID namespace and mounting a private procfs
+unprivileged needs one. Landlock refuses reading host `/proc` content at both `scoped` and
+`sealed`. What still reaches outside the capsule:
+
+| Call | What it reaches |
+|---|---|
+| `stat(2)` on `/proc/<pid>` | That a process exists, its owner and its start time |
+| `kill(2)` | Signal delivery to any process of the same user |
 
 **The one documented exception a manifest controls.**
 [`capabilities.network.unix_sockets: true`](manifest.md#field-capabilities) re-widens the
@@ -4063,3 +4070,36 @@ reports `read_only_to_commands: false` for the directory that lies inside. A `sc
 [`E-CAP-003`](#e-cap-003) instead.
 
 **What to do:** run with a `--workdir` that does not contain `~/.murmur`.
+
+### W-SEC-034 — a route this capsule runs code on is outside its class { #w-sec-034 }
+
+**Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present
+[route](containment.md#routes) the class does not cover:
+
+| Route | Present when |
+|---|---|
+| WASM tools | a `runtime: tool` entry is WASM, or `capabilities.install.tool` is non-empty |
+| drivers | any `runtime: driver` entry |
+| hooks | any `runtime: hook` entry |
+| the process harness and harness tools | `inference.transport: process` |
+
+Every agent capsule has a driver, so every agent capsule at `scoped` or `sealed` gets it. One
+warning names every such route and the artifacts on it:
+
+| From | When |
+|---|---|
+| `mur run` | Once per launch |
+| `mur doctor` | For the project's declared floor |
+
+```text
+[capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands, plan shell steps and native tools; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
+```
+
+**Why it matters:** the class confines shell commands, plan shell steps and native tools. WASM
+tools, drivers and hooks run inside the `mur` process, held by their WASI preopens and the network
+allowlist; the process harness and its tools run with your authority.
+
+**What the runtime does about it:** nothing is refused. The launch runs at the declared class.
+
+**What to do:** read the `Routes` block of `mur run --explain-scope` for what holds each route,
+and give each WASM tool, driver and hook only the `capabilities:` it needs.

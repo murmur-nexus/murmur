@@ -12,8 +12,8 @@ use std::{
 use capsule_runtime::session_status::{DeadlineSource, SessionDeadline};
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session_handling_sigterm, preopen_reports, probe_io_max, requires_process_bounding,
-    stage_session, state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LaunchEnding,
+    launch_session_handling_sigterm, preopen_reports, probe_scope, requires_process_bounding,
+    stage_session, state_store_reports, AfterTask, ArtifactRequest, LaunchEnding,
     LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
     TaskAcceptance, WorkdirError,
 };
@@ -594,20 +594,23 @@ pub(crate) fn run_run(
             .is_none()
             .then(|| read_lockfile(&project_dir.join("murmur.lock")).ok())
             .flatten();
-        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, |name| {
+        let locked_implementation_of = |name: &str| {
             lock.as_ref()
                 .and_then(|lock| lock.artifact_for(name))
                 .map(|entry| locked_implementation(&entry.sha256))
-        });
-        // Answered by performing the write, not by inferring it from a delegated controller list:
-        // `probe_io_max` creates a throwaway cgroup, writes the same `io.max` line a launch
-        // writes, and removes the directory again. The would-be workdir does not exist yet — this
-        // block runs ahead of every side effect — so the probe resolves the backing device from
-        // its nearest existing ancestor.
+        };
+        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, locked_implementation_of);
+        // Answered by doing what a launch does, not by inferring it from a delegated controller
+        // list: `probe_scope` resolves the delegated base and creates a throwaway cgroup through
+        // the calls `prepare_scope` makes, writes the same `io.max` line a launch writes, and
+        // removes the directory again. A base or scope it cannot create is reported with the
+        // reason `E-RUN-012` would print. The would-be workdir does not exist yet — this block
+        // runs ahead of every side effect — so the probe resolves the backing device from its
+        // nearest existing ancestor.
         //
         // A capsule that can reach no native subprocess is given no scope at launch, so the
-        // diagnostic reports `not-required` for it rather than exercising a write the launch would
-        // never perform.
+        // diagnostic reports `not-required` for it rather than exercising a scope the launch would
+        // never create.
         //
         // `has_native_artifact` is `false` here and not read from the manifest: an entry's
         // implementation is a property of the *installed* artifact, which only a registry read
@@ -617,15 +620,15 @@ pub(crate) fn run_run(
         // `not-required` here while its launch does create a scope and does report the real
         // status in `session_start`.
         //
-        // The `not-required` report is built by `IoMaxReport::no_scope_required` rather than
-        // spelled out here, because `session_start.effective_grants` must be the byte-for-byte
-        // object this prints — `trace.rs`'s
+        // The `not-required` reports come from the constructors `prepare_scope` uses rather than
+        // being spelled out here, because `session_start.effective_grants` must be the
+        // byte-for-byte object this prints — `trace.rs`'s
         // `session_start_effective_grants_match_explain_scope_json` asserts exactly that.
-        let io_max = if requires_process_bounding(&capability_policy, false) {
-            probe_io_max(&capability_policy.resources, &workdir)
-        } else {
-            IoMaxReport::no_scope_required(capability_policy.resources.cgroup_io_bytes_per_sec)
-        };
+        let scope_probe = probe_scope(
+            requires_process_bounding(&capability_policy, false),
+            &capability_policy.resources,
+            &workdir,
+        );
         // The interpreter runtimes and trust store `stage_session` would derive, through the same
         // functions and with the same trees excluded, so the report names the paths a launch
         // grants.
@@ -652,7 +655,7 @@ pub(crate) fn run_run(
             state_stores,
             configured_artifacts,
             preopens,
-            io_max,
+            scope_probe.io_max,
             &launch_workdir,
         )
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?
@@ -669,7 +672,17 @@ pub(crate) fn run_run(
                 .inference
                 .as_ref()
                 .map(|inference| inference.transport.as_str()),
-        );
+        )
+        // The route table `session_start.effective_grants.routes` records, each tool's
+        // implementation read off the lock as the reaches above are.
+        .with_routes(
+            locked_implementation_of,
+            runtime_manifest
+                .inference
+                .as_ref()
+                .map(|inference| inference.transport.as_str()),
+        )
+        .with_cgroup_scope(scope_probe.cgroup_scope);
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(

@@ -34,7 +34,7 @@ use murmur_artifact::{ContainmentClass, ExportMode, Exports, FileExport, PeerFil
 use serde::Serialize;
 
 use crate::{
-    cgroup::{IoMaxReport, IoMaxStatus},
+    cgroup::{CgroupScopeReport, CgroupScopeStatus, IoMaxReport, IoMaxStatus},
     errors::RuntimeError,
     runtime_dir::RuntimeDirPlacement,
     sandbox::{EnforcementTier, HostProbe},
@@ -613,6 +613,15 @@ const ENFORCED_FILESYSTEM_NOT_PROTECTED: &str =
      read the file to see the refusal. Declaring capabilities.containment: sealed on a host that \
      reaches the sealed tier composes a root the path is not in at all.";
 
+/// What `HOME` is on a tier with no kernel filesystem mechanism: moved, and nothing more.
+///
+/// Stated beside [`ADVISORY_FILESYSTEM_NOT_PROTECTED`] because the relocation is the one thing an
+/// operator sees working on such a tier, and it is easy to read as a boundary.
+const ADVISORY_HOME_NOT_PROTECTED: &str =
+    "HOME is relocated, not protected: it points at the session's home folder, and the real home \
+     directory stays readable and writable by absolute path, because no kernel mechanism mediates \
+     the filesystem on this tier.";
+
 /// What no mechanism protects, and the reason `--explain-scope` carries this block at all.
 ///
 /// Identical wherever it prints, because the rewrite it describes is identical: `HOME` is replaced
@@ -641,25 +650,31 @@ pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundar
     // The path-rewriting statement rides along with the mechanism-specific one rather than standing
     // on its own, so a composed root — where the paths outside it are absent, and the `~` rewrite
     // lands inside the workdir — discloses nothing at all.
-    let (restriction, filesystem) = match applied {
-        EnforcementTier::KernelSealed => (FilesystemRestriction::Absent, None),
-        EnforcementTier::KernelFull => (
-            FilesystemRestriction::Enforced,
-            Some(ENFORCED_FILESYSTEM_NOT_PROTECTED),
-        ),
-        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => (
-            FilesystemRestriction::Advisory,
-            Some(ADVISORY_FILESYSTEM_NOT_PROTECTED),
-        ),
-    };
-
-    let not_protected = match filesystem {
-        Some(filesystem) => vec![
-            filesystem.to_string(),
-            PATH_REWRITING_NOT_PROTECTED.to_string(),
+    // The `HOME` statement follows the path-rewriting one it qualifies, so that statement sits at
+    // the same place on every tier that carries it.
+    let not_protected: &[&str] = match applied {
+        EnforcementTier::KernelSealed => &[],
+        EnforcementTier::KernelFull => &[
+            ENFORCED_FILESYSTEM_NOT_PROTECTED,
+            PATH_REWRITING_NOT_PROTECTED,
         ],
-        None => Vec::new(),
+        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => &[
+            ADVISORY_FILESYSTEM_NOT_PROTECTED,
+            PATH_REWRITING_NOT_PROTECTED,
+            ADVISORY_HOME_NOT_PROTECTED,
+        ],
     };
+    let restriction = match applied {
+        EnforcementTier::KernelSealed => FilesystemRestriction::Absent,
+        EnforcementTier::KernelFull => FilesystemRestriction::Enforced,
+        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
+            FilesystemRestriction::Advisory
+        }
+    };
+    let not_protected = not_protected
+        .iter()
+        .map(|statement| (*statement).to_string())
+        .collect();
 
     FilesystemBoundaryReport {
         restriction,
@@ -935,13 +950,15 @@ pub struct ScopeReport {
     /// The tier this session installs, as a stable wire name: the host's tier capped by the
     /// declared floor, from [`ContainmentDecision::enforcement_tier`].
     pub enforcement_tier: &'static str,
-    /// What [`Self::enforcement_tier`] confines, as stable wire names: always `shell`,
-    /// `plan-shell-steps` and `native-tools`, since all three are spawned through one enforcement
-    /// path.
+    /// Every route this capsule could run code on, and what holds each: eight [`RouteReport`]
+    /// rows in [`Route::ALL`]'s order, from [`route_table`]. A route the session's class covers
+    /// names [`Self::enforcement_tier`]; one it does not names [`HOST_PROCESS_MECHANISM`] and says
+    /// what it does run under.
     ///
-    /// Always serialized, on the same terms as [`Self::workdir_exec`]: a consumer keys on its
-    /// presence, and a report without it comes from a runtime that does not confine native tools.
-    pub mechanism_covers: Vec<&'static str>,
+    /// Always serialized, all eight rows, on every tier and platform: an absent key identifies a
+    /// runtime that predates it. Set again through [`Self::with_routes`] by the caller that knows
+    /// each tool's implementation and the inference transport.
+    pub routes: Vec<RouteReport>,
     /// Where this host's permission to create an unprivileged user namespace comes from, as
     /// [`UsernsGrant::wire_name`], or `null` off Linux, where AppArmor does not exist and the
     /// question has no answer.
@@ -1166,6 +1183,15 @@ pub struct ScopeReport {
     /// no launch — `io.max` is the one non-fatal cgroup limit — so this field is the only place
     /// the shortfall appears.
     pub io_max: IoMaxReport,
+    /// Whether this session's subprocesses get a delegated cgroup v2 scope.
+    ///
+    /// Always serialized. At launch it is `delegated` or `not-required`, from
+    /// [`crate::cgroup::prepare_scope`]'s real outcome: a launch that cannot get a scope it needs
+    /// is refused with `E-RUN-012` and writes no `session_start`. Under `--explain-scope` it is
+    /// [`crate::cgroup::probe_scope`]'s answer, and `unavailable` there is that refusal predicted,
+    /// with the reason it would print. Changes no class and no floor: a refused capsule runs under
+    /// no class at all. Set through [`Self::with_cgroup_scope`]; `not-probed` until then.
+    pub cgroup_scope: CgroupScopeReport,
     /// What this session's filesystem mechanism does not restrict — the block `--explain-scope`
     /// prints as `Not protected here`, directly under `Containment`.
     ///
@@ -1210,10 +1236,6 @@ impl ScopeReport {
         }
         out.push_str(&format!("  mechanism: {}\n", self.enforcement_tier));
         out.push_str(&format!(
-            "  covers:    {}\n",
-            render_mechanism_covers(&self.mechanism_covers)
-        ));
-        out.push_str(&format!(
             "  userns grant: {}\n",
             match self.userns_grant {
                 Some(grant) => grant.wire_name(),
@@ -1227,6 +1249,13 @@ impl ScopeReport {
                 None => "n/a".to_string(),
             }
         ));
+        out.push_str(&format!(
+            "  {}\n",
+            crate::cgroup::render_cgroup_scope(&self.cgroup_scope)
+        ));
+
+        out.push('\n');
+        out.push_str(&render_routes(&self.routes));
 
         out.push('\n');
         out.push_str(&render_runtime_dir(&self.runtime_dir));
@@ -1362,6 +1391,12 @@ impl ScopeReport {
                 "\nThis is a report only — `mur run` without --explain-scope would refuse to \
                  launch here.\n",
             );
+        } else if self.cgroup_scope.status == CgroupScopeStatus::Unavailable {
+            out.push_str(
+                "\nThis is a report only — `mur run` without --explain-scope would refuse to \
+                 launch here with E-RUN-012: this capsule can run a native subprocess and no \
+                 cgroup scope can be created to bound it (see `cgroup scope:` above).\n",
+            );
         }
         out
     }
@@ -1398,6 +1433,37 @@ impl ScopeReport {
             max_per_turn: images.max_per_turn,
             keep_applies: transport != Some("process"),
         });
+        self
+    }
+
+    /// This report with [`Self::routes`] built again by [`route_table`], now that the caller
+    /// knows each tool's implementation (`implementation_of`, `None` where it cannot tell) and the
+    /// inference `transport` (`None` for a capsule with no `inference:` block).
+    ///
+    /// Reads [`Self::preopens`] for the capsule's tool, driver and hook entries, and the grants
+    /// beside them, so the table and the rest of the report describe one capsule.
+    #[must_use]
+    pub fn with_routes(
+        mut self,
+        implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
+        transport: Option<&str>,
+    ) -> Self {
+        let inputs = RouteInputs::new(
+            &self.shell_allow,
+            self.plan_submit,
+            &self.install_tool,
+            &self.preopens,
+            implementation_of,
+            transport,
+        );
+        self.routes = route_table(&inputs, self.enforcement_tier);
+        self
+    }
+
+    /// This report with [`Self::cgroup_scope`] set from `cgroup_scope`.
+    #[must_use]
+    pub fn with_cgroup_scope(mut self, cgroup_scope: CgroupScopeReport) -> Self {
+        self.cgroup_scope = cgroup_scope;
         self
     }
 
@@ -1725,6 +1791,20 @@ pub(crate) fn scope_report_for_tier(
     let runtime_dir = runtime_dir_report(applied, landlock_abi, runtime_dir_placement);
     let records_dir = records_dir_report(applied, landlock_abi, runtime_dir_placement);
     let mut filesystem_boundary = filesystem_boundary(applied);
+    let enforcement_tier = decision.enforcement_tier();
+    // Built again by `with_routes` once the caller knows each tool's implementation and the
+    // transport; until then every tool reads as one of unknown implementation.
+    let routes = route_table(
+        &RouteInputs::new(
+            &policy.shell_allow,
+            policy.plan_submit,
+            &policy.install_tool,
+            &preopens,
+            |_| None,
+            None,
+        ),
+        enforcement_tier,
+    );
     for report in [&runtime_dir, &records_dir] {
         if let Some(reason) = &report.not_protected_because {
             filesystem_boundary.not_protected.push(reason.clone());
@@ -1737,8 +1817,8 @@ pub(crate) fn scope_report_for_tier(
         host_containment: decision.host_containment(),
         floor_met: shortfall_reason.is_none(),
         shortfall_reason,
-        enforcement_tier: decision.enforcement_tier(),
-        mechanism_covers: MECHANISM_COVERS.to_vec(),
+        enforcement_tier,
+        routes,
         userns_grant,
         landlock_abi,
         // Copied straight through and never consulted above: `achieved` is already computed, and
@@ -1838,9 +1918,12 @@ pub(crate) fn scope_report_for_tier(
         // it had changed.
         runtime_writes: crate::workdir_writes::runtime_writes(),
         // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
-        // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
+        // at launch and `cgroup::probe_scope` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.
         io_max,
+        // Set by the caller that performed the operation, through `with_cgroup_scope`: the launch
+        // from `prepare_scope`, `--explain-scope` from `probe_scope`.
+        cgroup_scope: CgroupScopeReport::default(),
         // Derived here, from the `applied` tier already resolved above, rather than filled by
         // either caller: `--explain-scope --json` and `session_start.effective_grants` are the
         // same object, and a field either of them worded for itself would make them differ.
@@ -1892,22 +1975,329 @@ pub(crate) fn report_for(
     )
 }
 
-/// The subprocess routes the session's enforcement tier confines, as
-/// [`ScopeReport::mechanism_covers`] reports them.
-pub(crate) const MECHANISM_COVERS: &[&str] = &["shell", "plan-shell-steps", "native-tools"];
+/// The `mechanism` of a [`RouteReport`] whose route the session's class does not cover: the code
+/// runs as part of the `mur` process, or as a child it starts outside the class.
+pub const HOST_PROCESS_MECHANISM: &str = "host-process";
 
-/// One [`MECHANISM_COVERS`] wire name as `--explain-scope` prints it.
-fn render_mechanism_covers(covers: &[&str]) -> String {
-    covers
-        .iter()
-        .map(|cover| match *cover {
-            "shell" => "shell commands",
-            "plan-shell-steps" => "plan shell steps",
-            "native-tools" => "native tools",
-            other => other,
+/// One route a capsule can run code on, as [`RouteReport::route`] names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Route {
+    /// A `capabilities.shell.allow` command the model runs.
+    Shell,
+    /// A plan's shell step.
+    PlanShellSteps,
+    /// A native `runtime: tool` artifact, declared or pulled.
+    NativeTools,
+    /// A WASM `runtime: tool` artifact, declared or pulled.
+    WasmTools,
+    /// A `runtime: driver` artifact.
+    Drivers,
+    /// A `runtime: hook` artifact.
+    Hooks,
+    /// The coding harness `inference.transport: process` runs.
+    ProcessHarness,
+    /// The tools that harness runs on its own.
+    HarnessTools,
+}
+
+impl Route {
+    /// Every route, in the order [`route_table`] reports them.
+    pub const ALL: [Self; 8] = [
+        Self::Shell,
+        Self::PlanShellSteps,
+        Self::NativeTools,
+        Self::WasmTools,
+        Self::Drivers,
+        Self::Hooks,
+        Self::ProcessHarness,
+        Self::HarnessTools,
+    ];
+
+    /// The route's name in `--explain-scope`'s text, `mur doctor` and `W-SEC-034`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "shell commands",
+            Self::PlanShellSteps => "plan shell steps",
+            Self::NativeTools => "native tools",
+            Self::WasmTools => "WASM tools",
+            Self::Drivers => "drivers",
+            Self::Hooks => "hooks",
+            Self::ProcessHarness => "the process harness",
+            Self::HarnessTools => "harness tools",
+        }
+    }
+
+    /// Whether the session's class covers this route: exactly the routes spawned through
+    /// `sandbox::prepare_enforcement`, the one path that installs the session's tier. Where each
+    /// route is spawned today, not a policy; confining another route flips its arm here.
+    #[must_use]
+    pub fn under_class(self) -> bool {
+        match self {
+            Self::Shell | Self::PlanShellSteps | Self::NativeTools => true,
+            Self::WasmTools
+            | Self::Drivers
+            | Self::Hooks
+            | Self::ProcessHarness
+            | Self::HarnessTools => false,
+        }
+    }
+
+    /// What an uncovered route does run under, as [`RouteReport::note`] states it; `None` for a
+    /// covered route, which the tier's mechanism holds.
+    #[must_use]
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Shell | Self::PlanShellSteps | Self::NativeTools => None,
+            Self::WasmTools => Some(
+                "Runs inside the mur process, held by its WASI preopens and the host-side network \
+                 allowlist only.",
+            ),
+            Self::Drivers => Some(
+                "Runs inside the mur process, held by its WASI preopens and the host-side network \
+                 allowlist only.",
+            ),
+            Self::Hooks => Some(
+                "Runs inside the mur process, held only by the preopens and network grants its \
+                 own capabilities block declares.",
+            ),
+            Self::ProcessHarness => Some(
+                "A child of mur with a cleared environment and nothing else: no Landlock, \
+                 seccomp, network namespace or rlimits, in a cgroup with no limits.",
+            ),
+            Self::HarnessTools => Some(
+                "Run by the harness with the user's authority, kept off only by the arguments \
+                 the process driver passes.",
+            ),
+        }
+    }
+}
+
+/// One row of [`ScopeReport::routes`]: whether this capsule has the route, and what holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteReport {
+    /// Which route, as a kebab-case wire name.
+    pub route: Route,
+    /// Whether this capsule has the route.
+    pub present: bool,
+    /// Whether the session's class covers the route, from [`Route::under_class`].
+    pub under_class: bool,
+    /// [`ScopeReport::enforcement_tier`]'s wire name when [`Self::under_class`], else
+    /// [`HOST_PROCESS_MECHANISM`].
+    pub mechanism: &'static str,
+    /// What an uncovered route runs under, from [`Route::note`]; `null` when covered. Always
+    /// serialized.
+    pub note: Option<&'static str>,
+    /// The artifacts on the route, in manifest order: the tool, driver or hook entries it runs.
+    /// Empty for a route no artifact names. Always serialized.
+    pub artifacts: Vec<String>,
+}
+
+/// What [`route_table`] decides presence from, gathered by [`RouteInputs::new`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteInputs {
+    /// `capabilities.shell.allow` is non-empty.
+    pub shell_allow: bool,
+    /// `capabilities.plan.submit`.
+    pub plan_submit: bool,
+    /// `capabilities.install.tool` is non-empty, so a pull may install a WASM or native tool.
+    pub install_tool: bool,
+    /// Every `runtime: tool` entry and its implementation, `None` where it is not known.
+    pub tools: Vec<(String, Option<murmur_artifact::ArtifactImplementation>)>,
+    /// Every `runtime: driver` entry.
+    pub drivers: Vec<String>,
+    /// Every `runtime: hook` entry.
+    pub hooks: Vec<String>,
+    /// `inference.transport` is `process`.
+    pub process_transport: bool,
+}
+
+impl RouteInputs {
+    /// The inputs for a capsule with these grants, these resolved `preopens` (one per tool,
+    /// driver and hook entry), each tool's implementation from `implementation_of` and the
+    /// inference `transport`.
+    #[must_use]
+    pub fn new(
+        shell_allow: &[String],
+        plan_submit: bool,
+        install_tool: &[String],
+        preopens: &[PreopenReport],
+        implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
+        transport: Option<&str>,
+    ) -> Self {
+        let named = |role: murmur_artifact::ArtifactRuntime| {
+            preopens
+                .iter()
+                .filter(|preopen| preopen.role == role.as_str())
+                .map(|preopen| preopen.artifact.clone())
+                .collect::<Vec<_>>()
+        };
+        Self {
+            shell_allow: !shell_allow.is_empty(),
+            plan_submit,
+            install_tool: !install_tool.is_empty(),
+            tools: named(murmur_artifact::ArtifactRuntime::Tool)
+                .into_iter()
+                .map(|name| {
+                    let implementation = implementation_of(&name);
+                    (name, implementation)
+                })
+                .collect(),
+            drivers: named(murmur_artifact::ArtifactRuntime::Driver),
+            hooks: named(murmur_artifact::ArtifactRuntime::Hook),
+            process_transport: transport == Some("process"),
+        }
+    }
+}
+
+/// The route table: one [`RouteReport`] per [`Route::ALL`] entry, in that order, for a capsule
+/// with `inputs` whose session installs the tier named `enforcement_tier`.
+///
+/// The only place a route's presence, coverage and mechanism are decided. `--explain-scope`,
+/// `session_start.effective_grants` and `mur doctor` all read its rows, and `W-SEC-034` decides
+/// from them.
+#[must_use]
+pub fn route_table(inputs: &RouteInputs, enforcement_tier: &'static str) -> Vec<RouteReport> {
+    use murmur_artifact::ArtifactImplementation;
+    let tools_of = |native: bool| -> Vec<String> {
+        inputs
+            .tools
+            .iter()
+            .filter(|(_, implementation)| {
+                (*implementation == Some(ArtifactImplementation::Native)) == native
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    Route::ALL
+        .into_iter()
+        .map(|route| {
+            let (present, artifacts) = match route {
+                Route::Shell => (inputs.shell_allow, Vec::new()),
+                // A plan's shell step runs only a binary `shell.allow` names (see `plan.rs`).
+                Route::PlanShellSteps => (inputs.plan_submit && inputs.shell_allow, Vec::new()),
+                Route::NativeTools => {
+                    let native = tools_of(true);
+                    (!native.is_empty() || inputs.install_tool, native)
+                }
+                // A tool of unknown implementation is reported here: it is WASM unless its
+                // installed manifest says otherwise.
+                Route::WasmTools => {
+                    let wasm = tools_of(false);
+                    (!wasm.is_empty() || inputs.install_tool, wasm)
+                }
+                Route::Drivers => (!inputs.drivers.is_empty(), inputs.drivers.clone()),
+                Route::Hooks => (!inputs.hooks.is_empty(), inputs.hooks.clone()),
+                Route::ProcessHarness | Route::HarnessTools => {
+                    (inputs.process_transport, Vec::new())
+                }
+            };
+            let under_class = route.under_class();
+            RouteReport {
+                route,
+                present,
+                under_class,
+                mechanism: if under_class {
+                    enforcement_tier
+                } else {
+                    HOST_PROCESS_MECHANISM
+                },
+                note: route.note(),
+                artifacts,
+            }
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
+}
+
+/// The `Routes` block `--explain-scope` and `mur doctor` print: one line per route, saying
+/// whether the capsule has it and what holds it, with an uncovered present route's note under
+/// it. Starts with `Routes` and ends with a newline.
+#[must_use]
+pub fn render_routes(routes: &[RouteReport]) -> String {
+    let mut out = String::from("Routes\n");
+    for row in routes {
+        let label = match row.route {
+            Route::ProcessHarness => "process harness",
+            route => route.label(),
+        };
+        let presence = if row.present { "present" } else { "absent" };
+        let mechanism = if row.under_class {
+            row.mechanism
+        } else {
+            "host process, not confined by the class"
+        };
+        let artifacts = if row.artifacts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", row.artifacts.join(", "))
+        };
+        out.push_str(&format!(
+            "  {label:<17} {presence:<8} {mechanism}{artifacts}\n"
+        ));
+        if let (true, Some(note)) = (row.present, row.note) {
+            out.push_str(&format!("    {note}\n"));
+        }
+    }
+    out
+}
+
+/// The `W-SEC-034` message for a capsule declaring `declared` with `routes`, or `None` when it
+/// does not fire: below a `scoped` floor, or when no present route lies outside the class.
+///
+/// Pure, split from [`warn_on_uncovered_routes`] on [`crate::sandbox::tier_warning`]'s terms.
+#[must_use]
+pub fn uncovered_route_warning(
+    declared: ContainmentClass,
+    routes: &[RouteReport],
+) -> Option<String> {
+    if declared < ContainmentClass::Scoped {
+        return None;
+    }
+    let uncovered: Vec<String> = routes
+        .iter()
+        .filter(|row| row.present && !row.under_class)
+        .map(|row| {
+            if row.artifacts.is_empty() {
+                row.route.label().to_string()
+            } else {
+                format!("{} ({})", row.route.label(), row.artifacts.join(", "))
+            }
+        })
+        .collect();
+    let named = match uncovered.as_slice() {
+        [] => return None,
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    Some(format!(
+        "the declared {declared} floor does not confine every route this capsule runs code on: \
+         {named} run outside the class, with none of its Landlock, seccomp or network namespace \
+         around them (`mur run --explain-scope` lists what holds each under Routes). The class \
+         confines shell commands, plan shell steps and native tools; nothing is refused"
+    ))
+}
+
+/// Prints `W-SEC-034` when [`uncovered_route_warning`] fires: to stderr, and to the session's
+/// bootstrap log when `bootstrap_log` names a records directory. The one emitter the launch and
+/// `mur doctor` (with `None`) both call.
+pub fn warn_on_uncovered_routes(
+    declared: ContainmentClass,
+    routes: &[RouteReport],
+    bootstrap_log: Option<&crate::workdir_fs::WorkdirRoot>,
+) {
+    let Some(message) = uncovered_route_warning(declared, routes) else {
+        return;
+    };
+    let code = murmur_artifact::W_SEC_034;
+    let link = murmur_artifact::security_warning_link(code);
+    crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
+    if let Some(records) = bootstrap_log {
+        crate::agent::append_bootstrap_log(
+            records,
+            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
+        );
+    }
 }
 
 /// The wire name of the tier a native tool of a capsule declaring `declared` runs under on the
@@ -2367,7 +2757,7 @@ mod tests {
                 } => {
                     assert_eq!(declared, ContainmentClass::Sealed);
                     assert!(
-                        reason.contains("--cap-add SYS_ADMIN"),
+                        reason.contains("seccomp profile") && !reason.contains("--cap-add"),
                         "reason must name the blocking mechanism's remediation, got: {reason}"
                     );
                 }
@@ -2402,7 +2792,14 @@ mod tests {
             None,
         )
         .expect("refusal");
-        assert!(container.contains("--cap-add SYS_ADMIN"));
+        assert!(!container.contains("--cap-add"), "{container}");
+        assert!(container.contains("seccomp profile"), "{container}");
+        assert!(container.contains("unshare(CLONE_NEWUSER)"), "{container}");
+        assert!(container.contains("--security-opt seccomp="), "{container}");
+        assert!(
+            container.contains("seccompProfile: Localhost"),
+            "{container}"
+        );
         assert!(container.contains("outside the container"));
         assert!(!container.contains("apparmor_parser"));
 
@@ -3719,10 +4116,12 @@ mod tests {
 
         assert_eq!(with.preopens, preopens);
         assert!(without.preopens.is_empty());
-        // The only field that moved is its own.
+        // The only fields that moved are its own and the route table, which reads each entry's
+        // role off the preopens.
         assert_eq!(
             ScopeReport {
                 preopens: Vec::new(),
+                routes: without.routes.clone(),
                 ..with.clone()
             },
             without
@@ -4302,36 +4701,431 @@ mod tests {
         );
     }
 
-    /// Every tier names the same three subprocess routes it confines, on the line under
-    /// `mechanism:` and as an always-serialized JSON array a consumer can key on.
+    /// Every presence input the table reads, one at a time, with its expected present routes.
+    fn presence_cases() -> Vec<(&'static str, RouteInputs, Vec<Route>)> {
+        use murmur_artifact::ArtifactImplementation::{Native, Wasm};
+        let tool = |implementation| RouteInputs {
+            tools: vec![("t".to_string(), implementation)],
+            ..RouteInputs::default()
+        };
+        vec![
+            ("nothing", RouteInputs::default(), vec![]),
+            ("one WASM tool", tool(Some(Wasm)), vec![Route::WasmTools]),
+            (
+                "one native tool",
+                tool(Some(Native)),
+                vec![Route::NativeTools],
+            ),
+            (
+                "a tool of unknown implementation",
+                tool(None),
+                vec![Route::WasmTools],
+            ),
+            (
+                "a driver",
+                RouteInputs {
+                    drivers: vec!["d".to_string()],
+                    ..RouteInputs::default()
+                },
+                vec![Route::Drivers],
+            ),
+            (
+                "a hook",
+                RouteInputs {
+                    hooks: vec!["h".to_string()],
+                    ..RouteInputs::default()
+                },
+                vec![Route::Hooks],
+            ),
+            (
+                "install.tool",
+                RouteInputs {
+                    install_tool: true,
+                    ..RouteInputs::default()
+                },
+                vec![Route::NativeTools, Route::WasmTools],
+            ),
+            (
+                "transport: process",
+                RouteInputs {
+                    process_transport: true,
+                    ..RouteInputs::default()
+                },
+                vec![Route::ProcessHarness, Route::HarnessTools],
+            ),
+            (
+                "plan.submit without shell.allow",
+                RouteInputs {
+                    plan_submit: true,
+                    ..RouteInputs::default()
+                },
+                vec![],
+            ),
+            (
+                "plan.submit with shell.allow",
+                RouteInputs {
+                    plan_submit: true,
+                    shell_allow: true,
+                    ..RouteInputs::default()
+                },
+                vec![Route::Shell, Route::PlanShellSteps],
+            ),
+            (
+                "shell.allow alone",
+                RouteInputs {
+                    shell_allow: true,
+                    ..RouteInputs::default()
+                },
+                vec![Route::Shell],
+            ),
+        ]
+    }
+
+    /// The table over every tier, every declared class and every presence input: eight rows in
+    /// the fixed order; the first three covered by the applied tier's mechanism and the other five
+    /// `host-process` with their note, whatever the tier; presence exactly as each input implies.
     #[test]
-    fn the_mechanism_names_every_subprocess_route_it_covers() {
-        for tier in [
-            EnforcementTier::KernelSealed,
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            let report = boundary_report(ContainmentClass::Advisory, tier);
-            assert_eq!(
-                report.mechanism_covers,
-                vec!["shell", "plan-shell-steps", "native-tools"]
-            );
+    fn the_route_table_holds_its_invariants_on_every_input() {
+        for tier in ALL_TIERS {
+            for declared in [
+                ContainmentClass::Advisory,
+                ContainmentClass::Scoped,
+                ContainmentClass::Sealed,
+            ] {
+                let mechanism =
+                    ContainmentDecision::decide(*tier, declared, false, false).enforcement_tier();
+                for (case, inputs, present) in presence_cases() {
+                    let rows = route_table(&inputs, mechanism);
+                    assert_eq!(
+                        rows.iter().map(|row| row.route).collect::<Vec<_>>(),
+                        Route::ALL.to_vec(),
+                        "{case}"
+                    );
+                    for row in &rows {
+                        let covered = matches!(
+                            row.route,
+                            Route::Shell | Route::PlanShellSteps | Route::NativeTools
+                        );
+                        assert_eq!(row.under_class, covered, "{case}: {row:?}");
+                        if covered {
+                            assert_eq!(row.mechanism, mechanism, "{case}: {row:?}");
+                            assert_eq!(row.note, None, "{case}: {row:?}");
+                        } else {
+                            assert_eq!(row.mechanism, HOST_PROCESS_MECHANISM, "{case}: {row:?}");
+                            assert!(row.note.is_some(), "{case}: {row:?}");
+                        }
+                        assert_eq!(
+                            row.present,
+                            present.contains(&row.route),
+                            "{case} on {tier:?}/{declared}: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-            let rendered = report.render();
-            let mechanism = format!("  mechanism: {}\n", report.enforcement_tier);
-            let covers = "  covers:    shell commands, plan shell steps, native tools\n";
+    /// The notes say what each uncovered route does run under.
+    #[test]
+    fn each_uncovered_route_names_what_holds_it() {
+        let notes = |route: Route| route.note().unwrap();
+        for route in [Route::WasmTools, Route::Drivers] {
+            assert!(notes(route).contains("inside the mur process"), "{route:?}");
+            assert!(notes(route).contains("WASI preopens"), "{route:?}");
             assert!(
-                rendered.contains(&format!("{mechanism}{covers}")),
-                "covers: must follow mechanism: directly:\n{rendered}"
-            );
-
-            let json = serde_json::to_string(&report).unwrap();
-            assert!(
-                json.contains(r#""mechanism_covers":["shell","plan-shell-steps","native-tools"]"#),
-                "{json}"
+                notes(route).contains("host-side network allowlist only"),
+                "{route:?}"
             );
         }
+        assert!(notes(Route::Hooks).contains("its own capabilities block declares"));
+        let harness = notes(Route::ProcessHarness);
+        for word in [
+            "cleared environment",
+            "Landlock",
+            "seccomp",
+            "network namespace",
+            "rlimits",
+            "cgroup with no limits",
+        ] {
+            assert!(harness.contains(word), "{word}: {harness}");
+        }
+        assert!(notes(Route::HarnessTools).contains("the user's authority"));
+        assert!(notes(Route::HarnessTools).contains("arguments the process driver passes"));
+    }
+
+    /// The artifacts on each route come from the preopens by role, and each tool lands on the
+    /// route its implementation names.
+    #[test]
+    fn route_inputs_read_roles_and_implementations_off_the_preopens() {
+        let preopen = |artifact: &str, role: &str| PreopenReport {
+            artifact: artifact.to_string(),
+            role: role.to_string(),
+            scope: None,
+            surface: PreopenSurface::WholeWorkdir,
+            runtime_dir_reach: None,
+        };
+        let preopens = vec![
+            preopen("fs-tool", "tool"),
+            preopen("browser", "tool"),
+            preopen("driver-anthropic", "driver"),
+            preopen("audit", "hook"),
+        ];
+        let inputs = RouteInputs::new(
+            &[],
+            false,
+            &[],
+            &preopens,
+            |name| (name == "browser").then_some(murmur_artifact::ArtifactImplementation::Native),
+            Some("http"),
+        );
+        let rows = route_table(&inputs, "landlock+seccomp");
+        let row = |route: Route| rows.iter().find(|row| row.route == route).unwrap();
+        assert_eq!(row(Route::WasmTools).artifacts, vec!["fs-tool"]);
+        assert_eq!(row(Route::NativeTools).artifacts, vec!["browser"]);
+        assert_eq!(row(Route::Drivers).artifacts, vec!["driver-anthropic"]);
+        assert_eq!(row(Route::Hooks).artifacts, vec!["audit"]);
+        assert!(!row(Route::ProcessHarness).present);
+        assert!(
+            RouteInputs::new(&[], false, &[], &[], |_| None, Some("process")).process_transport
+        );
+    }
+
+    /// The `routes` key as `--explain-scope --json` and `session_start` carry it: eight rows,
+    /// always serialized, every key on every row.
+    #[test]
+    fn the_routes_json_is_pinned() {
+        let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelFull)
+            .with_routes(
+                |_| Some(murmur_artifact::ArtifactImplementation::Wasm),
+                Some("process"),
+            );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("mechanism_covers").is_none(), "{json}");
+        let routes = json["routes"].as_array().expect("routes is an array");
+        assert_eq!(routes.len(), 8);
+        let shell_present = !report.shell_allow.is_empty();
+        assert_eq!(
+            routes[0],
+            serde_json::json!({
+                "route": "shell",
+                "present": shell_present,
+                "under_class": true,
+                "mechanism": "landlock+seccomp",
+                "note": null,
+                "artifacts": [],
+            })
+        );
+        assert_eq!(
+            routes[6],
+            serde_json::json!({
+                "route": "process-harness",
+                "present": true,
+                "under_class": false,
+                "mechanism": "host-process",
+                "note": Route::ProcessHarness.note(),
+                "artifacts": [],
+            })
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .map(|row| row["route"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "shell",
+                "plan-shell-steps",
+                "native-tools",
+                "wasm-tools",
+                "drivers",
+                "hooks",
+                "process-harness",
+                "harness-tools"
+            ]
+        );
+        assert_eq!(
+            json["cgroup_scope"],
+            serde_json::json!({"status": "not-probed"})
+        );
+    }
+
+    /// The text report replaces the `covers:` line with a `Routes` block under `Containment`.
+    #[test]
+    fn the_routes_block_follows_the_containment_block() {
+        let preopens = vec![PreopenReport {
+            artifact: "fs-tool".to_string(),
+            role: "tool".to_string(),
+            scope: None,
+            surface: PreopenSurface::WholeWorkdir,
+            runtime_dir_reach: None,
+        }];
+        let report = report_for(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            Some(6),
+            None,
+            Vec::new(),
+            Vec::new(),
+            preopens,
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(EnforcementTier::KernelFull),
+            IoMaxReport::default(),
+        )
+        .with_routes(|_| None, None);
+        let rendered = report.render();
+        assert!(!rendered.contains("covers:"), "{rendered}");
+        let routes = rendered.find("\nRoutes\n").expect("a Routes block");
+        assert!(
+            routes > rendered.find("  mechanism: ").unwrap(),
+            "{rendered}"
+        );
+        assert!(
+            routes < rendered.find("\nRuntime directory\n").unwrap(),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  shell commands    present  landlock+seccomp\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  WASM tools        present  host process, not confined by the class (fs-tool)\n    \
+                 Runs inside the mur process"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("  process harness   absent   host process, not confined by the class\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  cgroup scope: not-probed\n"),
+            "{rendered}"
+        );
+    }
+
+    /// `W-SEC-034` fires only at a `scoped` or `sealed` floor, and names exactly the present
+    /// routes the class does not cover, with their artifacts.
+    #[test]
+    fn the_uncovered_route_warning_names_exactly_the_present_uncovered_routes() {
+        let inputs = RouteInputs {
+            shell_allow: true,
+            tools: vec![("fs-tool".to_string(), None)],
+            drivers: vec!["driver-anthropic".to_string()],
+            ..RouteInputs::default()
+        };
+        let routes = route_table(&inputs, "landlock+seccomp");
+        assert_eq!(
+            uncovered_route_warning(ContainmentClass::Advisory, &routes),
+            None
+        );
+
+        let covered_only = route_table(
+            &RouteInputs {
+                shell_allow: true,
+                plan_submit: true,
+                tools: vec![(
+                    "browser".to_string(),
+                    Some(murmur_artifact::ArtifactImplementation::Native),
+                )],
+                ..RouteInputs::default()
+            },
+            "landlock+seccomp",
+        );
+        assert_eq!(
+            uncovered_route_warning(ContainmentClass::Scoped, &covered_only),
+            None
+        );
+
+        for declared in [ContainmentClass::Scoped, ContainmentClass::Sealed] {
+            let message = uncovered_route_warning(declared, &routes).expect("fires");
+            assert!(
+                message.contains(&format!("the declared {declared} floor")),
+                "{message}"
+            );
+            assert!(
+                message.contains(
+                    "WASM tools (fs-tool) and drivers (driver-anthropic) run outside the class"
+                ),
+                "{message}"
+            );
+            assert!(message.contains("nothing is refused"), "{message}");
+            for absent in ["hooks", "process harness", "harness tools"] {
+                assert!(!message.contains(absent), "{absent}: {message}");
+            }
+        }
+
+        let process = route_table(
+            &RouteInputs {
+                process_transport: true,
+                drivers: vec!["driver-claude-code".to_string()],
+                ..RouteInputs::default()
+            },
+            "landlock+seccomp",
+        );
+        let message = uncovered_route_warning(ContainmentClass::Scoped, &process).unwrap();
+        assert!(
+            message.contains(
+                "drivers (driver-claude-code), the process harness and harness tools run"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The emitter writes the code, the message and the link to the bootstrap log it is handed.
+    #[test]
+    fn the_uncovered_route_warning_reaches_the_bootstrap_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let routes = route_table(
+            &RouteInputs {
+                drivers: vec!["d".to_string()],
+                ..RouteInputs::default()
+            },
+            "landlock+seccomp",
+        );
+        warn_on_uncovered_routes(
+            ContainmentClass::Sealed,
+            &routes,
+            Some(&crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap()),
+        );
+        let log = std::fs::read_to_string(temp.path().join("logs").join("bootstrap.log"))
+            .unwrap_or_default();
+        assert_eq!(log.matches("warning[W-SEC-034]").count(), 1, "{log}");
+        assert!(log.contains("drivers (d)"), "{log}");
+        assert!(log.contains("#w-sec-034"), "{log}");
+    }
+
+    /// Without a kernel filesystem mechanism `HOME` is relocated and nothing more; a Landlock
+    /// session does not carry the statement and a composed root carries nothing.
+    #[test]
+    fn an_advisory_session_says_home_is_relocated_not_protected() {
+        for tier in [
+            EnforcementTier::EnvironmentOnly,
+            EnforcementTier::KernelSeccompOnly,
+        ] {
+            let boundary = filesystem_boundary(tier);
+            let home = boundary
+                .not_protected
+                .iter()
+                .find(|statement| statement.contains("relocated, not protected"))
+                .unwrap_or_else(|| panic!("{tier:?}: {boundary:?}"));
+            assert!(home.contains("session's home folder"), "{home}");
+            assert!(
+                home.contains("real home directory stays readable and writable by absolute path"),
+                "{home}"
+            );
+            assert!(home.contains("no kernel mechanism"), "{home}");
+        }
+        assert!(!filesystem_boundary(EnforcementTier::KernelFull)
+            .not_protected
+            .iter()
+            .any(|statement| statement.contains("relocated, not protected")));
+        assert!(filesystem_boundary(EnforcementTier::KernelSealed)
+            .not_protected
+            .is_empty());
     }
 
     /// A host that mediates nothing says so, in the block an operator reads before the grants.
@@ -4344,18 +5138,22 @@ mod tests {
             report.filesystem_boundary.restriction,
             FilesystemRestriction::Advisory
         );
-        // The filesystem, path rewriting, and the runtime and records directories no command is
-        // kept from.
-        assert_eq!(report.filesystem_boundary.not_protected.len(), 4);
+        // The filesystem, path rewriting, the relocated HOME, and the runtime and records
+        // directories no command is kept from.
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 5);
         assert_eq!(
-            Some(&report.filesystem_boundary.not_protected[2]),
-            report.runtime_dir.not_protected_because.as_ref()
+            report.filesystem_boundary.not_protected[2],
+            ADVISORY_HOME_NOT_PROTECTED
         );
         assert_eq!(
             Some(&report.filesystem_boundary.not_protected[3]),
+            report.runtime_dir.not_protected_because.as_ref()
+        );
+        assert_eq!(
+            Some(&report.filesystem_boundary.not_protected[4]),
             report.records_dir.not_protected_because.as_ref()
         );
-        assert!(report.filesystem_boundary.not_protected[3].contains("the records directory"));
+        assert!(report.filesystem_boundary.not_protected[4].contains("the records directory"));
 
         let filesystem = &report.filesystem_boundary.not_protected[0];
         assert!(filesystem.contains("advisory"), "{filesystem}");

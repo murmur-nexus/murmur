@@ -3419,12 +3419,25 @@ pub fn stage_session(
     }
     // What each preopen's runtime-directory reach really is, now that every installed artifact's
     // implementation is known: `session_start.effective_grants` records the exact answer.
-    crate::containment::resolve_runtime_dir_reaches(&mut scope_report.preopens, |name| {
+    let installed_implementation = |name: &str| {
         installed_artifacts
             .iter()
             .find(|installed| installed.name == name)
             .and_then(|installed| installed.implementation.clone())
-    });
+    };
+    crate::containment::resolve_runtime_dir_reaches(
+        &mut scope_report.preopens,
+        installed_implementation,
+    );
+    // Built only now, for the same reason: which tools are native is known once each is
+    // installed.
+    let scope_report = scope_report.with_routes(
+        installed_implementation,
+        request
+            .inference
+            .as_ref()
+            .map(|inference| inference.transport.as_str()),
+    );
     runtime_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
@@ -3906,6 +3919,7 @@ fn launch(
     // and the script path both clone it later in this function. `stage_session` could not fill it:
     // the answer does not exist until the scope has been created.
     staged.scope_report.io_max = prepared_scope.io_max.clone();
+    staged.scope_report.cgroup_scope = prepared_scope.cgroup_scope.clone();
     // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
     // not apply has to be *said* here or the manifest and the scope report both go on implying it.
     cgroup::warn_for_unenforced_io_max(
@@ -4195,6 +4209,11 @@ fn launch(
             shell_enforcement.tier,
             &records_root,
             &staged.capability_policy,
+        );
+        crate::containment::warn_on_uncovered_routes(
+            staged.containment.declared(),
+            &staged.scope_report.routes,
+            Some(&records_root),
         );
         sandbox::warn_for_missing_aggregate_bounding(
             &records_root,

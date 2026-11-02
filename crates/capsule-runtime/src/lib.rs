@@ -132,11 +132,12 @@ pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
     detect_containment_decision, detect_sealed_shortfall, detect_userns_grant, doctor_runtime_dir,
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
-    render_records_dir, render_runtime_dir, render_temp_dir, resolve_runtime_dir_reach,
-    resolve_runtime_dir_reaches, ContainmentDecision, DoctorDirReports, ExportsFilesReport,
+    render_records_dir, render_routes, render_runtime_dir, render_temp_dir,
+    resolve_runtime_dir_reach, resolve_runtime_dir_reaches, route_table, uncovered_route_warning,
+    warn_on_uncovered_routes, ContainmentDecision, DoctorDirReports, ExportsFilesReport,
     FilesystemBoundaryReport, FilesystemRestriction, ImagesReport, PreopenReport, PreopenSurface,
-    RuntimeDirReach, RuntimeDirReport, ScopeReport, ShortfallCause, StateStoreReport,
-    TempDirReport,
+    Route, RouteInputs, RouteReport, RuntimeDirReach, RuntimeDirReport, ScopeReport,
+    ShortfallCause, StateStoreReport, TempDirReport, HOST_PROCESS_MECHANISM,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 // `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the
@@ -185,14 +186,15 @@ pub use sealed::{
 };
 pub use streaming::STREAM_EXTENSION_URI;
 // `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the
-// three test-support probes from its integration tests, the `io.max` reporting from
-// `mur run --explain-scope` and the swap-bound reporting from `mur doctor`, each of which has to
+// three test-support probes from its integration tests, the cgroup scope and `io.max` reporting
+// from `mur run --explain-scope` and `mur doctor`, and the swap-bound reporting from `mur doctor`, each of which has to
 // answer the question a launch does without staging a session. Re-exported here rather than
 // duplicating a probe once per crate that needs it.
 pub use cgroup::{
-    active_swap_areas, cgroup_delegation_available, io_max_device_available, probe_io_max,
-    probe_swap_control, requires_process_bounding, skip_without_host_support, IoMaxReport,
-    IoMaxStatus, SwapControl, SCOPE_SWAP_MAX,
+    active_swap_areas, cgroup_delegation_available, io_max_device_available, probe_scope,
+    probe_swap_control, render_cgroup_scope, requires_process_bounding, skip_without_host_support,
+    CgroupScopeReport, CgroupScopeStatus, IoMaxReport, IoMaxStatus, ScopeProbe, SwapControl,
+    SCOPE_SWAP_MAX,
 };
 // The door's protocol version and error tables: every client of a door sends the header pair,
 // and names the error it is answered with through `A2aError::from_code`.

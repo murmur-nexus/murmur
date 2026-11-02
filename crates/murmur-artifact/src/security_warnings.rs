@@ -37,10 +37,12 @@ pub const W_SEC_004: &str = "W-SEC-004";
 /// `domain` refuses `AF_UNIX` unless `capabilities.network.unix_sockets` is declared and refuses
 /// `AF_NETLINK`/`AF_PACKET` unconditionally, so a capsule cannot reach a host daemon socket such as
 /// `/var/run/docker.sock`; and the forked shell child drops every Linux
-/// capability and sets `no_new_privs` before `execve`. None of this has yet been verified by the
-/// team on real Landlock-capable Linux hardware — treat it as not-yet-confirmed rather than a
-/// hardened boundary. Fires on both Linux tiers so the "full" tier is not silently assumed to be
-/// confirmed-enforced.
+/// capability and sets `no_new_privs` before `execve`. Fires on both Linux kernel tiers, the
+/// sealed one with its own notice: there `/proc` is a bind of the host's, because the tier creates
+/// no PID namespace. Landlock refuses reading host `/proc` content at both `scoped` and `sealed`;
+/// what still reaches outside the capsule is `stat(2)` on `/proc/<pid>` (existence, owner, start
+/// time) and signal delivery to any process of the same user. The sealed column was measured on
+/// bare metal on 2026-08-09 and again on 2026-11-01.
 pub const W_SEC_005: &str = "W-SEC-005";
 
 /// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,
@@ -305,6 +307,13 @@ pub const W_SEC_032: &str = "W-SEC-032";
 /// `E-CAP-003` instead. `mur doctor` prints it for `<manifest-dir>/workdir`.
 pub const W_SEC_033: &str = "W-SEC-033";
 
+/// A capsule declares a `scoped` or `sealed` floor and runs code on a route that class does not
+/// confine: WASM tools, drivers and hooks run inside the `mur` process, and the
+/// `inference.transport: process` harness and its own tools run as children outside the class.
+/// One warning names every such route present, and the artifacts on it. Never a refusal. Fires
+/// once per launch, from `mur run` (stderr and the bootstrap log) and from `mur doctor`.
+pub const W_SEC_034: &str = "W-SEC-034";
+
 /// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.
 pub fn security_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -322,7 +331,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_016, W_SEC_017,
             W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_028,
-            W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
+            W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033, W_SEC_034,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

@@ -47,14 +47,85 @@ Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 The `mechanism:` column is what `mur run --explain-scope` prints for a session on that tier, and
 `--explain-scope --json` carries it as `enforcement_tier`. It names the tier the session's
 commands run on, which [Declared class and host tier](#declared-class-and-host-tier) gives for every
-declared class. The `covers:` line under it names the subprocess routes that mechanism confines,
-and `--explain-scope --json` carries them as `mechanism_covers`:
+declared class. The tier confines three of the routes a capsule runs code on; the
+[`Routes` block](#routes) says which routes this capsule has and what holds each.
 
-| `mechanism_covers` value | Route |
-|---|---|
-| `shell` | A `capabilities.shell.allow` binary the model calls |
-| `plan-shell-steps` | A shell step of a plan submitted through `submit-plan` |
-| `native-tools` | A `runtime: tool` artifact that ships a native implementation |
+### Routes and what holds each { #routes }
+
+`mur run --explain-scope` prints a `Routes` block after `Containment`, and `mur doctor` prints the
+same block for the project's declared floor. `--explain-scope --json` and
+`session_start.effective_grants` carry it as `routes`: eight rows, always in this order and always
+present.
+
+| `route` | Present when | `under_class` | What holds it when not under the class |
+|---|---|---|---|
+| `shell` | `capabilities.shell.allow` is non-empty | `true` | — |
+| `plan-shell-steps` | `capabilities.plan.submit` is `true` and `capabilities.shell.allow` is non-empty | `true` | — |
+| `native-tools` | a `runtime: tool` entry is native, or `capabilities.install.tool` is non-empty | `true` | — |
+| `wasm-tools` | a `runtime: tool` entry is WASM or of unknown implementation, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process, held by its WASI preopens and the host-side network allowlist only |
+| `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process, held by its WASI preopens and the host-side network allowlist only |
+| `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process, held only by the preopens and network grants its own `capabilities:` block declares |
+| `process-harness` | `inference.transport: process` | `false` | A child of `mur` with a cleared environment and nothing else: no Landlock, seccomp, network namespace or rlimits, in a cgroup with no limits |
+| `harness-tools` | `inference.transport: process` | `false` | Run by the harness with the user's authority, kept off only by the arguments the process driver passes |
+
+Each row has these keys:
+
+| Key | Type | Value |
+|---|---|---|
+| `route` | string | The route's name, from the table above |
+| `present` | boolean | Whether this capsule has the route |
+| `under_class` | boolean | Whether the session's class covers the route |
+| `mechanism` | string | The `enforcement_tier` wire name when `under_class` is `true`; `host-process` when it is `false` |
+| `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true` |
+| `artifacts` | array of strings | The tool, driver or hook entries on the route, in manifest order; `[]` for a route no artifact names |
+
+Whether a tool is native is read off the installed artifact at launch, and off `murmur.lock` under
+`--explain-scope` and `mur doctor`; a tool `murmur.lock` does not pin is reported under
+`wasm-tools`.
+
+```text
+Routes
+  shell commands    present  landlock+seccomp
+  plan shell steps  absent   landlock+seccomp
+  native tools      absent   landlock+seccomp
+  WASM tools        present  host process, not confined by the class (local/fs-tool)
+    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+  drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
+    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+  hooks             absent   host process, not confined by the class
+  process harness   absent   host process, not confined by the class
+  harness tools     absent   host process, not confined by the class
+```
+
+A capsule whose declared floor is `scoped` or `sealed` and which has a present route outside the
+class gets one [`W-SEC-034`](diagnostics.md#w-sec-034) naming every such route, at launch and from
+`mur doctor`. Nothing is refused.
+
+### Whether the launch gets its cgroup scope { #cgroup-scope }
+
+A capsule that can run a native subprocess is given a delegated cgroup v2 scope at launch, and on
+Linux is refused with [`E-RUN-012`](resource-limits.md#platform-behavior) when it cannot get one. The
+`cgroup scope:` line of the `Containment` block, and `cgroup_scope` under `--json` and in
+`session_start.effective_grants`, report that answer:
+
+| `status` | Meaning | `errno` | `reason` |
+|---|---|---|---|
+| `delegated` | A child cgroup was created under the delegated base: at launch the session's scope, under `--explain-scope` and `mur doctor` a throwaway one removed again | absent | absent |
+| `unavailable` | No child cgroup could be created, so a launch of this capsule is refused with `E-RUN-012` | the failing call's errno by name, such as `EROFS`; absent when no call left one | the reason text `E-RUN-012` prints on the same host |
+| `not-required` | No scope is created: the capsule declares no way to run a native subprocess, or the host is not Linux | absent | which of the two |
+| `not-probed` | Nobody asked | absent | absent |
+
+`--explain-scope` answers by doing what a launch does — resolving the delegated base, then creating
+and removing a child cgroup. It reports `not-required` for a capsule whose only subprocess route is
+a declared native tool, because which tools are native is known only once they are installed. A
+launch records only `delegated` or `not-required`, because a refused launch writes no
+`session_start`. `unavailable` changes neither `achieved_containment` nor `floor_met`; the text
+report closes with the line saying `mur run` would refuse to launch with `E-RUN-012`.
+
+`mur doctor` prints a `Cgroup scope` block with the host's answer for every project, and fails the
+check — no `All checks passed.`, a `Fix:` line and exit status `1` — when the capsule declares
+`capabilities.shell.allow`, `capabilities.spawn.allow` or `capabilities.install.tool`, or a native
+tool, and the answer is `unavailable`.
 
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
@@ -221,9 +292,9 @@ Containment
   host can back: sealed
   floor met: yes
   mechanism: mountns+pivot_root+landlock+seccomp
-  covers:    shell commands, plan shell steps, native tools
   userns grant: profile_confining
   landlock ABI: 3
+  cgroup scope: delegated
 ```
 
 | `userns grant:` | What permits the namespace | Scope of the permission |
@@ -318,7 +389,7 @@ its `errno` and the readings identify the host condition:
 | `mur-sealed` loaded | created | created | `=1; … mur-sealed` | Nothing refused |
 | A container whose profile and seccomp policy permit the namespace | created | created | `=1; … <container profile>` | Nothing refused |
 | A container profile that denies `mount` | created | refused at `making / MS_REC\|MS_PRIVATE` | `=1; … <container profile>` | `/tmp` not mapped; `sealed` refused as `mount(2)` refused. Run the container with a profile that permits `mount` |
-| A container runtime that refuses `unshare` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`; `sealed` refused as the namespace refused. Permit `unshare(CLONE_NEWUSER)` in the container's seccomp policy, or `--cap-add SYS_ADMIN` |
+| A container runtime that refuses `unshare` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`; `sealed` refused as the namespace refused. The container runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)` and `setns`: run the container with a profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespace outside the container |
 | `user.max_user_namespaces=0` | refused at `unshare(…)`, `ENOSPC` | not attempted | any | `E-CAP-005`; `sealed` refused as unsupported by the kernel. Raise `user.max_user_namespaces` |
 | `mur` running inside a `chroot` | refused at `unshare(…)`, `EPERM` | not attempted | any | `E-CAP-005`. The kernel refuses a user namespace to a chrooted process; run `mur` outside the `chroot` |
 
@@ -332,7 +403,7 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 |---|---|
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs `--cap-add SYS_ADMIN`, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
+| `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs a seccomp profile permitting `unshare(CLONE_NEWUSER)`, `setns`, `mount`, `umount2` and `pivot_root`, which the container runtime's default profile refuses, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
 
 `advisory` is user-level trust. What a capsule's shell can write, including the compiled WASM
 artifacts in [`~/.murmur/compiled/`](config.md#murmur-home-permissions) that every later launch
@@ -346,10 +417,15 @@ from, depends on the [tier](#subprocess-enforcement-tiers) the host achieves:
 
 !!! note "`sealed`'s one documented exception: `/proc`"
 
-    A private `procfs` needs a privilege an unprivileged user namespace does not have, so on most
-    hosts a `sealed` root carries the host's `/proc` instead. **Host process metadata is visible
-    under `/proc` inside a `sealed` capsule**, as it is under `scoped`; opens through it are still
-    refused. Every other axis of the root — `/etc`, `/dev`, block devices, sockets, other users'
+    A private `procfs` needs a PID namespace, which this tier does not create, so on most hosts a
+    `sealed` root carries the host's `/proc` instead. Landlock refuses reading host `/proc` content
+    at both `scoped` and `sealed`: another process's command line, environment and memory maps
+    cannot be read. What reaches outside the capsule is:
+
+    - `stat(2)` on `/proc/<pid>`, which shows that a process exists, its owner and its start time
+    - `kill(2)`, which delivers a signal to any process of the same user
+
+    Every other axis of the root — `/etc`, `/dev`, block devices, sockets, other users'
     homes — is absent, not merely denied. Where the runtime does hold that privilege, a private
     masked `/proc` is used and this exception does not apply.
 
@@ -421,10 +497,10 @@ end to end, in its own throwaway namespace, and reports the stage that failed:
 
 | Stage | A refusal reports |
 |---|---|
-| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` | The namespace could not be created — the container case: no `CAP_SYS_ADMIN`, or a seccomp filter blocking the syscall |
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` | The namespace could not be created — the container case: the container runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)` |
 | Identity `uid_map`/`gid_map` writes | The namespace exists and cannot be owned — an id-mapping policy problem, not a missing capability |
-| `mount(MS_REC \| MS_PRIVATE)` on `/`, then a `tmpfs` over a root base candidate | `mount(2)` inside the namespace was refused — what a confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN` looks like |
-| The parking directory, `chdir`, `pivot_root(2)`, `chdir("/")`, `umount2(MNT_DETACH)` | `pivot_root(2)` was refused. `mount(2)` working while the pivot does not is a policy that grants one and not the other: an AppArmor profile missing its `pivot_root,` rule, or a container runtime whose seccomp allowlist omits the syscall even where `CAP_SYS_ADMIN` is granted |
+| `mount(MS_REC \| MS_PRIVATE)` on `/`, then a `tmpfs` over a root base candidate | `mount(2)` inside the namespace was refused — what a confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN` looks like, or, inside a container, a seccomp profile that refuses `mount`, `umount2` and `pivot_root` |
+| The parking directory, `chdir`, `pivot_root(2)`, `chdir("/")`, `umount2(MNT_DETACH)` | `pivot_root(2)` was refused. `mount(2)` working while the pivot does not is a policy that grants one and not the other: an AppArmor profile missing its `pivot_root,` rule, or a container runtime whose seccomp profile refuses `pivot_root` whatever capabilities the container holds |
 
 The rehearsal runs in the child's own namespace with mount propagation made private first, so
 nothing it does reaches the host's mount table.
@@ -436,7 +512,7 @@ refuses `pivot_root(2)` is refused at launch, rather than at the first subproces
 **Refusal.** A host whose achieved class is weaker than the effective declared floor refuses the
 launch with [`E-CAP-003`](diagnostics.md#e-cap-003), before any registry pull, artifact compile, or
 workdir creation. The refusal names the specific missing mechanism — the AppArmor profile, a
-container's absent `CAP_SYS_ADMIN`, a refused `pivot_root(2)`, a kernel without user namespaces —
+container runtime's seccomp profile, a refused `pivot_root(2)`, a kernel without user namespaces —
 and the command that fixes it.
 
 A manifest that never declares `capabilities.containment` is never gated by this check — the
@@ -1215,6 +1291,9 @@ reads the file.
 
 `mur run --explain-scope` says the same thing under `Not protected here` on every session that
 composes no root, and `--explain-scope --json` carries it as `filesystem_boundary.not_protected`.
+On the `seccomp-only` and `none` tiers it adds that `HOME` is relocated, not protected: the real
+home directory stays readable and writable by absolute path, because no kernel mechanism mediates
+the filesystem there.
 
 The rewrite is unconditional, so a capsule that writes to `~` writes into its own home folder on
 every tier and every platform. See [Lock down a capsule](../how-to/lock-down-capsule.md) for the

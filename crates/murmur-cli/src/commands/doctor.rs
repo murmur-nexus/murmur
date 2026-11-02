@@ -8,16 +8,17 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_landlock_abi, doctor_runtime_dir, find_on_path, has_subprocess_route_at_staging,
     inspect_installed_profile, install_from_places, landlock_doctor_lines, preopen_reports,
-    read_only_advisory_for, render_install, render_read_only, render_records_dir,
-    render_runtime_dir, render_temp_dir, runtime_dir_inside_warning, served_wit_level,
-    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceFailure, HostProbe,
-    InstalledProfileState, MountAttempt, NamespaceReading, ProfileAttachment, UsernsGrant,
-    HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
-    SEALED_APPARMOR_PROFILE_SHA256,
+    probe_scope, read_only_advisory_for, render_cgroup_scope, render_install, render_read_only,
+    render_records_dir, render_routes, render_runtime_dir, render_temp_dir, route_table,
+    runtime_dir_inside_warning, served_wit_level, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_uncovered_routes, warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
+    ArtifactRequest, CgroupScopeReport, CgroupScopeStatus, EgressNamespaceFailure, HostProbe,
+    InstalledProfileState, MountAttempt, NamespaceReading, PreopenReport, ProfileAttachment,
+    RouteInputs, UsernsGrant, HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict, newest_fitting_level,
@@ -645,9 +646,10 @@ fn report_preopens(
     project_root: &Path,
     host_probe: &HostProbe,
     declared_floor: murmur_artifact::ContainmentClass,
-) {
+) -> Vec<PreopenReport> {
     capsule_runtime::report_println!("Filesystem preopens");
     let lock = read_optional_lockfile(project_root).ok().flatten();
+    let mut resolved = Vec::new();
     let runtime_dir_protected =
         doctor_runtime_dir(host_probe, declared_floor, &project_root.join("workdir"))
             .is_ok_and(|reports| reports.runtime_dir.read_only_to_commands);
@@ -675,6 +677,7 @@ fn report_preopens(
             for preopen in &preopens {
                 capsule_runtime::report_println!("  - {}", preopen.render(runtime_dir_protected));
             }
+            resolved = preopens;
         }
         Err(error) => {
             capsule_runtime::report_println!("  <unresolved>");
@@ -687,6 +690,71 @@ fn report_preopens(
     }
 
     capsule_runtime::report_println!();
+    resolved
+}
+
+/// Prints the `Routes` block for `runtime_manifest`, from the `route_table` `--explain-scope`
+/// reports, on the tier `declared_floor` installs here, and `W-SEC-034` from the emitter a launch
+/// calls. Each tool's implementation is read off `murmur.lock`, as [`report_preopens`] reads it.
+fn report_routes(
+    runtime_manifest: &murmur_artifact::RuntimeManifest,
+    policy: &capsule_runtime::CapabilityPolicy,
+    preopens: &[PreopenReport],
+    project_root: &Path,
+    host_probe: &HostProbe,
+    declared_floor: murmur_artifact::ContainmentClass,
+) {
+    let lock = read_optional_lockfile(project_root).ok().flatten();
+    let inputs = RouteInputs::new(
+        &policy.shell_allow,
+        policy.plan_submit,
+        &policy.install_tool,
+        preopens,
+        |name| {
+            lock.as_ref()
+                .and_then(|lock| lock.artifact_for(name))
+                .map(|entry| crate::commands::run::locked_implementation(&entry.sha256))
+        },
+        runtime_manifest
+            .inference
+            .as_ref()
+            .map(|inference| inference.transport.as_str()),
+    );
+    let routes = route_table(&inputs, applied_mechanism(host_probe, declared_floor));
+    capsule_runtime::report_print!("{}", render_routes(&routes));
+    capsule_runtime::report_println!();
+    warn_on_uncovered_routes(declared_floor, &routes, None);
+}
+
+/// The `Cgroup scope` block: whether a launch here would get the delegated cgroup v2 scope a
+/// capsule that runs subprocesses is refused without, answered by [`probe_scope`] creating and
+/// removing a child cgroup the way a launch does. Printed for every project. Returns the `Fix:`
+/// for a capsule that `needs_scope` on a host that cannot give one, which `mur run` refuses with
+/// `E-RUN-012`.
+fn report_cgroup_scope(report: &CgroupScopeReport, needs_scope: bool) -> Option<String> {
+    capsule_runtime::report_println!("Cgroup scope");
+    capsule_runtime::report_println!("  {}", render_cgroup_scope(report));
+    let refused = needs_scope && report.status == CgroupScopeStatus::Unavailable;
+    if refused {
+        capsule_runtime::report_println!(
+            "  refused: `mur run` refuses this capsule here with E-RUN-012, because it can run a \
+             native subprocess and no cgroup scope can be created to bound it"
+        );
+    } else if !needs_scope {
+        capsule_runtime::report_println!(
+            "  this capsule runs no native subprocess, so a launch creates no scope for it"
+        );
+    }
+    capsule_runtime::report_println!();
+    refused.then(|| {
+        concat!(
+            "give `mur` a delegated cgroup v2 scope: run it under a systemd user unit with \
+             `Delegate=yes` for memory, pids, cpu and io (for example `systemd-run --user --scope \
+             -p Delegate=yes mur run`), or `mur run` refuses this capsule with E-RUN-012 \u{2014} see ",
+            murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
+        )
+        .to_string()
+    })
 }
 
 /// Prints the workdir subtrees `capabilities.filesystem.read_only` protects, and whether that
@@ -1898,8 +1966,19 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // the same reason the block above is: it is a property of the manifest, not of any one
     // artifact's presence in a store, and it is the question `capabilities.filesystem.scope` at
     // the capsule level does not answer.
-    report_preopens(
+    let preopens = report_preopens(
         &runtime_manifest,
+        &project_root,
+        &host_probe,
+        declared_floor,
+    );
+
+    // Every route the capsule runs code on and what holds each, from the table `--explain-scope`
+    // prints, and `W-SEC-034` from the emitter a launch calls.
+    report_routes(
+        &runtime_manifest,
+        &capability_policy,
+        &preopens,
         &project_root,
         &host_probe,
         declared_floor,
@@ -2236,6 +2315,22 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 capsule_runtime::report_eprintln!("{warning}");
             }
         }
+    }
+
+    // Whether a launch here gets its cgroup scope, asked of the host by creating and removing a
+    // child cgroup whatever the capsule declares. A failed check only for a capsule that needs a
+    // scope — a subprocess route or a native tool — because only that launch is refused.
+    let cgroup_probe = probe_scope(
+        true,
+        &capability_policy.resources,
+        &project_root.join("workdir"),
+    );
+    capsule_runtime::report_println!();
+    if let Some(fix) = report_cgroup_scope(
+        &cgroup_probe.cgroup_scope,
+        can_spawn_subprocess || !native_tools.is_empty(),
+    ) {
+        fixes.push(fix);
     }
 
     // Where the session's runtime and records directories and its temporary folder lie and what

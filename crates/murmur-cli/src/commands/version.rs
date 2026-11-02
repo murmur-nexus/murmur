@@ -24,7 +24,7 @@ pub(crate) const MACHINE_COMMANDS: &[(&str, u32)] = &[
     ("eval show --json", 1),
     ("precompile --json", 1),
     ("ps --json", 1),
-    ("run --explain-scope --json", 1),
+    ("run --explain-scope --json", 2),
     ("run --json", 1),
     ("run --roster --json", 1),
     ("token", 1),

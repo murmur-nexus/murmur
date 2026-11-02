@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.7";
+/// The WASM tool the grants fixture declares, so its route table has a tool on it.
+const GRANTS_TOOL_NAME: &str = "local/jsonl-line-count";
+const GRANTS_TOOL_VERSION: &str = "0.1.0";
 
 // ── Response builders ────────────────────────────────────────────────────────
 
@@ -634,6 +637,12 @@ fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> Path
             "    gateway:\n",
             "      endpoint: {endpoint}\n",
             "      api_key: test-key\n",
+            "  - name: {tool_name}\n",
+            "    version: {tool_version}\n",
+            "    runtime: tool\n",
+            // A declared scope gives the tool no runtime-directory reach, which `--explain-scope`
+            // could only report `unresolved` for a tool no `murmur.lock` pins.
+            "    capabilities: {{filesystem: {{scope: cache}}}}\n",
             "capabilities:\n",
             "  containment: advisory\n",
             "  filesystem:\n",
@@ -653,10 +662,23 @@ fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> Path
         ),
         driver_name = DRIVER_NAME,
         driver_version = DRIVER_VERSION,
+        tool_name = GRANTS_TOOL_NAME,
+        tool_version = GRANTS_TOOL_VERSION,
         endpoint = endpoint,
     );
     fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
     project_dir.join("murmur.yaml")
+}
+
+/// Publishes the WASM tool [`create_grants_manifest`] declares.
+fn setup_grants_tool(home: &tempfile::TempDir, artifact_dir: &tempfile::TempDir) {
+    let tool = common::create_tool_artifact(
+        artifact_dir.path(),
+        GRANTS_TOOL_NAME,
+        GRANTS_TOOL_VERSION,
+        &common::fixture_path("graduation/tool/jsonl-line-count.wasm"),
+    );
+    common::publish_local(home, &tool).success();
 }
 
 /// Headline property, end to end: `session_start.effective_grants` in a real
@@ -677,6 +699,7 @@ fn session_start_effective_grants_match_explain_scope_json() {
     let project = tempfile::tempdir().unwrap();
 
     setup_driver(&home, &artifact_dir);
+    setup_grants_tool(&home, &artifact_dir);
 
     let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
 
@@ -737,6 +760,46 @@ fn session_start_effective_grants_match_explain_scope_json() {
         "the tier the session installs must be recorded as a wire name"
     );
 
+    // The route table and the cgroup answer are in the compared object, so both sides wrote them;
+    // these say what they hold. The table is `routes`; schema 2 carries no `mechanism_covers`.
+    assert!(grants.get("mechanism_covers").is_none(), "{grants}");
+    let routes = grants["routes"].as_array().expect("routes is an array");
+    assert_eq!(routes.len(), 8, "{grants}");
+    let route = |name: &str| {
+        routes
+            .iter()
+            .find(|row| row["route"] == name)
+            .unwrap_or_else(|| panic!("no {name} row: {grants}"))
+    };
+    for (name, present) in [
+        ("wasm-tools", true),
+        ("drivers", true),
+        ("process-harness", false),
+        ("shell", false),
+    ] {
+        assert_eq!(route(name)["present"], present, "{name}: {grants}");
+    }
+    for name in ["wasm-tools", "drivers", "process-harness"] {
+        assert_eq!(route(name)["under_class"], false, "{name}");
+        assert_eq!(route(name)["mechanism"], "host-process", "{name}");
+    }
+    assert_eq!(route("shell")["mechanism"], grants["enforcement_tier"]);
+    assert_eq!(route("wasm-tools")["artifacts"], json!([GRANTS_TOOL_NAME]));
+    assert_eq!(route("drivers")["artifacts"], json!([DRIVER_NAME]));
+    // No shell, spawn or install grant and no native tool: the launch asked for no scope.
+    assert_eq!(grants["cgroup_scope"]["status"], "not-required", "{grants}");
+    // Nothing declared beyond `advisory`: the class is the applied tier's, which on a
+    // Landlock-capable host is `scoped` whatever the host could back.
+    match grants["enforcement_tier"].as_str() {
+        Some("landlock+seccomp") => {
+            assert_eq!(session_start["containment_achieved"], json!("scoped"));
+        }
+        other => eprintln!(
+            "[SKIP-HOST] session_start_effective_grants_match_explain_scope_json: tier {other:?} \
+             is not landlock+seccomp, so `containment_achieved: scoped` is not asserted"
+        ),
+    }
+
     // The pre-existing summary fields are untouched by the new object sitting next to them, and
     // agree with it — they are now read off the same report.
     //
@@ -778,6 +841,7 @@ fn session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants() 
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     setup_driver(&home, &artifact_dir);
+    setup_grants_tool(&home, &artifact_dir);
     let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
     let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
         "capabilities:\n",

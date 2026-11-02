@@ -100,7 +100,7 @@ fn version_json_is_one_object_naming_the_same_level_and_packages() {
         "    \"eval show --json\": 1,\n",
         "    \"precompile --json\": 1,\n",
         "    \"ps --json\": 1,\n",
-        "    \"run --explain-scope --json\": 1,\n",
+        "    \"run --explain-scope --json\": 2,\n",
         "    \"run --json\": 1,\n",
         "    \"run --roster --json\": 1,\n",
         "    \"token\": 1,\n",

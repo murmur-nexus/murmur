@@ -164,11 +164,13 @@ Keep these facts separate in the assessment:
 - **declared floor:** minimum enforcement requested by manifest, CLI, or workspace policy;
 - **achieved class:** the class the capsule's commands ran under (`achieved:` / `achieved_containment`);
 - **installed mechanism:** the enforcement tier those commands ran on (`mechanism:` / `enforcement_tier`);
-- **host ceiling:** what probing shows the host could support for a capsule declaring `sealed` (`host can back:` / `host_containment`).
+- **host ceiling:** what probing shows the host could support for a capsule declaring `sealed` (`host can back:` / `host_containment`);
+- **routes outside the class:** the class confines shell commands, plan shell steps and native tools only. WASM tools, drivers, hooks and an `inference.transport: process` harness run outside it — read the `Routes` block / `routes` rows (`under_class: false`, `mechanism: host-process`), and expect `W-SEC-034` for a `scoped` or `sealed` floor;
+- **cgroup scope:** whether a launch gets the cgroup scope a subprocess-capable capsule needs (`cgroup scope:` / `cgroup_scope`); `unavailable` predicts an `E-RUN-012` refusal.
 
 A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest class. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
 
-Do not overstate guarantees. Filesystem mediation may govern read/write/execute operations without hiding path metadata. Strong root isolation can make outside paths absent while host process metadata may remain visible. Record exceptions that matter to the workload.
+Do not overstate guarantees. Filesystem mediation may govern read/write/execute operations without hiding path metadata. Strong root isolation can make outside paths absent, yet under `sealed` a process can still learn that another process exists, its owner and start time (`stat(2)` on `/proc/<pid>`), and can signal processes of the same user. Record exceptions that matter to the workload.
 
 ## Bound denial-of-service authority
 
