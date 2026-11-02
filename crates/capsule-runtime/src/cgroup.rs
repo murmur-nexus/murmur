@@ -145,6 +145,7 @@ pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
 /// The writes of an unconfined session's scope: one per `cgroup_*` field `declared` names, and
 /// nothing else — no `memory.swap.max` and no default for an undeclared field. `io.max` is
 /// written separately, and only when declared.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn declared_scope_limits(
     declared: &murmur_artifact::ResourceCapabilities,
 ) -> Vec<ScopeLimit> {
