@@ -192,8 +192,11 @@ fn skip_unless_sealed(test_name: &str) -> bool {
     false
 }
 
-/// Every session directory under the process home's records root: none after a refused launch.
-fn session_dirs() -> Vec<PathBuf> {
+/// Every session directory `project`'s launches left under the process home's records root: none
+/// after a refused launch. The records root is shared by every test in this file, so a session
+/// another test starts at the same moment is filtered out by `project`'s own folder name, which
+/// is unique and appears in the path of each session the project starts.
+fn session_dirs(project: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -215,6 +218,8 @@ fn session_dirs() -> Vec<PathBuf> {
         0,
         &mut found,
     );
+    let name = project.file_name().expect("a temporary project folder");
+    found.retain(|dir| dir.components().any(|part| part.as_os_str() == name));
     found
 }
 
@@ -346,7 +351,11 @@ fn below_sealed_is_refused() {
                 && !message.contains("image-tool"),
             "{message}"
         );
-        assert!(session_dirs().is_empty(), "{:?}", session_dirs());
+        assert!(
+            session_dirs(project.path()).is_empty(),
+            "{:?}",
+            session_dirs(project.path())
+        );
     }
 
     // Two computer tools are both named.
@@ -492,7 +501,11 @@ fn vision_false_is_refused_and_true_or_absent_runs() {
          driver choice 'fallback' has no vision: driver local/provider-tool-driver@0.1.0 \
          declares vision: false for it"
     );
-    assert!(session_dirs().is_empty(), "{:?}", session_dirs());
+    assert!(
+        session_dirs(project.path()).is_empty(),
+        "{:?}",
+        session_dirs(project.path())
+    );
 
     // `vision: true`, and no `vision` key, start and complete.
     for vision in [Some(true), None] {
