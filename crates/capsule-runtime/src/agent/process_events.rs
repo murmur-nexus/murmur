@@ -365,7 +365,7 @@ impl<'a> ProcessEventSink<'a> {
                     .report
                     .fence_source
                     .as_deref()
-                    .is_some_and(|source| output.contains(&crate::fence::open_marker(source)))
+                    .is_some_and(|source| carries_fence(output, source))
         };
         let index = self
             .reports
@@ -652,8 +652,7 @@ impl<'a> ProcessEventSink<'a> {
                         ),
                         None => (result.output, Vec::new(), None),
                     };
-                let fence_source = fence_source
-                    .filter(|source| output.contains(&crate::fence::open_marker(source)));
+                let fence_source = fence_source.filter(|source| carries_fence(&output, source));
                 let output_bytes = output.len() as u64;
                 let result_id = result.id.clone();
                 // Measured by the runtime rather than taken from the harness: the bridge executes
@@ -1061,6 +1060,12 @@ impl<'a> ProcessEventSink<'a> {
         self.a2a.mark_spend_refused(&refusal);
         Err(SinkOutcome::SpendCeilingReached(refusal))
     }
+}
+
+/// Whether `output` holds the opening marker of the fence named `source`. The only test the sink
+/// applies before naming a reported fence on a frame; it never derives a source from the text.
+fn carries_fence(output: &str, source: &str) -> bool {
+    output.contains(&crate::fence::open_marker(source))
 }
 
 /// `output` with every verbatim occurrence of each image's base64 replaced by its

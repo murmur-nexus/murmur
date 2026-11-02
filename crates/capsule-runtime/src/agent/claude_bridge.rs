@@ -696,10 +696,12 @@ impl BridgeHandle {
 /// The result of a dispatched call whose tool returned `text`, and its [`CallReport`] when the
 /// tool named any `attachments` or the result was fenced under `fence_source`.
 ///
-/// `fence_source` reaches the report only: the result is the same whatever it says. Each attachment adds one line after the fence's closing marker: `[image attached: …]` for one
+/// Each attachment adds one line after the fence's closing marker: `[image attached: …]` for one
 /// that passes the `context.images` checks, the refusal note for one that does not. Each accepted
 /// one also becomes an `image` item after the text item, carried whatever `is_error` says. With no
 /// attachment the result is the text item alone. Nothing is stored.
+///
+/// `fence_source` reaches the report only: the result is the same whatever it says.
 fn answer(
     store: &CapsuleStoreState,
     name: &str,

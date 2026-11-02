@@ -2348,7 +2348,7 @@ pub(crate) async fn run_agent_loop(
                             // before the session ends on it.
                             let fatal = outcome.fatal.take();
                             // Set by the dispatch on exactly the branch that fenced the result,
-                            // so it is `Some` for an ordinary tool result and `None` for a skill.
+                            // so it is `None` only for an operator-pinned skill.
                             let fence_source = outcome.fence_source.take();
                             let is_error = !matches!(outcome.result.status, Status::Passed);
                             // Read the tool's self-declared state effect and resource identity
