@@ -10,7 +10,8 @@
 //!   `sh -c` in an environment of its own, as a real `ssh` would: `HOME=T/root` and a `PATH` whose
 //!   first entry holds no-op `sysctl`, `iptables` and `ufw`, so the host's firewall is never
 //!   touched. Nothing else of the deploying process's environment reaches the target.
-//! - Before a command that starts `mur run` it writes a listing of `T/root/.murmur/compiled` to
+//! - Before the start script's `mur run --manifest` (not the `mur run --contained-launch --help`
+//!   probe sent ahead of it) it writes a listing of `T/root/.murmur/compiled` to
 //!   `T/compiled-before-start.txt` and appends `start <ns>` to `T/timings.log`; around a
 //!   `mur precompile` command it appends `precompile <start ns> <end ns>`. Times are
 //!   `CLOCK_REALTIME` nanoseconds (`date +%s%N`), the only sub-millisecond clock a shell has, so
@@ -59,7 +60,7 @@ run() {
   env -i HOME="$T/root" PATH="$T/noop-bin:@PATH@" LANG=C.UTF-8 sh -c "$remote"
 }
 case "$cmd" in
-  *"bin/mur run "*)
+  *"bin/mur run --manifest "*)
     "$T/list-compiled" "$T" > "$T/compiled-before-start.txt"
     echo "start $(date +%s%N)" >> "$T/timings.log"
     run

@@ -41,6 +41,7 @@ section that explains it.
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-CFG-003` | `registry:` in a config file cannot be used: a removed `default:` key, a source's `name:`, `type:` or `url:`, a `repo` that is not `<owner>/<repo>`, a reserved scope claimed, or two sources for one scope | [E-CFG-003](#e-cfg-003) |
 | `E-CFG-004` | A `host_paths` entry cannot be used: it is malformed, it is named outside `~/.murmur/config.yaml`, or it cannot be honoured on this host | [E-CFG-004](#e-cfg-004) |
+| `E-CFG-005` | A project's `.murmur/config.yaml` says `containment: unconfined`, which only the global config may | [E-CFG-005](#e-cfg-005) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy run`](cli.md#mur-deploy-run) |
@@ -142,6 +143,8 @@ section that explains it.
 | `E-RUN-056` | The running session a session address named is a script capsule, which binds no door to connect to | [E-RUN-056](#e-run-056) |
 | `E-RUN-057` | A capsule declares a computer tool and a `transport: http` driver choice runs a model its driver marks `vision: false` | [E-RUN-057](#e-run-057) |
 | `E-RUN-058` | A stored tool artifact ships a malformed `provider_tool:` block, or one on an artifact that is not a tool | [E-RUN-058](#e-run-058) |
+| `E-RUN-059` | The unconfined stance was chosen for a capsule the manifest or a config file declares a containment floor for | [E-RUN-059](#e-run-059) |
+| `E-RUN-060` | `--unconfined` was given to a launch the runtime started contained | [E-RUN-060](#e-run-060) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -195,6 +198,7 @@ section that explains it.
 | `W-SEC-033` | The session's runtime or records directory lies inside the workdir, so the capsule's commands can change the files the runtime owns or the records it keeps | [W-SEC-033](#w-sec-033) |
 | `W-SEC-034` | A capsule declaring a `scoped` or `sealed` floor runs code on a route that class does not confine | [W-SEC-034](#w-sec-034) |
 | `W-SEC-035` | A `host_paths` entry reaches a credential location, so every contained capsule on the host can read it | [W-SEC-035](#w-sec-035) |
+| `W-SEC-036` | The capsule runs unconfined: its commands run as the operator | [W-SEC-036](#w-sec-036) |
 
 ---
 
@@ -1565,6 +1569,38 @@ error[E-RUN-058]: artifact 'local/computer@1.0.0' ships a malformed provider_too
 
 `mur build` refuses the same block with [`E-BLD-006`](#e-bld-006).
 
+### E-RUN-059 — unconfined against a declared floor { #e-run-059 }
+
+The operator chose the [unconfined stance](containment.md#unconfined), with `--unconfined` or
+`containment: unconfined` in `~/.murmur/config.yaml`, for a capsule that some source declares a
+containment floor for. A declared floor is never lowered, so the launch is refused before it
+creates a workdir or a records directory or starts anything. `mur run --explain-scope` refuses on
+the same terms.
+
+```text
+error[E-RUN-059]: --unconfined cannot run this capsule unconfined: a containment floor is declared (scoped in the manifest's capabilities.containment), and a declared floor is never lowered
+  hint: remove the declared floor to run unconfined, or run without --unconfined to run contained
+```
+
+| Chosen by | Floors that refuse it |
+|---|---|
+| `--unconfined` | `capabilities.containment` in the manifest, `containment` in `.murmur/config.yaml`, a declarable `containment` in `~/.murmur/config.yaml` |
+| `containment: unconfined` in `~/.murmur/config.yaml` | `capabilities.containment` in the manifest, `containment` in `.murmur/config.yaml`. Pass `--containment <class>` to run this launch contained instead |
+
+Every declared floor is named with its source. `mur doctor` prints the same refusal as a warning.
+
+### E-RUN-060 — unconfined on a contained launch { #e-run-060 }
+
+`--unconfined` was given to a launch the runtime started on the operator's behalf — a delegated
+child, a plan `capsule` step, a contained roster member, a deployed capsule — or to one redeeming a
+roost spawn approval (`--spawn-grant-stdin`). Those always run contained; only a capsule the
+operator launches with `--unconfined` runs unconfined.
+
+```text
+error[E-RUN-060]: --unconfined cannot be given to a launch the runtime started on the operator's behalf (--contained-launch), which always runs contained
+  hint: a delegated child, a plan capsule step, a contained roster member, a deployed capsule and a spawn-approval redemption run contained; only a capsule the operator launches with --unconfined themselves runs unconfined
+```
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -2329,6 +2365,17 @@ error[E-CFG-004]: ~/.murmur/config.yaml: host_paths[1] (~/tools, resolved to /ho
 | `is read-write inside …, a folder this session may run … from` | On `sealed` the folder's read-only bind would hide the entry; on `scoped` the capsule could write a file there and run it | Name a folder outside it, or use `access: read` |
 | `is read-write over …, a folder this session may run … from` | At `scoped` nothing keeps the capsule from rewriting a binary it may run in place. Refused at `scoped` only: `sealed` binds that folder read-only on top of the entry | Name a folder that does not contain it, use `access: read`, or declare `containment: sealed` |
 
+### E-CFG-005 — a project config chooses unconfined { #e-cfg-005 }
+
+Only the operator chooses the [unconfined stance](containment.md#unconfined): `containment:
+unconfined` is read from `~/.murmur/config.yaml` alone. A project's `.murmur/config.yaml` saying
+it is refused, naming the file, by every command that reads the config.
+
+```text
+error[E-CFG-005]: /home/ana/project/.murmur/config.yaml says containment: unconfined, which a project config cannot choose
+  hint: only the operator chooses unconfined, with `mur run --unconfined` or `containment: unconfined` in ~/.murmur/config.yaml; remove the key or name a floor (advisory, scoped, sealed)
+```
+
 ---
 
 ## Index errors
@@ -3075,6 +3122,7 @@ Where a warning is written depends on whether the session's records directory ex
 | `W-SEC-033` — decided at staging by `mur run`, and by `mur doctor` | stderr |
 | `W-SEC-034` — from `mur doctor` | stderr |
 | `W-SEC-035` — decided before staging by `mur run`, and by `mur doctor` | stderr |
+| `W-SEC-036` — decided at launch, after staging succeeds | stderr, with `--json` too, and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -4164,3 +4212,17 @@ contained capsule on the host.
 `effective_grants.host_paths[i].credential_location` names the location.
 
 **What to do:** lend a narrower folder that does not hold the credential, or accept the warning.
+
+### W-SEC-036 — the capsule runs unconfined { #w-sec-036 }
+
+**Fires when:** the launch runs [unconfined](containment.md#unconfined), chosen with
+`mur run --unconfined` or `containment: unconfined` in `~/.murmur/config.yaml`. Exactly once per
+launch, after staging succeeds; `mur run --explain-scope` does not print it. It replaces the tier
+warnings `W-SEC-001`, `W-SEC-002`, `W-SEC-005` and `W-SEC-010`.
+
+```text
+[capsule-runtime] warning[W-SEC-036]: this capsule runs unconfined: its shell commands, plan shell steps, native tools and process harness run as ana (uid 1000) with HOME /home/ana, the whole environment mur run was started with (credential variables included), the host filesystem and network as that account has them, and no no_new_privs, so sudo works wherever that account's sudoers allows it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-036)
+```
+
+**What to do:** nothing, when you meant to run the capsule as yourself. Otherwise run without
+`--unconfined`, or pass `--containment <class>` when the global config chooses it.

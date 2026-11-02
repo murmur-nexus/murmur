@@ -910,6 +910,8 @@ struct ParentConfig {
     task_md: Option<String>,
     /// Entries appended verbatim to the parent's `artifacts:` list, after its driver.
     extra_artifacts: String,
+    /// The declared containment floor the parent is staged at, `advisory` when `None`.
+    declared_floor: Option<ContainmentClass>,
 }
 
 impl Default for ParentConfig {
@@ -921,6 +923,7 @@ impl Default for ParentConfig {
             max_turns: None,
             task_md: None,
             extra_artifacts: String::new(),
+            declared_floor: None,
         }
     }
 }
@@ -1037,6 +1040,9 @@ impl Parent {
                     input_timeout_secs: None,
                     ..Default::default()
                 }),
+                declared_containment_floor: config
+                    .declared_floor
+                    .unwrap_or(ContainmentClass::Advisory),
                 ..stage_request(&project, &runtime_manifest)
             },
         )
@@ -1565,6 +1571,48 @@ const SPAWN_YAML: &str = "  spawn:\n    allow: [local/worker, local/worker-two, 
                           local/deep-worker, local/thirsty-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
+
+/// The unconfined stance never spreads: a parent staged unconfined, under a global config that
+/// says `containment: unconfined`, launches its child contained.
+#[test]
+fn a_child_of_an_unconfined_parent_runs_contained() {
+    if common::skip_without_host_support("a_child_of_an_unconfined_parent_runs_contained") {
+        return;
+    }
+    let config = home().join(".murmur").join("config.yaml");
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{existing}containment: unconfined\n")).unwrap();
+    let parent = Parent::launch_configured(
+        TempDir::new().unwrap().keep(),
+        PARENT,
+        SPAWN_YAML,
+        None,
+        None,
+        ParentConfig {
+            declared_floor: Some(ContainmentClass::Unconfined),
+            ..ParentConfig::default()
+        },
+    );
+    parent.delegate("toolu_unconfined", WORKER, VERSION, "summarise the report");
+
+    let parent_start = parent
+        .trace_events()
+        .into_iter()
+        .find(|event| event["event_type"] == "session_start")
+        .unwrap();
+    assert_eq!(parent_start["containment_achieved"], "unconfined");
+
+    let started = parent.events("delegation_start");
+    let child_session_id = started[0]["child_session_id"].as_str().unwrap().to_string();
+    let child_trace = child_events(&parent.only_child_dir(), &child_session_id);
+    let child_start = only_event(&child_trace, "session_start");
+    assert_ne!(
+        child_start["containment_achieved"], "unconfined",
+        "{child_start}"
+    );
+    assert!(child_start["effective_grants"]["unconfined"].is_null());
+    std::fs::write(&config, existing).unwrap();
+}
 
 /// The happy path, and the leak sweep over what it left behind.
 ///

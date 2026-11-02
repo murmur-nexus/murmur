@@ -454,6 +454,7 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
         formation_lifeline: false,
         formation_launcher: None,
         spawned_by: None,
+        unconfined: false,
     };
     let record_path = running.join(format!("{session_id}.json"));
     let record_json = serde_json::to_string(&record).unwrap();

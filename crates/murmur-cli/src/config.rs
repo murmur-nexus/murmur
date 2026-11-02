@@ -7,7 +7,7 @@ use std::{
 use murmur_artifact::ContainmentClass;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{CliError, E_CFG_004, E_IO_001, E_IO_003};
+use crate::error::{CliError, E_CFG_004, E_CFG_005, E_IO_001, E_IO_003};
 
 /// Runtime feature flag state. Persisted under `beta:` in ~/.murmur/config.yaml.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -52,6 +52,10 @@ pub struct MurConfig {
     /// requirement — it does not mean `advisory`, so a manifest or `--containment` that asks
     /// for more is not contradicted. Merged as a max, never a project-wins override (see
     /// [`merge_containment`]).
+    ///
+    /// `unconfined` is the operator's stance rather than a floor, and only the global file may
+    /// say it: a project file saying it is refused with `E-CFG-005` at load, and the merged value
+    /// never holds it. `mur run` reads it from [`ContainmentConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<ContainmentClass>,
     /// Provider keys by credential name. A manifest's `gateway.api_key: ${NAME}` is answered from
@@ -214,6 +218,7 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
     }
 
     if let Some(project) = &project_opt {
+        refuse_project_unconfined(project)?;
         refuse_project_host_paths(&project_mur_config_path()?, project)?;
         warn_if_project_api_key_literal(project)?;
         if let Some(warning) = project_credentials_warning(&project_mur_config_path()?, project) {
@@ -225,13 +230,59 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
     Ok(Some(merge_mur_configs(global, project_opt)))
 }
 
+/// `E-CFG-005` when the project file says `containment: unconfined`: only the operator's global
+/// file may choose the unconfined stance.
+fn refuse_project_unconfined(project: &MurConfig) -> Result<(), CliError> {
+    if project.containment != Some(ContainmentClass::Unconfined) {
+        return Ok(());
+    }
+    Err(CliError::with_hint(
+        E_CFG_005,
+        format!(
+            "{} says containment: unconfined, which a project config cannot choose",
+            project_mur_config_path()?.display()
+        ),
+        "only the operator chooses unconfined, with `mur run --unconfined` or `containment: \
+         unconfined` in ~/.murmur/config.yaml; remove the key or name a floor (advisory, scoped, \
+         sealed)",
+    ))
+}
+
+/// The `containment` each config file states, unmerged: what `mur run`'s stance resolution
+/// reads, because the global file may choose the unconfined stance and the project file may not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContainmentConfig {
+    /// `containment` in `~/.murmur/config.yaml`, `unconfined` included.
+    pub global: Option<ContainmentClass>,
+    /// `containment` in `<cwd>/.murmur/config.yaml`, never `unconfined`.
+    pub project: Option<ContainmentClass>,
+}
+
+/// Reads [`ContainmentConfig`] from both files, refusing a project file that says
+/// `containment: unconfined` with `E-CFG-005`.
+pub fn load_containment_config() -> Result<ContainmentConfig, CliError> {
+    let global = load_mur_config_if_exists()?.and_then(|config| config.containment);
+    let project = match load_project_mur_config_if_exists()? {
+        Some(project) => {
+            refuse_project_unconfined(&project)?;
+            project.containment
+        }
+        None => None,
+    };
+    Ok(ContainmentConfig { global, project })
+}
+
 /// Per-key merge of a global and an optional project-level `MurConfig`. `project` values win
 /// for non-empty scalars; `registry.sources` and `beta.enabled` merge as unions; `api_key` and
 /// `credentials` are unconditionally sourced from `global`, never `project`, regardless of their
-/// shape. Returns `global` unchanged when `project` is `None`.
+/// shape. Returns `global` when `project` is `None`, with an `unconfined` containment dropped as
+/// [`merge_containment`] drops it.
 pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurConfig {
     let Some(project) = project else {
-        return global;
+        return MurConfig {
+            containment: merge_containment(global.containment, None),
+            ..global
+        };
     };
 
     MurConfig {
@@ -344,11 +395,17 @@ pub fn merge_spend(
 /// what the global file asked for but never to lower it. `None` on a side means that side asked
 /// for nothing and does not participate; `None` on both stays `None` (no declaration at all,
 /// which is distinct from an explicit `advisory`).
+///
+/// `unconfined` never takes part: it is the operator's stance, not a floor, so the merged value is
+/// always a declarable floor or `None`.
 pub fn merge_containment(
     global: Option<ContainmentClass>,
     project: Option<ContainmentClass>,
 ) -> Option<ContainmentClass> {
-    match (global, project) {
+    let declarable = |class: Option<ContainmentClass>| {
+        class.filter(|class| *class != ContainmentClass::Unconfined)
+    };
+    match (declarable(global), declarable(project)) {
         (Some(global), Some(project)) => Some(global.max(project)),
         (value, None) | (None, value) => value,
     }
@@ -1071,6 +1128,88 @@ mod tests {
         assert!(!serde_norway::to_string(&bare)
             .unwrap()
             .contains("containment"));
+    }
+
+    /// `unconfined` never takes part in the merge: the merged value is always a declarable floor
+    /// or nothing.
+    #[test]
+    fn merge_containment_never_lets_unconfined_take_part() {
+        use ContainmentClass::{Advisory, Scoped, Sealed, Unconfined};
+        for other in [None, Some(Advisory), Some(Scoped), Some(Sealed)] {
+            assert_eq!(merge_containment(Some(Unconfined), other), other);
+            assert_eq!(merge_containment(other, Some(Unconfined)), other);
+        }
+        let global = MurConfig {
+            containment: Some(Unconfined),
+            ..MurConfig::default()
+        };
+        assert_eq!(merge_mur_configs(global.clone(), None).containment, None);
+        assert_eq!(
+            merge_mur_configs(global, Some(MurConfig::default())).containment,
+            None
+        );
+    }
+
+    /// The global file may say `containment: unconfined`, and it survives a save and a load.
+    #[test]
+    fn a_global_unconfined_containment_round_trips_through_save_mur_config() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _env = test_env::EnvGuard::set_up(home.path(), cwd.path());
+        save_mur_config(&MurConfig {
+            containment: Some(ContainmentClass::Unconfined),
+            ..MurConfig::default()
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(mur_config_path().unwrap()).unwrap();
+        assert!(written.contains("containment: unconfined"), "{written}");
+        assert_eq!(
+            load_mur_config().unwrap().containment,
+            Some(ContainmentClass::Unconfined)
+        );
+        assert_eq!(
+            load_containment_config().unwrap(),
+            ContainmentConfig {
+                global: Some(ContainmentClass::Unconfined),
+                project: None,
+            }
+        );
+        // Every command reading the effective config sees no floor from it.
+        assert_eq!(load_effective_mur_config().unwrap().containment, None);
+    }
+
+    /// A project file saying `containment: unconfined` is `E-CFG-005`, naming the file, from
+    /// every reader of the effective config and from the stance's own reader.
+    #[test]
+    fn a_project_unconfined_containment_is_e_cfg_005_naming_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _env = test_env::EnvGuard::set_up(home.path(), cwd.path());
+        std::fs::create_dir_all(cwd.path().join(".murmur")).unwrap();
+        std::fs::write(
+            cwd.path().join(".murmur/config.yaml"),
+            "containment: unconfined\n",
+        )
+        .unwrap();
+        let path = project_mur_config_path().unwrap();
+        for error in [
+            load_effective_mur_config_if_any_exists().unwrap_err(),
+            load_containment_config().unwrap_err(),
+        ] {
+            assert_eq!(error.code, E_CFG_005);
+            assert!(
+                error.message.contains(&path.display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error
+                    .hint
+                    .as_deref()
+                    .unwrap()
+                    .contains("mur run --unconfined"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

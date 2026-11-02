@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -509,14 +510,7 @@ fn spawn_and_wait(
     // to stop it growing further is to not start the next process that would write to it.
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(
-        policy,
-        env_overrides,
-        enforcement.home_dir_path(),
-        enforcement.runtime_dir_path(),
-        enforcement.records_dir_path(),
-        enforcement.tmpdir_value().as_deref(),
-    )?;
+    let env = subprocess_env(policy, env_overrides, enforcement)?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
     // run, and it is the only point where the invoked name is still in hand.
@@ -1313,6 +1307,98 @@ pub(crate) fn build_shell_env(
     }
 
     Ok(env)
+}
+
+/// The names `mur` itself owns for a session's lineage. Never copied from this process's
+/// environment: an unconfined subprocess gets none of them, so a `mur run` it starts is a fresh
+/// top-level session rather than a second reader of this session's spawner, lifeline or
+/// formation, and a delegated child gets only the values its launch sets
+/// ([`crate::child_launch`]). A formation member's grant names
+/// ([`crate::formation::is_member_grant_env`]) are withheld on the same terms.
+pub(crate) const LINEAGE_ENV: &[&str] = &[
+    crate::delegation::SPAWNER_ENV,
+    crate::formation::FORMATION_ID_ENV,
+    crate::lifeline::SPAWNER_LIFELINE_ENV,
+    crate::host_warnings::HOST_WARNINGS_REPORTED_ENV,
+    "MURMUR_ROOST_URL",
+];
+
+/// The environment of one shell command, plan shell step or native tool spawned on
+/// `enforcement`: [`build_unconfined_env`] on the unconfined tier, [`build_shell_env`] on every
+/// other. A native tool's dispatch adds its own values to what this returns.
+pub(crate) fn subprocess_env(
+    policy: &CapabilityPolicy,
+    env_overrides: &[(String, String)],
+    enforcement: &crate::sandbox::ShellEnforcement,
+) -> Result<BTreeMap<OsString, OsString>, String> {
+    if enforcement.tier == crate::sandbox::EnforcementTier::Unconfined {
+        return Ok(build_unconfined_env(
+            policy,
+            env_overrides,
+            enforcement.runtime_dir_path(),
+            enforcement.records_dir_path(),
+        ));
+    }
+    Ok(build_shell_env(
+        policy,
+        env_overrides,
+        enforcement.home_dir_path(),
+        enforcement.runtime_dir_path(),
+        enforcement.records_dir_path(),
+        enforcement.tmpdir_value().as_deref(),
+    )?
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+    .collect())
+}
+
+/// The environment of one unconfined shell command, plan shell step or native tool: this
+/// process's whole environment, then `env_overrides`, minus the lineage names
+/// ([`LINEAGE_ENV`] and every formation member grant name), [`ARTIFACT_CONFIG_ENV`],
+/// [`crate::state_store::STATE_DIR_ENV`] and whatever `capabilities.shell.strip_env` matches, and
+/// then `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
+///
+/// The credential backstop ([`CREDENTIAL_ENV_PATTERNS`]) is not applied, and `HOME`,
+/// `USERPROFILE`, `TMPDIR`, `TMP` and `TEMP` are whatever this process had: the operator chose to
+/// run the capsule as themselves.
+pub(crate) fn build_unconfined_env(
+    policy: &CapabilityPolicy,
+    env_overrides: &[(String, String)],
+    runtime_dir: Option<&std::path::Path>,
+    records_dir: Option<&std::path::Path>,
+) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    for (key, value) in env_overrides {
+        env.insert(OsString::from(key), OsString::from(value));
+    }
+    env.retain(|key, _| {
+        let Some(key) = key.to_str() else {
+            return true;
+        };
+        !(LINEAGE_ENV.contains(&key)
+            || crate::formation::is_member_grant_env(key)
+            || key == ARTIFACT_CONFIG_ENV
+            || key == crate::state_store::STATE_DIR_ENV
+            || key == crate::runtime_dir::RUNTIME_DIR_ENV
+            || key == crate::records_dir::RECORDS_DIR_ENV
+            || policy
+                .shell_strip_env
+                .iter()
+                .any(|pattern| env_name_matches_pattern(pattern, key)))
+    });
+    if let Some(runtime_dir) = runtime_dir {
+        env.insert(
+            OsString::from(crate::runtime_dir::RUNTIME_DIR_ENV),
+            runtime_dir.as_os_str().to_owned(),
+        );
+    }
+    if let Some(records_dir) = records_dir {
+        env.insert(
+            OsString::from(crate::records_dir::RECORDS_DIR_ENV),
+            records_dir.as_os_str().to_owned(),
+        );
+    }
+    env
 }
 
 /// Drop every entry whose name matches [`CREDENTIAL_ENV_PATTERNS`] or one of
@@ -3426,6 +3512,112 @@ mod tests {
             build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
         assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
+    }
+
+    /// An unconfined command gets this process's whole environment — `HOME`, `TMPDIR` and a
+    /// credential-shaped variable included — minus the lineage names, the per-tool settings and
+    /// what `strip_env` matches, with this session's runtime and records directories set last.
+    #[test]
+    fn build_unconfined_env_inherits_everything_but_the_lineage_names() {
+        let get = |env: &BTreeMap<OsString, OsString>, name: &str| {
+            env.get(std::ffi::OsStr::new(name))
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let removed: Vec<&str> = LINEAGE_ENV
+            .iter()
+            .copied()
+            .chain([
+                crate::formation::FORMATION_PEERS_ENV,
+                crate::formation_credentials::FORMATION_CHANNEL_ENV,
+                crate::lifeline::FORMATION_LIFELINE_ENV,
+                ARTIFACT_CONFIG_ENV,
+                crate::state_store::STATE_DIR_ENV,
+            ])
+            .collect();
+        for name in &removed {
+            std::env::set_var(name, "host-value");
+        }
+        std::env::set_var("GITHUB_TOKEN", "unconfined-sentinel");
+        std::env::set_var("MURMUR_TEST_UNCONFINED", "present");
+        std::env::set_var("MURMUR_TEST_STRIPPED", "gone");
+        std::env::set_var("HOME", "/home/operator");
+        std::env::set_var("TMPDIR", "/var/tmp/operator");
+        std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/runtime");
+        std::env::set_var(crate::records_dir::RECORDS_DIR_ENV, "/host/records");
+        let policy = CapabilityPolicy {
+            shell_strip_env: vec!["MURMUR_TEST_STRIP*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let overrides = [
+            (
+                crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+                "/override".to_string(),
+            ),
+            (
+                crate::delegation::SPAWNER_ENV.to_string(),
+                "override".to_string(),
+            ),
+            ("GUEST_SET".to_string(), "yes".to_string()),
+        ];
+
+        let env = build_unconfined_env(
+            &policy,
+            &overrides,
+            Some(std::path::Path::new("/session/runtime")),
+            Some(std::path::Path::new("/session/records")),
+        );
+        for name in &removed {
+            assert_eq!(
+                get(&env, name),
+                None,
+                "{name} reached an unconfined command"
+            );
+        }
+        assert_eq!(
+            get(&env, "GITHUB_TOKEN").as_deref(),
+            Some("unconfined-sentinel")
+        );
+        assert_eq!(
+            get(&env, "MURMUR_TEST_UNCONFINED").as_deref(),
+            Some("present")
+        );
+        assert_eq!(get(&env, "MURMUR_TEST_STRIPPED"), None);
+        assert_eq!(get(&env, "HOME").as_deref(), Some("/home/operator"));
+        assert_eq!(get(&env, "TMPDIR").as_deref(), Some("/var/tmp/operator"));
+        assert_eq!(get(&env, "GUEST_SET").as_deref(), Some("yes"));
+        assert_eq!(
+            get(&env, crate::runtime_dir::RUNTIME_DIR_ENV).as_deref(),
+            Some("/session/runtime")
+        );
+        assert_eq!(
+            get(&env, crate::records_dir::RECORDS_DIR_ENV).as_deref(),
+            Some("/session/records")
+        );
+        // With no session directories, neither variable is set at all.
+        let without = build_unconfined_env(&policy, &overrides, None, None);
+        assert_eq!(get(&without, crate::runtime_dir::RUNTIME_DIR_ENV), None);
+        assert_eq!(get(&without, crate::records_dir::RECORDS_DIR_ENV), None);
+    }
+
+    /// `subprocess_env` builds the unconfined environment on the unconfined tier and the
+    /// contained one on every other.
+    #[test]
+    fn subprocess_env_follows_the_enforcement_tier() {
+        std::env::set_var("GITHUB_TOKEN", "unconfined-sentinel");
+        let policy = CapabilityPolicy::default();
+        let contained =
+            crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
+        let unconfined = crate::sandbox::ShellEnforcement {
+            tier: crate::sandbox::EnforcementTier::Unconfined,
+            ..contained.clone()
+        };
+        let token = std::ffi::OsStr::new("GITHUB_TOKEN");
+        assert!(!subprocess_env(&policy, &[], &contained)
+            .unwrap()
+            .contains_key(token));
+        assert!(subprocess_env(&policy, &[], &unconfined)
+            .unwrap()
+            .contains_key(token));
     }
 
     /// `MURMUR_RECORDS_DIR` is runtime-owned on `MURMUR_RUNTIME_DIR`'s terms: an override, a

@@ -125,6 +125,12 @@ pub(crate) enum EnforcementTier {
     /// macOS (or any non-Linux target): no kernel sandboxing primitive exists. This is
     /// PERMANENT, not a placeholder for a future slice.
     EnvironmentOnly,
+    /// The operator chose to run the capsule unconfined (`ContainmentClass::Unconfined`), on any
+    /// host. Never a host reading: [`applied_tier`] is the only place it comes from. Subprocesses
+    /// get no network namespace, no `/tmp` mapping, no composed root, no capability drop, no
+    /// `no_new_privs`, no seccomp filter and no Landlock domain; they keep the fd-hygiene step,
+    /// their process group, and only the resource limits `capabilities.resources` declares.
+    Unconfined,
 }
 
 /// Pure decision: given whether the host is Linux, the outcome of a Landlock
@@ -165,6 +171,9 @@ pub(crate) fn applied_tier(
     host_tier: EnforcementTier,
     declared: murmur_artifact::ContainmentClass,
 ) -> EnforcementTier {
+    if declared == murmur_artifact::ContainmentClass::Unconfined {
+        return EnforcementTier::Unconfined;
+    }
     match host_tier {
         EnforcementTier::KernelSealed if declared < murmur_artifact::ContainmentClass::Sealed => {
             EnforcementTier::KernelFull
@@ -374,7 +383,9 @@ pub(crate) fn ruleset_landlock_abi(kernel_abi: Option<u8>, tier: EnforcementTier
         EnforcementTier::KernelFull | EnforcementTier::KernelSealed => kernel_abi
             .filter(|abi| *abi >= 1)
             .map(|abi| abi.min(LANDLOCK_TARGET_ABI)),
-        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => None,
+        EnforcementTier::KernelSeccompOnly
+        | EnforcementTier::EnvironmentOnly
+        | EnforcementTier::Unconfined => None,
     }
 }
 
@@ -1386,9 +1397,9 @@ pub(crate) fn host_path_mechanism(tier: EnforcementTier) -> crate::host_paths::H
     match tier {
         EnforcementTier::KernelSealed => crate::host_paths::HostPathMechanism::Bind,
         EnforcementTier::KernelFull => crate::host_paths::HostPathMechanism::Landlock,
-        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
-            crate::host_paths::HostPathMechanism::None
-        }
+        EnforcementTier::KernelSeccompOnly
+        | EnforcementTier::EnvironmentOnly
+        | EnforcementTier::Unconfined => crate::host_paths::HostPathMechanism::None,
     }
 }
 
@@ -2452,6 +2463,10 @@ pub(crate) struct ShellEnforcement {
     /// so macOS gets the per-process bounds even though it can never get the aggregate (cgroup)
     /// half. See [`crate::resources`].
     pub(crate) resource_limits: crate::resources::HostResourceLimits,
+    /// The manifest's own `capabilities.resources` block, every field as declared. The
+    /// [`EnforcementTier::Unconfined`] tier sets an rlimit only for a field declared here, where
+    /// every other tier sets [`Self::resource_limits`].
+    pub(crate) declared_resources: murmur_artifact::ResourceCapabilities,
     /// The session's cgroup v2 scope, when the host could delegate one (Linux only, and only
     /// for capsules that can actually spawn a native subprocess). `None` on macOS always, and on
     /// Linux only for capsules with no subprocess capability at all — a Linux capsule that *can*
@@ -2597,6 +2612,7 @@ impl ShellEnforcement {
             sealed_bind_dirs,
             staged_runtime_dirs,
             resource_limits: policy.resources,
+            declared_resources: policy.declared_resources,
             cgroup_scope: None,
             workdir_guard: None,
             session_netns: Arc::new(crate::network_namespace::SessionNetns::new()),
@@ -2806,6 +2822,7 @@ impl ShellEnforcement {
             // Defaults, not "no limits": the rlimit ceilings apply unchanged on this tier, so
             // zeroing them out here would misrepresent what a real macOS host does.
             resource_limits: crate::resources::HostResourceLimits::default(),
+            declared_resources: murmur_artifact::ResourceCapabilities::default(),
             cgroup_scope: None,
             workdir_guard: None,
             session_netns: Arc::new(crate::network_namespace::SessionNetns::new()),
@@ -3066,6 +3083,8 @@ pub(crate) fn tier_warning(
         EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE)),
         EnforcementTier::KernelSeccompOnly => Some((W_SEC_002, SECCOMP_ONLY_WARNING)),
         EnforcementTier::EnvironmentOnly => Some((W_SEC_001, ENVIRONMENT_ONLY_WARNING)),
+        // The launch prints `W-SEC-036` instead, which names what the capsule can reach.
+        EnforcementTier::Unconfined => None,
     }
 }
 
@@ -3325,6 +3344,11 @@ pub(crate) fn attach_process_limits(
 ) {
     use std::os::unix::process::CommandExt;
 
+    if enforcement.tier == EnforcementTier::Unconfined {
+        attach_unconfined_limits(command, enforcement);
+        return;
+    }
+
     let limits = enforcement.resource_limits;
     let nproc = enforcement.nproc_bound();
     let cgroup_scope = enforcement.cgroup_scope.clone();
@@ -3340,6 +3364,38 @@ pub(crate) fn attach_process_limits(
             if let Some(scope) = cgroup_scope.as_ref() {
                 scope.join_current_process()?;
             }
+            Ok(())
+        });
+    }
+}
+
+/// [`attach_process_limits`] on [`EnforcementTier::Unconfined`]: only the rlimits
+/// [`ShellEnforcement::declared_resources`] declares, the cgroup join when a scope exists, and on
+/// Linux the fd-hygiene step. Nothing else: no `RLIMIT_CORE`, no default ceiling, so an
+/// undeclared limit is the one `mur run` itself has.
+///
+/// Same `pre_exec` restrictions as [`attach_process_limits`].
+#[cfg(unix)]
+fn attach_unconfined_limits(command: &mut std::process::Command, enforcement: &ShellEnforcement) {
+    use std::os::unix::process::CommandExt;
+
+    let declared = enforcement.declared_resources;
+    let nproc = enforcement.nproc_bound();
+    let cgroup_scope = enforcement.cgroup_scope.clone();
+
+    // SAFETY: the closure runs in the forked child before `execve`, where only async-signal-safe
+    // operations are permitted. It performs `getrlimit`/`setrlimit` pairs, at most one `write` to
+    // a descriptor opened by the parent before the fork, and on Linux one `close_range` (or a
+    // bounded `fcntl` loop) — no allocation, no locks, no path lookups.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            crate::resources::apply_declared_rlimits(&declared, nproc)?;
+            if let Some(scope) = cgroup_scope.as_ref() {
+                scope.join_current_process()?;
+            }
+            #[cfg(target_os = "linux")]
+            linux_enforce::mark_inherited_fds_cloexec()?;
             Ok(())
         });
     }
@@ -3380,10 +3436,12 @@ pub(crate) fn prepare_enforcement(
     #[cfg(test)]
     forced_prepare_failure()?;
 
-    debug_assert_eq!(
-        enforcement.tier,
-        EnforcementTier::EnvironmentOnly,
-        "non-Linux targets must always resolve to EnforcementTier::EnvironmentOnly"
+    debug_assert!(
+        matches!(
+            enforcement.tier,
+            EnforcementTier::EnvironmentOnly | EnforcementTier::Unconfined
+        ),
+        "non-Linux targets must always resolve to EnforcementTier::EnvironmentOnly or Unconfined"
     );
     attach_process_limits(command, enforcement);
     Ok(SupervisorHandle::Noop)
@@ -3407,9 +3465,13 @@ pub(crate) fn prepare_enforcement(
     #[cfg(test)]
     forced_prepare_failure()?;
 
-    if enforcement.tier == EnforcementTier::EnvironmentOnly {
-        // No kernel sandbox to install, but the POSIX rlimit ceilings still apply — this tier is
-        // only reachable on Linux from tests, and even there it must not read as "unbounded".
+    if matches!(
+        enforcement.tier,
+        EnforcementTier::EnvironmentOnly | EnforcementTier::Unconfined
+    ) {
+        // No kernel sandbox to install. `EnvironmentOnly` keeps the POSIX rlimit ceilings — it is
+        // only reachable on Linux from tests, and even there it must not read as "unbounded" —
+        // and `Unconfined` keeps the declared limits and the fd-hygiene step.
         attach_process_limits(command, enforcement);
         return Ok(SupervisorHandle::Noop);
     }
@@ -6813,6 +6875,30 @@ mod tests {
         }
     }
 
+    /// The unconfined stance is the unconfined tier on every host, and the tier prints none of
+    /// the tier warnings: the launch prints `W-SEC-036` instead.
+    #[test]
+    fn applied_tier_is_unconfined_on_every_host_for_the_unconfined_stance() {
+        use murmur_artifact::ContainmentClass;
+        for host_tier in [
+            EnforcementTier::KernelSealed,
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            assert_eq!(
+                applied_tier(host_tier, ContainmentClass::Unconfined),
+                EnforcementTier::Unconfined,
+                "{host_tier:?}"
+            );
+        }
+        assert_eq!(tier_warning(EnforcementTier::Unconfined, false), None);
+        assert_eq!(
+            ruleset_landlock_abi(Some(4), EnforcementTier::Unconfined),
+            None
+        );
+    }
+
     /// A capsule that declared the weaker class keeps the weaker mechanism, even where the host
     /// could give it more. Silently installing a composed root under a `scoped` declaration would
     /// delete host paths its `interpreter_runtime` grants legitimately name.
@@ -9504,6 +9590,106 @@ mod linux_integration_tests {
             "the /tmp rule and the workdir rule share one right-set binding in \
              apply_landlock_scope; if that set ever grows a second conditional axis, this test and \
              that binding must be revisited together",
+        );
+    }
+
+    /// An enforcement on the unconfined tier, holding test session directories, with `declared`
+    /// as its `capabilities.resources` block.
+    fn unconfined_enforcement(declared: murmur_artifact::ResourceCapabilities) -> ShellEnforcement {
+        ShellEnforcement {
+            tier: EnforcementTier::Unconfined,
+            declared_resources: declared,
+            temp_mapping: crate::temp_dir::tier_temp_mapping(EnforcementTier::Unconfined),
+            ..ShellEnforcement::environment_only()
+        }
+        .with_test_session_dirs()
+    }
+
+    /// The `/proc/self/status` line starting `field`, of this process or of what `command`
+    /// printed.
+    fn status_line(status: &str, field: &str) -> String {
+        status
+            .lines()
+            .find(|line| line.starts_with(field))
+            .unwrap_or_else(|| panic!("no {field} line in {status}"))
+            .to_string()
+    }
+
+    /// What `script` prints when spawned through `prepare_enforcement` on `enforcement`.
+    fn spawn_unconfined(enforcement: &ShellEnforcement, script: &str) -> String {
+        let mut command = std::process::Command::new("bash");
+        command.args(["-c", script]);
+        let supervisor = prepare_enforcement(&mut command, enforcement, Path::new("/tmp"))
+            .expect("the unconfined tier installs nothing that can fail");
+        assert!(matches!(supervisor, SupervisorHandle::Noop));
+        let output = command.output().expect("bash runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// A child spawned through `prepare_enforcement` on the unconfined tier keeps this process's
+    /// `NoNewPrivs`, effective capabilities and network namespace: nothing is installed, so `sudo`
+    /// works wherever the operator's sudoers allows it.
+    #[test]
+    fn an_unconfined_child_keeps_no_new_privs_capabilities_and_network_namespace() {
+        let enforcement = unconfined_enforcement(Default::default());
+        let child = spawn_unconfined(
+            &enforcement,
+            "cat /proc/self/status; echo \"netns=$(readlink /proc/self/ns/net)\"",
+        );
+        let own = std::fs::read_to_string("/proc/self/status").unwrap();
+        for field in ["NoNewPrivs:", "CapEff:"] {
+            assert_eq!(
+                status_line(&child, field),
+                status_line(&own, field),
+                "{child}"
+            );
+        }
+        let own_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        assert!(
+            child.contains(&format!("netns={}", own_netns.display())),
+            "{child}"
+        );
+        assert_eq!(
+            enforcement.session_netns.creations(),
+            0,
+            "the unconfined tier creates no network namespace"
+        );
+    }
+
+    /// The unconfined tier sets no rlimit a manifest does not declare — the child keeps this
+    /// process's `RLIMIT_NOFILE` and `RLIMIT_CORE` — and sets exactly what one declares.
+    #[test]
+    fn an_unconfined_child_gets_only_the_declared_rlimits() {
+        let read = |resource| {
+            let limit = rustix::process::getrlimit(resource);
+            let show = |value: Option<u64>| {
+                value.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
+            };
+            format!("{} {}", show(limit.current), show(limit.maximum))
+        };
+        let undeclared = spawn_unconfined(
+            &unconfined_enforcement(Default::default()),
+            "echo \"$(ulimit -Sn) $(ulimit -Hn)\"; echo \"$(ulimit -Sc) $(ulimit -Hc)\"",
+        );
+        assert_eq!(
+            undeclared,
+            format!(
+                "{}\n{}\n",
+                read(rustix::process::Resource::Nofile),
+                read(rustix::process::Resource::Core)
+            )
+        );
+        let declared = spawn_unconfined(
+            &unconfined_enforcement(murmur_artifact::ResourceCapabilities {
+                max_open_files: Some(256),
+                ..Default::default()
+            }),
+            "echo \"$(ulimit -Sn) $(ulimit -Hn)\"; echo \"$(ulimit -Sc) $(ulimit -Hc)\"",
+        );
+        assert_eq!(
+            declared,
+            format!("256 256\n{}\n", read(rustix::process::Resource::Core))
         );
     }
 

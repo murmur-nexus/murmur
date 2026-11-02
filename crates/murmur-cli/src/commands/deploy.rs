@@ -935,23 +935,64 @@ fn precompile_warnings(
     warnings
 }
 
+/// The command that asks the target's `mur` whether it knows
+/// [`capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG`], printing `accepted` or `refused`.
+///
+/// `mur run <flag> --help` prints help and exits 0 when clap knows the flag, and exits 2 on the
+/// unknown argument before it reaches `--help` when it does not. `mur` is the target binary's
+/// path.
+fn build_contained_launch_probe(mur: &str) -> String {
+    format!(
+        "{mur} run {} --help >/dev/null 2>&1 && echo accepted || echo refused",
+        capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG
+    )
+}
+
+/// Whether the last non-empty line of [`build_contained_launch_probe`]'s stdout says the target's
+/// `mur` accepts the flag.
+fn read_contained_launch_probe(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim() == "accepted")
+}
+
 /// Build the shell script that starts the capsule on the remote host.
 ///
 /// The flags here must stay a subset of what `mur run` actually accepts — an
 /// unknown flag makes the remote `mur run` exit on argument parsing, which
 /// deploy only discovers as a 120s `tail -f` timeout. Artifacts are pre-staged
 /// by the upload step before this runs, so no fetch flag belongs here.
-fn build_start_script(remote_deploy_dir: &str, remote_manifest: &str) -> String {
+///
+/// `accepts_contained_launch` is [`read_contained_launch_probe`]'s answer for the target's `mur`.
+/// When it is `true` the script passes
+/// [`capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG`], so a deployed capsule is contained
+/// whatever the target's global config says. A `mur` that does not know the flag has no
+/// unconfined stance, so it runs contained without it.
+fn build_start_script(
+    remote_deploy_dir: &str,
+    remote_manifest: &str,
+    accepts_contained_launch: bool,
+) -> String {
+    let contained = if accepts_contained_launch {
+        format!(" {}", capsule_runtime::child_launch::CONTAINED_LAUNCH_FLAG)
+    } else {
+        String::new()
+    };
     format!(
         "{}> /tmp/mur-start.json; \
-         nohup /usr/local/bin/mur run --manifest {remote_manifest} \
+         nohup {REMOTE_MUR} run --manifest {remote_manifest} \
          --workdir {remote_deploy_dir} \
-         --json \
+         --json{contained} \
          >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
          timeout 120 tail -f /tmp/mur-start.json | head -n 1",
-        remote_env_prefix(remote_deploy_dir)
+        remote_env_prefix(remote_deploy_dir),
     )
 }
+
+/// Where the deploy installs `mur` on the target.
+const REMOTE_MUR: &str = "/usr/local/bin/mur";
 
 // ─── run_deploy ───────────────────────────────────────────────────────────────
 
@@ -1775,7 +1816,20 @@ pub(crate) fn run_deploy(
     // ── 8. Start capsule ──────────────────────────────────────────────────────
     activate_step(&start_pb, &spinner_style, "→ starting capsule...");
 
-    let start_script = build_start_script(&remote_deploy_dir, &remote_manifest);
+    // Fail closed: the probe always exits 0 on the target, so a non-zero status is ssh itself
+    // failing, and it stops the deploy here. Reading it as `refused` would start a `mur` that
+    // knows the flag without it, unconfined if the target's global config says so.
+    let accepts_contained_launch = read_contained_launch_probe(&ssh_exec(
+        host,
+        key_ref,
+        ssh_user,
+        &build_contained_launch_probe(REMOTE_MUR),
+    )?);
+    let start_script = build_start_script(
+        &remote_deploy_dir,
+        &remote_manifest,
+        accepts_contained_launch,
+    );
     let raw_output = ssh_exec(host, key_ref, ssh_user, &start_script)?;
     let json_line = raw_output.trim().to_string();
 
@@ -1983,7 +2037,7 @@ mod tests {
 
     #[test]
     fn start_script_passes_no_auto_pull_flag() {
-        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true);
         assert!(
             !script.contains("--auto-pull"),
             "`mur run` has no --auto-pull flag; sending it makes the remote process \
@@ -1993,19 +2047,30 @@ mod tests {
 
     #[test]
     fn start_script_uses_only_flags_mur_run_accepts() {
-        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true);
         assert!(
             script.contains("mur run --manifest /root/mur-abc123/murmur.yaml"),
             "{script}"
         );
         assert!(script.contains("--workdir /root/mur-abc123"), "{script}");
         assert!(script.contains("--json"), "{script}");
+        assert!(script.contains("--contained-launch"), "{script}");
+        assert!(!script.contains("--unconfined"), "{script}");
     }
 
     #[test]
     fn the_start_script_is_pinned_byte_for_byte() {
         assert_eq!(
-            build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml"),
+            build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true),
+            "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
+             > /tmp/mur-start.json; \
+             nohup /usr/local/bin/mur run --manifest /root/mur-abc123/murmur.yaml \
+             --workdir /root/mur-abc123 --json --contained-launch \
+             >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
+             timeout 120 tail -f /tmp/mur-start.json | head -n 1"
+        );
+        assert_eq!(
+            build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", false),
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
              > /tmp/mur-start.json; \
              nohup /usr/local/bin/mur run --manifest /root/mur-abc123/murmur.yaml \
@@ -2013,6 +2078,76 @@ mod tests {
              >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
              timeout 120 tail -f /tmp/mur-start.json | head -n 1"
         );
+    }
+
+    #[test]
+    fn the_contained_launch_probe_is_pinned_and_read_from_its_last_line() {
+        assert_eq!(
+            build_contained_launch_probe(REMOTE_MUR),
+            "/usr/local/bin/mur run --contained-launch --help >/dev/null 2>&1 \
+             && echo accepted || echo refused"
+        );
+        assert!(read_contained_launch_probe("accepted\n"));
+        assert!(read_contained_launch_probe("motd\naccepted\n\n"));
+        assert!(!read_contained_launch_probe("refused\n"));
+        assert!(!read_contained_launch_probe(""));
+        assert!(!read_contained_launch_probe("accepted\nrefused\n"));
+    }
+
+    /// A stand-in target `mur` that, like clap, exits 2 on a flag it does not know: one that
+    /// predates `--contained-launch` and one that knows it. Each is probed, and the `mur run`
+    /// command of the start script built from the answer is run against it.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_mur_that_predates_contained_launch_still_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stand_in = |name: &str, known: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n\
+                     for arg in \"$@\"; do\n\
+                     case \"$arg\" in\n\
+                     run|--help|--manifest|--workdir|--json{known}) ;;\n\
+                     --*) echo \"error: unexpected argument '$arg' found\" >&2; exit 2 ;;\n\
+                     esac\n\
+                     done\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        let sh = |command: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .unwrap()
+        };
+        for (mur, expect_accepted) in [
+            (stand_in("mur-old", ""), false),
+            (stand_in("mur-new", "|--contained-launch"), true),
+        ] {
+            let probe = sh(&build_contained_launch_probe(&mur));
+            let accepted = read_contained_launch_probe(&String::from_utf8_lossy(&probe.stdout));
+            assert_eq!(accepted, expect_accepted, "{mur}");
+            let script = build_start_script("/srv/dep", "/srv/dep/murmur.yaml", accepted);
+            assert_eq!(script.contains("--contained-launch"), accepted, "{script}");
+            let run = script
+                .split_once("nohup ")
+                .and_then(|(_, rest)| rest.split_once(" >/tmp/mur-start.json"))
+                .map(|(run, _)| run.replacen(REMOTE_MUR, &mur, 1))
+                .expect("the start script runs mur under nohup");
+            let started = sh(&run);
+            assert!(
+                started.status.success(),
+                "{run}: {}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+        }
     }
 
     // ─── precompile on the target ─────────────────────────────────────────────
@@ -2024,7 +2159,7 @@ mod tests {
             prefix,
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; "
         );
-        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true);
         let compile = build_precompile_command(
             "/root/mur-abc123",
             &["/root/.murmur/artifacts/local/a/0.1.0/a-0.1.0.mur.zip".to_string()],
@@ -2072,7 +2207,7 @@ mod tests {
              /root/.murmur/artifacts/local/a/0.1.0/a-0.1.0.mur.zip \
              /root/.murmur/artifacts/murmur/b/1.2.3/b-1.2.3-linux-aarch64.mur.zip"
         );
-        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true);
         assert!(start.contains(" --workdir /root/mur-abc123 "), "{start}");
     }
 
@@ -3288,7 +3423,7 @@ mod tests {
 
     #[test]
     fn the_start_script_never_asks_for_the_tokens() {
-        let script = build_start_script("/opt/murmur/dep_x", "/opt/murmur/dep_x/murmur.yaml");
+        let script = build_start_script("/opt/murmur/dep_x", "/opt/murmur/dep_x/murmur.yaml", true);
         assert!(script.contains(" --json "), "{script}");
         assert!(
             !script.contains(capsule_runtime::READINESS_TOKENS_FLAG),

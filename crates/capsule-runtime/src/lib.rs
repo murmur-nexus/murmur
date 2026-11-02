@@ -138,7 +138,8 @@ pub use containment::{
     warn_on_uncovered_routes, ContainmentDecision, DoctorDirReports, ExportsFilesReport,
     FilesystemBoundaryReport, FilesystemRestriction, ImagesReport, PreopenReport, PreopenSurface,
     Route, RouteInputs, RouteReport, RuntimeDirReach, RuntimeDirReport, ScopeReport,
-    ShortfallCause, StateStoreReport, TempDirReport, HOST_PROCESS_MECHANISM,
+    ShortfallCause, StateStoreReport, TempDirReport, UnconfinedReport, HOST_PROCESS_MECHANISM,
+    UNCONFINED_APPLIES_TO,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 // `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the
@@ -192,10 +193,10 @@ pub use streaming::STREAM_EXTENSION_URI;
 // each of which has to answer the question a launch does without staging a session. Re-exported
 // here rather than duplicating a probe once per crate that needs it.
 pub use cgroup::{
-    active_swap_areas, cgroup_delegation_available, io_max_device_available, probe_scope,
-    probe_swap_control, render_cgroup_scope, requires_process_bounding, skip_without_host_support,
-    CgroupScopeReport, CgroupScopeStatus, IoMaxReport, IoMaxStatus, ScopeProbe, SwapControl,
-    SCOPE_SWAP_MAX,
+    active_swap_areas, cgroup_delegation_available, explain_scope_probe, io_max_device_available,
+    probe_scope, probe_swap_control, render_cgroup_scope, requires_process_bounding,
+    skip_without_host_support, CgroupScopeReport, CgroupScopeStatus, IoMaxReport, IoMaxStatus,
+    ScopeProbe, SwapControl, SCOPE_SWAP_MAX,
 };
 // The door's protocol version and error tables: every client of a door sends the header pair,
 // and names the error it is answered with through `A2aError::from_code`.

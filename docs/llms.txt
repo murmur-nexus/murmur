@@ -51,6 +51,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Connect two capsules with A2A messaging](/how-to/capsules-a2a-messaging.md): Having an orchestrator capsule delegate work to a worker capsule directly.
 - [Launch a formation of capsules](/how-to/launch-formation.md): Scaffolding a two-member formation with `mur new --roster`, launching it, and following one member handing the other its task in the trace.
 - [Configure a long-running capsule](/how-to/long-running-capsule.md): Keeping a capsule alive across multiple tasks instead of the default exit-on-completion.
+- [Run a capsule on the host as yourself](/how-to/run-capsule-on-the-host.md): `mur run --unconfined` — running your own coding agent with your `HOME`, environment and `sudo`, what that gives up, and what stays contained.
 
 ### Observability & Evaluation
 

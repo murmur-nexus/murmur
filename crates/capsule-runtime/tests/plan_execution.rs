@@ -732,9 +732,13 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
     );
     assert!(argv.contains(&child_dir.display().to_string()), "{argv}");
     assert!(
-        argv.ends_with(" --json --readiness-tokens --no-env-file --spawn-grant-stdin"),
+        argv.ends_with(
+            " --json --readiness-tokens --no-env-file --spawn-grant-stdin --contained-launch"
+        ),
         "{argv}"
     );
+    // A plan capsule step never runs unconfined, whatever the session that submitted it runs as.
+    assert!(!argv.contains("--unconfined"), "{argv}");
     let child_workdir = argv
         .split(" --workdir ")
         .nth(1)

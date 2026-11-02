@@ -162,6 +162,7 @@ nav:
       - Visualise capsule sessions with mur topology: how-to/topology-view.md
       - Run a capsule from the CLI or from another program: how-to/different-ways-to-run-murmur.md
       - Run a capsule on your subscription: how-to/run-capsule-on-subscription.md
+      - Run a capsule on the host as yourself: how-to/run-capsule-on-the-host.md
       - Publish your own artifact source: how-to/publish-artifact-source.md
       - Let a coding capsule pull the tools it needs: how-to/self-healing-coding-capsule.md
   - Language Guides:

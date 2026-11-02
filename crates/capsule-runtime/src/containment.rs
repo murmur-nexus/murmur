@@ -64,6 +64,8 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
         EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
             ContainmentClass::Advisory
         }
+        // The operator's own stance: nothing is installed, and the class says so.
+        EnforcementTier::Unconfined => ContainmentClass::Unconfined,
     }
 }
 
@@ -253,6 +255,11 @@ fn containment_shortfall(
     }
 
     let reason = match declared {
+        // Unreachable: every class meets an unconfined floor, so `achieved >= declared` above
+        // has already returned.
+        ContainmentClass::Unconfined => {
+            "unconfined declares no floor and is met by every session".to_string()
+        }
         // Unreachable in practice — `Advisory` is the weakest class, so nothing is below it —
         // but stated rather than `unreachable!()` so a future variant reordering cannot panic
         // a launch path.
@@ -568,6 +575,9 @@ pub enum FilesystemRestriction {
     Enforced,
     /// A composed root, where the path outside the capsule is not there to open.
     Absent,
+    /// The unconfined stance: commands run as the operator and reach the host filesystem as the
+    /// operator does.
+    None,
 }
 
 /// What the filesystem mechanism this session installs does *not* protect, in words an operator
@@ -634,6 +644,14 @@ const PATH_REWRITING_NOT_PROTECTED: &str =
      the host file was never looked for. A ~-based probe is therefore never evidence of containment; test with an absolute path \
      to a real file outside the workdir instead.";
 
+/// What an unconfined session leaves unrestricted: everything, which is the one statement made.
+pub(crate) const UNCONFINED_NOT_PROTECTED: &str =
+    "Nothing is contained: this session runs unconfined, so its shell commands, plan shell steps, \
+     native tools and process harness run as the operator, with the operator's HOME, environment \
+     (credential variables included), filesystem and network, and sudo works wherever the \
+     operator's sudoers allows it. The trace and the records directory are written as always but \
+     are not protected from those commands.";
+
 /// The filesystem boundary the tier a session applies actually provides, and the protections it
 /// does not.
 ///
@@ -650,10 +668,18 @@ pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundar
     // The path-rewriting statement rides along with the mechanism-specific one rather than standing
     // on its own, so a composed root — where the paths outside it are absent, and the `~` rewrite
     // lands inside the workdir — discloses nothing at all.
+    if applied == EnforcementTier::Unconfined {
+        // `HOME` is not rewritten on this tier, so the path-rewriting statement does not apply.
+        return FilesystemBoundaryReport {
+            restriction: FilesystemRestriction::None,
+            not_protected: vec![UNCONFINED_NOT_PROTECTED.to_string()],
+        };
+    }
     // The `HOME` statement follows the path-rewriting one it qualifies, so that statement sits at
     // the same place on every tier that carries it.
     let not_protected: &[&str] = match applied {
         EnforcementTier::KernelSealed => &[],
+        EnforcementTier::Unconfined => unreachable!("returned above"),
         EnforcementTier::KernelFull => &[
             ENFORCED_FILESYSTEM_NOT_PROTECTED,
             PATH_REWRITING_NOT_PROTECTED,
@@ -666,6 +692,7 @@ pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundar
     };
     let restriction = match applied {
         EnforcementTier::KernelSealed => FilesystemRestriction::Absent,
+        EnforcementTier::Unconfined => unreachable!("returned above"),
         EnforcementTier::KernelFull => FilesystemRestriction::Enforced,
         EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
             FilesystemRestriction::Advisory
@@ -799,6 +826,10 @@ fn protected_dir_report(
         not_protected_because: Some(reason),
     };
     match applied {
+        EnforcementTier::Unconfined => not_protected(format!(
+            "the capsule runs unconfined, so its commands run as the operator and can change the \
+             {noun}"
+        )),
         EnforcementTier::EnvironmentOnly => not_protected(format!(
             "this host has no kernel containment for capsule commands — macOS and every \
              non-Linux host run them as the operator's own processes, so a command can change \
@@ -1222,6 +1253,152 @@ pub struct ScopeReport {
     /// [`temp_dir_report`] on the session's [`crate::temp_dir::temp_mapping`] answer — the one
     /// its enforcement installs. Always serialized.
     pub temp_dir: TempDirReport,
+    /// Who the capsule's subprocesses run as when the session is unconfined; `null` on every
+    /// contained session. Always serialized.
+    pub unconfined: Option<UnconfinedReport>,
+}
+
+/// What an unconfined session's subprocesses run as: `ScopeReport::unconfined`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnconfinedReport {
+    /// The account name of the uid `mur` runs as, `null` when the account database has none.
+    pub user: Option<String>,
+    /// The uid `mur` runs as, which every unconfined subprocess runs as.
+    pub uid: u32,
+    /// The `HOME` `mur run` was started with, which every unconfined subprocess sees; `null` when
+    /// it had none.
+    pub home: Option<String>,
+    /// The subprocess routes that run unconfined, as stable wire names.
+    pub applies_to: Vec<&'static str>,
+    /// The `capabilities.resources` fields the manifest declares, the only limits an unconfined
+    /// session applies.
+    pub resource_limits: Vec<&'static str>,
+}
+
+/// The subprocess routes an unconfined session runs as the operator, as
+/// [`UnconfinedReport::applies_to`] names them.
+pub const UNCONFINED_APPLIES_TO: &[&str] =
+    &["shell", "plan-shell-step", "native-tool", "process-harness"];
+
+impl UnconfinedReport {
+    /// The report for this process: its uid, that uid's account name, its `HOME`, and the fields
+    /// `declared` names.
+    pub(crate) fn for_this_process(declared: &murmur_artifact::ResourceCapabilities) -> Self {
+        let uid = current_uid();
+        Self {
+            user: account_name(uid),
+            uid,
+            home: std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned()),
+            applies_to: UNCONFINED_APPLIES_TO.to_vec(),
+            resource_limits: crate::resources::declared_resource_fields(declared),
+        }
+    }
+
+    /// The `Unconfined` block of `--explain-scope`. Ends with a newline.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let applies_to = self
+            .applies_to
+            .iter()
+            .map(|route| match *route {
+                "shell" => "shell commands",
+                "plan-shell-step" => "plan shell steps",
+                "native-tool" => "native tools",
+                "process-harness" => "process harness",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limits = if self.resource_limits.is_empty() {
+            "none declared".to_string()
+        } else {
+            self.resource_limits.join(", ")
+        };
+        format!(
+            "Unconfined\n  user:      {}\n  uid:       {}\n  HOME:      {}\n  applies to: \
+             {applies_to}\n  resource limits: {limits}\n",
+            self.user.as_deref().unwrap_or("<unknown>"),
+            self.uid,
+            self.home.as_deref().unwrap_or("<unset>"),
+        )
+    }
+}
+
+/// The `W-SEC-036` message for an unconfined session running as `report` says.
+pub(crate) fn unconfined_warning(report: &UnconfinedReport) -> String {
+    let user = match &report.user {
+        Some(user) => format!("{user} (uid {})", report.uid),
+        None => format!("uid {}", report.uid),
+    };
+    let home = report.home.as_deref().unwrap_or("<unset>");
+    format!(
+        "this capsule runs unconfined: its shell commands, plan shell steps, native tools and \
+         process harness run as {user} with HOME {home}, the whole environment mur run was \
+         started with (credential variables included), the host filesystem and network as that \
+         account has them, and no no_new_privs, so sudo works wherever that account's sudoers \
+         allows it"
+    )
+}
+
+/// Prints `W-SEC-036` once, on stderr and in the bootstrap log. Called by `launch_session` after
+/// staging succeeds, never by `--explain-scope`.
+pub(crate) fn warn_unconfined_launch(
+    records_root: &crate::workdir_fs::WorkdirRoot,
+    report: &UnconfinedReport,
+) {
+    let code = murmur_artifact::security_warnings::W_SEC_036;
+    let message = unconfined_warning(report);
+    let link = murmur_artifact::security_warning_link(code);
+    crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
+    crate::agent::append_bootstrap_log(
+        records_root,
+        &format!("[capability-policy] warning[{code}]: {message} ({link})"),
+    );
+}
+
+/// The uid this process runs as.
+#[cfg(unix)]
+pub(crate) fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_uid() -> u32 {
+    0
+}
+
+/// The account name the account database holds for `uid`, `None` when it holds none.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn account_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value of a plain C struct of pointers and integers;
+    // `getpwuid_r` overwrites it before it is read.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to a live local that outlives the call, and `buffer.len()` is the
+    // buffer's real length, so `getpwuid_r` writes only inside it.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` points at a NUL-terminated string inside `buffer`, which is
+    // still alive.
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn account_name(_uid: u32) -> Option<String> {
+    None
 }
 
 impl ScopeReport {
@@ -1261,6 +1438,11 @@ impl ScopeReport {
 
         out.push('\n');
         out.push_str(&render_routes(&self.routes));
+
+        if let Some(unconfined) = &self.unconfined {
+            out.push('\n');
+            out.push_str(&unconfined.render());
+        }
 
         out.push('\n');
         out.push_str(&render_runtime_dir(&self.runtime_dir));
@@ -1819,11 +2001,16 @@ pub(crate) fn scope_report_for_tier(
         ),
         enforcement_tier,
     );
-    for report in [&runtime_dir, &records_dir] {
-        if let Some(reason) = &report.not_protected_because {
-            filesystem_boundary.not_protected.push(reason.clone());
+    // On the unconfined tier the boundary's one statement already covers both directories.
+    if applied != EnforcementTier::Unconfined {
+        for report in [&runtime_dir, &records_dir] {
+            if let Some(reason) = &report.not_protected_because {
+                filesystem_boundary.not_protected.push(reason.clone());
+            }
         }
     }
+    let unconfined = (applied == EnforcementTier::Unconfined)
+        .then(|| UnconfinedReport::for_this_process(&policy.declared_resources));
 
     ScopeReport {
         declared_containment: declared,
@@ -1951,6 +2138,7 @@ pub(crate) fn scope_report_for_tier(
         runtime_dir,
         records_dir,
         temp_dir: temp_dir_report(temp_mapping, runtime_dir_placement),
+        unconfined,
     }
 }
 
@@ -1998,6 +2186,10 @@ pub(crate) fn report_for(
 /// The `mechanism` of a [`RouteReport`] whose route the session's class does not cover: the code
 /// runs as part of the `mur` process, or as a child it starts outside the class.
 pub const HOST_PROCESS_MECHANISM: &str = "host-process";
+
+/// The `note` of a [`RouteReport`] for a route [`Route::runs_unconfined`] on the unconfined tier.
+const UNCONFINED_ROUTE_NOTE: &str = "Runs as the operator, with their HOME, whole environment, \
+     filesystem, network and sudo; nothing holds it.";
 
 /// One route a capsule can run code on, as [`RouteReport::route`] names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2065,6 +2257,16 @@ impl Route {
         }
     }
 
+    /// Whether an unconfined session runs this route as the operator: the routes
+    /// [`UNCONFINED_APPLIES_TO`] names.
+    #[must_use]
+    pub fn runs_unconfined(self) -> bool {
+        match self {
+            Self::Shell | Self::PlanShellSteps | Self::NativeTools | Self::ProcessHarness => true,
+            Self::WasmTools | Self::Drivers | Self::Hooks | Self::HarnessTools => false,
+        }
+    }
+
     /// What an uncovered route does run under, as [`RouteReport::note`] states it; `None` for a
     /// covered route, which the tier's mechanism holds.
     #[must_use]
@@ -2105,10 +2307,12 @@ pub struct RouteReport {
     /// Whether the session's class covers the route, from [`Route::under_class`].
     pub under_class: bool,
     /// [`ScopeReport::enforcement_tier`]'s wire name when [`Self::under_class`], else
-    /// [`HOST_PROCESS_MECHANISM`].
+    /// [`HOST_PROCESS_MECHANISM`]. `unconfined` on the unconfined tier for every route
+    /// [`Route::runs_unconfined`].
     pub mechanism: &'static str,
-    /// What an uncovered route runs under, from [`Route::note`]; `null` when covered. Always
-    /// serialized.
+    /// What an uncovered route runs under, from [`Route::note`]; `null` when covered, except on
+    /// the unconfined tier, where a route [`Route::runs_unconfined`] says nothing holds it.
+    /// Always serialized.
     pub note: Option<&'static str>,
     /// The artifacts on the route, in manifest order: the tool, driver or hook entries it runs.
     /// Empty for a route no artifact names. Always serialized.
@@ -2181,6 +2385,7 @@ impl RouteInputs {
 #[must_use]
 pub fn route_table(inputs: &RouteInputs, enforcement_tier: &'static str) -> Vec<RouteReport> {
     use murmur_artifact::ArtifactImplementation;
+    let unconfined = enforcement_tier == enforcement_tier_name(EnforcementTier::Unconfined);
     let tools_of = |native: bool| -> Vec<String> {
         inputs
             .tools
@@ -2214,6 +2419,16 @@ pub fn route_table(inputs: &RouteInputs, enforcement_tier: &'static str) -> Vec<
                     (inputs.process_transport, Vec::new())
                 }
             };
+            if unconfined && route.runs_unconfined() {
+                return RouteReport {
+                    route,
+                    present,
+                    under_class: true,
+                    mechanism: enforcement_tier,
+                    note: Some(UNCONFINED_ROUTE_NOTE),
+                    artifacts,
+                };
+            }
             let under_class = route.under_class();
             RouteReport {
                 route,
@@ -2338,6 +2553,7 @@ fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
         EnforcementTier::KernelFull => "landlock+seccomp",
         EnforcementTier::KernelSeccompOnly => "seccomp-only",
         EnforcementTier::EnvironmentOnly => "none",
+        EnforcementTier::Unconfined => "unconfined",
     }
 }
 
@@ -2657,6 +2873,7 @@ mod tests {
                 KernelSealed => Sealed,
                 KernelFull => Scoped,
                 KernelSeccompOnly | EnvironmentOnly => Advisory,
+                EnforcementTier::Unconfined => unreachable!("never a host tier"),
             };
             for workdir_exec in [false, true] {
                 for inside in [false, true] {
@@ -2940,6 +3157,134 @@ mod tests {
             }],
             ..CapabilityPolicy::default()
         }
+    }
+
+    /// The unconfined stance is decided to the unconfined tier and class on every host, meets its
+    /// own floor, and every tier-keyed field of its report says what is true: no mechanism, no
+    /// Landlock ABI, no filesystem restriction, nothing read-only and `/tmp` not mapped.
+    #[test]
+    fn an_unconfined_report_names_no_protection_it_does_not_install() {
+        for host_tier in [
+            EnforcementTier::KernelSealed,
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            let decision =
+                ContainmentDecision::decide(host_tier, ContainmentClass::Unconfined, true, true);
+            assert_eq!(decision.applied_tier(), EnforcementTier::Unconfined);
+            assert_eq!(decision.achieved(), ContainmentClass::Unconfined);
+            assert_eq!(decision.enforcement_tier(), "unconfined");
+            assert_eq!(
+                decision.host_containment(),
+                achieved_class_for_tier(host_tier)
+            );
+        }
+        let policy = CapabilityPolicy {
+            containment_floor: ContainmentClass::Unconfined,
+            declared_resources: murmur_artifact::ResourceCapabilities {
+                max_open_files: Some(256),
+                ..Default::default()
+            },
+            ..sample_policy()
+        };
+        let report = report_for(
+            &policy,
+            ContainmentClass::Unconfined,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            Some(4),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(EnforcementTier::Unconfined),
+            IoMaxReport::default(),
+        );
+        assert!(report.floor_met);
+        assert_eq!(report.achieved_containment, ContainmentClass::Unconfined);
+        assert_eq!(report.enforcement_tier, "unconfined");
+        // The routes the stance runs as the operator say so; the in-process ones keep their notes.
+        for row in &report.routes {
+            if row.route.runs_unconfined() {
+                assert!(row.under_class, "{row:?}");
+                assert_eq!(row.mechanism, "unconfined", "{row:?}");
+                assert_eq!(row.note, Some(UNCONFINED_ROUTE_NOTE), "{row:?}");
+            } else {
+                assert_eq!(row.note, row.route.note(), "{row:?}");
+            }
+        }
+        assert_eq!(
+            uncovered_route_warning(report.declared_containment, &report.routes),
+            None,
+            "W-SEC-034 keys on a scoped or sealed floor"
+        );
+        assert_eq!(report.landlock_abi, None);
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::None
+        );
+        assert_eq!(
+            report.filesystem_boundary.not_protected,
+            vec![UNCONFINED_NOT_PROTECTED.to_string()]
+        );
+        for dir in [&report.runtime_dir, &report.records_dir] {
+            assert!(!dir.read_only_to_commands);
+            assert_eq!(dir.enforced_by, None);
+            assert!(dir
+                .not_protected_because
+                .as_deref()
+                .unwrap()
+                .contains("unconfined"));
+        }
+        assert!(!report.temp_dir.tmp_mapped);
+        assert_eq!(
+            report.temp_dir.not_mapped_because.as_deref(),
+            Some(crate::temp_dir::NotMappedReason::Unconfined.describe())
+        );
+        let unconfined = report.unconfined.as_ref().expect("an unconfined report");
+        assert_eq!(unconfined.uid, current_uid());
+        assert_eq!(unconfined.applies_to, UNCONFINED_APPLIES_TO.to_vec());
+        assert_eq!(unconfined.resource_limits, vec!["max_open_files"]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["enforcement_tier"], "unconfined");
+        assert_eq!(json["achieved_containment"], "unconfined");
+        assert_eq!(json["filesystem_boundary"]["restriction"], "none");
+        assert!(json["unconfined"].is_object(), "{json}");
+        let rendered = report.render();
+        assert!(rendered.contains("  achieved:  unconfined\n"), "{rendered}");
+        assert!(rendered.contains("\nUnconfined\n  user:"), "{rendered}");
+        assert!(rendered.contains("  uid:       "), "{rendered}");
+        assert!(rendered.contains("  HOME:      "), "{rendered}");
+        assert!(
+            rendered.contains(
+                "applies to: shell commands, plan shell steps, native tools, process harness"
+            ),
+            "{rendered}"
+        );
+        assert!(unconfined_warning(unconfined).contains("sudo"));
+
+        // A contained report carries the key, `null`.
+        let contained = report_for(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(EnforcementTier::KernelFull),
+            IoMaxReport::default(),
+        );
+        let json = serde_json::to_value(&contained).unwrap();
+        assert!(json["unconfined"].is_null(), "{json}");
+        assert!(json.as_object().unwrap().contains_key("unconfined"));
     }
 
     #[test]
@@ -4507,6 +4852,7 @@ mod tests {
             ("install_tool", "install_tool"),
             ("install_from_sources", "install_from"),
             ("containment_floor", "declared_containment"),
+            ("declared_resources", "unconfined"),
         ];
 
         let declared = capability_policy_field_names(include_str!("types.rs"));
@@ -5535,6 +5881,7 @@ mod tests {
                     EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
                         FilesystemRestriction::Advisory
                     }
+                    EnforcementTier::Unconfined => FilesystemRestriction::None,
                 };
                 assert_eq!(
                     report.filesystem_boundary.restriction, expected,
@@ -5549,6 +5896,7 @@ mod tests {
                     FilesystemRestriction::Advisory => "advisory",
                     FilesystemRestriction::Enforced => "enforced",
                     FilesystemRestriction::Absent => "absent",
+                    FilesystemRestriction::None => "none",
                 };
                 assert_eq!(
                     serde_json::to_value(report.filesystem_boundary.restriction).unwrap(),
@@ -5648,6 +5996,10 @@ mod tests {
                 FilesystemRestriction::Absent => assert!(
                     seen.contains("read=refused") && seen.contains("exists=no"),
                     "reported absent, so the path is not in the composed root: {seen}"
+                ),
+                FilesystemRestriction::None => assert!(
+                    seen.contains("read=PROBE-CONTENTS"),
+                    "reported none, so nothing denies the read: {seen}"
                 ),
             }
         }

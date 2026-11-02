@@ -138,24 +138,7 @@ impl Deployer {
         extra: &[&str],
         ceiling: Option<&str>,
     ) -> Deployed {
-        let mut command = Command::cargo_bin("mur").unwrap();
-        command
-            .env("HOME", self.home.path())
-            .env("PATH", target.path_env())
-            .env_remove(CEILING_ENV)
-            .current_dir(self.project.path())
-            .timeout(Duration::from_secs(600))
-            .args(["deploy", "run", "--host", "127.0.0.1", "--mur-binary"])
-            .arg(mur_binary)
-            .args([
-                "--deploy-platform",
-                murmur_artifact::current_platform(),
-                "--manifest",
-                self.manifest.to_str().unwrap(),
-                "--env",
-                &format!("GATEWAY_TEST_KEY={KEY}"),
-            ])
-            .args(extra);
+        let mut command = self.deploy_command(&target.path_env(), mur_binary, extra);
         if let Some(ceiling) = ceiling {
             command.env(CEILING_ENV, ceiling);
         }
@@ -174,6 +157,29 @@ impl Deployer {
             stderr,
             wall,
         }
+    }
+
+    /// The `mur deploy run` of [`Self::deploy`], with `path_env` as its `PATH`.
+    fn deploy_command(&self, path_env: &str, mur_binary: &Path, extra: &[&str]) -> Command {
+        let mut command = Command::cargo_bin("mur").unwrap();
+        command
+            .env("HOME", self.home.path())
+            .env("PATH", path_env)
+            .env_remove(CEILING_ENV)
+            .current_dir(self.project.path())
+            .timeout(Duration::from_secs(600))
+            .args(["deploy", "run", "--host", "127.0.0.1", "--mur-binary"])
+            .arg(mur_binary)
+            .args([
+                "--deploy-platform",
+                murmur_artifact::current_platform(),
+                "--manifest",
+                self.manifest.to_str().unwrap(),
+                "--env",
+                &format!("GATEWAY_TEST_KEY={KEY}"),
+            ])
+            .args(extra);
+        command
     }
 
     /// The URL `deployments.json` records for the latest deploy.
@@ -400,8 +406,14 @@ fn is_env_write(command: &str) -> bool {
     command.starts_with("printf '%s' ") && command.contains("/.env && chmod 600 ")
 }
 
+/// The start script's `mur run`. `mur run --contained-launch --help`, the probe sent before it,
+/// is not one.
 fn is_start(command: &str) -> bool {
-    command.contains("/usr/local/bin/mur run ")
+    command.contains("/usr/local/bin/mur run --manifest ")
+}
+
+fn is_contained_launch_probe(command: &str) -> bool {
+    command.starts_with("/usr/local/bin/mur run --contained-launch --help ")
 }
 
 fn is_precompile(command: &str) -> bool {
@@ -441,7 +453,14 @@ fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
     let commands = target.commands();
     let precompile = position(&commands, "precompile", is_precompile);
     assert!(position(&commands, ".env write", is_env_write) < precompile);
-    assert!(precompile < position(&commands, "start", is_start));
+    let start = position(&commands, "start", is_start);
+    assert!(precompile < start);
+    assert!(position(&commands, "probe", is_contained_launch_probe) < start);
+    assert!(
+        commands[start].contains(" --json --contained-launch "),
+        "a target mur that knows the flag is started contained: {}",
+        commands[start]
+    );
     let dir = remote_deploy_dir(&commands);
     let command = &commands[precompile];
     assert!(command.contains(" precompile --json "), "{command}");
@@ -654,6 +673,86 @@ fn a_target_mur_without_precompile_warns_and_the_capsule_still_serves() {
     deployer.serve_one_task(&deployed.url, 0);
     assert_forms_of_tool_and_driver(&target, &target.compiled_listing());
     target.stop_capsules();
+}
+
+/// A target `mur` from before `--contained-launch` rejects it as clap does. `mur deploy` asks
+/// first, so the start script leaves the flag out and the capsule still starts and serves.
+#[test]
+fn a_target_mur_without_contained_launch_still_starts_the_capsule() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_target_mur_without_contained_launch_still_starts_the_capsule",
+    ) {
+        return;
+    }
+    let deployer = Deployer::new();
+    let scripts = TempDir::new().unwrap();
+    let old_mur = scripts.path().join("mur");
+    fs::write(
+        &old_mur,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = --contained-launch ]; then\n    \
+             printf \"error: unexpected argument '--contained-launch' found\\n\" >&2\n    \
+             exit 2\n  fi\ndone\nexec '{}' \"$@\"\n",
+            real_mur().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&old_mur, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = LoopbackTarget::new();
+    let deployed = deployer.deploy(&target, &old_mur, &[], None);
+    let commands = target.commands();
+    let start = position(&commands, "start", is_start);
+    assert!(position(&commands, "probe", is_contained_launch_probe) < start);
+    assert!(
+        !commands[start].contains("--contained-launch"),
+        "{}",
+        commands[start]
+    );
+
+    deployer.serve_one_task(&deployed.url, 0);
+    target.stop_capsules();
+}
+
+/// `ssh` fails on the probe alone, as a dropped connection would. The deploy stops there with
+/// `E-DEPLOY-003` and never sends the start script: a target `mur` whose answer is unknown might
+/// know the flag, and starting it without `--contained-launch` would let the target's global
+/// config run the capsule unconfined.
+#[test]
+fn a_probe_ssh_cannot_deliver_stops_the_deploy_before_the_start() {
+    let deployer = Deployer::new();
+    let target = LoopbackTarget::new();
+    let wrapper = TempDir::new().unwrap();
+    let ssh = wrapper.path().join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *'mur run --contained-launch --help'*)\n    \
+             echo 'Connection to 127.0.0.1 closed by remote host.' >&2\n    exit 255 ;;\n\
+             esac\nexec '{}' \"$@\"\n",
+            target.path().join("shim/ssh").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!("{}:{}", wrapper.path().display(), target.path_env());
+    let output = deployer
+        .deploy_command(&path_env, &real_mur(), &[])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("E-DEPLOY-003"), "{stderr}");
+    let commands = target.commands();
+    assert!(
+        commands.iter().any(|command| is_precompile(command)),
+        "the deploy reached the step before the probe: {commands:#?}"
+    );
+    assert!(
+        !commands.iter().any(|command| is_start(command)),
+        "{commands:#?}"
+    );
 }
 
 // ─── measured, run by hand ───────────────────────────────────────────────────

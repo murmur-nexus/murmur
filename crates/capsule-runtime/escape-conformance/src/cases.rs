@@ -141,6 +141,10 @@ impl Case {
             ContainmentClass::Advisory => self.advisory,
             ContainmentClass::Scoped => self.scoped,
             ContainmentClass::Sealed => self.sealed,
+            // `--class` refuses it, so no run asks for this.
+            ContainmentClass::Unconfined => {
+                unreachable!("the harness runs the declarable classes only")
+            }
         }
     }
 }

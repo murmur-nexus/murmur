@@ -1866,6 +1866,13 @@ pub struct StateCapabilities {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ContainmentClass {
+    /// No containment at all: subprocesses run as the operator, with their `HOME`, their
+    /// whole environment, the host filesystem and network, and no `no_new_privs`, so `sudo`
+    /// works wherever the operator's sudoers allows it. Only the operator chooses it, with
+    /// `mur run --unconfined` or `containment: unconfined` in `~/.murmur/config.yaml`; a
+    /// manifest, a project config and `--containment` cannot name it, so it is absent from
+    /// [`ContainmentClass::DECLARABLE`]. It meets no declared floor.
+    Unconfined,
     /// No kernel mechanism required. Capability declarations are honored by the runtime's
     /// own dispatch layer and by convention; anything the host cannot mediate is warned
     /// about, not refused. Every host satisfies this, including macOS. The default.
@@ -1890,14 +1897,20 @@ impl ContainmentClass {
     /// `--containment` flag, `trace.jsonl`, and `--explain-scope` output.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unconfined => "unconfined",
             Self::Advisory => "advisory",
             Self::Scoped => "scoped",
             Self::Sealed => "sealed",
         }
     }
 
-    /// Every value, weakest first — the single source for the "must be one of: …" text.
-    pub const ALL: [ContainmentClass; 3] = [Self::Advisory, Self::Scoped, Self::Sealed];
+    /// Every value, weakest first.
+    pub const ALL: [ContainmentClass; 4] =
+        [Self::Unconfined, Self::Advisory, Self::Scoped, Self::Sealed];
+
+    /// The classes a manifest, a project config or `--containment` may name, weakest first —
+    /// the single source for the "must be one of: …" text.
+    pub const DECLARABLE: [ContainmentClass; 3] = [Self::Advisory, Self::Scoped, Self::Sealed];
 }
 
 impl std::fmt::Display for ContainmentClass {
@@ -1906,7 +1919,7 @@ impl std::fmt::Display for ContainmentClass {
     }
 }
 
-/// A string that is not one of the three containment class names.
+/// A string that is not a containment class name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseContainmentClassError {
     pub value: String,
@@ -1914,9 +1927,14 @@ pub struct ParseContainmentClassError {
 
 impl std::fmt::Display for ParseContainmentClassError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = ContainmentClass::DECLARABLE
+            .iter()
+            .map(|class| class.as_str())
+            .collect();
         write!(
             f,
-            "must be one of: advisory, scoped, sealed; got '{}'",
+            "must be one of: {}; got '{}'",
+            names.join(", "),
             self.value
         )
     }
@@ -1929,6 +1947,7 @@ impl std::str::FromStr for ContainmentClass {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
+            "unconfined" => Ok(Self::Unconfined),
             "advisory" => Ok(Self::Advisory),
             "scoped" => Ok(Self::Scoped),
             "sealed" => Ok(Self::Sealed),
@@ -1939,11 +1958,16 @@ impl std::str::FromStr for ContainmentClass {
     }
 }
 
+/// Why a manifest cannot declare `capabilities.containment: unconfined`.
+pub const UNCONFINED_NOT_DECLARABLE: &str = "unconfined is not a declarable floor; only the operator chooses it, with `mur run --unconfined` or `containment: unconfined` in ~/.murmur/config.yaml";
+
 /// The one floor a single `mur run` invocation must clear: the *strongest* class any source
 /// asked for, defaulting to [`ContainmentClass::Advisory`] when no source declares one.
 ///
 /// Monotonic by construction — an absent source does not participate, and no present source
-/// can lower what another raised. Argument order carries no precedence.
+/// can lower what another raised. Argument order carries no precedence. The inputs are
+/// declarable classes; the unconfined stance is resolved before a floor is computed, so it
+/// never reaches this function.
 pub fn effective_containment_floor(
     workspace_default: Option<ContainmentClass>,
     manifest_declared: Option<ContainmentClass>,
@@ -5091,12 +5115,19 @@ fn parse_capabilities(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
-            value.parse::<ContainmentClass>().map_err(|error| {
+            let class = value.parse::<ContainmentClass>().map_err(|error| {
                 RuntimeManifestError::InvalidCapabilities {
                     field: "capabilities.containment".to_string(),
                     message: error.to_string(),
                 }
-            })
+            })?;
+            if class == ContainmentClass::Unconfined {
+                return Err(RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.containment".to_string(),
+                    message: UNCONFINED_NOT_DECLARABLE.to_string(),
+                });
+            }
+            Ok(class)
         })
         .transpose()?;
 
@@ -13113,6 +13144,7 @@ capabilities:
 
     #[test]
     fn containment_classes_order_weakest_to_strongest() {
+        assert!(ContainmentClass::Unconfined < ContainmentClass::Advisory);
         assert!(ContainmentClass::Advisory < ContainmentClass::Scoped);
         assert!(ContainmentClass::Scoped < ContainmentClass::Sealed);
         assert!(ContainmentClass::Advisory < ContainmentClass::Sealed);
@@ -13139,6 +13171,39 @@ capabilities:
         assert_eq!(ContainmentClass::Advisory.as_str(), "advisory");
         assert_eq!(ContainmentClass::Scoped.as_str(), "scoped");
         assert_eq!(ContainmentClass::Sealed.as_str(), "sealed");
+        assert_eq!(ContainmentClass::Unconfined.as_str(), "unconfined");
+        assert_eq!(ContainmentClass::Unconfined.to_string(), "unconfined");
+        assert_eq!(
+            serde_json::to_string(&ContainmentClass::Unconfined).unwrap(),
+            "\"unconfined\""
+        );
+        assert_eq!(
+            serde_norway::from_str::<ContainmentClass>("unconfined").unwrap(),
+            ContainmentClass::Unconfined
+        );
+    }
+
+    #[test]
+    fn containment_declarable_classes_exclude_unconfined() {
+        use ContainmentClass::{Advisory, Scoped, Sealed, Unconfined};
+        assert_eq!(ContainmentClass::DECLARABLE, [Advisory, Scoped, Sealed]);
+        assert_eq!(
+            ContainmentClass::ALL,
+            [Unconfined, Advisory, Scoped, Sealed]
+        );
+        let inputs: Vec<Option<ContainmentClass>> = std::iter::once(None)
+            .chain(ContainmentClass::DECLARABLE.map(Some))
+            .collect();
+        for &workspace in &inputs {
+            for &manifest in &inputs {
+                for &cli in &inputs {
+                    assert_ne!(
+                        effective_containment_floor(workspace, manifest, cli),
+                        Unconfined
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -13255,7 +13320,7 @@ capabilities:
 
     #[test]
     fn manifest_parses_each_declared_containment_class() {
-        for class in ContainmentClass::ALL {
+        for class in ContainmentClass::DECLARABLE {
             let manifest = RuntimeManifest::from_yaml_str(&format!(
                 r#"
 name: cap
@@ -13321,6 +13386,28 @@ capabilities:
                     message,
                     "must be one of: advisory, scoped, sealed; got 'paranoid'"
                 );
+            }
+            other => panic!("expected InvalidCapabilities, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_refuses_an_unconfined_containment_class() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  containment: unconfined
+"#,
+        )
+        .expect_err("a manifest cannot choose the unconfined stance");
+
+        match err {
+            RuntimeManifestError::InvalidCapabilities { field, message } => {
+                assert_eq!(field, "capabilities.containment");
+                assert!(message.contains("mur run --unconfined"), "{message}");
+                assert!(message.contains("~/.murmur/config.yaml"), "{message}");
             }
             other => panic!("expected InvalidCapabilities, got {other:?}"),
         }

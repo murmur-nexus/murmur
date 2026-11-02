@@ -215,6 +215,25 @@ fn run_session_with(
     deadline_seconds: Option<u64>,
     plan_submit: bool,
 ) -> Session {
+    run_session_at(
+        responses,
+        hooks,
+        native_tools,
+        deadline_seconds,
+        plan_submit,
+        murmur_artifact::ContainmentClass::Advisory,
+    )
+}
+
+/// [`run_session_with`], staged at `floor`.
+fn run_session_at(
+    responses: Vec<String>,
+    hooks: &[Hook<'_>],
+    native_tools: &[(&str, &str)],
+    deadline_seconds: Option<u64>,
+    plan_submit: bool,
+    floor: murmur_artifact::ContainmentClass,
+) -> Session {
     let server = common::ScriptedServer::start(responses);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -261,7 +280,8 @@ fn run_session_with(
         deadline_seconds,
         plan_submit,
     );
-    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+    let staged =
+        common::stage_agent_session_at_floor(&home, project.path(), &manifest_path, floor, None);
     let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Do the thing.").unwrap();
@@ -399,6 +419,43 @@ fn denying_on_shell_hook_stops_the_command() {
         "nothing ran, so nothing is recorded as having run:\n{}",
         session.trace_raw
     );
+}
+
+/// An unconfined session's commands run as the operator, and a denying `on-shell` hook still
+/// stops one: the policy hooks and the trace stay on.
+#[test]
+fn an_unconfined_shell_command_is_still_denied_by_a_policy_hook() {
+    let session = run_session_at(
+        vec![
+            tool_call(
+                "msg_1",
+                "toolu_bash",
+                "bash",
+                json!({"command": marker_command()}),
+            ),
+            end_turn("msg_2", "Understood."),
+        ],
+        &[hook(
+            "branch-policy",
+            "on-shell",
+            "deny",
+            deny_hook_wasm("on-shell", "protected branch"),
+        )],
+        &[],
+        None,
+        false,
+        murmur_artifact::ContainmentClass::Unconfined,
+    );
+
+    assert!(!session.marker_exists(), "the denied command must not run");
+    let text = session.tool_result_text("toolu_bash");
+    assert!(text.contains("branch-policy"), "{text}");
+    assert!(text.contains("protected branch"), "{text}");
+
+    let start = &session.events("session_start")[0];
+    assert_eq!(start["containment_achieved"], "unconfined", "{start}");
+    assert_eq!(session.denial()["event"], "on-shell");
+    assert!(!session.events("session_end").is_empty());
 }
 
 /// A denying `on-tool-call` hook stops the tool: its side effect is absent and the trace

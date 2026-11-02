@@ -358,9 +358,9 @@ fn execute_inner(
     // unless its tree can be put in a cgroup scope. `has_native_artifact` is `false` here — a
     // plan step reaches native binaries only through `invoke_tool`, which routes back into the
     // session that already established its own scope.
-    let cgroup_scope = match crate::cgroup::prepare_scope(
-        crate::cgroup::requires_process_bounding(&ctx.capability_policy, false),
-        &ctx.capability_policy.resources,
+    let cgroup_scope = match crate::cgroup::prepare_policy_scope(
+        &ctx.capability_policy,
+        false,
         &plan.id,
         ctx.accessible_workdir.path(),
     ) {
@@ -382,13 +382,16 @@ fn execute_inner(
             ));
         }
     };
-    let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
-        &ctx.accessible_workdir,
-        ctx.runtime_dir.temp.as_ref(),
-        ctx.runtime_dir.home.as_ref(),
-        ctx.runtime_dir.records.as_ref(),
-        ctx.capability_policy.resources.workdir_max_bytes,
-    ));
+    let workdir_guard =
+        crate::resources::workdir_guard_max_bytes(&ctx.capability_policy).map(|max_bytes| {
+            crate::resources::WorkdirGuard::spawn(
+                &ctx.accessible_workdir,
+                ctx.runtime_dir.temp.as_ref(),
+                ctx.runtime_dir.home.as_ref(),
+                ctx.runtime_dir.records.as_ref(),
+                max_bytes,
+            )
+        });
 
     // Host-probed kernel enforcement tier + resolved network allowlist for this plan's shell
     // steps — resolved once, up front, same cadence as `runtime::launch_session`. The `/tmp`

@@ -1018,6 +1018,31 @@ fn a_formation_states_a_host_warning_once() {
     );
 }
 
+/// `mur run --roster --unconfined` passes `--unconfined` to every member, and each member records
+/// the unconfined stance.
+#[test]
+fn an_unconfined_roster_runs_every_member_unconfined() {
+    let _lock = launch_lock();
+    let project = Project::new(&[CODER, PLANNER], "");
+    let mut launcher = project.launch(&["--unconfined"], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.release.send(()).unwrap();
+    assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
+    for capsule in ["coder", "planner"] {
+        let start = &project.trace_of(capsule)[0];
+        assert_eq!(start["event_type"], "session_start", "{capsule}: {start}");
+        assert_eq!(
+            start["containment_achieved"], "unconfined",
+            "{capsule}: {start}"
+        );
+    }
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
+
 /// Scenario 2: only the members the entry member may call are handed to it; every member is
 /// launched regardless.
 #[test]

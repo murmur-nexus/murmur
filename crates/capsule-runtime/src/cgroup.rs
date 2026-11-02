@@ -142,6 +142,37 @@ pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
     writes
 }
 
+/// The writes of an unconfined session's scope: one per `cgroup_*` field `declared` names, and
+/// nothing else — no `memory.swap.max` and no default for an undeclared field. `io.max` is
+/// written separately, and only when declared.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn declared_scope_limits(
+    declared: &murmur_artifact::ResourceCapabilities,
+) -> Vec<ScopeLimit> {
+    let required = |file, value| ScopeLimit {
+        file,
+        value,
+        absent_ok: false,
+    };
+    let mut writes = Vec::new();
+    if let Some(bytes) = declared.cgroup_memory_bytes {
+        writes.push(required("memory.max", bytes.to_string()));
+    }
+    if let Some(pids) = declared.cgroup_pids_max {
+        writes.push(required("pids.max", pids.to_string()));
+    }
+    if let Some(percent) = declared.cgroup_cpu_percent {
+        writes.push(required(
+            "cpu.max",
+            format!(
+                "{} {CPU_MAX_PERIOD_US}",
+                u64::from(percent) * (CPU_MAX_PERIOD_US / 100)
+            ),
+        ));
+    }
+    writes
+}
+
 /// Whether this kernel gives a cgroup a `memory.swap.max` to write, as `mur doctor` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwapControl {
@@ -599,6 +630,19 @@ const NOT_LINUX_CGROUP_REASON: &str =
 /// and [`probe_scope`] cannot word the same finding differently.
 const NO_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so it is \
      given no cgroup scope and there is no process tree for an I/O ceiling to apply to";
+/// Why an unconfined session that can start a subprocess has no scope, as `cgroup_scope` and as
+/// `io_max` say it.
+const UNCONFINED_NO_CGROUP_SCOPE_REASON: &str = "this session runs unconfined and \
+     capabilities.resources declares no cgroup field, so a launch creates no cgroup scope for it";
+const UNCONFINED_NO_SCOPE_REASON: &str = "this session runs unconfined and \
+     capabilities.resources declares no cgroup field, so it is given no cgroup scope and no \
+     I/O ceiling applies";
+
+/// Why an unconfined session's scope carries no `io.max`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const UNCONFINED_IO_UNDECLARED_REASON: &str = "this session runs unconfined and \
+     capabilities.resources declares no cgroup_io_bytes_per_sec, so its cgroup scope writes no \
+     io.max";
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 const NOT_LINUX_REASON: &str =
     "cgroups are a Linux mechanism and this host has none, so no io.max ceiling can exist here";
@@ -703,7 +747,12 @@ pub(crate) fn prepare_scope(
         if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
             return Err("forced: delegation refused by the test seam".to_string());
         }
-        let (scope, io_max) = CgroupScope::create(limits, session_id, workdir)?;
+        let (scope, io_max) = CgroupScope::create(
+            &scope_limits(limits),
+            IoMaxWrite::Declared(limits.cgroup_io_bytes_per_sec),
+            session_id,
+            workdir,
+        )?;
         let scope = Arc::new(scope);
         Ok(PreparedScope {
             cgroup_scope: CgroupScopeReport::of_prepared(Some(&scope), true),
@@ -720,6 +769,93 @@ pub(crate) fn prepare_scope(
             cgroup_scope: CgroupScopeReport::of_prepared(None, true),
         })
     }
+}
+
+/// The session's or a plan's scope for `policy`: [`prepare_scope`] with the resolved limits on a
+/// contained session, and on an unconfined one (a `containment_floor` of
+/// [`murmur_artifact::ContainmentClass::Unconfined`]) a scope that writes only the `cgroup_*`
+/// fields `capabilities.resources` declares. [`requires_process_bounding`] decides whether one is
+/// required either way.
+pub(crate) fn prepare_policy_scope(
+    policy: &crate::types::CapabilityPolicy,
+    has_native_artifact: bool,
+    session_id: &str,
+    workdir: &Path,
+) -> Result<PreparedScope, String> {
+    let required = requires_process_bounding(policy, has_native_artifact);
+    if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
+        return prepare_scope(required, &policy.resources, session_id, workdir);
+    }
+    let reported_bytes_per_sec = policy.resources.cgroup_io_bytes_per_sec;
+    if !required {
+        let (io_max, cgroup_scope) = unrequired_scope_reports(policy, has_native_artifact);
+        return Ok(PreparedScope {
+            scope: None,
+            io_max,
+            cgroup_scope,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
+            return Err("forced: delegation refused by the test seam".to_string());
+        }
+        let declared = &policy.declared_resources;
+        let io = match declared.cgroup_io_bytes_per_sec {
+            Some(bytes_per_sec) => IoMaxWrite::Declared(bytes_per_sec),
+            None => IoMaxWrite::Undeclared(reported_bytes_per_sec),
+        };
+        let (scope, io_max) =
+            CgroupScope::create(&declared_scope_limits(declared), io, session_id, workdir)?;
+        let scope = Arc::new(scope);
+        Ok(PreparedScope {
+            cgroup_scope: CgroupScopeReport::of_prepared(Some(&scope), true),
+            scope: Some(scope),
+            io_max,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (session_id, workdir);
+        Ok(PreparedScope {
+            scope: None,
+            io_max: IoMaxReport::not_required(reported_bytes_per_sec, NOT_LINUX_REASON),
+            cgroup_scope: CgroupScopeReport::of_prepared(None, true),
+        })
+    }
+}
+
+/// The `io.max` and `cgroup_scope` reports of a session given no scope: the no-scope-required
+/// pair, or for an unconfined session that can start a subprocess and declares no `cgroup_*`
+/// field, the reason that is.
+fn unrequired_scope_reports(
+    policy: &crate::types::CapabilityPolicy,
+    has_native_artifact: bool,
+) -> (IoMaxReport, CgroupScopeReport) {
+    let reported_bytes_per_sec = policy.resources.cgroup_io_bytes_per_sec;
+    let has_route = crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact;
+    if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined && has_route {
+        return (
+            IoMaxReport::not_required(reported_bytes_per_sec, UNCONFINED_NO_SCOPE_REASON),
+            CgroupScopeReport::not_required(UNCONFINED_NO_CGROUP_SCOPE_REASON),
+        );
+    }
+    (
+        IoMaxReport::no_scope_required(reported_bytes_per_sec),
+        CgroupScopeReport::no_scope_required(),
+    )
+}
+
+/// Whether a scope writes `io.max`, and the ceiling it writes or reports.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+enum IoMaxWrite {
+    /// Write this ceiling.
+    Declared(u64),
+    /// An unconfined session declared no `cgroup_io_bytes_per_sec`: write nothing, and report the
+    /// resolved value as not required.
+    Undeclared(u64),
 }
 
 /// What [`probe_scope`] found: whether a launch would get its cgroup scope here, and whether the
@@ -830,6 +966,42 @@ fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
     )
 }
 
+/// What `mur run --explain-scope` reports for `policy`'s cgroup scope and `io.max`, on the terms
+/// a launch reports them: [`probe_scope`] for a contained session, and for an unconfined one the
+/// no-scope reports when it declares no `cgroup_*` field, else the probe with `io.max` written
+/// only when `cgroup_io_bytes_per_sec` is declared.
+#[must_use]
+pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Path) -> ScopeProbe {
+    let required = requires_process_bounding(policy, false);
+    if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
+        return probe_scope(required, &policy.resources, workdir);
+    }
+    if !required {
+        let (io_max, cgroup_scope) = unrequired_scope_reports(policy, false);
+        return ScopeProbe {
+            cgroup_scope,
+            io_max,
+        };
+    }
+    let declared_io = policy.declared_resources.cgroup_io_bytes_per_sec;
+    let mut probe = probe_scope(
+        true,
+        &HostResourceLimits {
+            cgroup_io_bytes_per_sec: declared_io
+                .unwrap_or(policy.resources.cgroup_io_bytes_per_sec),
+            ..policy.resources
+        },
+        workdir,
+    );
+    if cfg!(target_os = "linux") && declared_io.is_none() {
+        probe.io_max = IoMaxReport::not_required(
+            policy.resources.cgroup_io_bytes_per_sec,
+            UNCONFINED_IO_UNDECLARED_REASON,
+        );
+    }
+    probe
+}
+
 /// Does this policy give the capsule any way to run a native subprocess at all?
 ///
 /// The exact condition the Linux fail-closed launch refusal keys on: every route
@@ -838,11 +1010,19 @@ fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
 /// tool a pull installs), or a declared artifact whose implementation is native (passed in by the
 /// caller, which is the only place the installed-artifact list is in hand). The same routes the
 /// `E-CAP-005` egress refusal counts, from the same function.
+///
+/// An unconfined session (a `containment_floor` of
+/// [`murmur_artifact::ContainmentClass::Unconfined`]) additionally requires a `cgroup_*` field
+/// in `capabilities.resources`: it bounds only what the manifest declares.
 pub fn requires_process_bounding(
     policy: &crate::types::CapabilityPolicy,
     has_native_artifact: bool,
 ) -> bool {
-    crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact
+    let has_route = crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact;
+    if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined {
+        return has_route && crate::resources::declares_cgroup_limit(&policy.declared_resources);
+    }
+    has_route
 }
 
 impl CgroupScope {
@@ -1612,7 +1792,8 @@ impl CgroupScope {
     /// the launch must not proceed. The one exception is a kernel that exposes no
     /// `memory.swap.max` at all (see [`ScopeLimit::absent_ok`]).
     fn create(
-        limits: &HostResourceLimits,
+        limits: &[ScopeLimit],
+        io: IoMaxWrite,
         session_id: &str,
         workdir: &Path,
     ) -> Result<(Self, IoMaxReport), String> {
@@ -1628,10 +1809,15 @@ impl CgroupScope {
             watcher: None,
         };
 
-        for limit in scope_limits(limits) {
-            scope.write_limit(&limit)?;
+        for limit in limits {
+            scope.write_limit(limit)?;
         }
-        let io_max = scope.apply_io_max(limits.cgroup_io_bytes_per_sec, workdir);
+        let io_max = match io {
+            IoMaxWrite::Declared(bytes_per_sec) => scope.apply_io_max(bytes_per_sec, workdir),
+            IoMaxWrite::Undeclared(bytes_per_sec) => {
+                IoMaxReport::not_required(bytes_per_sec, UNCONFINED_IO_UNDECLARED_REASON)
+            }
+        };
 
         // Opened last, so a scope that failed any of the fatal writes above is never handed out
         // with a usable join descriptor.
@@ -2781,6 +2967,124 @@ mod tests {
         assert!(
             !requires_process_bounding(&bare, false),
             "a WASM-only capsule has no process tree to bound and must not be blocked"
+        );
+    }
+
+    /// An unconfined session requires a scope only when it can start a subprocess and declares a
+    /// `cgroup_*` field; a contained one requires one for any subprocess route.
+    #[test]
+    fn an_unconfined_session_requires_a_scope_only_for_a_declared_cgroup_field() {
+        use murmur_artifact::{ContainmentClass, ResourceCapabilities};
+        let shell = |containment_floor, declared_resources| crate::types::CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            containment_floor,
+            declared_resources,
+            ..Default::default()
+        };
+        assert!(requires_process_bounding(
+            &shell(ContainmentClass::Advisory, ResourceCapabilities::default()),
+            false
+        ));
+        assert!(!requires_process_bounding(
+            &shell(
+                ContainmentClass::Unconfined,
+                ResourceCapabilities::default()
+            ),
+            true
+        ));
+        assert!(!requires_process_bounding(
+            &shell(
+                ContainmentClass::Unconfined,
+                ResourceCapabilities {
+                    max_open_files: Some(256),
+                    workdir_max_bytes: Some(1 << 20),
+                    ..Default::default()
+                }
+            ),
+            false
+        ));
+        for declared in [
+            ResourceCapabilities {
+                cgroup_memory_bytes: Some(1 << 30),
+                ..Default::default()
+            },
+            ResourceCapabilities {
+                cgroup_pids_max: Some(64),
+                ..Default::default()
+            },
+            ResourceCapabilities {
+                cgroup_cpu_percent: Some(50),
+                ..Default::default()
+            },
+            ResourceCapabilities {
+                cgroup_io_bytes_per_sec: Some(1 << 20),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                requires_process_bounding(&shell(ContainmentClass::Unconfined, declared), false),
+                "{declared:?}"
+            );
+            let bare = crate::types::CapabilityPolicy {
+                containment_floor: ContainmentClass::Unconfined,
+                declared_resources: declared,
+                ..Default::default()
+            };
+            assert!(
+                !requires_process_bounding(&bare, false),
+                "no subprocess route, no scope"
+            );
+        }
+
+        // An unconfined session with no scope says why, without claiming it starts nothing.
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = prepare_policy_scope(
+            &shell(
+                ContainmentClass::Unconfined,
+                ResourceCapabilities::default(),
+            ),
+            false,
+            "ses_unconfined",
+            temp.path(),
+        )
+        .expect("an unconfined session with no cgroup field is never refused");
+        assert!(prepared.scope.is_none());
+        assert_eq!(prepared.io_max.status, IoMaxStatus::NotRequired);
+        assert_eq!(
+            prepared.io_max.reason.as_deref(),
+            Some(UNCONFINED_NO_SCOPE_REASON)
+        );
+    }
+
+    /// An unconfined scope writes exactly the `cgroup_*` fields declared, and no swap bound.
+    #[test]
+    fn an_unconfined_scope_writes_only_the_declared_fields() {
+        use murmur_artifact::ResourceCapabilities;
+        assert!(declared_scope_limits(&ResourceCapabilities::default()).is_empty());
+        let files = |declared: ResourceCapabilities| -> Vec<(&str, String)> {
+            declared_scope_limits(&declared)
+                .into_iter()
+                .map(|limit| (limit.file, limit.value))
+                .collect()
+        };
+        assert_eq!(
+            files(ResourceCapabilities {
+                cgroup_pids_max: Some(64),
+                max_open_files: Some(256),
+                ..Default::default()
+            }),
+            vec![("pids.max", "64".to_string())]
+        );
+        assert_eq!(
+            files(ResourceCapabilities {
+                cgroup_memory_bytes: Some(1024),
+                cgroup_cpu_percent: Some(50),
+                ..Default::default()
+            }),
+            vec![
+                ("memory.max", "1024".to_string()),
+                ("cpu.max", format!("50000 {CPU_MAX_PERIOD_US}")),
+            ]
         );
     }
 

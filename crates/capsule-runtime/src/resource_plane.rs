@@ -390,10 +390,14 @@ pub enum SymlinkPolicy {
 ///   no outside to name, so everything under the export root is capsule-authored. Follow, and check the target.
 /// * `advisory` — a convention on top of a convention. Same rule as `sealed`, and every response
 ///   says `advisory` so a caller knows what it is trusting.
+/// * `unconfined` — nothing contains the capsule's commands. Same rule as `advisory`, and every
+///   response says `unconfined`.
 pub fn symlink_policy(class: ContainmentClass) -> SymlinkPolicy {
     match class {
         ContainmentClass::Scoped => SymlinkPolicy::Refuse,
-        ContainmentClass::Sealed | ContainmentClass::Advisory => SymlinkPolicy::FollowWithinRoot,
+        ContainmentClass::Sealed | ContainmentClass::Advisory | ContainmentClass::Unconfined => {
+            SymlinkPolicy::FollowWithinRoot
+        }
     }
 }
 

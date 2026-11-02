@@ -35,6 +35,10 @@ pub(crate) struct RosterLaunch<'a> {
     pub(crate) verbose: bool,
     pub(crate) no_env_file: bool,
     pub(crate) containment: Option<&'a str>,
+    /// `--unconfined`: every member is passed it.
+    pub(crate) unconfined: bool,
+    /// The hidden `--contained-launch`: the roster runs contained whatever the global config says.
+    pub(crate) contained_launch: bool,
     /// `--deadline`: seconds from this launcher's start to the formation's one deadline.
     pub(crate) deadline: Option<u64>,
 }
@@ -47,6 +51,22 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         .deadline
         .map(|secs| SessionDeadline::after(Instant::now(), SystemTime::now(), secs));
     refuse_inside_a_formation()?;
+    // The roster's own stance, from its flags and both config files. An unconfined roster passes
+    // `--unconfined` to every member, which resolves it against its own manifest; a contained one
+    // passes the contained-launch flag. Decided before anything is read or started.
+    let containment_config = crate::config::load_containment_config()?;
+    let stance = crate::stance::resolve_stance(crate::stance::StanceInputs {
+        unconfined_flag: launch.unconfined,
+        containment_flag: launch
+            .containment
+            .map(crate::stance::parse_containment_value)
+            .transpose()?,
+        contained_launch: launch.contained_launch,
+        spawn_grant_stdin: false,
+        global: containment_config.global,
+        project: containment_config.project,
+        manifest: None,
+    })?;
     let project_dir = roster_project_dir(launch.roster)?;
 
     // The stores and the lock `mur run --capsule` resolves a member from, in the same order.
@@ -86,6 +106,7 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     options.verbose = launch.verbose;
     options.no_env_file = launch.no_env_file;
     options.containment = launch.containment.map(str::to_string);
+    options.unconfined = stance.is_unconfined();
     options.deadline = deadline;
 
     formation_launch::catch_launcher_signals().map_err(|error| {

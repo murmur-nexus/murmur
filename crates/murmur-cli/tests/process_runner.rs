@@ -271,6 +271,11 @@ struct Run {
 
 impl Capsule {
     fn run(&self, profile: &str, extra_env: &[(&str, &str)]) -> Run {
+        self.run_with(profile, extra_env, &[])
+    }
+
+    /// [`Self::run`] with `extra_args` after `mur run`'s own.
+    fn run_with(&self, profile: &str, extra_env: &[(&str, &str)], extra_args: &[&str]) -> Run {
         let mut command = Command::cargo_bin("mur").unwrap();
         command
             .env_clear()
@@ -290,6 +295,7 @@ impl Capsule {
                 "do the thing",
                 "--verbose",
             ])
+            .args(extra_args)
             .output()
             .unwrap();
         let text = format!(
@@ -845,6 +851,29 @@ fn trace_show_prints_the_latest_quota_window_per_name() {
 }
 
 // ── S7: exactly the declared environment ──────────────────────────────────────
+
+/// An unconfined session's harness starts from the operator's whole environment: an undeclared
+/// host variable and `HOME` reach it, as `harness_start.env_names` records.
+#[test]
+fn s7_an_unconfined_harness_inherits_the_operators_environment() {
+    let capsule = Built::new().with_tool().build();
+    let run = capsule
+        .run_with(
+            "env",
+            &[("FIXTURE_UNDECLARED_SENTINEL", "reaches-the-harness")],
+            &["--unconfined"],
+        )
+        .succeeded();
+    let start = run.one("harness_start");
+    let env_names = names(&start["env_names"]);
+    for name in ["FIXTURE_UNDECLARED_SENTINEL", "HOME", "MURMUR_RUNTIME_DIR"] {
+        assert!(env_names.contains(&name), "{name} not in {env_names:?}");
+    }
+    assert_eq!(
+        run.one("session_start")["containment_achieved"],
+        "unconfined"
+    );
+}
 
 #[test]
 fn s7_the_harness_sees_exactly_what_was_declared_and_set() {

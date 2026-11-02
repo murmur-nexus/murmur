@@ -772,6 +772,7 @@ mod tests {
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
+            unconfined: false,
         };
         assert!(started_by_hand(&member));
         member.spawned_by = Some("ses_0199c4e2f1b7712a9d3e4f5061728390".to_string());

@@ -40,6 +40,7 @@ capsule on a sealed-capable host runs on Full.
 | Full | Linux, kernel ≥5.13 (Landlock available) | `landlock+seccomp` | kernel-enforced | kernel-enforced | kernel-enforced |
 | Seccomp-only | Linux, kernel <5.13 (no Landlock) | `seccomp-only` | **not** enforced | **not** enforced¹ | kernel-enforced |
 | Environment-only | macOS, Windows, any non-Linux host | `none` | **not** enforced | **not** enforced | **not** enforced |
+| Unconfined | Any host, when the operator [runs the capsule unconfined](#unconfined) | `unconfined` | none: the operator's own access | none | none |
 
 ¹ Exec is a Landlock right, so a host without Landlock has no kernel-level exec mediation at all.
 Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
@@ -76,8 +77,13 @@ Each row has these keys:
 | `present` | boolean | Whether this capsule has the route |
 | `under_class` | boolean | Whether the session's class covers the route |
 | `mechanism` | string | The `enforcement_tier` wire name when `under_class` is `true`; `host-process` when it is `false` |
-| `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true` |
+| `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true`, except on the Unconfined tier |
 | `artifacts` | array of strings | The tool, driver or hook entries on the route, in manifest order; `[]` for a route no artifact names |
+
+On the [Unconfined tier](#unconfined) the `shell`, `plan-shell-steps`, `native-tools` and
+`process-harness` rows read `under_class: true` and `mechanism: unconfined`, with the note
+`Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing
+holds it.` The other four rows are unchanged.
 
 Whether a tool is native is read off the installed artifact at launch, and off `murmur.lock` under
 `--explain-scope` and `mur doctor`; a tool `murmur.lock` does not pin is reported under
@@ -112,7 +118,7 @@ Linux is refused with [`E-RUN-012`](resource-limits.md#platform-behavior) when i
 |---|---|---|---|
 | `delegated` | A child cgroup was created under the delegated base: at launch the session's scope, under `--explain-scope` and `mur doctor` a throwaway one removed again | absent | absent |
 | `unavailable` | No child cgroup could be created, so a launch of this capsule is refused with `E-RUN-012` | the failing call's errno by name, such as `EROFS`; absent when no call left one | the reason text `E-RUN-012` prints on the same host |
-| `not-required` | No scope is created: the capsule declares no way to run a native subprocess, or the host is not Linux | absent | which of the two |
+| `not-required` | No scope is created: the capsule declares no way to run a native subprocess, the session runs [unconfined](#unconfined) and `capabilities.resources` declares no `cgroup_*` field, or the host is not Linux | absent | which of the three |
 | `not-probed` | Nobody asked | absent | absent |
 
 `--explain-scope` answers by doing what a launch does — resolving the delegated base, then creating
@@ -398,10 +404,12 @@ its `errno` and the readings identify the host condition:
 
 A containment class is a floor requirement — "don't launch me unless the host can actually enforce
 at least this much" — as opposed to a capability grant like `network.allow` or `shell.allow`, which
-describe *what* is allowed once a session is running. Three classes exist, weakest to strongest:
+describe *what* is allowed once a session is running. Three classes can be declared, weakest to
+strongest, above the operator's own `unconfined` stance:
 
 | Class | Meaning |
 |---|---|
+| `unconfined` | No containment: the capsule's commands run as the operator. Chosen only by the operator, never declared — see [Running unconfined](#unconfined). |
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
 | `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs a seccomp profile permitting `unshare(CLONE_NEWUSER)`, `setns`, `mount`, `umount2` and `pivot_root`, which the container runtime's default profile refuses, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
@@ -537,6 +545,82 @@ the same `required by:` lines. A `pull-artifact` of such a tool into a session b
 refused, with nothing installed.
 
 ---
+
+## Running unconfined { #unconfined }
+
+An operator can run their own capsule on the host the way a local coding agent runs: as
+themselves, with their home folder, their environment and `sudo`.
+
+| Chosen by | Scope |
+|---|---|
+| `mur run --unconfined` | This launch |
+| `containment: unconfined` in `~/.murmur/config.yaml` | Every launch the operator makes, unless it passes `--containment <class>` |
+
+Nothing else chooses it:
+
+| Source | Result |
+|---|---|
+| `capabilities.containment: unconfined` in a manifest, a capsule artifact's included | Refused at parse with `E-MAN-003` |
+| `containment: unconfined` in `.murmur/config.yaml` in the project | Refused with [`E-CFG-005`](diagnostics.md#e-cfg-005) by every command that reads the config |
+| `--containment unconfined` | Refused with `E-IO-003`, naming `--unconfined` |
+| An environment variable | None is read |
+
+A declared floor is never lowered. `--unconfined`, or the global `containment: unconfined`, meeting a
+`capabilities.containment` in the manifest, or a `containment` floor in either config file, is
+refused with [`E-RUN-059`](diagnostics.md#e-run-059), naming both. `--unconfined` together with
+`--containment` is a usage error.
+
+**What it removes.** An unconfined capsule's shell commands, plan shell steps, native tools and
+`transport: process` harness run on the Unconfined tier, which installs no network namespace, no
+`/tmp` mapping, no composed root, no capability drop, no `no_new_privs`, no seccomp filter and no
+Landlock domain. They get:
+
+| | Unconfined | Contained |
+|---|---|---|
+| `HOME` | The `HOME` `mur run` was started with | The [session's home folder](#home-folder) |
+| Environment | `mur run`'s whole environment, credential variables included, less what `capabilities.shell.strip_env` matches and less the names `mur` keeps for a session's own lineage (`MURMUR_SPAWNER`, `MURMUR_FORMATION_*`, `MURMUR_SPAWNER_LIFELINE`, `MURMUR_HOST_WARNINGS_REPORTED`, `MURMUR_ROOST_URL`) | A fixed baseline, credential variables stripped |
+| `TMPDIR` | `mur run`'s own, and the host's `/tmp` | The [session's temporary folder](#temp-folder) |
+| Filesystem and network | As the operator has them | The tier's grants |
+| `sudo` | Works wherever the operator's sudoers allows it. murmur does not manage `sudo` | Refused by `no_new_privs` |
+| Resource limits | Only the fields `capabilities.resources` declares: an undeclared limit is the one `mur run` has, a cgroup scope is created only for a declared `cgroup_*` field, and the workdir ceiling applies only when `workdir_max_bytes` is declared | Every field, with its default |
+
+`MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` are still the session's own, and a `mur run` an
+unconfined command starts is a fresh top-level session.
+
+**What stays on.** The `capabilities.shell.allow` dispatch check (under unconfined, a listed binary
+may start anything), `capabilities.filesystem.read_only`, policy hooks, the trace, the spend
+ceilings, `inference.max_turns`, deadlines, the untrusted-content fence, the credential gateway,
+and every [WASM artifact's boundary](#artifact-boundary): its preopens, environment and network
+allowlist do not change.
+
+**What is not protected.**
+
+- The trace and the records directory are written as always, but the capsule's commands run as the
+  operator and can change them.
+- A process an unconfined command moves out of its process group, with `setsid` for example, can
+  outlive the session.
+
+**It never spreads.** Every launch the runtime makes on the operator's behalf runs contained: a
+delegated child, a plan `capsule` step, a roster member of a contained `mur run --roster`, a
+capsule `mur deploy` starts, and a launch redeeming a roost spawn approval. Such a launch refuses
+`--unconfined` with [`E-RUN-060`](diagnostics.md#e-run-060). `mur deploy` asks the target's `mur`
+first and starts it this way only when it knows how; a `mur` from before the unconfined stance
+always runs contained. A deploy that cannot ask stops with `E-DEPLOY-003`.
+`mur run --roster --unconfined` passes `--unconfined` to every member, and each member resolves it
+against its own manifest.
+
+**Reporting.** `mur run` prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line per launch
+instead of the tier warnings. The stance is recorded and reported everywhere:
+
+| Surface | Says |
+|---|---|
+| `session_start` | `containment_declared` and `containment_achieved` are `unconfined`; `effective_grants.unconfined` names the user, uid and `HOME` |
+| `mur run --explain-scope` | `achieved:  unconfined`, `mechanism: unconfined`, and an `Unconfined` block with the user, uid, `HOME`, the routes it applies to and the declared resource limits; `--json` carries the block as `unconfined`, `null` on a contained run, and `filesystem_boundary.restriction` as `none` |
+| `mur trace show` | The `containment:` line names the user and `HOME` the commands ran as |
+| `mur ps` | A line below the table per unconfined session; `--json` carries `"unconfined": true` |
+| `mur doctor` | A `Containment stance:` line when the global config chooses it, and an `E-RUN-059` warning when a floor is declared too |
+
+See [Run a capsule on the host](../how-to/run-capsule-on-the-host.md).
 
 ## What bounds a WASM artifact { #artifact-boundary }
 

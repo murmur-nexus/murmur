@@ -129,6 +129,10 @@ impl ParentWorkdirReport {
                 "advisory: nothing in the kernel stops a command that names the parent's work \
                  folder by its absolute path; the runtime grants it nowhere"
             }
+            FilesystemRestriction::None => {
+                "none: this session runs unconfined, so a command can reach the parent's work \
+                 folder as the operator can"
+            }
         }
     }
 }
