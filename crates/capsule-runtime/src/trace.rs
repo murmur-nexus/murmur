@@ -903,6 +903,98 @@ struct BackgroundCommandEvent<'a> {
     output_bytes: u64,
 }
 
+/// The fields of a `process_start` line: a program a WASM tool started through `murmur:process`.
+#[derive(Serialize)]
+pub(crate) struct ProcessStartLine<'a> {
+    /// The task whose tool call started it. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    /// The tool that started it.
+    pub(crate) tool: &'a str,
+    /// The session process's handle, or the `prc_` id minted for one `run`.
+    pub(crate) process_id: &'a str,
+    /// `run` or `session`.
+    pub(crate) kind: &'static str,
+    /// The tool's name for a session process; null for a `run`.
+    pub(crate) name: Option<&'a str>,
+    /// The program, resolved against the host `PATH`.
+    pub(crate) binary: &'a str,
+    /// The arguments, without the program.
+    pub(crate) argv: &'a [String],
+    /// The process's pid, which also names its process group.
+    pub(crate) pid: i32,
+}
+
+#[derive(Serialize)]
+struct ProcessStartEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(flatten)]
+    line: ProcessStartLine<'a>,
+}
+
+/// The fields of a `process_exit` line.
+#[derive(Serialize)]
+pub(crate) struct ProcessExitLine<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    pub(crate) tool: &'a str,
+    pub(crate) process_id: &'a str,
+    pub(crate) kind: &'static str,
+    pub(crate) name: Option<&'a str>,
+    pub(crate) binary: &'a str,
+    /// The exit code; a death by signal `n` is `128 + n`.
+    pub(crate) exit_code: i32,
+    /// `exited`, `stopped`, `timed_out` or `session_end`.
+    pub(crate) reason: &'static str,
+    pub(crate) duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ProcessExitEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(flatten)]
+    line: ProcessExitLine<'a>,
+}
+
+/// The fields of a `process_refused` line.
+#[derive(Serialize)]
+pub(crate) struct ProcessRefusedLine<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    pub(crate) tool: &'a str,
+    /// `run`, `session` or `connect`.
+    pub(crate) kind: &'static str,
+    /// The session process named; null for a `run`.
+    pub(crate) name: Option<&'a str>,
+    /// The program, resolved; absent for `connect`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binary: Option<&'a str>,
+    /// The port asked for; present for `connect` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) port: Option<u16>,
+    pub(crate) rule: &'static str,
+    pub(crate) reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct ProcessRefusedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(flatten)]
+    line: ProcessRefusedLine<'a>,
+}
+
 /// A detached command the session ended without carrying its result back. No task will ever report
 /// it; this record and the operator report beside it are what keep the loss visible.
 ///
@@ -4932,6 +5024,48 @@ impl ResourceTraceAppender {
             exit_code,
             waited_ms,
             output_bytes,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records a program a WASM tool started through `murmur:process`, hung off the session node.
+    /// Failures are swallowed, as every line this appender writes.
+    pub(crate) async fn write_process_start(&self, line: ProcessStartLine<'_>) {
+        let event = ProcessStartEvent {
+            event_type: "process_start",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            line,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records the exit of a program a WASM tool started through `murmur:process`, hung off the
+    /// session node.
+    pub(crate) async fn write_process_exit(&self, line: ProcessExitLine<'_>) {
+        let event = ProcessExitEvent {
+            event_type: "process_exit",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            line,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records a `murmur:process` `run`, `start` or `connect` a rule refused, hung off the session
+    /// node.
+    pub(crate) async fn write_process_refused(&self, line: ProcessRefusedLine<'_>) {
+        let event = ProcessRefusedEvent {
+            event_type: "process_refused",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            line,
         };
         self.append(&event).await;
     }

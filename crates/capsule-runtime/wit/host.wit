@@ -4,4 +4,11 @@ world runtime-host {
   import murmur:artifact-manager/manage@0.1.0;
   import murmur:shell/execute@0.1.0;
   import murmur:tool-registry/invoke@0.2.0;
+  import murmur:message/send@0.1.0;
+}
+
+/// The interfaces the runtime provides to a WASM tool's own store, beyond the ones registered by
+/// hand in `invoke_tool_component`.
+world tool-host {
+  import murmur:process/process@0.1.0;
 }

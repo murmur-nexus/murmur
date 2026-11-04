@@ -39,7 +39,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -899,6 +899,64 @@ transports. A refused call writes none
 
 ```json
 {"event_type":"background_command","event_id":"evt_01a15992…","parent_id":"evt_01a15991…","session_id":"ses_01a15991…","timestamp":1792504131519,"task_id":"tsk_01a15991…","work_id":"wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2","operation":"wait","state":"exited","exit_code":1,"waited_ms":312004,"output_bytes":48213}
+```
+
+**`process_start`**{ #process-start } — written when a program a WASM tool runs through
+[`murmur:process`](wit-interfaces.md#process) has started: one per `run`, one per `start` that
+started a process
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task whose tool call started it. Absent outside a task |
+| `tool` | string | The tool that started it |
+| `process_id` | string | The session process's handle, or a `prc_` id minted for one `run` |
+| `kind` | string | `"run"` \| `"session"` |
+| `name` | string or null | The session process's name; null for a `run` |
+| `binary` | string | The program, resolved against the host `PATH` |
+| `argv` | array of strings | The arguments, without the program |
+| `pid` | i32 | The process's pid, which also names its process group |
+
+```json
+{"event_type":"process_start","event_id":"evt_01a1b0c2…","parent_id":"evt_01a1b0c1…","session_id":"ses_01a1b0c1…","timestamp":1793820000000,"task_id":"tsk_01a1b0c1…","tool":"process-probe","process_id":"prc_019a5a7c3e1f7d2c9b8a6f5e4d3c2b1a","kind":"session","name":"web","binary":"/usr/bin/python3","argv":["-m","http.server","--bind","127.0.0.1","8765"],"pid":412233}
+```
+
+**`process_exit`**{ #process-exit } — written once for every `process_start`, when the process
+exits: for a session process when it happens, not at the tool's next call
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | As on `process_start` |
+| `tool` | string | As on `process_start` |
+| `process_id` | string | As on `process_start` |
+| `kind` | string | As on `process_start` |
+| `name` | string or null | As on `process_start` |
+| `binary` | string | As on `process_start` |
+| `exit_code` | i32 | The exit code; a death by signal `n` is `128 + n` |
+| `reason` | string | `"exited"` \| `"stopped"` (a `stop` call) \| `"timed_out"` (a `run` past its time limit) \| `"session_end"` (killed as the session ended, written before `session_end`) |
+| `duration_ms` | u64 | From the start to the exit |
+
+```json
+{"event_type":"process_exit","event_id":"evt_01a1b0d9…","parent_id":"evt_01a1b0c1…","session_id":"ses_01a1b0c1…","timestamp":1793820004200,"task_id":"tsk_01a1b0c1…","tool":"process-probe","process_id":"prc_019a5a7c3e1f7d2c9b8a6f5e4d3c2b1a","kind":"session","name":"web","binary":"/usr/bin/python3","exit_code":137,"reason":"session_end","duration_ms":4200}
+```
+
+**`process_refused`**{ #process-refused } — written when a rule refuses a `run`, a `start` or a
+`connect`; nothing ran. The rules are listed under
+[`murmur:process/process`](wit-interfaces.md#process). A refusal at the decision point also writes
+the `call_denied` or `protected_path_denied` line it always writes
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | As on `process_start` |
+| `tool` | string | The tool whose call was refused |
+| `kind` | string | `"run"` \| `"session"` \| `"connect"` |
+| `name` | string or null | The session process named; null for a `run` |
+| `binary` | string | The program, resolved. Absent for `"connect"` |
+| `port` | u16 | The port asked for. Present for `"connect"` only |
+| `rule` | string | The rule that refused |
+| `reason` | string | What the rule found |
+
+```json
+{"event_type":"process_refused","event_id":"evt_01a1b0c5…","parent_id":"evt_01a1b0c1…","session_id":"ses_01a1b0c1…","timestamp":1793820001000,"task_id":"tsk_01a1b0c1…","tool":"process-probe","kind":"connect","name":"web","port":443,"rule":"connect","reason":"no process in the group of 'web' listens on port 443 at a loopback or wildcard address"}
 ```
 
 **`deadline_notice`**{ #deadline-notice } — written once, when a tool result carries the

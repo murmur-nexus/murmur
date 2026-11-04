@@ -474,43 +474,76 @@ enum Wait {
     Stop(ForegroundStop),
 }
 
-/// The one place a shell command is checked, contained, spawned and waited for: [`run_shell`]
-/// and [`run_shell_until_stopped`] differ only in `wait`. The second value is set when a
-/// [`Wait::Stop`] killed the command.
-fn spawn_and_wait(
+/// The `capabilities.shell.allow` check every program the runtime runs for a capsule passes first:
+/// a shell call's binary and a WASM tool's `murmur:process` program alike.
+pub(crate) fn check_shell_allow(policy: &CapabilityPolicy, binary: &str) -> Result<(), String> {
+    if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
+        return Err(format!(
+            "binary '{binary}' is not in capabilities.shell.allow"
+        ));
+    }
+    Ok(())
+}
+
+/// Why [`spawn_contained`] started nothing.
+pub(crate) enum ContainedSpawnError {
+    /// `capabilities.resources.max_workdir_bytes` is already crossed.
+    WorkdirBudget(String),
+    /// Environment construction, enforcement setup or the spawn itself failed.
+    Exec(ShellExecError),
+}
+
+impl From<ContainedSpawnError> for ShellExecError {
+    fn from(error: ContainedSpawnError) -> Self {
+        match error {
+            ContainedSpawnError::WorkdirBudget(message) => Self::Failed(message),
+            ContainedSpawnError::Exec(error) => error,
+        }
+    }
+}
+
+/// A program [`spawn_contained`] started: its child, the group it leads, and the cgroup
+/// bookkeeping that must stay held until it exits.
+pub(crate) struct ContainedChild {
+    pub(crate) child: std::process::Child,
+    /// The child leads its own process group, so its pid names the group.
+    pub(crate) pgid: i32,
+    /// The program as `resolve_invoked_binary_path` named it before the spawn.
+    pub(crate) resolved_binary: String,
+    pub(crate) started: Instant,
+    pub(crate) cgroup_occupancy: Option<crate::cgroup::ScopeOccupancy>,
+    pub(crate) cgroup_counters_before: Option<crate::cgroup::CgroupEventCounters>,
+}
+
+/// Everything between a program's admission and its running child, in one order for every
+/// program the runtime runs for a capsule: the workdir budget, the sanitized environment, the
+/// work folder as its current directory, its own process group, the kernel enforcement of the
+/// session's tier (fail-closed), cgroup occupancy, and the spawn.
+///
+/// The caller has already checked [`check_shell_allow`] and asked whatever decision point
+/// applies. stdout and stderr are piped; `stdin` is the caller's. `subject` names the caller in an
+/// enforcement failure's text.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_contained(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
     accessible_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
-    wait: Wait,
-) -> Result<(ShellOutcome, Option<ForegroundStopReason>), ShellExecError> {
+    stdin: Stdio,
+    subject: &str,
+) -> Result<ContainedChild, ContainedSpawnError> {
     use std::os::unix::process::CommandExt as _;
-
-    if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
-        return Err(ShellExecError::Failed(format!(
-            "binary '{binary}' is not in capabilities.shell.allow"
-        )));
-    }
-
-    // A call the task's tool loop reaches after its cancel starts nothing: the task is ending,
-    // and a command it started now would only be demoted at its first poll.
-    if let Wait::Detach(DetachPolicy {
-        canceled: Some(canceled),
-        ..
-    }) = &wait
-    {
-        if canceled.is_canceled() {
-            return Err(ShellExecError::Failed(CANCELED_BEFORE_SPAWN.to_string()));
-        }
-    }
 
     // Refuse before spawning, not after: once the workdir ceiling is crossed, the cheapest way
     // to stop it growing further is to not start the next process that would write to it.
-    enforcement.check_workdir_budget()?;
+    enforcement
+        .check_workdir_budget()
+        .map_err(ContainedSpawnError::WorkdirBudget)?;
 
-    let env = subprocess_env(policy, env_overrides, enforcement)?;
+    let env = subprocess_env(policy, env_overrides, enforcement)
+        .map_err(|error| ContainedSpawnError::Exec(ShellExecError::Failed(error)))?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
     // run, and it is the only point where the invoked name is still in hand.
@@ -524,8 +557,9 @@ fn spawn_and_wait(
         .env_clear()
         .envs(env)
         // A command in its own process group that read `mur`'s terminal would be stopped by
-        // `SIGTTIN`, and under process transport `mur`'s stdin is a protocol pipe.
-        .stdin(Stdio::null())
+        // `SIGTTIN`, and under process transport `mur`'s stdin is a protocol pipe, so a caller
+        // passes `Stdio::null()` or a pipe of its own, never the inherited stdin.
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Its own group, so what it leaves holding its pipes can be killed without touching
@@ -537,7 +571,8 @@ fn spawn_and_wait(
     // subprocess with zero enforcement because setup failed. This also installs the hard
     // rlimits and (where a scope exists) cgroup membership for the child.
     let supervisor =
-        crate::sandbox::prepare_enforcement(&mut command, enforcement, accessible_workdir.path())?;
+        crate::sandbox::prepare_enforcement(&mut command, enforcement, accessible_workdir.path())
+            .map_err(|error| ContainedSpawnError::Exec(ShellExecError::Failed(error)))?;
 
     // Entered before the snapshot and held until the command exits — carried to the demoted
     // thread if it gets that far — so a sibling's spawn anywhere inside this window is visible to
@@ -550,15 +585,15 @@ fn spawn_and_wait(
         .as_ref()
         .map(|scope| scope.event_counters());
 
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Err(enforced_spawn_failure(
+            return Err(ContainedSpawnError::Exec(enforced_spawn_failure(
                 command,
                 &supervisor,
-                "shell",
+                subject,
                 error.to_string(),
-            ))
+            )))
         }
     };
     // The child is its group's leader, so its pid names the group.
@@ -568,6 +603,60 @@ fn spawn_and_wait(
             sink.store(pgid, std::sync::atomic::Ordering::SeqCst);
         }
     });
+
+    Ok(ContainedChild {
+        child,
+        pgid,
+        resolved_binary,
+        started,
+        cgroup_occupancy,
+        cgroup_counters_before,
+    })
+}
+
+/// The one place a shell command is checked, contained, spawned and waited for: [`run_shell`]
+/// and [`run_shell_until_stopped`] differ only in `wait`. The second value is set when a
+/// [`Wait::Stop`] killed the command.
+fn spawn_and_wait(
+    binary: &str,
+    args: &[&str],
+    env_overrides: &[(String, String)],
+    accessible_workdir: &WorkdirRoot,
+    policy: &CapabilityPolicy,
+    enforcement: &crate::sandbox::ShellEnforcement,
+    wait: Wait,
+) -> Result<(ShellOutcome, Option<ForegroundStopReason>), ShellExecError> {
+    check_shell_allow(policy, binary).map_err(ShellExecError::Failed)?;
+
+    // A call the task's tool loop reaches after its cancel starts nothing: the task is ending,
+    // and a command it started now would only be demoted at its first poll.
+    if let Wait::Detach(DetachPolicy {
+        canceled: Some(canceled),
+        ..
+    }) = &wait
+    {
+        if canceled.is_canceled() {
+            return Err(ShellExecError::Failed(CANCELED_BEFORE_SPAWN.to_string()));
+        }
+    }
+
+    let ContainedChild {
+        mut child,
+        pgid,
+        resolved_binary,
+        started,
+        cgroup_occupancy,
+        cgroup_counters_before,
+    } = spawn_contained(
+        binary,
+        args,
+        env_overrides,
+        accessible_workdir,
+        policy,
+        enforcement,
+        Stdio::null(),
+        "shell",
+    )?;
 
     // `wait_with_output` reads both pipes and waits in one uninterruptible step, so it cannot be
     // given a deadline. Draining each pipe on its own thread separates reading from waiting,

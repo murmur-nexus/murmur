@@ -1,0 +1,140 @@
+package murmur:process@0.1.0;
+
+/// Programs a WASM tool runs, under exactly the rules a shell command obeys.
+///
+/// Every program must be named in `capabilities.shell.allow`, runs at the session's containment
+/// tier inside its cgroup scope, network namespace and resource limits with the sanitized shell
+/// environment, and is put to the `capabilities.filesystem.read_only` check and every `on-shell`
+/// `commit_policy: deny` hook, on the argv it will run, before it starts.
+///
+/// The functions are served only to an agent capsule's tool calls. Everywhere else (an inference
+/// driver turn, a hook's `run-inference`, a script capsule's `invoke`) every function returns
+/// `refused` with rule `unavailable`.
+interface process {
+  /// A session process, as the runtime names it: `prc_` and lowercase hex. Valid only for the
+  /// tool that started it, until the session ends.
+  type handle = string;
+
+  /// Why a program was not run or a connection not opened.
+  record refusal {
+    /// The rule that refused: `capabilities.shell.allow`, `on-shell`,
+    /// `capabilities.filesystem.read_only`, `capabilities.resources.max_workdir_bytes`,
+    /// `session-process-cap`, `name`, `connect`, `unavailable` or `session-ended`.
+    rule: string,
+    /// What the rule found, in words.
+    reason: string,
+  }
+
+  variant process-error {
+    /// A rule refused the call; nothing ran.
+    refused(refusal),
+    /// The handle names no process this tool started in this session.
+    unknown-handle,
+    /// The process has exited.
+    not-running,
+    /// The call's time ran out before it finished.
+    timed-out,
+    /// The program could not be started or reached; the text says why.
+    failed(string),
+  }
+
+  record run-request {
+    /// The program, as named in `capabilities.shell.allow`.
+    program: string,
+    /// The arguments, without the program.
+    args: list<string>,
+    /// Environment variables added to the sanitized shell environment.
+    env: list<tuple<string, string>>,
+    /// Bytes written to the program's stdin, followed by end-of-file; `none` gives it no stdin.
+    stdin: option<list<u8>>,
+    /// The time limit in milliseconds, clamped to what is left of this tool call's deadline;
+    /// `none` means the rest of that deadline.
+    timeout-ms: option<u64>,
+  }
+
+  record run-output {
+    /// The exit code; a death by signal `n` is `128 + n`. A non-zero code is not an error.
+    exit-code: s32,
+    /// The time limit passed and the program's process group was killed.
+    timed-out: bool,
+    /// The first 1 MiB of stdout.
+    stdout: list<u8>,
+    /// Stdout was longer than 1 MiB and the rest was discarded.
+    stdout-truncated: bool,
+    /// The first 1 MiB of stderr.
+    stderr: list<u8>,
+    /// Stderr was longer than 1 MiB and the rest was discarded.
+    stderr-truncated: bool,
+  }
+
+  /// Run a program to completion. Nothing it starts outlives this tool call.
+  run: func(request: run-request) -> result<run-output, process-error>;
+
+  record start-request {
+    /// The tool's own name for the process: 1 to 64 characters from `A-Z a-z 0-9 . _ -`.
+    name: string,
+    /// The program, as named in `capabilities.shell.allow`.
+    program: string,
+    /// The arguments, without the program.
+    args: list<string>,
+    /// Environment variables added to the sanitized shell environment.
+    env: list<tuple<string, string>>,
+  }
+
+  record started {
+    handle: handle,
+    /// A process under this name was already running for this tool, and this is its handle;
+    /// nothing new ran.
+    already-running: bool,
+  }
+
+  /// Start a program that keeps running for the session, under `name`. A session holds at most
+  /// 8 running processes, all tools together; each is killed with its process group when the
+  /// session ends.
+  start: func(request: start-request) -> result<started, process-error>;
+
+  /// The handle of this tool's latest process under `name`, running or exited.
+  find: func(name: string) -> option<handle>;
+
+  variant state {
+    running,
+    /// The exit code; a death by signal `n` is `128 + n`.
+    exited(s32),
+  }
+
+  status: func(handle: handle) -> result<state, process-error>;
+
+  /// Write all of `bytes` to the process's stdin. `timed-out` at the tool call's deadline,
+  /// `not-running` once the process has exited.
+  write: func(handle: handle, bytes: list<u8>) -> result<_, process-error>;
+
+  record output {
+    stdout: list<u8>,
+    stderr: list<u8>,
+    /// Stdout bytes discarded since the last read because more than 1 MiB was waiting.
+    stdout-dropped: u64,
+    /// Stderr bytes discarded since the last read because more than 1 MiB was waiting.
+    stderr-dropped: u64,
+  }
+
+  /// Up to `max-bytes` of each stream printed since the last read, oldest first; the rest stays
+  /// buffered. Each stream keeps its newest 1 MiB.
+  read: func(handle: handle, max-bytes: u32) -> result<output, process-error>;
+
+  /// Send `SIGTERM` to the process group, `SIGKILL` 2 seconds later, and return the final state.
+  stop: func(handle: handle) -> result<state, process-error>;
+
+  /// A TCP connection to a port a session process listens on. Lasts until the tool call that
+  /// opened it returns.
+  resource connection {
+    /// Up to `max-bytes`, waiting at most `timeout-ms` for the first byte. An empty list means
+    /// the peer closed the connection; `timed-out` means nothing arrived in time.
+    read: func(max-bytes: u32, timeout-ms: u32) -> result<list<u8>, process-error>;
+    /// Write all of `bytes`.
+    write: func(bytes: list<u8>) -> result<_, process-error>;
+  }
+
+  /// Connect to `port` at loopback inside the session's network namespace. Refused with rule
+  /// `connect` unless a process in the handle's process group listens on `port`.
+  connect: func(handle: handle, port: u16) -> result<connection, process-error>;
+}

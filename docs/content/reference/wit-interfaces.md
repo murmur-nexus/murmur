@@ -18,6 +18,7 @@ version each one carries.
 | [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | Implemented natively by the runtime | Run an allowlisted shell binary |
 | [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
 | [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
+| [`murmur:process/process`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process.wit) | Imported by tool components | Run a program, or keep one running for the session, under the rules a shell command obeys |
 | [`murmur:stream/events`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-stream/events.wit) | Imported by tool and driver components | Tell the session's stream what a turn is doing while it is still in flight: reply and thinking chunks, and a tool call being written |
 | [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
@@ -33,7 +34,7 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | World | Imports | Exports | Defined in |
 |---|---|---|---|
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `tool` | `task/task`, `stream/events` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
+| `tool` | `task/task`, `stream/events`, `process/process` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `stream/events` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read`, `conversation/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `murmur:message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
@@ -579,6 +580,72 @@ A driver's [safety checks](#safety-checks) on a tool call put the task in
 [lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,
 the component is aborted and the attempt ends; the task ends `TASK_STATE_FAILED` with message
 `input-timeout` unless an `on-task-end` hook reopens it.
+
+---
+
+## `murmur:process/process` { #process }
+
+A WASM tool runs a program to completion with `run`, or starts one that keeps running for the
+session with `start` and reaches it again on later calls. Every program obeys exactly what a
+shell command obeys:
+
+- it is named in [`capabilities.shell.allow`](manifest.md);
+- it runs at the session's [containment tier](containment.md#wasm-tool-programs), inside the
+  session's cgroup scope, network namespace and resource limits, with the shell's sanitized
+  environment plus the request's `env`;
+- the [`capabilities.filesystem.read_only`](manifest.md) check and every `on-shell` hook with
+  `commit_policy: deny` see its argv before it starts, and can refuse it.
+
+The interface is served to an agent capsule's tool calls, on `transport: http` and
+`transport: process` alike, plan steps included. In an inference driver's call, a hook's
+`run-inference` and a script capsule's `invoke`, every function returns `refused` with rule
+`unavailable`.
+
+| Function | What it does |
+|---|---|
+| `run(request)` | Runs `program` with `args`, `env` and optional `stdin` bytes (then end-of-file) and returns its exit code and output. The time limit is `timeout-ms`, clamped to what is left of the tool call's [`deadline_seconds`](manifest.md); past it the process group is killed (`SIGKILL`), and the output so far returns with `timed-out` set and exit code `137`. A non-zero exit is data, not an error. Nothing it starts outlives the tool call |
+| `start(request)` | Starts `program` under `name` and returns its handle. A name already running for this tool returns that handle with `already-running` set, before anything is checked or asked: nothing new runs. A name whose process has exited starts a new one |
+| `find(name)` | This tool's latest handle under `name`, running or exited; `none` if it started none |
+| `status(handle)` | `running` or `exited(code)` |
+| `write(handle, bytes)` | Writes all of `bytes` to the process's stdin. `timed-out` at the tool call's deadline, `not-running` once it has exited |
+| `read(handle, max-bytes)` | Up to `max-bytes` of each stream printed since the last read, oldest first; the rest stays buffered. `stdout-dropped` and `stderr-dropped` count bytes pushed out since the last read |
+| `stop(handle)` | Sends `SIGTERM` to the process group, `SIGKILL` 2 seconds later, waits up to 3 seconds more, and returns the final state |
+| `connect(handle, port)` | Opens a TCP connection to `port` at loopback, inside the session's network namespace. The `connection` resource's `read` and `write` exchange bytes with it until the tool call returns |
+
+| Bound | Value |
+|---|---|
+| Running session processes per session, all tools together | 8; an exited process does not count |
+| `run` output | The first 1 MiB of each stream; `stdout-truncated` / `stderr-truncated` mark the rest discarded |
+| Session process output | The newest 1 MiB of each stream between two `read`s |
+| Process name | 1 to 64 characters from `A-Z a-z 0-9 . _ -` |
+
+A handle is `prc_` followed by lowercase hex. It resolves only for the tool that started the
+process: any other tool gets `unknown-handle`, and its `find` of the same name returns `none`.
+Every session process is killed with its process group when the session ends.
+
+`connect` reaches a port only while a process in the handle's process group holds a socket
+listening on it at a loopback or wildcard address, as that process's own network namespace
+reports it. Every other port is refused with rule `connect`, whatever listens there: another
+session process, the session's egress proxy, or on the unconfined tier any host service.
+
+A refusal is `refused({ rule, reason })`, nothing ran, and a `process_refused` line is
+[traced](observability-schemas.md#process-refused):
+
+| `rule` | Refused because |
+|---|---|
+| `capabilities.shell.allow` | The program is not in `capabilities.shell.allow` |
+| `on-shell` | An `on-shell` deny hook refused it (`reason` names the hook and its reason), or the session has such a hook or a `read_only` declaration and the call has no route to the decision point |
+| `capabilities.filesystem.read_only` | The argv writes a declared read-only path |
+| `capabilities.resources.max_workdir_bytes` | The work folder is over its size limit |
+| `session-process-cap` | The session already holds 8 running processes |
+| `name` | The process name breaks the naming rule |
+| `connect` | No process in the handle's group listens on the port |
+| `unavailable` | The call is not an agent capsule's tool call |
+| `session-ended` | The session has ended |
+
+`unknown-handle`, `not-running`, `timed-out` and `failed(text)` are errors, not refusals, and
+are not traced as refusals. No `on-shell` observation (the `outcome: some` dispatch a shell
+command gets after it runs) is made for a program run through this interface.
 
 ---
 

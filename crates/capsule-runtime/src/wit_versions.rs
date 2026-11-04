@@ -25,6 +25,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),
+    ("murmur:process", "0.1.0"),
     ("murmur:runtime", "0.4.0"),
     ("murmur:runtime-guest", "0.1.0"),
     ("murmur:shell", "0.1.0"),
@@ -111,6 +112,7 @@ mod tests {
             crate::inference_import::INFERENCE_IFACE_VERSIONED,
             crate::task_io_import::TASK_IO_IFACE_VERSIONED,
             crate::tokens_import::TOKENS_IFACE_VERSIONED,
+            crate::session_process::PROCESS_IFACE,
         ];
         let served = served_set();
         for interface in resolved {
@@ -149,8 +151,44 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_3() {
-        assert_eq!(served_wit_level().level, 3);
+    fn wit_levels_served_level_is_level_4() {
+        assert_eq!(served_wit_level().level, 4);
+    }
+
+    /// Level 4 adds `murmur:process` as a new package and moves nothing else, so an artifact fits
+    /// level 4 exactly when it fits level 3, unless it imports the new package.
+    #[test]
+    fn wit_levels_level_4_only_adds_the_process_package() {
+        use murmur_artifact::{
+            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
+        };
+        let levels = wit_levels();
+        let (three, four) = (&levels[2], &levels[3]);
+        let added: Vec<_> = four
+            .packages
+            .iter()
+            .filter(|package| !three.packages.contains(package))
+            .collect();
+        assert_eq!(
+            added,
+            [&("murmur:process".to_string(), "0.1.0".to_string())]
+        );
+        assert_eq!(four.packages.len(), three.packages.len() + 1);
+
+        let contracts = |imports: &[&str]| WitContracts {
+            exports: vec!["murmur:tool/run@0.2.0".to_string()],
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level, current_platform())
+                == VersionFit::Fits
+        };
+        let tool = || contracts(&["murmur:stream/events@0.1.0", "murmur:task/task@0.1.0"]);
+        assert!(fits(tool(), three));
+        assert!(fits(tool(), four));
+        let process_tool = || contracts(&["murmur:process/process@0.1.0"]);
+        assert!(!fits(process_tool(), three));
+        assert!(fits(process_tool(), four));
     }
 
     /// Level 3 moved `murmur:tool` and `murmur:tool-registry` together, for `tool-result`'s

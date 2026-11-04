@@ -17,6 +17,7 @@ Current versions:
 | `murmur:artifact-manager`| `0.1.0`  |
 | `murmur:shell`           | `0.1.0`  |
 | `murmur:message`         | `0.1.0`  |
+| `murmur:process`         | `0.1.0`  |
 | `murmur:task`            | `0.1.0`  |
 | `murmur:task-io`         | `0.1.0`  |
 | `murmur:conversation`    | `0.2.0`  |
@@ -418,6 +419,19 @@ the host reads the file under the work folder's own rules. Media types beyond
 the four the host checks, and a placement hint for the driver, were declined:
 each would be a field nobody yet needs, and the next one is a breaking bump of
 its own.
+
+`murmur:process@0.1.0` was added on 2026-11-04, WIT level 4: the interface
+`murmur:process/process@0.1.0`, through which a WASM tool runs a program or keeps
+one running for the session under the rules a shell command obeys. It is a new
+package under the "wholly new interface" rule below. The `tool` world in
+`murmur:runtime-guest` imports it, and the host binds it through a new
+`tool-host` world in `murmur:host`; both are world-only packages whose version is
+part of no instance name, so both stay `0.1.0`. No instance name changed and no
+committed component was rebuilt: a component imports only the interfaces its
+source calls, so a tool built against the extended `tool` world that does not
+call `murmur:process` names exactly what it named before. An artifact therefore
+fits level 4 exactly when it fits level 3, unless it imports the new package,
+which fits level 4 only.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

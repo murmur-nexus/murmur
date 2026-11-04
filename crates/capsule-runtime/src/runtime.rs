@@ -4711,6 +4711,20 @@ fn launch(
                     // deadline default — see `CapabilityPolicy::hook_limits`.
                     let hook_limits = capability_policy.hook_limits();
 
+                    // The session's processes, started by its WASM tools through
+                    // `murmur:process`: contained by the session's enforcement, given the
+                    // environment every shell command of the session is given, and recorded on
+                    // the concurrent trace appender.
+                    let session_processes =
+                        Arc::new(crate::session_process::SessionProcesses::new(
+                            shell_enforcement_for_state.clone(),
+                            capability_policy.clone(),
+                            accessible_root.clone(),
+                            native_env(&all_env),
+                            resource_trace.clone(),
+                        ));
+                    let session_processes_for_teardown = Arc::clone(&session_processes);
+
                     // Build CapsuleStoreState ONCE — reused across all task iterations
                     let mut state = CapsuleStoreState {
                         // Agent capsules have no WASM component of their own, so this state
@@ -4801,6 +4815,7 @@ fn launch(
                         current_forget_harness_session: None,
                         live_delegations: Arc::clone(&live_delegations),
                         detached: Some(Arc::clone(&detached)),
+                        session_processes: Some(session_processes),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
                         background_results_delivered: effective_lifecycle
                             .can_receive_background_tasks(),
@@ -4915,6 +4930,9 @@ fn launch(
                         run_config.conversation_root.clone(),
                     )
                     .await?;
+                    // Whether a WASM tool's program can be refused by a hook, for the dispatches
+                    // that hold no decision point of their own.
+                    session_processes_for_teardown.set_hooks_gate_calls(hooks.gates_calls());
 
                     // on-session-start fires ONCE per launch, before the task loop —
                     // regardless of task_acceptance. For queue capsules this is the single
@@ -5530,6 +5548,9 @@ fn launch(
                     // commands' groups are killed by the registry first, which reaches them on a
                     // host with no cgroup scope too.
                     detached.kill_running();
+                    // The WASM tools' session processes, with their process groups, each
+                    // recorded as ended by the session before `session_end` is written.
+                    session_processes_for_teardown.end_session().await;
                     shell_enforcement_for_teardown.end_session();
                     // Work that reported after the task loop stopped reading. No task will carry
                     // the result, so it is discarded on the same terms as work still running — but
@@ -5844,6 +5865,7 @@ fn launch(
         // have nowhere to be delivered: every command it dispatches runs to completion in the
         // foreground.
         detached: None,
+        session_processes: None,
         shell_grace_secs: None,
         background_results_delivered: false,
         a2a_task_registry: None,
@@ -8220,6 +8242,9 @@ pub(crate) struct CapsuleStoreState {
     /// keeps a call site foreground-only: the script-capsule path and every test construction
     /// run no task loop, so a completion would have nowhere to land.
     pub(crate) detached: Option<Arc<DetachedRegistry>>,
+    /// The processes this session's WASM tools started through `murmur:process`, killed at the
+    /// session's end. `None` for a script capsule and every store that is not an agent session's.
+    pub(crate) session_processes: Option<Arc<crate::session_process::SessionProcesses>>,
     /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
     /// is demoted. Read from the resolved lifecycle once per launch. `None` demotes no command on
     /// a clock, and the session offers no `background-command`.
@@ -9125,6 +9150,9 @@ pub(crate) struct ToolInvokeEnv<'a> {
     pub(crate) role: ComponentRole,
     /// The session's latch, where a call the wall-clock bound stops is recorded.
     pub(crate) call_deadlines: &'a CallDeadlines,
+    /// What the store's `murmur:process` import serves: an agent capsule's tool call gets the
+    /// session's processes, every other call the reason it gets none.
+    pub(crate) process: crate::session_process::ProcessAccess,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -9189,6 +9217,7 @@ pub(crate) async fn invoke_tool_component(
         task_provenance,
         role,
         call_deadlines,
+        process,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -9311,6 +9340,21 @@ pub(crate) async fn invoke_tool_component(
             .map_err(|err| format!("failed to register request-input for tool '{name}': {err}"))?;
     }
 
+    // `murmur:process`, always defined so a tool importing it instantiates; each function refuses
+    // with rule `unavailable` when the store holds no process context.
+    crate::session_process::add_to_linker(&mut linker, |state: &mut ToolStoreState| {
+        crate::session_process::ProcessView {
+            access: &state.process,
+            table: &mut state.table,
+        }
+    })
+    .map_err(|err| {
+        format!(
+            "failed to register {} for tool '{name}': {err}",
+            crate::session_process::PROCESS_IFACE
+        )
+    })?;
+
     let tool_limits = capability_policy.limits;
     // Both halves of the grant are resolved here, on the one path every WASM tool and the
     // inference driver share, so a driver needs no enforcement code of its own.
@@ -9350,6 +9394,7 @@ pub(crate) async fn invoke_tool_component(
             formation: formation.cloned(),
             task_provenance,
         },
+        process,
     };
 
     let mut store = Store::new(engine, state);
@@ -9395,6 +9440,10 @@ pub(crate) async fn invoke_tool_component(
     // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
     // also the driver path (`agent.rs` dispatches the inference driver through here).
     store.set_epoch_deadline(tool_limits.deadline_ticks());
+    store
+        .data_mut()
+        .process
+        .begin_call(std::time::Duration::from_secs(tool_limits.deadline_seconds));
     let called = call_deadlines
         .bound(
             name,
@@ -9531,6 +9580,9 @@ impl CapsuleStoreState {
             &env,
             tool_calls,
             ComponentRole::Driver,
+            crate::session_process::ProcessAccess::Unavailable(
+                crate::session_process::unavailable::DRIVER,
+            ),
         )
         .await
     }
@@ -9548,6 +9600,9 @@ impl CapsuleStoreState {
             &self.inference_env,
             None,
             ComponentRole::Tool,
+            crate::session_process::ProcessAccess::Unavailable(
+                crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
+            ),
         )
         .await
     }
@@ -9601,6 +9656,7 @@ impl CapsuleStoreState {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_component_with_env(
         &self,
         name: &str,
@@ -9609,6 +9665,7 @@ impl CapsuleStoreState {
         inference_env: &[(String, String)],
         tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
         role: ComponentRole,
+        process: crate::session_process::ProcessAccess,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -9632,6 +9689,7 @@ impl CapsuleStoreState {
                 task_provenance: self.current_task_provenance,
                 role,
                 call_deadlines: &self.call_deadlines,
+                process,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -9827,7 +9885,7 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
         cancel: Option<&crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, gate, None, cancel.cloned())
+        self.dispatch_fenced(name, input, gate, None, cancel.cloned(), None)
             .await
     }
 
@@ -9839,13 +9897,17 @@ impl CapsuleStoreState {
     /// `lifecycle.shell_grace_secs` is set; with no task context to deliver a completion to, it
     /// runs to the end on the blocking pool and its result is discarded. No other branch reads
     /// the signal: the bridge drops their futures instead.
+    ///
+    /// `process_gate` is the bridge's route to the session's decision point, on which a WASM
+    /// tool's `murmur:process` programs are put to it.
     pub(crate) async fn dispatch_bridged_tool_async(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         abandon: crate::detached::AbandonSignal,
+        process_gate: crate::session_process::GateSender,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, None, Some(abandon), None)
+        self.dispatch_fenced(name, input, None, Some(abandon), None, Some(process_gate))
             .await
     }
 
@@ -9856,9 +9918,10 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
         abandon: Option<crate::detached::AbandonSignal>,
         canceled: Option<crate::cancel::CancelSignal>,
+        process_gate: Option<crate::session_process::GateSender>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = self
-            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled)
+            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled, process_gate)
             .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         self.deliver_deadline_notice(name, &mut outcome).await;
@@ -9912,6 +9975,9 @@ impl CapsuleStoreState {
     /// agent loop passes its attempt's cancel, so a cancel demotes a running foreground command
     /// rather than waiting on it. A plan step and the bridge pass `None`: the plan's and the
     /// harness's own waits answer the cancel there.
+    ///
+    /// `process_gate` reaches the WASM branch only: the process-transport bridge's route to the
+    /// decision point, which has no `gate` of its own here. `None` for every other caller.
     async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
@@ -9919,6 +9985,7 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
         abandon: Option<crate::detached::AbandonSignal>,
         canceled: Option<crate::cancel::CancelSignal>,
+        process_gate: Option<crate::session_process::GateSender>,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -10099,9 +10166,124 @@ impl CapsuleStoreState {
                 "tool '{name}' is not declared in manifest allowlist"
             ));
         }
-        self.dispatch_tool_async(name, input)
+        self.dispatch_agent_wasm_tool(name, input, gate, process_gate)
             .await
-            .map(DispatchOutcome::tool)
+    }
+
+    /// An agent's call to the WASM tool `name`, whose store is served the session's processes
+    /// through `murmur:process`.
+    ///
+    /// Each program the tool runs or starts is put to the session's decision point before it
+    /// spawns, on the route this dispatch has: the bridge's `process_gate` on process transport;
+    /// otherwise `gate`, answered here while the tool's call is driven, when it can refuse
+    /// anything; otherwise, for a session that gates calls, no route at all, and every program is
+    /// refused.
+    async fn dispatch_agent_wasm_tool(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        gate: Option<&mut crate::agent::CallGate<'_>>,
+        process_gate: Option<crate::session_process::GateSender>,
+    ) -> Result<DispatchOutcome, String> {
+        use crate::session_process::{
+            GateRoute, GateSender, ProcessAccess, ProcessCallCtx, ProcessGateRequest,
+            ProcessRefusal,
+        };
+        let gateway = self.gateways.for_artifact(name);
+        let Some(registry) = self.session_processes.clone() else {
+            return self
+                .dispatch_component_with_env(
+                    name,
+                    input,
+                    gateway,
+                    &self.inference_env,
+                    None,
+                    ComponentRole::Tool,
+                    ProcessAccess::Unavailable(crate::session_process::unavailable::NO_REGISTRY),
+                )
+                .await
+                .map(DispatchOutcome::tool);
+        };
+        let mut gate = gate;
+        let mut requests = None;
+        let route = match (process_gate, gate.as_deref_mut()) {
+            (Some(send), _) => GateRoute::Route(send),
+            (None, Some(gate)) if gate.gates(self) => {
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                requests = Some(receiver);
+                let send: GateSender =
+                    Arc::new(move |request: ProcessGateRequest| sender.send(request).is_ok());
+                GateRoute::Route(send)
+            }
+            (None, Some(_)) => GateRoute::Ungated,
+            (None, None) => registry.route_without_gate(self.has_protected_paths()),
+        };
+        let task_id = self
+            .session_status
+            .as_ref()
+            .and_then(|status| status.task_id());
+        let dispatch = self.dispatch_component_with_env(
+            name,
+            input,
+            gateway,
+            &self.inference_env,
+            None,
+            ComponentRole::Tool,
+            ProcessAccess::Available(ProcessCallCtx::new(
+                Arc::clone(&registry),
+                name,
+                task_id,
+                route,
+            )),
+        );
+        let result = match (requests, gate) {
+            (Some(mut requests), Some(gate)) => {
+                tokio::pin!(dispatch);
+                loop {
+                    tokio::select! {
+                        result = &mut dispatch => break result,
+                        Some(request) = requests.recv() => {
+                            // A refusal that could not be recorded refuses anyway.
+                            let verdict = match gate.check_with_rule(self, &request.resolved).await {
+                                Ok(refusal) => refusal.map(|refusal| ProcessRefusal {
+                                    rule: refusal.rule,
+                                    reason: refusal.reason,
+                                }),
+                                Err(error) => Some(ProcessRefusal {
+                                    rule: crate::session_process::rule::ON_SHELL,
+                                    reason: error.to_string(),
+                                }),
+                            };
+                            let _ = request.reply.send(verdict);
+                        }
+                    }
+                }
+            }
+            _ => dispatch.await,
+        };
+        // A sealed root that failed to build for one of the tool's programs ends the session, as
+        // it does for a shell command.
+        let fatal = registry
+            .take_sealed_failure()
+            .map(|detail| crate::errors::RuntimeError::SealedRootConstructionFailed { detail });
+        match (result, fatal) {
+            (result, None) => result.map(DispatchOutcome::tool),
+            (result, Some(fatal)) => {
+                let tool_result = result.unwrap_or_else(|error| murmur::tool::run::ToolResult {
+                    status: murmur::tool::run::Status::Error,
+                    summary: None,
+                    data: Some(error),
+                    data_path: None,
+                    truncated: false,
+                    metadata: Vec::new(),
+                    attachments: Vec::new(),
+                });
+                Ok(DispatchOutcome {
+                    fatal: Some(fatal),
+                    ..DispatchOutcome::tool(tool_result)
+                })
+            }
+        }
     }
 
     /// `share-file`: mint one handle for one file, for one named peer.
@@ -11177,10 +11359,11 @@ impl CapsuleStoreState {
                 // futures are mutually recursive and one of them has to be behind a pointer for
                 // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
                 // recursion is one level deep in practice.
-                let outcome =
-                    Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate, None, None))
-                        .await
-                        .map(|outcome| outcome.result);
+                let outcome = Box::pin(
+                    self.dispatch_agent_tool_unfenced(&name, input, gate, None, None, None),
+                )
+                .await
+                .map(|outcome| outcome.result);
                 let _ = reply.send(outcome);
             }
         }
@@ -11555,6 +11738,9 @@ struct ToolStoreState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     http_hooks: NetworkPolicyHooks,
+    /// What `murmur:process` serves this call: the session's processes, or the reason it serves
+    /// nothing.
+    process: crate::session_process::ProcessAccess,
 }
 
 impl WasiView for ToolStoreState {
@@ -18485,6 +18671,7 @@ inference:
             current_forget_harness_session: None,
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
+            session_processes: None,
             shell_grace_secs: None,
             background_results_delivered: false,
             a2a_task_registry: None,
@@ -23149,6 +23336,9 @@ inference:
                     task_provenance: None,
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
+                    process: crate::session_process::ProcessAccess::Unavailable(
+                        crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
+                    ),
                 },
                 ToolA2aWiring::silent(),
                 "scoped-tool",
@@ -23198,6 +23388,9 @@ inference:
                     task_provenance: None,
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
+                    process: crate::session_process::ProcessAccess::Unavailable(
+                        crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
+                    ),
                 },
                 ToolA2aWiring::silent(),
                 "plain-tool",
