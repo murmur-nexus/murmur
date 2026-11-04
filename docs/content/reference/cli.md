@@ -783,6 +783,9 @@ mur install <scope/name@version>
 # Install from a GitHub source directly
 mur install github:<owner>/<repo>@<tag>
 
+# Install several references, in the order given, compiling them together
+mur install <ref>...
+
 # Install into the global store (~/.murmur/artifacts/) instead of the project store
 mur install -g <ref>
 
@@ -797,9 +800,10 @@ mur install --all-platforms <scope/name@version>
 | `mur install <scope/name>` | Fetches the newest version that [fits this `mur`](installing-artifacts.md#version-selection) from the source of the scope |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
 | `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
+| `mur install <ref> <ref>...` | Installs each reference in the order given, printing its `Installed` lines before the next one starts. Every WASM artifact they install is then compiled in one batch, several at once, as many at a time as there are CPUs available to `mur`. A reference that fails does not stop the others: once every other reference is installed and compiled, `mur install` prints a report naming each failed reference with its error, in the order given, and exits 1. A reference that cannot be parsed refuses the whole command before anything is installed. `--all-platforms` takes one reference |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
 | `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
-| `mur install --no-precompile` | Installs without compiling and without keeping host facts; a project install then writes nothing under `~/.murmur`. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch. In a project it also keeps the [host facts](containment.md#host-facts) of the manifest's `capabilities.shell.allow` binaries, Behavior step 6 below |
+| `mur install --no-precompile` | Installs without compiling and without keeping host facts; a project install then writes nothing under `~/.murmur`. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. Everything one command installs compiles in parallel, as many artifacts at a time as there are CPUs available to `mur`. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch. In a project it also keeps the [host facts](containment.md#host-facts) of the manifest's `capabilities.shell.allow` binaries, Behavior step 6 below |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). A pinned version that does not fit this `mur` refuses the whole install before anything is fetched or written. An install refused for any reason before its first write leaves the project as it was, with no `.murmur/artifacts/` created. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
 
@@ -843,6 +847,18 @@ error[E-REG-001]: artifact local/x@1.0.0 is not in the store, and no source serv
   hint: a local/ artifact is installed from its .mur.zip file: mur install ./x-1.0.0.mur.zip
 ```
 
+With several references, a reference that fails is reported after every other one is installed and compiled, and `mur install` exits 1:
+
+```text
+Installed local/tool-read@0.2.0 from ./tool-read-0.2.0.mur.zip
+Installed local/tool-write@0.2.0 from ./tool-write-0.2.0.mur.zip
+
+1 of 3 references failed to install:
+
+  ./missing.mur.zip
+    error[E-IO-003]: failed to read ./missing.mur.zip: No such file or directory (os error 2)
+```
+
 A name that is not `<scope>/<name>` is refused with [`E-REG-007`](diagnostics.md#e-reg-007). The reference forms and what each one stores are in [Installing artifacts](installing-artifacts.md#reference-forms).
 
 ---
@@ -861,7 +877,7 @@ mur precompile [--workdir <dir>] [--json] <ZIP>...
 | `--workdir` | — | The `--workdir` of the `mur run` that will launch these artifacts. When `~/.murmur` is inside it, nothing is stored, as that launch would neither read nor write `compiled/` |
 | `--json` | off | Print the report as one JSON object on stdout |
 
-Each WASM tool, driver and hook is compiled under this machine's `mur` build and [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registry.md#artifact-integrity) value; a later launch loads the form only under the same two. Files are compiled in parallel and reported in argument order, one outcome each:
+Each WASM tool, driver and hook is compiled under this machine's `mur` build and [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registry.md#artifact-integrity) value; a later launch loads the form only under the same two. Files are compiled in parallel, as many at a time as there are CPUs available to `mur`, and reported in argument order, one outcome each:
 
 | Outcome (text) | Outcome (JSON) | Meaning |
 |---|---|---|
