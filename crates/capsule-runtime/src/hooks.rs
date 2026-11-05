@@ -649,6 +649,34 @@ pub(crate) enum ResolvedCall {
 }
 
 impl ResolvedCall {
+    /// The shell call that execs `binary` directly with `argv` (the arguments, without the
+    /// binary), shown as `command`.
+    ///
+    /// `script` is set only when `binary` is a shell interpreter and `argv` begins `-c`: that
+    /// body is the one whose redirections are live, where in any other argv `>` is a literal
+    /// argument. An interpreter's `-c` form is never a recipe invocation.
+    pub(crate) fn shell_from_argv(
+        binary: &str,
+        command: String,
+        argv: &[String],
+        workdir: &WorkdirRoot,
+    ) -> Self {
+        let script = (crate::shell::is_shell_interpreter(binary)
+            && argv.first().is_some_and(|first| first == "-c"))
+        .then(|| argv.get(1).cloned().unwrap_or_default());
+        let recipe = match script {
+            Some(_) => None,
+            None => crate::recipes::resolve_recipe(workdir, binary, argv),
+        };
+        Self::Shell {
+            binary: crate::sandbox::resolve_invoked_binary_path(binary),
+            command,
+            argv: argv.to_vec(),
+            script,
+            recipe,
+        }
+    }
+
     /// The WIT lifecycle function whose decision point gates this call.
     pub(crate) fn event_name(&self) -> &'static str {
         match self {

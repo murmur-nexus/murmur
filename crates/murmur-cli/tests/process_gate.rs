@@ -37,6 +37,9 @@ const TOOL_OUTPUT: &str = "MARKER-TOOL-RAN";
 /// The prebuilt WASM tool the timing case calls, which echoes its input and touches no disk.
 const ECHO_TOOL: &str = "echo-tool";
 
+/// The committed WASM tool that runs programs through `murmur:process`.
+const PROCESS_PROBE: &str = "process-probe";
+
 /// The file `read_only` protects, and the subtree that covers it.
 const PROTECTED_FILE: &str = "tests/api.py";
 const PROTECTED_RULE: &str = "tests";
@@ -102,6 +105,8 @@ struct Capsule<'a> {
     tool_schema: Option<&'a str>,
     /// `true` for the prebuilt [`ECHO_TOOL`].
     echo_tool: bool,
+    /// `true` for the committed [`PROCESS_PROBE`] WASM tool.
+    process_probe: bool,
     read_only: &'a [&'a str],
     shell_allow: &'a [&'a str],
     deadline_seconds: Option<u64>,
@@ -121,6 +126,7 @@ impl<'a> Capsule<'a> {
             tool_name: TOOL,
             tool_schema: None,
             echo_tool: false,
+            process_probe: false,
             read_only: &[],
             shell_allow: &[],
             deadline_seconds: None,
@@ -255,6 +261,11 @@ fn create_manifest(project: &Path, capsule: &Capsule<'_>, harness: &Path) -> Pat
             "  - name: local/{ECHO_TOOL}\n    version: 0.1.0\n    runtime: tool\n"
         ));
     }
+    if capsule.process_probe {
+        tool_yaml.push_str(&format!(
+            "  - name: local/{PROCESS_PROBE}\n    version: 0.1.0\n    runtime: tool\n"
+        ));
+    }
     let shell_yaml = if capsule.shell_allow.is_empty() {
         String::new()
     } else {
@@ -342,6 +353,15 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
     }
     if capsule.echo_tool {
         let artifact = create_wasm_tool_artifact(artifact_dir.path(), ECHO_TOOL, "0.1.0");
+        common::publish_local(&home, &artifact).success();
+    }
+    if capsule.process_probe {
+        let artifact = common::create_tool_artifact(
+            artifact_dir.path(),
+            &format!("local/{PROCESS_PROBE}"),
+            "0.1.0",
+            &common::fixture_path("process-probe/tool/process-probe.wasm"),
+        );
         common::publish_local(&home, &artifact).success();
     }
 
@@ -852,6 +872,56 @@ fn each_bridged_call_is_announced() {
         announcement_log_lines(&session),
         2,
         "two calls, two announcements:\n{}",
+        session.trace_raw
+    );
+}
+
+// ── A WASM tool's program reached through the bridge ─────────────────────────
+
+/// A program a WASM tool runs through `murmur:process`, in a call that arrived over the bridge,
+/// is put to the same decision point an `on-shell` hook guards on `transport: http`: the hook
+/// refuses it, the tool's result names the rule, and nothing starts.
+#[test]
+fn an_on_shell_hook_refuses_a_bridged_wasm_tools_program() {
+    if common::skip_without_host_support("an_on_shell_hook_refuses_a_bridged_wasm_tools_program") {
+        return;
+    }
+    let session = run_session(&Capsule {
+        marker_tool: false,
+        process_probe: true,
+        shell_allow: &["cat"],
+        call_tool: Some(PROCESS_PROBE),
+        call_args: Some(r#"{"op":"run","program":"cat","stdin":"x"}"#),
+        ..Capsule::calling_the_marker_tool().with_hook(hook(
+            "no-programs",
+            "on-shell",
+            "deny",
+            deny_hook_wasm("on-shell", "no programs today"),
+        ))
+    });
+
+    let answer = session.harness_answer();
+    // The tool's JSON result, carried as text inside the bridge's own JSON answer.
+    assert!(
+        answer.contains(r#"\"rule\":\"on-shell\""#),
+        "names the rule: {answer}"
+    );
+    assert!(answer.contains("no-programs"), "names the hook: {answer}");
+    assert!(
+        answer.contains("no programs today"),
+        "carries the reason: {answer}"
+    );
+
+    let denial = session.denial();
+    assert_eq!(denial["event"], "on-shell");
+    assert_eq!(denial["hook_name"], "no-programs");
+    let refused = session.events("process_refused");
+    assert_eq!(refused.len(), 1, "{}", session.trace_raw);
+    assert_eq!(refused[0]["rule"], "on-shell");
+    assert_eq!(refused[0]["tool"], PROCESS_PROBE);
+    assert!(
+        session.events("process_start").is_empty(),
+        "{}",
         session.trace_raw
     );
 }

@@ -896,8 +896,8 @@ fn old_level_tool_is_refused() {
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(
         text.contains(&format!(
-            "artifact 'local/tool-v1@{VERSION}' does not fit WIT level 3, the level this mur \
-             serves: it exports murmur:tool/run@0.1.0, and level 3 has murmur:tool@0.2.0"
+            "artifact 'local/tool-v1@{VERSION}' does not fit WIT level 4, the level this mur \
+             serves: it exports murmur:tool/run@0.1.0, and level 4 has murmur:tool@0.2.0"
         )),
         "{text}"
     );

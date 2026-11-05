@@ -1140,7 +1140,7 @@ async fn drive_harness(
     };
     // Every bridged call crosses the decision point, because the required-field check applies to
     // every capsule. A run with no bridge never sends on the channel, and the receiver parks.
-    let (gate_tx, mut gate_rx) = mpsc::unbounded_channel::<claude_bridge::GateRequest>();
+    let (gate_tx, mut gate_rx) = mpsc::unbounded_channel::<claude_bridge::GateAsk>();
     // What the bridge saw that belongs in the trace: calls the harness walked away from, and
     // calls refused at the in-flight bound.
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<claude_bridge::BridgeNote>();
@@ -1200,7 +1200,42 @@ async fn drive_harness(
             // awaits a policy hook the bridge is not polled, so finished calls' responses wait
             // for the next turn of the loop, though the commands behind them keep running.
             request = next_gate_request(&mut gate_rx) => {
-                let claude_bridge::GateRequest { tool_name, input_json, reply } = request;
+                let claude_bridge::GateRequest { tool_name, input_json, reply } = match request {
+                    claude_bridge::GateAsk::Call(request) => request,
+                    // A program a WASM tool is about to run, already resolved to the shell call
+                    // it is: the read-only check and the `on-shell` hooks only, answered with the
+                    // rule that refused. A refusal that could not be recorded refuses anyway.
+                    claude_bridge::GateAsk::Process(request) => {
+                        if request.reply.is_closed() {
+                            continue;
+                        }
+                        let mut gate = CallGate::new(
+                            hooks,
+                            trace,
+                            &store_state.records_root,
+                            sink.current_turn(),
+                        );
+                        let verdict = if gate.gates(store_state) {
+                            match gate.check_with_rule(store_state, &request.resolved).await {
+                                Ok(refusal) => refusal.map(|refusal| {
+                                    crate::session_process::ProcessRefusal {
+                                        rule: refusal.rule,
+                                        reason: refusal.reason,
+                                    }
+                                }),
+                                Err(error) => Some(crate::session_process::ProcessRefusal {
+                                    rule: crate::session_process::rule::ON_SHELL,
+                                    reason: error.to_string(),
+                                }),
+                            }
+                        } else {
+                            None
+                        };
+                        let _ = request.reply.send(verdict);
+                        bump();
+                        continue;
+                    }
+                };
                 // Its connection closed while it waited, and the bridge has noted that. Nobody
                 // is waiting on a verdict, so no check or hook runs for it.
                 if reply.is_closed() {
@@ -1484,8 +1519,8 @@ async fn next_call_report(
 
 /// The gate arm's future: the next bridged call waiting on the decision point.
 async fn next_gate_request(
-    gate: &mut mpsc::UnboundedReceiver<claude_bridge::GateRequest>,
-) -> claude_bridge::GateRequest {
+    gate: &mut mpsc::UnboundedReceiver<claude_bridge::GateAsk>,
+) -> claude_bridge::GateAsk {
     // The sender lives in the driving function's frame for as long as the loop runs, so the
     // channel cannot close under it; parking rather than returning is what keeps the arm from
     // spinning if it ever does.

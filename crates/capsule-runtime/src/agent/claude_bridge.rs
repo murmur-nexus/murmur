@@ -206,22 +206,30 @@ pub(super) struct GateRequest {
     pub(super) reply: oneshot::Sender<Option<String>>,
 }
 
+/// One question for the session's decision point: a bridged tool call, or a program a WASM tool
+/// that call reached is about to run through `murmur:process`, already resolved to the shell call
+/// it is.
+pub(super) enum GateAsk {
+    Call(GateRequest),
+    Process(crate::session_process::ProcessGateRequest),
+}
+
 /// Put one call to the session's decision point and wait for its verdict.
 ///
 /// Fail closed on both arms — a send onto a closed channel and a dropped reply alike — so a
 /// session that has stopped answering cannot let a tool through ungated.
 async fn ask_gate(
-    gate: &mpsc::UnboundedSender<GateRequest>,
+    gate: &mpsc::UnboundedSender<GateAsk>,
     tool_name: &str,
     input_json: &str,
 ) -> Option<String> {
     let (reply, verdict) = oneshot::channel();
     if gate
-        .send(GateRequest {
+        .send(GateAsk::Call(GateRequest {
             tool_name: tool_name.to_string(),
             input_json: input_json.to_string(),
             reply,
-        })
+        }))
         .is_err()
     {
         return Some(GATE_UNREACHABLE.to_string());
@@ -415,7 +423,7 @@ impl BridgeHandle {
     pub(super) async fn serve(
         &self,
         store: &CapsuleStoreState,
-        gate: &mpsc::UnboundedSender<GateRequest>,
+        gate: &mpsc::UnboundedSender<GateAsk>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
         reports: &mpsc::UnboundedSender<CallReport>,
         on_request: &dyn Fn(),
@@ -444,7 +452,7 @@ impl BridgeHandle {
         &self,
         stream: TcpStream,
         store: &CapsuleStoreState,
-        gate: &mpsc::UnboundedSender<GateRequest>,
+        gate: &mpsc::UnboundedSender<GateAsk>,
         notes: &mpsc::UnboundedSender<BridgeNote>,
         reports: &mpsc::UnboundedSender<CallReport>,
         in_flight: &AtomicUsize,
@@ -640,7 +648,7 @@ impl BridgeHandle {
         name: &str,
         input_json: String,
         store: &CapsuleStoreState,
-        gate: &mpsc::UnboundedSender<GateRequest>,
+        gate: &mpsc::UnboundedSender<GateAsk>,
         abandon: AbandonSignal,
         decided: &AtomicBool,
     ) -> (Value, Option<CallReport>) {
@@ -654,6 +662,14 @@ impl BridgeHandle {
             return (error_result(refusal), None);
         }
 
+        // The same decision point, for each program a WASM tool runs through `murmur:process`.
+        // A closed channel answers `false`, which the tool's side refuses on.
+        let process_gate: crate::session_process::GateSender = {
+            let gate = gate.clone();
+            std::sync::Arc::new(move |request: crate::session_process::ProcessGateRequest| {
+                gate.send(GateAsk::Process(request)).is_ok()
+            })
+        };
         match store
             .dispatch_bridged_tool_async(
                 name,
@@ -662,6 +678,7 @@ impl BridgeHandle {
                     log_path: None,
                 },
                 abandon,
+                process_gate,
             )
             .await
         {
@@ -1291,11 +1308,15 @@ mod tests {
             .unwrap_or("")
     }
 
-    async fn next_gate(gate: &mut mpsc::UnboundedReceiver<GateRequest>) -> GateRequest {
-        tokio::time::timeout(PROMPT, gate.recv())
+    async fn next_gate(gate: &mut mpsc::UnboundedReceiver<GateAsk>) -> GateRequest {
+        match tokio::time::timeout(PROMPT, gate.recv())
             .await
             .expect("the call reached the decision point in time")
             .expect("the gate channel is open")
+        {
+            GateAsk::Call(request) => request,
+            GateAsk::Process(_) => panic!("a tool call was expected at the decision point"),
+        }
     }
 
     async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {

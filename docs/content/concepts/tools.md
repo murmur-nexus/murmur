@@ -21,6 +21,45 @@ host — the whole host under `mur run --unconfined`, or the folders `host_paths
 its folders and checks a path before opening it: see
 [The folders a WASM tool is handed](../reference/wit-interfaces.md#wasm-tool-folders).
 
+## Programs a WASM tool runs { #wasm-tool-programs }
+
+A WASM tool runs a program through the [`murmur:process`](../reference/wit-interfaces.md#process)
+interface its `tool` world imports: `run` runs one to completion, and `start` keeps one running
+for the rest of the session, which the tool finds again on later calls, writes to, reads from,
+connects to over TCP and stops.
+
+A program runs under exactly what a shell command of the capsule runs under, so the capsule
+grants it the same way:
+
+| Grant | Where | What it allows |
+|---|---|---|
+| The program's name | [`capabilities.shell.allow`](../reference/manifest.md) | Running it at all |
+| A containment class | [`capabilities.containment`](../reference/containment.md#wasm-tool-programs) | The tier the program runs at: the session's, in its cgroup scope and network namespace |
+| Hosts it reaches | `capabilities.network.allow` | Outbound connections through the session's egress proxy, as for a shell command |
+
+```yaml
+capabilities:
+  shell:
+    allow:
+      - python3
+```
+
+The `capabilities.filesystem.read_only` check and every `on-shell` hook with
+`commit_policy: deny` see the program's argv before it starts. A refused call starts nothing
+and returns `refused` naming the rule:
+
+```json
+{"rule": "capabilities.shell.allow", "reason": "binary 'ls' is not in capabilities.shell.allow"}
+```
+
+`capabilities.shell.allow` is one list for the whole capsule: every WASM tool in it can run every
+program the list names, as the model's shell calls can. A session holds at most 8 running
+processes, and all of them are killed when it ends. Each tool sees only the processes it started.
+
+A session process lives as long as the program `start` ran: when it exits, whatever it left
+running in its process group is killed. Start a server in its foreground mode, not one that
+forks into the background and exits.
+
 ## Tool dispatch
 
 Each tool call is resolved in a fixed precedence order:

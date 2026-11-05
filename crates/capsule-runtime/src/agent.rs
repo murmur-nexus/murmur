@@ -3696,6 +3696,19 @@ impl<'a> CallGate<'a> {
         store: &CapsuleStoreState,
         resolved: &ResolvedCall,
     ) -> Result<Option<String>, RuntimeError> {
+        Ok(self
+            .check_with_rule(store, resolved)
+            .await?
+            .map(|refusal| refusal.text))
+    }
+
+    /// [`Self::check`], keeping which rule refused: the `capabilities.filesystem.read_only` check
+    /// or a policy hook bound to the call's event. Writes exactly what [`Self::check`] writes.
+    pub(crate) async fn check_with_rule(
+        &mut self,
+        store: &CapsuleStoreState,
+        resolved: &ResolvedCall,
+    ) -> Result<Option<GateRefusal>, RuntimeError> {
         if let Some(refusal) = store.check_protected_paths(resolved) {
             let signal = refusal.signal.describe();
             let reason = protected_path_reason(&refusal);
@@ -3711,7 +3724,11 @@ impl<'a> CallGate<'a> {
                 )
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
-            return Ok(Some(protected_path_tool_result(&refusal)));
+            return Ok(Some(GateRefusal {
+                rule: PROTECTED_PATH_RULE,
+                reason,
+                text: protected_path_tool_result(&refusal),
+            }));
         }
         if let CallDecision::Denied { hook_name, reason } = self
             .hooks
@@ -3731,10 +3748,29 @@ impl<'a> CallGate<'a> {
             // An unsupported arm returned at the decision point is a fault as well as a refusal;
             // drain it now so both reach the trace.
             flush_hook_dispatch_faults(self.hooks, self.trace).await;
-            return Ok(Some(denial_tool_result(&hook_name, &reason)));
+            return Ok(Some(GateRefusal {
+                rule: resolved.event_name(),
+                text: denial_tool_result(&hook_name, &reason),
+                reason: format!("policy hook '{hook_name}' refused: {reason}"),
+            }));
         }
         Ok(None)
     }
+}
+
+/// The rule a `capabilities.filesystem.read_only` refusal names.
+pub(crate) const PROTECTED_PATH_RULE: &str = "capabilities.filesystem.read_only";
+
+/// A refusal at the decision point, as [`CallGate::check_with_rule`] returns it.
+pub(crate) struct GateRefusal {
+    /// [`PROTECTED_PATH_RULE`], or the event the refusing hook is bound to (`on-shell`,
+    /// `on-tool-call`).
+    pub(crate) rule: &'static str,
+    /// One line naming what refused and why: the read-only path and rule, or the hook's name
+    /// and its reason.
+    pub(crate) reason: String,
+    /// What the model is handed in place of the call's result.
+    pub(crate) text: String,
 }
 
 /// Which dispatch path a refusal names in the trace: `"shell"` or `"tool"`.

@@ -483,6 +483,9 @@ impl HookInferenceCtx {
                 task_provenance: None,
                 role: ComponentRole::Driver,
                 call_deadlines: &self.call_deadlines,
+                process: crate::session_process::ProcessAccess::Unavailable(
+                    crate::session_process::unavailable::DRIVER,
+                ),
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.

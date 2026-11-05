@@ -627,6 +627,30 @@ instead of the tier warnings. The stance is recorded and reported everywhere:
 
 See [Run a capsule on the host](../how-to/run-capsule-on-the-host.md).
 
+## Programs a WASM tool runs { #wasm-tool-programs }
+
+A program a WASM tool runs through [`murmur:process`](wit-interfaces.md#process) is contained
+exactly as a shell command of the same session is, at every tier:
+
+| What applies | As for a shell command |
+|---|---|
+| [`capabilities.shell.allow`](manifest.md) | The program must be named there |
+| The decision point | The `capabilities.filesystem.read_only` check and every `on-shell` deny hook see its argv before it starts; the argv they see is the argv that runs |
+| The work-folder size limit | Checked before it starts |
+| Environment | The sanitized shell environment, plus the tool's additions |
+| [Enforcement tier](#subprocess-enforcement-tiers) | Landlock, seccomp, the sealed composed root and the per-process limits of the session's tier |
+| [Cgroup scope](#cgroup-scope) and network namespace | The session's own; outbound connections go through its egress proxy |
+
+A session holds at most 8 running session processes. When a program exits, whatever it left
+running in its process group is killed, so the 8 count everything that runs. When the session
+ends, each process still running is killed with its process group before the trace's
+`session_end` line, and a `process_exit` line with `reason: session_end` records it. A `run`
+never outlives the tool call that made it.
+
+`connect` opens a TCP connection to loopback from inside the session's network namespace, only to
+a port a process in the handle's own process group listens on: see
+[`murmur:process/process`](wit-interfaces.md#process).
+
 ## What bounds a WASM artifact { #artifact-boundary }
 
 A containment class and a WASM artifact's own grants answer different questions:

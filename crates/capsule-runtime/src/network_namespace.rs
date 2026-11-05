@@ -804,7 +804,7 @@ pub(crate) fn decode_step_record(record: &[u8; STEP_RECORD_LEN]) -> (u32, i32) {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{create_session_netns, join_session_netns, reap_child};
+pub(crate) use linux::{create_session_netns, join_session_netns, reap_child, send_fds};
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -1474,7 +1474,7 @@ mod linux {
     /// # Safety
     /// Post-`fork()`, pre-exec child context only; `sendmsg` is async-signal-safe and every
     /// buffer is a stack local.
-    unsafe fn send_fds(sock_fd: RawFd, fds: &[RawFd]) -> Result<(), ()> {
+    pub(crate) unsafe fn send_fds(sock_fd: RawFd, fds: &[RawFd]) -> Result<(), ()> {
         // SAFETY: all buffers are live locals outliving the single `sendmsg`; the control buffer
         // is 8-byte aligned, which the CMSG macros require.
         unsafe {

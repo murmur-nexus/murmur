@@ -7,7 +7,7 @@ so this file records who binds what. Versioning policy lives in
 
 | Path | Consumed by |
 | --- | --- |
-| `host/` | `wasmtime::component::bindgen!({ path: "wit/host", world: "runtime-host" })` in `src/bindings.rs` — the host-side bindings for every interface the runtime provides to guests (`tool-registry`, `artifact-manager`, `shell`, `message`). |
+| `host/` | `wasmtime::component::bindgen!({ path: "wit/host", world: "runtime-host" })` in `src/bindings.rs` — the host-side bindings for the interfaces the runtime provides to capsule components (`tool-registry`, `artifact-manager`, `shell`, `message`) — **and** `bindgen!({ path: "wit/host", world: "tool-host", imports: { default: async } })` (`bindings::tool_host`), the host side of the `tool` world's `murmur:process/process` import, served to every WASM tool's store by `src/session_process.rs`. |
 | `hook/` | `wasmtime::component::bindgen!({ path: "wit/hook", world: "hook" })` in `src/bindings.rs` — the host-side view of the hook lifecycle contract. |
 | `process-driver/` | `wasmtime::component::bindgen!({ path: "wit/process-driver", world: "process-driver" })` in `src/bindings.rs` — the host-side view of the process driver contract (`murmur:driver/process`) — **and** process drivers in the out-of-repo `default-artifacts` repository, which vendors this tree the same way as `hook/`. |
 | `guest/` | `wit_bindgen::generate!` in guest components: the test fixtures under `crates/murmur-cli/tests/fixtures/*/src/*` (worlds `tool`, `capsule`) **and the out-of-repo `default-artifacts` repository**, which vendors this tree (drivers, tools, and hooks there compile against its copy — see below). |

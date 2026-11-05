@@ -8,6 +8,7 @@ world capsule {
 world tool {
   import murmur:task/task@0.1.0;
   import murmur:%stream/events@0.1.0;
+  import murmur:process/process@0.1.0;
   export murmur:tool/run@0.2.0;
 }
 

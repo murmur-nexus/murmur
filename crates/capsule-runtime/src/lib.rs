@@ -99,6 +99,7 @@ pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
 pub mod session_check;
+pub(crate) mod session_process;
 pub mod session_status;
 pub(crate) mod shell;
 #[cfg(test)]
