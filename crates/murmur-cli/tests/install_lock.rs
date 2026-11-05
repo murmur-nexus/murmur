@@ -903,7 +903,10 @@ fn a_frozen_install_refuses_a_missing_entry_and_a_missing_lock() {
         .clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("error[E-REG-005]:"), "{stderr}");
-    assert!(stderr.contains("local/tool-b"), "{stderr}");
+    assert!(
+        stderr.contains("murmur.lock has no entry for 'local/tool-b'"),
+        "{stderr}"
+    );
     assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
     assert!(!project.path().join(".murmur").exists());
 
@@ -914,7 +917,7 @@ fn a_frozen_install_refuses_a_missing_entry_and_a_missing_lock() {
         .clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("error[E-REG-005]:"), "{stderr}");
-    assert!(stderr.contains("murmur.lock"), "{stderr}");
+    assert!(stderr.contains("there is no murmur.lock"), "{stderr}");
     assert!(!lock_path.exists());
     assert!(!project.path().join(".murmur").exists());
 }
@@ -926,13 +929,21 @@ fn frozen_is_refused_beside_a_reference_global_or_all_platforms() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write_manifest_with_deps(project.path(), &[("tool-a", "1.0.0")]);
-    for args in [
-        &["--frozen", "local/tool-a@1.0.0"][..],
-        &["--frozen", "-g", "local/tool-a@1.0.0"][..],
-        &["--frozen", "--all-platforms", "murmur/x@1.0.0"][..],
-        &["--frozen", "-g"][..],
+    for (args, conflicting) in [
+        (&["--frozen", "local/tool-a@1.0.0"][..], "[ARTIFACT]..."),
+        (&["--frozen", "-g", "local/tool-a@1.0.0"][..], "--global"),
+        (
+            &["--frozen", "--all-platforms", "murmur/x@1.0.0"][..],
+            "--all-platforms",
+        ),
+        (&["--frozen", "-g"][..], "--global"),
     ] {
-        run_install_args(&home, project.path(), args).code(2);
+        run_install_args(&home, project.path(), args)
+            .code(2)
+            .stderr(predicate::str::contains(
+                "the argument '--frozen' cannot be used with",
+            ))
+            .stderr(predicate::str::contains(conflicting));
     }
     assert!(!project.path().join(".murmur").exists());
     assert!(!project.path().join("murmur.lock").exists());

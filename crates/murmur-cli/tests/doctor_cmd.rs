@@ -867,7 +867,7 @@ fn doctor_fails_when_the_lock_pins_a_different_version_than_the_manifest() {
         "got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Fix: local/repinned-skill: remove the stale murmur.lock entry, then run mur install local/repinned-skill@0.1.0"),
+        stdout.contains("Fix: local/repinned-skill: run mur install, which moves its murmur.lock entry to 0.1.0"),
         "got:\n{stdout}"
     );
 }

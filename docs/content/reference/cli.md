@@ -1191,7 +1191,7 @@ Each artifact resolved from a store is also checked against `murmur.lock` when o
 failure lines:
 
 - `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
-- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares
+- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares; `mur install` moves the entry to the declared version
 - `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
 - `✗ name@version   <platform>   — murmur.lock has no sha256 for 'name' on <platform>: it pins <platforms>` — the lock was written on another platform and has never been installed against on this one
 
