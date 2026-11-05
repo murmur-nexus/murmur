@@ -7624,10 +7624,20 @@ mod tests {
             );
             assert!(granted.iter().all(|grant| !grant.executable));
         } else {
+            // A fallback to `scoped` grants what `scoped` grants: the name-resolution files and
+            // nothing else of the host's own `/etc`.
             assert!(
-                granted.is_empty(),
+                granted
+                    .iter()
+                    .all(|grant| name_resolution(grant) && !grant.executable && !grant.list_dir),
                 "this host fell back to {:?}, where there is no composed root and /etc is the \
-                 host's own",
+                 host's own: {granted:?}",
+                sealed.tier,
+            );
+            assert_eq!(
+                granted.len(),
+                resolve_scoped_name_resolution_landlock_grants(sealed.tier).len(),
+                "{:?}: {granted:?}",
                 sealed.tier,
             );
         }
