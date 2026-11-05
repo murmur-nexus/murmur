@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use capsule_runtime::precompile::Precompiler;
+use capsule_runtime::precompile::{PrecompileItem, Precompiler};
 use capsule_runtime::served_wit_level;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -198,8 +198,7 @@ fn install_resolved(
     name: &ArtifactName,
     resolved: Resolved,
     lock_path: Option<&Path>,
-    precompiler: Option<&Precompiler>,
-) -> Result<(), CliError> {
+) -> Result<Stored, CliError> {
     let meta = source_meta(
         name,
         &resolved.version,
@@ -219,13 +218,11 @@ fn install_resolved(
         resolved.version,
         resolved.source
     );
-    precompile(
-        precompiler,
-        name.as_str(),
-        &resolved.version,
-        &resolved.bytes,
-    );
-    Ok(())
+    Ok(Stored {
+        name: name.to_string(),
+        version: resolved.version,
+        payload: resolved.bytes,
+    })
 }
 
 /// Write `meta`'s payload to `local_registry` and, when `lock_path` is given, pin it there with
@@ -255,13 +252,16 @@ fn store_and_pin(
 /// `mur install github:<owner>/<repo>@<tag>`: every `.mur.zip` of that release, each filed under
 /// its packed name in the owner's scope. The owner id is checked against `lock` and, for the
 /// `murmur` scope, the compiled-in one before any payload is downloaded.
+///
+/// Each payload stored is pushed onto `stored`, so the ones stored before an asset that fails
+/// are there to compile when this returns its error.
 fn install_github_release(
     owner: &str,
     repo: &str,
     tag: &str,
     store: &LocalRegistry,
     lock_path: Option<&Path>,
-    precompiler: Option<&Precompiler>,
+    stored: &mut Vec<Stored>,
 ) -> Result<(), CliError> {
     let scope = github_scope(owner, repo)?;
     let token = Sources::load()?.token_for(owner, repo);
@@ -311,7 +311,11 @@ fn install_github_release(
         let meta = source_meta(&name, &version, &manifest, platform, owner_id);
         store_and_pin(store, meta, &payload.bytes, &sha256, lock_path)?;
         capsule_runtime::report_println!("Installed {name}@{version} from {label}");
-        precompile(precompiler, name.as_str(), &version, &payload.bytes);
+        stored.push(Stored {
+            name: name.to_string(),
+            version,
+            payload: payload.bytes,
+        });
     }
     Ok(())
 }
@@ -329,12 +333,39 @@ fn build_precompiler(no_precompile: bool, project_root: Option<&Path>) -> Option
     Precompiler::new(capsule_writable.as_deref())
 }
 
-/// Stores the compiled form of the payload `bytes` just stored as `name@version`, when a
-/// precompiler is given. The outcome is deliberately dropped: a form that is not stored only means
-/// the first launch compiles, so it never changes what install prints or how it exits.
-fn precompile(precompiler: Option<&Precompiler>, name: &str, version: &str, bytes: &[u8]) {
-    if let Some(precompiler) = precompiler {
-        let _ = precompiler.precompile(name, version, bytes);
+/// A payload an install stored as `name@version`, held until the command compiles everything it
+/// stored as one batch.
+pub(crate) struct Stored {
+    name: String,
+    version: String,
+    payload: bytes::Bytes,
+}
+
+impl Stored {
+    fn item(&self) -> PrecompileItem<'_> {
+        PrecompileItem {
+            name: &self.name,
+            version: &self.version,
+            payload: &self.payload,
+        }
+    }
+}
+
+/// Stores the compiled forms of every payload in `stored` as one batch, with the precompiler
+/// [`build_precompiler`] gives for `no_precompile` and `project_root`. The outcomes are
+/// deliberately dropped: a form that is not stored only means the first launch compiles, so it
+/// never changes what install prints or how it exits. Builds no engine when `stored` is empty.
+fn compile_stored<'a>(
+    stored: impl IntoIterator<Item = PrecompileItem<'a>>,
+    no_precompile: bool,
+    project_root: Option<&Path>,
+) {
+    let items: Vec<PrecompileItem<'_>> = stored.into_iter().collect();
+    if items.is_empty() {
+        return;
+    }
+    if let Some(precompiler) = build_precompiler(no_precompile, project_root) {
+        let _ = precompiler.precompile_all(&items);
     }
 }
 
@@ -417,31 +448,97 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
+/// `mur install [<ref>...]`: the manifest's artifacts with no reference, else each reference in
+/// the order given.
 pub(crate) fn run_install(
-    artifact_ref: Option<&str>,
+    artifact_refs: &[String],
     global: bool,
     all_platforms: bool,
     no_precompile: bool,
 ) -> Result<(), CliError> {
-    // Refusals that need no store come first, so a refused install creates nothing.
-    let parsed = artifact_ref.map(InstallRef::parse).transpose()?;
+    // Refusals that need no store come first, so a refused install creates nothing: every
+    // reference is parsed before any is installed.
+    let mut parsed = artifact_refs
+        .iter()
+        .map(|text| InstallRef::parse(text))
+        .collect::<Result<Vec<_>, _>>()?;
     if all_platforms {
         return run_install_all_platforms(parsed, no_precompile);
     }
-    if parsed.is_none() && !global {
+    if parsed.is_empty() && !global {
         let manifest_path = resolve_manifest_path(&find_project_root()?);
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
     }
     let (store, project_root) = determine_store(global)?;
+    let project_root_path = project_root.as_deref();
 
-    match parsed {
-        None => install_manifest_deps(&store, &project_root, no_precompile),
-        Some(parsed) => {
-            install_single(parsed, &store, project_root.as_deref(), no_precompile)?;
-            keep_host_facts(no_precompile, project_root.as_deref());
+    match parsed.len() {
+        0 => install_manifest_deps(&store, &project_root, no_precompile),
+        1 => {
+            let mut stored = Vec::new();
+            let installed =
+                install_single(parsed.remove(0), &store, project_root_path, &mut stored);
+            compile_stored(
+                stored.iter().map(Stored::item),
+                no_precompile,
+                project_root_path,
+            );
+            installed?;
+            keep_host_facts(no_precompile, project_root_path);
             Ok(())
         }
+        _ => install_several(
+            artifact_refs,
+            parsed,
+            &store,
+            project_root_path,
+            no_precompile,
+        ),
     }
+}
+
+/// `mur install <ref> <ref>...`: installs each reference in argument order, one after another,
+/// then compiles every payload they stored as one batch. A reference that fails does not stop the
+/// ones after it; once every other is stored, pinned and compiled, the report names each failed
+/// reference, in argument order, and the process exits 1.
+fn install_several(
+    artifact_refs: &[String],
+    parsed: Vec<InstallRef>,
+    store: &LocalRegistry,
+    project_root: Option<&Path>,
+    no_precompile: bool,
+) -> Result<(), CliError> {
+    let mut stored = Vec::new();
+    let mut failures = Vec::new();
+    for (text, parsed) in artifact_refs.iter().zip(parsed) {
+        if let Err(error) = install_single(parsed, store, project_root, &mut stored) {
+            failures.push((text, error));
+        }
+    }
+    compile_stored(stored.iter().map(Stored::item), no_precompile, project_root);
+    if failures.len() < artifact_refs.len() {
+        keep_host_facts(no_precompile, project_root);
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!(
+        "{} of {} references failed to install:",
+        failures.len(),
+        artifact_refs.len()
+    );
+    for (text, error) in &failures {
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("  {text}");
+        for line in error.to_string().lines() {
+            capsule_runtime::report_println!("    {line}");
+        }
+    }
+    // One `CliError` cannot name every failed reference, so the report above does and the process
+    // ends here, as the manifest install's does. All I/O is done.
+    std::process::exit(1);
 }
 
 /// What `mur install <ref>` names, read from the reference's text alone.
@@ -533,32 +630,28 @@ fn determine_store(global: bool) -> Result<(LocalRegistry, Option<PathBuf>), Cli
     }
 }
 
+/// Installs the one reference `parsed` into `store`, printing an `Installed` line for each
+/// payload it stores and pushing that payload onto `stored` for the caller to compile.
 fn install_single(
     parsed: InstallRef,
     store: &LocalRegistry,
     project_root: Option<&Path>,
-    no_precompile: bool,
+    stored: &mut Vec<Stored>,
 ) -> Result<(), CliError> {
     let lock_path = project_root.map(|r| r.join("murmur.lock"));
     let (name, version) = match parsed {
         InstallRef::File(path) => {
-            let precompiler = build_precompiler(no_precompile, project_root);
-            return install_from_local_file(
-                &path,
-                store,
-                lock_path.as_deref(),
-                precompiler.as_ref(),
-            );
+            stored.push(install_from_local_file(&path, store, lock_path.as_deref())?);
+            return Ok(());
         }
         InstallRef::GitHubRelease { owner, repo, tag } => {
-            let precompiler = build_precompiler(no_precompile, project_root);
             return install_github_release(
                 &owner,
                 &repo,
                 &tag,
                 store,
                 lock_path.as_deref(),
-                precompiler.as_ref(),
+                stored,
             );
         }
         InstallRef::Name { name, version } => (name, version),
@@ -579,15 +672,15 @@ fn install_single(
                 current_platform(),
             ) {
                 VersionFit::Fits => {
-                    return install_from_global_store(
+                    stored.push(install_from_global_store(
                         &name,
                         version,
                         resolved,
                         store,
                         lock_path.as_deref(),
                         lock.as_ref(),
-                        build_precompiler(no_precompile, project_root).as_ref(),
-                    );
+                    )?);
+                    return Ok(());
                 }
                 VersionFit::Unserved(mismatched) => {
                     return Err(level_mismatch(name.as_str(), version, mismatched));
@@ -617,14 +710,13 @@ fn install_single(
         lock.as_ref(),
     )
     .map_err(CliError::from)?;
-    let precompiler = build_precompiler(no_precompile, project_root);
-    install_resolved(
+    stored.push(install_resolved(
         store,
         &name,
         resolved,
         lock_path.as_deref(),
-        precompiler.as_ref(),
-    )
+    )?);
+    Ok(())
 }
 
 /// Copy `name@version`, which the global store holds as `resolved`, into `store` and pin it. No
@@ -636,8 +728,7 @@ fn install_from_global_store(
     store: &LocalRegistry,
     lock_path: Option<&Path>,
     lock: Option<&MurmurLock>,
-    precompiler: Option<&Precompiler>,
-) -> Result<(), CliError> {
+) -> Result<Stored, CliError> {
     verify_sha256(name.as_str(), version, &resolved.bytes, &resolved.sha256)
         .map_err(CliError::from)?;
     check_stored_owner(
@@ -673,8 +764,11 @@ fn install_from_global_store(
         name.scope(),
         name.name()
     );
-    precompile(precompiler, name.as_str(), version, &resolved.bytes);
-    Ok(())
+    Ok(Stored {
+        name: name.to_string(),
+        version: version.to_string(),
+        payload: resolved.bytes,
+    })
 }
 
 fn install_manifest_deps(
@@ -907,17 +1001,15 @@ fn install_manifest_deps(
     // After the lock is written, so an interrupted compile never costs a pin, and for the cached
     // artifacts too, so forms a new `mur` build keys differently are filled in. The header
     // spinner keeps ticking meanwhile.
-    if let Some(precompiler) = build_precompiler(no_precompile, Some(&root)) {
-        successes.par_iter().for_each(|(i, outcome)| {
-            let artifact = artifacts[*i];
-            precompile(
-                Some(&precompiler),
-                &artifact.name,
-                &artifact.version,
-                &outcome.payload,
-            );
-        });
-    }
+    compile_stored(
+        successes.iter().map(|(i, outcome)| PrecompileItem {
+            name: &artifacts[*i].name,
+            version: &artifacts[*i].version,
+            payload: &outcome.payload,
+        }),
+        no_precompile,
+        Some(&root),
+    );
 
     // Byte/cache accounting covers the successes only — a failed artifact contributed no
     // bytes and is neither "fetched" nor "cached".
@@ -1239,8 +1331,7 @@ pub(crate) fn install_from_local_file(
     path_str: &str,
     store: &LocalRegistry,
     lock_path: Option<&Path>,
-    precompiler: Option<&Precompiler>,
-) -> Result<(), CliError> {
+) -> Result<Stored, CliError> {
     let bytes = std::fs::read(path_str)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to read {path_str}: {e}")))?;
 
@@ -1291,8 +1382,11 @@ pub(crate) fn install_from_local_file(
     }
 
     capsule_runtime::report_println!("Installed {name}@{} from {path_str}", manifest.version);
-    precompile(precompiler, name.as_str(), &manifest.version, &bytes);
-    Ok(())
+    Ok(Stored {
+        name: name.to_string(),
+        version: manifest.version,
+        payload: bytes.into(),
+    })
 }
 
 /// Which platform a native payload installed from a local file is for.
@@ -1330,10 +1424,16 @@ fn local_file_platform(path_str: &str) -> Result<String, CliError> {
 }
 
 fn run_install_all_platforms(
-    parsed: Option<InstallRef>,
+    mut parsed: Vec<InstallRef>,
     no_precompile: bool,
 ) -> Result<(), CliError> {
-    let (name, version) = match parsed {
+    if parsed.len() > 1 {
+        return Err(CliError::new(
+            E_IO_003,
+            "--all-platforms takes one artifact reference (scope/name@version)",
+        ));
+    }
+    let (name, version) = match parsed.pop() {
         None => {
             return Err(CliError::new(
                 E_IO_003,
@@ -1399,11 +1499,14 @@ fn run_install_all_platforms(
         // Only this host's payload: a form is native code for the machine that compiled
         // it, so another platform's payload has nothing to gain from one here.
         if *platform == current_platform() {
-            precompile(
-                build_precompiler(no_precompile, None).as_ref(),
-                name.as_str(),
-                version,
-                &resolved.bytes,
+            compile_stored(
+                [PrecompileItem {
+                    name: name.as_str(),
+                    version,
+                    payload: &resolved.bytes,
+                }],
+                no_precompile,
+                None,
             );
         }
     }
@@ -1499,7 +1602,7 @@ mod tests {
 
         let store_dir = tempdir().unwrap();
         let store = murmur_artifact::LocalRegistry::new(store_dir.path());
-        super::install_from_local_file(file.to_str().unwrap(), &store, None, None).unwrap();
+        super::install_from_local_file(file.to_str().unwrap(), &store, None).unwrap();
 
         let name = murmur_artifact::ArtifactName::parse("local/my-tool").unwrap();
         let meta_path = store.metadata_path_for(&name, "1.0.0", Some(platform));

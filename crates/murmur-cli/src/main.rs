@@ -245,21 +245,22 @@ enum Commands {
         #[arg(long)]
         platform: Option<String>,
     },
-    /// Install an artifact into the project store (.murmur/artifacts/) by default, or globally with -g.
+    /// Install artifacts into the project store (.murmur/artifacts/) by default, or globally with -g.
     /// With no arguments, installs all manifest deps from murmur.yaml into the project store.
     Install {
-        /// Artifact reference: scope/name@version (the global store, then the scope's source),
-        /// scope/name (the newest version that fits, from the scope's source),
-        /// github:<owner>/<repo>@<tag>, or a local file path
+        /// Artifact references, installed in the order given: scope/name@version (the global
+        /// store, then the scope's source), scope/name (the newest version that fits, from the
+        /// scope's source), github:<owner>/<repo>@<tag>, or a local file path
         /// (./artifact.mur.zip). Omit to install all manifest deps from murmur.yaml.
-        artifact: Option<String>,
+        #[arg(value_name = "ARTIFACT")]
+        artifact: Vec<String>,
 
         /// Install into the global store (~/.murmur/artifacts/) instead of the project store
         #[arg(short = 'g', long)]
         global: bool,
 
         /// Download all platform variants and install into the global store (CI / roost seeding).
-        /// Requires a scope/name@version artifact reference whose scope has a source.
+        /// Takes exactly one scope/name@version artifact reference, whose scope has a source.
         #[arg(long)]
         all_platforms: bool,
 
@@ -810,7 +811,7 @@ fn main() {
             global,
             all_platforms,
             no_precompile,
-        } => run_install(artifact.as_deref(), global, all_platforms, no_precompile),
+        } => run_install(&artifact, global, all_platforms, no_precompile),
         Commands::Precompile {
             files,
             workdir,

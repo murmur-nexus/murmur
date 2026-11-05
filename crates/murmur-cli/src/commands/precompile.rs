@@ -1,16 +1,15 @@
 //! `mur precompile`: storing the compiled forms of `.mur.zip` files for this machine, so the first
 //! launch that stages them loads a form instead of compiling.
 //!
-//! The work is [`Precompiler::precompile`]'s, the same call `mur install` makes; this command only
-//! reads files, fans them out and reports. It resolves nothing, touches no artifact store and
-//! writes no `murmur.lock`, which is what lets `mur deploy run` run it on a target whose store it
-//! has just filled by hand.
+//! The work is [`Precompiler::precompile_all`]'s, the same call `mur install` makes; this command
+//! only reads files, hands them over as one batch and reports. It resolves nothing, touches no
+//! artifact store and writes no `murmur.lock`, which is what lets `mur deploy run` run it on a
+//! target whose store it has just filled by hand.
 
 use std::path::{Path, PathBuf};
 
-use capsule_runtime::precompile::{Precompiled, Precompiler};
+use capsule_runtime::precompile::{PrecompileItem, Precompiled, Precompiler};
 use murmur_artifact::max_artifact_decompressed_bytes;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::CliError;
@@ -60,38 +59,54 @@ fn outcome_text(outcome: Precompiled) -> &'static str {
     }
 }
 
-/// Compiles every file in `files` with one precompiler whose capsule writable root is `workdir`,
-/// in parallel, and reports them in argument order. Never fails: a file that cannot be read, or
-/// every file when no engine can be built, is [`Precompiled::Failed`].
+/// Compiles every file in `files` as one batch, with one precompiler whose capsule writable root
+/// is `workdir`, and reports them in argument order. Never fails: a file that cannot be read or
+/// has no manifest that parses, or every file when no engine can be built, is
+/// [`Precompiled::Failed`].
 pub(crate) fn precompile_files(files: &[PathBuf], workdir: Option<&Path>) -> PrecompileReport {
-    let precompiler = Precompiler::new(workdir);
+    let read: Vec<(Vec<u8>, Option<murmur_artifact::Manifest>)> = files
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            let manifest = murmur_artifact::load_manifest_from_artifact_bytes(&bytes).ok();
+            (bytes, manifest)
+        })
+        .collect();
+    let items: Vec<PrecompileItem<'_>> = read
+        .iter()
+        .filter_map(|(bytes, manifest)| {
+            let manifest = manifest.as_ref()?;
+            Some(PrecompileItem {
+                name: &manifest.name,
+                version: &manifest.version,
+                payload: bytes,
+            })
+        })
+        .collect();
+    let mut compiled = match Precompiler::new(workdir) {
+        Some(precompiler) => precompiler.precompile_all(&items),
+        None => vec![Precompiled::Failed; items.len()],
+    }
+    .into_iter();
     let artifacts = files
-        .par_iter()
-        .map(|path| precompile_file(precompiler.as_ref(), path))
+        .iter()
+        .zip(read.iter().map(|(_, manifest)| manifest))
+        .map(|(path, manifest)| PrecompiledFile {
+            path: path.to_string_lossy().into_owned(),
+            name: manifest.as_ref().map(|manifest| manifest.name.clone()),
+            version: manifest.as_ref().map(|manifest| manifest.version.clone()),
+            outcome: match manifest {
+                Some(_) => compiled
+                    .next()
+                    .expect("one outcome per file with a manifest"),
+                None => Precompiled::Failed,
+            },
+        })
         .collect();
     PrecompileReport {
         mur_version: env!("CARGO_PKG_VERSION").to_string(),
         decompression_ceiling: max_artifact_decompressed_bytes(),
         artifacts,
-    }
-}
-
-fn precompile_file(precompiler: Option<&Precompiler>, path: &Path) -> PrecompiledFile {
-    let bytes = std::fs::read(path).ok();
-    let manifest = bytes
-        .as_deref()
-        .and_then(|bytes| murmur_artifact::load_manifest_from_artifact_bytes(bytes).ok());
-    let outcome = match (precompiler, &bytes, &manifest) {
-        (Some(precompiler), Some(bytes), Some(manifest)) => {
-            precompiler.precompile(&manifest.name, &manifest.version, bytes)
-        }
-        _ => Precompiled::Failed,
-    };
-    PrecompiledFile {
-        path: path.to_string_lossy().into_owned(),
-        name: manifest.as_ref().map(|manifest| manifest.name.clone()),
-        version: manifest.map(|manifest| manifest.version),
-        outcome,
     }
 }
 

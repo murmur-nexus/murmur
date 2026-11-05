@@ -1624,3 +1624,490 @@ fn create_tool_artifact(
     zip.finish().unwrap();
     artifact_path
 }
+
+// ── Several references in one `mur install` ─────────────────────────────────
+
+/// The full names of the three WASM tools a [`Batch`] packs.
+/// The first is the tool `capsule-allowlisted.wasm` calls.
+const BATCH_TOOLS: [&str; 3] = ["local/echo-tool", "local/echo-two", "local/echo-three"];
+
+/// Three WASM tools with distinct names, each packing `echo-tool.wasm` (so three payload sha256s
+/// and three forms), and a skill, as `.mur.zip` files.
+struct Batch {
+    dir: TempDir,
+    tools: [PathBuf; 3],
+    skill: PathBuf,
+}
+
+impl Batch {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = BATCH_TOOLS.map(|name| {
+            let bare = murmur_artifact::tool_name_of(name);
+            let path = dir.path().join(format!("{bare}-{TOOL_VERSION}.mur.zip"));
+            common::github_release::write_zip(
+                &path,
+                &format!("name: {bare}\nversion: {TOOL_VERSION}\nruntime: tool\n"),
+                &[(
+                    "tool.wasm",
+                    &fs::read(fixture_component("echo-tool.wasm")).unwrap(),
+                )],
+            );
+            path
+        });
+        let skill = dir
+            .path()
+            .join(format!("batch-skill-{TOOL_VERSION}.mur.zip"));
+        common::github_release::write_zip(
+            &skill,
+            &format!("name: batch-skill\nversion: {TOOL_VERSION}\nruntime: skill\n"),
+            &[("SKILL.md", b"# Batch skill\n")],
+        );
+        Self { dir, tools, skill }
+    }
+
+    /// `[t1, t2, skill, t3]`, the order the scenarios install them in.
+    fn references(&self) -> Vec<String> {
+        [&self.tools[0], &self.tools[1], &self.skill, &self.tools[2]]
+            .map(|path| path.to_str().unwrap().to_string())
+            .to_vec()
+    }
+
+    /// A file in the batch's directory that does not exist.
+    fn missing(&self) -> String {
+        self.dir
+            .path()
+            .join("missing.mur.zip")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A file in the batch's directory that is not a zip.
+    fn garbage(&self) -> String {
+        let path = self.dir.path().join("garbage.mur.zip");
+        fs::write(&path, b"not a zip").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+}
+
+/// A scratch `HOME` and a project declaring the three [`BATCH_TOOLS`], run by the
+/// `capsule-allowlisted.wasm` capsule.
+struct BatchProject {
+    home: TempDir,
+    project: TempDir,
+    manifest: PathBuf,
+}
+
+impl BatchProject {
+    fn new() -> Self {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = create_project(
+            project.path(),
+            "capsule-allowlisted.wasm",
+            &BATCH_TOOLS
+                .map(|name| format!("  - name: {name}\n    version: {TOOL_VERSION}\n"))
+                .concat(),
+        );
+        Self {
+            home: tempfile::tempdir().unwrap(),
+            project,
+            manifest,
+        }
+    }
+
+    /// `mur install <args>` in the project under the scratch `HOME`.
+    fn install<S: AsRef<str>>(&self, args: &[S]) -> assert_cmd::assert::Assert {
+        Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .current_dir(self.project.path())
+            .arg("install")
+            .args(args.iter().map(AsRef::as_ref))
+            .assert()
+    }
+
+    fn compiled(&self) -> PathBuf {
+        self.home.path().join(".murmur").join("compiled")
+    }
+
+    /// The `.mur.zip` the project store holds for the bare name `bare`.
+    fn stored(&self, bare: &str) -> PathBuf {
+        self.project.path().join(format!(
+            ".murmur/artifacts/local/{bare}/{TOOL_VERSION}/{bare}-{TOOL_VERSION}.mur.zip"
+        ))
+    }
+
+    /// The full names `murmur.lock` pins, sorted.
+    fn pinned(&self) -> Vec<String> {
+        let lock = read_lockfile(&self.project.path().join("murmur.lock")).unwrap();
+        let mut names: Vec<String> = lock.artifacts.iter().map(|a| a.name.clone()).collect();
+        names.sort();
+        names
+    }
+}
+
+/// What `mur install --no-precompile <reference>` prints into a fresh [`BatchProject`].
+fn single_no_precompile(reference: &str) -> (String, String) {
+    output(
+        BatchProject::new()
+            .install(&["--no-precompile", reference])
+            .success(),
+    )
+}
+
+/// The form of each of `tools`, named by its payload sha256, each checked against its sidecar
+/// and owner-only.
+fn checked_forms(compiled: &Path, tools: &[&PathBuf]) -> Vec<PathBuf> {
+    assert_eq!(mode(compiled), 0o700);
+    let mut forms: Vec<PathBuf> = tools
+        .iter()
+        .map(|tool| {
+            let form = form_named(compiled, &sha256_hex(&fs::read(tool).unwrap()));
+            assert_eq!(mode(&form), 0o600, "{}", form.display());
+            assert_matches_sidecar(&form);
+            form
+        })
+        .collect();
+    forms.sort();
+    forms
+}
+
+#[test]
+fn several_references_install_in_order_and_compile_every_wasm_form() {
+    let batch = Batch::new();
+    let references = batch.references();
+    let project = BatchProject::new();
+
+    let (stdout, stderr) = output(project.install(&references).success());
+    let expected: String = references
+        .iter()
+        .map(|reference| single_no_precompile(reference).0)
+        .collect();
+    assert_eq!(stdout, expected);
+
+    let unprecompiled = BatchProject::new();
+    let mut args = vec!["--no-precompile".to_string()];
+    args.extend(references.iter().cloned());
+    assert_eq!(
+        output(unprecompiled.install(&args).success()),
+        (stdout, stderr)
+    );
+    assert!(!unprecompiled.home.path().join(".murmur").exists());
+
+    let tool_forms = checked_forms(&project.compiled(), &batch.tools.iter().collect::<Vec<_>>());
+    assert_eq!(
+        forms(&project.compiled()),
+        tool_forms,
+        "the skill got a form"
+    );
+    for bare in ["echo-tool", "echo-two", "echo-three", "batch-skill"] {
+        assert!(project.stored(bare).is_file(), "{bare} was not stored");
+    }
+
+    let one_by_one = BatchProject::new();
+    for reference in &references {
+        one_by_one
+            .install(&["--no-precompile", reference.as_str()])
+            .success();
+    }
+    assert_eq!(
+        fs::read_to_string(project.project.path().join("murmur.lock")).unwrap(),
+        fs::read_to_string(one_by_one.project.path().join("murmur.lock")).unwrap()
+    );
+
+    let before: Vec<_> = tool_forms
+        .iter()
+        .map(|form| (identity(form), identity(&sidecar(form))))
+        .collect();
+    common::run_capsule(&project.home, &project.manifest)
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+    let after: Vec<_> = tool_forms
+        .iter()
+        .map(|form| (identity(form), identity(&sidecar(form))))
+        .collect();
+    assert_eq!(after, before, "the run rewrote a form install wrote");
+}
+
+#[test]
+fn several_references_report_in_argument_order_whatever_order_they_compile_in() {
+    let batch = Batch::new();
+    let references = batch.references();
+    let runs: Vec<(String, String)> = (0..3)
+        .map(|_| output(BatchProject::new().install(&references).success()))
+        .collect();
+    assert_eq!(runs[0], runs[1]);
+    assert_eq!(runs[0], runs[2]);
+
+    let reversed: Vec<String> = references.iter().rev().cloned().collect();
+    let (stdout, stderr) = output(BatchProject::new().install(&reversed).success());
+    assert_eq!(stderr, runs[0].1);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), references.len());
+    assert!(lines.iter().all(|line| line.starts_with("Installed ")));
+    assert_eq!(
+        lines.into_iter().rev().collect::<Vec<_>>(),
+        runs[0].0.lines().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_failed_reference_stops_none_of_the_others_and_the_report_names_each_in_order() {
+    let batch = Batch::new();
+    let [t1, t2, t3] = batch
+        .tools
+        .clone()
+        .map(|path| path.to_str().unwrap().to_string());
+    let (missing, garbage) = (batch.missing(), batch.garbage());
+    let project = BatchProject::new();
+
+    let (stdout, _) = output(
+        project
+            .install(&[&t1, &missing, &t2, &garbage, &t3])
+            .code(1),
+    );
+
+    let mut expected: String = [&t1, &t2, &t3]
+        .map(|reference| single_no_precompile(reference).0)
+        .concat();
+    expected.push_str("\n2 of 5 references failed to install:\n");
+    for failed in [&missing, &garbage] {
+        let (single_stdout, single_stderr) = output(BatchProject::new().install(&[failed]).code(1));
+        assert_eq!(single_stdout, "");
+        expected.push_str(&format!("\n  {failed}\n"));
+        for line in single_stderr.lines() {
+            expected.push_str(&format!("    {line}\n"));
+        }
+    }
+    assert_eq!(stdout, expected);
+
+    checked_forms(&project.compiled(), &batch.tools.iter().collect::<Vec<_>>());
+    assert_eq!(forms(&project.compiled()).len(), 3);
+    assert_eq!(
+        project.pinned(),
+        vec!["local/echo-three", "local/echo-tool", "local/echo-two"]
+    );
+    let mut stored: Vec<String> =
+        fs::read_dir(project.project.path().join(".murmur/artifacts/local"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+    stored.sort();
+    assert_eq!(stored, vec!["echo-three", "echo-tool", "echo-two"]);
+
+    // One missing reference on its own fails exactly as it always has.
+    let alone = BatchProject::new();
+    let (stdout, stderr) = output(alone.install(&[&missing]).code(1));
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        format!(
+            "error[E-IO-003]: failed to read {missing}: No such file or directory (os error 2)\n"
+        )
+    );
+    assert!(!alone.project.path().join(".murmur").exists());
+}
+
+#[test]
+fn a_reference_that_does_not_parse_refuses_every_reference_before_any_write() {
+    let batch = Batch::new();
+    let t1 = batch.tools[0].to_str().unwrap();
+
+    let single = BatchProject::new();
+    let (single_stdout, single_stderr) = output(single.install(&["x"]).code(1));
+    assert!(single_stderr.contains("E-REG-007"), "{single_stderr}");
+
+    let several = BatchProject::new();
+    assert_eq!(
+        output(several.install(&[t1, "x"]).code(1)),
+        (single_stdout, single_stderr)
+    );
+    for project in [&single, &several] {
+        assert!(!project.project.path().join(".murmur").exists());
+        assert!(!project.compiled().exists());
+    }
+
+    let all_platforms = BatchProject::new();
+    let (stdout, stderr) = output(
+        all_platforms
+            .install(&["--all-platforms", "acme/a@1.0.0", "acme/b@1.0.0"])
+            .code(1),
+    );
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "error[E-IO-003]: --all-platforms takes one artifact reference (scope/name@version)\n"
+    );
+    assert!(!all_platforms.project.path().join(".murmur").exists());
+    assert!(!all_platforms.home.path().join(".murmur").exists());
+}
+
+#[test]
+fn several_references_with_no_precompile_store_and_pin_both_and_touch_no_murmur_home() {
+    let batch = Batch::new();
+    let project = BatchProject::new();
+    project
+        .install(&[
+            "--no-precompile",
+            batch.tools[0].to_str().unwrap(),
+            batch.tools[1].to_str().unwrap(),
+        ])
+        .success();
+    assert!(project.stored("echo-tool").is_file());
+    assert!(project.stored("echo-two").is_file());
+    assert_eq!(project.pinned(), vec!["local/echo-tool", "local/echo-two"]);
+    assert!(!project.home.path().join(".murmur").exists());
+}
+
+#[test]
+fn several_references_into_the_global_store_compile_every_wasm_form() {
+    let batch = Batch::new();
+    let project = BatchProject::new();
+    let references = batch.references();
+    let mut args = vec!["-g".to_string()];
+    args.extend(references.iter().cloned());
+    project.install(&args).success();
+
+    let store = project.home.path().join(".murmur/artifacts/local");
+    for bare in ["echo-tool", "echo-two", "echo-three", "batch-skill"] {
+        assert!(
+            store
+                .join(format!(
+                    "{bare}/{TOOL_VERSION}/{bare}-{TOOL_VERSION}.mur.zip"
+                ))
+                .is_file(),
+            "{bare} was not stored"
+        );
+    }
+    let tool_forms = checked_forms(&project.compiled(), &batch.tools.iter().collect::<Vec<_>>());
+    assert_eq!(forms(&project.compiled()), tool_forms);
+    assert!(!project.project.path().join(".murmur").exists());
+}
+
+#[test]
+fn a_manifest_install_compiles_each_success_and_reports_failures_in_manifest_order() {
+    let batch = Batch::new();
+    let project = BatchProject::new();
+    for tool in &batch.tools {
+        common::publish_local(&project.home, tool).success();
+    }
+    let declare = |names: &[&str]| {
+        create_project(
+            project.project.path(),
+            "capsule-allowlisted.wasm",
+            &names
+                .iter()
+                .map(|name| format!("  - name: {name}\n    version: {TOOL_VERSION}\n"))
+                .collect::<String>(),
+        );
+    };
+    declare(&[
+        BATCH_TOOLS[0],
+        "local/absent-two",
+        BATCH_TOOLS[1],
+        "local/absent-four",
+        BATCH_TOOLS[2],
+    ]);
+    let no_args: [&str; 0] = [];
+
+    // The failure report, without the roll-up line after it, which says `all cached` once the
+    // project store holds the three.
+    let report = |stdout: &str| -> String {
+        let report = stdout
+            .split_once("2 of 5 artifacts failed to install:")
+            .unwrap_or_else(|| panic!("no failure report in:\n{stdout}"))
+            .1;
+        report.split("\ninstalled ").next().unwrap().to_string()
+    };
+    let (first, _) = output(project.install(&no_args).code(1));
+    let first = report(&first);
+    let two = first.find("\n  local/absent-two@0.1.0\n").unwrap();
+    let four = first.find("\n  local/absent-four@0.1.0\n").unwrap();
+    assert!(two < four, "{first}");
+    for _ in 0..2 {
+        assert_eq!(report(&output(project.install(&no_args).code(1)).0), first);
+    }
+
+    let tool_forms = checked_forms(&project.compiled(), &batch.tools.iter().collect::<Vec<_>>());
+    assert_eq!(forms(&project.compiled()), tool_forms);
+    assert_eq!(
+        project.pinned(),
+        vec!["local/echo-three", "local/echo-tool", "local/echo-two"]
+    );
+
+    declare(&BATCH_TOOLS);
+    project.install(&no_args).success();
+    let before: Vec<_> = tool_forms.iter().map(|form| identity(form)).collect();
+    common::run_capsule(&project.home, &project.manifest)
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+    assert_eq!(
+        tool_forms
+            .iter()
+            .map(|form| identity(form))
+            .collect::<Vec<_>>(),
+        before,
+        "the run compiled an installed artifact again"
+    );
+}
+
+#[test]
+fn a_github_release_compiles_each_wasm_payload_and_no_native_one() {
+    use common::github_release::{native_tool_zip, wasm_tool_zip, MockGitHub};
+
+    let staging = tempfile::tempdir().unwrap();
+    let platform = murmur_artifact::current_platform();
+    let alpha = wasm_tool_zip(staging.path(), "alpha", "1.0.0");
+    let gamma = native_tool_zip(staging.path(), "gamma", "1.0.0", platform);
+    let beta = wasm_tool_zip(staging.path(), "beta", "1.0.0");
+    let release = MockGitHub::start();
+    release.repository("acme/artifacts", 4242);
+    release.release(
+        "acme/artifacts",
+        "v1.0.0",
+        [&alpha, &gamma, &beta]
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .to_vec(),
+    );
+    let install = |home: &TempDir, extra: &[&str]| {
+        output(
+            Command::cargo_bin("mur")
+                .unwrap()
+                .env("HOME", home.path())
+                .env("MUR_GITHUB_API_BASE", &release.api_base)
+                .env_remove("GITHUB_TOKEN")
+                .args(["install", "-g"])
+                .args(extra)
+                .arg("github:acme/artifacts@v1.0.0")
+                .assert()
+                .success(),
+        )
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = install(&home, &[]);
+    assert_eq!(
+        install(&tempfile::tempdir().unwrap(), &["--no-precompile"]),
+        (stdout.clone(), stderr)
+    );
+    let installed: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Installed "))
+        .map(|line| line.split('@').next().unwrap())
+        .collect();
+    assert_eq!(installed, vec!["acme/alpha", "acme/gamma", "acme/beta"]);
+
+    let compiled = home.path().join(".murmur").join("compiled");
+    let tool_forms = checked_forms(&compiled, &[&alpha, &beta]);
+    assert_eq!(
+        forms(&compiled),
+        tool_forms,
+        "the native payload got a form"
+    );
+}
