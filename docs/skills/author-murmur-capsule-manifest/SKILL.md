@@ -62,7 +62,7 @@ In the capsule manifest, describe the role an artifact plays:
 - `hook` — lifecycle/runtime behavior supplied by an artifact;
 - `skill` — packaged guidance or instructions.
 
-Do not put artifact implementation details such as WASM/native packaging into the capsule manifest. Those belong to the artifact's own manifest.
+Do not put artifact implementation details such as packaging into the capsule manifest. Those belong to the artifact's own manifest.
 
 ### Pin what must be reproducible
 
@@ -362,9 +362,9 @@ Both require the binary to already be in `shell.allow`. They are mutually exclus
 
 #### Resource bounds
 
-Use `capabilities.limits` for component-level WASM limits and `capabilities.resources` for native subprocess-tree limits.
+Use `capabilities.limits` for component-level WASM limits and `capabilities.resources` for subprocess-tree limits.
 
-Only override defaults when the workload needs a different hard ceiling. CPU time (`cpu_seconds`) and the cgroup CPU cap (`cgroup_cpu_percent`) have no default: an unset field means no CPU bound, so set them when the capsule needs one. Useful native-process controls include:
+Only override defaults when the workload needs a different hard ceiling. CPU time (`cpu_seconds`) and the cgroup CPU cap (`cgroup_cpu_percent`) have no default: an unset field means no CPU bound, so set them when the capsule needs one. Useful subprocess controls include:
 
 - process/task count;
 - open files;
@@ -689,7 +689,7 @@ Audit the completed manifest semantically, not just syntactically.
 - Filesystem scopes are relative and do not escape.
 - Ingress via peer fetch is separately justified.
 - Spawn allow-list contains only intended child capsules.
-- Hard resource ceilings exist where runaway native workloads are plausible.
+- Hard resource ceilings exist where runaway subprocess workloads are plausible.
 - The declared containment floor is compatible with the rest of the manifest.
 
 ### Per-artifact semantics

@@ -54,7 +54,7 @@
 
 ## What this verifies
 
-A capsule declaring `capabilities.containment: sealed` runs its native subprocess tree inside a
+A capsule declaring `capabilities.containment: sealed` runs its subprocess tree inside a
 private mount namespace pivoted onto a composed root. The property under test is a **negative and
 absolute** one, stronger than anything `scoped` can state:
 
@@ -1993,5 +1993,5 @@ file; each is a scoping decision this slice made explicitly.
   is worth knowing before debugging a pty failure. `/proc` has its rule: the command opens the
   private `procfs` it mounted and grants read and list beneath it before the root is built.
 - **The composed root applies to every subprocess path.** Shell commands, plan shell steps and
-  native tools are all spawned through `sandbox::prepare_enforcement`; see
-  [Native tools](containment.md#native-tools).
+  the programs a WASM tool runs are all spawned through `sandbox::prepare_enforcement`; see
+  [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers).

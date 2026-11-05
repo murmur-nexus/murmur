@@ -358,94 +358,6 @@ pub fn fixture_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// Name of the fixture native tool crate under `tests/fixtures/native-tool/`,
-/// used both as the artifact name and as the binary name inside `bin/`.
-pub const FIXTURE_NATIVE_TOOL_NAME: &str = "tool-fixture";
-
-/// Build (once per test process) and locate the fixture native tool binary.
-///
-/// Returns `None` — for the caller to turn into a clean skip — if the build
-/// cannot run or leaves nothing at the expected path. Unlike the WASM fixtures
-/// alongside it, this binary is host-native and therefore not portable across
-/// the project's platform targets, so it is compiled here rather than checked
-/// in. Output lands in the workspace target directory, so an unchanged fixture
-/// is not recompiled.
-pub fn fixture_native_tool_binary() -> Option<PathBuf> {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = fixture_path("native-tool/Cargo.toml");
-    let target_dir = workspace_root.join("target").join("native-tool-fixture");
-    let binary_path = target_dir.join("release").join(FIXTURE_NATIVE_TOOL_NAME);
-
-    // Built on every first call in the process, not only when the binary is missing: cargo's
-    // freshness check makes an unchanged fixture cheap, and a stale binary from before an edit
-    // to the fixture would otherwise be reused silently.
-    static BUILT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let built = *BUILT.get_or_init(|| {
-        let status = std::process::Command::new("cargo")
-            .args(["build", "--release", "--manifest-path"])
-            .arg(&manifest)
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .status();
-        match status {
-            Ok(status) if status.success() => true,
-            _ => {
-                eprintln!("[fixture] cargo build of {FIXTURE_NATIVE_TOOL_NAME} failed");
-                false
-            }
-        }
-    });
-    if !built {
-        return None;
-    }
-
-    // A build can exit 0 without producing the binary, so the caller gets a clean skip
-    // rather than a path that fails to spawn inside a test body.
-    if !binary_path.exists() {
-        eprintln!(
-            "[fixture] {FIXTURE_NATIVE_TOOL_NAME} not found at {} after a successful build",
-            binary_path.display()
-        );
-        return None;
-    }
-    Some(binary_path)
-}
-
-/// The fixture native tool's own `murmur.yaml`, the manifest the tests pack into
-/// its artifact zip so `input_schema` matches what a real artifact carries.
-pub fn fixture_native_tool_manifest() -> PathBuf {
-    fixture_path("native-tool/murmur.yaml")
-}
-
-/// Pack a native tool artifact zip with the canonical `murmur.yaml` + `bin/<name>` layout:
-/// the manifest at the archive root and the binary executable at `bin/<name>`.
-pub fn create_native_tool_zip(
-    dir: &Path,
-    name: &str,
-    version: &str,
-    manifest_bytes: &[u8],
-    binary_path: &Path,
-) -> PathBuf {
-    let name = murmur_artifact::tool_name_of(name);
-    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
-    let file = fs::File::create(&artifact_path).unwrap();
-    let mut zip = ZipWriter::new(file);
-
-    let options: SimpleFileOptions =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("murmur.yaml", options).unwrap();
-    zip.write_all(manifest_bytes).unwrap();
-
-    let exec_options: SimpleFileOptions = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    zip.start_file(format!("bin/{name}"), exec_options).unwrap();
-    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
-
-    zip.finish().unwrap();
-    artifact_path
-}
-
 /// Point `$HOME` at a scratch directory that lives as long as the test process.
 ///
 /// Staging in-process means the runtime resolves `$HOME` from the test binary's own environment,
@@ -827,55 +739,6 @@ pub fn create_hook_artifact(dir: &Path, name: &str, version: &str, wasm_path: &P
 
     zip.start_file("hook.wasm", options).unwrap();
     zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();
-
-    zip.finish().unwrap();
-    artifact_path
-}
-
-/// Create a native artifact .mur.zip with a shell-script binary.
-///
-/// The binary is named `<name>` and must be an executable script (shebang line included).
-/// This is used in tests to exercise the native artifact staging and dispatch path
-/// without requiring a pre-compiled Rust binary.
-pub fn create_native_artifact(
-    dir: &Path,
-    name: &str,
-    version: &str,
-    binary_script: &str,
-    description: Option<&str>,
-    input_schema: Option<&str>,
-) -> PathBuf {
-    let name = murmur_artifact::tool_name_of(name);
-    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
-    let file = fs::File::create(&artifact_path).unwrap();
-    let mut zip = ZipWriter::new(file);
-
-    // Manifest entry — Deflated for consistency
-    let options: SimpleFileOptions =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    zip.start_file("murmur.yaml", options).unwrap();
-    writeln!(zip, "name: {name}").unwrap();
-    writeln!(zip, "version: {version}").unwrap();
-    // A native tool is `runtime: tool` with the binary implementation declared
-    // via `implementation: native` in the artifact's own manifest.
-    writeln!(zip, "runtime: tool").unwrap();
-    writeln!(zip, "implementation: native").unwrap();
-    if let Some(desc) = description {
-        writeln!(zip, "description: {desc}").unwrap();
-    }
-    if let Some(schema) = input_schema {
-        writeln!(zip, "input_schema: |").unwrap();
-        writeln!(zip, "  {schema}").unwrap();
-    }
-
-    // Binary entry — canonical native layout places the binary at `bin/<name>`
-    // with Unix executable permissions (0o755) via zip external attributes.
-    let exec_options: SimpleFileOptions = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    zip.start_file(format!("bin/{name}"), exec_options).unwrap();
-    zip.write_all(binary_script.as_bytes()).unwrap();
 
     zip.finish().unwrap();
     artifact_path
@@ -1284,7 +1147,6 @@ pub fn publish_to_store(
             version: version.to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: artifact_runtime.to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,

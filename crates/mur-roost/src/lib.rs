@@ -32,7 +32,7 @@ use std::time::Duration;
 use capsule_runtime::{
     artifact::extract_manifest_yaml, SpawnEnvelope, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
-use murmur_artifact::{current_platform, LocalRegistry, Registry};
+use murmur_artifact::{LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{now_ms, AuthorityError, SpawnAuthority, SPAWN_APPROVAL_TTL_SECS};
@@ -354,15 +354,13 @@ fn resolve_capsule(
     let artifact_name = murmur_artifact::ArtifactName::parse(name)
         .map_err(|e| err(400, "Bad Request", &e.to_string()))?;
     let registry = LocalRegistry::new(&state.registry_path);
-    let resolved = registry
-        .resolve_with_platform(&artifact_name, version, Some(current_platform()))
-        .map_err(|e| {
-            err(
-                500,
-                "Internal Server Error",
-                &format!("registry error for '{name}/{version}': {e}"),
-            )
-        })?;
+    let resolved = registry.resolve(&artifact_name, version).map_err(|e| {
+        err(
+            500,
+            "Internal Server Error",
+            &format!("registry error for '{name}/{version}': {e}"),
+        )
+    })?;
 
     let manifest_yaml = extract_manifest_yaml(name, version, &resolved.bytes).map_err(|e| {
         err(

@@ -242,8 +242,8 @@ Containment
 Routes
   shell commands    present  landlock+seccomp
   plan shell steps  absent   landlock+seccomp
-  native tools      present  landlock+seccomp (murmur/tool-git)
-  WASM tools        absent   host process, not confined by the class
+  WASM tools        present  host process, not confined by the class (murmur/tool-git)
+    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
   drivers           present  host process, not confined by the class (murmur/driver-anthropic)
     Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
   hooks             present  host process, not confined by the class (ana/hook-telemetry)
@@ -306,10 +306,10 @@ the composed root; on the same host every other capsule runs on `landlock+seccom
 | `none` | `advisory` | No kernel sandboxing primitive (macOS and every non-Linux target) |
 
 `Routes` names every way this capsule runs code and what holds each. The mechanism confines shell
-commands, shell steps of a submitted plan, and native tools, such as `murmur/tool-git` here, which
-runs `git` because `shell allow:` names it. WASM tools, drivers and hooks run inside the `mur`
+commands and shell steps of a submitted plan. WASM tools, drivers and hooks run inside the `mur`
 process, held by their own preopens and network grants, and a process harness runs as a child of
-`mur` outside the class. See
+`mur` outside the class. A program a WASM tool runs, such as the `git` that `murmur/tool-git` runs
+here because `shell allow:` names it, runs under the mechanism like a shell command. See
 [Routes and what holds each](../reference/containment.md#routes).
 
 `cgroup scope:` says whether a launch here gets the cgroup scope a capsule that runs subprocesses

@@ -1,19 +1,16 @@
 # Quickstart: Building a Murmur Tool in Python
 
-Murmur's ecosystem is currently Rust-centric, but Murmur is designed to work well with **any language**.  
-If your tool can be packaged as a supported artifact runtime, it can participate in the ecosystem.
+A Murmur tool is a WASM component. Any language that compiles to a WASM component can write one, Python included.
 
 This guide walks through building, packaging, and publishing a Murmur tool artifact written in Python.
 
 By the end, you will have a working `.mur.zip` published into your global store and a capsule that can invoke it.
 
-Prefer shipping a native binary instead of WASM? See [Python Tool Quickstart (Native)](python-native.md).
-
 ---
 
 ## How it works
 
-A Murmur tool can be distributed as a WASM component. For Python, the flow is:
+For Python, the flow is:
 
 ```text
 tool.py → componentize-py → tool.wasm → mur build → .mur.zip → mur publish

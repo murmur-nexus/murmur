@@ -25,7 +25,7 @@ Apply these rules throughout the work:
 2. **Assume confused-deputy behavior.** Ask: if attacker-influenced content makes the agent use every granted capability for the wrong reason, what can it damage or disclose?
 3. **The top-level capability block is the ceiling.** Lower it before tuning artifacts. An artifact's effective grant is its declaration intersected with this ceiling; it can subtract but cannot widen it.
 4. **Declaration and enforcement are separate facts.** A manifest states intended authority. The target host and runtime mechanisms determine which parts are walls. Never report a capability as enforced without evidence from the deployment class being assessed.
-5. **Subprocess creation changes the boundary.** WASM component filesystem scopes are runtime-enforced across supported platforms. A shell binary, spawn grant, native tool, or a WASM tool running a `shell.allow` program through `murmur:process` moves work into an OS process whose filesystem, exec, network, and resource confinement depends on host support. Every `shell.allow` entry is runnable by every WASM tool in the capsule, not only by the model's shell calls.
+5. **Subprocess creation changes the boundary.** WASM component filesystem scopes are runtime-enforced across supported platforms. A shell binary, spawn grant, or a WASM tool running a `shell.allow` program through `murmur:process` moves work into an OS process whose filesystem, exec, network, and resource confinement depends on host support. Every `shell.allow` entry is runnable by every WASM tool in the capsule, not only by the model's shell calls.
 6. **Break the maximum-risk pair first.** A general shell plus any path for external content is the critical combination. Count fetches performed by tools, drivers, peer retrieval, package managers, version-control commands, and pre/post hooks—not only entries visible under the capsule network allowlist.
 7. **Reduce authority before adding detection.** Prefer removing a grant, narrowing a scope, or moving work into a constrained artifact. Observability is still required, but it is evidence rather than protection.
 
@@ -67,7 +67,7 @@ Use the first viable option in this order:
 
 1. No subprocesses.
 2. Scoped WASM tools and drivers for discrete operations.
-3. Specific native binaries without a general shell, while acknowledging that interpreters and programs with execution options can still launch arbitrary code unless the host enforces exec mediation.
+3. Specific host binaries in `shell.allow` without a general shell, while acknowledging that interpreters and programs with execution options can still launch arbitrary code unless the host enforces exec mediation.
 4. A general shell only when the workload cannot be expressed otherwise.
 
 For any external or attacker-influenced content, separate ingestion from action:
@@ -100,11 +100,8 @@ Subprocesses start from Murmur's small baseline rather than the complete host en
 - remember that built-in credential-shaped variables are stripped before spawn;
 - remember the composition order: baseline, explicit additions, removals, then synthetic `HOME`/`USERPROFILE`; removals win and the synthetic home cannot be overridden.
 
-The same environment construction applies to native tool subprocesses even when `shell.allow` is absent.
-
 Give a WASM tool, hook, or the inference driver its third-party key through `gateway: {endpoint, api_key}` on its own `artifacts:` entry. The runtime attaches the key to that artifact's requests and the artifact never holds it.
 
-- A native tool cannot take a gateway (`E-CAP-017`).
 - A gateway for anything but the configured driver is not metered by the spend ceilings, reported as `W-SEC-030`.
 - An upstream that takes no key is declared `keyless: true`; a gateway with neither `api_key` nor `keyless: true` is refused with `E-CAP-018`.
 - Never pass a key through `env.allow` or an artifact's `config:` block.
@@ -118,7 +115,7 @@ Do this after the ceiling is minimal.
 - Per-artifact network entries must be at least as specific as the corresponding ceiling entry. Match scheme, host, and port exactly when possible.
 - Use per-artifact `filesystem.scope` to give each WASM tool only its required subtree.
 - Only per-artifact `network`, `filesystem` and `state` take effect on a tool or driver. Per-artifact `shell`, `spawn`, `env`, `limits`, `resources`, or `containment` entries are inert and trigger `W-SEC-008`; put subprocess controls at capsule scope or move the operation into WASM.
-- A native tool cannot be narrowed below the ceiling: any per-artifact sub-block on it other than `state` triggers `W-SEC-008`. On Linux it runs in the capsule's subprocess sandbox under the capsule-wide grants, so grant what it runs in `shell.allow` (for example `git` for `murmur/tool-git`) and the hosts it reaches in `network.allow`, and keep its inputs and outputs in the workdir. Its own entry's `config:` reaches it as `MURMUR_ARTIFACT_CONFIG`, and `capabilities.state` gives it a durable store at `MURMUR_STATE_DIR`; put lasting state such as a browser profile there rather than in the workdir. Only Full and Sealed keep that store from other subprocesses.
+- A program a WASM tool runs through `murmur:process` runs in the capsule's subprocess sandbox under the capsule-wide grants: grant it in `shell.allow` (for example `git` for `murmur/tool-git`) and the hosts it reaches in `network.allow`.
 - Hooks start with no network, directory, or task visibility unless granted. Tools and drivers start from the opposite default by inheriting the ceiling. Audit unnarrowed tools and widened hooks.
 
 Example shape; adapt endpoints, scopes, artifact names, versions, and provider fields to the actual use case:
@@ -165,7 +162,7 @@ Keep these facts separate in the assessment:
 - **achieved class:** the class the capsule's commands ran under (`achieved:` / `achieved_containment`);
 - **installed mechanism:** the enforcement tier those commands ran on (`mechanism:` / `enforcement_tier`);
 - **host ceiling:** what probing shows the host could support for a capsule declaring `sealed` (`host can back:` / `host_containment`);
-- **routes outside the class:** the class confines shell commands, plan shell steps and native tools only. WASM tools, drivers, hooks and an `inference.transport: process` harness run outside it — read the `Routes` block / `routes` rows (`under_class: false`, `mechanism: host-process`), and expect `W-SEC-034` for a `scoped` or `sealed` floor;
+- **routes outside the class:** the class confines shell commands, plan shell steps and the programs WASM tools run through `murmur:process` only. WASM tools, drivers, hooks and an `inference.transport: process` harness run outside it — read the `Routes` block / `routes` rows (`under_class: false`, `mechanism: host-process`), and expect `W-SEC-034` for a `scoped` or `sealed` floor;
 - **cgroup scope:** whether a launch gets the cgroup scope a subprocess-capable capsule needs (`cgroup scope:` / `cgroup_scope`); `unavailable` predicts an `E-RUN-012` refusal.
 
 A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest declarable class, and lets the operator run the capsule [unconfined](https://docs.murmur.nexus/reference/containment/#unconfined); any declared floor, `advisory` included, refuses that. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.

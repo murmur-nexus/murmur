@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use capsule_runtime::SERVED_WIT_PACKAGES;
-use murmur_artifact::{
-    current_platform, ArtifactMeta, LocalRegistry, Registry, RuntimeType, SUPPORTED_PLATFORMS,
-};
+use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
 use predicates::prelude::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -30,31 +28,12 @@ fn served(package: &str) -> &'static str {
         .1
 }
 
-/// A platform other than this host's.
-fn other_platform() -> &'static str {
-    SUPPORTED_PLATFORMS
-        .iter()
-        .find(|p| **p != current_platform())
-        .unwrap()
-}
-
-fn asset(name: &str, version: &str, platform: Option<&str>) -> Value {
-    match platform {
-        Some(platform) => json!({
-            "file": format!("{name}-{version}-{platform}.mur.zip"),
-            "platform": platform,
-            "sha256": "0".repeat(64),
-        }),
-        None => json!({ "file": format!("{name}-{version}.mur.zip"), "sha256": "0".repeat(64) }),
-    }
-}
-
-fn version(name: &str, version: &str, interfaces: &[&str], platforms: &[Option<&str>]) -> Value {
+fn version(name: &str, version: &str, interfaces: &[&str]) -> Value {
     json!({
         "version": version,
         "release": format!("v{version}"),
         "interfaces": interfaces,
-        "assets": platforms.iter().map(|p| asset(name, version, *p)).collect::<Vec<_>>(),
+        "assets": [{ "file": format!("{name}-{version}.mur.zip"), "sha256": "0".repeat(64) }],
     })
 }
 
@@ -64,7 +43,7 @@ fn tool_entry(name: &str) -> Value {
         "runtime": "tool",
         "description": format!("The {name} tool."),
         "tags": ["tool", name],
-        "versions": [version(name, "1.0.0", &[], &[None])],
+        "versions": [version(name, "1.0.0", &[])],
     })
 }
 
@@ -87,8 +66,8 @@ fn write_index(dir: &TempDir, entries: &[Value]) -> String {
 }
 
 /// An index exercising the fit rule: a tool whose newest version names an interface version no
-/// `mur` serves, a native tool whose newest version has no payload for this host, a hook naming
-/// a package this `mur` does not serve, and a skill that fits everywhere.
+/// `mur` serves, a tool whose only version fits, a hook naming a package this `mur` does not
+/// serve, and a skill that fits everywhere.
 fn fit_index_entries() -> Vec<Value> {
     let tool_run = format!("murmur:tool/run@{}", served("murmur:tool"));
     vec![
@@ -98,8 +77,8 @@ fn fit_index_entries() -> Vec<Value> {
             "description": "Read, write and patch files in the workdir.",
             "tags": ["tool", "editor"],
             "versions": [
-                version("tool-editor", "0.8.0", &["murmur:tool/run@9.9.9"], &[None]),
-                version("tool-editor", "0.7.0", &[&tool_run], &[None]),
+                version("tool-editor", "0.8.0", &["murmur:tool/run@9.9.9"]),
+                version("tool-editor", "0.7.0", &[&tool_run]),
             ],
         }),
         json!({
@@ -108,22 +87,21 @@ fn fit_index_entries() -> Vec<Value> {
             "description": "Structured git interface.",
             "tags": ["tool", "git"],
             "versions": [
-                version("tool-git", "0.3.0", &[], &[Some(other_platform())]),
-                version("tool-git", "0.2.0", &[], &[Some(current_platform())]),
+                version("tool-git", "0.2.0", &[]),
             ],
         }),
         json!({
             "name": "hook-old",
             "runtime": "hook",
             "tags": ["hook", "old"],
-            "versions": [version("hook-old", "1.0.0", &["murmur:nowhere/x@1.0.0"], &[None])],
+            "versions": [version("hook-old", "1.0.0", &["murmur:nowhere/x@1.0.0"])],
         }),
         json!({
             "name": "skill-x",
             "runtime": "skill",
             "description": "A skill.",
             "tags": ["skill", "x"],
-            "versions": [version("skill-x", "0.4.0", &[], &[None])],
+            "versions": [version("skill-x", "0.4.0", &[])],
         }),
     ]
 }
@@ -134,9 +112,8 @@ fn publish_meta(home: &TempDir, name: &str) {
     let meta = ArtifactMeta {
         name: murmur_artifact::ArtifactName::parse(name).unwrap(),
         version: "1.0.0".to_string(),
-        runtime: RuntimeType::Native,
-        artifact_runtime: "native".to_string(),
-        platforms: vec![("darwin".to_string(), "aarch64".to_string())],
+        runtime: RuntimeType::Wasm,
+        artifact_runtime: "tool".to_string(),
         description: None,
         tags: vec![],
         wit_contracts: None,
@@ -285,10 +262,6 @@ fn search_shows_the_newest_version_that_fits_this_mur() {
                 "murmur/tool-editor: 0.8.0 needs murmur:tool/run@9.9.9, this mur serves \
                  murmur:tool@{}",
                 served("murmur:tool")
-            ),
-            format!(
-                "murmur/tool-git: 0.3.0 has no payload for {}",
-                current_platform()
             ),
         ],
         "{stdout}"

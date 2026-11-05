@@ -21,14 +21,12 @@ use capsule_runtime::{
     SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, native_binary_verdict, newest_fitting_level,
-    parse_tool_implementation_from_yaml, read_runtime_manifest_text, registry_warning_link,
-    resolve_manifest_path, resolve_roster_path, sha256_hex, version_fit,
-    warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactImplementation,
-    ArtifactRuntime, ContractDirection, FitSubject, LocalRegistry, LockOrigin, MurmurLock,
-    NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
-    RuntimeManifest, UnservedInterface, VersionFit, WitContracts, MANIFEST_FILENAME,
-    ROSTER_FILENAME, W_REG_001, W_REG_002, W_REG_003,
+    effective_containment_floor, newest_fitting_level, read_runtime_manifest_text,
+    registry_warning_link, resolve_manifest_path, resolve_roster_path, sha256_hex, version_fit,
+    warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactRuntime,
+    ContractDirection, FitSubject, LocalRegistry, LockOrigin, MurmurLock, Registry,
+    ResolvedArtifact, RosterReachability, RuntimeManifest, UnservedInterface, VersionFit,
+    WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -45,94 +43,7 @@ use crate::error::{
 };
 use crate::stores::{installed_contracts, interface_label, served_phrase, FallbackRegistry};
 
-/// Whether an installed artifact's payload can run on the host doctor is checking for.
-///
-/// Separate from [`LockVerdict`] because it asks a different question of the same bytes: the lock
-/// checks that the artifact on disk is the one that was pinned, this checks that the machine can
-/// execute it. Only a native tool has an answer beyond `Independent`.
-enum PlatformVerdict {
-    /// Nothing about this artifact's payload is platform-specific.
-    Independent,
-    /// A native binary identified as this host's platform.
-    Matches,
-    /// A native binary whose format this check does not recognise.
-    Unverified,
-    /// A native binary built for another platform.
-    Mismatch { binary_platform: String },
-}
-
-/// Classify one installed artifact's payload against `platform`, the way `stage_session` does
-/// before it writes a native binary into a session workdir.
-///
-/// An artifact is native when the capsule manifest declares it a tool *and* its own packed
-/// `murmur.yaml` says `implementation: native`. `ArtifactMeta.runtime` cannot stand in: the value
-/// recorded on disk depends on which install path wrote it — resolving from a remote registry
-/// stores `Wasm` for a native tool — so the same artifact can carry either answer.
-///
-/// Any failure to open the archive or read `bin/<name>` is `Unverified`, never `Mismatch`. The
-/// lock and hash checks above already report a corrupt or truncated artifact, and reporting the
-/// same read failure a second time as a platform failure would send the operator after the wrong
-/// thing.
-fn check_artifact_platform(
-    name: &str,
-    version: &str,
-    runtime: &ArtifactRuntime,
-    artifact_bytes: &[u8],
-    platform: &str,
-) -> PlatformVerdict {
-    if !matches!(runtime, ArtifactRuntime::Tool) {
-        return PlatformVerdict::Independent;
-    }
-
-    let Ok(manifest_yaml) =
-        capsule_runtime::artifact::extract_manifest_yaml(name, version, artifact_bytes)
-    else {
-        return PlatformVerdict::Unverified;
-    };
-    if parse_tool_implementation_from_yaml(&manifest_yaml) != ArtifactImplementation::Native {
-        return PlatformVerdict::Independent;
-    }
-
-    let Ok(binary) = capsule_runtime::artifact::extract_native_binary(
-        murmur_artifact::tool_name_of(name),
-        version,
-        artifact_bytes,
-    ) else {
-        return PlatformVerdict::Unverified;
-    };
-
-    match native_binary_verdict(&binary, platform) {
-        NativeBinaryVerdict::Runnable => PlatformVerdict::Matches,
-        NativeBinaryVerdict::Indeterminate => PlatformVerdict::Unverified,
-        NativeBinaryVerdict::Mismatch { binary_platform } => PlatformVerdict::Mismatch {
-            binary_platform: binary_platform.to_string(),
-        },
-    }
-}
-
-/// The `Native tools` block: each native tool the checklist identified, and the mechanism it runs
-/// under on this host. `mechanism` is the wire name `--explain-scope` spells a tier with, for the
-/// tier this capsule's declared floor installs here; `none` is a host with no kernel sandbox.
-fn render_native_tools(native_tools: &[String], mechanism: &str) -> String {
-    let mut out = String::from("Native tools\n");
-    for tool in native_tools {
-        if mechanism == "none" {
-            out.push_str(&format!(
-                "  - {tool}: runs with no kernel confinement on this host (rlimits only) \u{2014} a \
-                 per-artifact capabilities: block does not narrow it\n"
-            ));
-        } else {
-            out.push_str(&format!(
-                "  - {tool}: runs under {mechanism} with this capsule's capabilities.filesystem, \
-                 capabilities.network.allow and capabilities.shell.allow \u{2014} a per-artifact \
-                 capabilities: block does not narrow it\n"
-            ));
-        }
-    }
-    out
-}
-
-/// The `E-CAP-005` warning for a capsule that can spawn a native subprocess on a host that cannot
+/// The `E-CAP-005` warning for a capsule that can spawn a subprocess on a host that cannot
 /// give it a network namespace, or `None` when `mur run` would not refuse it for that.
 fn egress_namespace_warning(
     can_spawn_subprocess: bool,
@@ -247,17 +158,14 @@ enum LockVerdict {
     MissingEntry,
     /// The lock pins a different version than the manifest declares.
     VersionMismatch { pinned: String },
-    /// The bytes on disk hash to something other than the hash pinned for this platform —
-    /// `mur run` fails with E-REG-002.
+    /// The bytes on disk hash to something other than the hash pinned — `mur run` fails with
+    /// E-REG-002.
     HashMismatch { expected: String, actual: String },
-    /// The entry pins this artifact for other platforms but not for this host's —
-    /// `mur run` fails with E-RUN-003.
-    MissingPlatform { pinned: String },
 }
 
 /// Check one installed artifact against the lockfile the way `stage_session` does:
 /// entry must exist, its `resolved_version` must equal the manifest pin, and the hash it pins
-/// for `platform` must equal the hash of the bytes that were actually resolved.
+/// must equal the hash of the bytes that were actually resolved.
 ///
 /// A version mismatch short-circuits the hash comparison — hashing bytes for a version
 /// already known to be wrong would report one drifted artifact as two failures. The pin's origin
@@ -269,7 +177,6 @@ fn check_lock_entry(
     name: &str,
     version: &str,
     artifact_bytes: &[u8],
-    platform: &str,
     runtime: &ArtifactRuntime,
     declares_gateway: bool,
     bound_as_system_prompt: bool,
@@ -284,16 +191,10 @@ fn check_lock_entry(
         };
     }
 
-    let Some(expected) = entry.sha256.for_platform(platform) else {
-        return LockVerdict::MissingPlatform {
-            pinned: entry.sha256.platform_tags().join(", "),
-        };
-    };
-
     let actual = sha256_hex(artifact_bytes);
-    if actual != expected {
+    if actual != entry.sha256.any {
         return LockVerdict::HashMismatch {
-            expected: expected.to_string(),
+            expected: entry.sha256.any.clone(),
             actual,
         };
     }
@@ -652,23 +553,16 @@ fn report_home_unusable(error: &capsule_runtime::HomeUnusable) {
 /// `E-CAP-004` precedent above: doctor launches nothing, so it has nothing to refuse, and aborting
 /// the checklist over one manifest line would hide every artifact problem behind it.
 ///
-/// How each tool reaches the runtime directory is read off the project's `murmur.lock`, as
-/// `--explain-scope` reads it; an unlocked tool is reported unresolved. Each WASM tool's extra
-/// roots come from `declared_floor` and the global config's `host_paths` checked for the default
+/// Each WASM tool's extra roots come from `declared_floor` and the global config's `host_paths` checked for the default
 /// workdir; a refused `host_paths` entry adds none here and is reported under `Host paths`.
 fn report_preopens(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
     project_root: &Path,
-    host_probe: &HostProbe,
     declared_floor: murmur_artifact::ContainmentClass,
     config: Option<&crate::config::MurConfig>,
 ) -> Vec<PreopenReport> {
     capsule_runtime::report_println!("Filesystem preopens");
-    let lock = read_optional_lockfile(project_root).ok().flatten();
     let mut resolved = Vec::new();
-    let runtime_dir_protected =
-        doctor_runtime_dir(host_probe, declared_floor, &project_root.join("workdir"))
-            .is_ok_and(|reports| reports.runtime_dir.read_only_to_commands);
     match preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
         (
             artifact.name.as_str(),
@@ -683,11 +577,6 @@ fn report_preopens(
             &mut preopens,
             &capsule_runtime::guest_roots::extra_guest_roots_for(declared_floor, &host_paths),
         );
-        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, |name| {
-            lock.as_ref()
-                .and_then(|lock| lock.artifact_for(name))
-                .map(|entry| crate::commands::run::locked_implementation(&entry.sha256))
-        });
         preopens
     }) {
         Ok(preopens) if preopens.is_empty() => {
@@ -697,7 +586,7 @@ fn report_preopens(
         }
         Ok(preopens) => {
             for preopen in &preopens {
-                capsule_runtime::report_println!("  - {}", preopen.render(runtime_dir_protected));
+                capsule_runtime::report_println!("  - {}", preopen.render());
             }
             resolved = preopens;
         }
@@ -717,26 +606,19 @@ fn report_preopens(
 
 /// Prints the `Routes` block for `runtime_manifest`, from the `route_table` `--explain-scope`
 /// reports, on the tier `declared_floor` installs here, and `W-SEC-034` from the emitter a launch
-/// calls. Each tool's implementation is read off `murmur.lock`, as [`report_preopens`] reads it.
+/// calls.
 fn report_routes(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
     policy: &capsule_runtime::CapabilityPolicy,
     preopens: &[PreopenReport],
-    project_root: &Path,
     host_probe: &HostProbe,
     declared_floor: murmur_artifact::ContainmentClass,
 ) {
-    let lock = read_optional_lockfile(project_root).ok().flatten();
     let inputs = RouteInputs::new(
         &policy.shell_allow,
         policy.plan_submit,
         &policy.install_tool,
         preopens,
-        |name| {
-            lock.as_ref()
-                .and_then(|lock| lock.artifact_for(name))
-                .map(|entry| crate::commands::run::locked_implementation(&entry.sha256))
-        },
         runtime_manifest
             .inference
             .as_ref()
@@ -760,11 +642,11 @@ fn report_cgroup_scope(report: &CgroupScopeReport, needs_scope: bool) -> Option<
     if refused {
         capsule_runtime::report_println!(
             "  refused: `mur run` refuses this capsule here with E-RUN-012, because it can run a \
-             native subprocess and no cgroup scope can be created to bound it"
+             subprocess and no cgroup scope can be created to bound it"
         );
     } else if !needs_scope {
         capsule_runtime::report_println!(
-            "  this capsule runs no native subprocess, so a launch creates no scope for it"
+            "  this capsule runs no subprocess, so a launch creates no scope for it"
         );
     }
     capsule_runtime::report_println!();
@@ -818,7 +700,7 @@ fn report_install(policy: &capsule_runtime::CapabilityPolicy) {
 }
 
 /// Prints the aggregate memory ceiling `capabilities.resources.cgroup_memory_bytes` gives the
-/// capsule's native subprocess tree, as the cgroup files a launch writes: `memory.max` and
+/// capsule's subprocess tree, as the cgroup files a launch writes: `memory.max` and
 /// `memory.swap.max`.
 ///
 /// The swap value is [`capsule_runtime::SCOPE_SWAP_MAX`], the constant the scope is written from,
@@ -851,8 +733,8 @@ fn render_memory_bound(
     let mut out = format!("  cgroup_memory_bytes: {cgroup_memory_bytes}\n");
     if !linux {
         out.push_str(
-            "  not applied on this host: cgroup bounds are Linux-only, so the native subprocess \
-             tree is bounded by rlimits alone\n",
+            "  not applied on this host: cgroup bounds are Linux-only, so the subprocess tree is \
+             bounded by rlimits alone\n",
         );
         return out;
     }
@@ -1119,9 +1001,9 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
             // A payload with no readable component names no `murmur:*` interface.
             let contracts = installed_contracts(registry, &meta).unwrap_or_default();
             let subject = FitSubject::component(contracts.clone());
-            let mismatched = match version_fit(&subject, served, current_platform()) {
+            let mismatched = match version_fit(&subject, served) {
                 VersionFit::Unserved(mismatched) => mismatched,
-                VersionFit::Fits | VersionFit::NoPayloadFor(_) => Vec::new(),
+                VersionFit::Fits => Vec::new(),
             };
             rows.push(InstalledRow {
                 reference,
@@ -1226,13 +1108,9 @@ fn resolved_unserved(resolved: &ResolvedArtifact) -> Vec<UnservedInterface> {
         .clone()
         .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
         .unwrap_or_default();
-    match version_fit(
-        &FitSubject::component(contracts),
-        served_wit_level(),
-        current_platform(),
-    ) {
+    match version_fit(&FitSubject::component(contracts), served_wit_level()) {
         VersionFit::Unserved(mismatched) => mismatched,
-        VersionFit::Fits | VersionFit::NoPayloadFor(_) => Vec::new(),
+        VersionFit::Fits => Vec::new(),
     }
 }
 
@@ -1944,16 +1822,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let _ = warn_on_unreachable_toolchain_helpers(&capability_policy, declared_floor);
 
     // Same reasoning again, for the mechanism that replaced the seccomp connect/sendto
-    // interception: a capsule that can spawn a native subprocess needs a network namespace to put
-    // it in, and a host that cannot create one refuses the run with E-CAP-005. Unlike the two
+    // interception: a capsule that can spawn a subprocess needs a network namespace to put it
+    // in, and a host that cannot create one refuses the run with E-CAP-005. Unlike the two
     // checks above this is a pure *host* question — no manifest floor is involved and no flag can
     // change the answer — so doctor asks it whenever the capsule declares a subprocess capability
     // at all, which is exactly what `mur run` does.
-    //
-    // Here for `shell.allow`, `spawn.allow` and `install.tool`, whose pattern can match a native
-    // tool a pull installs. A declared native tool is the last route, and only the artifact loop
-    // below can tell one apart, so a capsule whose only route is a declared native tool is asked
-    // after it, the way `mur run` asks it in `launch` after staging.
     let capabilities = runtime_manifest.capabilities.as_ref();
     let spawn_allows = capabilities
         .and_then(|caps| caps.spawn.as_ref())
@@ -1962,8 +1835,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy)
         && declared_floor != murmur_artifact::ContainmentClass::Unconfined;
     // One reading of the host for the whole checklist: the `E-CAP-005` warnings, the `AppArmor /
-    // user namespaces` block, the native tools' mechanism and the runtime directory sections below
-    // cannot describe two different hosts.
+    // user namespaces` block and the runtime directory sections below cannot describe two
+    // different hosts.
     let host_probe = HostProbe::probe();
     let egress_failure = host_probe.egress_namespace_failure();
     if let Some(warning) = egress_namespace_warning(can_spawn_subprocess, egress_failure.as_ref()) {
@@ -1971,7 +1844,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     }
 
     // The daemon that capsule registers with at launch, gated on `spawn_allows` alone: a capsule
-    // declaring only `capabilities.shell.allow` spawns native subprocesses of its own and
+    // declaring only `capabilities.shell.allow` spawns subprocesses of its own and
     // addresses no daemon, so `can_spawn_subprocess` above is the wrong question here.
     if spawn_allows {
         report_roost_daemon();
@@ -2001,7 +1874,6 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let preopens = report_preopens(
         &runtime_manifest,
         &project_root,
-        &host_probe,
         declared_floor,
         effective_config.as_ref(),
     );
@@ -2012,7 +1884,6 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         &runtime_manifest,
         &capability_policy,
         &preopens,
-        &project_root,
         &host_probe,
         declared_floor,
     );
@@ -2025,7 +1896,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // `--explain-scope` prints from.
     report_install(&capability_policy);
 
-    // The memory ceiling `capabilities.resources` gives the native subprocess tree, as the cgroup
+    // The memory ceiling `capabilities.resources` gives the subprocess tree, as the cgroup
     // files a launch writes it to.
     report_memory_bound(&capability_policy);
 
@@ -2057,7 +1928,6 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     let project_registry = LocalRegistry::new(project_root.join(".murmur").join("artifacts"));
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
-    let platform = current_platform();
 
     // Members resolve from the stores `mur run --capsule` resolves from, in the same order.
     let roster_findings = report_roster(
@@ -2075,7 +1945,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let interface_findings = report_interface_versions(&project_registry, &global_registry);
     report_artifact_stores(&project_registry, &global_registry);
 
-    capsule_runtime::report_println!("Checking {} for {platform}...", manifest_path.display());
+    capsule_runtime::report_println!("Checking {}...", manifest_path.display());
 
     // Align every check line on the widest "name@version" reference string.
     let col_width = runtime_manifest
@@ -2088,15 +1958,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let mut total_pass: u32 = 0;
     let mut fixes: Vec<String> = Vec::new();
     // Findings that are worth a printed Fix but are not failures. Kept apart from `fixes`
-    // because the exit code is driven by `fixes` alone: an artifact resolved off the untagged
-    // path still runs, and failing every pre-upgrade store's `mur doctor` in CI would be a
-    // worse outcome than the migration it announces.
+    // because the exit code is driven by `fixes` alone: a pin a session pulled still runs.
     let mut warnings: Vec<String> = Vec::new();
     // `name@version` of every declared artifact the checklist failed for stale interfaces, so
     // the inventory adds no warning-tier `Fix:` for the same artifact.
     let mut interface_failed: HashSet<String> = HashSet::new();
-    // `name@version` of every declared artifact the checklist identified as a native tool.
-    let mut native_tools: Vec<String> = Vec::new();
     // Each installed artifact's declared name, `name@version`, and bundled `murmur.yaml`, for the
     // model limits each driver choice resolves to.
     let mut installed_manifests: Vec<(String, String, String)> = Vec::new();
@@ -2121,7 +1987,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         let version = &artifact.version;
         let ref_str = format!("{name}@{version}");
 
-        match artifact_presence(&project_registry, &global_registry, &request, platform) {
+        match artifact_presence(&project_registry, &global_registry, &request) {
             // Local-source artifacts are never registry-resolved and never locked, so
             // they are exempt from every lock check — the same exemption `mur run` makes.
             ArtifactPresence::LocalSource => {
@@ -2143,7 +2009,6 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                         name,
                         version,
                         &resolved.bytes,
-                        platform,
                         &artifact.runtime,
                         artifact.gateway.is_some(),
                         runtime_manifest
@@ -2158,28 +2023,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 match verdict {
                     LockVerdict::Ok { pulled_by } => {
                         let unserved = resolved_unserved(&resolved);
-                        let platform_verdict = check_artifact_platform(
-                            name,
-                            version,
-                            &artifact.runtime,
-                            &resolved.bytes,
-                            platform,
-                        );
-                        if !matches!(platform_verdict, PlatformVerdict::Independent) {
-                            native_tools.push(ref_str.clone());
-                        }
-                        // A binary this host cannot run is an error whether or not the store
-                        // recorded a platform for it, and it is reported ahead of the missing
-                        // tag: reinstalling fixes both, but only one of them stops `mur run`.
-                        match (platform_verdict, pulled_by) {
-                            (PlatformVerdict::Mismatch { binary_platform }, _) => {
-                                capsule_runtime::report_println!(
-                                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
-                                );
-                                fixes.push(format!(
-                                    "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
-                                ));
-                            }
+                        match pulled_by {
                             // The bytes `stage_session` instantiates on the next `mur run`, and the
                             // host resolves one instance name per interface with no fallback, so
                             // a green line here would be one the launch contradicts.
@@ -2201,42 +2045,16 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                                 ));
                                 interface_failed.insert(ref_str.clone());
                             }
-                            // `mur install` both adopts the pin and records a missing platform
-                            // tag, so one warning covers an artifact that has both findings.
-                            (_, Some(session)) => {
+                            Some(session) => {
                                 capsule_runtime::report_println!(
                                     "  \u{26A0}  {ref_str:<col_width$}   \u{2014} pulled at runtime by session {session}"
                                 );
                                 warnings.push(format!("mur install {ref_str}"));
                                 total_pass += 1;
                             }
-                            (_, None)
-                                if resolved.platform_match == PlatformMatch::UntaggedFallback =>
-                            {
+                            None => {
                                 capsule_runtime::report_println!(
-                                    "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
-                                );
-                                warnings.push(format!("mur install {ref_str}"));
-                                total_pass += 1;
-                            }
-                            // A green line names only what was read: the host platform appears
-                            // on it solely for a native binary this check identified and
-                            // matched, never for an artifact whose payload doctor never opened.
-                            (PlatformVerdict::Independent, None) => {
-                                capsule_runtime::report_println!(
-                                    "  \u{2713}  {ref_str:<col_width$}   platform-independent"
-                                );
-                                total_pass += 1;
-                            }
-                            (PlatformVerdict::Matches, None) => {
-                                capsule_runtime::report_println!(
-                                    "  \u{2713}  {ref_str:<col_width$}   {platform}"
-                                );
-                                total_pass += 1;
-                            }
-                            (PlatformVerdict::Unverified, None) => {
-                                capsule_runtime::report_println!(
-                                    "  \u{2713}  {ref_str:<col_width$}   platform unverified"
+                                    "  \u{2713}  {ref_str:<col_width$}   installed"
                                 );
                                 total_pass += 1;
                             }
@@ -2253,27 +2071,21 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                     }
                     LockVerdict::MissingEntry => {
                         capsule_runtime::report_println!(
-                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock missing artifact entry for '{name}'"
+                            "  \u{2717}  {ref_str:<col_width$}   \u{2014} murmur.lock missing artifact entry for '{name}'"
                         );
                         fixes.push(format!("mur install {ref_str}"));
                     }
                     LockVerdict::VersionMismatch { pinned } => {
                         capsule_runtime::report_println!(
-                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock version mismatch for '{name}': manifest requested {version}, lock pinned {pinned}"
+                            "  \u{2717}  {ref_str:<col_width$}   \u{2014} murmur.lock version mismatch for '{name}': manifest requested {version}, lock pinned {pinned}"
                         );
                         fixes.push(format!(
                             "{name}: run mur install, which moves its murmur.lock entry to {version}"
                         ));
                     }
-                    LockVerdict::MissingPlatform { pinned } => {
-                        capsule_runtime::report_println!(
-                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock has no sha256 for '{name}' on {platform}: it pins {pinned}"
-                        );
-                        fixes.push(format!("mur install {ref_str}"));
-                    }
                     LockVerdict::HashMismatch { expected, actual } => {
                         capsule_runtime::report_println!(
-                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} artifact integrity check failed for {ref_str}"
+                            "  \u{2717}  {ref_str:<col_width$}   \u{2014} artifact integrity check failed for {ref_str}"
                         );
                         capsule_runtime::report_println!(
                             "        expected sha256 (murmur.lock): {expected}"
@@ -2287,11 +2099,22 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                     }
                 }
             }
+            // The refusal `mur run` makes before staging, so it is one failure and gets no lock
+            // line.
+            ArtifactPresence::NativeTool { field } => {
+                let refusal = crate::error::native_tool_launch_error(name, &field);
+                capsule_runtime::report_println!(
+                    "  \u{2717}  {ref_str:<col_width$}   \u{2014} error[{}]: {}",
+                    refusal.code,
+                    refusal.message
+                );
+                fixes.extend(refusal.hint);
+            }
             // A missing artifact is already one failure; there is nothing on disk to
             // hash, so it never also gets a lock line.
             ArtifactPresence::Missing => {
                 capsule_runtime::report_println!(
-                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} missing"
+                    "  \u{2717}  {ref_str:<col_width$}   \u{2014} missing"
                 );
                 fixes.push(format!("mur install {ref_str}"));
             }
@@ -2346,37 +2169,16 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
-    if !native_tools.is_empty() {
-        capsule_runtime::report_println!();
-        capsule_runtime::report_print!(
-            "{}",
-            render_native_tools(
-                &native_tools,
-                applied_mechanism(&host_probe, declared_floor)
-            )
-        );
-        // The half of the E-CAP-005 check above that needed this loop: a capsule whose only
-        // subprocess route is a native tool.
-        if !can_spawn_subprocess {
-            if let Some(warning) = egress_namespace_warning(true, egress_failure.as_ref()) {
-                capsule_runtime::report_eprintln!("{warning}");
-            }
-        }
-    }
-
     // Whether a launch here gets its cgroup scope, asked of the host by creating and removing a
     // child cgroup whatever the capsule declares. A failed check only for a capsule that needs a
-    // scope — a subprocess route or a native tool — because only that launch is refused.
+    // scope — a subprocess route — because only that launch is refused.
     let cgroup_probe = probe_scope(
         true,
         &capability_policy.resources,
         &project_root.join("workdir"),
     );
     capsule_runtime::report_println!();
-    if let Some(fix) = report_cgroup_scope(
-        &cgroup_probe.cgroup_scope,
-        can_spawn_subprocess || !native_tools.is_empty(),
-    ) {
+    if let Some(fix) = report_cgroup_scope(&cgroup_probe.cgroup_scope, can_spawn_subprocess) {
         fixes.push(fix);
     }
 
@@ -2518,8 +2320,8 @@ fn doctor_containment_stance(
 /// The `Containment stance` line for an unconfined launch chosen by `source`.
 fn unconfined_stance_line(source: &str) -> String {
     format!(
-        "Containment stance: unconfined ({source}) — shell commands, plan shell steps, native \
-         tools and the process harness run as you, with your HOME, your whole environment, the \
+        "Containment stance: unconfined ({source}) — shell commands, plan shell steps and the \
+         process harness run as you, with your HOME, your whole environment, the \
          host filesystem and network, and sudo; no Landlock, seccomp, namespaces or \
          no_new_privs, and resource limits only where capabilities.resources declares them"
     )
@@ -2544,51 +2346,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_native_tools_block_names_each_tool_and_its_mechanism() {
-        let tools = vec!["local/tool-fixture@0.1.0".to_string()];
-        let confined = render_native_tools(&tools, "landlock+seccomp");
-        assert_eq!(
-            confined,
-            "Native tools\n  - local/tool-fixture@0.1.0: runs under landlock+seccomp with this \
-             capsule's capabilities.filesystem, capabilities.network.allow and \
-             capabilities.shell.allow \u{2014} a per-artifact capabilities: block does not \
-             narrow it\n"
-        );
-        let unconfined = render_native_tools(&tools, "none");
-        assert!(
-            unconfined.contains(
-                "local/tool-fixture@0.1.0: runs with no kernel confinement on this host \
-                 (rlimits only)"
-            ),
-            "{unconfined}"
-        );
-    }
-
-    /// The mechanism the block names is the tier the declared class runs on, read from one probe:
-    /// a capsule declaring `scoped` never runs its native tools inside a composed root, and on a
-    /// sealed-capable host one declaring `sealed` does while one declaring `scoped` runs on
-    /// `landlock+seccomp`.
-    #[test]
-    fn the_native_tools_block_names_the_tier_the_declared_class_runs_on() {
-        let probe = HostProbe::probe();
-        let tools = vec!["local/tool-fixture@0.1.0".to_string()];
-        let scoped_mechanism = applied_mechanism(&probe, murmur_artifact::ContainmentClass::Scoped);
-        let sealed_mechanism = applied_mechanism(&probe, murmur_artifact::ContainmentClass::Sealed);
-        let scoped = render_native_tools(&tools, scoped_mechanism);
-        let sealed = render_native_tools(&tools, sealed_mechanism);
-        assert!(!scoped.contains("mountns+pivot_root"), "{scoped}");
-        if sealed_mechanism == "mountns+pivot_root+landlock+seccomp" {
-            assert!(
-                sealed.contains("runs under mountns+pivot_root+landlock+seccomp"),
-                "{sealed}"
-            );
-            assert!(scoped.contains("runs under landlock+seccomp"), "{scoped}");
-        } else {
-            assert_eq!(scoped, sealed);
-        }
-    }
-
     /// A namespace creation refused because the kernel has no user namespaces left to give.
     fn kernel_support_missing() -> EgressNamespaceFailure {
         EgressNamespaceFailure {
@@ -2600,10 +2357,10 @@ mod tests {
         }
     }
 
-    /// A capsule whose only subprocess route is a native tool gets the same `E-CAP-005` warning
-    /// as one declaring `shell.allow`, on a host that cannot create the namespace.
+    /// A capsule with a subprocess route gets the `E-CAP-005` warning on a host that cannot create
+    /// the namespace, and one with none gets no warning.
     #[test]
-    fn a_native_only_capsule_on_a_host_without_a_namespace_warns_e_cap_005() {
+    fn a_subprocess_route_on_a_host_without_a_namespace_warns_e_cap_005() {
         let failure = kernel_support_missing();
         let warning = egress_namespace_warning(true, Some(&failure)).expect("a warning");
         assert!(
@@ -2619,10 +2376,11 @@ mod tests {
         assert_eq!(egress_namespace_warning(false, Some(&failure)), None);
     }
 
-    /// An `install.tool` grant is a subprocess route for the pre-checklist warning, as it is for
-    /// `mur run`; an `install.skill` grant installs nothing that runs.
+    /// An `install.tool` grant alone is no subprocess route for the pre-checklist warning, as it
+    /// is none for `mur run`: a pulled tool is a WASM component, which starts a program only
+    /// through `murmur:process` and so only one `capabilities.shell.allow` names.
     #[test]
-    fn egress_namespace_warning_counts_an_install_tool_grant() {
+    fn egress_namespace_warning_ignores_an_install_grant_alone() {
         let policy = |install: &str| {
             capability_policy_from_runtime_manifest(
                 &murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
@@ -2636,7 +2394,7 @@ mod tests {
         let failure = kernel_support_missing();
         assert!(
             egress_namespace_warning(has_subprocess_route_at_staging(&tool), Some(&failure))
-                .is_some()
+                .is_none()
         );
         assert!(
             egress_namespace_warning(has_subprocess_route_at_staging(&skill), Some(&failure))

@@ -202,9 +202,8 @@ pub struct LifecycleOverride {
 ///
 /// Variant meanings:
 ///
-/// - `Tool`: agent-callable tool (WASM component or native binary). Visible in MURMUR.md and the
-///   LLM tool list. Implementation details (wasm vs native) are declared in the artifact's own
-///   murmur.yaml via `implementation:`.
+/// - `Tool`: agent-callable tool implemented as a WASM component. Visible in MURMUR.md and the
+///   LLM tool list.
 /// - `Driver`: inference driver implemented as a WASM component. The runtime calls it as a
 ///   processor. Hidden from the LLM.
 /// - `Hook`: event-triggered artifact implemented as a WASM component. The runtime calls it at
@@ -212,7 +211,7 @@ pub struct LifecycleOverride {
 ///   in the artifact's own murmur.yaml. Hidden from the LLM.
 /// - `Skill`: documentation artifact; no executable binary. Visible in the LLM tool inventory.
 ///   Invoking a skill by name returns its `skill.md` content as the tool result (just-in-time
-///   injection). No WASM/native dispatch occurs. A skill bound via
+///   injection). No WASM dispatch occurs. A skill bound via
 ///   `inference.system_prompt_artifact` is excluded from the callable inventory because it is
 ///   already part of the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -247,46 +246,6 @@ impl ArtifactRuntime {
             ArtifactRuntime::Skill => "skill",
         }
     }
-}
-
-/// How a `runtime: tool` artifact is implemented.
-///
-/// Declared via `implementation:` in the artifact's own murmur.yaml.
-/// Defaults to `Wasm` when the field is absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArtifactImplementation {
-    Wasm,
-    Native,
-}
-
-/// Read the `implementation:` field from an artifact's murmur.yaml.
-/// Defaults to `Wasm` when the field is absent or unparseable.
-pub fn read_tool_implementation(
-    artifact_manifest_path: &Path,
-) -> Result<ArtifactImplementation, RuntimeManifestError> {
-    let content =
-        fs::read_to_string(artifact_manifest_path).map_err(|source| RuntimeManifestError::Io {
-            path: artifact_manifest_path.display().to_string(),
-            source,
-        })?;
-    Ok(parse_tool_implementation_from_yaml(&content))
-}
-
-/// Parse `implementation:` from an in-memory manifest YAML string.
-/// Defaults to `Wasm` when the field is absent or unparseable.
-pub fn parse_tool_implementation_from_yaml(yaml: &str) -> ArtifactImplementation {
-    serde_norway::from_str::<serde_norway::Value>(yaml)
-        .map(|v| {
-            v.as_mapping()
-                .and_then(|m| m.get(serde_norway::Value::String("implementation".to_string())))
-                .and_then(serde_norway::Value::as_str)
-                .map(|s| match s {
-                    "native" => ArtifactImplementation::Native,
-                    _ => ArtifactImplementation::Wasm,
-                })
-                .unwrap_or(ArtifactImplementation::Wasm)
-        })
-        .unwrap_or(ArtifactImplementation::Wasm)
 }
 
 // ── Hook configuration types ──────────────────────────────────────────────────
@@ -1635,7 +1594,7 @@ pub struct PlanCapabilities {
 pub struct InstallCapabilities {
     /// Entries admitting skill artifacts (`skill.md`, no executable payload).
     pub skill: Vec<String>,
-    /// Entries admitting tool artifacts, WASM or native alike.
+    /// Entries admitting tool artifacts.
     pub tool: Vec<String>,
     /// `capabilities.install.from`: where a pull may find what it installs.
     pub from: InstallFrom,
@@ -1791,8 +1750,8 @@ pub struct ResourceLimits {
 /// Host-process (OS-level) resource bounds from `capabilities.resources`.
 ///
 /// Distinct from [`ResourceLimits`] (`capabilities.limits`) in both mechanism and subject:
-/// that block bounds a WASM *guest* inside its wasmtime store, this one bounds every *native
-/// subprocess* the runtime spawns — `rlimit(2)` ceilings applied before `execve`, a Linux
+/// that block bounds a WASM *guest* inside its wasmtime store, this one bounds every OS
+/// *subprocess* the runtime spawns — `rlimit(2)` ceilings applied before `execve`, a Linux
 /// cgroup v2 scope around the whole process tree, and a periodic workdir-size check. A capsule
 /// that cannot escape containment can still wedge its host by forking, allocating, or writing
 /// without bound; this is the block that stops that.
@@ -2184,14 +2143,13 @@ struct RawRuntimeManifest {
     #[serde(default)]
     #[allow(dead_code)]
     runtime: Option<serde_norway::Value>,
-    /// Read by `mur build` and `mur publish`: it separates a native tool from a wasm one, both in
-    /// the derived packaging type and in `mur publish`'s platform tagging. Ignored on the run
-    /// path, and untyped for the same reason as `runtime:` above.
+    /// Read by `mur build` and `mur publish`, which accept only `wasm`. Ignored on the run path,
+    /// and untyped for the same reason as `runtime:` above.
     #[serde(default)]
     #[allow(dead_code)]
     implementation: Option<serde_norway::Value>,
     /// Read by `mur build` and `mur publish` as the declared packaging type, which overrides the
-    /// one derived from `runtime:` and `implementation:`. Ignored on the run path, and untyped for
+    /// one derived from `runtime:`. Ignored on the run path, and untyped for
     /// the same reason as `runtime:` above.
     #[serde(default)]
     #[allow(dead_code)]
@@ -3780,8 +3738,7 @@ impl RuntimeManifest {
                         return Err(RuntimeManifestError::InvalidArtifact {
                             index,
                             message: format!(
-                                "use 'runtime: tool'; implementation is declared in the \
-                                 artifact's own manifest (got '{}')",
+                                "use 'runtime: tool' for a tool (got '{}')",
                                 artifact.runtime.as_deref().unwrap_or("")
                             ),
                         });
@@ -11869,20 +11826,6 @@ context:
                 other => panic!("expected InvalidInferenceConfig for {block:?}, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn parse_tool_implementation_defaults_to_wasm() {
-        let impl_ = parse_tool_implementation_from_yaml("name: my-tool\nruntime: tool\n");
-        assert_eq!(impl_, ArtifactImplementation::Wasm);
-    }
-
-    #[test]
-    fn parse_tool_implementation_native() {
-        let impl_ = parse_tool_implementation_from_yaml(
-            "name: my-tool\nruntime: tool\nimplementation: native\n",
-        );
-        assert_eq!(impl_, ArtifactImplementation::Native);
     }
 
     #[test]

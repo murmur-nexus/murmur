@@ -11,8 +11,8 @@ use capsule_runtime::{
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use murmur_artifact::{
-    current_platform, resolve_manifest_path, ArtifactRuntime, LocalRegistry, Registry,
-    RegistryError, RuntimeManifest, ARTIFACT_INDEX_FILE_NAME, MANIFEST_FILENAME,
+    resolve_manifest_path, ArtifactRuntime, LocalRegistry, Registry, RegistryError,
+    RuntimeManifest, ARTIFACT_INDEX_FILE_NAME, MANIFEST_FILENAME,
 };
 
 use super::new_roster::{Provider, ANTHROPIC, OPENAI};
@@ -80,8 +80,9 @@ fn inject_driver_key(runtime_manifest: &mut RuntimeManifest, key: &str) {
 }
 
 /// The origins `murmur/tool-registry-search` reads the index on the latest default-artifacts
-/// release from: the release download URL, and the asset host it redirects to. A native tool
-/// runs under the capsule-wide grants, so the generator capsule lists both itself.
+/// release from: the release download URL, and the asset host it redirects to. A tool's outbound
+/// requests are held to the capsule's `capabilities.network.allow`, so the generator capsule lists
+/// both.
 pub(crate) const REGISTRY_SEARCH_ORIGINS: [&str; 2] = [
     "https://github.com",
     "https://release-assets.githubusercontent.com",
@@ -620,11 +621,7 @@ fn check_artifacts_installed(
     for artifact in artifacts {
         let name = murmur_artifact::ArtifactName::parse(&artifact.name)
             .map_err(|error| CliError::new(E_RUN_008, error.to_string()))?;
-        match local_registry.resolve_with_platform(
-            &name,
-            &artifact.version,
-            Some(current_platform()),
-        ) {
+        match local_registry.resolve(&name, &artifact.version) {
             Ok(_) => {}
             Err(RegistryError::NotFound { .. }) => {
                 return Err(CliError::with_hint(
@@ -634,6 +631,12 @@ fn check_artifacts_installed(
                         "run `mur install -g {}@{}` to install it",
                         artifact.name, artifact.version
                     ),
+                ));
+            }
+            Err(RegistryError::NativeTool { field, .. }) => {
+                return Err(crate::error::native_tool_launch_error(
+                    &artifact.name,
+                    &field,
                 ));
             }
             Err(error) => return Err(CliError::from(error)),

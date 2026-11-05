@@ -59,9 +59,6 @@ pub const W_SEC_007: &str = "W-SEC-007";
 /// A `runtime: tool`/`runtime: driver` artifact entry declares `capabilities.shell`/`.spawn`/
 /// `.env`/`.limits`, but per-artifact narrowing only reads `network` and `filesystem` — the
 /// other sub-blocks are structurally accepted and silently inert.
-///
-/// On a native tool's entry it fires for any sub-block other than `state`: a native tool runs
-/// under the capsule-wide grants, and `capabilities.state` is the one sub-block applied to it.
 pub const W_SEC_008: &str = "W-SEC-008";
 
 /// `capabilities.shell.interpreter_runtime` grants an allowlisted binary specific host
@@ -71,7 +68,7 @@ pub const W_SEC_008: &str = "W-SEC-008";
 /// this grant only bridges until. Fires once per declared grant, at staging.
 pub const W_SEC_009: &str = "W-SEC-009";
 
-/// The capsule can spawn native subprocesses on a host where no cgroup v2 scope can exist
+/// The capsule can spawn subprocesses on a host where no cgroup v2 scope can exist
 /// (macOS, or any non-Linux target). Per-process `rlimit(2)` ceilings still apply, but every
 /// *aggregate* bound does not: nothing caps memory, pid count or CPU across the subprocess tree
 /// as a whole. `RLIMIT_NPROC` is not a substitute — it is per-**uid**, so a fork bomb of
@@ -125,9 +122,8 @@ pub const W_SEC_013: &str = "W-SEC-013";
 /// Fires at staging, before any session workdir exists.
 pub const W_SEC_014: &str = "W-SEC-014";
 
-// W-SEC-015 is retired and its code is not reused. A native tool receives its entry's `config:`
-// block as `MURMUR_ARTIFACT_CONFIG`, as a WASM tool does. The diagnostics page keeps the
-// `#w-sec-015` anchor.
+// W-SEC-015 is retired and its code is not reused. The diagnostics page keeps the `#w-sec-015`
+// anchor.
 
 /// A `capabilities.conversation` block was declared in the capsule-wide `capabilities:` block,
 /// where nothing reads it, so no artifact was granted `murmur:conversation/read`.
@@ -184,7 +180,7 @@ pub const W_SEC_019: &str = "W-SEC-019";
 
 /// The capsule was given a cgroup scope and the declared
 /// `capabilities.resources.cgroup_io_bytes_per_sec` ceiling did not apply to it, so the capsule's
-/// native subprocess tree runs with no I/O bandwidth bound.
+/// subprocess tree runs with no I/O bandwidth bound.
 ///
 /// `io.max` is the one cgroup limit this runtime treats as non-fatal: the backing device of a path
 /// cannot always be resolved to a `MAJ:MIN` the block layer accepts (tmpfs, overlayfs, btrfs
@@ -322,8 +318,8 @@ pub const W_SEC_034: &str = "W-SEC-034";
 /// from `mur run` and from `mur doctor`, naming the entry and the location.
 pub const W_SEC_035: &str = "W-SEC-035";
 
-/// The capsule runs unconfined: its shell commands, plan shell steps, native tools and
-/// `transport: process` harness run as the operator, with their `HOME`, their whole environment
+/// The capsule runs unconfined: its shell commands, plan shell steps, the programs its
+/// tools run through `murmur:process` and its `transport: process` harness run as the operator, with their `HOME`, their whole environment
 /// (credential variables included), the host filesystem and network, and no `no_new_privs`, so
 /// `sudo` works wherever the operator's sudoers allows it. Chosen only by the operator, with
 /// `mur run --unconfined` or `containment: unconfined` in `~/.murmur/config.yaml`. Fires exactly

@@ -16,7 +16,6 @@ use std::{
 };
 
 use capsule_runtime::{launch_session, StagedSession};
-use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
@@ -27,7 +26,8 @@ use zip::{
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const WASM_TOOL: &str = "echo-tool";
-const NATIVE_TOOL: &str = common::FIXTURE_NATIVE_TOOL_NAME;
+/// The `shell.allow` program the shell-dispatch case calls, under its own name.
+const SHELL_TOOL: &str = "bash";
 const TOOL_VERSION: &str = "0.1.0";
 const SKILL_NAME: &str = "house-style";
 
@@ -75,38 +75,6 @@ fn publish_wasm_tool(home: &TempDir, artifact_dir: &Path) {
     zip.finish().unwrap();
 
     common::publish_local(home, &artifact_path).success();
-}
-
-/// Publish the fixture native tool, packed with its own manifest — the same route
-/// `git_tool.rs` uses, because a native artifact goes into the registry as `RuntimeType::Native`.
-fn publish_native_tool(home: &TempDir, artifact_dir: &Path, binary: &Path) {
-    let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
-    let artifact_path = common::create_native_tool_zip(
-        artifact_dir,
-        NATIVE_TOOL,
-        TOOL_VERSION,
-        &manifest_bytes,
-        binary,
-    );
-    let registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
-    registry
-        .publish(
-            ArtifactMeta {
-                name: murmur_artifact::ArtifactName::parse(&format!("local/{NATIVE_TOOL}"))
-                    .unwrap(),
-                version: TOOL_VERSION.to_string(),
-                runtime: RuntimeType::Native,
-                artifact_runtime: "native".to_string(),
-                platforms: Vec::new(),
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-                owner_id: None,
-                built_at_level: None,
-            },
-            &fs::read(&artifact_path).unwrap(),
-        )
-        .unwrap();
 }
 
 fn publish_skill(home: &TempDir, artifact_dir: &Path, content: &str) {
@@ -350,39 +318,16 @@ fn hostile_tool_output_cannot_close_the_fence_early() {
     );
 }
 
-/// Both invocation paths — WASM component and native subprocess — are fenced by the same
-/// function, so the markers are byte-identical and only the source name differs.
+/// A WASM tool's result and a `shell.allow` command's result are fenced by the same function, so
+/// the markers are byte-identical and only the source name differs.
 #[test]
-fn wasm_and_native_tool_results_carry_the_same_fence() {
-    if capsule_runtime::skip_without_egress_namespace(
-        "wasm_and_native_tool_results_carry_the_same_fence",
-    ) {
+fn wasm_and_shell_tool_results_carry_the_same_fence() {
+    if common::skip_without_host_support("wasm_and_shell_tool_results_carry_the_same_fence") {
         return;
     }
-    let Some(native_binary) = common::fixture_native_tool_binary() else {
-        eprintln!(
-            "[SKIP] wasm_and_native_tool_results_carry_the_same_fence: no native fixture binary"
-        );
-        return;
-    };
     let server = common::ScriptedServer::start(vec![
         tool_use_turn("toolu_wasm", WASM_TOOL, json!({"message": "hello"})),
-        json!({
-            "id": "msg_2",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{
-                "type": "tool_use",
-                "id": "toolu_native",
-                "name": NATIVE_TOOL,
-                "input": {"operation": "list_entries", "path": "."}
-            }],
-            "stop_reason": "tool_use",
-            "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string(),
+        tool_use_turn("toolu_shell", SHELL_TOOL, json!({"command": "echo hello"})),
         end_turn("Both read."),
     ]);
 
@@ -391,13 +336,12 @@ fn wasm_and_native_tool_results_carry_the_same_fence() {
     let project = tempfile::tempdir().unwrap();
     publish_driver(&home, artifacts.path());
     publish_wasm_tool(&home, artifacts.path());
-    publish_native_tool(&home, artifacts.path(), &native_binary);
 
     let manifest = write_manifest(
         project.path(),
         &server.endpoint,
-        &[(WASM_TOOL, "tool"), (NATIVE_TOOL, "tool")],
-        &[],
+        &[(WASM_TOOL, "tool")],
+        &[SHELL_TOOL],
     );
     let staged = stage(&home, project.path(), &manifest);
     fs::write(
@@ -411,11 +355,11 @@ fn wasm_and_native_tool_results_carry_the_same_fence() {
     let wasm_text = common::extract_result_text(
         &common::find_tool_result(&requests, "toolu_wasm").expect("wasm tool_result"),
     );
-    let native_text = common::extract_result_text(
-        &common::find_tool_result(&requests, "toolu_native").expect("native tool_result"),
+    let shell_text = common::extract_result_text(
+        &common::find_tool_result(&requests, "toolu_shell").expect("shell tool_result"),
     );
 
-    for (text, tool) in [(&wasm_text, WASM_TOOL), (&native_text, NATIVE_TOOL)] {
+    for (text, tool) in [(&wasm_text, WASM_TOOL), (&shell_text, SHELL_TOOL)] {
         assert!(
             text.starts_with(&format!("{}\n", fence_open(&format!("tool:{tool}")))),
             "{tool} must be fenced and named; got:\n{text}"
@@ -423,13 +367,12 @@ fn wasm_and_native_tool_results_carry_the_same_fence() {
         assert!(text.ends_with(&format!("\n{FENCE_CLOSE}")), "got:\n{text}");
     }
 
-    // The marker text itself, with the source name taken out, must be the same bytes on both
-    // paths — one fence, one function, two dispatch branches.
+    // With the source name taken out, the marker is the same bytes on both dispatch paths.
     let wasm_open = wasm_text.lines().next().unwrap();
-    let native_open = native_text.lines().next().unwrap();
+    let shell_open = shell_text.lines().next().unwrap();
     assert_eq!(
         wasm_open.replace(WASM_TOOL, "<name>"),
-        native_open.replace(NATIVE_TOOL, "<name>"),
+        shell_open.replace(SHELL_TOOL, "<name>"),
         "the opening marker must differ only in the source name"
     );
 }

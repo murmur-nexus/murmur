@@ -147,7 +147,7 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
     let entry = lock.artifact_for(FULL_NAME).unwrap();
     assert_eq!(entry.resolved_version, VERSION);
-    assert_eq!(entry.sha256.any.as_deref(), Some(sha256.as_str()));
+    assert_eq!(entry.sha256.any, sha256);
     assert_eq!(entry.owner_id, Some(MURMUR_OWNER_ID));
     assert_no_config_written(&home);
 }

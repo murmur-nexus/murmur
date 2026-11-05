@@ -55,7 +55,7 @@ pub(crate) struct OutputLog {
     /// through the records root.
     pub relative: String,
     /// The absolute host path, the one name every text gives the log. A shell command, a plan
-    /// shell step, a native tool and a process harness can all open it; a WASM tool cannot.
+    /// shell step and a process harness can all open it; a WASM tool cannot.
     pub path: String,
 }
 

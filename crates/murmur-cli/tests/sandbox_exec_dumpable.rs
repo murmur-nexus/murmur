@@ -284,7 +284,7 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
         .clone();
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    // Pre-existing, unrelated launch gate (slice `5cd4e8d`): a capsule that can spawn native
+    // Pre-existing, unrelated launch gate (slice `5cd4e8d`): a capsule that can spawn
     // subprocesses refuses to launch unless a cgroup v2 scope can bound the process tree, and the
     // cgroup a test harness runs in is normally undelegated. Retry with `mur` in a delegated scope
     // of its own; there is nothing to observe about *this* slice until it launches.

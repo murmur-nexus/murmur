@@ -109,7 +109,7 @@ fn install_no_args_installs_manifest_declared_dependency() {
         .artifact_for("local/declared-dep")
         .expect("lock entry for declared-dep");
     assert_eq!(entry.resolved_version, "1.2.3");
-    assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
+    assert_eq!(entry.sha256.any.as_str(), expected_sha256);
 }
 
 /// Write a project `murmur.yaml` declaring every `(name, version)` in `deps` as an artifact.
@@ -146,7 +146,7 @@ fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256
         .artifact_for(&format!("local/{name}"))
         .unwrap_or_else(|| panic!("lock entry for local/{name}"));
     assert_eq!(entry.resolved_version, version);
-    assert_eq!(entry.sha256.any.as_deref().unwrap(), sha256);
+    assert_eq!(entry.sha256.any.as_str(), sha256);
 }
 
 /// One unpublished artifact must not discard the other two: both successes are stored *and*
@@ -312,7 +312,7 @@ fn install_registers_lock_entry_for_registry_resolved_artifact() {
         .artifact_for("local/locked-tool")
         .expect("lock entry for locked-tool");
     assert_eq!(entry.resolved_version, "1.0.0");
-    assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
+    assert_eq!(entry.sha256.any.as_str(), expected_sha256);
 
     let installed = project
         .path()
@@ -351,11 +351,11 @@ fn install_upserts_lock_preserving_existing_entries() {
 
     let existing = lock.artifact_for("local/already-pinned").unwrap();
     assert_eq!(existing.resolved_version, "0.4.0");
-    assert_eq!(existing.sha256.any.as_deref().unwrap(), "preexisting-hash");
+    assert_eq!(existing.sha256.any.as_str(), "preexisting-hash");
 
     let new_entry = lock.artifact_for("local/new-tool").unwrap();
     assert_eq!(new_entry.resolved_version, "2.0.0");
-    assert_eq!(new_entry.sha256.any.as_deref().unwrap(), expected_sha256);
+    assert_eq!(new_entry.sha256.any.as_str(), expected_sha256);
 }
 
 const REGENERATE: &str = "delete murmur.lock and run `mur install` to regenerate it";
@@ -571,7 +571,7 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock.artifact_for("local/conflict-tool").unwrap();
     assert_eq!(
-        entry.sha256.any.as_deref().unwrap(),
+        entry.sha256.any.as_str(),
         "a-completely-different-hash-from-a-prior-pull"
     );
 }
@@ -922,20 +922,15 @@ fn a_frozen_install_refuses_a_missing_entry_and_a_missing_lock() {
     assert!(!project.path().join(".murmur").exists());
 }
 
-/// `--frozen` belongs to the manifest install alone: clap refuses it beside a reference, `-g` or
-/// `--all-platforms`.
+/// `--frozen` belongs to the manifest install alone: clap refuses it beside a reference or `-g`.
 #[test]
-fn frozen_is_refused_beside_a_reference_global_or_all_platforms() {
+fn frozen_is_refused_beside_a_reference_or_global() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write_manifest_with_deps(project.path(), &[("tool-a", "1.0.0")]);
     for (args, conflicting) in [
         (&["--frozen", "local/tool-a@1.0.0"][..], "[ARTIFACT]..."),
         (&["--frozen", "-g", "local/tool-a@1.0.0"][..], "--global"),
-        (
-            &["--frozen", "--all-platforms", "murmur/x@1.0.0"][..],
-            "--all-platforms",
-        ),
         (&["--frozen", "-g"][..], "--global"),
     ] {
         run_install_args(&home, project.path(), args)

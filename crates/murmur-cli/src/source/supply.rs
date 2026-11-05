@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use capsule_runtime::{SourceSupply, SourcedArtifact};
-use murmur_artifact::{
-    current_platform, ArtifactIndex, ArtifactName, MurmurLock, PlatformMatch, ResolvedArtifact,
-};
+use murmur_artifact::{ArtifactIndex, ArtifactName, MurmurLock, ResolvedArtifact};
 
 use super::{resolve, ArtifactSource, ExplicitVersion, ResolveError, SourceError, Sources};
 use crate::error::CliError;
@@ -121,7 +119,6 @@ impl SourceSupply for CliSourceSupply {
         &self,
         name: &ArtifactName,
         version: &str,
-        platform: &str,
         lock: &MurmurLock,
     ) -> Result<SourcedArtifact, String> {
         let source = self
@@ -133,20 +130,19 @@ impl SourceSupply for CliSourceSupply {
             name,
             Some(version),
             ExplicitVersion::FitChecked,
-            platform,
             Some(lock),
         )
-        .map_err(|error| one_line(CliError::from(error)))?;
-        let platform_match = if resolved.platform.as_deref() == Some(current_platform()) {
-            PlatformMatch::Tagged
-        } else {
-            PlatformMatch::NotApplicable
-        };
+        .map_err(|error| match *error {
+            // A session pulling a native tool is refused on the launch's terms, not the store's.
+            ResolveError::NativeTool { name, field, .. } => one_line(
+                crate::error::native_tool_launch_error(name.as_str(), &field),
+            ),
+            error => one_line(CliError::from(error)),
+        })?;
         let meta = crate::commands::install::source_meta(
             name,
             &resolved.version,
             &resolved.manifest,
-            resolved.platform.as_deref(),
             resolved.owner_id,
         );
         Ok(SourcedArtifact {
@@ -154,7 +150,6 @@ impl SourceSupply for CliSourceSupply {
                 meta,
                 bytes: resolved.bytes,
                 sha256: resolved.sha256,
-                platform_match,
             },
             source: resolved.source,
             owner_id: resolved.owner_id,
@@ -205,7 +200,6 @@ mod tests {
             "v1",
             "tool-editor",
             "0.3.0",
-            None,
             &[],
             tool_zip("tool-editor", "0.3.0"),
         );
@@ -220,9 +214,7 @@ mod tests {
         assert!(supply.scopes().contains(&"ana".to_string()));
         assert_eq!(supply.index("ana").unwrap().artifacts.len(), 1);
 
-        let sourced = supply
-            .fetch(&name, "0.3.0", current_platform(), &empty_lock())
-            .unwrap();
+        let sourced = supply.fetch(&name, "0.3.0", &empty_lock()).unwrap();
         assert_eq!(sourced.source, "github:ana/artifacts");
         assert_eq!(sourced.owner_id, 4242);
         assert_eq!(sourced.resolved.meta.owner_id, Some(4242));
@@ -239,7 +231,6 @@ mod tests {
             "v1",
             "tool-editor",
             "0.3.0",
-            None,
             &[],
             tool_zip("tool-editor", "0.3.0"),
         );
@@ -254,9 +245,7 @@ mod tests {
         );
         lock.set_owner_id("ana/tool-other", 1111);
 
-        let refusal = supply
-            .fetch(&name, "0.3.0", current_platform(), &lock)
-            .unwrap_err();
+        let refusal = supply.fetch(&name, "0.3.0", &lock).unwrap_err();
 
         assert!(
             refusal.starts_with(

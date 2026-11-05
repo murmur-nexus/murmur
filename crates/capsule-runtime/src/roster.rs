@@ -27,9 +27,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use murmur_artifact::{
-    current_platform, load_roster, resolve_roster_path, roster_warning_link, sha256_hex,
-    ArtifactName, LockedSha256, MurmurLock, Registry, RegistryError, Roster, RosterError,
-    RosterReachability, RuntimeManifest, TaskAcceptance, ROSTER_FILENAME, W_ROS_001,
+    load_roster, resolve_roster_path, roster_warning_link, sha256_hex, ArtifactName, LockedSha256,
+    MurmurLock, Registry, RegistryError, Roster, RosterError, RosterReachability, RuntimeManifest,
+    TaskAcceptance, ROSTER_FILENAME, W_ROS_001,
 };
 use thiserror::Error;
 
@@ -422,7 +422,6 @@ pub fn admit_roster(
         }
     }
 
-    let platform = current_platform();
     let mut members = Vec::with_capacity(roster.members.len());
     for member in &roster.members {
         let coordinate = format!("{}@{}", member.capsule, member.version);
@@ -435,7 +434,7 @@ pub fn admit_roster(
         let capsule = ArtifactName::parse(&member.capsule)
             .map_err(|error| unresolvable(error.to_string()))?;
         let resolved = registry
-            .resolve_with_platform(&capsule, &member.version, Some(platform))
+            .resolve(&capsule, &member.version)
             .map_err(|error| {
                 unresolvable(match error {
                     RegistryError::NotFound { .. } => {
@@ -461,7 +460,7 @@ pub fn admit_roster(
         })?;
 
         if let Some(pinned) = lock.and_then(|lock| lock.artifact_for(&member.capsule)) {
-            let incoming = LockedSha256::for_resolved(&resolved, platform);
+            let incoming = LockedSha256::any(resolved.sha256.clone());
             if let Some(conflict) = pinned.conflict_with(&member.version, &incoming) {
                 return Err(RosterRefusal::MemberLockConflict {
                     member: member.name.clone(),
@@ -603,7 +602,6 @@ mod tests {
                     version: version.to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
-                    platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,

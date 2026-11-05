@@ -11,8 +11,8 @@ use std::path::Path;
 
 use capsule_runtime::EnvelopeAxis;
 use murmur_artifact::{
-    current_platform, dotenv_variable_names, referenced_env_variables, DotenvError, LocalRegistry,
-    MurmurLock, ReferencedEnvVariable, Registry, RuntimeManifest,
+    dotenv_variable_names, referenced_env_variables, DotenvError, LocalRegistry, MurmurLock,
+    ReferencedEnvVariable, Registry, RuntimeManifest,
 };
 
 use crate::stores::FallbackRegistry;
@@ -540,16 +540,13 @@ impl Walk<'_> {
     ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
         let name = &murmur_artifact::ArtifactName::parse(name)
             .map_err(|error| murmur_artifact::RegistryError::InvalidInput(error.to_string()))?;
-        let platform = Some(current_platform());
         let resolved = match &self.global_registry {
             Some(global) => FallbackRegistry {
                 primary: self.project_registry.clone(),
                 secondary: global.clone(),
             }
-            .resolve_with_platform(name, version, platform)?,
-            None => self
-                .project_registry
-                .resolve_with_platform(name, version, platform)?,
+            .resolve(name, version)?,
+            None => self.project_registry.resolve(name, version)?,
         };
         Ok(resolved)
     }
@@ -609,8 +606,7 @@ impl Walk<'_> {
     }
 }
 
-/// Every version of `name` this store holds, sorted and without the duplicate a
-/// platform-tagged payload set would otherwise contribute.
+/// Every version of `name` this store holds, sorted and without duplicates.
 fn installed_versions(registry: &LocalRegistry, name: &str) -> Vec<String> {
     let Ok(index) = registry.list_index() else {
         return Vec::new();
@@ -656,7 +652,6 @@ mod tests {
                     version: version.to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
-                    platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,
@@ -892,7 +887,6 @@ mod tests {
                     version: "0.1.0".to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
-                    platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,

@@ -2,7 +2,9 @@ package murmur:artifact-manager@0.1.0;
 
 interface manage {
   enum runtime-type {
+    /// An installed artifact: a WASM component or a skill.
     wasm,
+    /// A program `capabilities.shell.allow` names.
     native,
   }
 

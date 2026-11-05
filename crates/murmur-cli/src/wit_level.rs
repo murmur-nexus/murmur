@@ -6,9 +6,7 @@
 //! an artifact has been refused for exactly that reason.
 
 use capsule_runtime::{served_wit_level, RuntimeError};
-use murmur_artifact::{
-    current_platform, level_has_phrase, ArtifactName, UnservedInterface, WitLevel,
-};
+use murmur_artifact::{level_has_phrase, ArtifactName, UnservedInterface, WitLevel};
 
 use crate::error::{CliError, E_WIT_LEVEL_001};
 use crate::source::{newest_fitting, Sources};
@@ -172,7 +170,7 @@ fn fitting_hint(full_name: &str, level: u64) -> String {
         .artifacts
         .iter()
         .find(|artifact| artifact.name == name.name())
-        .and_then(|artifact| newest_fitting(artifact, current_platform()));
+        .and_then(|artifact| newest_fitting(artifact));
     index_hint(
         full_name,
         label,

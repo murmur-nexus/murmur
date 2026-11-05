@@ -23,13 +23,13 @@ use zip::{
 const TOOL: &str = "echo-tool";
 const VERSION: &str = "0.1.0";
 
-/// A fresh `HOME` and the five files the tests compile: a WASM tool, a native tool, a file that is
+/// A fresh `HOME` and the five files the tests compile: a WASM tool, a skill, a file that is
 /// not a zip, a path that does not exist, and a tool whose `tool.wasm` is not wasm.
 struct Files {
     home: TempDir,
     _dir: TempDir,
     echo: PathBuf,
-    native: PathBuf,
+    skill: PathBuf,
     garbage: PathBuf,
     missing: PathBuf,
     bad_wasm: PathBuf,
@@ -45,14 +45,7 @@ impl Files {
             VERSION,
             &common::fixture_path("run/components/echo-tool.wasm"),
         );
-        let native = common::create_native_artifact(
-            dir.path(),
-            "native-echo",
-            VERSION,
-            "#!/bin/sh\necho ok\n",
-            None,
-            None,
-        );
+        let skill = common::create_skill_artifact(dir.path(), "echo-skill", VERSION, "# echo\n");
         let garbage = dir.path().join("garbage.mur.zip");
         fs::write(&garbage, b"not a zip").unwrap();
         let missing = dir.path().join("missing.mur.zip");
@@ -70,7 +63,7 @@ impl Files {
             home,
             _dir: dir,
             echo,
-            native,
+            skill,
             garbage,
             missing,
             bad_wasm,
@@ -143,7 +136,7 @@ fn every_file_is_reported_in_order_and_only_the_wasm_tool_is_stored() {
     let output = files.precompile(
         &[
             &files.echo,
-            &files.native,
+            &files.skill,
             &files.garbage,
             &files.missing,
             &files.bad_wasm,
@@ -157,12 +150,7 @@ fn every_file_is_reported_in_order_and_only_the_wasm_tool_is_stored() {
     let artifacts = report["artifacts"].as_array().unwrap();
     let expected = [
         (&files.echo, Some(TOOL), Some(VERSION), "compiled"),
-        (
-            &files.native,
-            Some("native-echo"),
-            Some(VERSION),
-            "not_wasm",
-        ),
+        (&files.skill, Some("echo-skill"), Some(VERSION), "not_wasm"),
         (&files.garbage, None, None, "failed"),
         (&files.missing, None, None, "failed"),
         (&files.bad_wasm, Some("bad-wasm"), Some("0.2.0"), "failed"),
@@ -216,11 +204,11 @@ fn a_stored_form_is_already_stored_and_left_as_it_is() {
 #[test]
 fn the_text_report_is_one_line_per_file() {
     let files = Files::new();
-    let output = files.precompile(&[&files.echo, &files.native], false);
+    let output = files.precompile(&[&files.echo, &files.skill], false);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "compiled        echo-tool@0.1.0\nnot wasm        native-echo@0.1.0\n"
+        "compiled        echo-tool@0.1.0\nnot wasm        echo-skill@0.1.0\n"
     );
 
     let output = files.precompile(&[&files.echo, &files.missing], false);

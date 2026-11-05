@@ -11,16 +11,14 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, is_credential_shaped_env_name, native_binary_verdict,
-    parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
-    runtime_warning_link, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
-    ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
-    ConversationMode, DoneCheck, HookBinding, InferenceConfig, InterpreterRuntimeGrant,
-    KeepWorking, LifecycleConfig, LockOrigin, LockedSha256, LockfileError, MurmurLock,
-    NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance,
-    LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003,
-    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_016,
-    W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    is_credential_shaped_env_name, parse_hook_config_from_yaml, read_lockfile,
+    refuse_native_payload, runtime_warning_link, security_warning_link, verify_sha256,
+    write_lockfile_atomic, AfterTask, ApiKeyReference, ArtifactName, ArtifactRuntime,
+    ContextConfig, ConversationMode, DoneCheck, HookBinding, InferenceConfig,
+    InterpreterRuntimeGrant, KeepWorking, LifecycleConfig, LockOrigin, LockedSha256, LockfileError,
+    MurmurLock, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008,
+    W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -43,8 +41,7 @@ use crate::{
     a2a::{A2aTask, IncomingTask, TaskRegistry, TaskState},
     agent::{self, AgentLoopExit},
     artifact::{
-        check_root_wasm, extract_manifest_yaml, extract_native_binary, extract_root_wasm,
-        extract_skill_files, SkillFiles,
+        check_root_wasm, extract_manifest_yaml, extract_root_wasm, extract_skill_files, SkillFiles,
     },
     artifact_config::ARTIFACT_CONFIG_ENV,
     background_command::BACKGROUND_COMMAND_TOOL,
@@ -1219,7 +1216,7 @@ async fn run_done_check(
 ) -> Result<crate::done_check::DoneCheckReport, RuntimeError> {
     let argv = check.argv();
     let accessible_workdir = state.accessible_root.clone();
-    let env_overrides = native_env(&state.inference_env);
+    let env_overrides = subprocess_guest_env(&state.inference_env);
     let policy = state.capability_policy.clone();
     let enforcement = state.shell_enforcement.clone();
     let stop = crate::shell::ForegroundStop {
@@ -2584,7 +2581,7 @@ pub fn stage_session(
         sandbox::host_path_mechanism(containment.applied_tier()),
     )
     .map_err(RuntimeError::HostPathRefused)?;
-    let mut scope_report = crate::containment::scope_report_for_tier(
+    let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         &containment,
         sealed_shortfall.as_ref(),
@@ -2665,17 +2662,11 @@ pub fn stage_session(
     )?;
     // A third refusal, in the same pre-staging seam and for the same fail-closed reason, but
     // about a mechanism that sits outside the containment ladder entirely: a capsule that can
-    // spawn a native subprocess needs a network namespace to put it in, because that namespace —
+    // spawn a subprocess needs a network namespace to put it in, because that namespace —
     // not a syscall filter — is what makes `capabilities.network.allow` mean anything for
     // that subprocess. See `RuntimeError::EgressNamespaceUnavailable` for why this refuses even
-    // when the allowlist is empty.
-    //
-    // Counts `shell.allow`, `spawn.allow` and `install.tool`, whose pattern can match a native
-    // tool a pull installs. A declared native tool is a subprocess route too, but whether the
-    // capsule has one is known only from `staged.installed_artifacts`, after the registry is
-    // resolved, so a capsule whose only route is a declared native tool is refused by `launch`
-    // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
-    // An unconfined session's subprocesses run in no namespace, so none is needed.
+    // when the allowlist is empty. An unconfined session's subprocesses run in no namespace, so
+    // none is needed.
     crate::network_namespace::check_egress_namespace(
         has_subprocess_route_at_staging(&request.capability_policy) && !unconfined,
         host_probe.egress_namespace_failure().as_ref(),
@@ -2756,9 +2747,8 @@ pub fn stage_session(
     // Past the host probes' forks and the last fork staging makes, so no child is forked while
     // this process moves into its own scope. A fork added between here and `prepare_scope` in
     // `launch` (later in staging, in a caller before it launches, or early in `launch`) goes above
-    // this call, or this call moves below it. A capsule that needs a scope only for a native
-    // artifact is known once the artifacts resolve, and `prepare_scope` resolves the base for it.
-    if cgroup::requires_process_bounding(&request.capability_policy, false) {
+    // this call, or this call moves below it.
+    if cgroup::requires_process_bounding(&request.capability_policy) {
         cgroup::resolve_delegated_base_in_background();
     }
     let engine = build_engine()?;
@@ -2803,11 +2793,6 @@ pub fn stage_session(
     // loop below (which borrows `request.artifacts`). It is what an artifact entry's
     // `capabilities.state` defaults its store name to.
     let capsule_name = request.capsule_name.clone();
-    // (name, binary_bytes) for native tool artifacts — installed after workdir creation
-    let mut native_binaries: Vec<(String, Vec<u8>)> = Vec::new();
-    // Only native tools whose entry declares `config:` or `capabilities.state` get an entry.
-    let mut native_tool_settings: HashMap<String, crate::types::NativeToolSettings> =
-        HashMap::new();
     // (name, files) for skill artifacts — installed after workdir creation
     let mut skill_files: Vec<(String, SkillFiles)> = Vec::new();
     // The inference driver's transport and artifact name. Its exports are checked against the
@@ -2838,7 +2823,6 @@ pub fn stage_session(
                 name: artifact.name.clone(),
                 version: artifact.version.clone(),
                 runtime: artifact.runtime.clone(),
-                implementation: None,
                 origin: LockOrigin::Operator,
             });
             continue;
@@ -2883,15 +2867,11 @@ pub fn stage_session(
             None => (artifact.version.clone(), None, LockOrigin::Operator),
         };
 
-        // Always pass current_platform(). `LocalRegistry` falls back to the generic file when no
-        // platform-specific file exists, so a WASM artifact (which has no platform file) resolves
-        // through the same call that gives a native artifact its platform variant. A store that
-        // refused a missing platform match instead would break WASM resolution.
         let artifact_name = ArtifactName::parse(&full_name).map_err(|error| {
             RuntimeError::Runtime(format!("cannot resolve artifact '{full_name}': {error}"))
         })?;
         let resolved = registry
-            .resolve_with_platform(&artifact_name, &resolved_version, Some(current_platform()))
+            .resolve(&artifact_name, &resolved_version)
             .map_err(|err| map_registry_error(&full_name, &resolved_version, err))?;
 
         verify_sha256(
@@ -2902,13 +2882,6 @@ pub fn stage_session(
         )
         .map_err(|_| RuntimeError::artifact_integrity_failed(&full_name, &resolved_version))?;
 
-        // Which platform this payload gets pinned under in `murmur.lock`. A native binary is a
-        // different payload per platform, so its hash is only ever the hash for this host; a
-        // WASM component or a skill is the same bytes everywhere and is pinned once. Read from
-        // the payload's own recorded runtime, the same question `pull` asks.
-        let resolved_platform =
-            (resolved.meta.runtime == RuntimeType::Native).then(|| current_platform().to_string());
-
         if let Some(expected) = expected_hash {
             if resolved.sha256 != expected {
                 return Err(RuntimeError::artifact_integrity_failed(
@@ -2918,62 +2891,39 @@ pub fn stage_session(
             }
         }
 
+        // Ahead of reading anything else out of the payload, so a store an older mur left holding
+        // a native tool stops the launch here, before any session starts.
+        refuse_native_payload(&full_name, &resolved.bytes)
+            .map_err(|error| native_tool_error(&full_name, error))?;
+
         let manifest_yaml =
             extract_manifest_yaml(&artifact.name, &resolved_version, &resolved.bytes)?;
 
         installed_manifests.push((artifact.name.clone(), manifest_yaml.clone()));
 
-        let mut artifact_implementation: Option<ArtifactImplementation> = None;
-
         match artifact.runtime {
             ArtifactRuntime::Tool => {
-                let implementation = parse_tool_implementation_from_yaml(&manifest_yaml);
-                artifact_implementation = Some(implementation.clone());
-                match implementation {
-                    ArtifactImplementation::Native => {
-                        // A native tool is a host subprocess, not a WASI guest: it never
-                        // reaches `invoke_tool_component`, so nothing applies a per-artifact
-                        // grant to it beyond its store. Say so rather than let the rest of the
-                        // block read as enforced.
-                        warn_on_unenforceable_native_capabilities(
-                            &full_name,
-                            artifact.capabilities.as_ref(),
-                        );
-                        if let Some(settings) = stage_native_tool_settings(artifact, &capsule_name)?
-                        {
-                            native_tool_settings.insert(artifact.name.clone(), settings);
-                        }
-                        let binary = extract_native_binary(
-                            &artifact.name,
-                            &resolved_version,
-                            &resolved.bytes,
-                        )?;
-                        native_binaries.push((artifact.name.clone(), binary));
-                    }
-                    ArtifactImplementation::Wasm => {
-                        stage_artifact_grant(
-                            artifact,
-                            &ceiling_network_allow_rules,
-                            &capsule_name,
-                            &mut artifact_grants,
-                        )?;
-                        let tool_component = stage_root_component(
-                            &engine,
-                            &compiled_forms,
-                            &artifact.name,
-                            &resolved_version,
-                            &resolved.bytes,
-                            &resolved.sha256,
-                        )?;
-                        crate::process_driver::check_component_level(
-                            &full_name,
-                            &resolved_version,
-                            murmur_contracts(&engine, &tool_component),
-                            crate::served_wit_level(),
-                        )?;
-                        tool_components.insert(artifact.name.clone(), tool_component);
-                    }
-                }
+                stage_artifact_grant(
+                    artifact,
+                    &ceiling_network_allow_rules,
+                    &capsule_name,
+                    &mut artifact_grants,
+                )?;
+                let tool_component = stage_root_component(
+                    &engine,
+                    &compiled_forms,
+                    &artifact.name,
+                    &resolved_version,
+                    &resolved.bytes,
+                    &resolved.sha256,
+                )?;
+                crate::process_driver::check_component_level(
+                    &full_name,
+                    &resolved_version,
+                    murmur_contracts(&engine, &tool_component),
+                    crate::served_wit_level(),
+                )?;
+                tool_components.insert(artifact.name.clone(), tool_component);
             }
             ArtifactRuntime::Driver
                 if inference_driver.is_some_and(|(transport, name)| {
@@ -3128,13 +3078,11 @@ pub fn stage_session(
             name: full_name.clone(),
             resolved_version: resolved_version.clone(),
             sha256: resolved.sha256,
-            platform: resolved_platform,
         });
         installed_artifacts.push(InstalledArtifactSummary {
             name: full_name,
             version: resolved_version,
             runtime: artifact.runtime.clone(),
-            implementation: artifact_implementation,
             origin,
         });
     }
@@ -3480,22 +3428,7 @@ pub fn stage_session(
             hook.grant.records_hooks_dir = Some(hooks_dir.clone());
         }
     }
-    // What each preopen's runtime-directory reach really is, now that every installed artifact's
-    // implementation is known: `session_start.effective_grants` records the exact answer.
-    let installed_implementation = |name: &str| {
-        installed_artifacts
-            .iter()
-            .find(|installed| installed.name == name)
-            .and_then(|installed| installed.implementation.clone())
-    };
-    crate::containment::resolve_runtime_dir_reaches(
-        &mut scope_report.preopens,
-        installed_implementation,
-    );
-    // Built only now, for the same reason: which tools are native is known once each is
-    // installed.
     let scope_report = scope_report.with_routes(
-        installed_implementation,
         request
             .inference
             .as_ref()
@@ -3512,12 +3445,6 @@ pub fn stage_session(
         write_tool_manifest(&runtime_root, name, manifest_yaml)?;
     }
 
-    let native_entrypoints = install_native_binaries(
-        &runtime_root,
-        &accessible_workdir,
-        native_binaries,
-        &full_names,
-    )?;
     install_skill_files(&runtime_root, skill_files)?;
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
@@ -3743,8 +3670,6 @@ pub fn stage_session(
         compiled_forms,
         capsule_component,
         tool_components,
-        native_entrypoints,
-        native_tool_settings,
         process_driver: staged_process_driver,
         artifact_grants,
         hook_components,
@@ -3804,7 +3729,7 @@ pub fn stage_session(
 
 /// Instantiates the staged capsule and executes it.
 ///
-/// Agent capsules (inference configured) run the built-in native Rust loop.
+/// Agent capsules (inference configured) run the built-in Rust agent loop.
 /// Script capsules (WASM component present) instantiate and call `murmur:capsule/run#run()`.
 ///
 /// Leaves the process's `SIGTERM` disposition alone: a caller that runs several sessions in one
@@ -3947,35 +3872,15 @@ fn launch(
 
     // --- Host-process bounding, before any WASM is instantiated ------------------------------
     //
-    // A capsule that can reach a native subprocess by any route (`shell.allow`, `spawn.allow`,
-    // `install.tool`, or a native-implementation artifact) needs a cgroup scope around that
-    // process tree. On Linux, failing to get one is fatal here — refusing the launch is strictly
-    // better than running the tree with no aggregate memory/pids/cpu ceiling, and it must happen
-    // before instantiation so no subprocess is ever spawned unbounded. Off Linux there is no
-    // cgroup to get, so `prepare_scope` returns `None` and the gap is reported as `W-SEC-010`
-    // instead.
-    let has_native_artifact = staged.installed_artifacts.iter().any(|artifact| {
-        matches!(
-            artifact.implementation,
-            Some(murmur_artifact::ArtifactImplementation::Native)
-        )
-    });
-    // The `E-CAP-005` refusal `stage_session` could not make for a capsule whose only subprocess
-    // route is a native tool: whether it has one is known only now, after staging. Still ahead of
-    // the cgroup scope, the enforcement and every WASM instantiation, so no tool call is reached.
-    check_native_artifact_egress_namespace(
-        &staged.capability_policy,
-        has_native_artifact,
-        staged.host_probe.egress_namespace_failure().as_ref(),
-    )
-    .map_err(|error| {
-        with_provider_tools_required(error, staged.provider_tool_terms.declared.clone())
-    })?;
-    let requires_process_bounding =
-        cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
+    // A capsule that can reach a subprocess by any route (`shell.allow`, `spawn.allow`) needs a
+    // cgroup scope around that process tree. On Linux, failing to get one is fatal here —
+    // refusing the launch is strictly better than running the tree with no aggregate
+    // memory/pids/cpu ceiling, and it must happen before instantiation so no subprocess is ever
+    // spawned unbounded. Off Linux there is no cgroup to get, so `prepare_scope` returns `None`
+    // and the gap is reported as `W-SEC-010` instead.
+    let requires_process_bounding = cgroup::requires_process_bounding(&staged.capability_policy);
     let prepared_scope = prepare_launch_scope(
         &staged.capability_policy,
-        has_native_artifact,
         &staged.session_id,
         &staged.accessible_workdir,
     )?;
@@ -4472,8 +4377,6 @@ fn launch(
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
-        let native_entrypoints = staged.native_entrypoints;
-        let native_tool_settings = staged.native_tool_settings;
         let process_driver_for_state = staged.process_driver.clone();
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
@@ -4767,7 +4670,7 @@ fn launch(
                             shell_enforcement_for_state.clone(),
                             capability_policy.clone(),
                             accessible_root.clone(),
-                            native_env(&all_env),
+                            subprocess_guest_env(&all_env),
                             resource_trace.clone(),
                         ));
                     let session_processes_for_teardown = Arc::clone(&session_processes);
@@ -4831,8 +4734,6 @@ fn launch(
                         manifest_file_name: staged.manifest_file_name.clone(),
                         murmur_md: murmur_md_inputs,
                         tool_components,
-                        native_entrypoints,
-                        native_tool_settings,
                         process_driver: process_driver_for_state.clone(),
                         artifact_grants,
                         allowlisted_tools,
@@ -5877,8 +5778,6 @@ fn launch(
         manifest_file_name: staged.manifest_file_name.clone(),
         murmur_md: None,
         tool_components: staged.tool_components,
-        native_entrypoints: staged.native_entrypoints,
-        native_tool_settings: staged.native_tool_settings,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
         process_driver: None,
         artifact_grants: staged.artifact_grants,
@@ -6706,29 +6605,25 @@ fn warn_on_runtime_dir_inside_workdir(placement: &crate::runtime_dir::RuntimeDir
     }
 }
 
-/// The session's cgroup scope, decided and created: none when `policy` and `has_native_artifact`
-/// give the capsule no route to a native subprocess
-/// ([`cgroup::requires_process_bounding`]), and
-/// [`RuntimeError::CgroupDelegationUnavailable`] on a Linux host that cannot delegate one when
-/// they do. `launch_session` calls this once, before any WASM is instantiated.
+/// The session's cgroup scope, decided and created: none when `policy` gives the capsule no route
+/// to a subprocess ([`cgroup::requires_process_bounding`]), and
+/// [`RuntimeError::CgroupDelegationUnavailable`] on a Linux host that cannot delegate one when it
+/// does. `launch_session` calls this once, before any WASM is instantiated.
 pub(crate) fn prepare_launch_scope(
     policy: &CapabilityPolicy,
-    has_native_artifact: bool,
     session_id: &str,
     workdir: &Path,
 ) -> Result<cgroup::PreparedScope, RuntimeError> {
-    cgroup::prepare_policy_scope(policy, has_native_artifact, session_id, workdir)
+    cgroup::prepare_policy_scope(policy, session_id, workdir)
         .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
 }
 
-/// Whether `stage_session` can already tell the capsule may start a native subprocess: a
-/// `shell.allow`, a `spawn.allow` or an `install.tool` grant, whose pattern can match a native
-/// tool a pull installs. `mur doctor` asks the same question before its checklist.
+/// Whether the capsule may start a subprocess: a `shell.allow` or a `spawn.allow` grant. A
+/// pulled tool is a WASM component, which starts a program only through `murmur:process` and so
+/// only one `shell.allow` names. `mur doctor` asks the same question before its checklist.
 #[must_use]
 pub fn has_subprocess_route_at_staging(policy: &CapabilityPolicy) -> bool {
-    !policy.shell_allow.is_empty()
-        || !policy.spawn_allow.is_empty()
-        || !policy.install_tool.is_empty()
+    !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty()
 }
 
 /// One credential-shaped entry of `capabilities.env.allow` that reaches every WASM guest.
@@ -7417,105 +7312,6 @@ fn warn_on_inert_tool_capabilities(
     }
 }
 
-/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host subprocess
-/// under the capsule-wide grants, enforced by the same sandbox as a shell command, never through
-/// the WASI tool path per-artifact grants are applied on. `capabilities.state` is the one
-/// sub-block applied to it ([`stage_native_tool_settings`]); any other narrows nothing, which is
-/// a sharper hazard than an inert sub-block and gets the same `W-SEC-008` treatment. A block that
-/// holds only `state` prints nothing.
-fn warn_on_unenforceable_native_capabilities(
-    artifact_name: &str,
-    capabilities: Option<&murmur_artifact::Capabilities>,
-) {
-    let Some(capabilities) = capabilities else {
-        return;
-    };
-    // Every field but `state`, named so a sub-block added to `Capabilities` has to be placed.
-    let murmur_artifact::Capabilities {
-        network,
-        peer_fetch,
-        filesystem,
-        shell,
-        spawn,
-        env,
-        limits,
-        resources,
-        state: _,
-        task_io,
-        conversation,
-        plan,
-        install,
-        containment,
-    } = capabilities;
-    let unapplied: Vec<&str> = [
-        ("network", network.is_some()),
-        ("peer_fetch", peer_fetch.is_some()),
-        ("filesystem", filesystem.is_some()),
-        ("shell", shell.is_some()),
-        ("spawn", spawn.is_some()),
-        ("env", env.is_some()),
-        ("limits", limits.is_some()),
-        ("resources", resources.is_some()),
-        ("task_io", task_io.is_some()),
-        ("conversation", conversation.is_some()),
-        ("plan", plan.is_some()),
-        ("install", install.is_some()),
-        ("containment", containment.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| present.then_some(name))
-    .collect();
-    if unapplied.is_empty() {
-        return;
-    }
-
-    let link = security_warning_link(W_SEC_008);
-    crate::runtime_err!(
-        "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
-         capabilities.{} but ships a native implementation — capabilities.state is the one \
-         sub-block that applies to a native tool, and the rest run under the capsule-wide \
-         capabilities, enforced by the same sandbox as shell commands, which this block does not \
-         narrow ({link})",
-        unapplied.join(", capabilities.")
-    );
-}
-
-/// The settings a native tool's own entry hands it: `config:` lowered to compact JSON, refused
-/// with [`RuntimeError::InvalidArtifactConfig`] on the WASM path's terms, and the store
-/// `capabilities.state` names, resolved on the WASM path's name rule and created here. `None`
-/// when the entry declares neither, which stages nothing and creates nothing.
-///
-/// The config is lowered before the store is created, so a malformed block leaves no directory.
-/// The store is created at staging only; `mur run --explain-scope` reports it through
-/// [`crate::state_store::state_store_reports`] without creating it.
-fn stage_native_tool_settings(
-    artifact: &ArtifactRequest,
-    capsule_name: &str,
-) -> Result<Option<crate::types::NativeToolSettings>, RuntimeError> {
-    let config_json = artifact
-        .config
-        .as_ref()
-        .map(|config| crate::artifact_config::lower_artifact_config(&artifact.name, config))
-        .transpose()?;
-    let store = match artifact.capabilities.as_ref() {
-        Some(capabilities) => {
-            crate::network_policy::derive_state_store(capabilities, capsule_name)?
-        }
-        None => None,
-    };
-    if config_json.is_none() && store.is_none() {
-        return Ok(None);
-    }
-    let state_dir = store
-        .as_deref()
-        .map(crate::state_store::ensure_state_store)
-        .transpose()?;
-    Ok(Some(crate::types::NativeToolSettings {
-        config_json,
-        state_dir,
-    }))
-}
-
 /// Builds the single `Engine` a session runs every guest on.
 ///
 /// `epoch_interruption` compiles a deadline check into wasm loop back-edges and function
@@ -7548,7 +7344,24 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
         RegistryError::IntegrityMismatch { .. } => {
             RuntimeError::artifact_integrity_failed(name, version)
         }
+        RegistryError::NativeTool { name, field } => RuntimeError::NativeTool {
+            artifact: name,
+            field,
+        },
         other => RuntimeError::Runtime(other.to_string()),
+    }
+}
+
+/// [`refuse_native_payload`]'s refusal as the launch reports it, naming `full_name`. Any other
+/// manifest error is the payload's own `murmur.yaml` failing to parse, which the staging step
+/// reading that manifest reports on its own terms.
+fn native_tool_error(full_name: &str, error: murmur_artifact::ManifestError) -> RuntimeError {
+    match error {
+        murmur_artifact::ManifestError::NativeTool { field, .. } => RuntimeError::NativeTool {
+            artifact: full_name.to_string(),
+            field: field.to_string(),
+        },
+        other => RuntimeError::Runtime(format!("artifact '{full_name}': {other}")),
     }
 }
 
@@ -7642,8 +7455,8 @@ pub(crate) fn gateway_env_pair(gateway: &CredentialGateway) -> (String, String) 
 /// virtual address — for a formation member with callees.
 ///
 /// One list, read by the agent or script root's store, by every tool and driver store and by a
-/// hook's `run-inference` driver. The shell tool takes it through [`native_env`], which drops the
-/// formation entry, as a native tool and a process-driver harness are never handed it.
+/// hook's `run-inference` driver. The shell tool takes it through [`subprocess_guest_env`], which
+/// drops the formation entry, as a process-driver harness is never handed it.
 /// `build_wasi_ctx` applies it after the manifest's allowlist, and neither the allowlist nor a
 /// shell baseline resolves the peers name from the host, so no declaration supplies or displaces
 /// it.
@@ -8176,14 +7989,6 @@ pub(crate) struct CapsuleStoreState {
     /// checkpoints drain it through here.
     pub(crate) accessible_root: WorkdirRoot,
     pub(crate) tool_components: HashMap<String, Component>,
-    /// What each native tool installed in this session needs to start, keyed by tool name: from
-    /// [`StagedSession::native_entrypoints`], and added to by a pull. A native tool is
-    /// dispatched only through its entry here; see [`sandbox::NativeEntrypoint`].
-    pub(crate) native_entrypoints: HashMap<String, sandbox::NativeEntrypoint>,
-    /// What each native tool's own manifest entry hands it, from
-    /// [`StagedSession::native_tool_settings`]. Removed with the tool's entrypoint; a pull adds
-    /// nothing here, because a pulled tool has no operator entry.
-    pub(crate) native_tool_settings: HashMap<String, crate::types::NativeToolSettings>,
     /// The `transport: process` driver this session drives its harness through, shared from
     /// [`StagedSession::process_driver`]. `None` on every other transport, and on the
     /// script-capsule path, which runs no agent loop.
@@ -8601,7 +8406,7 @@ impl manage::Host for CapsuleStoreState {
             .map(|artifact| manage::ArtifactSummary {
                 name: artifact.name.clone(),
                 version: artifact.version.clone(),
-                runtime: runtime_type_to_wit(&artifact.runtime, artifact.implementation.as_ref()),
+                runtime: manage::RuntimeType::Wasm,
             })
             .collect();
 
@@ -8609,6 +8414,7 @@ impl manage::Host for CapsuleStoreState {
             .iter()
             .map(|a| murmur_artifact::tool_name_of(&a.name).to_string())
             .collect();
+        // `runtime-type::native` labels a `capabilities.shell.allow` program and nothing else.
         for binary in &self.capability_policy.shell_allow {
             if !existing.contains(binary) {
                 result.push(manage::ArtifactSummary {
@@ -8624,27 +8430,19 @@ impl manage::Host for CapsuleStoreState {
 
     fn describe(&mut self, name: String) -> Result<manage::ArtifactInfo, String> {
         // Check installed artifacts first, then fall back to shell tool manifests on disk.
-        let fallback_summary;
-        let summary = if let Some(s) = self
+        let (version, runtime) = if let Some(installed) = self
             .installed_artifacts
             .iter()
             .find(|artifact| artifact.name == name)
         {
-            s
+            (installed.version.clone(), manage::RuntimeType::Wasm)
         } else if self
             .capability_policy
             .shell_allow
             .iter()
             .any(|b| b == &name)
         {
-            fallback_summary = InstalledArtifactSummary {
-                name: name.clone(),
-                version: "0.0.0".to_string(),
-                runtime: ArtifactRuntime::Tool,
-                implementation: Some(ArtifactImplementation::Native),
-                origin: LockOrigin::Operator,
-            };
-            &fallback_summary
+            ("0.0.0".to_string(), manage::RuntimeType::Native)
         } else if let Err(error) = ArtifactName::parse(&name) {
             return Err(crate::install_grant::name_refusal(&error));
         } else {
@@ -8661,7 +8459,7 @@ impl manage::Host for CapsuleStoreState {
             .map_err(|err| format!("failed to read {err}"))?
             .ok_or_else(|| format!("failed to read {rel}: it does not exist"))?;
 
-        read_artifact_info_from_manifest(&manifest_content, &rel, summary)
+        read_artifact_info_from_manifest(&manifest_content, &rel, &name, version, runtime)
     }
 
     /// What `query` reaches that this capsule may pull: an exact full name or an install
@@ -8678,11 +8476,7 @@ impl manage::Host for CapsuleStoreState {
                     .or_else(|| listed.versions.first().cloned())
                     .unwrap_or_default(),
                 name: listed.artifact,
-                runtime: if listed.native {
-                    manage::RuntimeType::Native
-                } else {
-                    manage::RuntimeType::Wasm
-                },
+                runtime: manage::RuntimeType::Wasm,
             })
             .collect())
     }
@@ -8696,10 +8490,7 @@ impl manage::Host for CapsuleStoreState {
         Ok(manage::ArtifactSummary {
             name: pulled.summary.name,
             version: pulled.summary.version,
-            runtime: runtime_type_to_wit(
-                &pulled.summary.runtime,
-                pulled.summary.implementation.as_ref(),
-            ),
+            runtime: manage::RuntimeType::Wasm,
         })
     }
 
@@ -8742,9 +8533,7 @@ fn gateway_for_store(
 ///
 /// For each such artifact the `gateway.api_key` is resolved first, against `credentials_file` and
 /// the environment, so a credential found nowhere refuses with
-/// [`RuntimeError::GatewayCredentialNotFound`]. A native implementation is then refused with
-/// [`RuntimeError::GatewayOnNativeArtifact`] — its requests leave through the egress proxy and
-/// would never reach the gateway — and the artifact's own bundled `upstream_auth:` block is read,
+/// [`RuntimeError::GatewayCredentialNotFound`]. Then the artifact's own bundled `upstream_auth:` block is read,
 /// refusing with [`RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth`] when it is absent or
 /// malformed. A keyless gateway needs that block too: its header is the one stripped from every
 /// request. A gateway with neither a credential nor `keyless: true` is refused with
@@ -8831,13 +8620,6 @@ fn stage_gateways(
             }
             Err(error) => return Err(error),
         };
-        if installed.is_some_and(|installed| {
-            installed.implementation == Some(ArtifactImplementation::Native)
-        }) {
-            return Err(RuntimeError::GatewayOnNativeArtifact {
-                name: full_name.to_string(),
-            });
-        }
         let refuse = |reason: Option<String>| RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth {
             name: full_name.to_string(),
             version: installed
@@ -9677,16 +9459,13 @@ impl CapsuleStoreState {
 
     /// The extra roots `name`'s guest is preopened into under `murmur-host`
     /// ([`crate::guest_roots::tool_extra_roots`]): the session's, for exactly the WASM guests
-    /// [`Self::runtime_dir_preopen`] hands the runtime directory; none for every other, a native
-    /// tool included.
+    /// [`Self::runtime_dir_preopen`] hands the runtime directory; none for every other.
     pub(crate) fn extra_roots_preopen(&self, name: &str) -> Vec<crate::guest_roots::GuestRoot> {
         let scoped = self.declares_filesystem_scope(name);
         self.installed_artifacts
             .iter()
             .find(|artifact| {
                 murmur_artifact::tool_name_of(&artifact.name) == name
-                    && artifact.implementation
-                        != Some(murmur_artifact::ArtifactImplementation::Native)
                     && crate::runtime_dir::gets_runtime_dir_preopen(&artifact.runtime, scoped)
             })
             .map(|artifact| {
@@ -9753,7 +9532,7 @@ impl CapsuleStoreState {
     ///
     /// Routes exactly as [`Self::dispatch_agent_tool_unfenced`] does, in the same order, so the
     /// hook is shown the branch that will actually be taken. Everything that is not a shell
-    /// call — a runtime peer-handoff tool, a native artifact binary, a skill, a WASM tool —
+    /// call — a runtime peer-handoff tool, a skill, a WASM tool —
     /// resolves to [`ResolvedCall::Tool`] carrying the exact input JSON.
     ///
     /// Read-only and side-effect free: it decides nothing and grants nothing, and the capability
@@ -9782,12 +9561,6 @@ impl CapsuleStoreState {
             || name == REMOVE_ARTIFACT_TOOL
             || name == SESSION_STATUS_TOOL
             || name == BACKGROUND_COMMAND_TOOL
-        {
-            return as_tool();
-        }
-        if self.native_entrypoints.contains_key(name)
-            && !self.tool_components.contains_key(name)
-            && !self.removed_artifacts.contains(name)
         {
             return as_tool();
         }
@@ -9909,11 +9682,10 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
-    /// whatever comes back.
+    /// Dispatch a tool call from the agent loop: shell or WASM, and fence whatever comes back.
     ///
     /// The single convergence point of every agent-facing tool call, on both invocation paths
-    /// (WASM component and native subprocess), which is why the fence is applied here rather
+    /// (WASM component and shell subprocess), which is why the fence is applied here rather
     /// than at either of the two callers that turn a [`DispatchOutcome`] into model-facing text.
     /// The reduction from `data`/`summary` to one string happens here too, so no unfenced tool
     /// text is left on the outcome for a caller to reach for.
@@ -10096,38 +9868,6 @@ impl CapsuleStoreState {
             return Err(exclusive_only(name));
         }
 
-        // Native artifact: a binary this session installed at <runtime dir>/tools/<name>/<name>. A
-        // file the capsule wrote there itself has no entry and is not dispatched as a native tool.
-        let native_entrypoint = self.native_entrypoints.get(name).cloned();
-        if let Some(native_entrypoint) = native_entrypoint.filter(|_| {
-            !self.tool_components.contains_key(name) && !self.removed_artifacts.contains(name)
-        }) {
-            let settings = self.native_tool_settings.get(name).cloned();
-            // On the blocking pool, like the shell branch: the wait on the child is a blocking
-            // wait, and on the calling task it would stall every other future that task polls.
-            let running = enforce_allowlist(&self.allowlisted_tools, name, || {
-                let name = name.to_string();
-                let accessible_workdir = self.accessible_workdir.clone();
-                let policy = self.capability_policy.clone();
-                let enforcement = self.shell_enforcement.clone();
-                Ok(tokio::task::spawn_blocking(move || {
-                    dispatch_native_tool(
-                        &name,
-                        input,
-                        &native_entrypoint,
-                        settings.as_ref(),
-                        &accessible_workdir,
-                        &policy,
-                        &enforcement,
-                    )
-                }))
-            })?;
-            return running
-                .await
-                .map_err(|e| format!("native tool panicked: {e}"))
-                .map(native_tool_outcome);
-        }
-
         // Shell tool — run on the blocking pool, since waiting on the child process is a
         // blocking wait.
         if self
@@ -10138,7 +9878,7 @@ impl CapsuleStoreState {
         {
             let name = name.to_string();
             let accessible_workdir = self.accessible_root.clone();
-            let env_overrides = native_env(&self.inference_env);
+            let env_overrides = subprocess_guest_env(&self.inference_env);
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
             // Both halves are required. Without a registry there is no task loop to deliver a
@@ -11704,10 +11444,14 @@ fn json_tool_result(summary: String, data: serde_json::Value) -> murmur::tool::r
 }
 
 /// `manifest_content` is the staged manifest, read from `manifest_rel` beneath the session root.
+/// `name`, `version` and `runtime` are what the session holds for the artifact, reported as they
+/// are whatever the manifest says.
 fn read_artifact_info_from_manifest(
     manifest_content: &str,
     manifest_rel: &str,
-    fallback: &InstalledArtifactSummary,
+    name: &str,
+    version: String,
+    runtime: manage::RuntimeType,
 ) -> Result<manage::ArtifactInfo, String> {
     let value: Value = serde_norway::from_str(manifest_content)
         .map_err(|err| format!("failed to parse {manifest_rel}: {err}"))?;
@@ -11742,11 +11486,11 @@ fn read_artifact_info_from_manifest(
         .transpose()?;
 
     Ok(manage::ArtifactInfo {
-        name: fallback.name.clone(),
-        version: fallback.version.clone(),
+        name: name.to_string(),
+        version,
         description,
         tags,
-        runtime: runtime_type_to_wit(&fallback.runtime, fallback.implementation.as_ref()),
+        runtime,
         input_schema,
         output_schema,
     })
@@ -11760,18 +11504,6 @@ fn yaml_to_json_string(value: &Value) -> Result<String, String> {
         }
     }
     serde_json::to_string(value).map_err(|err| format!("failed to convert schema to JSON: {err}"))
-}
-
-fn runtime_type_to_wit(
-    runtime: &ArtifactRuntime,
-    implementation: Option<&ArtifactImplementation>,
-) -> manage::RuntimeType {
-    match (runtime, implementation) {
-        (ArtifactRuntime::Tool, Some(ArtifactImplementation::Native)) => {
-            manage::RuntimeType::Native
-        }
-        _ => manage::RuntimeType::Wasm,
-    }
 }
 
 struct ToolStoreState {
@@ -11972,7 +11704,6 @@ fn write_tool_manifest_unchecked(
         runtime_root,
         &tool_manifest_rel(name)?,
         manifest_yaml.as_bytes(),
-        None,
     )
 }
 
@@ -11991,25 +11722,22 @@ fn tool_manifest_rel(name: &str) -> Result<String, RuntimeError> {
     }
 }
 
-/// Writes one staged file under `tools/`, with no link followed: `mode` is exact when given, and
-/// `std`'s default less the umask otherwise. A link on the way is
-/// [`RuntimeError::WorkdirPathRefused`]; any other failure is [`RuntimeError::WriteToolManifest`].
+/// Writes one staged file under `tools/`, with no link followed, at `std`'s default mode less the
+/// umask. A link on the way is [`RuntimeError::WorkdirPathRefused`]; any other failure is
+/// [`RuntimeError::WriteToolManifest`].
 fn write_staged_file(
     runtime_root: &WorkdirRoot,
     rel: &str,
     bytes: &[u8],
-    mode: Option<u32>,
 ) -> Result<(), RuntimeError> {
-    match mode {
-        Some(mode) => runtime_root.write_file_exact_mode(rel, bytes, mode),
-        None => runtime_root.write_file(rel, bytes, DEFAULT_FILE_MODE),
-    }
-    .map_err(|error| {
-        RuntimeError::from_workdir(error, |_, source| RuntimeError::WriteToolManifest {
-            path: runtime_root.host_path(rel).display().to_string(),
-            source,
+    runtime_root
+        .write_file(rel, bytes, DEFAULT_FILE_MODE)
+        .map_err(|error| {
+            RuntimeError::from_workdir(error, |_, source| RuntimeError::WriteToolManifest {
+                path: runtime_root.host_path(rel).display().to_string(),
+                source,
+            })
         })
-    })
 }
 
 /// Copies the manifest file this launch read into the runtime directory under its own file name,
@@ -12061,48 +11789,6 @@ fn manifest_file_name(manifest_file: &Path) -> Option<String> {
     manifest_file
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-}
-
-/// Mode of an installed native binary: executable by everyone, writable by its owner.
-const NATIVE_BINARY_MODE: u32 = 0o755;
-
-/// Write each native tool's binary to `<runtime dir>/tools/<name>/<name>`, executable, and return
-/// what each needs to start, keyed by `name`, derived from the bytes written rather than read back.
-/// `accessible_workdir` is the capsule-writable tree the dependency walk stays out of. `name` is the tool name; a refusal names the
-/// artifact by its full name from `full_names`.
-///
-/// Every image is classified against this host before the first one is written. A batch holding
-/// one unrunnable binary installs none of them: a refusal that had already written two of three
-/// tools would leave a workdir that is neither the state before staging nor the state after it.
-fn install_native_binaries(
-    runtime_root: &WorkdirRoot,
-    accessible_workdir: &Path,
-    native_binaries: Vec<(String, Vec<u8>)>,
-    full_names: &HashMap<String, String>,
-) -> Result<HashMap<String, sandbox::NativeEntrypoint>, RuntimeError> {
-    let host_platform = current_platform();
-    for (name, bytes) in &native_binaries {
-        if let NativeBinaryVerdict::Mismatch { binary_platform } =
-            native_binary_verdict(bytes, host_platform)
-        {
-            return Err(RuntimeError::NativeBinaryPlatformMismatch {
-                name: crate::tool_names::full_name_of(full_names, name).to_string(),
-                binary_platform: binary_platform.to_string(),
-                host_platform: host_platform.to_string(),
-            });
-        }
-    }
-
-    let mut entrypoints = HashMap::new();
-    for (name, bytes) in native_binaries {
-        let rel = format!("tools/{name}/{name}");
-        write_staged_file(runtime_root, &rel, &bytes, Some(NATIVE_BINARY_MODE))?;
-        let binary_path = runtime_root.host_path(&rel);
-        let entrypoint =
-            sandbox::NativeEntrypoint::derive(&binary_path, &bytes, accessible_workdir);
-        entrypoints.insert(name, entrypoint);
-    }
-    Ok(entrypoints)
 }
 
 /// How many supporting files a skill call's result lists before it summarises the rest.
@@ -12194,12 +11880,7 @@ fn install_skill_files(
 ) -> Result<(), RuntimeError> {
     for (name, files) in skill_files {
         for (relative, bytes) in files {
-            write_staged_file(
-                runtime_root,
-                &format!("tools/{name}/{relative}"),
-                &bytes,
-                None,
-            )?;
+            write_staged_file(runtime_root, &format!("tools/{name}/{relative}"), &bytes)?;
         }
     }
     Ok(())
@@ -12282,7 +11963,6 @@ const SHARE_FILE_TOOL_MANIFEST: &str = concat!(
     "name: share-file\n",
     "version: 0.0.0\n",
     "runtime: tool\n",
-    "implementation: native\n",
     "description: \"Mint an opaque handle a named peer can use to fetch one file from this ",
     "capsule's declared peer export. `path` is relative to exports.peer_files.root; `peer` is ",
     "the peer's address. Returns a handle to put in a message to that peer — it names no ",
@@ -12298,7 +11978,6 @@ const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
     "name: fetch-peer-file\n",
     "version: 0.0.0\n",
     "runtime: tool\n",
-    "implementation: native\n",
     "description: \"Redeem a handle a peer sent and store the file it names in this capsule's ",
     "workdir. Returns the stored path, size and SHA-256 — never the file's contents. Read the ",
     "stored path if you need what is in it.\"\n",
@@ -12385,7 +12064,7 @@ fn delegate_task_tool_manifest(spawn_allow: &[String], workdir_snapshot: &[Strin
          cancelled, or that ends any other way while a sub-capsule is still running, ends that \
          sub-capsule with it."
     );
-    native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
+    runtime_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
 }
 
 /// The sentence `delegate-task`'s description gains for `capabilities.spawn.workdir_snapshot`,
@@ -12484,7 +12163,7 @@ fn write_end_without_answer_tool_manifest(
     write_runtime_provided_tool_manifest(
         runtime_root,
         END_WITHOUT_ANSWER_TOOL,
-        &native_tool_manifest_yaml(
+        &runtime_tool_manifest_yaml(
             END_WITHOUT_ANSWER_TOOL,
             END_WITHOUT_ANSWER_DESCRIPTION.to_string(),
             schema.to_string(),
@@ -12519,7 +12198,6 @@ fn member_call_tool_manifest(callees: &[&str]) -> String {
         "name: {MEMBER_CALL_TOOL}\n\
          version: 0.0.0\n\
          runtime: tool\n\
-         implementation: native\n\
          description: \"Hand one task to another member of this formation. `member` must be one \
          of the members this capsule may call. `task` is the whole of what that member is told, \
          so state it in full and include the content of any file the member needs: members do \
@@ -12593,7 +12271,7 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
         "properties": {"driver": {"type": "string", "enum": names}},
         "required": ["driver"],
     });
-    native_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
+    runtime_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
 }
 
 /// The `murmur.yaml` staged for a skill declared with `source:`, which has no package to carry
@@ -12611,13 +12289,12 @@ fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
 
 /// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
 /// description carrying a quote, a colon or a backtick cannot break it.
-fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
+fn runtime_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
     let mut manifest = serde_norway::Mapping::new();
     for (key, value) in [
         ("name", name.to_string()),
         ("version", "0.0.0".to_string()),
         ("runtime", "tool".to_string()),
-        ("implementation", "native".to_string()),
         ("description", description),
         ("input_schema", input_schema),
     ] {
@@ -12647,7 +12324,7 @@ fn write_session_status_tool_manifest(
     write_runtime_provided_tool_manifest(
         runtime_root,
         SESSION_STATUS_TOOL,
-        &native_tool_manifest_yaml(
+        &runtime_tool_manifest_yaml(
             SESSION_STATUS_TOOL,
             description,
             crate::session_status::INPUT_SCHEMA.to_string(),
@@ -12671,7 +12348,7 @@ fn write_background_command_tool_manifest(
     write_runtime_provided_tool_manifest(
         runtime_root,
         BACKGROUND_COMMAND_TOOL,
-        &native_tool_manifest_yaml(
+        &runtime_tool_manifest_yaml(
             BACKGROUND_COMMAND_TOOL,
             crate::background_command::description(),
             crate::background_command::INPUT_SCHEMA.to_string(),
@@ -12802,7 +12479,6 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "name: submit-plan\n",
     "version: 0.0.0\n",
     "runtime: tool\n",
-    "implementation: native\n",
     "description: \"Hand one plan to the runtime and get back every step's result. `plan` is an ",
     "object with an `id` and a `steps` array; each step has an `id` and exactly one of `tool`, ",
     "`shell` or `capsule`, plus optional `input`, `depends_on`, `if`, `on_error` and `retries`. ",
@@ -12838,7 +12514,6 @@ fn write_shell_tool_manifests(
             runtime_root,
             &rel,
             shell_tool_manifest_yaml(binary).as_bytes(),
-            None,
         )?;
     }
     Ok(())
@@ -12862,233 +12537,15 @@ fn with_provider_tools_required(
     }
 }
 
-/// Refuses with `E-CAP-005` a capsule whose only subprocess route is a native tool, on a host
-/// that cannot give it a network namespace.
-///
-/// A capsule declaring `shell.allow`, `spawn.allow` or `install.tool` was already asked by
-/// `stage_session`, before any registry pull; `has_native_artifact` exists only after staging, so
-/// this is the half that check cannot make. Pure, with the host answer passed in.
-fn check_native_artifact_egress_namespace(
-    policy: &CapabilityPolicy,
-    has_native_artifact: bool,
-    failure: Option<&crate::network_namespace::EgressNamespaceFailure>,
-) -> Result<(), RuntimeError> {
-    let checked_at_staging = has_subprocess_route_at_staging(policy);
-    let unconfined = policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined;
-    crate::network_namespace::check_egress_namespace(
-        has_native_artifact && !checked_at_staging && !unconfined,
-        failure,
-    )
-}
-
-/// A session's guest environment as a native process gets it: without
+/// A session's guest environment as a subprocess gets it: without
 /// [`crate::formation::FORMATION_PEERS_ENV`]. A virtual callee address works only through the
-/// runtime's own egress, so the variable would name members a native process cannot reach.
-pub(crate) fn native_env(guest_env: &[(String, String)]) -> Vec<(String, String)> {
+/// runtime's own egress, so the variable would name members a subprocess cannot reach.
+pub(crate) fn subprocess_guest_env(guest_env: &[(String, String)]) -> Vec<(String, String)> {
     guest_env
         .iter()
         .filter(|(name, _)| name != crate::formation::FORMATION_PEERS_ENV)
         .cloned()
         .collect()
-}
-
-/// Execute a native artifact binary.
-///
-/// The binary receives the serialized ToolInput JSON on stdin and must write a valid
-/// ToolResult JSON object to stdout. The binary's working directory is the capsule workdir.
-///
-/// Spawned through [`sandbox::prepare_enforcement`], the one path every shell command takes, with
-/// the capsule-wide grants as its ceiling: it joins the session's network namespace, runs under
-/// the seccomp filter with its capabilities dropped, and on the Landlock tiers inside the
-/// capsule's Landlock scope (and composed root, on `sealed`). The grants added for it are the
-/// exec closure of `entrypoint` itself and the store `settings` names — see
-/// [`sandbox::ShellEnforcement::for_native_entrypoint`].
-///
-/// `settings` is this tool's own record, from its operator entry: its config becomes
-/// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`] and its store
-/// [`crate::state_store::STATE_DIR_ENV`], each inserted after [`build_shell_env`] has removed
-/// both names, so the values reach this tool's process tree alone. An environment entry survives
-/// `execve` on every tier, into the composed root and on macOS, with no mount or rule behind it.
-/// `None` sets neither.
-///
-/// A setup failure keeps [`ShellExecError`]'s session-fatal distinction, so a `sealed` composed
-/// root that cannot be built ends the session here exactly as it does for a shell command; a
-/// store that cannot be bound into it is one such failure.
-fn dispatch_native_tool(
-    name: &str,
-    input: murmur::tool::run::ToolInput,
-    entrypoint: &sandbox::NativeEntrypoint,
-    settings: Option<&crate::types::NativeToolSettings>,
-    accessible_workdir: &Path,
-    policy: &CapabilityPolicy,
-    enforcement: &sandbox::ShellEnforcement,
-) -> Result<murmur::tool::run::ToolResult, ShellExecError> {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-    };
-
-    let input_json = serde_json::to_string(&serde_json::json!({
-        "data": input.data,
-        "log_path": input.log_path,
-    }))
-    .map_err(|e| format!("failed to serialize input for native tool '{name}': {e}"))?;
-
-    enforcement.check_workdir_budget()?;
-
-    let mut env = crate::shell::subprocess_env(policy, &[], enforcement)?;
-    let state_dir = settings.and_then(|settings| settings.state_dir.as_deref());
-    if let Some(config_json) = settings.and_then(|settings| settings.config_json.as_ref()) {
-        env.insert(
-            crate::artifact_config::ARTIFACT_CONFIG_ENV.into(),
-            config_json.clone().into(),
-        );
-    }
-    if let Some(state_dir) = state_dir {
-        env.insert(
-            crate::state_store::STATE_DIR_ENV.into(),
-            state_dir.to_string_lossy().into_owned().into(),
-        );
-    }
-
-    let mut command = Command::new(entrypoint.path());
-    command
-        .current_dir(accessible_workdir)
-        .env_clear()
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // Fail-closed, as on the shell path: a setup failure returns here and nothing is spawned.
-    let supervisor = sandbox::prepare_enforcement(
-        &mut command,
-        &enforcement.for_native_entrypoint(entrypoint, state_dir),
-        accessible_workdir,
-    )?;
-
-    // Held until the tool has exited, so a shell command overlapping it in the scope does not
-    // claim a counter delta this process could have caused.
-    let _occupancy = enforcement.cgroup_scope.as_ref().map(|scope| scope.enter());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return Err(crate::shell::enforced_spawn_failure(
-                command,
-                &supervisor,
-                "native tool",
-                format!("failed to spawn native tool '{name}': {error}"),
-            ))
-        }
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input_json.as_bytes());
-        // stdin closes when dropped, signalling EOF to the child
-    }
-
-    let output = child.wait_with_output().map_err(|e| {
-        ShellExecError::Failed(format!("native tool '{name}' failed to complete: {e}"))
-    })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if stdout.trim().is_empty() {
-        return Ok(murmur::tool::run::ToolResult {
-            status: if output.status.success() {
-                murmur::tool::run::Status::Passed
-            } else {
-                murmur::tool::run::Status::Error
-            },
-            summary: Some(format!(
-                "native tool '{}' exited with {}",
-                name, output.status
-            )),
-            data: if stderr.is_empty() {
-                None
-            } else {
-                Some(stderr.to_string())
-            },
-            data_path: None,
-            truncated: false,
-            metadata: Vec::new(),
-            attachments: Vec::new(),
-        });
-    }
-
-    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-        Ok(json) => {
-            let status = match json.get("status").and_then(|s| s.as_str()) {
-                Some("passed") => murmur::tool::run::Status::Passed,
-                Some("failed") => murmur::tool::run::Status::Failed,
-                _ => murmur::tool::run::Status::Error,
-            };
-            let summary = json
-                .get("summary")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let data = json
-                .get("data")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    json.get("data")
-                        .filter(|d| !d.is_null())
-                        .map(|d| d.to_string())
-                });
-            Ok(murmur::tool::run::ToolResult {
-                status,
-                summary,
-                data,
-                data_path: None,
-                truncated: false,
-                metadata: Vec::new(),
-                attachments: native_attachments(json.get("attachments")),
-            })
-        }
-        Err(_) => Ok(murmur::tool::run::ToolResult {
-            status: if output.status.success() {
-                murmur::tool::run::Status::Passed
-            } else {
-                murmur::tool::run::Status::Error
-            },
-            summary: Some(format!("native tool '{}' completed", name)),
-            data: Some(stdout.to_string()),
-            data_path: None,
-            truncated: false,
-            metadata: Vec::new(),
-            attachments: Vec::new(),
-        }),
-    }
-}
-
-/// The `attachments` of a native tool's stdout envelope: an array of
-/// `{"media_type": <string>, "path": <string>}` objects, in order.
-///
-/// An entry that is not an object of two strings keeps whatever string it does carry and an empty
-/// string for the rest, and a value that is not an array is one such entry; the agent loop then
-/// refuses each as `malformed` rather than dropping it unseen. An absent or `null` value is no
-/// attachments.
-fn native_attachments(value: Option<&serde_json::Value>) -> Vec<murmur::tool::run::Attachment> {
-    let entry = |value: &serde_json::Value| {
-        let field = |key: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        murmur::tool::run::Attachment {
-            media_type: field("media_type"),
-            path: field("path"),
-        }
-    };
-    match value {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(entries)) => entries.iter().map(entry).collect(),
-        Some(other) => vec![entry(other)],
-    }
 }
 
 /// The `murmur:*` instance names `component` exports and imports, read from its compiled type
@@ -13105,30 +12562,6 @@ fn murmur_contracts(engine: &Engine, component: &Component) -> murmur_artifact::
             .imports(engine)
             .filter_map(|(name, _)| murmur(name))
             .collect(),
-    }
-}
-
-/// The dispatch outcome of one [`dispatch_native_tool`] call. A failure becomes an error tool
-/// result carrying its text, the same text in `runtime_error`, and `fatal` set when it ends the
-/// session, the way [`dispatch_shell_tool`] reports a failed shell command.
-fn native_tool_outcome(
-    result: Result<murmur::tool::run::ToolResult, ShellExecError>,
-) -> DispatchOutcome {
-    match result {
-        Ok(result) => DispatchOutcome::tool(result),
-        Err(error) => DispatchOutcome {
-            fatal: error.session_fatal(),
-            runtime_error: Some(error.to_string()),
-            ..DispatchOutcome::tool(murmur::tool::run::ToolResult {
-                status: murmur::tool::run::Status::Error,
-                summary: Some("native tool execution failed".to_string()),
-                data: Some(error.to_string()),
-                data_path: None,
-                truncated: false,
-                metadata: Vec::new(),
-                attachments: Vec::new(),
-            })
-        },
     }
 }
 
@@ -13611,23 +13044,6 @@ fn validate_capability_policy(policy: &CapabilityPolicy) -> Result<(), RuntimeEr
     }
 
     Ok(())
-}
-
-fn enforce_allowlist<T, F>(
-    allowlisted_tools: &HashSet<String>,
-    name: &str,
-    dispatch: F,
-) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String>,
-{
-    if !allowlisted_tools.contains(name) {
-        return Err(format!(
-            "tool '{name}' is not declared in manifest allowlist"
-        ));
-    }
-
-    dispatch()
 }
 
 /// What ended the task loop's bounded wait: a task arriving (or its channel closing) or a report
@@ -14444,7 +13860,7 @@ mod tests {
             serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("delegate-task"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
-        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+        assert!(parsed.get("implementation").is_none());
 
         let schema: serde_json::Value =
             serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
@@ -14724,7 +14140,7 @@ mod tests {
         assert_eq!(parsed["name"].as_str(), Some("submit-plan"));
         assert_eq!(parsed["version"].as_str(), Some("0.0.0"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
-        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+        assert!(parsed.get("implementation").is_none());
 
         let schema: serde_json::Value =
             serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
@@ -14820,7 +14236,7 @@ mod tests {
                 .expect("the manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("switch-driver"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
-        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+        assert!(parsed.get("implementation").is_none());
         let schema: serde_json::Value =
             serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
                 .expect("the schema is JSON");
@@ -15391,7 +14807,7 @@ mod tests {
                 serde_norway::from_str(&fs::read_to_string(manifest_path(agent.path())).unwrap())
                     .unwrap();
             assert_eq!(manifest["name"].as_str(), Some(BACKGROUND_COMMAND_TOOL));
-            assert_eq!(manifest["implementation"].as_str(), Some("native"));
+            assert!(manifest.get("implementation").is_none());
             assert_eq!(
                 manifest["description"].as_str(),
                 Some(crate::background_command::description().as_str())
@@ -15501,7 +14917,7 @@ mod tests {
             assert_eq!(manifest["name"].as_str(), Some(SESSION_STATUS_TOOL));
             assert_eq!(manifest["version"].as_str(), Some("0.0.0"));
             assert_eq!(manifest["runtime"].as_str(), Some("tool"));
-            assert_eq!(manifest["implementation"].as_str(), Some("native"));
+            assert!(manifest.get("implementation").is_none());
             assert_eq!(manifest["description"].as_str(), Some(description.as_str()));
             assert_eq!(
                 manifest["input_schema"].as_str(),
@@ -16638,30 +16054,6 @@ inference:
         );
     }
 
-    #[test]
-    fn allowlist_blocks_unlisted_before_dispatch() {
-        let allowlist = HashSet::from(["echo-tool".to_string()]);
-        let mut dispatched = false;
-
-        let result = enforce_allowlist(&allowlist, "missing-tool", || {
-            dispatched = true;
-            Ok::<_, String>(())
-        });
-
-        assert!(!dispatched);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("not declared in manifest allowlist"));
-    }
-
-    #[test]
-    fn allowlist_dispatches_listed_tool() {
-        let allowlist = HashSet::from(["echo-tool".to_string()]);
-        let result = enforce_allowlist(&allowlist, "echo-tool", || Ok::<_, String>("ok")).unwrap();
-        assert_eq!(result, "ok");
-    }
-
     /// Builds a component that exports a single empty instance under `iface`.
     /// `resolve_versioned_iface` only looks up the export index by instance
     /// name — it never inspects the instance's contents — so an empty instance
@@ -16754,7 +16146,6 @@ inference:
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -16763,7 +16154,6 @@ inference:
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: "definitely-wrong".to_string(),
-                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -16859,7 +16249,6 @@ inference:
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -16868,7 +16257,6 @@ inference:
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: murmur_artifact::sha256_hex(b"not-a-real-zip"),
-                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -17499,7 +16887,8 @@ inference:
     }
 
     /// Each manifest subprocess route alone starts one background resolution of the delegated
-    /// cgroup base per staging, and a capsule with none starts no thread.
+    /// cgroup base per staging, and a capsule with none, `install.tool` alone included, starts no
+    /// thread.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "run by staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route under a scratch HOME"]
@@ -17540,7 +16929,7 @@ inference:
                     install_tool: vec!["local/tool-*".to_string()],
                     ..CapabilityPolicy::default()
                 },
-                1,
+                0,
             ),
             ("no route", CapabilityPolicy::default(), 0),
         ];
@@ -17983,7 +17372,6 @@ inference:
                         version: "1.0.0".to_string(),
                         runtime: RuntimeType::Static,
                         artifact_runtime: "skill".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -18325,7 +17713,6 @@ inference:
                     version: "1.0.0".to_string(),
                     runtime: RuntimeType::Static,
                     artifact_runtime: "skill".to_string(),
-                    platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,
@@ -18572,7 +17959,6 @@ inference:
                 version: "0.1.0".to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "wasm".to_string(),
-                platforms: vec![],
                 description: None,
                 tags: vec![],
                 wit_contracts: None,
@@ -18581,7 +17967,6 @@ inference:
             },
             sha256: murmur_artifact::sha256_hex(&bytes),
             bytes: bytes.into(),
-            platform_match: murmur_artifact::PlatformMatch::NotApplicable,
         }
     }
 
@@ -18765,8 +18150,6 @@ inference:
             accessible_root: root,
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
-            native_entrypoints: HashMap::new(),
-            native_tool_settings: HashMap::new(),
             process_driver: None,
             artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
@@ -18947,11 +18330,10 @@ inference:
                     version: version.to_string(),
                     runtime: self.runtime,
                     artifact_runtime: match self.runtime {
-                        RuntimeType::Wasm | RuntimeType::Native => "tool",
+                        RuntimeType::Wasm => "tool",
                         _ => "skill",
                     }
                     .to_string(),
-                    platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,
@@ -18960,7 +18342,6 @@ inference:
                 },
                 bytes: self.bytes.clone().into(),
                 sha256: self.sha256.clone(),
-                platform_match: murmur_artifact::PlatformMatch::NotApplicable,
             })
         }
 
@@ -19020,7 +18401,7 @@ inference:
             .artifact_for("local/my-skill")
             .expect("lock entry for local/my-skill");
         assert_eq!(entry.resolved_version, "1.0.0");
-        assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
+        assert_eq!(entry.sha256.any.as_str(), expected_sha256);
     }
 
     /// A workdir with `zzz-existing-tool` installed at launch, and a store whose registry
@@ -20123,7 +19504,6 @@ inference:
                         version: version.to_string(),
                         runtime: RuntimeType::Static,
                         artifact_runtime: "skill".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -20132,7 +19512,6 @@ inference:
                     },
                     bytes: b"tampered-bytes".to_vec().into(),
                     sha256: "not-the-real-hash".to_string(),
-                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -20232,10 +19611,7 @@ inference:
         let lock = read_lockfile(&lock_path).unwrap();
         let entry = lock.artifact_for("local/my-skill").unwrap();
         assert_eq!(entry.resolved_version, "1.0.0");
-        assert_eq!(
-            entry.sha256.any.as_deref().unwrap(),
-            "pinned-hash-from-earlier-pull"
-        );
+        assert_eq!(entry.sha256.any.as_str(), "pinned-hash-from-earlier-pull");
     }
 
     /// A static skill `.mur.zip` for full name `name` at 1.0.0, and the registry serving it.
@@ -20419,7 +19795,6 @@ inference:
                 .sha256
                 .any
                 .clone()
-                .unwrap()
         }
     }
 
@@ -20964,36 +20339,11 @@ inference:
         assert_eq!(fs::read(&pinned.lock_path).unwrap(), lock_before);
     }
 
-    /// `binary` as the runtime records a native tool it installed in `workdir`.
-    fn installed_native_tool(binary: &Path, workdir: &Path) -> sandbox::NativeEntrypoint {
-        sandbox::NativeEntrypoint::derive(binary, &fs::read(binary).unwrap(), workdir)
-    }
-
-    /// Writes an executable shell script native-tool fixture that echoes the given env
-    /// var names (space-separated `NAME=value`, empty string for an unset var) into the
-    /// `data` field of a passing ToolResult JSON payload on stdout.
-    fn write_env_echo_native_tool(dir: &Path, name: &str, env_vars: &[&str]) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let script_path = dir.join(name);
-        let echoes: String = env_vars
-            .iter()
-            .map(|var| format!(r#"echo -n "{var}=${{{var}-<unset>}} ""#))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let script = format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf '{{\"status\":\"passed\",\"data\":\"'\n{echoes}\nprintf '\"}}'\n"
-        );
-        fs::write(&script_path, script).unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
-        script_path
-    }
-
     /// A member's session hands its callees, at their virtual addresses, to every WASM guest and
-    /// to no native process — not the shell tool, not a native tool — and no
-    /// `capabilities.env.allow` or `shell.baseline_env` entry naming the variable supplies it.
+    /// to no subprocess, and no `capabilities.env.allow` or `shell.baseline_env` entry naming the
+    /// variable supplies it.
     #[test]
-    fn formation_peers_reach_every_guest_and_no_native_process() {
+    fn formation_peers_reach_every_guest_and_no_subprocess() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -21022,8 +20372,10 @@ inference:
                 .iter()
                 .all(|(key, _)| key != name)
         );
-        assert!(native_env(&agent).iter().all(|(key, _)| key != name));
-        assert!(native_env(&agent)
+        assert!(subprocess_guest_env(&agent)
+            .iter()
+            .all(|(key, _)| key != name));
+        assert!(subprocess_guest_env(&agent)
             .iter()
             .any(|(key, _)| key == "MURMUR_INFERENCE_MODEL"));
 
@@ -21034,38 +20386,22 @@ inference:
             ..CapabilityPolicy::default()
         };
         // Neither a WASI guest's declared environment nor a shell baseline resolves the name from
-        // the host, and the shell tool and a native tool are not handed the session's value.
+        // the host, and the shell tool is not handed the session's value.
         let declared = build_declared_env(&declaring);
         let tmp = TempDir::new().unwrap();
         let shell = crate::shell::build_shell_env(
             &declaring,
-            &native_env(&agent),
+            &subprocess_guest_env(&agent),
             Some(tmp.path()),
             None,
             None,
             None,
         )
         .unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
-        let native = dispatch_native_tool(
-            "echo-peers",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &declaring,
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        );
         std::env::remove_var(name);
 
         assert!(!declared.contains_key(name), "{declared:?}");
         assert!(!shell.contains_key(name), "{shell:?}");
-        let data = native.unwrap().data.unwrap_or_default();
-        assert!(!data.contains("formation.invalid"), "{data}");
-        assert!(!data.contains("decoy"), "{data}");
     }
 
     /// A plan `shell` step and the equivalent direct shell tool call are shown the decision
@@ -21938,83 +21274,7 @@ inference:
         );
     }
 
-    /// The native-tool half of the composed-root failure path: a native tool goes through the
-    /// same `prepare_enforcement`, so a `sealed` root that cannot be built for it ends the session
-    /// (`E-RUN-014`) exactly as it does for a shell command. Any other setup failure is a tool
-    /// error naming the step that failed, not the bare errno `spawn()` collapses it to.
-    ///
-    /// Drives [`native_tool_outcome`] over [`dispatch_native_tool`], which is what the native
-    /// branch of `dispatch_agent_tool_unfenced` runs, so the `DispatchOutcome` mapping is covered.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_native_tool_composed_root_failure_is_session_fatal() {
-        if crate::network_namespace::skip_without_egress_namespace(
-            "a_native_tool_composed_root_failure_is_session_fatal",
-        ) {
-            return;
-        }
-        let tmp = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
-        let dispatch = |enforcement: &sandbox::ShellEnforcement| {
-            native_tool_outcome(dispatch_native_tool(
-                "echo-home",
-                murmur::tool::run::ToolInput {
-                    data: None,
-                    log_path: None,
-                },
-                &installed_native_tool(&binary, tmp.path()),
-                None,
-                tmp.path(),
-                &CapabilityPolicy::default(),
-                enforcement,
-            ))
-        };
-
-        let sealed = {
-            let _guard = sandbox::ForceSealedRootFailureGuard::new();
-            dispatch(&sandbox::sealed_test_enforcement())
-        };
-        assert!(
-            matches!(sealed.result.status, murmur::tool::run::Status::Error),
-            "the failed call must still read as a failed call"
-        );
-        let data = sealed.result.data.as_deref().unwrap_or_default();
-        assert!(
-            data.contains("composed root"),
-            "the tool result must still say what happened: {data}"
-        );
-        let fatal = sealed
-            .fatal
-            .expect("a composed-root failure must be carried out as session-fatal");
-        assert!(
-            matches!(fatal, RuntimeError::SealedRootConstructionFailed { .. }),
-            "must be the variant murmur-cli maps to E-RUN-014: {fatal}"
-        );
-
-        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(true));
-        let landlock = dispatch(&sandbox::ShellEnforcement {
-            tier: sandbox::EnforcementTier::KernelFull,
-            ..sandbox::ShellEnforcement::environment_only().with_test_session_dirs()
-        });
-        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(false));
-        assert!(
-            landlock.fatal.is_none(),
-            "a Landlock setup failure ends the tool call, not the session: {:?}",
-            landlock.fatal
-        );
-        let data = landlock.result.data.as_deref().unwrap_or_default();
-        assert!(
-            data.contains("native tool enforcement setup failed before exec")
-                && data.contains("landlock"),
-            "the tool result must name the failed step: {data}"
-        );
-        assert!(
-            !data.contains("os error 22"),
-            "the bare errno must not stand in for the step: {data}"
-        );
-    }
-
-    /// A native tool or shell command the runtime could not start carries the runtime's own text
+    /// A shell command the runtime could not start carries the runtime's own text
     /// out as `runtime_error`, the same text the tool result's `data` holds before the fence, so
     /// the `tool_call` trace record has it under every capture mode.
     #[cfg(target_os = "linux")]
@@ -22026,7 +21286,6 @@ inference:
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
         let workdir = crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap();
         let kernel_full = sandbox::ShellEnforcement {
             tier: sandbox::EnforcementTier::KernelFull,
@@ -22037,64 +21296,41 @@ inference:
             ..CapabilityPolicy::default()
         };
 
+        let dispatch = |enforcement: &sandbox::ShellEnforcement| {
+            dispatch_shell_tool(
+                "bash",
+                murmur::tool::run::ToolInput {
+                    data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                    log_path: None,
+                },
+                &workdir,
+                &[],
+                &policy,
+                enforcement,
+                None,
+            )
+        };
         sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(true));
-        let native = native_tool_outcome(dispatch_native_tool(
-            "echo-home",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &CapabilityPolicy::default(),
-            &kernel_full,
-        ));
-        let shell = dispatch_shell_tool(
-            "bash",
-            murmur::tool::run::ToolInput {
-                data: Some(r#"{"command":"echo hi"}"#.to_string()),
-                log_path: None,
-            },
-            &workdir,
-            &[],
-            &policy,
-            &kernel_full,
-            None,
-        );
+        let shell = dispatch(&kernel_full);
         sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(false));
 
-        for (what, outcome) in [("native tool", &native), ("shell", &shell)] {
-            let error = outcome
-                .runtime_error
-                .as_deref()
-                .unwrap_or_else(|| panic!("{what}: a failed start must carry runtime_error"));
-            assert!(
-                error.contains("enforcement setup failed before exec")
-                    && error.contains("landlock"),
-                "{what}: runtime_error must name the failed step: {error}"
-            );
-            assert_eq!(
-                outcome.result.data.as_deref(),
-                Some(error),
-                "{what}: runtime_error is the tool result's own text"
-            );
-        }
+        let error = shell
+            .runtime_error
+            .as_deref()
+            .expect("a failed start must carry runtime_error");
+        assert!(
+            error.contains("enforcement setup failed before exec") && error.contains("landlock"),
+            "runtime_error must name the failed step: {error}"
+        );
+        assert_eq!(
+            shell.result.data.as_deref(),
+            Some(error),
+            "runtime_error is the tool result's own text"
+        );
 
         let sealed = {
             let _guard = sandbox::ForceSealedRootFailureGuard::new();
-            native_tool_outcome(dispatch_native_tool(
-                "echo-home",
-                murmur::tool::run::ToolInput {
-                    data: None,
-                    log_path: None,
-                },
-                &installed_native_tool(&binary, tmp.path()),
-                None,
-                tmp.path(),
-                &CapabilityPolicy::default(),
-                &sandbox::sealed_test_enforcement(),
-            ))
+            dispatch(&sandbox::sealed_test_enforcement())
         };
         let error = sealed
             .runtime_error
@@ -22104,35 +21340,12 @@ inference:
         assert_eq!(sealed.result.data.as_deref(), Some(error));
     }
 
-    /// A native tool or shell command that ran and failed on its own leaves `runtime_error`
-    /// unset: the failure is the tool's, and its text is the tool's output.
+    /// A shell command that ran and failed on its own leaves `runtime_error` unset: the failure
+    /// is the command's, and its text is the command's output.
     #[test]
     fn a_tool_that_ran_and_failed_has_no_runtime_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
-        let binary = tmp.path().join("exits-three");
-        fs::write(&binary, "#!/bin/sh\ncat >/dev/null\necho broken\nexit 3\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let workdir = crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap();
-
-        let native = native_tool_outcome(dispatch_native_tool(
-            "exits-three",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &CapabilityPolicy::default(),
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        ));
-        assert!(
-            !matches!(native.result.status, murmur::tool::run::Status::Passed),
-            "the tool's own failure still reads as a failed call"
-        );
-        assert_eq!(native.runtime_error, None);
 
         let shell = dispatch_shell_tool(
             "bash",
@@ -22164,34 +21377,11 @@ inference:
         }
     }
 
-    /// `launch`'s half of `E-CAP-005`: a capsule whose only subprocess route is a native tool is
-    /// refused on a host that cannot give it a network namespace. A capsule with `shell.allow` is
-    /// not asked again here, because `stage_session` already asked it.
+    /// `install.tool` installs a WASM component, which starts a program only through
+    /// `murmur:process` and so only one `shell.allow` names: it is no subprocess route, and neither
+    /// is `install.skill`. A capsule holding either alone is not asked for a network namespace.
     #[test]
-    fn a_native_only_capsule_needs_an_egress_namespace() {
-        let failure = kernel_support_missing();
-        let failed = Some(&failure);
-        let native_only = CapabilityPolicy::default();
-
-        assert!(matches!(
-            check_native_artifact_egress_namespace(&native_only, true, failed),
-            Err(RuntimeError::EgressNamespaceUnavailable { .. })
-        ));
-        assert!(check_native_artifact_egress_namespace(&native_only, false, failed).is_ok());
-        assert!(check_native_artifact_egress_namespace(&native_only, true, None).is_ok());
-
-        let with_shell = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string()],
-            ..CapabilityPolicy::default()
-        };
-        assert!(check_native_artifact_egress_namespace(&with_shell, true, failed).is_ok());
-    }
-
-    /// `install.tool` can match a native tool a pull installs, so it is a subprocess route at
-    /// staging; `install.skill` installs nothing that runs. A capsule refused at staging for its
-    /// install grant is not refused a second time after it.
-    #[test]
-    fn native_artifact_egress_counts_install_tool_at_staging_and_not_twice() {
+    fn install_grants_alone_need_no_egress_namespace() {
         let failure = kernel_support_missing();
         let failed = Some(&failure);
         let tool_grant = CapabilityPolicy {
@@ -22202,35 +21392,34 @@ inference:
             install_skill: vec!["local/skill-*".to_string()],
             ..CapabilityPolicy::default()
         };
+        let with_shell = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..tool_grant.clone()
+        };
 
-        assert!(has_subprocess_route_at_staging(&tool_grant));
-        assert!(!has_subprocess_route_at_staging(&skill_grant));
+        for policy in [&tool_grant, &skill_grant] {
+            assert!(!has_subprocess_route_at_staging(policy), "{policy:?}");
+            assert!(crate::network_namespace::check_egress_namespace(
+                has_subprocess_route_at_staging(policy),
+                failed
+            )
+            .is_ok());
+        }
         assert!(matches!(
             crate::network_namespace::check_egress_namespace(
-                has_subprocess_route_at_staging(&tool_grant),
+                has_subprocess_route_at_staging(&with_shell),
                 failed
             ),
             Err(RuntimeError::EgressNamespaceUnavailable { .. })
         ));
-        assert!(crate::network_namespace::check_egress_namespace(
-            has_subprocess_route_at_staging(&skill_grant),
-            failed
-        )
-        .is_ok());
-        // Already refused at staging, so `launch` does not ask again.
-        assert!(check_native_artifact_egress_namespace(&tool_grant, true, failed).is_ok());
-        assert!(matches!(
-            check_native_artifact_egress_namespace(&skill_grant, true, failed),
-            Err(RuntimeError::EgressNamespaceUnavailable { .. })
-        ));
     }
 
-    /// A capsule whose only native route is a tool it may pull is bounded like one declaring a
-    /// native tool: on a Linux host that cannot delegate a scope, both are refused with the error
-    /// `E-RUN-012` reports, and a capsule with no route is launched with no scope.
+    /// A capsule whose only grant is `install.tool`, with an empty `shell.allow`, has no route to
+    /// a subprocess and launches with no scope even on a Linux host that cannot delegate one; a
+    /// non-empty `shell.allow` on that host is refused with the error `E-RUN-012` reports.
     #[cfg(target_os = "linux")]
     #[test]
-    fn install_tool_alone_needs_a_cgroup_scope() {
+    fn install_tool_alone_needs_no_cgroup_scope() {
         struct ClearOnDrop;
         impl Drop for ClearOnDrop {
             fn drop(&mut self) {
@@ -22246,23 +21435,24 @@ inference:
             install_skill: vec!["local/skill-*".to_string()],
             ..CapabilityPolicy::default()
         };
+        let with_shell = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..tool_grant.clone()
+        };
         let bare = CapabilityPolicy::default();
 
         cgroup::FORCE_DELEGATION_FAILURE.with(|flag| flag.set(true));
         let _clear = ClearOnDrop;
-        let launch = |policy: &CapabilityPolicy, has_native_artifact| {
-            prepare_launch_scope(policy, has_native_artifact, "ses_test", temp.path())
-        };
-        for (policy, has_native_artifact) in [(&tool_grant, false), (&bare, true)] {
-            match launch(policy, has_native_artifact) {
-                Err(RuntimeError::CgroupDelegationUnavailable { reason }) => {
-                    assert!(reason.starts_with("forced:"), "{reason}");
-                }
-                other => panic!("{policy:?} / native {has_native_artifact}: {other:?}"),
+        let launch =
+            |policy: &CapabilityPolicy| prepare_launch_scope(policy, "ses_test", temp.path());
+        match launch(&with_shell) {
+            Err(RuntimeError::CgroupDelegationUnavailable { reason }) => {
+                assert!(reason.starts_with("forced:"), "{reason}");
             }
+            other => panic!("{with_shell:?}: {other:?}"),
         }
-        for policy in [&skill_grant, &bare] {
-            let prepared = launch(policy, false).expect("no route needs no scope");
+        for policy in [&tool_grant, &skill_grant, &bare] {
+            let prepared = launch(policy).expect("no route needs no scope");
             assert!(prepared.scope.is_none(), "{policy:?}");
         }
     }
@@ -22636,23 +21826,12 @@ inference:
         assert_eq!(shell_event["command"], "echo hi");
     }
 
-    /// A native tool's wait runs on the blocking pool. On the calling task it would stall every
+    /// A shell command's wait runs on the blocking pool. On the calling task it would stall every
     /// other future that task polls — on process transport, every other bridged call, the
     /// decision point and the harness's output.
     #[test]
-    fn a_native_tool_does_not_block_the_task_dispatching_it() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn a_shell_command_does_not_block_the_task_dispatching_it() {
         let tmp = TempDir::new().unwrap();
-        let native_dir = tmp.path().join("tools").join("slow-native");
-        fs::create_dir_all(&native_dir).unwrap();
-        let native_bin = native_dir.join("slow-native");
-        fs::write(
-            &native_bin,
-            "#!/bin/sh\nsleep 3\necho '{\"status\":\"passed\",\"data\":\"slow-done\"}'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&native_bin, fs::Permissions::from_mode(0o755)).unwrap();
         let skill_dir = tmp.path().join("tools").join("quick-skill");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("skill.md"), "# quick\n").unwrap();
@@ -22662,35 +21841,32 @@ inference:
             tmp.path().to_path_buf(),
             tmp.path().join("murmur.lock"),
         );
-        state.allowlisted_tools.insert("slow-native".to_string());
-        state.native_entrypoints.insert(
-            "slow-native".to_string(),
-            installed_native_tool(&native_bin, tmp.path()),
-        );
+        state.allowlisted_tools.insert("bash".to_string());
+        state.capability_policy.shell_allow = vec!["bash".to_string()];
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let (native, skill_elapsed, native_running) = runtime.block_on(async {
-            let native_done = AtomicBool::new(false);
-            let native = async {
+        let (shell, skill_elapsed, shell_running) = runtime.block_on(async {
+            let shell_done = AtomicBool::new(false);
+            let shell = async {
                 let outcome = state
                     .dispatch_agent_tool_async(
-                        "slow-native",
+                        "bash",
                         murmur::tool::run::ToolInput {
-                            data: None,
+                            data: Some(r#"{"command":"sleep 3; echo slow-$((2+3))"}"#.to_string()),
                             log_path: None,
                         },
                         None,
                         None,
                     )
                     .await;
-                native_done.store(true, Ordering::SeqCst);
+                shell_done.store(true, Ordering::SeqCst);
                 outcome
             };
             let skill = async {
-                // Let the native dispatch start first, so it is the one already running.
+                // Let the shell dispatch start first, so it is the one already running.
                 tokio::task::yield_now().await;
                 let started = std::time::Instant::now();
                 let outcome = state
@@ -22705,273 +21881,27 @@ inference:
                     )
                     .await;
                 assert!(outcome.is_ok(), "the skill dispatches: {:?}", outcome.err());
-                (started.elapsed(), !native_done.load(Ordering::SeqCst))
+                (started.elapsed(), !shell_done.load(Ordering::SeqCst))
             };
-            let (native, (skill_elapsed, native_running)) = tokio::join!(native, skill);
-            (native, skill_elapsed, native_running)
+            let (shell, (skill_elapsed, shell_running)) = tokio::join!(shell, skill);
+            (shell, skill_elapsed, shell_running)
         });
 
         assert!(
             skill_elapsed < std::time::Duration::from_secs(1),
-            "the skill waited {skill_elapsed:?} behind the native tool"
+            "the skill waited {skill_elapsed:?} behind the shell command"
         );
         assert!(
-            native_running,
-            "the skill finished while the native tool still ran"
+            shell_running,
+            "the skill finished while the shell command still ran"
         );
-        let Ok(native) = native else {
-            panic!("the native tool dispatches: {:?}", native.err());
+        let Ok(shell) = shell else {
+            panic!("the shell command dispatches: {:?}", shell.err());
         };
-        let data = native.result.data.unwrap_or_default();
+        let data = shell.result.data.unwrap_or_default();
         assert!(
-            data.contains("slow-done"),
-            "the native tool's own result: {data}"
-        );
-    }
-
-    /// A native tool's `$HOME` is the session's home folder, as a shell command's is, and the
-    /// work folder gains nothing for it.
-    #[test]
-    fn home_folder_is_a_native_tools_home() {
-        let tmp = TempDir::new().unwrap();
-        let workdir = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
-        let policy = CapabilityPolicy::default();
-        let enforcement = sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
-
-        let result = dispatch_native_tool(
-            "echo-home",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            workdir.path(),
-            &policy,
-            &enforcement,
-        )
-        .unwrap();
-
-        let expected_home = enforcement.home_dir_path().unwrap();
-        let data = result.data.unwrap_or_default();
-        assert!(
-            data.contains(&format!("HOME={}", expected_home.display())),
-            "expected the home folder as HOME in native tool output, got: {data}"
-        );
-        assert_eq!(fs::read_dir(workdir.path()).unwrap().count(), 0);
-    }
-
-    /// A native tool whose enforcement holds no home folder is refused before it is spawned, with
-    /// an error naming the missing home folder, and nothing is created in the work folder or
-    /// beside it.
-    #[test]
-    fn no_home_folder_refuses_a_native_tool() {
-        let tmp = TempDir::new().unwrap();
-        let parent = TempDir::new().unwrap();
-        let workdir = parent.path().join("work");
-        fs::create_dir(&workdir).unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
-
-        let error = dispatch_native_tool(
-            "echo-home",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            &workdir,
-            &CapabilityPolicy::default(),
-            &sandbox::ShellEnforcement::environment_only(),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("no home folder"), "{error}");
-        assert_eq!(fs::read_dir(&workdir).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
-    }
-
-    /// A native tool's own settings reach it as `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR`,
-    /// and a tool with none gets neither, though the host and `shell.baseline_env` name both.
-    #[test]
-    fn dispatch_native_tool_hands_its_settings_and_no_host_value() {
-        let tmp = TempDir::new().unwrap();
-        let names = [
-            crate::artifact_config::ARTIFACT_CONFIG_ENV,
-            crate::state_store::STATE_DIR_ENV,
-        ];
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-settings", &names);
-        let policy = CapabilityPolicy {
-            shell_baseline_env: names.iter().map(|name| name.to_string()).collect(),
-            ..CapabilityPolicy::default()
-        };
-        let store = tmp.path().join("state").join("config-capsule");
-        let settings = crate::types::NativeToolSettings {
-            config_json: Some(r#"{"who":"manifest"}"#.to_string()),
-            state_dir: Some(store.clone()),
-        };
-        let enforcement = sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
-        let dispatch = |settings: Option<&crate::types::NativeToolSettings>| {
-            dispatch_native_tool(
-                "echo-settings",
-                murmur::tool::run::ToolInput {
-                    data: None,
-                    log_path: None,
-                },
-                &installed_native_tool(&binary, tmp.path()),
-                settings,
-                tmp.path(),
-                &policy,
-                &enforcement,
-            )
-            .unwrap()
-            .data
-            .unwrap_or_default()
-        };
-
-        for name in names {
-            std::env::set_var(name, "host-value");
-        }
-        let with = dispatch(Some(&settings));
-        let without = dispatch(None);
-        for name in names {
-            std::env::remove_var(name);
-        }
-
-        assert!(
-            with.contains(r#"MURMUR_ARTIFACT_CONFIG={"who":"manifest"} "#),
-            "{with}"
-        );
-        assert!(
-            with.contains(&format!("MURMUR_STATE_DIR={} ", store.display())),
-            "{with}"
-        );
-        assert!(
-            without.contains("MURMUR_ARTIFACT_CONFIG=<unset> "),
-            "{without}"
-        );
-        assert!(without.contains("MURMUR_STATE_DIR=<unset> "), "{without}");
-        assert!(!with.contains("host-value") && !without.contains("host-value"));
-    }
-
-    #[test]
-    fn dispatch_native_tool_strips_credential_shaped_var() {
-        let tmp = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-token", &["GITHUB_TOKEN"]);
-        let policy = CapabilityPolicy::default();
-
-        std::env::set_var("GITHUB_TOKEN", "leaked-token");
-        let result = dispatch_native_tool(
-            "echo-token",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &policy,
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        )
-        .unwrap();
-        std::env::remove_var("GITHUB_TOKEN");
-
-        let data = result.data.unwrap_or_default();
-        assert!(
-            !data.contains("leaked-token"),
-            "GITHUB_TOKEN must not reach a native tool subprocess, got: {data}"
-        );
-    }
-
-    #[test]
-    fn dispatch_native_tool_strips_wildcard_credential_pattern() {
-        let tmp = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-stripe", &["STRIPE_API_KEY"]);
-        let policy = CapabilityPolicy::default();
-
-        std::env::set_var("STRIPE_API_KEY", "leaked-key");
-        let result = dispatch_native_tool(
-            "echo-stripe",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &policy,
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        )
-        .unwrap();
-        std::env::remove_var("STRIPE_API_KEY");
-
-        let data = result.data.unwrap_or_default();
-        assert!(
-            !data.contains("leaked-key"),
-            "*_API_KEY wildcard pattern must strip STRIPE_API_KEY from native tool subprocess, got: {data}"
-        );
-    }
-
-    #[test]
-    fn dispatch_native_tool_keeps_safe_baseline_var() {
-        let tmp = TempDir::new().unwrap();
-        let binary = write_env_echo_native_tool(tmp.path(), "echo-cargo-home", &["CARGO_HOME"]);
-        let policy = CapabilityPolicy::default();
-
-        std::env::set_var("CARGO_HOME", "/fake/cargo/home");
-        let result = dispatch_native_tool(
-            "echo-cargo-home",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &policy,
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        )
-        .unwrap();
-        std::env::remove_var("CARGO_HOME");
-
-        let data = result.data.unwrap_or_default();
-        assert!(
-            data.contains("CARGO_HOME=/fake/cargo/home"),
-            "safe baseline var CARGO_HOME must pass through to native tool subprocess, got: {data}"
-        );
-    }
-
-    #[test]
-    fn dispatch_native_tool_composes_policy_strip_env() {
-        let tmp = TempDir::new().unwrap();
-        let binary =
-            write_env_echo_native_tool(tmp.path(), "echo-mycompany", &["MYCOMPANY_SECRET"]);
-        let policy = CapabilityPolicy {
-            shell_strip_env: vec!["MYCOMPANY_*".to_string()],
-            ..CapabilityPolicy::default()
-        };
-
-        std::env::set_var("MYCOMPANY_SECRET", "leaked-secret");
-        let result = dispatch_native_tool(
-            "echo-mycompany",
-            murmur::tool::run::ToolInput {
-                data: None,
-                log_path: None,
-            },
-            &installed_native_tool(&binary, tmp.path()),
-            None,
-            tmp.path(),
-            &policy,
-            &sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        )
-        .unwrap();
-        std::env::remove_var("MYCOMPANY_SECRET");
-
-        let data = result.data.unwrap_or_default();
-        assert!(
-            !data.contains("leaked-secret"),
-            "policy.shell_strip_env pattern must compose for native tool subprocess, got: {data}"
+            data.contains("slow-5"),
+            "the shell command's own result: {data}"
         );
     }
 
@@ -26630,7 +25560,7 @@ inference:
     #[test]
     fn check_required_fields_checks_every_tool_runtime_spelling_and_a_yaml_mapping_schema() {
         let (_dir, state) = required_fields_state();
-        for runtime in ["tool", "wasm", "native"] {
+        for runtime in ["tool", "wasm"] {
             let name = format!("t-{runtime}");
             stage_tool_manifest(
                 &state,
@@ -27620,42 +26550,6 @@ inference:
         }
     }
 
-    /// A native tool's binary installed onto a link is refused the same way.
-    #[test]
-    fn workdir_path_refused_tools_pull_of_a_native_tool() {
-        let binary = fs::read("/bin/true").expect("a host binary to install");
-        let artifact = zip_with_files(&[
-            (
-                PACKED_MANIFEST_ENTRY,
-                b"name: native-tool\nversion: 1.0.0\nruntime: native\n",
-            ),
-            ("bin/native-tool", &binary),
-        ]);
-        let planted = Planted::new();
-        planted.link(&planted.sentinel, "tools/native-tool/native-tool");
-        let lock_path = planted.dir.path().join("murmur.lock");
-        let mut state = build_test_state(
-            Arc::new(FakeSkillRegistry {
-                runtime: RuntimeType::Native,
-                ..FakeSkillRegistry::new(artifact)
-            }),
-            planted.workdir.clone(),
-            lock_path.clone(),
-        );
-        grant_install(&mut state, &[], &["local/native-tool"]);
-
-        let error = manage::Host::pull(&mut state, "local/native-tool".into(), "1.0.0".into())
-            .expect_err("the pull is refused");
-
-        assert!(error.contains("tools/native-tool/native-tool"), "{error}");
-        planted.assert_outside_unchanged();
-        assert_eq!(
-            only_refusal(&state).refused_at,
-            "tools/native-tool/native-tool"
-        );
-        assert!(!lock_path.exists());
-    }
-
     /// A dangling link where a shell tool's synthetic manifest goes is not "already staged".
     #[test]
     fn workdir_path_refused_tools_shell_manifest() {
@@ -28204,7 +27098,7 @@ mod member_call_tests {
         assert_eq!(manifest["name"], "call-member");
         assert_eq!(manifest["version"], "0.0.0");
         assert_eq!(manifest["runtime"], "tool");
-        assert_eq!(manifest["implementation"], "native");
+        assert!(manifest.get("implementation").is_none());
         let schema: serde_json::Value =
             serde_json::from_str(manifest["input_schema"].as_str().unwrap()).unwrap();
         assert_eq!(
@@ -29754,7 +28648,7 @@ mod member_call_tests {
         assert_eq!(manifest["name"], "end-without-answer");
         assert_eq!(manifest["version"], "0.0.0");
         assert_eq!(manifest["runtime"], "tool");
-        assert_eq!(manifest["implementation"], "native");
+        assert!(manifest.get("implementation").is_none());
         assert_eq!(manifest["description"], END_WITHOUT_ANSWER_DESCRIPTION);
         assert!(END_WITHOUT_ANSWER_DESCRIPTION.ends_with(
             "It is refused while a call you made is still out, and for a task no formation \

@@ -17,7 +17,7 @@
 //! server that advertises the capsule's tool **schemas only** (no logic) over the protocol
 //! harnesses speak to externally-hosted tool servers. When the model calls a tool, the request
 //! comes here, and murmur executes it through the *same* `CapsuleStoreState` dispatch the HTTP
-//! path uses — under the capsule's declared capabilities and sandbox. The model gets native,
+//! path uses — under the capsule's declared capabilities and sandbox. The model gets its own
 //! structured tool calling; murmur keeps ownership of execution, capabilities, and the trace.
 //!
 //! # Scope / invariants (process transport only)

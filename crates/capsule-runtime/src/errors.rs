@@ -529,7 +529,7 @@ pub enum RuntimeError {
     )]
     SealedRootConstructionFailed { detail: String },
 
-    /// This host cannot give a capsule's native subprocess tree its own network namespace, so the
+    /// This host cannot give a capsule's subprocess tree its own network namespace, so the
     /// egress boundary that mediates `capabilities.network.allow` cannot be built.
     ///
     /// Raised before any registry pull, component compile or workdir creation, and raised for
@@ -603,7 +603,7 @@ pub enum RuntimeError {
     },
 
     #[error(
-        "this capsule can spawn native subprocesses but no cgroup v2 scope could be created to \
+        "this capsule can spawn subprocesses but no cgroup v2 scope could be created to \
          bound them ({reason}); on Linux the runtime refuses to launch rather than run a \
          subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user \
          delegation requirement at {}",
@@ -645,14 +645,14 @@ pub enum RuntimeError {
     #[error(transparent)]
     ModelLimits(#[from] crate::model_limits::ModelLimitsError),
 
-    /// A `gateway:` block is declared on a `runtime: tool` entry whose artifact ships a native
-    /// implementation. A native tool's requests leave through the egress proxy and never pass the
-    /// credential gateway, so the key could never be attached. Refused at staging.
+    /// A staged or pulled artifact's own packed `murmur.yaml` declares `implementation: native`
+    /// or `execution: native`. Murmur runs tools only as WASM components, so the launch stops
+    /// before any session starts and a pull stages nothing. `artifact` is the full
+    /// `<scope>/<name>`; `field` is the manifest key that declared it.
     #[error(
-        "artifact '{name}' declares 'gateway:' but ships a native implementation, whose requests \
-         never pass the credential gateway"
+        "artifact '{artifact}' declares {field}: native; murmur runs tools only as WASM components"
     )]
-    GatewayOnNativeArtifact { name: String },
+    NativeTool { artifact: String, field: String },
 
     /// The launch's `--lifecycle-task-acceptance queue` override turns a manifest that declares
     /// `lifecycle.queue_depth: 0` under another acceptance into a queue with no room for a waiting
@@ -815,26 +815,6 @@ pub enum RuntimeError {
          refused"
     )]
     SessionDeadlineUnenforceable { reason: String },
-
-    /// A native tool's `bin/<name>` payload was built for another operating system or CPU
-    /// architecture than this host.
-    ///
-    /// Raised before any byte of any native binary in the same staging batch reaches the session
-    /// workdir: an image this host cannot exec would otherwise be written, made executable, and
-    /// then die on a raw `Exec format error` mid-run, at a point where nothing left says which
-    /// artifact was wrong.
-    ///
-    /// Both platforms are `current_platform()`-shaped strings, or the bare `darwin` a fat Mach-O
-    /// identifies as.
-    #[error(
-        "native tool '{name}' cannot run on this host: its binary is built for \
-         {binary_platform}, this host is {host_platform}"
-    )]
-    NativeBinaryPlatformMismatch {
-        name: String,
-        binary_platform: String,
-        host_platform: String,
-    },
 
     /// The artifact a `transport: process` manifest names under `inference.driver` exports no
     /// version of the `murmur:driver/process` interface at all, so it is not a process driver.

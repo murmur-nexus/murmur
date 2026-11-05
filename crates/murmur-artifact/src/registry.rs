@@ -19,24 +19,20 @@ use crate::{
     artifact_name::ArtifactName,
     build::artifact_name_format_error,
     build_info::{build_info_from_artifact_bytes, BUILD_INFO_FILE},
-    platform::split_platform_tag,
+    manifest::refuse_native_payload,
     wit_contract::{wit_contracts_from_artifact_bytes, WitContracts},
 };
-
-pub type Platform = (String, String);
 
 pub const RESERVED_VERSIONS: [&str; 3] = ["latest", "stable", "edge"];
 
 /// Registry package implementation type.
 ///
-/// Describes the execution model for platform resolution and capability dispatch. In addition
-/// to `wasm` (component bytes) and `native` (platform binary), `static` marks a payload with
-/// no executable (e.g. a skill guidance file) that is installed for the agent to read directly.
+/// `wasm` marks component bytes; `static` marks a payload with no executable (e.g. a skill
+/// guidance file) that is installed for the agent to read directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeType {
     Wasm,
-    Native,
     Static,
 }
 
@@ -45,7 +41,6 @@ impl RuntimeType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Wasm => "wasm",
-            Self::Native => "native",
             Self::Static => "static",
         }
     }
@@ -57,10 +52,9 @@ impl FromStr for RuntimeType {
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input.to_ascii_lowercase().as_str() {
             "wasm" => Ok(Self::Wasm),
-            "native" => Ok(Self::Native),
             "static" => Ok(Self::Static),
             _ => Err(RegistryError::InvalidInput(format!(
-                "invalid runtime '{input}' (expected wasm|native|static)"
+                "invalid runtime '{input}' (expected wasm|static)"
             ))),
         }
     }
@@ -74,17 +68,15 @@ pub struct ArtifactMeta {
     pub runtime: RuntimeType,
     /// High-level role from the artifact manifest `runtime:` field (e.g. "driver", "tool",
     /// "hook", "skill"). Distinct from `runtime` (RuntimeType), which describes the execution
-    /// model (wasm/native/skill) used for platform resolution and capability dispatch.
+    /// model (wasm/static).
     pub artifact_runtime: String,
-    #[serde(default)]
-    pub platforms: Vec<Platform>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// The versioned WIT interfaces the packed component declares, derived from the artifact
     /// bytes by [`LocalRegistry`] on every write. Absent when the artifact carries no readable
-    /// component — a native binary, a skill, a core module, or a payload that does not parse.
+    /// component — a skill, a core module, or a payload that does not parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wit_contracts: Option<WitContracts>,
     /// GitHub's numeric id of the account that owned the artifact's scope when it was fetched
@@ -105,26 +97,11 @@ pub struct PublishResult {
     pub sha256: String,
 }
 
-/// How the payload a resolve returned relates to the platform that was asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlatformMatch {
-    /// No platform was requested, or the payload needs none (WASM, static).
-    NotApplicable,
-    /// A platform-tagged payload for the requested platform.
-    Tagged,
-    /// A native payload returned from the generic, untagged path because no tagged
-    /// payload exists — resolvable, but nothing recorded which platform it is for.
-    UntaggedFallback,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedArtifact {
     pub meta: ArtifactMeta,
     pub bytes: Bytes,
     pub sha256: String,
-    /// Which store path these bytes came off, relative to the platform that was asked for.
-    /// [`PlatformMatch::UntaggedFallback`] is what `W-REG-001` reports.
-    pub platform_match: PlatformMatch,
 }
 
 pub trait Registry: Send + Sync {
@@ -133,21 +110,6 @@ pub trait Registry: Send + Sync {
         name: &ArtifactName,
         version: &str,
     ) -> Result<ResolvedArtifact, RegistryError>;
-
-    /// Resolve an artifact, preferring a platform-specific variant when `platform` is `Some`.
-    ///
-    /// For WASM artifacts, implementations should ignore `platform` and behave like `resolve`.
-    /// For native artifacts, implementations should prefer the platform-tagged file and fall back
-    /// to the generic file when no tagged variant exists.
-    fn resolve_with_platform(
-        &self,
-        name: &ArtifactName,
-        version: &str,
-        platform: Option<&str>,
-    ) -> Result<ResolvedArtifact, RegistryError> {
-        let _ = platform;
-        self.resolve(name, version)
-    }
 
     fn publish(&self, meta: ArtifactMeta, bytes: &[u8]) -> Result<PublishResult, RegistryError>;
     fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError>;
@@ -188,41 +150,13 @@ impl LocalRegistry {
     #[must_use]
     pub fn artifact_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(asset_file_name(name.name(), version, None))
+            .join(asset_file_name(name.name(), version))
     }
 
     #[must_use]
     pub fn sha256_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(sha256_file_name(name.name(), version, None))
-    }
-
-    /// Path for a platform-specific artifact variant (e.g.
-    /// `<root>/ana/tool-git/0.4.0/tool-git-0.4.0-darwin-aarch64.mur.zip`).
-    #[must_use]
-    pub fn artifact_path_for_platform(
-        &self,
-        name: &ArtifactName,
-        version: &str,
-        platform: &str,
-    ) -> PathBuf {
-        self.artifact_dir(name, version)
-            .join(asset_file_name(name.name(), version, Some(platform)))
-    }
-
-    /// Path of the sha256 beside a platform-specific artifact variant.
-    #[must_use]
-    pub fn sha256_path_for_platform(
-        &self,
-        name: &ArtifactName,
-        version: &str,
-        platform: &str,
-    ) -> PathBuf {
-        self.artifact_dir(name, version).join(sha256_file_name(
-            name.name(),
-            version,
-            Some(platform),
-        ))
+            .join(sha256_file_name(name.name(), version))
     }
 
     /// `<root>/<scope>/<name>/<version>`. The file names inside carry the bare name only.
@@ -230,21 +164,11 @@ impl LocalRegistry {
         self.root.join(name.scope()).join(name.name()).join(version)
     }
 
-    /// Path of the metadata sidecar describing one payload.
-    ///
-    /// `Some(platform)` names the sidecar beside the platform-tagged payload,
-    /// `None` the one beside the generic payload. One version directory holds one sidecar per
-    /// payload in it: a single untagged file would be overwritten by every platform installed
-    /// after the first, leaving the store claiming one platform's provenance for all of them.
+    /// Path of the metadata sidecar describing the payload.
     #[must_use]
-    pub fn metadata_path_for(
-        &self,
-        name: &ArtifactName,
-        version: &str,
-        platform: Option<&str>,
-    ) -> PathBuf {
+    pub fn metadata_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(metadata_file_name(name.name(), version, platform))
+            .join(metadata_file_name(name.name(), version))
     }
 
     /// The top-level directories of this store in the flat layout that predates scopes, sorted:
@@ -281,14 +205,6 @@ impl LocalRegistry {
         Ok(found)
     }
 
-    // Currently at most one platform per artifact. Vec<Platform> is kept for forward
-    // compatibility but only the first entry is used when writing/reading storage paths.
-    fn platform_key(meta: &ArtifactMeta) -> Option<String> {
-        meta.platforms
-            .first()
-            .map(|(os, arch)| format!("{os}-{arch}"))
-    }
-
     pub fn store_installed_overwrite(
         &self,
         meta: ArtifactMeta,
@@ -306,6 +222,8 @@ impl LocalRegistry {
         sha256: &str,
         overwrite: bool,
     ) -> Result<(), RegistryError> {
+        refuse_native_payload(meta.name.as_str(), bytes)
+            .map_err(|error| native_tool_error(meta.name.as_str(), &error))?;
         // The bare part a payload is filed under is its tool name in every session that stages
         // it, so it must be the name the artifact declares. A payload with no readable manifest
         // declares nothing to compare, and no models: table to check.
@@ -343,18 +261,9 @@ impl LocalRegistry {
             source,
         })?;
 
-        let platform = Self::platform_key(meta);
-        let artifact_path = if let Some(ref p) = platform {
-            self.artifact_path_for_platform(&meta.name, &meta.version, p)
-        } else {
-            self.artifact_path_for(&meta.name, &meta.version)
-        };
-        let hash_path = if let Some(ref p) = platform {
-            self.sha256_path_for_platform(&meta.name, &meta.version, p)
-        } else {
-            self.sha256_path_for(&meta.name, &meta.version)
-        };
-        let metadata_path = self.metadata_path_for(&meta.name, &meta.version, platform.as_deref());
+        let artifact_path = self.artifact_path_for(&meta.name, &meta.version);
+        let hash_path = self.sha256_path_for(&meta.name, &meta.version);
+        let metadata_path = self.metadata_path_for(&meta.name, &meta.version);
 
         if !overwrite && (artifact_path.exists() || hash_path.exists()) {
             return Err(RegistryError::Conflict {
@@ -420,34 +329,15 @@ impl LocalRegistry {
         &self,
         name: &ArtifactName,
         version: &str,
-        platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
-        // When a platform is requested, prefer the platform-specific file first, then
-        // fall back to the generic (platform-agnostic) file so WASM artifacts always resolve.
-        // `path_platform` is the tag of the payload actually chosen, and every sidecar below is
-        // read from beside that payload rather than from a single file per name+version.
-        let (artifact_path, hash_path, path_platform) = if let Some(p) = platform {
-            let plat_artifact = self.artifact_path_for_platform(name, version, p);
-            let plat_hash = self.sha256_path_for_platform(name, version, p);
-            if plat_artifact.exists() && plat_hash.exists() {
-                (plat_artifact, plat_hash, Some(p))
-            } else {
-                (
-                    self.artifact_path_for(name, version),
-                    self.sha256_path_for(name, version),
-                    None,
-                )
-            }
-        } else {
-            (
-                self.artifact_path_for(name, version),
-                self.sha256_path_for(name, version),
-                None,
-            )
-        };
-        let metadata_path = self.metadata_path_for(name, version, path_platform);
+        let artifact_path = self.artifact_path_for(name, version);
+        let hash_path = self.sha256_path_for(name, version);
+        let metadata_path = self.metadata_path_for(name, version);
 
         if !artifact_path.exists() || !hash_path.exists() {
+            if let Some(refusal) = self.legacy_native_payload(name, version)? {
+                return Err(refusal);
+            }
             return Err(RegistryError::NotFound {
                 name: name.to_string(),
                 version: version.to_string(),
@@ -458,6 +348,8 @@ impl LocalRegistry {
             path: artifact_path.display().to_string(),
             source,
         })?;
+        refuse_native_payload(name.as_str(), &bytes)
+            .map_err(|error| native_tool_error(name.as_str(), &error))?;
 
         let sha256 = fs::read_to_string(&hash_path)
             .map_err(|source| RegistryError::Io {
@@ -474,14 +366,19 @@ impl LocalRegistry {
         }
 
         let mut meta = if metadata_path.exists() {
-            read_metadata(&metadata_path)
-                .map_err(|source| RegistryError::Io {
-                    path: metadata_path.display().to_string(),
-                    source,
-                })?
-                .meta
+            let stored = read_metadata(&metadata_path).map_err(|source| RegistryError::Io {
+                path: metadata_path.display().to_string(),
+                source,
+            })?;
+            if stored.native {
+                return Err(RegistryError::NativeTool {
+                    name: name.to_string(),
+                    field: "runtime".to_string(),
+                });
+            }
+            stored.meta
         } else {
-            derived_meta(name, version, &bytes, path_platform)
+            derived_meta(name, version, &bytes)
         };
         meta.name = name.clone();
 
@@ -494,24 +391,43 @@ impl LocalRegistry {
             meta.artifact_runtime = declared.artifact_runtime;
         }
 
-        // A native payload off the generic path resolves, and runs — but nothing on disk says
-        // which platform it was built for, so a second platform installed into this version
-        // directory would overwrite it. `W-REG-001` reports that; a WASM payload off the same
-        // path is simply how a platform-independent artifact is stored and is not reported.
-        let platform_match = match (platform, path_platform) {
-            (Some(_), Some(_)) => PlatformMatch::Tagged,
-            (Some(_), None) if meta.runtime == RuntimeType::Native => {
-                PlatformMatch::UntaggedFallback
-            }
-            _ => PlatformMatch::NotApplicable,
-        };
-
         Ok(ResolvedArtifact {
             meta,
             sha256,
             bytes: Bytes::from(bytes),
-            platform_match,
         })
+    }
+
+    /// The refusal for a version directory an older mur filled with a native tool under a
+    /// platform-tagged file name (`<name>-<version>-<os>-<arch>.mur.zip`) and no payload at the
+    /// generic path, or `None` when the directory holds no such payload.
+    fn legacy_native_payload(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+    ) -> Result<Option<RegistryError>, RegistryError> {
+        let dir = self.artifact_dir(name, version);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let tagged_prefix = format!("{}-", payload_stem(name.name(), version));
+        for file_name in read_file_names(&dir)? {
+            let is_tagged_payload = file_name
+                .strip_prefix(&tagged_prefix)
+                .is_some_and(|tail| tail.ends_with(".mur.zip"));
+            if !is_tagged_payload {
+                continue;
+            }
+            let path = dir.join(&file_name);
+            let bytes = fs::read(&path).map_err(|source| RegistryError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            if let Err(error) = refuse_native_payload(name.as_str(), &bytes) {
+                return Ok(Some(native_tool_error(name.as_str(), &error)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -521,16 +437,7 @@ impl Registry for LocalRegistry {
         name: &ArtifactName,
         version: &str,
     ) -> Result<ResolvedArtifact, RegistryError> {
-        self.resolve_impl(name, version, None)
-    }
-
-    fn resolve_with_platform(
-        &self,
-        name: &ArtifactName,
-        version: &str,
-        platform: Option<&str>,
-    ) -> Result<ResolvedArtifact, RegistryError> {
-        self.resolve_impl(name, version, platform)
+        self.resolve_impl(name, version)
     }
 
     fn publish(&self, meta: ArtifactMeta, bytes: &[u8]) -> Result<PublishResult, RegistryError> {
@@ -591,12 +498,12 @@ impl LocalRegistry {
         version: &str,
         version_dir: &Path,
     ) -> Result<Option<ArtifactMeta>, RegistryError> {
-        // A version directory may contain the generic `name-ver.mur.zip` (WASM, static) or one
-        // `name-ver-<platform>.mur.zip` per platform (native), and one metadata sidecar beside
-        // each payload.
+        // A version directory holds `name-ver.mur.zip` and its sidecar. A directory an older mur
+        // filled with a native tool may instead hold `name-ver-<os>-<arch>.mur.zip` files: they
+        // are listed so the operator can find and delete them, and resolving them refuses.
         let mut payloads: Vec<PathBuf> = Vec::new();
         let mut sidecars: Vec<PathBuf> = Vec::new();
-        let prefix = payload_stem(name.name(), version, None);
+        let prefix = payload_stem(name.name(), version);
         for file_name in read_file_names(version_dir)? {
             let Some(tail) = file_name.strip_prefix(&prefix) else {
                 continue;
@@ -617,51 +524,34 @@ impl LocalRegistry {
             return Ok(None);
         }
 
-        // One row per name+version, however many payloads back it: `mur list` reports an
-        // artifact, and `platforms` is the set of platforms that artifact is installed for. A row
-        // per sidecar would list the same artifact twice.
-        let mut sidecar_metas = Vec::with_capacity(sidecars.len());
-        for sidecar in &sidecars {
-            sidecar_metas.push(
-                read_metadata(sidecar)
+        let generic_sidecar = self.metadata_path_for(name, version);
+        let sidecar = if generic_sidecar.exists() {
+            Some(generic_sidecar)
+        } else {
+            sidecars.first().cloned()
+        };
+        let mut meta = match sidecar {
+            Some(sidecar) => {
+                read_metadata(&sidecar)
                     .map_err(|source| RegistryError::Io {
                         path: sidecar.display().to_string(),
                         source,
                     })?
-                    .meta,
-            );
-        }
-
-        let mut meta = match sidecar_metas.first() {
-            Some(first) => {
-                let mut meta = first.clone();
-                meta.platforms = sidecar_metas
-                    .iter()
-                    .flat_map(|meta| meta.platforms.iter().cloned())
-                    .collect();
-                meta.platforms.sort_unstable();
-                meta.platforms.dedup();
-                meta
+                    .meta
             }
-            // No sidecar anywhere in this directory: read the payload rather than guessing, the
-            // same derivation `resolve_impl` makes. Only a directory missing its sidecars pays
-            // for this read.
+            // No sidecar: read the payload rather than guessing, the same derivation
+            // `resolve_impl` makes. Only a directory missing its sidecar pays for this read.
             None => {
                 let payload = if has_generic {
                     self.artifact_path_for(name, version)
                 } else {
                     payloads[0].clone()
                 };
-                let path_platform = payload
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(crate::platform::split_platform_suffix)
-                    .map(|(_, platform)| platform);
                 let bytes = fs::read(&payload).map_err(|source| RegistryError::Io {
                     path: payload.display().to_string(),
                     source,
                 })?;
-                derived_meta(name, version, &bytes, path_platform)
+                derived_meta(name, version, &bytes)
             }
         };
 
@@ -717,6 +607,11 @@ pub enum RegistryError {
     NotFound { name: String, version: String },
     #[error("artifact {name}@{version} already exists")]
     Conflict { name: String, version: String },
+    /// The payload's packed `murmur.yaml` declares `implementation: native` or
+    /// `execution: native`, or its sidecar records `runtime: native`. `name` is the full
+    /// `<scope>/<name>`.
+    #[error("{}", crate::manifest::native_tool_message(.name, .field))]
+    NativeTool { name: String, field: String },
     /// The payload's packed `murmur.yaml` declares a different name than the bare part of the
     /// full name it was to be filed under.
     #[error(
@@ -922,18 +817,13 @@ fn restore_backup(backup: &Path, final_path: &Path, had_backup: bool) -> Result<
 
 /// Describe a payload that has no metadata sidecar, from the payload itself.
 ///
-/// A store written before sidecars were per-platform, or seeded by a path that wrote only the
+/// A store seeded by a path that wrote only the
 /// zip and its hash, still has to answer what the artifact is. `runtime` and `artifact_runtime`
-/// come from the `murmur.yaml` packed inside the bytes and `platforms` from the tag of the path
-/// the bytes were found at, so the answer describes these bytes rather than a default. A payload
+/// come from the `murmur.yaml` packed inside the bytes, so the answer describes these bytes
+/// rather than a default. A payload
 /// that does not parse falls back to `wasm` with nothing else filled in, so an opaque payload
 /// still resolves.
-fn derived_meta(
-    name: &ArtifactName,
-    version: &str,
-    bytes: &[u8],
-    path_platform: Option<&str>,
-) -> ArtifactMeta {
+fn derived_meta(name: &ArtifactName, version: &str, bytes: &[u8]) -> ArtifactMeta {
     let (runtime, artifact_runtime) = declared_runtime_from_artifact_bytes(bytes).map_or_else(
         || (RuntimeType::Wasm, String::new()),
         |declared| (declared.runtime, declared.artifact_runtime),
@@ -943,10 +833,6 @@ fn derived_meta(
         version: version.to_string(),
         runtime,
         artifact_runtime,
-        platforms: path_platform
-            .and_then(split_platform_tag)
-            .map(|(os, arch)| vec![(os.to_string(), arch.to_string())])
-            .unwrap_or_default(),
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
@@ -955,9 +841,44 @@ fn derived_meta(
     }
 }
 
-fn read_metadata(path: &Path) -> Result<IndexMetadata, io::Error> {
+/// A sidecar as read from the store.
+struct StoredMetadata {
+    meta: ArtifactMeta,
+    /// The sidecar records `"runtime": "native"`, as an older mur wrote for a native tool. `meta`
+    /// then carries `runtime: wasm` so the row can still be listed; resolving it refuses.
+    native: bool,
+}
+
+fn read_metadata(path: &Path) -> Result<StoredMetadata, io::Error> {
     let raw = fs::read(path)?;
-    serde_json::from_slice(&raw).map_err(invalid_data)
+    let mut value: serde_json::Value = serde_json::from_slice(&raw).map_err(invalid_data)?;
+    let runtime = value.pointer_mut("/meta/runtime");
+    let native = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.as_str() == Some("native"));
+    if native {
+        if let Some(runtime) = runtime {
+            *runtime = serde_json::Value::String(RuntimeType::Wasm.as_str().to_string());
+        }
+    }
+    let metadata: IndexMetadata = serde_json::from_value(value).map_err(invalid_data)?;
+    Ok(StoredMetadata {
+        meta: metadata.meta,
+        native,
+    })
+}
+
+/// The registry form of a [`crate::ManifestError::NativeTool`] refusal; any other manifest error
+/// is reported under the `implementation` field it was raised for.
+fn native_tool_error(name: &str, error: &crate::ManifestError) -> RegistryError {
+    let field = match error {
+        crate::ManifestError::NativeTool { field, .. } => field,
+        _ => "implementation",
+    };
+    RegistryError::NativeTool {
+        name: name.to_string(),
+        field: (*field).to_string(),
+    }
 }
 
 fn write_metadata(path: &Path, metadata: &IndexMetadata) -> Result<(), io::Error> {
@@ -1132,7 +1053,6 @@ mod tests {
             version: version.to_string(),
             runtime: RuntimeType::Wasm,
             artifact_runtime: "wasm".to_string(),
-            platforms: Vec::new(),
             description: Some("demo".to_string()),
             tags: vec!["test".to_string()],
             wit_contracts: None,
@@ -1313,7 +1233,6 @@ mod tests {
             version: "0.1.0".to_string(),
             runtime: RuntimeType::Static,
             artifact_runtime: "skill".to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
@@ -1431,7 +1350,6 @@ mod tests {
         let module = wat::parse_str(r#"(module (func (export "f")))"#).unwrap();
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("skill", zip_with(&[("skill.md", b"# guidance")])),
-            ("native", zip_with(&[("bin/native", b"\x7fELF")])),
             ("stub", zip_with(&[("tool.wasm", b"\0asm")])),
             ("module", zip_with(&[("tool.wasm", &module)])),
             (
@@ -1446,8 +1364,7 @@ mod tests {
             let registry = LocalRegistry::new(dir.path());
             registry.publish(test_meta(name, "0.1.0"), &bytes).unwrap();
 
-            let raw =
-                fs::read_to_string(registry.metadata_path_for(&n(name), "0.1.0", None)).unwrap();
+            let raw = fs::read_to_string(registry.metadata_path_for(&n(name), "0.1.0")).unwrap();
             assert!(
                 !raw.contains("wit_contracts"),
                 "{name}: metadata carries a wit_contracts key: {raw}"
@@ -1461,96 +1378,129 @@ mod tests {
         }
     }
 
-    // ── platform provenance ───────────────────────────────────────────────────
+    // ── native payloads ───────────────────────────────────────────────────────
 
-    fn native_meta(name: &str, version: &str, platform: &str) -> ArtifactMeta {
-        let (os, arch) = crate::platform::split_platform_tag(platform).unwrap();
-        ArtifactMeta {
-            name: n(name),
-            version: version.to_string(),
-            runtime: RuntimeType::Native,
-            artifact_runtime: "tool".to_string(),
-            platforms: vec![(os.to_string(), arch.to_string())],
-            description: None,
-            tags: Vec::new(),
-            wit_contracts: None,
-            owner_id: None,
-            built_at_level: None,
-        }
-    }
-
-    /// A `.mur.zip` whose packed manifest declares a native tool, with `filler` bytes in the
-    /// binary so two platforms' payloads hash differently.
-    fn native_artifact_zip(name: &str, version: &str, filler: &[u8]) -> Vec<u8> {
+    /// A `.mur.zip` whose packed manifest declares a native tool.
+    fn native_zip(name: &str, version: &str) -> Vec<u8> {
         let manifest =
             format!("name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n");
         zip_with(&[
             ("murmur.yaml", manifest.as_bytes()),
-            (&format!("bin/{name}"), filler),
+            (&format!("bin/{name}"), b"binary"),
         ])
     }
 
-    #[test]
-    fn two_platforms_install_into_one_version_directory_without_clobbering() {
-        let dir = tempdir().unwrap();
-        let registry = LocalRegistry::new(dir.path());
-        let linux = native_artifact_zip("nativetool", "0.1.0", b"linux-binary");
-        let darwin = native_artifact_zip("nativetool", "0.1.0", b"darwin-binary");
-
-        for (platform, bytes) in [("linux-x86_64", &linux), ("darwin-aarch64", &darwin)] {
-            registry
-                .store_installed_overwrite(
-                    native_meta("nativetool", "0.1.0", platform),
-                    bytes,
-                    &sha256_hex(bytes),
-                )
-                .unwrap();
-        }
-
-        let version_dir = dir.path().join("ana/nativetool/0.1.0");
-        let mut files: Vec<String> = fs::read_dir(&version_dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        files.sort();
-        assert_eq!(
-            files,
-            vec![
-                "nativetool-0.1.0-darwin-aarch64.meta.json",
-                "nativetool-0.1.0-darwin-aarch64.mur.zip",
-                "nativetool-0.1.0-darwin-aarch64.sha256",
-                "nativetool-0.1.0-linux-x86_64.meta.json",
-                "nativetool-0.1.0-linux-x86_64.mur.zip",
-                "nativetool-0.1.0-linux-x86_64.sha256",
-            ]
-        );
-
-        let resolved_linux = registry
-            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
-            .unwrap();
-        let resolved_darwin = registry
-            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("darwin-aarch64"))
-            .unwrap();
-
-        assert_eq!(resolved_linux.platform_match, PlatformMatch::Tagged);
-        assert_eq!(resolved_darwin.platform_match, PlatformMatch::Tagged);
-        assert_eq!(resolved_linux.bytes, Bytes::from(linux));
-        assert_eq!(resolved_darwin.bytes, Bytes::from(darwin));
-        assert_ne!(resolved_linux.sha256, resolved_darwin.sha256);
-        assert_eq!(
-            resolved_linux.meta.platforms,
-            vec![("linux".to_string(), "x86_64".to_string())]
+    fn assert_native_refusal(error: &RegistryError, field: &str) {
+        assert!(
+            matches!(
+                error,
+                RegistryError::NativeTool { name, field: got }
+                    if name == "ana/my-tool" && got == field
+            ),
+            "{error:?}"
         );
         assert_eq!(
-            resolved_darwin.meta.platforms,
-            vec![("darwin".to_string(), "aarch64".to_string())]
+            error.to_string(),
+            format!(
+                "artifact 'ana/my-tool' declares {field}: native; murmur runs tools only as WASM \
+                 components"
+            )
         );
-        assert_eq!(resolved_linux.meta.runtime, RuntimeType::Native);
     }
 
     #[test]
-    fn a_platform_independent_payload_stays_at_the_generic_path() {
+    fn a_native_payload_at_the_generic_path_is_refused_on_resolve() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_zip("my-tool", "1.0.0");
+        let version_dir = dir.path().join("ana/my-tool/1.0.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("my-tool-1.0.0.mur.zip"), &bytes).unwrap();
+        fs::write(version_dir.join("my-tool-1.0.0.sha256"), sha256_hex(&bytes)).unwrap();
+
+        let error = registry.resolve(&n("my-tool"), "1.0.0").unwrap_err();
+        assert_native_refusal(&error, "implementation");
+    }
+
+    /// The layout an older mur left for a native tool: the payload only at its platform-tagged
+    /// path, beside a sidecar recording `runtime: native` and its platform.
+    #[test]
+    fn a_tagged_native_install_an_older_mur_left_is_refused_and_still_listed() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_zip("my-tool", "1.0.0");
+        let version_dir = dir.path().join("ana/my-tool/1.0.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(
+            version_dir.join("my-tool-1.0.0-linux-x86_64.mur.zip"),
+            &bytes,
+        )
+        .unwrap();
+        fs::write(
+            version_dir.join("my-tool-1.0.0-linux-x86_64.sha256"),
+            sha256_hex(&bytes),
+        )
+        .unwrap();
+        fs::write(
+            version_dir.join("my-tool-1.0.0-linux-x86_64.meta.json"),
+            r#"{"meta":{"name":"ana/my-tool","version":"1.0.0","runtime":"native","artifact_runtime":"tool","platforms":[["linux","x86_64"]],"description":null,"tags":[]}}"#,
+        )
+        .unwrap();
+
+        let error = registry.resolve(&n("my-tool"), "1.0.0").unwrap_err();
+        assert_native_refusal(&error, "implementation");
+
+        let index = registry.list_index().unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].name.as_str(), "ana/my-tool");
+        assert_eq!(index[0].artifact_runtime, "tool");
+    }
+
+    /// A sidecar recording `runtime: native` beside bytes carrying no readable manifest is
+    /// refused under the field it records.
+    #[test]
+    fn a_sidecar_recording_runtime_native_is_refused() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let version_dir = dir.path().join("ana/my-tool/1.0.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("my-tool-1.0.0.mur.zip"), b"not-an-archive").unwrap();
+        fs::write(
+            version_dir.join("my-tool-1.0.0.sha256"),
+            sha256_hex(b"not-an-archive"),
+        )
+        .unwrap();
+        fs::write(
+            version_dir.join("my-tool-1.0.0.meta.json"),
+            r#"{"meta":{"name":"ana/my-tool","version":"1.0.0","runtime":"native","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,
+        )
+        .unwrap();
+
+        let error = registry.resolve(&n("my-tool"), "1.0.0").unwrap_err();
+        assert_native_refusal(&error, "runtime");
+        assert_eq!(registry.list_index().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_native_payload_is_never_stored() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_zip("my-tool", "1.0.0");
+
+        let error = registry
+            .publish(test_meta("my-tool", "1.0.0"), &bytes)
+            .unwrap_err();
+        assert_native_refusal(&error, "implementation");
+        let error = registry
+            .store_installed_overwrite(test_meta("my-tool", "1.0.0"), &bytes, &sha256_hex(&bytes))
+            .unwrap_err();
+        assert_native_refusal(&error, "implementation");
+
+        assert!(!dir.path().join("ana").exists());
+    }
+
+    #[test]
+    fn a_wasm_payload_is_filed_at_the_generic_path() {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
         let bytes = zip_with(&[
@@ -1565,34 +1515,15 @@ mod tests {
             .store_installed_overwrite(test_meta("wasmtool", "0.1.0"), &bytes, &sha256_hex(&bytes))
             .unwrap();
 
-        assert!(dir
-            .path()
-            .join("ana/wasmtool/0.1.0/wasmtool-0.1.0.meta.json")
-            .exists());
-        // Requested for a platform this payload was never tagged with, and still resolved.
-        let resolved = registry
-            .resolve_with_platform(&n("wasmtool"), "0.1.0", Some("darwin-aarch64"))
-            .unwrap();
-        assert_eq!(resolved.platform_match, PlatformMatch::NotApplicable);
-        assert!(resolved.meta.platforms.is_empty());
-    }
-
-    #[test]
-    fn a_native_payload_off_the_generic_path_reports_the_untagged_fallback() {
-        let dir = tempdir().unwrap();
-        let registry = LocalRegistry::new(dir.path());
-        let bytes = native_artifact_zip("nativetool", "0.1.0", b"binary");
-        // An install written before platform tagging: generic paths, `platforms: []`.
-        let mut meta = native_meta("nativetool", "0.1.0", "linux-x86_64");
-        meta.platforms = Vec::new();
-        registry
-            .store_installed_overwrite(meta, &bytes, &sha256_hex(&bytes))
-            .unwrap();
-
-        let resolved = registry
-            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
-            .unwrap();
-        assert_eq!(resolved.platform_match, PlatformMatch::UntaggedFallback);
+        assert_eq!(
+            files_in(&dir.path().join("ana/wasmtool/0.1.0")),
+            vec![
+                "wasmtool-0.1.0.meta.json",
+                "wasmtool-0.1.0.mur.zip",
+                "wasmtool-0.1.0.sha256",
+            ]
+        );
+        let resolved = registry.resolve(&n("wasmtool"), "0.1.0").unwrap();
         assert_eq!(resolved.bytes, Bytes::from(bytes));
     }
 
@@ -1600,35 +1531,23 @@ mod tests {
     fn missing_metadata_is_derived_from_the_payload() {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
-        let bytes = native_artifact_zip("nativetool", "0.1.0", b"binary");
-        let version_dir = dir.path().join("ana/nativetool/0.1.0");
+        let bytes = zip_with(&[(
+            "murmur.yaml",
+            b"name: skilly\nversion: 0.1.0\nruntime: skill\n",
+        )]);
+        let version_dir = dir.path().join("ana/skilly/0.1.0");
         fs::create_dir_all(&version_dir).unwrap();
-        fs::write(
-            version_dir.join("nativetool-0.1.0-linux-x86_64.mur.zip"),
-            &bytes,
-        )
-        .unwrap();
-        fs::write(
-            version_dir.join("nativetool-0.1.0-linux-x86_64.sha256"),
-            sha256_hex(&bytes),
-        )
-        .unwrap();
+        fs::write(version_dir.join("skilly-0.1.0.mur.zip"), &bytes).unwrap();
+        fs::write(version_dir.join("skilly-0.1.0.sha256"), sha256_hex(&bytes)).unwrap();
 
-        let resolved = registry
-            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
-            .unwrap();
-        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
-        assert_eq!(resolved.meta.artifact_runtime, "tool");
-        assert_eq!(
-            resolved.meta.platforms,
-            vec![("linux".to_string(), "x86_64".to_string())]
-        );
-        assert_eq!(resolved.platform_match, PlatformMatch::Tagged);
+        let resolved = registry.resolve(&n("skilly"), "0.1.0").unwrap();
+        assert_eq!(resolved.meta.runtime, RuntimeType::Static);
+        assert_eq!(resolved.meta.artifact_runtime, "skill");
 
         // The same derivation backs `mur list`, which has no sidecar to read either.
         let index = registry.list_index().unwrap();
         assert_eq!(index.len(), 1);
-        assert_eq!(index[0].runtime, RuntimeType::Native);
+        assert_eq!(index[0].runtime, RuntimeType::Static);
     }
 
     #[test]
@@ -1647,37 +1566,6 @@ mod tests {
         let resolved = registry.resolve(&n("opaque"), "0.1.0").unwrap();
         assert_eq!(resolved.meta.runtime, RuntimeType::Wasm);
         assert!(resolved.meta.artifact_runtime.is_empty());
-        assert!(resolved.meta.platforms.is_empty());
-    }
-
-    #[test]
-    fn list_index_returns_one_row_per_version_with_every_platform_installed() {
-        let dir = tempdir().unwrap();
-        let registry = LocalRegistry::new(dir.path());
-        for (platform, filler) in [
-            ("linux-x86_64", b"linux".as_slice()),
-            ("darwin-aarch64", b"darwin".as_slice()),
-        ] {
-            let bytes = native_artifact_zip("nativetool", "0.1.0", filler);
-            registry
-                .store_installed_overwrite(
-                    native_meta("nativetool", "0.1.0", platform),
-                    &bytes,
-                    &sha256_hex(&bytes),
-                )
-                .unwrap();
-        }
-
-        let index = registry.list_index().unwrap();
-        assert_eq!(index.len(), 1);
-        assert_eq!(
-            index[0].platforms,
-            vec![
-                ("darwin".to_string(), "aarch64".to_string()),
-                ("linux".to_string(), "x86_64".to_string()),
-            ]
-        );
-        assert_eq!(index[0].runtime, RuntimeType::Native);
     }
 
     #[test]
@@ -1688,7 +1576,7 @@ mod tests {
             .publish(test_meta("old", "0.1.0"), b"bytes")
             .unwrap();
 
-        let path = registry.metadata_path_for(&n("old"), "0.1.0", None);
+        let path = registry.metadata_path_for(&n("old"), "0.1.0");
         fs::write(
             &path,
             r#"{"meta":{"name":"ana/old","version":"0.1.0","runtime":"wasm","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,
@@ -1713,7 +1601,7 @@ mod tests {
             ("tool.wasm", b"\0asm"),
         ]);
         let sha256 = sha256_hex(&bytes);
-        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0", None);
+        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0");
 
         registry
             .store_installed_overwrite(test_meta("wasmtool", "0.1.0"), &bytes, &sha256)
@@ -1740,7 +1628,7 @@ mod tests {
             "murmur.yaml",
             b"name: wasmtool\nversion: 0.1.0\nruntime: tool\n",
         );
-        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0", None);
+        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0");
 
         let unlabelled = zip_with(&[manifest]);
         let mut meta = test_meta("wasmtool", "0.1.0");
@@ -1779,20 +1667,6 @@ mod tests {
 
     // ── recorded runtime versus declared runtime ──────────────────────────────
 
-    /// A `.mur.zip` whose manifest declares a native tool.
-    fn native_zip(name: &str, version: &str) -> Vec<u8> {
-        zip_with(&[
-            (
-                "murmur.yaml",
-                format!(
-                    "name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"
-                )
-                .as_bytes(),
-            ),
-            (&format!("bin/{name}"), b"binary"),
-        ])
-    }
-
     /// Write one payload, its sha256 sidecar and a `.meta.json` recording exactly
     /// `recorded_runtime` and `recorded_artifact_runtime`, whether or not the payload agrees.
     fn write_store_by_hand(
@@ -1813,25 +1687,28 @@ mod tests {
         )
         .unwrap();
         let meta = format!(
-            r#"{{"meta":{{"name":"ana/{name}","version":"{version}","runtime":"{recorded_runtime}","artifact_runtime":"{recorded_artifact_runtime}","platforms":[],"description":null,"tags":[]}}}}"#
+            r#"{{"meta":{{"name":"ana/{name}","version":"{version}","runtime":"{recorded_runtime}","artifact_runtime":"{recorded_artifact_runtime}","description":null,"tags":[]}}}}"#
         );
-        fs::write(registry.metadata_path_for(&n(name), version, None), meta).unwrap();
+        fs::write(registry.metadata_path_for(&n(name), version), meta).unwrap();
     }
 
     #[test]
-    fn a_native_payload_recorded_as_wasm_resolves_as_native() {
+    fn a_skill_payload_recorded_as_wasm_resolves_as_static() {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
-        let bytes = native_zip("my-tool", "1.0.0");
-        write_store_by_hand(&registry, "my-tool", "1.0.0", &bytes, "wasm", "");
+        let bytes = zip_with(&[(
+            "murmur.yaml",
+            b"name: my-skill\nversion: 1.0.0\nruntime: skill\n",
+        )]);
+        write_store_by_hand(&registry, "my-skill", "1.0.0", &bytes, "wasm", "");
 
-        let metadata_path = registry.metadata_path_for(&n("my-tool"), "1.0.0", None);
+        let metadata_path = registry.metadata_path_for(&n("my-skill"), "1.0.0");
         let on_disk_before = fs::read_to_string(&metadata_path).unwrap();
 
-        let resolved = registry.resolve(&n("my-tool"), "1.0.0").unwrap();
+        let resolved = registry.resolve(&n("my-skill"), "1.0.0").unwrap();
 
-        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
-        assert_eq!(resolved.meta.artifact_runtime, "tool");
+        assert_eq!(resolved.meta.runtime, RuntimeType::Static);
+        assert_eq!(resolved.meta.artifact_runtime, "skill");
         assert_eq!(
             fs::read_to_string(&metadata_path).unwrap(),
             on_disk_before,
@@ -1848,14 +1725,14 @@ mod tests {
             "opaque",
             "1.0.0",
             b"not-an-archive",
-            "native",
-            "tool",
+            "static",
+            "skill",
         );
 
         let resolved = registry.resolve(&n("opaque"), "1.0.0").unwrap();
 
-        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
-        assert_eq!(resolved.meta.artifact_runtime, "tool");
+        assert_eq!(resolved.meta.runtime, RuntimeType::Static);
+        assert_eq!(resolved.meta.artifact_runtime, "skill");
     }
 
     // ── scoped layout ─────────────────────────────────────────────────────────
@@ -1875,47 +1752,6 @@ mod tests {
             .collect();
         files.sort();
         files
-    }
-
-    #[test]
-    fn registry_files_a_native_payload_under_scope_name_version_with_the_bare_name() {
-        let dir = tempdir().unwrap();
-        let registry = LocalRegistry::new(dir.path());
-        let bytes = native_artifact_zip("tool-x", "1.2.0", b"linux-binary");
-
-        let published = registry
-            .publish(native_meta("tool-x", "1.2.0", "linux-x86_64"), &bytes)
-            .unwrap();
-        assert_eq!(published.artifact_id, "ana/tool-x@1.2.0");
-
-        let version_dir = dir.path().join("ana/tool-x/1.2.0");
-        assert_eq!(
-            files_in(&version_dir),
-            vec![
-                "tool-x-1.2.0-linux-x86_64.meta.json",
-                "tool-x-1.2.0-linux-x86_64.mur.zip",
-                "tool-x-1.2.0-linux-x86_64.sha256",
-            ]
-        );
-        assert_eq!(
-            registry.artifact_path_for_platform(&n("tool-x"), "1.2.0", "linux-x86_64"),
-            version_dir.join("tool-x-1.2.0-linux-x86_64.mur.zip")
-        );
-        let sidecar = read_metadata(&version_dir.join("tool-x-1.2.0-linux-x86_64.meta.json"))
-            .unwrap()
-            .meta;
-        assert_eq!(sidecar.name.as_str(), "ana/tool-x");
-        assert_eq!(
-            sidecar.platforms,
-            vec![("linux".to_string(), "x86_64".to_string())]
-        );
-
-        let resolved = registry
-            .resolve_with_platform(&n("tool-x"), "1.2.0", Some("linux-x86_64"))
-            .unwrap();
-        assert_eq!(resolved.platform_match, PlatformMatch::Tagged);
-        assert_eq!(resolved.meta.name.as_str(), "ana/tool-x");
-        assert_eq!(resolved.bytes, Bytes::from(bytes));
     }
 
     #[test]

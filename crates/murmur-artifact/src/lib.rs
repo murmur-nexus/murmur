@@ -17,7 +17,6 @@ pub mod lockfile;
 pub mod manifest;
 pub mod manifest_path;
 pub mod payload_shape;
-pub mod platform;
 pub mod registry;
 pub mod registry_warnings;
 pub mod roster;
@@ -75,27 +74,24 @@ pub use lockfile::{
     MurmurLock, LOCK_VERSION,
 };
 pub use manifest::{
-    describe_yaml_shape, load_manifest, parse_model_limits, parse_provider_tool,
-    parse_upstream_auth, refuse_retired_auth_block, Manifest, ManifestError, ModelLimits,
-    ProviderTool, ProviderToolKind, UpstreamAuth, PROVIDER_TOOL_KEY, REGISTRY_BLOCK_HINT,
-    REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
+    describe_yaml_shape, load_manifest, native_tool_message, parse_model_limits,
+    parse_provider_tool, parse_upstream_auth, refuse_native_payload, refuse_native_tool,
+    refuse_retired_auth_block, Manifest, ManifestError, ModelLimits, ProviderTool,
+    ProviderToolKind, UpstreamAuth, PROVIDER_TOOL_KEY, REGISTRY_BLOCK_HINT, REGISTRY_BLOCK_KEY,
+    REGISTRY_BLOCK_MESSAGE, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{
-    is_root_wasm_candidate, native_binary_entry, root_wasm_candidates, select_root_wasm,
-    select_root_wasm_from_entries, select_root_wasm_in_archive, PayloadShapeError,
-    CAPSULE_WASM_ENTRY, NATIVE_BIN_DIR, SKILL_MD_ENTRY, WASM_EXTENSION,
-};
-pub use platform::{
-    binary_platform, current_platform, native_binary_verdict, split_platform_suffix,
-    split_platform_tag, NativeBinaryVerdict, DARWIN_ANY_ARCH, SUPPORTED_PLATFORMS,
+    is_root_wasm_candidate, root_wasm_candidates, select_root_wasm, select_root_wasm_from_entries,
+    select_root_wasm_in_archive, PayloadShapeError, CAPSULE_WASM_ENTRY, SKILL_MD_ENTRY,
+    WASM_EXTENSION,
 };
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
-    LocalRegistry, Platform, PlatformMatch, PublishResult, Registry, RegistryError,
-    ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
+    LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
+    RESERVED_VERSIONS,
 };
-pub use registry_warnings::{registry_warning_link, W_REG_001, W_REG_002, W_REG_003};
+pub use registry_warnings::{registry_warning_link, W_REG_002, W_REG_003};
 pub use roster::{
     load_roster, member_name_format_error, resolve_roster_path, ReachabilityRule, Roster,
     RosterError, RosterMember, RosterReachability, MAX_MEMBER_NAME_LEN, REACHABILITY_ALL,
@@ -104,17 +100,16 @@ pub use roster::{
 pub use roster_warnings::{roster_warning_link, W_ROS_001};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
-    parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
-    read_hook_config, read_runtime_manifest_text, read_tool_implementation,
+    parse_duration_secs, parse_hook_config_from_yaml, read_hook_config, read_runtime_manifest_text,
     referenced_env_variables, tool_name_of, AfterTask, ApiKeyReference, ArtifactGateway,
-    ArtifactImplementation, ArtifactRuntime, AuthenticationScheme, Capabilities, CompactionConfig,
-    ContainmentClass, ContextConfig, ContextImagesConfig, ContextRetainConfig, ControlConfig,
-    ControllableSetting, ConversationCapabilities, ConversationMode, DeployConfig, DoneCheck,
-    DoorCredential, EnvCapabilities, EvalConfig, ExportMode, Exports, FileExport,
-    FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode,
-    HookOverflowPolicy, InferenceAlternate, InferenceConfig, InferenceDriver, InferenceRetry,
-    InstallCapabilities, InstallFrom, InterpreterRuntimeDir, InterpreterRuntimeGrant, KeepWorking,
-    LifecycleConfig, LifecycleOverride, NetworkAuthentication, NetworkCapabilities, NetworkConfig,
+    ArtifactRuntime, AuthenticationScheme, Capabilities, CompactionConfig, ContainmentClass,
+    ContextConfig, ContextImagesConfig, ContextRetainConfig, ControlConfig, ControllableSetting,
+    ConversationCapabilities, ConversationMode, DeployConfig, DoneCheck, DoorCredential,
+    EnvCapabilities, EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities,
+    HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
+    InferenceAlternate, InferenceConfig, InferenceDriver, InferenceRetry, InstallCapabilities,
+    InstallFrom, InterpreterRuntimeDir, InterpreterRuntimeGrant, KeepWorking, LifecycleConfig,
+    LifecycleOverride, NetworkAuthentication, NetworkCapabilities, NetworkConfig,
     ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities, PeerFilesExport,
     PeerTasksExport, PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits,
     RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities,

@@ -149,7 +149,6 @@ fn publish_bytes(registry_root: &Path, name: &str, version: &str, bytes: &[u8]) 
                 version: version.to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,

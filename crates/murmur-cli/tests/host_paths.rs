@@ -54,15 +54,6 @@ fn end_turn_response() -> String {
     .to_string()
 }
 
-/// A native tool's script: drain stdin, run `body`, which sets `$v`, then report `$v` between
-/// `<<<` and `>>>`, escaped for a JSON string. Builtins only, plus what `shell.allow` names.
-fn native_script(body: &str) -> String {
-    format!(
-        "#!/bin/bash\nwhile read -r _; do :; done\n{body}\nv=${{v//\\\\/\\\\\\\\}}\nv=${{v//\\\"/\\\\\\\"}}\n\
-         printf '{{\"status\":\"passed\",\"summary\":\"<<<%s>>>\"}}' \"$v\"\n"
-    )
-}
-
 /// A canonical scratch directory outside `/tmp`.
 fn scratch() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -76,7 +67,7 @@ fn scratch() -> (TempDir, PathBuf) {
 }
 
 /// One capsule on a scripted model: a scratch `HOME`, a project, and the driver (and optionally
-/// a native tool) installed into the project under that `HOME`.
+/// the reach tool) installed into the project under that `HOME`.
 struct Capsule {
     _root: TempDir,
     base: PathBuf,
@@ -89,7 +80,7 @@ struct Capsule {
 }
 
 impl Capsule {
-    fn new(project_in_home: bool, native_tool: Option<&str>) -> Self {
+    fn new(project_in_home: bool) -> Self {
         let (root, base) = scratch();
         let home = base.join("home");
         let project = if project_in_home {
@@ -117,17 +108,6 @@ impl Capsule {
             &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
         );
         capsule.install(&driver, &["--no-precompile"]).success();
-        if let Some(body) = native_tool {
-            let artifact = common::create_native_artifact(
-                &fixture,
-                REACH_TOOL,
-                TOOL_VERSION,
-                &native_script(body),
-                Some("Reports what it can reach."),
-                None,
-            );
-            capsule.install(&artifact, &[]).success();
-        }
         capsule
     }
 
@@ -149,7 +129,15 @@ impl Capsule {
         self
     }
 
-    fn with_native_tool(mut self) -> Self {
+    /// Installs [`REACH_TOOL`], the `runtime-dir-probe` fixture, and declares it.
+    fn with_reach_tool(mut self) -> Self {
+        let artifact = common::create_tool_artifact(
+            &self.base.join("fixture"),
+            REACH_TOOL,
+            TOOL_VERSION,
+            &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
+        );
+        self.install(&artifact, &[]).success();
         self.entries =
             format!("  - name: {REACH_TOOL}\n    version: {TOOL_VERSION}\n    runtime: tool\n");
         self.write_manifest("http://127.0.0.1:9");
@@ -305,7 +293,7 @@ fn a_project_config_naming_host_paths_is_refused_before_staging() {
         "host_paths:\n  - path: /srv\n    access: read\n",
         "host_paths: []\n",
     ] {
-        let capsule = Capsule::new(false, None);
+        let capsule = Capsule::new(false);
         fs::create_dir_all(capsule.project.join(".murmur")).unwrap();
         let project_file = capsule.project.join(".murmur/config.yaml");
         fs::write(&project_file, project_config).unwrap();
@@ -325,7 +313,7 @@ fn a_project_config_naming_host_paths_is_refused_before_staging() {
 
 #[test]
 fn a_manifest_naming_host_paths_is_refused_with_e_man_003() {
-    let capsule = Capsule::new(false, None).with("  host_paths: []\n");
+    let capsule = Capsule::new(false).with("  host_paths: []\n");
     let (output, _) = capsule.run(Vec::new(), &[]);
     assert!(!output.status.success());
     let text = format!("{}{}", stdout(&output), stderr(&output));
@@ -337,7 +325,7 @@ fn a_manifest_naming_host_paths_is_refused_with_e_man_003() {
 
 #[test]
 fn a_root_or_missing_host_path_refuses_the_run_and_explain_scope_naming_it() {
-    let capsule = Capsule::new(false, None);
+    let capsule = Capsule::new(false);
     let missing = capsule.base.join("does-not-exist");
     for (entry, written, reason) in [
         ("/", "/".to_string(), "names /"),
@@ -372,8 +360,7 @@ fn a_credential_location_warns_and_launches() {
     if capsule_runtime::skip_without_egress_namespace(TEST) {
         return;
     }
-    let capsule =
-        Capsule::new(false, None).with("  containment: scoped\n  shell:\n    allow: [bash]\n");
+    let capsule = Capsule::new(false).with("  containment: scoped\n  shell:\n    allow: [bash]\n");
     fs::create_dir_all(capsule.home.join(".ssh")).unwrap();
     fs::create_dir_all(capsule.home.join(".cargo")).unwrap();
     fs::write(capsule.home.join(".cargo/credentials.toml"), "").unwrap();
@@ -467,23 +454,19 @@ impl Dirs {
     }
 }
 
-/// What the native reach tool does, reporting `read:<line> <ro> <rename> <outside>`.
-fn reach_body(dirs: &Dirs) -> String {
-    format!(
-        "if read -r l < '{ro}/in.txt'; then a=\"read:$l\"; else a=read-refused; fi\n\
-         if echo x > '{ro}/tool-new' 2>/dev/null; then b=ro-written; else b=ro-refused; fi\n\
-         if echo y > '{rw}/tool-a' && mv '{rw}/tool-a' '{rw}/tool-b'; then c=renamed; else c=rename-failed; fi\n\
-         if read -r s < '{out}/secret.txt' 2>/dev/null; then d=\"leak:$s\"; else d=outside-refused; fi\n\
-         v=\"$a $b $c $d\"",
-        ro = dirs.ro.display(),
-        rw = dirs.rw.display(),
-        out = dirs.outside.display(),
-    )
+/// The guest path a WASM tool reaches a host path at: under `murmur-host/`, at its own path.
+fn through(path: &Path) -> String {
+    format!("murmur-host{}", path.display())
 }
 
-/// One containment class: the runtime's `bash` tool and a native tool reach
-/// `ro/` read-only, `rw/` read-write and not `outside/`; `HOME` is the session's and
-/// `CARGO_HOME` the value `mur run` was started with.
+/// One call of the reach tool, `runtime-dir-probe`, with `input`.
+fn probe(id: &str, input: Value) -> String {
+    common::tool_use_response(id, murmur_artifact::tool_name_of(REACH_TOOL), input)
+}
+
+/// One containment class: the runtime's `bash` tool and a WASM tool reach `ro/` read-only, `rw/`
+/// read-write and not `outside/`; `HOME` is the session's and `CARGO_HOME` the value `mur run`
+/// was started with. The WASM tool reaches each host path under `murmur-host/`.
 fn reach_on(test: &str, containment: &str, tier: &str) {
     if capsule_runtime::skip_without_egress_namespace(test) {
         return;
@@ -493,11 +476,9 @@ fn reach_on(test: &str, containment: &str, tier: &str) {
     }
     let (_scratch, base) = scratch();
     let dirs = Dirs::under(&base);
-    let capsule = Capsule::new(false, Some(&reach_body(&dirs)))
-        .with_native_tool()
-        .with(&format!(
-            "  containment: {containment}\n  shell:\n    allow: [bash, mv]\n"
-        ));
+    let capsule = Capsule::new(false).with_reach_tool().with(&format!(
+        "  containment: {containment}\n  shell:\n    allow: [bash]\n"
+    ));
     capsule.global_config(&dirs.config());
     report_tier(&capsule, test, tier);
 
@@ -517,11 +498,27 @@ fn reach_on(test: &str, containment: &str, tier: &str) {
         .enumerate()
         .map(|(index, command)| bash(&format!("call_{index}"), command))
         .collect();
-    responses.push(common::tool_use_response(
-        "call_tool",
-        murmur_artifact::tool_name_of(REACH_TOOL),
-        json!({}),
-    ));
+    let ro_through = through(&dirs.ro);
+    let rw_through = through(&dirs.rw);
+    let out_through = through(&dirs.outside);
+    responses.extend([
+        probe(
+            "tool_read",
+            json!({"op": "read", "path": format!("{ro_through}/in.txt")}),
+        ),
+        probe(
+            "tool_write_ro",
+            json!({"op": "write", "path": format!("{ro_through}/tool-new")}),
+        ),
+        probe(
+            "tool_write_rw",
+            json!({"op": "write", "path": format!("{rw_through}/tool-b")}),
+        ),
+        probe(
+            "tool_outside",
+            json!({"op": "read", "path": format!("{out_through}/secret.txt")}),
+        ),
+    ]);
     let cargo_home = dirs.rw.display().to_string();
     let (output, requests) = capsule.run(responses, &[("CARGO_HOME", &cargo_home)]);
     assert_ok(&output);
@@ -565,14 +562,21 @@ fn reach_on(test: &str, containment: &str, tier: &str) {
     );
     assert!(has_line(&env, &format!("CARGO_HOME={cargo_home}")), "{env}");
 
-    let tool = result(&requests, "call_tool", &output);
-    assert!(
-        tool.contains("<<<read:lent ro-refused renamed outside-refused>>>"),
-        "{tool}"
-    );
+    let tool_read = result(&requests, "tool_read", &output);
+    assert!(!tool_read.contains("err:"), "{tool_read}");
+    assert!(tool_read.contains("lent"), "{tool_read}");
+    let tool_write_ro = result(&requests, "tool_write_ro", &output);
+    assert!(tool_write_ro.contains("err:"), "{tool_write_ro}");
     assert!(!dirs.ro.join("tool-new").exists());
-    assert_eq!(fs::read_to_string(dirs.rw.join("tool-b")).unwrap(), "y\n");
-    assert!(!dirs.rw.join("tool-a").exists());
+    let tool_write_rw = result(&requests, "tool_write_rw", &output);
+    assert!(!tool_write_rw.contains("err:"), "{tool_write_rw}");
+    assert_eq!(
+        fs::read_to_string(dirs.rw.join("tool-b")).unwrap(),
+        "written by the probe"
+    );
+    let tool_outside = result(&requests, "tool_outside", &output);
+    assert!(tool_outside.contains("err:"), "{tool_outside}");
+    assert!(!tool_outside.contains("secret"), "{tool_outside}");
 
     let grants = &session_start(&output)["effective_grants"]["host_paths"];
     let mechanism = if containment == "sealed" {
@@ -611,7 +615,7 @@ fn home_lent_read_on(test: &str, containment: &str, tier: &str) {
     if containment == "sealed" && !host_reaches_sealed(test) {
         return;
     }
-    let capsule = Capsule::new(true, None).with(&format!(
+    let capsule = Capsule::new(true).with(&format!(
         "  containment: {containment}\n  shell:\n    allow: [bash]\n"
     ));
     capsule.global_config("  - path: \"~\"\n    access: read\n");
@@ -688,8 +692,8 @@ impl Tools {
 fn scoped_refuses_a_read_write_host_path_holding_what_it_may_run() {
     let (_scratch, base) = scratch();
     let tools = Tools::under(&base);
-    let capsule = Capsule::new(false, None)
-        .with("  containment: scoped\n  shell:\n    allow: [bash, tool]\n");
+    let capsule =
+        Capsule::new(false).with("  containment: scoped\n  shell:\n    allow: [bash, tool]\n");
     capsule.global_config(&format!(
         "  - path: {}\n    access: read-write\n",
         tools.tools.display()
@@ -720,7 +724,7 @@ fn sealed_binds_what_it_may_run_read_only_inside_a_read_write_host_path() {
     }
     let (_scratch, base) = scratch();
     let tools = Tools::under(&base);
-    let capsule = Capsule::new(false, None).with(&format!(
+    let capsule = Capsule::new(false).with(&format!(
         "  containment: sealed\n  shell:\n    allow: [bash, tool]\n    interpreter_runtime:\n      \
          - binary: tool\n        dirs:\n          - path: {}\n            list_dir: true\n",
         tools.bin.display()
@@ -788,7 +792,7 @@ fn a_read_write_host_path_inside_what_it_may_run_is_refused_on_both_tiers() {
         classes.push("sealed");
     }
     for containment in classes {
-        let capsule = Capsule::new(false, None).with(&format!(
+        let capsule = Capsule::new(false).with(&format!(
             "  containment: {containment}\n  shell:\n    allow: [bash, tool]\n    \
              interpreter_runtime:\n      - binary: tool\n        dirs:\n          - path: {}\n            \
              list_dir: true\n",
@@ -815,7 +819,7 @@ fn a_read_write_host_path_inside_what_it_may_run_is_refused_on_both_tiers() {
 fn host_paths_appear_in_explain_scope_text_json_and_doctor() {
     let (_scratch, base) = scratch();
     let dirs = Dirs::under(&base);
-    let capsule = Capsule::new(false, None).with("  containment: scoped\n");
+    let capsule = Capsule::new(false).with("  containment: scoped\n");
 
     // No key: `[]`, always serialized.
     assert_eq!(capsule.explain_json(&[])["host_paths"], json!([]));

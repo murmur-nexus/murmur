@@ -1,7 +1,7 @@
 //! The capsule's own network namespace: the structural half of the mechanism that replaced the
 //! seccomp-notify `connect`/`sendto` supervisor.
 //!
-//! [`crate::egress_proxy`] decides *which* destinations a native subprocess may reach. This module
+//! [`crate::egress_proxy`] decides *which* destinations a subprocess may reach. This module
 //! is what makes that decision the only way out — it puts the subprocess tree somewhere with no
 //! route off the host, so an unlisted destination is not "denied" by a filter that has to be
 //! consulted, it is simply unreachable.
@@ -707,7 +707,7 @@ pub fn host_pid_in_workdir(_workdir: &std::path::Path, namespace_pid: i32) -> Op
     (namespace_pid > 0).then_some(namespace_pid)
 }
 
-/// Refuses the launch when a capsule that can spawn native subprocesses is on a host that cannot
+/// Refuses the launch when a capsule that can spawn subprocesses is on a host that cannot
 /// give them a network namespace.
 ///
 /// Pure — the host answer is passed in — so the decision is testable on any OS at any tier.
@@ -905,8 +905,8 @@ impl SessionNetns {
     /// starting the session's egress proxy on the first call.
     ///
     /// A creation step that fails is refused with `E-CAP-005` in the words staging uses, so a
-    /// native tool pulled mid-session, whose first call is the first time anything asks, is
-    /// refused the way a launch would have been.
+    /// first command, the first time anything asks, is refused the way a launch would have
+    /// been.
     ///
     /// Serialised on one mutex, so concurrent first commands create exactly one namespace. A
     /// failed creation leaves the namespace not yet created and leaks nothing, so that command's

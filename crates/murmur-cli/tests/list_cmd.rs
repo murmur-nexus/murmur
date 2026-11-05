@@ -25,21 +25,12 @@ fn publish_to_project(project_dir: &Path, meta: ArtifactMeta) {
     reg.publish(meta, b"fake-artifact-bytes").unwrap();
 }
 
-fn artifact_meta(
-    name: &str,
-    version: &str,
-    runtime: RuntimeType,
-    platforms: Vec<(&str, &str)>,
-) -> ArtifactMeta {
+fn artifact_meta(name: &str, version: &str, runtime: RuntimeType) -> ArtifactMeta {
     ArtifactMeta {
         name: ArtifactName::parse(name).unwrap(),
         version: version.to_string(),
         artifact_runtime: runtime.as_str().to_string(),
         runtime,
-        platforms: platforms
-            .into_iter()
-            .map(|(os, arch)| (os.to_string(), arch.to_string()))
-            .collect(),
         description: None,
         tags: vec![],
         wit_contracts: None,
@@ -99,12 +90,7 @@ fn list_global_shows_header_and_artifact_row() {
     let home = tempfile::tempdir().unwrap();
     publish_to_global(
         &home,
-        artifact_meta(
-            "local/my-tool",
-            "1.2.3",
-            RuntimeType::Wasm,
-            vec![("linux", "amd64")],
-        ),
+        artifact_meta("local/my-tool", "1.2.3", RuntimeType::Wasm),
     );
 
     mur_list(&home, &["-g"])
@@ -112,11 +98,10 @@ fn list_global_shows_header_and_artifact_row() {
         .stdout(predicate::str::contains("NAME"))
         .stdout(predicate::str::contains("VERSION"))
         .stdout(predicate::str::contains("RUNTIME"))
-        .stdout(predicate::str::contains("PLATFORMS"))
+        .stdout(predicate::str::contains("PLATFORMS").not())
         .stdout(predicate::str::contains("local/my-tool"))
         .stdout(predicate::str::contains("1.2.3"))
-        .stdout(predicate::str::contains("wasm"))
-        .stdout(predicate::str::contains("linux-amd64"));
+        .stdout(predicate::str::contains("wasm"));
 }
 
 #[test]
@@ -124,16 +109,11 @@ fn list_global_shows_multiple_artifacts_sorted_by_name_then_version() {
     let home = tempfile::tempdir().unwrap();
     publish_to_global(
         &home,
-        artifact_meta("local/zeta-tool", "0.1.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/zeta-tool", "0.1.0", RuntimeType::Wasm),
     );
     publish_to_global(
         &home,
-        artifact_meta(
-            "local/alpha-tool",
-            "2.0.0",
-            RuntimeType::Native,
-            vec![("darwin", "arm64")],
-        ),
+        artifact_meta("local/alpha-tool", "2.0.0", RuntimeType::Static),
     );
 
     let output = mur_list(&home, &["-g"])
@@ -152,31 +132,11 @@ fn list_global_shows_multiple_artifacts_sorted_by_name_then_version() {
 }
 
 #[test]
-fn list_global_formats_multiple_platforms_comma_separated() {
-    let home = tempfile::tempdir().unwrap();
-    publish_to_global(
-        &home,
-        artifact_meta(
-            "local/multi-plat",
-            "0.3.0",
-            RuntimeType::Native,
-            vec![("darwin", "arm64"), ("linux", "amd64"), ("linux", "arm64")],
-        ),
-    );
-
-    mur_list(&home, &["-g"])
-        .success()
-        .stdout(predicate::str::contains(
-            "darwin-arm64, linux-amd64, linux-arm64",
-        ));
-}
-
-#[test]
 fn list_global_flag_shows_global_store() {
     let home = tempfile::tempdir().unwrap();
     publish_to_global(
         &home,
-        artifact_meta("local/flag-tool", "0.1.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/flag-tool", "0.1.0", RuntimeType::Wasm),
     );
 
     mur_list(&home, &["-g"])
@@ -194,12 +154,12 @@ fn list_defaults_to_project_store_in_project_dir() {
 
     publish_to_project(
         project.path(),
-        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm),
     );
     // Also publish a different artifact to global — it should NOT appear.
     publish_to_global(
         &home,
-        artifact_meta("local/global-only", "9.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/global-only", "9.0.0", RuntimeType::Wasm),
     );
 
     mur_list_in(&home, project.path(), &[])
@@ -217,11 +177,11 @@ fn list_global_flag_in_project_dir_shows_global_not_project() {
 
     publish_to_project(
         project.path(),
-        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm),
     );
     publish_to_global(
         &home,
-        artifact_meta("local/global-only", "9.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/global-only", "9.0.0", RuntimeType::Wasm),
     );
 
     mur_list_in(&home, project.path(), &["-g"])
@@ -236,7 +196,7 @@ fn list_outside_project_dir_falls_back_to_global_store() {
     // No murmur.yaml in home dir → not a project
     publish_to_global(
         &home,
-        artifact_meta("local/global-tool", "2.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/global-tool", "2.0.0", RuntimeType::Wasm),
     );
 
     // Run from home.path() which has no murmur.yaml
@@ -268,11 +228,11 @@ fn list_all_shows_store_column_with_both_stores() {
 
     publish_to_project(
         project.path(),
-        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm),
     );
     publish_to_global(
         &home,
-        artifact_meta("ana/global-tool", "2.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("ana/global-tool", "2.0.0", RuntimeType::Wasm),
     );
 
     let output = mur_list_in(&home, project.path(), &["--all"])
@@ -313,11 +273,11 @@ fn list_all_project_appears_before_global() {
 
     publish_to_project(
         project.path(),
-        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/proj-tool", "1.0.0", RuntimeType::Wasm),
     );
     publish_to_global(
         &home,
-        artifact_meta("local/global-tool", "2.0.0", RuntimeType::Wasm, vec![]),
+        artifact_meta("local/global-tool", "2.0.0", RuntimeType::Wasm),
     );
 
     let output = mur_list_in(&home, project.path(), &["--all"])

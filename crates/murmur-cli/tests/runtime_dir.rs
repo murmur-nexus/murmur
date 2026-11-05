@@ -3,8 +3,7 @@
 //! workdir, which the capsule's commands can read and cannot change.
 //!
 //! The model is scripted against the anthropic driver fixture. What runs is real: the staged
-//! session, the kernel tier this host reaches, the native fixture tool, the WASM probe fixture and
-//! the `mur` binary. Every `scoped` and `sealed` case runs on this host or prints a `[SKIP-HOST]`
+//! session, the kernel tier this host reaches, the WASM probe fixture and the `mur` binary. Every `scoped` and `sealed` case runs on this host or prints a `[SKIP-HOST]`
 //! line saying why it cannot.
 
 #[path = "common/mod.rs"]
@@ -12,7 +11,6 @@ mod common;
 
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -25,16 +23,10 @@ use tempfile::TempDir;
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
-const FIXTURE_ARTIFACT: &str = "local/tool-fixture";
-const FIXTURE_TOOL: &str = common::FIXTURE_NATIVE_TOOL_NAME;
-const FIXTURE_VERSION: &str = "0.1.0";
 const SKILL: &str = "rd-skill";
 const SKILL_BODY: &str = "# rd skill\n\nThe original guidance of the runtime-directory skill.\n";
 const TASK: &str = "Probe the runtime directory and report.";
 const PROBE_TOOL: &str = "runtime-dir-probe";
-/// The native fixture published under a second name, only to the test store, for a pull.
-const PULLED_ARTIFACT: &str = "local/tool-pulled";
-const PULLED_TOOL: &str = "tool-pulled";
 const PROBE_ARTIFACT: &str = "local/runtime-dir-probe";
 /// The runtime-files line of a [`project`] declaring no WASM tool: `bash` is its one tool that
 /// opens the runtime directory by a fixed name.
@@ -80,10 +72,6 @@ fn bash(command: &str) -> Value {
     json!({ "command": command })
 }
 
-fn probe(operation: &str, path: &Path) -> Value {
-    json!({"operation": operation, "path": path.to_str().unwrap(), "text": "pwned"})
-}
-
 // ── host gate ────────────────────────────────────────────────────────────────
 
 /// Whether this host can run a session at `floor` with a kernel tier and a network namespace,
@@ -111,7 +99,7 @@ fn landlock_abi() -> u8 {
 
 // ── capsule ──────────────────────────────────────────────────────────────────
 
-/// A project: the scripted driver, the native fixture, a local skill, and `extra` YAML under
+/// A project: the scripted driver, a local skill, and `extra` YAML under
 /// `artifacts:` and `capabilities:`.
 struct Project {
     home: TempDir,
@@ -122,7 +110,6 @@ struct Project {
 
 #[derive(Default)]
 struct Spec<'a> {
-    native_fixture: bool,
     plan: bool,
     extra_artifacts: &'a str,
     extra_capabilities: &'a str,
@@ -131,7 +118,7 @@ struct Spec<'a> {
     env_allow: &'a [&'a str],
 }
 
-fn project(endpoint: &str, spec: &Spec<'_>) -> Option<Project> {
+fn project(endpoint: &str, spec: &Spec<'_>) -> Project {
     let home = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -147,21 +134,6 @@ fn project(endpoint: &str, spec: &Spec<'_>) -> Option<Project> {
          gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  - name: {SKILL}\n    \
          source: ./skills/{SKILL}/skill.md\n    runtime: skill\n"
     );
-    if spec.native_fixture {
-        let binary = common::fixture_native_tool_binary()?;
-        let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
-        let fixture = common::create_native_tool_zip(
-            staging.path(),
-            FIXTURE_TOOL,
-            FIXTURE_VERSION,
-            &manifest_bytes,
-            &binary,
-        );
-        common::publish_local(&home, &fixture).success();
-        artifacts.push_str(&format!(
-            "  - name: {FIXTURE_ARTIFACT}\n    version: {FIXTURE_VERSION}\n    runtime: tool\n"
-        ));
-    }
     artifacts.push_str(spec.extra_artifacts);
     let skill_dir = project.path().join("skills").join(SKILL);
     fs::create_dir_all(&skill_dir).unwrap();
@@ -196,12 +168,12 @@ fn project(endpoint: &str, spec: &Spec<'_>) -> Option<Project> {
     );
     let manifest_path = project.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest).unwrap();
-    Some(Project {
+    Project {
         home,
         _staging: staging,
         project,
         manifest: manifest_path,
-    })
+    }
 }
 
 /// The text the model was handed for call `id`.
@@ -212,13 +184,7 @@ fn result_text(server: &common::ScriptedServer, id: &str) -> String {
     text
 }
 
-/// A native fixture probe's `data`.
-fn probe_data(server: &common::ScriptedServer, id: &str) -> Value {
-    let text = result_text(server, id);
-    serde_json::from_str(&text).unwrap_or_else(|_| panic!("{id} returned no probe: {text}"))
-}
-
-// ── commands and native tools cannot change the runtime files ────────────────
+// ── commands cannot change the runtime files ─────────────────────────────────
 
 /// One `RD|<label>|<status>|<stderr>` line per attempt, each made against `target`.
 fn attack_lines(label: &str, target: &str) -> String {
@@ -256,9 +222,7 @@ fn attack_script() -> String {
         "echo \"RD-SKILL|$(cat \"$MURMUR_RUNTIME_DIR/tools/{SKILL}/skill.md\" | head -c 40)\"\n"
     ));
     script.push_str("echo \"RD-MURMUR|$(head -c 40 \"$MURMUR_RUNTIME_DIR/MURMUR.md\")\"\n");
-    script.push_str(&format!(
-        "echo \"RD-ENTRY|$(wc -c < \"$MURMUR_RUNTIME_DIR/tools/{FIXTURE_TOOL}/{FIXTURE_TOOL}\")\"\n"
-    ));
+    script.push_str("echo \"RD-MANIFEST|$(wc -c < \"$MURMUR_RUNTIME_DIR/murmur.yaml\")\"\n");
     script.push_str("echo \"RD-DIR|$MURMUR_RUNTIME_DIR\"\n");
     script
 }
@@ -267,7 +231,7 @@ fn attack_script() -> String {
 fn runtime_files() -> Vec<(&'static str, String)> {
     vec![
         ("skill", format!("tools/{SKILL}/skill.md")),
-        ("entrypoint", format!("tools/{FIXTURE_TOOL}/{FIXTURE_TOOL}")),
+        ("manifest", "murmur.yaml".to_string()),
         ("task", "task.md".to_string()),
         ("murmur", "MURMUR.md".to_string()),
     ]
@@ -292,8 +256,8 @@ fn self_rewriting_plan() -> Value {
     })
 }
 
-/// Runs a session at `floor` with the native tool's probes, and asserts every attempt to
-/// change a runtime file failed and every read-back returned the original.
+/// Runs a session at `floor` whose shell commands and plan steps try to change every runtime file,
+/// and asserts every attempt failed and every read-back returned the original.
 fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass) {
     if skip_host(test, floor) {
         return;
@@ -315,16 +279,13 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
             }
         })
     };
-    let Some(p) = project(
+    let p = project(
         &server.endpoint,
         &Spec {
-            native_fixture: true,
             plan: true,
             ..Spec::default()
         },
-    ) else {
-        panic!("the native fixture tool builds on a host that passes the host check");
-    };
+    );
     let workdir = TempDir::new().unwrap();
     let staged = common::stage_agent_session_at_floor(
         &p.home,
@@ -337,41 +298,11 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
     let records_dir = staged.records_dir.clone();
     fs::write(workdir.path().join("task.md"), TASK).unwrap();
 
-    // The native tool's own write probe on every runtime file, its own entrypoint included,
-    // then its read probe.
-    for (label, rel) in runtime_files() {
-        calls.push((
-            format!("toolu_write_{label}"),
-            FIXTURE_TOOL.to_string(),
-            probe("write", &runtime_dir.join(&rel)),
-        ));
-    }
-    for (label, rel) in runtime_files() {
-        if label == "entrypoint" {
-            continue;
-        }
-        calls.push((
-            format!("toolu_read_{label}"),
-            FIXTURE_TOOL.to_string(),
-            probe("read", &runtime_dir.join(&rel)),
-        ));
-    }
     calls.push(("toolu_skill".to_string(), SKILL.to_string(), json!({})));
     calls.push((
         "toolu_plan".to_string(),
         "submit-plan".to_string(),
         json!({"plan": self_rewriting_plan()}),
-    ));
-    let plan_file = runtime_dir.join("plans/plan-1.json");
-    calls.push((
-        "toolu_write_plan".to_string(),
-        FIXTURE_TOOL.to_string(),
-        probe("write", &plan_file),
-    ));
-    calls.push((
-        "toolu_read_plan".to_string(),
-        FIXTURE_TOOL.to_string(),
-        probe("read", &plan_file),
     ));
     calls.push((
         "toolu_root".to_string(),
@@ -428,45 +359,12 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         assert_eq!(line("RD-TASK|"), TASK);
         assert_eq!(line("RD-SKILL|"), SKILL_BODY.lines().next().unwrap());
         assert!(line("RD-MURMUR|").starts_with("# MURMUR.md"));
-        let entry_len = fs::metadata(common::fixture_native_tool_binary().unwrap())
-            .unwrap()
-            .len();
-        assert_eq!(line("RD-ENTRY|").trim(), entry_len.to_string());
+        let manifest_len = fs::metadata(&p.manifest).unwrap().len();
+        assert_eq!(line("RD-MANIFEST|").trim(), manifest_len.to_string());
         assert_eq!(line("RD-DIR|"), runtime_dir.display().to_string());
     }
 
-    // The native tool's writes fail, its own entrypoint included; its reads return the
-    // originals.
-    let native_refusals = write_refusals(floor, &runtime_dir);
-    for label in runtime_files()
-        .into_iter()
-        .map(|(label, _)| label)
-        .chain(["plan"])
-    {
-        let data = probe_data(&server, &format!("toolu_write_{label}"));
-        assert_eq!(data["ok"], false, "{label}: {data}");
-        let error = data["error"].as_str().unwrap_or_default();
-        // A running binary opened for writing is refused with ETXTBSY before Landlock is asked,
-        // so on `scoped` the fixture's write to its own entrypoint proves nothing about the rule;
-        // the shell's attempts on the same file above are what show Landlock refusing it.
-        let own_image = label == "entrypoint" && error.contains("Text file busy");
-        assert!(
-            native_refusals.iter().any(|text| error.contains(text)) || own_image,
-            "{label} must fail with {native_refusals:?}: {data}"
-        );
-    }
-    if truncate_mediated {
-        let read = |label: &str| probe_data(&server, &format!("toolu_read_{label}"));
-        assert_eq!(read("task")["contents"], TASK);
-        assert_eq!(read("skill")["contents"], SKILL_BODY);
-        assert!(read("murmur")["contents"]
-            .as_str()
-            .unwrap()
-            .starts_with("# MURMUR.md"));
-    }
-
-    // The skill still answers with its original text, and the native tool answered as itself:
-    // every probe above is its own JSON.
+    // The skill still answers with its original text.
     assert!(result_text(&server, "toolu_skill").contains("The original guidance"));
 
     // The plan ran as submitted: the rewrite failed, the second step still ran and read the
@@ -474,10 +372,6 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
     let plan = result_text(&server, "toolu_plan");
     assert!(plan.contains("rewrite-status=1"), "{plan}");
     assert!(plan.contains("readback-ran"), "{plan}");
-    let plan_read = probe_data(&server, "toolu_read_plan");
-    let stored: Value = serde_json::from_str(plan_read["contents"].as_str().unwrap_or_default())
-        .unwrap_or_else(|_| panic!("the plan file is still the submitted plan: {plan_read}"));
-    assert_eq!(stored["id"], "rd-plan", "{plan_read}");
 
     // Inside the root the runtime directory has the host's path, and the account database is the
     // synthetic one, written beside the runtime directory.
@@ -550,198 +444,6 @@ fn runtime_dir_sealed_commands_cannot_change_the_runtime_files() {
     );
 }
 
-// ── a pulled native tool cannot be rewritten and then run ────────────────────
-
-fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
-    use murmur_artifact::{
-        current_platform, ArtifactMeta, ArtifactName, LocalRegistry, Registry, RuntimeType,
-    };
-
-    if skip_host(test, floor) {
-        return;
-    }
-    let binary = common::fixture_native_tool_binary()
-        .expect("the native fixture tool builds on a host that passes the host check");
-    let rewrite = format!(
-        "E=\"$MURMUR_RUNTIME_DIR/tools/{PULLED_TOOL}/{PULLED_TOOL}\"\n\
-         printf '#!/bin/sh\\necho pwned\\n' > ./evil\n\
-         out=$( {{ cp /bin/sh \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
-         out=$( {{ cp ./evil \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
-         out=$( {{ printf '#!/bin/sh\\necho pwned\\n' > \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
-         out=$( {{ mv -f ./evil \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
-         [ -x \"$E\" ] && echo \"RD-PULLED|$E\"\n"
-    );
-    let server_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let server = {
-        let replies = std::sync::Arc::clone(&server_calls);
-        common::ScriptedServer::start_answering(16, move |_| {
-            let mut replies = replies.lock().unwrap();
-            if replies.is_empty() {
-                end_turn("done")
-            } else {
-                replies.remove(0)
-            }
-        })
-    };
-    // The declared fixture is the native tool that attacks the pulled one.
-    let p = project(
-        &server.endpoint,
-        &Spec {
-            native_fixture: true,
-            extra_capabilities: "  install:\n    tool: [\"local/tool-*\"]\n",
-            ..Spec::default()
-        },
-    )
-    .unwrap();
-    let manifest_bytes = fs::read_to_string(common::fixture_native_tool_manifest())
-        .unwrap()
-        .replacen(
-            &format!("name: {FIXTURE_TOOL}\n"),
-            &format!("name: {PULLED_TOOL}\n"),
-            1,
-        );
-    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    {
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        zip.start_file("murmur.yaml", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(manifest_bytes.as_bytes()).unwrap();
-        zip.start_file(
-            format!("bin/{PULLED_TOOL}"),
-            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
-        )
-        .unwrap();
-        zip.write_all(&fs::read(&binary).unwrap()).unwrap();
-        zip.finish().unwrap();
-    }
-    let (os, arch) = current_platform().split_once('-').unwrap();
-    LocalRegistry::new(p.home.path().join(".murmur").join("artifacts"))
-        .publish(
-            ArtifactMeta {
-                name: ArtifactName::parse(PULLED_ARTIFACT).unwrap(),
-                version: FIXTURE_VERSION.to_string(),
-                runtime: RuntimeType::Native,
-                artifact_runtime: "tool".to_string(),
-                platforms: vec![(os.to_string(), arch.to_string())],
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-                owner_id: None,
-                built_at_level: None,
-            },
-            &cursor.into_inner(),
-        )
-        .unwrap();
-    let workdir = TempDir::new().unwrap();
-    fs::write(workdir.path().join("inside.txt"), "inside text").unwrap();
-    let staged = common::stage_agent_session_at_floor(
-        &p.home,
-        p.project.path(),
-        &p.manifest,
-        floor,
-        Some(workdir.path()),
-    );
-    let records_dir = staged.records_dir.clone();
-    let staged_runtime_dir = staged.runtime_dir.clone();
-    fs::write(workdir.path().join("task.md"), "Pull the fixture.").unwrap();
-    let pulled_entrypoint = staged_runtime_dir.join(format!("tools/{PULLED_TOOL}/{PULLED_TOOL}"));
-    *server_calls.lock().unwrap() = vec![
-        tool_call(
-            1,
-            "toolu_pull",
-            "pull-artifact",
-            json!({"artifact": PULLED_ARTIFACT}),
-        ),
-        tool_call(2, "toolu_rewrite", "bash", bash(&rewrite)),
-        tool_call(
-            3,
-            "toolu_native_write",
-            FIXTURE_TOOL,
-            probe("write", &pulled_entrypoint),
-        ),
-        tool_call(
-            4,
-            "toolu_after",
-            PULLED_TOOL,
-            json!({"operation": "read", "path": "inside.txt"}),
-        ),
-    ];
-
-    launch_session(staged, |_| {}).expect("the session runs");
-
-    let pulled = common::find_tool_result(&server.requests(), "toolu_pull")
-        .map(|block| common::extract_result_text(&block))
-        .expect("a pull result");
-    println!("── toolu_pull\n{pulled}");
-    assert!(
-        pulled.contains(&format!("\"tool_name\":\"{PULLED_TOOL}\"")),
-        "{pulled}"
-    );
-    let rewrite = result_text(&server, "toolu_rewrite");
-    let lines: Vec<&str> = rewrite.lines().filter(|l| l.starts_with("RD|")).collect();
-    assert_eq!(lines.len(), 4, "{rewrite}");
-    let entrypoint = format!("tools/{PULLED_TOOL}/{PULLED_TOOL}");
-    assert!(
-        rewrite.contains(&format!(
-            "RD-PULLED|{}",
-            staged_runtime_dir.join(&entrypoint).display()
-        )),
-        "the pull lands in the runtime directory: {rewrite}"
-    );
-    for (index, line) in lines.iter().enumerate() {
-        assert!(!line.starts_with("RD|0|"), "the rewrite must fail: {line}");
-        // The first attempt may already fail reading `/bin/sh`; the others can only fail on the
-        // entrypoint itself.
-        if index > 0 {
-            assert!(
-                line.contains(&entrypoint)
-                    && (line.contains("Permission denied")
-                        || line.contains("Read-only file system")),
-                "the rewrite must be refused on the entrypoint: {line}"
-            );
-        }
-    }
-    // A native tool cannot change another tool's pulled entrypoint either.
-    let native = probe_data(&server, "toolu_native_write");
-    let native_refusals = write_refusals(floor, &staged_runtime_dir);
-    assert_eq!(native["ok"], false, "{native}");
-    assert!(
-        native["error"]
-            .as_str()
-            .is_some_and(|error| native_refusals.iter().any(|text| error.contains(text))),
-        "the native write must fail with {native_refusals:?}: {native}"
-    );
-    let after = result_text(&server, "toolu_after");
-    assert!(!after.contains("pwned"), "{after}");
-    let probe: Value = serde_json::from_str(&after).unwrap_or_else(|_| panic!("{after}"));
-    assert_eq!(probe["ok"], true, "the tool answers as itself: {probe}");
-    assert!(probe.to_string().contains("inside text"));
-    assert!(
-        !records_dir.join("tools").exists(),
-        "the records directory has no tools/"
-    );
-    assert!(!workdir.path().join("tools").exists());
-    assert!(!workdir.path().join(".murmur").exists());
-}
-
-#[test]
-#[allow(clippy::print_stdout)]
-fn runtime_dir_scoped_a_pulled_tool_cannot_be_rewritten_and_run() {
-    pulled_tool_cannot_be_rewritten(
-        "runtime_dir_scoped_a_pulled_tool_cannot_be_rewritten_and_run",
-        ContainmentClass::Scoped,
-    );
-}
-
-#[test]
-#[allow(clippy::print_stdout)]
-fn runtime_dir_sealed_a_pulled_tool_cannot_be_rewritten_and_run() {
-    pulled_tool_cannot_be_rewritten(
-        "runtime_dir_sealed_a_pulled_tool_cannot_be_rewritten_and_run",
-        ContainmentClass::Sealed,
-    );
-}
-
 // ── a WASM file tool reads the runtime directory at murmur-runtime/ ──────────
 
 fn wasm_probe_run(
@@ -790,8 +492,7 @@ fn wasm_probe_run(
             extra_artifacts: &entry,
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let probe = common::create_tool_artifact(
         staging.path(),
         PROBE_ARTIFACT,
@@ -833,7 +534,7 @@ fn runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it() {
         "{report:?}"
     );
     assert!(report
-        .render(true)
+        .render()
         .contains("runtime directory read-only at murmur-runtime/"));
 
     let read = result_text(&server, "toolu_read");
@@ -864,7 +565,7 @@ fn runtime_dir_scoped_wasm_tool_has_no_murmur_runtime() {
         .find(|report| report.artifact == PROBE_TOOL || report.artifact == PROBE_ARTIFACT)
         .unwrap_or_else(|| panic!("{preopens:?}"));
     assert_eq!(report.runtime_dir_reach, None, "{report:?}");
-    assert!(!report.render(true).contains("murmur-runtime"));
+    assert!(!report.render().contains("murmur-runtime"));
     for id in ["toolu_read", "toolu_write", "toolu_list"] {
         let text = result_text(&server, id);
         assert!(text.contains("err:"), "{id}: {text}");
@@ -901,8 +602,7 @@ fn capsule_block_is_the_same_whichever_way_the_task_arrives() {
             plan: true,
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
 
     let cli_workdir = TempDir::new().unwrap();
     Command::cargo_bin("mur")
@@ -997,8 +697,7 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
             env_allow: &[capsule_runtime::RUNTIME_DIR_ENV],
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let mut blocks = Vec::new();
     for round in 0..2 {
         let workdir = TempDir::new().unwrap();
@@ -1097,8 +796,7 @@ fn murmur_md_names_resolve() {
             extra_capabilities: "  install:\n    tool: [\"murmur/tool-*\"]\n",
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let bound_dir = p.project.path().join("skills").join(BOUND);
     fs::create_dir_all(&bound_dir).unwrap();
     fs::write(bound_dir.join("skill.md"), "You are the bound skill.\n").unwrap();
@@ -1272,8 +970,7 @@ fn murmur_md_runtime_directory_names() {
             extra_capabilities: "  install:\n    tool: [\"local/tool-*\"]\n",
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let staging = TempDir::new().unwrap();
     for name in [PROBE_ARTIFACT, PULLED_PROBE_ARTIFACT] {
         let probe = common::create_tool_artifact(
@@ -1367,8 +1064,7 @@ fn ceiling_project(endpoint: &str) -> Project {
             extra_shell: &["sleep"],
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let mut manifest = fs::read_to_string(&p.manifest).unwrap();
     manifest.push_str("lifecycle:\n  shell_grace_secs: 30\n");
     fs::write(&p.manifest, manifest).unwrap();
@@ -1495,7 +1191,7 @@ fn murmur_md_states_the_allowlist_and_an_unlisted_program_exits_126() {
         tool_call(2, "toolu_date", "bash", bash("date")),
         end_turn("done"),
     ]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", p.home.path())
@@ -1533,7 +1229,7 @@ fn task_run(prepare: impl FnOnce(&Path)) -> (common::ScriptedServer, TempDir) {
         ),
         end_turn("done"),
     ]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let workdir = TempDir::new().unwrap();
     prepare(workdir.path());
     let staged = common::stage_agent_session_at_floor(
@@ -1605,7 +1301,7 @@ fn runtime_dir_mur_run_task_writes_nothing_into_the_workdir() {
         ),
         end_turn("done"),
     ]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let workdir = TempDir::new().unwrap();
     Command::cargo_bin("mur")
         .unwrap()
@@ -1709,8 +1405,7 @@ fn runtime_dir_scoped_a_reopen_rewrites_only_the_runtime_task() {
             extra_artifacts: hook_entry,
             ..Spec::default()
         },
-    )
-    .unwrap();
+    );
     let hook = common::hook_wat::create_hook_zip(
         staging.path(),
         "reopen-once",
@@ -1796,7 +1491,7 @@ fn runtime_dir_an_a2a_task_is_written_to_the_runtime_dir() {
         ),
         end_turn("done"),
     ]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let workdir = TempDir::new().unwrap();
     let staged = common::stage_agent_session_at_floor(
         &p.home,
@@ -1819,7 +1514,7 @@ fn runtime_dir_a_task_md_link_in_the_workdir_fails_the_first_task() {
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let workdir = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
     let sentinel = outside.path().join("sentinel.txt");
@@ -1866,7 +1561,7 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
     }
     // Success.
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let staged = common::stage_agent_session_at_floor(
         &p.home,
         p.project.path(),
@@ -1897,7 +1592,7 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
 
     // A failed task: the provider answers nothing usable.
     let server = common::ScriptedServer::start(vec!["not json".to_string()]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let staged = common::stage_agent_session_at_floor(
         &p.home,
         p.project.path(),
@@ -1912,7 +1607,7 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
 
     // Staged and never launched.
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let staged = common::stage_agent_session_at_floor(
         &p.home,
         p.project.path(),
@@ -1937,7 +1632,7 @@ fn runtime_dir_staging_sweeps_unlocked_stale_directories_only() {
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     // Staged once to learn the home this process stages under.
     let first = common::stage_agent_session_at_floor(
         &p.home,
@@ -1999,7 +1694,7 @@ fn runtime_dir_staging_sweeps_unlocked_stale_directories_only() {
 
 /// A project published under `home`, whose `HOME` is also the `--workdir`.
 fn home_is_workdir(endpoint: &str) -> Project {
-    project(endpoint, &Spec::default()).unwrap()
+    project(endpoint, &Spec::default())
 }
 
 fn mur(home: &Path) -> Command {
@@ -2162,7 +1857,7 @@ fn runtime_dir_explain_scope_and_doctor_name_the_runtime_directory() {
             return;
         }
         let server = common::ScriptedServer::start(vec![]);
-        let p = project(&server.endpoint, &Spec::default()).unwrap();
+        let p = project(&server.endpoint, &Spec::default());
         let rendered = mur(p.home.path())
             .args([
                 "run",
@@ -2219,7 +1914,7 @@ fn runtime_dir_explain_scope_and_doctor_name_the_runtime_directory() {
     }
 
     let server = common::ScriptedServer::start(vec![]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let doctor = mur(p.home.path())
         .current_dir(p.project.path())
         .arg("doctor")
@@ -2273,7 +1968,7 @@ fn runtime_dir_workdir_identity_mismatch_refuses_before_writing() {
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let workdir = TempDir::new().unwrap();
     let other = TempDir::new().unwrap();
 
@@ -2305,7 +2000,7 @@ fn runtime_dir_workdir_identity_refuses_a_link_swapped_onto_the_created_director
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
-    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    let p = project(&server.endpoint, &Spec::default());
     let parent = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
     let created = parent.path().join("child");

@@ -16,7 +16,7 @@ We strongly believe that if you own the knowledge domain, you should own the har
 - Secure by default, capability-scoped
 - Reproducible, pinned artifacts
 - Model-agnostic
-- Language-agnostic (WASM or native)
+- Language-agnostic (any language that compiles to a WASM component)
 - Composable from versioned artifacts
 - OCI-native (deploy to a VM or Kubernetes)
 

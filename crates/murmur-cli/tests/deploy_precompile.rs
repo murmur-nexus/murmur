@@ -4,9 +4,7 @@
 //!
 //! Every deploy here goes to a [`LoopbackTarget`]: the real `mur deploy run` and the real target
 //! `mur`, with `ssh` and `scp` shimmed onto a temp dir. The capsule is an agent capsule whose
-//! anthropic driver reaches an in-test upstream, with one WASM tool and one native tool.
-//! The native tool needs the session's network namespace, so each test stands down with
-//! `[SKIP-HOST]` on a host that cannot create one.
+//! anthropic driver reaches an in-test upstream, with one WASM tool and one skill.
 #![cfg(feature = "beta-mur-deploy")]
 
 #[path = "common/mod.rs"]
@@ -32,7 +30,7 @@ use tempfile::TempDir;
 // Installed from their `.mur.zip` files, so filed in the `local` scope.
 const DRIVER: &str = "local/murmur-driver-anthropic";
 const TOOL: &str = "local/echo-tool";
-const NATIVE: &str = "local/native-echo";
+const SKILL: &str = "local/echo-skill";
 const VERSION: &str = "0.1.0";
 const KEY: &str = "sk-loopback-deploy";
 const CEILING_ENV: &str = "MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES";
@@ -78,14 +76,7 @@ impl Deployer {
                 VERSION,
                 &common::fixture_path("run/components/echo-tool.wasm"),
             ),
-            common::create_native_artifact(
-                artifacts.path(),
-                NATIVE,
-                VERSION,
-                "#!/bin/sh\necho '{\"ok\":true}'\n",
-                Some("prints ok"),
-                None,
-            ),
+            common::create_skill_artifact(artifacts.path(), SKILL, VERSION, "# echo\n"),
         ];
         for zip in &zips {
             Command::cargo_bin("mur")
@@ -112,8 +103,8 @@ impl Deployer {
                 "name: deployed-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    \
                  version: {VERSION}\n    runtime: driver\n    gateway:\n      \
                  endpoint: {}\n      api_key: ${{GATEWAY_TEST_KEY}}\n  - name: {TOOL}\n    \
-                 version: {VERSION}\n    runtime: tool\n  - name: {NATIVE}\n    \
-                 version: {VERSION}\n    runtime: tool\ninference:\n  transport: http\n  \
+                 version: {VERSION}\n    runtime: tool\n  - name: {SKILL}\n    \
+                 version: {VERSION}\n    runtime: skill\ninference:\n  transport: http\n  \
                  model: test-model\n  driver:\n    artifact: {DRIVER}\n",
                 upstream.endpoint
             ),
@@ -171,8 +162,6 @@ impl Deployer {
             .args(["deploy", "run", "--host", "127.0.0.1", "--mur-binary"])
             .arg(mur_binary)
             .args([
-                "--deploy-platform",
-                murmur_artifact::current_platform(),
                 "--manifest",
                 self.manifest.to_str().unwrap(),
                 "--env",
@@ -272,16 +261,10 @@ fn real_mur() -> PathBuf {
 // ─── the target ──────────────────────────────────────────────────────────────
 
 /// Where deploy uploads the payload of the full name `name`, relative to the target's root:
-/// `.murmur/artifacts/<scope>/<name>/<version>/<name>-<version>[-<platform>].mur.zip`, the
-/// native tool's file name carrying the deploy platform.
+/// `.murmur/artifacts/<scope>/<name>/<version>/<name>-<version>.mur.zip`.
 fn remote_payload(name: &str) -> String {
     let bare = murmur_artifact::tool_name_of(name);
-    let platform = if name == NATIVE {
-        format!("-{}", murmur_artifact::current_platform())
-    } else {
-        String::new()
-    };
-    format!(".murmur/artifacts/{name}/{VERSION}/{bare}-{VERSION}{platform}.mur.zip")
+    format!(".murmur/artifacts/{name}/{VERSION}/{bare}-{VERSION}.mur.zip")
 }
 
 /// The sha256 of the payload deploy uploaded for `name`.
@@ -322,11 +305,11 @@ fn engine_key(listing: &str, sha256: &str) -> String {
 }
 
 /// Asserts `listing` holds exactly one form and sidecar each for the tool and the driver as
-/// uploaded, owner-only in an owner-only directory, and nothing for the native tool.
+/// uploaded, owner-only in an owner-only directory, and nothing for the skill.
 fn assert_forms_of_tool_and_driver(target: &LoopbackTarget, listing: &str) {
     let tool = uploaded_sha256(target, TOOL);
     let driver = uploaded_sha256(target, DRIVER);
-    let native = uploaded_sha256(target, NATIVE);
+    let skill = uploaded_sha256(target, SKILL);
     let mut lines = listing.lines();
     assert_eq!(lines.next(), Some("dir 700"), "{listing}");
     let entries: Vec<(&str, &str)> = lines
@@ -348,7 +331,7 @@ fn assert_forms_of_tool_and_driver(target: &LoopbackTarget, listing: &str) {
             );
         }
     }
-    assert!(!listing.contains(&native), "{listing}");
+    assert!(!listing.contains(&skill), "{listing}");
 }
 
 /// `commands` with the deploy's `/root/mur-<6 hex>` and the capsule port of `url` replaced by
@@ -465,7 +448,7 @@ fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
     let command = &commands[precompile];
     assert!(command.contains(" precompile --json "), "{command}");
     assert!(command.contains(&format!(" --workdir {dir} ")), "{command}");
-    for name in [DRIVER, TOOL, NATIVE] {
+    for name in [DRIVER, TOOL, SKILL] {
         let path = format!(" /root/{}", remote_payload(name));
         assert!(command.contains(&path), "{path} missing from {command}");
     }

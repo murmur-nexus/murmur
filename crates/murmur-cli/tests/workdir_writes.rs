@@ -299,7 +299,11 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
 // ── The work folder holds only what the agent changed ────────────────────────
 
 const COMPACTOR: &str = "local/compactor";
-const COMPACTION_SUMMARY: &str = "the probe, the notes and the generated folder are in place";
+const COMPACTION_SUMMARY: &str = "the probe, the notes and the generated file are in place";
+
+/// The tool the acceptance runs call: the `runtime-dir-probe` fixture, whose `write` replaces one
+/// file with fixed bytes.
+const PROBE: &str = "runtime-dir-probe";
 const FINAL_ANSWER: &str = "All done.";
 
 /// What one [`run_agent`] left: the work folder, the run's own records directory, its trace and
@@ -343,9 +347,9 @@ fn scripted(id: &str, tool: Option<(&str, Value)>, text: &str, usage: (u64, u64)
     .to_string()
 }
 
-/// The scripted model of the acceptance runs: `command` through `bash`, the fixture native tool's
-/// `create_dir` of `generated` with label `x`, a call whose reported usage crosses the
-/// compaction trigger (400 of a 4000-token input budget), and the end of the turn.
+/// The scripted model of the acceptance runs: `command` through `bash`, a [`PROBE`] `write` of
+/// `generated.txt`, a call whose reported usage crosses the compaction trigger (400 of a
+/// 4000-token input budget), and the end of the turn.
 fn acceptance_responses(command: &str) -> Vec<String> {
     vec![
         scripted(
@@ -356,10 +360,7 @@ fn acceptance_responses(command: &str) -> Vec<String> {
         ),
         scripted(
             "msg_2",
-            Some((
-                common::FIXTURE_NATIVE_TOOL_NAME,
-                json!({"operation": "create_dir", "path": "generated", "label": "x"}),
-            )),
+            Some((PROBE, json!({"op": "write", "path": "generated.txt"}))),
             "",
             (10, 5),
         ),
@@ -373,20 +374,18 @@ fn acceptance_responses(command: &str) -> Vec<String> {
     ]
 }
 
-/// Launch an agent session in-process with `bash` and `extra_shell` allowed, the fixture native
-/// tool installed, an `on-compaction` hook that replaces the context, compaction at 10% of a
-/// 4000-token input budget (a 12192-token window less the fixture driver's 8192 output cap) with
-/// `dump_summaries`, `extra_capabilities` appended under
-/// `capabilities:`, and `workdir` as its `--workdir` when given. `None` when the native tool
-/// fixture cannot be built on this host.
+/// Launch an agent session in-process with `bash` and `extra_shell` allowed, [`PROBE`] installed,
+/// an `on-compaction` hook that replaces the context, compaction at 10% of a 4000-token input
+/// budget (a 12192-token window less the fixture driver's 8192 output cap) with
+/// `dump_summaries`, `extra_capabilities` appended under `capabilities:`, and `workdir` as its
+/// `--workdir` when given.
 fn run_agent(
     responses: Vec<String>,
     delay: std::time::Duration,
     workdir: Option<&Path>,
     extra_shell: &[&str],
     extra_capabilities: &str,
-) -> Option<AgentRun> {
-    let binary = common::fixture_native_tool_binary()?;
+) -> AgentRun {
     let server = ScriptedServer::start_with_delay(responses, delay);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -399,12 +398,11 @@ fn run_agent(
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
     );
     common::publish_local(&home, &driver).success();
-    let tool = common::create_native_tool_zip(
+    let tool = common::create_tool_artifact(
         artifact_dir.path(),
-        common::FIXTURE_NATIVE_TOOL_NAME,
+        PROBE,
         "0.1.0",
-        &fs::read(common::fixture_native_tool_manifest()).unwrap(),
-        &binary,
+        &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
     );
     common::publish_local(&home, &tool).success();
     let hook = create_hook_zip(
@@ -417,7 +415,6 @@ fn run_agent(
     common::publish_local(&home, &hook).success();
 
     let endpoint = &server.endpoint;
-    let tool_name = common::FIXTURE_NATIVE_TOOL_NAME;
     let extra_shell_yaml: String = extra_shell
         .iter()
         .map(|binary| format!("      - {binary}\n"))
@@ -429,7 +426,7 @@ fn run_agent(
             "name: workdir-writes-agent\nversion: 0.1.0\ncontext:\n  max_tokens: 12192\n\
              artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
              runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
-             - name: local/{tool_name}\n    version: 0.1.0\n    runtime: tool\n  \
+             - name: local/{PROBE}\n    version: 0.1.0\n    runtime: tool\n  \
              - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n\
              capabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      \
              - bash\n{extra_shell_yaml}{extra_capabilities}inference:\n  transport: http\n  \
@@ -450,7 +447,7 @@ fn run_agent(
     // the same directory when it returns.
     let records_dir = staged.records_dir.clone();
     staged
-        .write_task_input(b"Probe, write the notes and generate the folder.")
+        .write_task_input(b"Probe, write the notes and generate the file.")
         .unwrap();
 
     let launch_error = match launch_session(staged, |_| {}) {
@@ -467,13 +464,13 @@ fn run_agent(
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    Some(AgentRun {
+    AgentRun {
         work_folder,
         records_dir,
         events,
         launch_error,
         _dirs: vec![home, artifact_dir, project],
-    })
+    }
 }
 
 /// `git` in `repo` with a fixed identity, its stdout.
@@ -519,7 +516,7 @@ fn assert_the_records_hold_home_results_and_summaries(run: &AgentRun) {
 }
 
 /// The acceptance check: a git work folder handed to `--workdir`, a session that runs a shell
-/// command, calls a native tool and compacts, and `git status` lists only what the agent changed.
+/// command, calls a WASM tool and compacts, and `git status` lists only what the agent changed.
 #[test]
 fn a_git_work_folder_shows_only_what_the_agent_changed() {
     if common::skip_without_host_support("a_git_work_folder_shows_only_what_the_agent_changed") {
@@ -531,7 +528,7 @@ fn a_git_work_folder_shows_only_what_the_agent_changed() {
     git(repo.path(), &["add", "README.md"]);
     git(repo.path(), &["commit", "--quiet", "-m", "init"]);
 
-    let Some(run) = run_agent(
+    let run = run_agent(
         acceptance_responses(
             "echo probe > \"$HOME/probe\"; echo agent > notes.txt; echo more >> README.md",
         ),
@@ -539,10 +536,7 @@ fn a_git_work_folder_shows_only_what_the_agent_changed() {
         Some(repo.path()),
         &[],
         "",
-    ) else {
-        eprintln!("SKIP: the native tool fixture could not be built on this host");
-        return;
-    };
+    );
 
     let status = git(
         repo.path(),
@@ -552,7 +546,7 @@ fn a_git_work_folder_shows_only_what_the_agent_changed() {
     lines.sort_unstable();
     assert_eq!(
         lines,
-        [" M README.md", "?? generated/label.txt", "?? notes.txt"],
+        [" M README.md", "?? generated.txt", "?? notes.txt"],
         "{status}"
     );
     assert!(!repo.path().join(".murmur").exists());
@@ -566,20 +560,17 @@ fn a_default_work_folder_holds_only_what_the_agent_wrote() {
     if common::skip_without_host_support("a_default_work_folder_holds_only_what_the_agent_wrote") {
         return;
     }
-    let Some(run) = run_agent(
+    let run = run_agent(
         acceptance_responses("echo probe > \"$HOME/probe\"; echo agent > notes.txt"),
         std::time::Duration::ZERO,
         None,
         &[],
         "",
-    ) else {
-        eprintln!("SKIP: the native tool fixture could not be built on this host");
-        return;
-    };
+    );
 
     let mut files = walk(&run.work_folder, &run.work_folder);
     files.sort_unstable();
-    assert_eq!(files, ["generated", "generated/label.txt", "notes.txt"]);
+    assert_eq!(files, ["generated.txt", "notes.txt"]);
     assert_the_records_hold_home_results_and_summaries(&run);
 }
 
@@ -619,16 +610,13 @@ fn a_work_folder_past_its_ceiling_ends_the_session_under_workdir() {
         ),
         scripted("msg_4", None, "never reached", (10, 5)),
     ];
-    let Some(run) = run_agent(
+    let run = run_agent(
         responses,
         std::time::Duration::ZERO,
         Some(workdir.path()),
         &["sleep"],
         "  resources:\n    workdir_max_bytes: 1048576\n",
-    ) else {
-        eprintln!("SKIP: the native tool fixture could not be built on this host");
-        return;
-    };
+    );
 
     let error = run
         .launch_error

@@ -475,7 +475,7 @@ all — is refused before a connection opens, with the same refusal either way.
 | Pair | `<member name>=http://<member name>.formation.invalid` |
 | Absent | When the member may call nobody. The variable is never set empty |
 | Runtime-owned | `capabilities.env.allow` and `capabilities.shell.baseline_env` neither supply nor replace it |
-| Shell commands, native tools, a `transport: process` harness | Do not receive it. A virtual address works only through the runtime |
+| Shell commands, a `transport: process` harness | Do not receive it. A virtual address works only through the runtime |
 | Set in `mur run`'s own environment | The launch is refused with [`E-RUN-046`](diagnostics.md#e-run-046) |
 
 A shell-script component reads it without a parser:

@@ -4,8 +4,8 @@
 //! change, and which outlives the session.
 //!
 //! The model is scripted against the anthropic driver fixture. What runs is real: the staged
-//! session, the kernel tier this host reaches, the native fixture tool, the `records-hook` WASM
-//! fixture and the `mur` binary. Every `scoped` and `sealed` case runs on this host or prints a
+//! session, the kernel tier this host reaches, the `records-hook` WASM fixture and the `mur`
+//! binary. Every `scoped` and `sealed` case runs on this host or prints a
 //! `[SKIP-HOST]` line saying why it cannot.
 
 #[path = "common/mod.rs"]
@@ -29,9 +29,6 @@ use zip::{
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
-const FIXTURE_ARTIFACT: &str = "local/tool-fixture";
-const FIXTURE_TOOL: &str = common::FIXTURE_NATIVE_TOOL_NAME;
-const FIXTURE_VERSION: &str = "0.1.0";
 const HOOK_ARTIFACT: &str = "local/records-hook";
 const HOOK_VERSION: &str = "0.1.0";
 const TASK: &str = "Probe the records directory and report.";
@@ -75,10 +72,6 @@ fn end_turn(text: &str) -> String {
 
 fn bash(command: &str) -> Value {
     json!({ "command": command })
-}
-
-fn probe(operation: &str, path: &Path) -> Value {
-    json!({"operation": operation, "path": path.to_str().unwrap(), "text": "pwned"})
 }
 
 /// A server answering each request with the next of the calls `calls` will hold, then `done`.
@@ -134,7 +127,7 @@ fn landlock_abi() -> u8 {
 
 // ── capsule ──────────────────────────────────────────────────────────────────
 
-/// A project: the scripted driver, the native fixture, and the `records-hook` fixture declared
+/// A project: the scripted driver and the `records-hook` fixture declared
 /// with `hook_capabilities` (YAML under its `capabilities:`), or no hook when `None`.
 struct Project {
     home: TempDir,
@@ -159,7 +152,7 @@ fn records_hook_zip(dir: &Path) -> PathBuf {
     path
 }
 
-fn project(endpoint: &str, hook_capabilities: Option<&str>, native: bool) -> Project {
+fn project(endpoint: &str, hook_capabilities: Option<&str>) -> Project {
     let home = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -174,22 +167,6 @@ fn project(endpoint: &str, hook_capabilities: Option<&str>, native: bool) -> Pro
         "  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    \
          gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n"
     );
-    if native {
-        let binary = common::fixture_native_tool_binary()
-            .expect("the native fixture tool builds on a host that passes the host check");
-        let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
-        let fixture = common::create_native_tool_zip(
-            staging.path(),
-            FIXTURE_TOOL,
-            FIXTURE_VERSION,
-            &manifest_bytes,
-            &binary,
-        );
-        common::publish_local(&home, &fixture).success();
-        artifacts.push_str(&format!(
-            "  - name: {FIXTURE_ARTIFACT}\n    version: {FIXTURE_VERSION}\n    runtime: tool\n"
-        ));
-    }
     if let Some(capabilities) = hook_capabilities {
         common::publish_local(&home, &records_hook_zip(staging.path())).success();
         artifacts.push_str(&format!(
@@ -228,19 +205,13 @@ fn result_text(server: &common::ScriptedServer, id: &str) -> String {
     text
 }
 
-/// A native fixture probe's `data`.
-fn probe_data(server: &common::ScriptedServer, id: &str) -> Value {
-    let text = result_text(server, id);
-    serde_json::from_str(&text).unwrap_or_else(|_| panic!("{id} returned no probe: {text}"))
-}
-
 fn mur(home: &Path) -> Command {
     let mut command = Command::cargo_bin("mur").unwrap();
     command.env("HOME", home);
     command
 }
 
-// ── commands and native tools cannot change the records ──────────────────────
+// ── commands cannot change the records ───────────────────────────────────────
 
 /// One `RD|<label>|<status>|<stderr>` line per attempt.
 fn attempt(label: &str, command: &str) -> String {
@@ -309,7 +280,7 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
         return;
     }
     let (server, calls) = scripted_server();
-    let p = project(&server.endpoint, Some(RECORDS_GRANT), true);
+    let p = project(&server.endpoint, Some(RECORDS_GRANT));
     let workdir = TempDir::new().unwrap();
     let staged = common::stage_agent_session_at_floor(
         &p.home,
@@ -327,27 +298,11 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
     );
     fs::write(workdir.path().join("task.md"), TASK).unwrap();
 
-    let mut plan: Vec<(String, String, Value)> = vec![(
+    let plan: Vec<(String, String, Value)> = vec![(
         "toolu_attack".to_string(),
         "bash".to_string(),
         bash(&attack_script(&session_id)),
     )];
-    for (label, rel) in [
-        ("trace", "trace.jsonl"),
-        ("eval", "hooks/eval.jsonl"),
-        ("completion", "completion.json"),
-    ] {
-        plan.push((
-            format!("toolu_write_{label}"),
-            FIXTURE_TOOL.to_string(),
-            probe("write", &records.join(rel)),
-        ));
-    }
-    plan.push((
-        "toolu_read_trace".to_string(),
-        FIXTURE_TOOL.to_string(),
-        probe("read", &records.join("trace.jsonl")),
-    ));
     script(&calls, &plan);
 
     launch_session(staged, |_| {}).expect("the session launches");
@@ -397,30 +352,6 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
     }
     assert_eq!(line("RD-DIR|"), records.display().to_string());
 
-    // The native tool's writes fail with the text the kernel gave; its read returns the trace.
-    let native_refusals = write_refusals(floor, &records);
-    for label in ["trace", "eval", "completion"] {
-        let data = probe_data(&server, &format!("toolu_write_{label}"));
-        assert_eq!(data["ok"], false, "{label}: {data}");
-        assert!(
-            native_refusals
-                .iter()
-                .any(|text| data["error"] == format!("{text} (os error {})", errno_of(text))),
-            "{label}: {data}"
-        );
-    }
-    if truncate_mediated {
-        let read = probe_data(&server, "toolu_read_trace");
-        assert_eq!(read["ok"], true, "{read}");
-        assert!(
-            read["contents"]
-                .as_str()
-                .unwrap()
-                .contains("\"session_start\""),
-            "{read}"
-        );
-    }
-
     // After the session the records are the runtime's, whole, and kept.
     assert!(
         records.is_dir(),
@@ -436,8 +367,7 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
         }
         let events = common::read_whole_trace(&records.join("trace.jsonl"));
         assert_eq!(events[0]["event_type"], "session_start");
-        // The session's own record of what it ran under: the records directory protected, and
-        // the native tool reaching the runtime directory through its environment.
+        // The session's own record of what it ran under: the records directory protected.
         let grants = &events[0]["effective_grants"];
         assert_eq!(
             grants["records_dir"]["read_only_to_commands"], true,
@@ -452,13 +382,6 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
                 .display()
                 .to_string()
         );
-        let native = grants["preopens"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|preopen| preopen["artifact"] == FIXTURE_ARTIFACT)
-            .unwrap_or_else(|| panic!("{grants}"));
-        assert_eq!(native["runtime_dir_reach"], "environment", "{native}");
         assert_eq!(
             events.last().unwrap()["event_type"],
             "session_end",
@@ -557,7 +480,7 @@ fn sealed_commands_cannot_change_the_records() {
 /// and its records directory.
 fn hook_run(capabilities: &str) -> (TempDir, PathBuf) {
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
-    let p = project(&server.endpoint, Some(capabilities), false);
+    let p = project(&server.endpoint, Some(capabilities));
     let workdir = TempDir::new().unwrap();
     let staged = common::stage_agent_session_at_floor(
         &p.home,
@@ -609,7 +532,7 @@ fn eval_run_reads_the_records_granted_hook_s_score_and_names_the_grant_otherwise
     }
     for (grant, records) in [(RECORDS_GRANT, true), (SCOPE_GRANT, false)] {
         let server = common::ScriptedServer::start(vec![end_turn("done")]);
-        let p = project(&server.endpoint, Some(grant), false);
+        let p = project(&server.endpoint, Some(grant));
         let task = p.project.path().join("case.md");
         fs::write(&task, TASK).unwrap();
         let dataset = p.project.path().join("dataset.jsonl");
@@ -744,7 +667,7 @@ fn records_dir_explain_scope_and_doctor_name_the_records_directory() {
             return;
         }
         let server = common::ScriptedServer::start(vec![]);
-        let p = project(&server.endpoint, None, false);
+        let p = project(&server.endpoint, None);
         let rendered = mur(p.home.path())
             .args([
                 "run",
@@ -805,7 +728,7 @@ fn records_dir_explain_scope_and_doctor_name_the_records_directory() {
     }
 
     let server = common::ScriptedServer::start(vec![]);
-    let p = project(&server.endpoint, None, false);
+    let p = project(&server.endpoint, None);
     let doctor = mur(p.home.path())
         .current_dir(p.project.path())
         .arg("doctor")
@@ -829,7 +752,7 @@ fn records_dir_explain_scope_and_doctor_name_the_records_directory() {
 #[allow(clippy::print_stdout)]
 fn records_dir_inside_the_workdir_refuses_a_kernel_floor() {
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
-    let p = project(&server.endpoint, None, false);
+    let p = project(&server.endpoint, None);
     let home = p.home.path();
     for floor in ["scoped", "sealed"] {
         let output = mur(home)
@@ -908,7 +831,7 @@ fn records_dir_inside_the_workdir_refuses_a_kernel_floor() {
 #[test]
 fn workdir_exec_under_a_kernel_floor_names_its_own_fix() {
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
-    let p = project(&server.endpoint, None, false);
+    let p = project(&server.endpoint, None);
     let manifest = fs::read_to_string(&p.manifest).unwrap().replace(
         "capabilities:\n",
         "capabilities:\n  filesystem:\n    workdir_exec: true\n",
@@ -960,7 +883,7 @@ fn the_runtime_dir_copies_the_launched_manifest() {
             ),
             end_turn("done"),
         ]);
-        let p = project(&server.endpoint, None, false);
+        let p = project(&server.endpoint, None);
         let scoped = fs::read_to_string(&p.manifest)
             .unwrap()
             .replace("name: records-capsule", "name: local/b");
@@ -1032,7 +955,7 @@ fn an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest() {
         ),
         end_turn("done"),
     ]);
-    let p = project(&server.endpoint, None, false);
+    let p = project(&server.endpoint, None);
     let manifest = fs::read_to_string(&p.manifest).unwrap();
     let body = manifest
         .strip_prefix("name: records-capsule\nversion: 0.1.0\n")
@@ -1103,13 +1026,5 @@ fn write_refusals(floor: ContainmentClass, dir: &Path) -> &'static [&'static str
         &["Permission denied", "Read-only file system"]
     } else {
         &["Permission denied"]
-    }
-}
-
-/// The `errno` the kernel's message `text` is the `strerror` of.
-fn errno_of(text: &str) -> i32 {
-    match text {
-        "Read-only file system" => 30,
-        _ => 13,
     }
 }

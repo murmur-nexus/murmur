@@ -1,4 +1,4 @@
-//! Linux cgroup v2 scoping for a capsule's whole native-subprocess tree.
+//! Linux cgroup v2 scoping for a capsule's whole subprocess tree.
 //!
 //! `resources::apply_hard_rlimits` bounds each spawned process individually. That is necessary
 //! and not sufficient: `RLIMIT_NPROC` is a **per-uid** ceiling, checked against every thread the
@@ -44,7 +44,7 @@
 //!
 //! ## Fail closed, but only where the threat exists
 //!
-//! On Linux, a capsule that can spawn *any* native subprocess and cannot be given a cgroup
+//! On Linux, a capsule that can spawn *any* subprocess and cannot be given a cgroup
 //! refuses to launch (`RuntimeError::CgroupDelegationUnavailable`) rather than running that
 //! subprocess tree unbounded. A capsule that declares no subprocess capability at all needs no
 //! scope and is never blocked — there is no process tree to bound. On macOS, cgroups cannot
@@ -256,7 +256,7 @@ const REQUIRED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SUPERVISOR_LEAF: &str = "murmur-supervisor";
 
-/// A cgroup v2 scope created for one capsule session, holding that session's whole native
+/// A cgroup v2 scope created for one capsule session, holding that session's whole
 /// subprocess tree.
 ///
 /// Constructed once per launch (never per subprocess) so that `pids.max` and `memory.max` bound
@@ -290,7 +290,7 @@ pub(crate) struct CgroupScope {
 /// window. These two counters are what answer that.
 #[derive(Debug, Default)]
 struct Occupancy {
-    /// Shell commands and native tools inside the scope now.
+    /// Shell commands and `murmur:process` programs inside the scope now.
     occupants: AtomicU64,
     /// Entries since the scope was created. Never decremented: a later entry is visible as a
     /// higher number even after it has left.
@@ -392,7 +392,7 @@ pub enum IoMaxStatus {
     /// still enforced on it, and so is `cpu.max` when `cgroup_cpu_percent` sets a cap; I/O
     /// bandwidth is not bounded. What `W-SEC-021` reports.
     Unavailable,
-    /// No scope was asked for: either this capsule declares no way to reach a native subprocess,
+    /// No scope was asked for: either this capsule declares no way to reach a subprocess,
     /// or this is not Linux, where cgroups cannot exist. Not a shortfall — there is no process
     /// tree for a ceiling to apply to.
     NotRequired,
@@ -443,7 +443,7 @@ impl IoMaxReport {
         }
     }
 
-    /// No cgroup scope is required because this capsule can reach no native subprocess.
+    /// No cgroup scope is required because this capsule can reach no subprocess.
     ///
     /// Public, and takes no reason argument: `mur run --explain-scope` has to produce the
     /// byte-for-byte report a launch produces — `trace.rs`'s `session_start_effective_grants_match_explain_scope_json`
@@ -466,7 +466,7 @@ impl IoMaxReport {
 }
 
 /// Whether this session's subprocesses get a delegated cgroup v2 scope, the precondition every
-/// capsule that can run a native subprocess is refused without (`E-RUN-012`).
+/// capsule that can run a subprocess is refused without (`E-RUN-012`).
 ///
 /// [`Self::NotProbed`] is the `Default` so a report nobody filled in claims nothing, on
 /// [`IoMaxStatus`]'s terms.
@@ -479,7 +479,7 @@ pub enum CgroupScopeStatus {
     /// No child cgroup could be created, so a launch of a capsule that needs one is refused with
     /// `E-RUN-012`. Never seen at launch: a refused launch writes no `session_start`.
     Unavailable,
-    /// No scope was asked for: the capsule declares no way to run a native subprocess, or this is
+    /// No scope was asked for: the capsule declares no way to run a subprocess, or this is
     /// not Linux.
     NotRequired,
     /// Nobody asked. The `Default`.
@@ -537,7 +537,7 @@ impl CgroupScopeReport {
         }
     }
 
-    /// No scope is required because this capsule can reach no native subprocess. Public on
+    /// No scope is required because this capsule can reach no subprocess. Public on
     /// [`IoMaxReport::no_scope_required`]'s terms.
     #[must_use]
     pub fn no_scope_required() -> Self {
@@ -621,14 +621,14 @@ impl From<CgroupError> for String {
 
 /// [`CgroupScopeReport::reason`] for the two `not-required` causes, worded for the scope rather
 /// than for the I/O ceiling [`NO_SCOPE_REASON`] speaks of.
-const NO_CGROUP_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so \
+const NO_CGROUP_SCOPE_REASON: &str = "this capsule declares no way to run a subprocess, so \
      a launch creates no cgroup scope for it";
 const NOT_LINUX_CGROUP_REASON: &str =
     "cgroups are a Linux mechanism and this host has none, so a launch creates no cgroup scope";
 
 /// Reason text for the two [`IoMaxStatus::NotRequired`] causes, in one place so `prepare_scope`
 /// and [`probe_scope`] cannot word the same finding differently.
-const NO_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so it is \
+const NO_SCOPE_REASON: &str = "this capsule declares no way to run a subprocess, so it is \
      given no cgroup scope and there is no process tree for an I/O ceiling to apply to";
 /// Why an unconfined session that can start a subprocess has no scope, as `cgroup_scope` and as
 /// `io_max` say it.
@@ -650,7 +650,7 @@ const NOT_LINUX_REASON: &str =
 /// The message `W-SEC-021` carries, minus the limits still enforced and the reason the host gave.
 const IO_MAX_UNAVAILABLE_WARNING: &str = "the declared \
 capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup \
-scope, so this capsule's native subprocess tree has no I/O bandwidth bound";
+scope, so this capsule's subprocess tree has no I/O bandwidth bound";
 
 /// Pure decision for the unenforced-`io.max` warning, split out of
 /// [`warn_for_unenforced_io_max`] the same way `sandbox::aggregate_bounding_warning` is split out
@@ -716,7 +716,7 @@ pub(crate) struct PreparedScope {
 
 /// Decide-and-create entry point, called once per launch before any WASM is instantiated.
 ///
-/// * `required == false` (the capsule declares no way to spawn a native subprocess) → `Ok(None)`
+/// * `required == false` (the capsule declares no way to spawn a subprocess) → `Ok(None)`
 ///   on every platform. There is no process tree to bound, so demanding host configuration here
 ///   would be a regression for WASM-only capsules with nothing to show for it.
 /// * non-Linux → `Ok(None)` always. Never an error: cgroups are structurally impossible there,
@@ -778,17 +778,16 @@ pub(crate) fn prepare_scope(
 /// required either way.
 pub(crate) fn prepare_policy_scope(
     policy: &crate::types::CapabilityPolicy,
-    has_native_artifact: bool,
     session_id: &str,
     workdir: &Path,
 ) -> Result<PreparedScope, String> {
-    let required = requires_process_bounding(policy, has_native_artifact);
+    let required = requires_process_bounding(policy);
     if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
         return prepare_scope(required, &policy.resources, session_id, workdir);
     }
     let reported_bytes_per_sec = policy.resources.cgroup_io_bytes_per_sec;
     if !required {
-        let (io_max, cgroup_scope) = unrequired_scope_reports(policy, has_native_artifact);
+        let (io_max, cgroup_scope) = unrequired_scope_reports(policy);
         return Ok(PreparedScope {
             scope: None,
             io_max,
@@ -831,10 +830,9 @@ pub(crate) fn prepare_policy_scope(
 /// field, the reason that is.
 fn unrequired_scope_reports(
     policy: &crate::types::CapabilityPolicy,
-    has_native_artifact: bool,
 ) -> (IoMaxReport, CgroupScopeReport) {
     let reported_bytes_per_sec = policy.resources.cgroup_io_bytes_per_sec;
-    let has_route = crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact;
+    let has_route = crate::runtime::has_subprocess_route_at_staging(policy);
     if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined && has_route {
         return (
             IoMaxReport::not_required(reported_bytes_per_sec, UNCONFINED_NO_SCOPE_REASON),
@@ -972,12 +970,12 @@ fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
 /// only when `cgroup_io_bytes_per_sec` is declared.
 #[must_use]
 pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Path) -> ScopeProbe {
-    let required = requires_process_bounding(policy, false);
+    let required = requires_process_bounding(policy);
     if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
         return probe_scope(required, &policy.resources, workdir);
     }
     if !required {
-        let (io_max, cgroup_scope) = unrequired_scope_reports(policy, false);
+        let (io_max, cgroup_scope) = unrequired_scope_reports(policy);
         return ScopeProbe {
             cgroup_scope,
             io_max,
@@ -1002,23 +1000,17 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
     probe
 }
 
-/// Does this policy give the capsule any way to run a native subprocess at all?
+/// Does this policy give the capsule any way to run a subprocess at all?
 ///
 /// The exact condition the Linux fail-closed launch refusal keys on: every route
-/// [`crate::runtime::has_subprocess_route_at_staging`] counts (`capabilities.shell.allow`,
-/// `capabilities.spawn.allow`, and `capabilities.install.tool`, whose pattern can match a native
-/// tool a pull installs), or a declared artifact whose implementation is native (passed in by the
-/// caller, which is the only place the installed-artifact list is in hand). The same routes the
-/// `E-CAP-005` egress refusal counts, from the same function.
+/// [`crate::runtime::has_subprocess_route_at_staging`] counts. The same routes the `E-CAP-005`
+/// egress refusal counts, from the same function.
 ///
 /// An unconfined session (a `containment_floor` of
 /// [`murmur_artifact::ContainmentClass::Unconfined`]) additionally requires a `cgroup_*` field
 /// in `capabilities.resources`: it bounds only what the manifest declares.
-pub fn requires_process_bounding(
-    policy: &crate::types::CapabilityPolicy,
-    has_native_artifact: bool,
-) -> bool {
-    let has_route = crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact;
+pub fn requires_process_bounding(policy: &crate::types::CapabilityPolicy) -> bool {
+    let has_route = crate::runtime::has_subprocess_route_at_staging(policy);
     if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined {
         return has_route && crate::resources::declares_cgroup_limit(&policy.declared_resources);
     }
@@ -2587,7 +2579,7 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
     if !cgroup_delegation_available() {
         crate::runtime_err!(
             "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
-             that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
+             that can spawn subprocesses refuses to launch with E-RUN-012 before anything \
              this test observes happens -- see {}",
             murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
         );
@@ -2928,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_is_required_by_any_route_to_a_native_subprocess() {
+    fn scope_is_required_by_any_route_to_a_subprocess() {
         let shell = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -2947,29 +2939,25 @@ mod tests {
         };
         let bare = CapabilityPolicy::default();
 
-        assert!(requires_process_bounding(&shell, false));
-        assert!(requires_process_bounding(&spawn, false));
+        assert!(requires_process_bounding(&shell));
+        assert!(requires_process_bounding(&spawn));
         assert!(
-            requires_process_bounding(&install_tool, false),
-            "a tool the capsule may pull can be native"
+            !requires_process_bounding(&install_tool),
+            "a pulled tool runs a program only through murmur:process, which obeys shell.allow"
         );
         assert!(
-            !requires_process_bounding(&install_skill, false),
+            !requires_process_bounding(&install_skill),
             "a pulled skill gains no grant and runs no subprocess"
         );
         for policy in [&shell, &spawn, &install_tool, &install_skill, &bare] {
             assert_eq!(
-                requires_process_bounding(policy, false),
+                requires_process_bounding(policy),
                 crate::runtime::has_subprocess_route_at_staging(policy),
                 "{policy:?}"
             );
         }
         assert!(
-            requires_process_bounding(&bare, true),
-            "a native artifact alone is enough"
-        );
-        assert!(
-            !requires_process_bounding(&bare, false),
+            !requires_process_bounding(&bare),
             "a WASM-only capsule has no process tree to bound and must not be blocked"
         );
     }
@@ -2985,28 +2973,22 @@ mod tests {
             declared_resources,
             ..Default::default()
         };
-        assert!(requires_process_bounding(
-            &shell(ContainmentClass::Advisory, ResourceCapabilities::default()),
-            false
-        ));
-        assert!(!requires_process_bounding(
-            &shell(
-                ContainmentClass::Unconfined,
-                ResourceCapabilities::default()
-            ),
-            true
-        ));
-        assert!(!requires_process_bounding(
-            &shell(
-                ContainmentClass::Unconfined,
-                ResourceCapabilities {
-                    max_open_files: Some(256),
-                    workdir_max_bytes: Some(1 << 20),
-                    ..Default::default()
-                }
-            ),
-            false
-        ));
+        assert!(requires_process_bounding(&shell(
+            ContainmentClass::Advisory,
+            ResourceCapabilities::default()
+        )));
+        assert!(!requires_process_bounding(&shell(
+            ContainmentClass::Unconfined,
+            ResourceCapabilities::default()
+        )));
+        assert!(!requires_process_bounding(&shell(
+            ContainmentClass::Unconfined,
+            ResourceCapabilities {
+                max_open_files: Some(256),
+                workdir_max_bytes: Some(1 << 20),
+                ..Default::default()
+            }
+        )));
         for declared in [
             ResourceCapabilities {
                 cgroup_memory_bytes: Some(1 << 30),
@@ -3026,7 +3008,7 @@ mod tests {
             },
         ] {
             assert!(
-                requires_process_bounding(&shell(ContainmentClass::Unconfined, declared), false),
+                requires_process_bounding(&shell(ContainmentClass::Unconfined, declared)),
                 "{declared:?}"
             );
             let bare = crate::types::CapabilityPolicy {
@@ -3035,7 +3017,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                !requires_process_bounding(&bare, false),
+                !requires_process_bounding(&bare),
                 "no subprocess route, no scope"
             );
         }
@@ -3047,7 +3029,6 @@ mod tests {
                 ContainmentClass::Unconfined,
                 ResourceCapabilities::default(),
             ),
-            false,
             "ses_unconfined",
             temp.path(),
         )

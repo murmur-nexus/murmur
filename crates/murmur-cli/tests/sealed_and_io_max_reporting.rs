@@ -511,7 +511,7 @@ fn explain_scope_always_carries_an_io_max_object() {
         io_max["status"].as_str(),
         Some("enforced" | "unavailable" | "not-required" | "not-probed")
     ));
-    // A capsule that can reach no native subprocess is given no scope at launch, so the
+    // A capsule that can reach no subprocess is given no scope at launch, so the
     // diagnostic must not exercise a write the launch would never perform.
     assert_eq!(io_max["status"], "not-required");
 }

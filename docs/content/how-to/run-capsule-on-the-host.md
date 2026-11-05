@@ -9,7 +9,7 @@ that, and keeps the trace, the spend ceilings, the turn limit and the policy hoo
 ??? definition "What is the unconfined stance?"
     **Unconfined** is a stance only the operator chooses, with `mur run --unconfined` or
     `containment: unconfined` in `~/.murmur/config.yaml`. The capsule's shell commands, plan shell
-    steps, native tools and process harness then run as your account, with nothing installed
+    steps and process harness then run as your account, with nothing installed
     between them and the host.
 
 The relevant manifest options are:
@@ -102,7 +102,6 @@ Routes
   shell commands    present  unconfined
     Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing holds it.
   plan shell steps  absent   unconfined
-  native tools      absent   unconfined
   WASM tools        absent   host process, not confined by the class
   drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
     Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
@@ -114,7 +113,7 @@ Unconfined
   user:      ana
   uid:       1000
   HOME:      /home/ana
-  applies to: shell commands, plan shell steps, native tools, process harness
+  applies to: shell commands, plan shell steps, process harness
   resource limits: none declared
 ```
 
@@ -130,7 +129,7 @@ mur run --unconfined --task task.md
 ```
 
 ```text
-[capsule-runtime] warning[W-SEC-036]: this capsule runs unconfined: its shell commands, plan shell steps, native tools and process harness run as ana (uid 1000) with HOME /home/ana, the whole environment mur run was started with (credential variables included), the host filesystem and network as that account has them, and no no_new_privs, so sudo works wherever that account's sudoers allows it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-036)
+[capsule-runtime] warning[W-SEC-036]: this capsule runs unconfined: its shell commands, plan shell steps and process harness run as ana (uid 1000) with HOME /home/ana, the whole environment mur run was started with (credential variables included), the host filesystem and network as that account has them, and no no_new_privs, so sudo works wherever that account's sudoers allows it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-036)
 murmur: url localhost:52222
 session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok

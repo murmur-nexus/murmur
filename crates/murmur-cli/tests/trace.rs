@@ -841,7 +841,7 @@ fn session_start_effective_grants_match_explain_scope_json() {
     // these say what they hold. The table is `routes`; schema 2 carries no `mechanism_covers`.
     assert!(grants.get("mechanism_covers").is_none(), "{grants}");
     let routes = grants["routes"].as_array().expect("routes is an array");
-    assert_eq!(routes.len(), 8, "{grants}");
+    assert_eq!(routes.len(), 7, "{grants}");
     let route = |name: &str| {
         routes
             .iter()
@@ -863,7 +863,7 @@ fn session_start_effective_grants_match_explain_scope_json() {
     assert_eq!(route("shell")["mechanism"], grants["enforcement_tier"]);
     assert_eq!(route("wasm-tools")["artifacts"], json!([GRANTS_TOOL_NAME]));
     assert_eq!(route("drivers")["artifacts"], json!([DRIVER_NAME]));
-    // No shell, spawn or install grant and no native tool: the launch asked for no scope.
+    // No shell or spawn grant: the launch asked for no scope.
     assert_eq!(grants["cgroup_scope"]["status"], "not-required", "{grants}");
     // Nothing declared beyond `advisory`: the class is the applied tier's, which on a
     // Landlock-capable host is `scoped` whatever the host could back.

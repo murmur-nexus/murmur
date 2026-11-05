@@ -354,30 +354,13 @@ fn latest_in_store(store: &Path, name: &str) -> Option<StoreArtifact> {
 
 /// The `.mur.zip` installed for the full name `name` at `version` in `store`, if there is one.
 ///
-/// It is filed under `<scope>/<name>/<version>/`, its file named by the bare part. A portable
-/// artifact is stored as `<name>-<version>.mur.zip`; one built per platform carries a target
-/// suffix (`<name>-<version>-linux-x86_64.mur.zip`), so a name-and-version match alone would miss
-/// every native tool. The exact name wins when both are present.
+/// It is filed under `<scope>/<name>/<version>/` as `<name>-<version>.mur.zip`, its file named by
+/// the bare part.
 fn published_zip(store: &Path, name: &str, version: &str) -> Option<PathBuf> {
     let bare = murmur_artifact::tool_name_of(name);
     let dir = store.join(name).join(version);
     let exact = dir.join(format!("{bare}-{version}.mur.zip"));
-    if exact.is_file() {
-        return Some(exact);
-    }
-    let prefix = format!("{bare}-{version}-");
-    let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".mur.zip"))
-        })
-        .collect();
-    candidates.sort();
-    candidates.pop()
+    exact.is_file().then_some(exact)
 }
 
 /// The scratch `$HOME` every capsule in this binary runs under, and the retry setting the two

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use capsule_runtime::served_wit_level;
 use murmur_artifact::{
-    compare_versions, current_platform, version_fit, ArtifactIndex, ArtifactIndexError,
-    ArtifactMeta, FitSubject, LocalRegistry, Registry, VersionFit,
+    compare_versions, version_fit, ArtifactIndex, ArtifactIndexError, ArtifactMeta, FitSubject,
+    LocalRegistry, Registry, VersionFit,
 };
 
 use crate::{
@@ -83,14 +83,13 @@ impl<'a> IndexSource<'a> {
 }
 
 pub(crate) fn run_search(query: &str, index: Option<&str>, limit: usize) -> Result<(), CliError> {
-    let platform = current_platform();
     let entries = match index.map(IndexSource::parse) {
-        Some(IndexSource::GlobalStore) => scan_local(platform)?,
-        Some(IndexSource::File(path)) => index_entries(read_index_file(path)?, platform),
-        Some(IndexSource::Url(url)) => index_entries(fetch_remote(url)?, platform),
+        Some(IndexSource::GlobalStore) => scan_local()?,
+        Some(IndexSource::File(path)) => index_entries(read_index_file(path)?),
+        Some(IndexSource::Url(url)) => index_entries(fetch_remote(url)?),
         None => {
             let url = resolve_index_url()?;
-            index_entries(fetch_remote(&url)?, platform)
+            index_entries(fetch_remote(&url)?)
         }
     };
 
@@ -171,7 +170,7 @@ pub(crate) fn fetch_index_text(url: &str, timeout: Duration) -> Result<String, S
         .map_err(|e| e.to_string())
 }
 
-fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {
+fn index_entries(index: ArtifactIndex) -> Vec<SearchEntry> {
     let scope = index.scope;
     index
         .artifacts
@@ -182,7 +181,7 @@ fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {
                 .versions
                 .iter()
                 .map(|v| {
-                    let fit = version_fit(&FitSubject::indexed(v), served_wit_level(), platform);
+                    let fit = version_fit(&FitSubject::indexed(v), served_wit_level());
                     (v.version.clone(), fit)
                 })
                 .collect(),
@@ -194,9 +193,8 @@ fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {
 }
 
 /// The global store as search entries, one per full name. A version's interfaces are the ones
-/// `mur doctor` reads for it, and its payloads are the platforms its sidecars record, or one
-/// untagged payload when they record none.
-fn scan_local(platform: &str) -> Result<Vec<SearchEntry>, CliError> {
+/// `mur doctor` reads for it.
+fn scan_local() -> Result<Vec<SearchEntry>, CliError> {
     let registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let mut by_name: BTreeMap<String, Vec<ArtifactMeta>> = BTreeMap::new();
     for meta in registry.list_index().map_err(CliError::from)? {
@@ -210,11 +208,10 @@ fn scan_local(platform: &str) -> Result<Vec<SearchEntry>, CliError> {
             let versions = metas
                 .iter()
                 .map(|meta| {
-                    let subject = FitSubject {
-                        contracts: installed_contracts(&registry, meta).unwrap_or_default(),
-                        ..FitSubject::stored(meta, None)
-                    };
-                    let fit = version_fit(&subject, served_wit_level(), platform);
+                    let subject = FitSubject::component(
+                        installed_contracts(&registry, meta).unwrap_or_default(),
+                    );
+                    let fit = version_fit(&subject, served_wit_level());
                     (meta.version.clone(), fit)
                 })
                 .collect();

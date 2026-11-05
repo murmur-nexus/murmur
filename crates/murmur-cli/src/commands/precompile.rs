@@ -62,13 +62,26 @@ fn outcome_text(outcome: Precompiled) -> &'static str {
 /// Compiles every file in `files` as one batch, with one precompiler whose capsule writable root
 /// is `workdir`, and reports them in argument order. Never fails: a file that cannot be read or
 /// has no manifest that parses, or every file when no engine can be built, is
-/// [`Precompiled::Failed`].
+/// [`Precompiled::Failed`]. A file whose packed `murmur.yaml` declares a native tool is that too,
+/// and its `E-RUN-061` refusal is printed to standard error.
 pub(crate) fn precompile_files(files: &[PathBuf], workdir: Option<&Path>) -> PrecompileReport {
     let read: Vec<(Vec<u8>, Option<murmur_artifact::Manifest>)> = files
         .iter()
         .map(|path| {
             let bytes = std::fs::read(path).unwrap_or_default();
-            let manifest = murmur_artifact::load_manifest_from_artifact_bytes(&bytes).ok();
+            let manifest = match murmur_artifact::load_manifest_from_artifact_bytes(&bytes) {
+                Ok(manifest) => Some(manifest),
+                Err(murmur_artifact::ArtifactError::Manifest(
+                    murmur_artifact::ManifestError::NativeTool { name, field },
+                )) => {
+                    capsule_runtime::report_eprintln!(
+                        "{}",
+                        crate::error::native_tool_launch_error(&name, field)
+                    );
+                    None
+                }
+                Err(_) => None,
+            };
             (bytes, manifest)
         })
         .collect();

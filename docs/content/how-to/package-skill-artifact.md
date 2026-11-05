@@ -3,7 +3,7 @@
 A skill artifact packages a `skill.md` file — a Markdown document encoding domain knowledge, conventions, or structured guidance — and the reference files and scripts it points at into a `.mur.zip` the runtime installs alongside a capsule. A skill folder made for Claude Code, Codex or pi builds as it is. Skills are **callable**: the agent invokes a skill by name (no arguments) and receives its full `skill.md` content as the tool result. No file-read capability is required. This lets you ship guidance independently of any particular capsule and install it into any capsule that benefits from it.
 
 ??? definition "What is a skill artifact?"
-    A **skill artifact** is a `.mur.zip` whose required payload is a `skill.md` file, optionally with supporting files beside it. Unlike tool artifacts (WASM or native binaries), a skill artifact installs static files. The runtime writes them under `tools/<name>/` in the session's [runtime directory](../reference/workdir.md#runtime-directory), lists the skill in `MURMUR.md`, and exposes it in the tool inventory as a zero-argument callable. When the agent calls the skill, the runtime reads `skill.md` and returns its content as the tool result — no file-read capability, no subprocess, no WASM. Content is loaded just-in-time, so it only consumes context tokens when the agent chooses to call it.
+    A **skill artifact** is a `.mur.zip` whose required payload is a `skill.md` file, optionally with supporting files beside it. Unlike a tool artifact, which is a WASM component, a skill artifact installs static files. The runtime writes them under `tools/<name>/` in the session's [runtime directory](../reference/workdir.md#runtime-directory), lists the skill in `MURMUR.md`, and exposes it in the tool inventory as a zero-argument callable. When the agent calls the skill, the runtime reads `skill.md` and returns its content as the tool result — no file-read capability, no subprocess, no WASM. Content is loaded just-in-time, so it only consumes context tokens when the agent chooses to call it.
 
 The relevant manifest options are:
 
@@ -456,7 +456,7 @@ The underlying event in `trace.jsonl` looks like this:
 
 | | Tool artifact | Skill artifact |
 |---|---|---|
-| Payload | WASM component or native binary | `skill.md` Markdown file, plus any supporting files |
+| Payload | WASM component | `skill.md` Markdown file, plus any supporting files |
 | Model interaction | Agent calls it as a function with input | Agent calls it by name (no input); runtime returns `skill.md` content and lists the supporting files |
 | Runs code | Yes | No — static file read by the runtime |
 | Requires file-read capability | No | No |

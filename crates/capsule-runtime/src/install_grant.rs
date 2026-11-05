@@ -44,24 +44,23 @@ impl InstallTier {
     ///
     /// Keyed on the payload type, because that is what the pull extracts and so what can
     /// execute: a static payload yields `skill.md` and the files it points at, installed
-    /// read-only and not executable; a WASM or native payload yields code. The declared role
+    /// read-only and not executable; a WASM payload yields code. The declared role
     /// must agree with it. A `driver` or `hook`, or a role that disagrees with its payload, is
     /// never pullable.
     pub(crate) fn of(meta: &ArtifactMeta) -> Option<Self> {
         match (meta.runtime, meta.artifact_runtime.as_str()) {
             (RuntimeType::Static, "skill") => Some(Self::Skill),
-            (RuntimeType::Wasm | RuntimeType::Native, "tool") => Some(Self::Tool),
+            (RuntimeType::Wasm, "tool") => Some(Self::Tool),
             _ => None,
         }
     }
 
-    /// The tier of an artifact a source's index lists, from its packed role and whether a
-    /// payload is platform-tagged, which only a native binary is. A tagged skill, and any role
-    /// but `skill` or `tool`, is never pullable.
-    pub(crate) fn of_indexed(role: &str, platform_tagged: bool) -> Option<Self> {
-        match (role, platform_tagged) {
-            ("skill", false) => Some(Self::Skill),
-            ("tool", _) => Some(Self::Tool),
+    /// The tier of an artifact a source's index lists, from its packed role. Any role but
+    /// `skill` or `tool` is never pullable.
+    pub(crate) fn of_indexed(role: &str) -> Option<Self> {
+        match role {
+            "skill" => Some(Self::Skill),
+            "tool" => Some(Self::Tool),
             _ => None,
         }
     }
@@ -235,8 +234,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use murmur_artifact::{
-        current_platform, read_lockfile, LocalRegistry, PublishResult, Registry, RegistryError,
-        ResolvedArtifact, PACKED_MANIFEST_ENTRY,
+        read_lockfile, LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact,
+        PACKED_MANIFEST_ENTRY,
     };
     use tempfile::TempDir;
 
@@ -270,17 +269,8 @@ mod tests {
             name: &ArtifactName,
             version: &str,
         ) -> Result<ResolvedArtifact, RegistryError> {
-            self.resolve_with_platform(name, version, None)
-        }
-
-        fn resolve_with_platform(
-            &self,
-            name: &ArtifactName,
-            version: &str,
-            platform: Option<&str>,
-        ) -> Result<ResolvedArtifact, RegistryError> {
             self.resolved.lock().unwrap().push(name.to_string());
-            self.inner.resolve_with_platform(name, version, platform)
+            self.inner.resolve(name, version)
         }
 
         fn publish(
@@ -356,21 +346,11 @@ mod tests {
             role: &str,
             bytes: Vec<u8>,
         ) -> String {
-            let platforms = match runtime {
-                RuntimeType::Native => {
-                    let (os, arch) = current_platform()
-                        .split_once('-')
-                        .expect("a supported host platform");
-                    vec![(os.to_string(), arch.to_string())]
-                }
-                _ => Vec::new(),
-            };
             let meta = ArtifactMeta {
                 name: ArtifactName::parse(name).unwrap(),
                 version: version.to_string(),
                 runtime,
                 artifact_runtime: role.to_string(),
-                platforms,
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -434,26 +414,6 @@ mod tests {
             );
         }
 
-        /// Publishes a native tool `name` for this host's platform.
-        pub(crate) fn publish_native_tool(&self, name: &str) {
-            let packed = tool_name_of(name);
-            self.publish(
-                name,
-                RuntimeType::Native,
-                "tool",
-                zip_with_files(&[
-                    (
-                        PACKED_MANIFEST_ENTRY,
-                        format!(
-                            "name: {packed}\nversion: {VERSION}\nruntime: tool\nimplementation: native\n"
-                        )
-                        .as_bytes(),
-                    ),
-                    (&format!("bin/{packed}"), b"#!/bin/sh\necho ok\n"),
-                ]),
-            );
-        }
-
         /// The `tools/<tool name>/` directory artifact `name` installs into.
         pub(crate) fn installed(&self, name: &str) -> PathBuf {
             self.workdir.join("tools").join(tool_name_of(name))
@@ -506,7 +466,6 @@ mod tests {
             version: VERSION.to_string(),
             runtime,
             artifact_runtime: role.to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
@@ -520,12 +479,9 @@ mod tests {
         let cases = [
             (RuntimeType::Static, "skill", Some(InstallTier::Skill)),
             (RuntimeType::Wasm, "tool", Some(InstallTier::Tool)),
-            (RuntimeType::Native, "tool", Some(InstallTier::Tool)),
             (RuntimeType::Wasm, "driver", None),
             (RuntimeType::Wasm, "hook", None),
-            (RuntimeType::Native, "driver", None),
             (RuntimeType::Wasm, "skill", None),
-            (RuntimeType::Native, "skill", None),
             (RuntimeType::Static, "tool", None),
             (RuntimeType::Static, "driver", None),
         ];
@@ -572,7 +528,7 @@ mod tests {
         let lock = read_lockfile(&project.lock_path).unwrap();
         let entry = lock.artifact_for("local/my-skill").unwrap();
         assert_eq!(entry.resolved_version, VERSION);
-        assert_eq!(entry.sha256.any.as_deref(), Some(sha256.as_str()));
+        assert_eq!(entry.sha256.any, sha256);
         assert!(state
             .installed_artifacts
             .iter()
@@ -633,35 +589,25 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_grant_admits_wasm_and_native_tools_and_not_skills() {
-        under_scratch_home("inner_a_tool_grant_admits_wasm_and_native_tools");
+    fn a_tool_grant_admits_wasm_tools_and_not_skills() {
+        under_scratch_home("inner_a_tool_grant_admits_wasm_tools");
     }
 
     #[test]
-    #[ignore = "run by a_tool_grant_admits_wasm_and_native_tools_and_not_skills"]
-    fn inner_a_tool_grant_admits_wasm_and_native_tools() {
+    #[ignore = "run by a_tool_grant_admits_wasm_tools_and_not_skills"]
+    fn inner_a_tool_grant_admits_wasm_tools() {
         if !crate::murmur_home::in_scratch_home() {
             return;
         }
         let project = Project::new();
         project.publish_wasm_tool("local/wasm-tool");
-        project.publish_native_tool("local/native-tool");
         project.publish_skill("local/my-skill", "# guidance");
         // `my-skill` is named in the tool list, so it is the tier and not the name that refuses it.
-        let mut state = project.session(
-            &[],
-            &["local/wasm-tool", "local/native-tool", "local/my-skill"],
-        );
+        let mut state = project.session(&[], &["local/wasm-tool", "local/my-skill"]);
 
         pull(&mut state, "local/wasm-tool").expect("a granted WASM tool pulls");
         assert!(state.tool_components.contains_key("wasm-tool"));
         assert_eq!(cwasm_entries(&scratch_compiled_dir()).len(), 1);
-
-        pull(&mut state, "local/native-tool").expect("a granted native tool pulls");
-        assert!(project
-            .installed("local/native-tool")
-            .join("native-tool")
-            .is_file());
 
         let err = pull(&mut state, "local/my-skill").expect_err("a tool grant admits no skill");
         assert!(err.starts_with("not-granted:"), "{err}");
@@ -919,14 +865,18 @@ mod tests {
     #[test]
     fn a_scoped_pull_installs_under_its_tool_name_and_locks_its_full_name() {
         let project = Project::new();
-        project.publish_native_tool("ana/tool-x");
-        let mut state = project.session(&[], &["ana/tool-*"]);
+        project.publish_skill("ana/tool-x", "# x");
+        let mut state = project.session(&["ana/tool-*"], &[]);
 
-        let summary = pull(&mut state, "ana/tool-x").expect("a granted scoped tool pulls");
+        let summary = pull(&mut state, "ana/tool-x").expect("a granted scoped skill pulls");
 
         assert_eq!(summary.name, "ana/tool-x");
         let dir = project.workdir.join("tools").join("tool-x");
-        assert!(dir.join("tool-x").is_file(), "{:?}", tree(&project.workdir));
+        assert!(
+            dir.join("skill.md").is_file(),
+            "{:?}",
+            tree(&project.workdir)
+        );
         assert!(!project.workdir.join("tools").join("ana").exists());
         let lock = read_lockfile(&project.lock_path).unwrap();
         let entry = lock
@@ -950,8 +900,8 @@ mod tests {
     #[test]
     fn a_scoped_grant_refuses_another_scope_and_a_bare_name() {
         let project = Project::new();
-        project.publish_native_tool("ana/tool-x");
-        project.publish_native_tool("murmur/tool-x");
+        project.publish_skill("ana/tool-x", "# x");
+        project.publish_skill("murmur/tool-x", "# x");
         let mut state = project.session(&[], &["ana/tool-*"]);
         let before = tree(project._dir.path());
 
@@ -982,14 +932,13 @@ mod tests {
     #[test]
     fn a_pull_whose_tool_name_a_staged_artifact_holds_is_refused_before_resolving() {
         let project = Project::new();
-        project.publish_native_tool("ana/tool-y");
-        let mut state = project.session(&[], &["*"]);
+        project.publish_skill("ana/tool-y", "# y");
+        let mut state = project.session(&["*"], &["*"]);
         // `murmur/tool-y` as staging leaves it: an installed entry under its full name.
         state.installed_artifacts.push(InstalledArtifactSummary {
             name: "murmur/tool-y".to_string(),
             version: VERSION.to_string(),
             runtime: murmur_artifact::ArtifactRuntime::Tool,
-            implementation: Some(murmur_artifact::ArtifactImplementation::Native),
             origin: murmur_artifact::LockOrigin::Operator,
         });
         let before = tree(project._dir.path());
@@ -1013,9 +962,9 @@ mod tests {
     #[test]
     fn a_pull_whose_tool_name_a_pulled_artifact_holds_changes_nothing() {
         let project = Project::new();
-        project.publish_native_tool("murmur/tool-y");
-        project.publish_native_tool("ana/tool-y");
-        let mut state = project.session(&[], &["*"]);
+        project.publish_skill("murmur/tool-y", "# y");
+        project.publish_skill("ana/tool-y", "# y");
+        let mut state = project.session(&["*"], &["*"]);
         pull(&mut state, "murmur/tool-y").expect("the first tool-y pulls");
         let lock_before = fs::read(&project.lock_path).unwrap();
         let tree_before = tree(&project.workdir);
@@ -1072,7 +1021,7 @@ mod tests {
             Ok(ArtifactName::parse("local/style-rust").unwrap())
         );
         assert_eq!(
-            refuse_after_resolve(&policy, &jq, &meta(RuntimeType::Native, "tool")),
+            refuse_after_resolve(&policy, &jq, &meta(RuntimeType::Wasm, "tool")),
             None
         );
     }

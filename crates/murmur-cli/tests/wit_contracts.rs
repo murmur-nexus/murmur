@@ -198,17 +198,6 @@ fn payloads_with_no_component_omit_the_key() {
             ),
         ),
         (
-            "contract-native",
-            pack(
-                work.path(),
-                "contract-native",
-                "0.1.0",
-                "tool",
-                "native",
-                &[("bin/contract-native", b"\x7fELF")],
-            ),
-        ),
-        (
             "contract-stub",
             pack(
                 work.path(),
@@ -338,6 +327,5 @@ fn the_default_listing_carries_no_contracts_column() {
     list(&home, &["-g"])
         .success()
         .stdout(predicate::str::contains("NAME"))
-        .stdout(predicate::str::contains("PLATFORMS"))
         .stdout(predicate::str::contains("CONTRACTS").not());
 }

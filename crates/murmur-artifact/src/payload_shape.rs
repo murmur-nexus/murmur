@@ -1,7 +1,7 @@
 //! The shared payload-shape contract for `.mur.zip` artifacts.
 //!
 //! This module is the single place that answers "what counts as a structurally valid wasm /
-//! native / skill payload inside a `.mur.zip`": which entry name holds the payload, and — for
+//! skill payload inside a `.mur.zip`": which entry name holds the payload, and — for
 //! wasm artifacts, where the name is not fixed — which of the archive's root `*.wasm` entries
 //! is selected, or which error the caller must report.
 //!
@@ -31,17 +31,8 @@ pub const CAPSULE_WASM_ENTRY: &str = "capsule.wasm";
 /// The fixed payload entry name for a skill (static) artifact.
 pub const SKILL_MD_ENTRY: &str = "skill.md";
 
-/// The directory holding a native artifact's compiled binary.
-pub const NATIVE_BIN_DIR: &str = "bin";
-
 /// File extension (including the dot) of a wasm payload entry.
 pub const WASM_EXTENSION: &str = ".wasm";
-
-/// The payload entry name for a native artifact: `bin/<artifact_name>`.
-#[must_use]
-pub fn native_binary_entry(artifact_name: &str) -> String {
-    format!("{NATIVE_BIN_DIR}/{artifact_name}")
-}
 
 /// Why a set of archive entries does not describe a valid wasm payload shape.
 ///
@@ -280,10 +271,5 @@ mod tests {
             err.to_string(),
             "multiple root .wasm files found: alpha.wasm, zeta.wasm"
         );
-    }
-
-    #[test]
-    fn native_binary_entry_is_bin_slash_name() {
-        assert_eq!(native_binary_entry("demo"), "bin/demo");
     }
 }

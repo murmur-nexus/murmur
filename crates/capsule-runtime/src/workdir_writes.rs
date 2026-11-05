@@ -599,8 +599,8 @@ mod tests {
     const RUNTIME_DIR_WRITES: &[(&str, &str)] = &[
         (
             "tools",
-            "Every staged and pulled artifact's manifest, `skill.md` and native entrypoint, and \
-             every runtime-provided tool's manifest.",
+            "Every staged and pulled artifact's manifest and `skill.md`, and every \
+             runtime-provided tool's manifest.",
         ),
         (
             "MURMUR.md",
@@ -1131,13 +1131,6 @@ mod tests {
             "open_o_path",
             "An `O_PATH` handle for a Landlock rule, opened from a host path the grant names; it \
              reads and writes nothing.",
-        ),
-        (
-            "sandbox.rs",
-            "open_state_dir",
-            "An `O_PATH` handle for a native tool's state store, `~/.murmur/state/<store>/`, \
-             created by the runtime outside every workdir and opened with no link followed at \
-             its own name; it reads and writes nothing.",
         ),
         (
             "sandbox.rs",

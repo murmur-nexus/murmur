@@ -49,7 +49,7 @@ pub fn manifest_yaml(name: &str, version: &str, body: &str) -> String {
 }
 
 /// Pack a `.mur.zip` with the given manifest and a root `capsule.wasm`, and publish it under the
-/// full name `name` where `resolve_with_platform` will find it; the packed manifest declares the
+/// full name `name` where `resolve` will find it; the packed manifest declares the
 /// bare part.
 ///
 /// `salt` lands in an extra zip entry the runtime never reads, so a coordinate can be republished
@@ -80,7 +80,6 @@ pub fn publish_capsule(registry_root: &Path, name: &str, version: &str, body: &s
                 version: version.to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,

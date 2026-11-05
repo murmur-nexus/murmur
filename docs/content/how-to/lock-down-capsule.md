@@ -172,9 +172,6 @@ The subprocess does not inherit your full host environment. It starts with a min
 !!! info "TMPDIR, TMP and TEMP name the session's temporary folder"
     The runtime sets all three in every subprocess, to `/tmp` where the session maps `/tmp` onto its private temporary folder and to the folder's absolute path where it does not. Neither `baseline_env` nor the host's own values change them. See [The session's temporary folder](../reference/containment.md#temp-folder) for what each tier does.
 
-!!! info "Native tool artifacts get the same treatment"
-    Everything in this step — `HOME` set to the session's home folder, the credential-pattern strip list, `strip_env`, and `baseline_env` — also applies to `runtime: tool` artifacts declared with `implementation: native` (see [Python Tool Quickstart (Native)](../language-guides/python-native.md)), even if the capsule declares no `capabilities.shell.allow` entries at all. A native tool is spawned the way a shell command is, in the same sandbox with the same environment, so there is no separate configuration surface for native tools.
-
 Use `strip_env` to remove baseline variables the agent doesn't need:
 
 ```yaml
@@ -287,7 +284,7 @@ capabilities:
 The effective grant is the intersection of what an artifact declares and the ceiling — it can only ever subtract. Each block does one job:
 
 - **The driver** gets `network.allow: []` and reaches no host directly. Inference is unaffected: the runtime sends the driver's requests to the driver entry's `gateway.endpoint` itself and attaches `gateway.api_key` there, including for a driver call a hook's `run-inference` makes.
-- **The git tool** is a native tool, so it takes no per-artifact block: it runs under the capsule ceiling in the same sandbox as `bash`. It can run `git` because the ceiling's `shell.allow` names it. To fetch from or push to `github.com` it needs `https://github.com` in the ceiling's `network.allow` and, on Linux, an `interpreter_runtime` grant for `git` naming its helper directory (`/usr/lib/git-core` on Debian and Ubuntu): `git` runs its remote helpers from there, and the sandbox refuses them otherwise. See [Native tools](../reference/containment.md#native-tools).
+- **The git tool** takes no per-artifact block, so it inherits the ceiling. It runs `git` through `murmur:process`, which the ceiling's `shell.allow` permits, and that `git` runs in the same sandbox as `bash`. To fetch from or push to `github.com` it needs `https://github.com` in the ceiling's `network.allow` and, on Linux, an `interpreter_runtime` grant for `git` naming its helper directory (`/usr/lib/git-core` on Debian and Ubuntu): `git` runs its remote helpers from there, and the sandbox refuses them otherwise. See [Programs a WASM tool runs](../reference/containment.md#wasm-tool-programs).
 - **The edit tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
 
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.
@@ -345,7 +342,7 @@ Each shell invocation the agent makes appears in the session's [`trace.jsonl`](.
 Per-artifact grants resolve at staging, before the session's records directory exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
 
 - **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/diagnostics.md#w-sec-007).
-- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or declared anything but `state` on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. A native tool runs under the capsule-wide grants, enforced by the same sandbox as a shell command, and its per-artifact block does not narrow them: narrow the capsule-wide block itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
+- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`. Only `network` and `filesystem` narrow; the rest parse but are inert: narrow the capsule-wide block itself. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
 
 Keep credentials out of the manifest itself. Reference them by environment variable — `gateway.api_key: ${ANTHROPIC_API_KEY}` on the driver's artifact entry, as every example above does — never as a literal string. A literal secret prints a [`W-SEC-004`](../reference/diagnostics.md#w-sec-004) warning and risks leaking into version control.
 
@@ -379,6 +376,5 @@ mur trace show
 | `filesystem.scope` on a WASM artifact | A real directory grant, enforced on every platform including macOS |
 | Bare host under a scheme-bound ceiling | Dropped with `W-SEC-007`; write the entry as specifically as the ceiling |
 | `shell`/`spawn`/`env`/`limits` in a per-artifact block | Parsed but inert; prints `W-SEC-008` |
-| Any per-artifact sub-block but `state` on a native tool | Inert; prints `W-SEC-008`. The tool runs under the ceiling, in the same sandbox as `bash`. `state` gives it a [durable store](../reference/containment.md#native-tool-settings) |
 | `gateway.api_key: ${ENV_VAR}` | Keeps secrets out of the manifest; a literal triggers `W-SEC-004` |
 | Non-zero exit code | Passed back to the model as data; the session continues |

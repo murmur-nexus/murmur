@@ -7,7 +7,6 @@ from a release asset. It is test data:
 |---|---|
 | `default_versions` and `commands::new` unit tests in `murmur-cli` | An index the version resolver picks each default artifact's newest fitting version from |
 | `tests/new_roster.rs` | The `--index` every `mur new --roster` case passes, and the versions it expects the scaffold to pin |
-| `tests/native_tool_confinement.rs` | A real published index |
 
 No version `mur` writes, and no version the docs show, is read from it: `mur new` reads the
 latest release's index at run time, and the docs read it at build time.

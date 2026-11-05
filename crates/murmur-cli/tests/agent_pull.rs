@@ -20,8 +20,8 @@ use std::{
 use assert_cmd::{assert::Assert, Command};
 use common::github_release::{publish_dir, write_zip, MockGitHub};
 use murmur_artifact::{
-    current_platform, read_lockfile, write_lockfile_atomic, ArtifactMeta, ArtifactName,
-    LocalRegistry, LockOrigin, LockedSha256, MurmurLock, Registry, RuntimeType, LOCK_VERSION,
+    read_lockfile, write_lockfile_atomic, ArtifactMeta, ArtifactName, LocalRegistry, LockOrigin,
+    LockedSha256, MurmurLock, Registry, RuntimeType, LOCK_VERSION,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -153,23 +153,18 @@ impl Project {
 }
 
 /// Publishes `name@version` into the store rooted at `store`: a packed `murmur.yaml` of
-/// `runtime: role` (plus `implementation: native` for a native tool) and `entries`.
-#[allow(clippy::too_many_arguments)]
+/// `runtime: role` and `entries`.
 fn publish(
     store: &Path,
     name: &str,
     version: &str,
     role: &str,
-    native: bool,
     entries: &[(&str, &[u8])],
     description: Option<&str>,
     owner_id: Option<u64>,
 ) {
     let bare = murmur_artifact::tool_name_of(name);
     let mut manifest = format!("name: {bare}\nversion: {version}\nruntime: {role}\n");
-    if native {
-        manifest.push_str("implementation: native\n");
-    }
     if let Some(description) = description {
         manifest.push_str(&format!("description: {description}\n"));
     }
@@ -180,26 +175,15 @@ fn publish(
             .unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
         for (entry, bytes) in entries {
-            let options = if native {
-                SimpleFileOptions::default().unix_permissions(0o755)
-            } else {
-                SimpleFileOptions::default()
-            };
-            zip.start_file(*entry, options).unwrap();
+            zip.start_file(*entry, SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(bytes).unwrap();
         }
         zip.finish().unwrap();
     }
-    let runtime = match (role, native) {
-        ("skill", _) => RuntimeType::Static,
-        (_, true) => RuntimeType::Native,
+    let runtime = match role {
+        "skill" => RuntimeType::Static,
         _ => RuntimeType::Wasm,
-    };
-    let platforms = if native {
-        let (os, arch) = current_platform().split_once('-').unwrap();
-        vec![(os.to_string(), arch.to_string())]
-    } else {
-        Vec::new()
     };
     LocalRegistry::new(store)
         .publish(
@@ -208,7 +192,6 @@ fn publish(
                 version: version.to_string(),
                 runtime,
                 artifact_runtime: role.to_string(),
-                platforms,
                 description: description.map(str::to_string),
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -237,7 +220,6 @@ fn publish_editors(store: &Path) {
         EDITOR,
         "0.1.0",
         "tool",
-        false,
         &[("tool.wasm", &component("config-echo.wasm"))],
         Some("Edits files"),
         None,
@@ -247,7 +229,6 @@ fn publish_editors(store: &Path) {
         EDITOR,
         "0.2.0",
         "tool",
-        false,
         &[("tool.wasm", &component("echo-tool.wasm"))],
         Some("Edits files"),
         Some(MURMUR_OWNER_ID),
@@ -262,7 +243,6 @@ fn publish_refusal_fixtures(store: &Path) {
         EDITOR,
         "0.3.0",
         "tool",
-        false,
         &[("tool.wasm", &unserved_component())],
         Some("Edits files"),
         None,
@@ -276,7 +256,6 @@ fn publish_refusal_fixtures(store: &Path) {
             name,
             "0.1.0",
             role,
-            false,
             &[("hook.wasm", &component("echo-tool.wasm"))],
             None,
             None,
@@ -287,7 +266,6 @@ fn publish_refusal_fixtures(store: &Path) {
         "murmur/other",
         "0.1.0",
         "tool",
-        false,
         &[("tool.wasm", &component("echo-tool.wasm"))],
         None,
         None,
@@ -795,7 +773,6 @@ fn s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused() {
         EDITOR,
         "0.3.0",
         "tool",
-        false,
         &[("tool.wasm", &unserved_component())],
         None,
         None,
@@ -1440,136 +1417,4 @@ fn s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing() {
     let events = trace(&p.records(&workdir));
     assert!(of_type(&events, "artifact_pulled").is_empty());
     assert!(of_type(&events, "tools_refreshed").is_empty());
-}
-
-// ── S11 ──────────────────────────────────────────────────────────────────────
-
-/// A pulled native tool runs in the capsule's sandbox: a host file outside the workdir is out of
-/// its reach, and one inside is not.
-#[test]
-fn s11_a_pulled_native_tool_is_confined_like_a_declared_one() {
-    let test = "s11_a_pulled_native_tool_is_confined_like_a_declared_one";
-    if common::skip_without_host_support(test) {
-        return;
-    }
-    let floor = murmur_artifact::ContainmentClass::Scoped;
-    let achieved = capsule_runtime::detect_containment_decision(floor)
-        .0
-        .achieved();
-    if achieved < floor {
-        eprintln!("[SKIP-HOST] {test}: this host reaches {achieved}, the test needs {floor}");
-        return;
-    }
-    let Some(binary) = common::fixture_native_tool_binary() else {
-        panic!("the native fixture tool builds on a host that passes the host check");
-    };
-    let outside = tempfile::tempdir().unwrap();
-    let sentinel = outside.path().join("secret.txt");
-    fs::write(&sentinel, "host secret sentinel\n").unwrap();
-
-    let home = tempfile::tempdir().unwrap();
-    let staging = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let workdir = tempfile::tempdir().unwrap();
-    fs::write(workdir.path().join("inside.txt"), "inside text").unwrap();
-    let driver = common::create_driver_artifact(
-        staging.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
-    // The fixture's own manifest, packed under the name the grant reaches.
-    let packed = fs::read_to_string(common::fixture_native_tool_manifest())
-        .unwrap()
-        .replace("name: tool-fixture", "name: tool-probe");
-    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    {
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        zip.start_file("murmur.yaml", SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(packed.as_bytes()).unwrap();
-        zip.start_file(
-            "bin/tool-probe",
-            SimpleFileOptions::default().unix_permissions(0o755),
-        )
-        .unwrap();
-        zip.write_all(&fs::read(&binary).unwrap()).unwrap();
-        zip.finish().unwrap();
-    }
-    let (os, arch) = current_platform().split_once('-').unwrap();
-    LocalRegistry::new(home.path().join(".murmur").join("artifacts"))
-        .publish(
-            ArtifactMeta {
-                name: ArtifactName::parse("murmur/tool-probe").unwrap(),
-                version: "0.1.0".to_string(),
-                runtime: RuntimeType::Native,
-                artifact_runtime: "tool".to_string(),
-                platforms: vec![(os.to_string(), arch.to_string())],
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-                owner_id: None,
-                built_at_level: None,
-            },
-            &cursor.into_inner(),
-        )
-        .unwrap();
-
-    let server = common::ScriptedServer::start(vec![
-        tool_use(
-            1,
-            "toolu_pull",
-            "pull-artifact",
-            json!({"artifact": "murmur/tool-probe"}),
-        ),
-        tool_use(
-            2,
-            "toolu_outside",
-            "tool-probe",
-            json!({"operation": "read", "path": sentinel.to_str().unwrap()}),
-        ),
-        tool_use(
-            3,
-            "toolu_inside",
-            "tool-probe",
-            json!({"operation": "read", "path": "inside.txt"}),
-        ),
-        end_turn("done"),
-    ]);
-    let manifest_path = project.path().join("murmur.yaml");
-    fs::write(
-        &manifest_path,
-        manifest_yaml(&server.endpoint, GRANT, "", ""),
-    )
-    .unwrap();
-    let staged = common::stage_agent_session_at_floor(
-        &home,
-        project.path(),
-        &manifest_path,
-        floor,
-        Some(workdir.path()),
-    );
-    fs::write(staged.accessible_workdir.join("task.md"), "Probe.").unwrap();
-
-    capsule_runtime::launch_session(staged, |_| {}).expect("the session runs");
-
-    let requests = server.requests();
-    let (pulled, is_error) = result(&requests, "toolu_pull");
-    assert!(!is_error, "{pulled}");
-    let (outside_text, _) = result(&requests, "toolu_outside");
-    let outside_probe: Value = serde_json::from_str(&common::unfence(&outside_text)).unwrap();
-    println!("S11 outside: {outside_probe}");
-    assert_eq!(outside_probe["ok"], false, "{outside_probe}");
-    let (inside_text, _) = result(&requests, "toolu_inside");
-    let inside_probe: Value = serde_json::from_str(&common::unfence(&inside_text)).unwrap();
-    println!("S11 inside: {inside_probe}");
-    assert_eq!(inside_probe["ok"], true, "{inside_probe}");
-    assert!(inside_probe.to_string().contains("inside text"));
-    for request in &requests {
-        assert!(
-            !request.to_string().contains("host secret sentinel"),
-            "the sentinel reached a request"
-        );
-    }
 }

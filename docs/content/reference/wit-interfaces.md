@@ -193,26 +193,6 @@ fn host_path(path: &Path) -> Option<PathBuf> {
 [`preopens[].extra_roots`](observability-schemas.md#preopens) of `mur run --explain-scope --json`
 and `session_start`.
 
-### Native tool result { #native-tool-result }
-
-A [native tool](../language-guides/python-native.md) reads one JSON object on stdin and writes one
-on stdout. The stdout object carries the same fields as a `tool-result`:
-
-| Field | Type | Notes |
-|---|---|---|
-| `status` | `"passed"`, `"failed"`, other | Any other value, or none, is `error` |
-| `summary` | string | Optional. The result text when `data` is absent |
-| `data` | string or any JSON value | Optional. A non-string value is passed on serialized |
-| `attachments` | array of `{"media_type": <string>, "path": <string>}` | Optional. The images the call returns, checked as [Returning an image](#tool-attachments) describes. A single object in place of the array is read as a one-entry list. An entry that is not an object of two strings, and any other value that is not an array, is refused `malformed` |
-
-```json
-{"status": "passed", "summary": "took a screenshot", "data": "saved shot.png",
- "attachments": [{"media_type": "image/png", "path": "shot.png"}]}
-```
-
-Stdout that is not JSON becomes the result text as it is, and an empty stdout reports the exit
-status.
-
 ### Stateful driver continuation { #stateful-driver-continuation }
 
 By default the runtime resends the full conversation history on every turn. A driver holding
@@ -419,6 +399,13 @@ pulled. An agent capsule makes the same pulls and removals through the
 [`pull-artifact` and `remove-artifact`](runtime-provided-tools.md#pull-artifact) tools; both paths
 run one implementation and make the same checks.
 
+`list()` and `describe()` label each entry with a `runtime-type`:
+
+| `runtime-type` | Labels |
+|---|---|
+| `wasm` | An installed artifact: a tool, a driver, a hook or a skill |
+| `native` | A program from [`capabilities.shell.allow`](manifest.md#shell-allow), listed by its bare name at version `0.0.0` |
+
 Every function takes and returns artifacts by full name, `<scope>/<name>` — see
 [Artifact names](../concepts/registry.md#artifact-names). The signatures are unchanged: a name is a
 `string`. A name that is not a full name is refused with an error string beginning `not-granted:`,
@@ -515,7 +502,7 @@ A removal deletes the artifact from every place `pull` put it:
 
 | Place | After `remove` |
 |---|---|
-| `tools/<name>/` in the [runtime directory](workdir.md#runtime-directory), `<name>` being the bare part | Deleted: the manifest, `skill.md` and the native binary |
+| `tools/<name>/` in the [runtime directory](workdir.md#runtime-directory), `<name>` being the bare part | Deleted: the manifest, `skill.md` and the component |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
 | `invoke()` | The name leaves the dispatch allowlist. A call to it returns `tool '<name>' was removed from this session; it can no longer be called` |

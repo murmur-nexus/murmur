@@ -112,7 +112,6 @@ fn store_as(root: &Path, name: &str, version: &str, zip: &Path) {
                 version: version.to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "tool".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -439,12 +438,6 @@ fn a_local_store_miss_names_the_file_install_and_asks_no_source() {
         stderr.contains("mur install ./absent-1.0.0.mur.zip"),
         "{stderr}"
     );
-
-    let assert = mur(&home, cwd.path(), &source.api_base)
-        .args(["install", "-g", "--all-platforms", "local/absent@1.0.0"])
-        .assert()
-        .failure();
-    assert!(stderr_of(&assert).contains("error[E-REG-001]"));
 
     for reserved in ["github:local/repo@v1", "github:murmur/repo@v1"] {
         let assert = mur(&home, cwd.path(), &source.api_base)

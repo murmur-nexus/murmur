@@ -23,45 +23,16 @@ use serde_json::{json, Value};
 const DRIVER: &str = "local/fixture-process-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
-/// The native tool every scenario calls through the bridge.
-const TOOL: &str = "png-tool";
-/// The text the tool answers with, so its result's text item can be found.
-const TOOL_OUTPUT: &str = "PNG-TOOL-RAN";
+/// The `image-tool` fixture every scenario calls through the bridge. It writes its images into the
+/// work folder and names them in its text, `attached <path>, <path>…`.
+const TOOL: &str = "image-tool";
 
-/// The PNG signature as `printf` octal escapes, then a short payload. The shell's `printf`
-/// builtin writes it: a native tool execs only what `shell.allow` grants.
-const PNG_PRINTF: &str = r"\211PNG\r\n\032\nIHDRpayload";
-
-/// The bytes [`PNG_PRINTF`] writes.
-fn png_bytes() -> Vec<u8> {
-    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    bytes.extend_from_slice(b"IHDRpayload");
-    bytes
-}
-
-/// What one scenario's tool does and names.
+/// What one scenario asks of the tool.
 struct Scenario<'a> {
-    /// Shell lines the tool runs in the work folder before it answers.
-    writes: String,
-    /// The envelope's `attachments` value as JSON, or `None` for an envelope without the key.
-    attachments: Option<String>,
+    /// The tool's input: its `mode` and that mode's settings, as the harness sends them.
+    input: Value,
     /// Extra manifest lines, top level.
     manifest_extra: &'a str,
-}
-
-impl Scenario<'_> {
-    fn tool_script(&self) -> String {
-        let attachments = self
-            .attachments
-            .as_ref()
-            .map(|list| format!(r#","attachments":{list}"#))
-            .unwrap_or_default();
-        format!(
-            "#!/bin/sh\n{}\necho '{{\"status\":\"passed\",\"summary\":\"ok\",\"data\":\"{TOOL_OUTPUT}\",\
-             \"data_path\":null,\"truncated\":false,\"metadata\":[]{attachments}}}'\n",
-            self.writes
-        )
-    }
 }
 
 /// What one launched session left behind.
@@ -140,17 +111,15 @@ fn run_session(scenario: &Scenario<'_>) -> Session {
         "",
     );
     common::publish_local(&home, &driver).success();
-    let tool = common::create_native_artifact(
+    let tool = common::create_tool_artifact(
         artifact_dir.path(),
         TOOL,
         "0.1.0",
-        &scenario.tool_script(),
-        Some("Fixture image tool"),
-        None,
+        &common::fixture_path("image-tool/tool/image-tool.wasm"),
     );
     common::publish_local(&home, &tool).success();
 
-    let harness = write_harness(project.path(), r#"{"shot":1}"#);
+    let harness = write_harness(project.path(), &scenario.input.to_string());
     let manifest = format!(
         "name: process-images\n\
          version: 0.1.0\n\
@@ -221,7 +190,7 @@ fn refused(path: &str, code: &str) -> Value {
     json!([{ "path": path, "media_type": "image/png", "refused": code }])
 }
 
-/// A tool that writes a PNG and names it: the answer is the text item, naming the image, then the
+/// A tool that writes a PNG and attaches it: the answer is the text item, naming the image, then the
 /// image item holding exactly the file's bytes; the record carries `attachments` and a
 /// placeholder where the harness's report repeated the base64; nothing is stored.
 #[test]
@@ -230,12 +199,14 @@ fn bridged_png_answers_text_then_image() {
         return;
     }
     let session = run_session(&Scenario {
-        writes: format!("printf '{PNG_PRINTF}' > a.png"),
-        attachments: Some(r#"[{"media_type":"image/png","path":"a.png"}]"#.to_string()),
+        input: json!({"mode": "png"}),
         manifest_extra: "",
     });
-    let png = fs::read(session.workdir.join("a.png")).unwrap();
-    assert_eq!(png, png_bytes(), "the tool wrote the PNG");
+    let png = fs::read(session.workdir.join("img-1.png")).unwrap();
+    assert!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the tool wrote the PNG"
+    );
     let sha = murmur_artifact::sha256_hex(&png);
     let n = png.len();
 
@@ -243,9 +214,11 @@ fn bridged_png_answers_text_then_image() {
     let content = answer["content"].as_array().unwrap();
     assert_eq!(content.len(), 2, "{answer}");
     let text = session.answer_text();
-    assert!(text.contains(TOOL_OUTPUT), "{text}");
+    assert!(text.contains("attached img-1.png"), "{text}");
     assert!(
-        text.contains(&format!("[image attached: a.png, image/png, {n} bytes]")),
+        text.contains(&format!(
+            "[image attached: img-1.png, image/png, {n} bytes]"
+        )),
         "{text}"
     );
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
@@ -262,7 +235,7 @@ fn bridged_png_answers_text_then_image() {
     let call = session.tool_call();
     assert_eq!(
         call["attachments"],
-        json!([{ "path": "a.png", "media_type": "image/png", "bytes": n, "sha256": sha }])
+        json!([{ "path": "img-1.png", "media_type": "image/png", "bytes": n, "sha256": sha }])
     );
     let output = call["output"]
         .as_str()
@@ -301,16 +274,15 @@ fn bridged_png_answers_text_then_image() {
     );
 }
 
-/// A tool that attaches nothing gets one text item and `isError`, nothing else, and its record has
-/// no `attachments` key.
+/// A tool that writes and attaches nothing gets one text item and `isError`, nothing else, and its
+/// record has no `attachments` key.
 #[test]
 fn bridged_call_without_attachment_answers_as_today() {
     if common::skip_without_host_support("bridged_call_without_attachment_answers_as_today") {
         return;
     }
     let session = run_session(&Scenario {
-        writes: format!("printf '{PNG_PRINTF}' > a.png"),
-        attachments: None,
+        input: json!({"mode": "none"}),
         manifest_extra: "",
     });
     let answer = session.answer();
@@ -323,7 +295,7 @@ fn bridged_call_without_attachment_answers_as_today() {
     item_keys.sort();
     assert_eq!(item_keys, ["text", "type"]);
     let text = session.answer_text();
-    assert!(text.contains(TOOL_OUTPUT), "{text}");
+    assert!(text.contains("attached"), "{text}");
     assert!(!text.contains("[image attached"), "{text}");
     let call = session.tool_call();
     assert!(call.get("attachments").is_none(), "{call}");
@@ -337,30 +309,30 @@ fn bridged_refusals() {
     if common::skip_without_host_support("bridged_refusals") {
         return;
     }
-    // 8 signature bytes, `IHDRpayload`, then 40 × 40 bytes: 1619 bytes.
-    let big = format!(
-        "printf '{PNG_PRINTF}' > big.png\ni=0\nwhile [ $i -lt 40 ]; do \
-         printf '0123456789012345678901234567890123456789' >> big.png; i=$((i+1)); done"
-    );
+    // `big` writes the 8 signature bytes and then `bytes` zero bytes: 1619 bytes.
     let cases = [
         (
-            "printf 'just some text' > note.png".to_string(),
+            json!({"mode": "text_png"}),
             "note.png",
             "",
             "content_mismatch",
         ),
         (
-            big,
+            json!({"mode": "big", "bytes": 1611}),
             "big.png",
             "context:\n  images:\n    max_bytes: 1Ki\n",
             "too_large",
         ),
-        (String::new(), "../escape.png", "", "outside_root"),
+        (
+            json!({"mode": "escape"}),
+            "../escape.png",
+            "",
+            "outside_root",
+        ),
     ];
-    for (writes, path, manifest_extra, code) in cases {
+    for (input, path, manifest_extra, code) in cases {
         let session = run_session(&Scenario {
-            writes,
-            attachments: Some(format!(r#"[{{"media_type":"image/png","path":"{path}"}}]"#)),
+            input,
             manifest_extra,
         });
         let answer = session.answer();
@@ -390,46 +362,40 @@ fn bridged_refusals() {
     }
 }
 
-/// Six valid PNGs named by one call, under the default `context.images`: the first five are image
+/// Six valid PNGs attached by one call, under the default `context.images`: the first five are image
 /// items, the sixth is refused with `turn_limit`.
 #[test]
 fn bridged_call_caps_images_per_call() {
     if common::skip_without_host_support("bridged_call_caps_images_per_call") {
         return;
     }
-    let writes: Vec<String> = (0..6)
-        .map(|i| format!("printf '{PNG_PRINTF}{i}' > {i}.png"))
-        .collect();
-    let attachments: Vec<String> = (0..6)
-        .map(|i| format!(r#"{{"media_type":"image/png","path":"{i}.png"}}"#))
-        .collect();
     let session = run_session(&Scenario {
-        writes: writes.join("\n"),
-        attachments: Some(format!("[{}]", attachments.join(","))),
+        input: json!({"mode": "many", "count": 6}),
         manifest_extra: "",
     });
     let answer = session.answer();
     let content = answer["content"].as_array().unwrap();
     assert_eq!(content.len(), 6, "one text item and five images: {answer}");
-    for (i, item) in content[1..].iter().enumerate() {
+    for (i, item) in (1..).zip(&content[1..]) {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(item["data"].as_str().unwrap())
             .unwrap();
         assert_eq!(
             decoded,
-            fs::read(session.workdir.join(format!("{i}.png"))).unwrap()
+            fs::read(session.workdir.join(format!("img-{i}.png"))).unwrap()
         );
     }
     let text = session.answer_text();
-    for i in 0..5 {
+    for i in 1..=5 {
         assert!(
-            text.contains(&format!("[image attached: {i}.png, image/png, ")),
+            text.contains(&format!("[image attached: img-{i}.png, image/png, ")),
             "{text}"
         );
     }
     let line = text.lines().last().unwrap();
     assert!(
-        line.starts_with("attachment '5.png' was not attached: ") && line.ends_with("(turn_limit)"),
+        line.starts_with("attachment 'img-6.png' was not attached: ")
+            && line.ends_with("(turn_limit)"),
         "{line}"
     );
     let entries = session.tool_call()["attachments"]
@@ -438,5 +404,5 @@ fn bridged_call_caps_images_per_call() {
         .clone();
     assert_eq!(entries.len(), 6);
     assert!(entries[..5].iter().all(|e| e["sha256"].is_string()));
-    assert_eq!(entries[5], refused("5.png", "turn_limit")[0]);
+    assert_eq!(entries[5], refused("img-6.png", "turn_limit")[0]);
 }

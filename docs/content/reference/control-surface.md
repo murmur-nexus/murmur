@@ -19,7 +19,7 @@ command. `control.agent_settings` lets the agent change a setting about itself t
 runtime-provided [`switch-driver`](runtime-provided-tools.md#switch-driver) tool, which the runtime
 answers in-process without the token or the surface.
 
-Where the session's filesystem restriction is `advisory`, a shell command or native tool can read
+Where the session's filesystem restriction is `advisory`, a shell command can read
 any file you can, the [token file](#token) included: on such a host, do not grant
 `capabilities.shell` to a capsule whose controls the agent must not reach. `mur run --explain-scope
 --json` reports the restriction as

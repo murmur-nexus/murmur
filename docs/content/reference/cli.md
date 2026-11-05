@@ -396,8 +396,8 @@ or the command refuses with `E-MAN-003` naming `inference.endpoint`.
 
 #### Driver version { #mur-new-roster-driver-version }
 
-Both members pin the newest version of the provider's driver that fits this `mur`: its WIT level
-and a payload for this platform, as [`mur search`](#mur-search) lists in its `VERSION` column and
+Both members pin the newest version of the provider's driver that fits this `mur`'s WIT level,
+as [`mur search`](#mur-search) lists in its `VERSION` column and
 `mur install <scope>/<name>` with no version installs.
 
 | `--index` | Index read |
@@ -615,7 +615,7 @@ mur build .
 - Packages **`murmur.yaml` plus exactly the files listed in `requires_files:`** — the rest of the
   source directory (`src/`, `Cargo.toml`, `README.md`, editor files, build output) is not packaged.
   `mur build` never compiles anything, so a `.wasm` payload must already exist on disk and be
-  declared. A native or static artifact that declares no `requires_files:` builds to a
+  declared. A static artifact that declares no `requires_files:` builds to a
   manifest-only archive; a **wasm** artifact does not — with no root `*.wasm` to pack it fails
   with [`E-BLD-003`](diagnostics.md#e-bld-003).
 - Validates the manifest `name:`, the `requires_files:` paths and the resulting payload shape,
@@ -733,14 +733,14 @@ See also: [Package a skill into an artifact](../how-to/package-skill-artifact.md
 Publish an existing artifact into the global store as `local/<name>`, at `~/.murmur/artifacts/local/<name>/<version>/`. `<name>` is the `name:` the artifact's own `murmur.yaml` declares.
 
 ```bash
-mur publish [artifact_path] [--platform <os-arch>]
+mur publish [artifact_path]
 ```
 
 - If `artifact_path` is omitted, CLI infers `<name>-<version>.mur.zip` from local `murmur.yaml`
 - `--registry` is refused with exit status 2 and a hint naming the global store
-- `--platform` overrides the platform tag (format: `os-arch`, e.g. `darwin-aarch64`). When omitted for a native artifact (`implementation: native` in the zip's `murmur.yaml`), the platform is **auto-detected** from the current build host. WASM artifacts publish without a platform tag regardless.
+- A payload whose `murmur.yaml` declares `implementation: native` or `execution: native` is refused with [`E-REG-012`](diagnostics.md#e-reg-012), and nothing is stored
 
-Example — WASM artifact (no platform tag):
+Example:
 
 ```bash
 mur publish my-tool-0.1.0.mur.zip
@@ -748,17 +748,6 @@ mur publish my-tool-0.1.0.mur.zip
 
 ```text
 Published local/my-tool@0.1.0
-```
-
-Example — native artifact (auto-detected platform):
-
-```bash
-mur publish my-native-tool-0.1.0.mur.zip
-```
-
-```text
-Platform: darwin-aarch64 (auto-detected)
-Published local/my-native-tool@0.1.0
 ```
 
 Reserved versions rejected:
@@ -792,21 +781,18 @@ mur install <ref>...
 # Install into the global store (~/.murmur/artifacts/) instead of the project store
 mur install -g <ref>
 
-# Download all platform variants into the global store (CI / cross-platform seeding)
-mur install --all-platforms <scope/name@version>
 ```
 
 | Form | Behavior |
 |---|---|
 | `mur install` (no args) | Reads `murmur.yaml` in or above CWD; fetches all declared artifacts in parallel into the project-local store (`.murmur/artifacts/` next to the manifest) |
-| `mur install --frozen` | Installs the manifest's artifacts at exactly the versions and hashes `murmur.lock` pins, and never writes `murmur.lock`. Refused with [`E-REG-005`](workdir.md#lockfile-murmurlock) before anything is fetched when there is no `murmur.lock`, when a declared artifact has no entry, or when its `murmur.yaml` version is not the one its entry pins; an artifact whose bytes disagree with its entry, or a native artifact whose entry pins no hash for this platform, fails with `E-REG-005` before it is stored. Takes no reference, `-g` or `--all-platforms` (exit status 2) |
+| `mur install --frozen` | Installs the manifest's artifacts at exactly the versions and hashes `murmur.lock` pins, and never writes `murmur.lock`. Refused with [`E-REG-005`](workdir.md#lockfile-murmurlock) before anything is fetched when there is no `murmur.lock`, when a declared artifact has no entry, or when its `murmur.yaml` version is not the one its entry pins; an artifact whose bytes disagree with its entry, fails with `E-REG-005` before it is stored. Takes no reference or `-g` (exit status 2) |
 | `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked. A version that does not [fit this `mur`](installing-artifacts.md#version-selection) is refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched |
 | `mur install <scope/name>` | Fetches the newest version that [fits this `mur`](installing-artifacts.md#version-selection) from the source of the scope |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
 | `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
 | `mur install <ref> <ref>...` | Installs each reference in the order given, then compiles them together; see [Several references](#mur-install-several) |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
-| `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --no-precompile` | Installs without compiling and without keeping host facts; a project install then writes nothing under `~/.murmur`. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch. In a project it also keeps the [host facts](containment.md#host-facts) of the manifest's `capabilities.shell.allow` binaries, Behavior step 6 below |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). A pinned version that does not fit this `mur` refuses the whole install before anything is fetched or written. An install refused for any reason before its first write leaves the project as it was, with no `.murmur/artifacts/` created. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
@@ -895,8 +881,6 @@ With more than one reference, `mur install`:
         error[E-IO-003]: failed to read ./missing.mur.zip: No such file or directory (os error 2)
     ```
 
-`--all-platforms` takes exactly one reference; with more it is refused with `E-IO-003` before anything is written.
-
 ---
 
 ## `mur precompile`
@@ -919,7 +903,7 @@ Each WASM tool, driver and hook is compiled under this machine's `mur` build and
 |---|---|---|
 | `compiled` | `compiled` | Compiled, and stored unless `compiled/` cannot be written or `--workdir` holds it back |
 | `already stored` | `already_stored` | A usable compiled form was already in `compiled/`; nothing was written |
-| `not wasm` | `not_wasm` | A native tool, a skill or a capsule; nothing to compile |
+| `not wasm` | `not_wasm` | A skill or a capsule; nothing to compile |
 | `failed` | `failed` | The file could not be read, is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile. Its first launch compiles it, or fails, as it would have |
 
 **Text output** — one line per file: the outcome, then `name@version`, or the path when the file has no readable manifest.
@@ -981,32 +965,32 @@ interface for an artifact that imports it as much as for one that exports it.
 Example output (`mur list`):
 
 ```text
-NAME                     VERSION  RUNTIME  PLATFORMS
-murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
-murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
+NAME                     VERSION  RUNTIME
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver
+murmur/tool-git          {{ v.murmur_tool_git }}    tool
 ```
 
 Example output (`mur list --all`):
 
 ```text
-STORE    NAME                     VERSION  RUNTIME  PLATFORMS
-project  murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
-global   murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
+STORE    NAME                     VERSION  RUNTIME
+project  murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver
+global   murmur/tool-git          {{ v.murmur_tool_git }}    tool
 ```
 
 Example output (`mur list -g --contract murmur:tool`):
 
 ```text
-NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
-murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.2.0
-murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.2.0
+NAME                     VERSION  RUNTIME  CONTRACTS
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   murmur:tool-registry/invoke@0.2.0
+murmur/tool-git          {{ v.murmur_tool_git }}    tool     murmur:tool/run@0.2.0
 ```
 
 ---
 
 ## `mur doctor`
 
-Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store, current-platform resolution `mur run` performs before staging. In a formation directory, check that its `roster.yaml` is admitted.
+Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store resolution `mur run` performs before staging. In a formation directory, check that its `roster.yaml` is admitted.
 
 ```bash
 mur doctor [--bind <ADDR>]
@@ -1027,15 +1011,13 @@ In a project, it prints one checklist line per declared artifact:
 
 | Line | Meaning |
 |---|---|
-| `✓ name@version   <platform>` | A native tool whose `bin/<name>` binary was read and identified as this host's platform |
-| `✓ name@version   platform-independent` | The payload runs the same on every platform: a skill, a WASM tool, a driver, a hook |
-| `✓ name@version   platform unverified` | A native tool whose `bin/<name>` payload is in a format the platform check does not recognise, such as a shell script |
+| `✓ name@version   installed` | Resolved from the project store or the global store |
 | `✓ name@version   local source` | Declared with a `source:` path; resolved from the filesystem at stage time, never checked against a store or a lockfile |
-| `✗ name@version   <platform>   — missing` | Resolved from neither store |
-| `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` | The artifact holds a host executable this machine cannot run; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021) |
+| `✗ name@version   — missing` | Resolved from neither store |
+| `✗ name@version   — error[E-RUN-061]: installed artifact <scope>/<name> declares <field>: native in its murmur.yaml; …` | The installed payload declares a native implementation; `mur run` refuses it before any session starts. See [`E-RUN-061`](diagnostics.md#e-run-061) |
 | `✗ name@version   — built against <interface>, this mur serves <package>@<version>` | The artifact names an interface version this `mur` does not serve, and `mur run` refuses it at launch. The line ends `this mur serves no version of <package>` when this `mur` has no such package, and `(+N more)` follows when the artifact names several. See [WIT level](#doctor-interface-versions) |
 
-Every green line means the artifact resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
+Every green line means the artifact resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below).
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
@@ -1131,9 +1113,9 @@ Read-only paths
     - bench/fixtures
   read_only enforcement: enforced for every tool call and every shell command the dispatch check can read
 
-Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}   platform-independent
-  ✓  murmur/tool-git@{{ v.murmur_tool_git }}            darwin-aarch64
+Checking /path/to/murmur.yaml...
+  ✓  murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}   installed
+  ✓  murmur/tool-git@{{ v.murmur_tool_git }}            installed
 
 All checks passed.
 ```
@@ -1141,29 +1123,18 @@ All checks passed.
 **Output — one or more artifacts missing:**
 
 ```text
-Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  murmur/tool-git@{{ v.murmur_tool_git }}   darwin-aarch64   — missing
+Checking /path/to/murmur.yaml...
+  ✗  murmur/tool-git@{{ v.murmur_tool_git }}   — missing
 
 0 checks passed, 1 error found.
 
 Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
 ```
 
-**Output — a native binary built for another platform:**
-
-```text
-Checking /path/to/murmur.yaml for linux-x86_64...
-  ✗  murmur/tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
-
-0 checks passed, 1 error found.
-
-Fix: murmur/tool-git: native binary is built for darwin-aarch64 — reinstall murmur/tool-git@{{ v.murmur_tool_git }} on this host
-```
-
 ### Memory bound { #doctor-memory-bound }
 
 The `Memory bound` block shows `capabilities.resources.cgroup_memory_bytes`, the aggregate memory
-bound on the capsule's native subprocess tree, as the cgroup scope files a launch on this host
+bound on the capsule's subprocess tree, as the cgroup scope files a launch on this host
 writes:
 
 ```text
@@ -1182,7 +1153,7 @@ Memory bound
 | `memory.swap.max 0 where this kernel exposes it — …` | No cgroup this process can see has the memory controller, so whether the kernel exposes the file is unknown. The line ends saying whether swap is active |
 | `not applied on this host: cgroup bounds are Linux-only, …` | Off Linux, in place of the `memory.max` and `memory.swap.max` lines |
 
-A scope is created only for a capsule that can start a native subprocess.
+A scope is created only for a capsule that can start a subprocess.
 
 ### Lock integrity
 
@@ -1190,10 +1161,9 @@ Each artifact resolved from a store is also checked against `murmur.lock` when o
 [Lock integrity](../concepts/registry.md#lock-integrity). A disagreement produces one of three
 failure lines:
 
-- `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
-- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares; `mur install` moves the entry to the declared version
-- `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
-- `✗ name@version   <platform>   — murmur.lock has no sha256 for 'name' on <platform>: it pins <platforms>` — the lock was written on another platform and has never been installed against on this one
+- `✗ name@version   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
+- `✗ name@version   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares; `mur install` moves the entry to the declared version
+- `✗ name@version   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
 
 A pin a capsule wrote through `manage.pull()` ([`origin: runtime`](workdir.md#lock-origin)) adds
 one of three lines:
@@ -1239,8 +1209,8 @@ the way a launch does — see [Whether the launch gets its cgroup scope](contain
 
 | Capsule | `cgroup scope:` reads `unavailable` | Otherwise |
 |---|---|---|
-| Declares `capabilities.shell.allow`, `capabilities.spawn.allow` or `capabilities.install.tool`, or has a native tool | `refused:` line naming `E-RUN-012`, a `Fix:` line, no `All checks passed.`, exit status `1` | the line alone |
-| Runs no native subprocess | the line, then `this capsule runs no native subprocess, so a launch creates no scope for it`; the exit code is unchanged | the same |
+| Declares `capabilities.shell.allow` or `capabilities.spawn.allow` | `refused:` line naming `E-RUN-012`, a `Fix:` line, no `All checks passed.`, exit status `1` | the line alone |
+| Runs no subprocess | the line, then `this capsule runs no subprocess, so a launch creates no scope for it`; the exit code is unchanged | the same |
 
 ### Runtime directory { #doctor-runtime-directory }
 
@@ -1445,28 +1415,15 @@ same build.
 
 ### Warnings
 
-A finding that is worth reporting but is not a failure prints on its own checklist line, marked
-`⚠`, and adds a `Fix:` line in the same block as the errors. The summary line counts warnings
-separately and the exit code ignores them, so a store that resolves everything it is asked for
-still exits `0`. [`W-REG-001`](diagnostics.md#w-reg-001) is the one warning the checklist reports.
-A stale artifact this project does not declare adds its `Fix:` line in the same way, from the
-[WIT level](#doctor-interface-versions) block.
-
-**Output — a native artifact with no recorded platform:**
-
-```text
-Checking /path/to/murmur.yaml for linux-x86_64...
-  ⚠  murmur/tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
-
-1 check passed, 0 errors found, 1 warning.
-
-Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
-```
+A stale artifact this project does not declare, from the
+[WIT level](#doctor-interface-versions) block, adds a `Fix:` line in the same block as the errors.
+The summary line counts warnings separately and the exit code ignores them, so a store that
+resolves everything it is asked for still exits `0`.
 
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, carries no binary built for another platform, and speaks only interface versions this `mur` serves; and the `Environment requirements` block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, hold a native binary this host cannot run, or speak an interface version this `mur` does not serve (checklist printed to stdout first); or the `Environment requirements` block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
+- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, declares no native implementation, and speaks only interface versions this `mur` serves; and the `Environment requirements` block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, declare a native implementation (`E-RUN-061`), or speak an interface version this `mur` does not serve (checklist printed to stdout first); or the `Environment requirements` block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -1475,7 +1432,7 @@ Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent, and the current directory holds no `roster.yaml` |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 3, which is refused rather than migrated |
-| `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
+| `E-RUN-061` | A declared artifact's installed `murmur.yaml` declares `implementation: native` or `execution: native` — reported on the checklist line; `mur run` refuses the same artifact before any session starts |
 | `E-RUN-043` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the spawn closure's `capabilities.env.allow` declares is unset in this environment |
 | `E-CAP-015` | A capsule in the spawn closure declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
@@ -1515,7 +1472,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`). The resolved value is the one [`W-SEC-024`](diagnostics.md#w-sec-024) reports, so `--explain-scope` previews the warning this override produces; a value outside the two is refused there as on a real run |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
-| `--unconfined` | off | Run the capsule on the host as you: its shell commands, plan shell steps, native tools and process harness get your `HOME`, your whole environment, the host filesystem and network, and no `no_new_privs`, so `sudo` works wherever your sudoers allows it. Cannot be combined with `--containment` (a usage error). Refused with [`E-RUN-059`](diagnostics.md#e-run-059) when the manifest or a config file declares a containment floor. Prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line. With `--roster`, passed to every member. Capsules the runtime launches for you — delegated children, plan `capsule` steps, deployed capsules — run contained. See [Running unconfined](containment.md#unconfined) |
+| `--unconfined` | off | Run the capsule on the host as you: its shell commands, plan shell steps and process harness get your `HOME`, your whole environment, the host filesystem and network, and no `no_new_privs`, so `sudo` works wherever your sudoers allows it. Cannot be combined with `--containment` (a usage error). Refused with [`E-RUN-059`](diagnostics.md#e-run-059) when the manifest or a config file declares a containment floor. Prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line. With `--roster`, passed to every member. Capsules the runtime launches for you — delegated children, plan `capsule` steps, deployed capsules — run contained. See [Running unconfined](containment.md#unconfined) |
 | `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the work folder in a `Runtime writes` block — the line `paths are relative to the work folder`, then `- peer-in (directory, peer-fetch)` and `- out (directory, script-session)` — and as `runtime_writes` under `--json`; see [What the capsule changed](workdir.md#what-the-capsule-changed). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. A `Routes` block after `Containment` names every route the capsule runs code on and what holds each, as `routes` under `--json` — see [Routes and what holds each](containment.md#routes). The `cgroup scope:` line ends `Containment` and says whether a launch here gets its cgroup scope, as `cgroup_scope` under `--json`; when it reads `unavailable` the report ends with a line saying `mur run` would refuse to launch with [`E-RUN-012`](resource-limits.md#platform-behavior) — see [Whether the launch gets its cgroup scope](containment.md#cgroup-scope). Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary`. An `Images` block reports the [`context.images`](manifest.md#context-images) limits, as `images` under `--json` — see [The Images block](#explain-scope-images). When the manifest names a file by path, a `Manifest files` block after `Runtime writes` prints one `<key>: <declared> -> <resolved>` line per path, and `--json` carries the same rows as `manifest_files` (`[]` when it names none) — see [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Under `--capsule` the manifest checked is the one inside the artifact, so an installed capsule with no `inference:` block fails the same way. With `--roster`, the formation's one deadline, counted from the launcher's start |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The files [`inference.instruction_files`](manifest.md#inference-instruction-files) lists are still appended after it. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Under `--explain-scope` it removes the `inference.system_prompt_file` row from `Manifest files` and changes nothing else. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
@@ -2581,7 +2538,7 @@ mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--mur-binary` | — | Path to a `mur` binary for `--deploy-platform` to upload. When omitted, the release named by [`deploy.mur_version`](manifest.md#field-deploy) in the manifest (or the running `mur` version) is downloaded from GitHub and cached at `~/.murmur/bin/mur-{version}-{platform}` |
 | `--env` | — | Environment variable in `KEY=VALUE` format; repeat for multiple vars |
 | `--env-file` | — | Path to a `.env` file of `KEY=VALUE` lines, `#` comments ignored. Takes precedence over the `.env` beside the manifest, which is loaded when neither `--env` nor `--env-file` is given |
-| `--deploy-platform` | `linux-x86_64` | Platform the uploaded artifacts and `mur` binary are resolved for |
+| `--deploy-platform` | `linux-x86_64` | Platform of the VM; picks the `mur` binary uploaded to it |
 | `--no-precompile` | off | Skip compiling the uploaded WASM artifacts on the target; they compile on the capsule's first launch instead |
 
 **Output — a summary box on stderr.** `mur deploy run` emits no JSON; progress and the final box
@@ -2610,7 +2567,7 @@ for humans and its layout is not a stable interface.
 **Deployment flow:**
 
 1. Validate `--manifest`, `--workdir`, `--mur-binary` and every `--env` entry (no network calls)
-2. Resolve every declared artifact for `--deploy-platform`, and the `mur` binary
+2. Resolve every declared artifact, and the `mur` binary for `--deploy-platform`
 3. Wait up to 30s for SSH to become available on the VM
 4. Upload the `mur` binary via `scp` to `/usr/local/bin/mur`
 5. Upload the manifest, the files it references and the optional workdir to `/root/mur-<id>/`
@@ -2630,7 +2587,7 @@ for humans and its layout is not a stable interface.
 
 Artifacts are pre-staged in step 6, so the remote `mur run` finds them installed and starts without fetching anything. Step 8 compiles them with the VM's own `mur`, so the capsule's first launch loads compiled forms instead of compiling; see [Precompile on the target](#deploy-precompile).
 
-| Measured: release `mur`, a driver, a WASM tool and a native tool, 8 logical CPUs | Median of 5 deploys |
+| Measured: release `mur`, a driver and a WASM tool, 8 logical CPUs | Median of 5 deploys |
 |---|---|
 | Time step 8 adds | 0.52 s |
 | First launch to first inference request, with step 8 | 0.20 s |
@@ -4121,11 +4078,10 @@ version and the reason:
 |---|---|
 | `<scope>/<name>: <version> needs <interface>, this mur serves <package>@<version>` | The version names an interface at a version this `mur` does not serve. `(+N more)` follows when more than one interface is affected |
 | `<scope>/<name>: <version> needs <interface>, this mur serves no version of <package>` | This `mur` serves no version of the interface's package |
-| `<scope>/<name>: <version> has no payload for <platform>` | Every payload of the version is for another platform |
 
 With `--index local`, rows are the global store's artifacts under their full names. A version's
 interfaces are the ones its store record lists, or read from its payload when the record lists
-none, and its platforms are the ones it is installed for.
+none.
 
 When no artifacts match, prints `No results found.` and exits `0`.
 
@@ -4174,8 +4130,7 @@ mur index <DIR> --repo <OWNER/REPO> --release <TAG> [--merge <INDEX>] [-o <FILE>
 | `-o`, `--output` | `artifacts-index.json` | File to write. Replaced whole, through a temporary file beside it, so a refusal leaves an existing file as it was |
 
 Each `.mur.zip` must hold a packed `murmur.yaml` whose `name:` and `version:` match its file name,
-`<name>-<version>.mur.zip`. A native payload carries its platform,
-`<name>-<version>-<platform>.mur.zip`; a WASM or static payload carries none. A WASM payload must
+`<name>-<version>.mur.zip`. A WASM payload must
 carry a component `mur index` can read — its `capsule.wasm` or one root `*.wasm` — or it is refused
 with [`E-IDX-001`](diagnostics.md#e-idx-001) naming why. How each field is derived is under
 [How `mur index` derives each field](artifact-index.md#derivation).

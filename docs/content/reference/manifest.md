@@ -15,9 +15,9 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `name` | string | yes | The artifact's bare name, without a scope. Lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing `-`), non-empty, at most 100 characters. Anything else, a `/` included, fails the build with [`E-BLD-001`](diagnostics.md#e-bld-001). The artifact installs as `<scope>/<name>` — see [Artifact names](../concepts/registry.md#artifact-names). |
 | `version` | string | yes | `latest`, `stable` and `edge` are reserved and cannot be published (`E-REG-004`). |
 | `description` | string | no | What the artifact does. [`mur index`](cli.md#mur-index) records its first sentence as the artifact's description in the [artifact index](artifact-index.md). |
-| `runtime` | string | yes | The artifact's role. Two values change how it is packaged when `execution` is absent: `skill` packages as `static`, and `tool` with `implementation: native` packages as `native`. Everything else packages as `wasm`. |
-| `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
-| `execution` | `wasm \| native \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime` and `implementation`. Case-insensitive. An unrecognized value is a parse error. |
+| `runtime` | string | yes | The artifact's role. When `execution` is absent, `skill` packages as `static` and every other role packages as `wasm`. |
+| `implementation` | `wasm` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. A tool is a WASM component: `native` is refused with [`E-BLD-007`](diagnostics.md#e-bld-007), and any other value is an invalid-type error. |
+| `execution` | `wasm \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime`. Case-insensitive. `native` is refused with [`E-BLD-007`](diagnostics.md#e-bld-007); any other value is a parse error. |
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A skill ships supporting files by listing them here (`references/forms.md`); a skill folder with no `murmur.yaml` instead packs every file in it — see [`mur build` skill packaging](cli.md#skill-packaging-skill). A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 | `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
@@ -412,12 +412,12 @@ Manifest files
 | `artifacts` | list | no | Defaults to empty. |
 | `artifacts[].name` | string | yes (per entry) | The artifact's full name, `<scope>/<name>`, such as `murmur/tool-git` — see [Artifact names](../concepts/registry.md#artifact-names). A bare name is refused with `E-MAN-003` and a hint naming its scoped forms. An entry that declares `source:` takes the bare name instead, and a scope on it is refused. The bare part is the tool name the model calls, so two entries may not share one ([`E-CAP-020`](diagnostics.md#e-cap-020)). |
 | `artifacts[].version` | string | yes (per entry) | Optional when `source` is set — see [Local-source artifacts](#local-source-skills). |
-| `artifacts[].runtime` | `tool \| driver \| hook \| skill` | no | Default: `tool`. `tool` and `skill` artifacts are model-visible; `driver` and `hook` artifacts are hidden from the model. `wasm` and `native` are rejected here — those belong in the artifact's own manifest as `implementation`. |
+| `artifacts[].runtime` | `tool \| driver \| hook \| skill` | no | Default: `tool`. `tool` and `skill` artifacts are model-visible; `driver` and `hook` artifacts are hidden from the model. `wasm` and `native` are rejected here: they are packaging types, not roles. |
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry. Requires `local_source: true`. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
-| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. On a tool with a native implementation `state` is the only sub-block that applies ([Native tools](containment.md#native-tool-settings)). Declaring it on `runtime: skill` fails with `E-MAN-003`. |
-| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` (WASM and native) and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
+| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
+| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
 | `artifacts[].gateway` | map | no | The third-party upstream this artifact reaches through the credential gateway, and the key the runtime presents there. Required on the `transport: http` driver `inference.driver.artifact` names. Which other entries accept it is in [Credential gateway](#artifact-gateway). |
 | `artifacts[].gateway.endpoint` | string | yes (when `gateway` is set) | Upstream URL. A `gateway:` without it fails with `E-MAN-003`. See [`gateway.endpoint` validation](#gateway-endpoint-validation). |
 | `artifacts[].gateway.api_key` | string | yes, unless `keyless: true` | Literal value or `${NAME}` reference. A gateway with neither a non-blank `api_key` nor `keyless: true` fails with [`E-CAP-018`](diagnostics.md#e-cap-018). See [`gateway.api_key` resolution](#gateway-api-key). |
@@ -618,13 +618,6 @@ Rules:
 - **Only `network`, `filesystem` and `state` apply to a tool or driver.** `shell`, `spawn`, `env`,
   `limits`, `resources` and `containment` parse but are inert here and print
   [`W-SEC-008`](diagnostics.md#w-sec-008).
-- **Only `state` applies to a tool with a native (non-WASM) implementation.** The tool reads the
-  store's absolute path from `MURMUR_STATE_DIR`; who else can open it depends on the tier — see
-  [A native tool's own config and store](containment.md#native-tool-settings). Any other sub-block
-  prints [`W-SEC-008`](diagnostics.md#w-sec-008): a native tool runs under the capsule-wide
-  `capabilities.filesystem`, `capabilities.network` and `capabilities.shell.allow`, enforced by the
-  same sandbox as a shell command (see [Native tools](containment.md#native-tools)), and the
-  per-artifact block does not narrow them.
 
 ##### Artifact config { #artifact-config }
 
@@ -669,9 +662,6 @@ Rules:
   [Artifact config shape](#artifact-config-shape) fails with
   [`E-CAP-010`](diagnostics.md#e-cap-010). Which keys a given artifact requires is that artifact's
   own business, and a missing one surfaces as that artifact's error.
-- **A native tool reads it the same way.** A `runtime: tool` entry whose artifact ships a native
-  (non-WASM) implementation gets `MURMUR_ARTIFACT_CONFIG` in its own process environment on every
-  containment tier — see [A native tool's own config and store](containment.md#native-tool-settings).
 - **Only the capsule operator can configure**, exactly as for capabilities: the block is read from
   your manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
 - **Config is per artifact.** A top-level `config:` key fails with `E-MAN-003`.
@@ -724,8 +714,7 @@ Which entries accept the block:
 
 | Entry | `gateway:` |
 |---|---|
-| `runtime: tool` (WASM) | Accepted |
-| `runtime: tool` with a native implementation | Refused at launch with [`E-CAP-017`](diagnostics.md#e-cap-017) |
+| `runtime: tool` | Accepted |
 | `runtime: hook` | Accepted |
 | `runtime: driver` named by `inference.driver.artifact`, `transport: http` | Required |
 | `runtime: driver` named by an [`inference.alternates`](#inference-alternates) entry, `transport: http` | Required, unless it is also the primary's driver |
@@ -929,11 +918,11 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.limits.table_elements` | integer | no | Cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | Cap on the number of component instances one call may create. Default: 1000. Must be > 0. |
 | `capabilities.limits.deadline_seconds` | integer | no | Wall-clock budget for a single component call, in seconds. Default: 600 for a capsule, tool or driver call; 30 for a hook lifecycle call. An explicit value overrides both defaults, hooks included. A hook's own entry can set its deadline ahead of this value — see [Hook capabilities](#hook-capabilities). Must be > 0. |
-| `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for a native subprocess with no cgroup scope: the account's count at that spawn plus this value, in threads on Linux and processes on macOS. No effect on Linux when the subprocess runs in a cgroup scope, where `cgroup_pids_max` is the bound. Each running command counts one task more than its own: its [relay](containment.md#capsule-proc). Default: 128. Must be > 0. See [`max_processes` by platform](resource-limits.md#max-processes-headroom). |
-| `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
+| `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for a subprocess with no cgroup scope: the account's count at that spawn plus this value, in threads on Linux and processes on macOS. No effect on Linux when the subprocess runs in a cgroup scope, where `cgroup_pids_max` is the bound. Each running command counts one task more than its own: its [relay](containment.md#capsule-proc). Default: 128. Must be > 0. See [`max_processes` by platform](resource-limits.md#max-processes-headroom). |
+| `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
-| `capabilities.resources.cpu_seconds` | integer | no | The CPU time, in CPU-seconds, after which each native subprocess gets `SIGXCPU`, and `SIGKILL` one second later. Default: not set — no CPU-time limit; a subprocess keeps the `RLIMIT_CPU` `mur` was started with. Must be > 0. |
-| `capabilities.resources.memory_bytes` | integer | no | `RLIMIT_AS` (Linux) hard ceiling on each native subprocess's address space, in bytes: what a process reserves, not what it uses, so it breaks V8 (`node`) and the JVM well below their real memory use. Cap RAM with `cgroup_memory_bytes` instead; `68719476736` (64 GiB) runs `node`, and a lower limit for `node` draws [`W-RUN-010`](diagnostics.md#w-run-010) — see [`memory_bytes` and `cgroup_memory_bytes`](resource-limits.md#address-space-and-memory). Default: 2147483648 (2 GiB). Must be > 0. macOS maps this to `RLIMIT_DATA`, which its kernel does not enforce — see the [platform note](resource-limits.md#host-resource-limits). |
+| `capabilities.resources.cpu_seconds` | integer | no | The CPU time, in CPU-seconds, after which each subprocess gets `SIGXCPU`, and `SIGKILL` one second later. Default: not set — no CPU-time limit; a subprocess keeps the `RLIMIT_CPU` `mur` was started with. Must be > 0. |
+| `capabilities.resources.memory_bytes` | integer | no | `RLIMIT_AS` (Linux) hard ceiling on each subprocess's address space, in bytes: what a process reserves, not what it uses, so it breaks V8 (`node`) and the JVM well below their real memory use. Cap RAM with `cgroup_memory_bytes` instead; `68719476736` (64 GiB) runs `node`, and a lower limit for `node` draws [`W-RUN-010`](diagnostics.md#w-run-010) — see [`memory_bytes` and `cgroup_memory_bytes`](resource-limits.md#address-space-and-memory). Default: 2147483648 (2 GiB). Must be > 0. macOS maps this to `RLIMIT_DATA`, which its kernel does not enforce — see the [platform note](resource-limits.md#host-resource-limits). |
 | `capabilities.resources.cgroup_memory_bytes` | integer | no | cgroup v2 `memory.max` — aggregate memory across the whole subprocess tree, in bytes. Swap is bounded too: the scope's `memory.swap.max` is `0`, so a tree over this ceiling is OOM-killed rather than pushed out to swap. Default: 4294967296 (4 GiB). Must be > 0. Linux only. On a kernel that exposes no `memory.swap.max`, swap is not bounded and [`mur doctor`](cli.md#mur-doctor) says so. |
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Each running command counts one task more than its own: its [relay](containment.md#capsule-proc). Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: not set — no CPU cap; the scope's `cpu.max` stays at the kernel's `max`. Must be > 0. Linux only. |
@@ -944,7 +933,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory; a capsule that declares nothing is not offered it. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
 | `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that a pull — `manage.pull`, or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool — may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md`, plus any supporting files packed beside it, which install read-only and not executable under `tools/<name>/`. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` and `remove-artifact` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
-| `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools, WASM or native, that a pull may install, as [install entries](#install-entries). A pulled tool joins the dispatch allowlist. The same entries let a removal uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
+| `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools that a pull may install, as [install entries](#install-entries). A pulled tool joins the dispatch allowlist. The same entries let a removal uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
 | `capabilities.install.from` | `[stores] \| [stores, sources]` | no | Where a pull finds what it installs. Default: `[stores]`, the project store then the global store. `[stores, sources]` (in either order) also fetches a version no store holds from the GitHub source of the artifact's scope; the runtime fetches it, records the owner id in `murmur.lock` and writes it to no store. An empty list, a list without `stores`, a duplicate and any other value are refused with `E-MAN-003`. `mur run --explain-scope` and `mur doctor` report it as `install from`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_from`. A spawned child declaring `sources` under a parent without it is refused. |
 | `capabilities.spawn.allow` | list<string> | no | Full names, `<scope>/<name>`, of the capsules this capsule may spawn as sub-capsules. A bare name is refused with `E-MAN-003`, and so are two entries with the same bare part, because `delegate-task` offers each capsule to the model by its bare part. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with the bare part of each name as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 | `capabilities.spawn.workdir_snapshot` | list<string> | no | Default: `[]`. Full names from `capabilities.spawn.allow` whose every delegation — from `delegate-task` or a plan `capsule` step — starts the child in a copy of this capsule's work folder as it stands when the delegation is made, instead of an empty folder. The child reads, runs and writes the copy; nothing it writes reaches this capsule's work folder, and this capsule receives only its answer. Each entry is refused with `E-MAN-003` when it is a bare name, is listed twice, or is absent from `capabilities.spawn.allow`. The copy counts against the child's own `capabilities.resources.workdir_max_bytes`: a work folder larger than that fails the delegation before the child starts. See [Workdir snapshot](roost-api.md#workdir-snapshot). `mur run --explain-scope` reports it as `spawn workdir snapshot`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_workdir_snapshot`. |
@@ -992,7 +981,7 @@ name only, never by value.
 #### Process environment { #process-environment }
 
 A process the runtime starts on the host — a `transport: process` harness, a shell command or a
-native tool — begins with an empty environment and receives the variables below, in order. A later
+program a WASM tool runs — begins with an empty environment and receives the variables below, in order. A later
 row wins over an earlier one for the same name. A WASM component receives only what
 `capabilities.env.allow` declares, as described above.
 
@@ -1007,7 +996,7 @@ A [`transport: process`](#transport-process) harness:
 
 The harness's version check runs with rows 1 and 3 only.
 
-A shell tool call, a plan's `shell` step, or a native tool:
+A shell tool call, a plan's `shell` step, or a program a WASM tool runs through `murmur:process`:
 
 | Order | Source | Variables |
 |---|---|---|
@@ -1071,7 +1060,7 @@ capabilities:
 | Key | Admits |
 |---|---|
 | `skill` | Artifacts whose payload is a `skill.md`, declared `runtime: skill` |
-| `tool` | Artifacts whose payload is a WASM component or a native binary, declared `runtime: tool` |
+| `tool` | Artifacts whose payload is a WASM component, declared `runtime: tool` |
 
 An artifact matches only the list for its own kind: `skill: ["*"]` admits no tool. A `driver` or
 `hook` is refused under every entry, and so is an artifact whose declared role does not match its
@@ -1084,8 +1073,7 @@ fetched from the scope's [source](config.md) with the checks `mur install` makes
 `murmur.lock` with the scope's owner id; no store gains it. A pull names a full artifact name and
 a version that is a single path segment; a bare name, a `github:` reference, a path, or a version
 containing `/` or `..` is refused. A pull with no version takes the newest version, by semver
-precedence, that fits the [WIT level](wit-levels.md#fit) this `mur` serves and has a payload for
-this platform; on a tie the store wins. A version that does not fit is refused with
+precedence, that fits the [WIT level](wit-levels.md#fit) this `mur` serves; on a tie the store wins. A version that does not fit is refused with
 [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), naming the newest that does.
 
 A pulled artifact runs on this capsule's own grants. A pulled tool joins the dispatch allowlist,
@@ -1962,7 +1950,7 @@ What the model can do with an artifact once it is offered depends on its runtime
 |---|---|---|
 | `runtime: skill` | Yes, with no input parameters | Yes: calling it returns its `skill.md` |
 | The skill named by [`inference.system_prompt_artifact`](#inference-system-prompt-artifact) | No | — |
-| A WASM or native tool not declared in `artifacts:` | Yes | Yes: a pulled tool joins the dispatch allowlist |
+| A tool not declared in `artifacts:` | Yes | Yes: a pulled tool joins the dispatch allowlist |
 | `runtime: driver` or `runtime: hook` | No | — |
 
 Each refresh writes a [`tools_refreshed`](observability-schemas.md#tools-refreshed) line to

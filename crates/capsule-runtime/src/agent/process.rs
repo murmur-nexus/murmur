@@ -425,7 +425,7 @@ pub(super) fn harness_base_env(
 ///
 /// The allowlist goes through the credential backstop every WASM guest gets — a credential-shaped
 /// name in `env.allow` is refused at staging, so the harness cannot be handed a key that way
-/// either. Native shell subprocesses use a different, baseline-derived environment
+/// either. Shell subprocesses use a different, baseline-derived environment
 /// ([`shell::build_shell_env`]): a harness is a guest, not a shell command.
 pub(super) fn build_harness_env(
     policy: &CapabilityPolicy,
@@ -2679,7 +2679,7 @@ mod tests {
         );
     }
 
-    /// A harness is a native process: it cannot reach a formation callee's virtual address, so it
+    /// A harness is a host process: it cannot reach a formation callee's virtual address, so it
     /// is handed no formation peers and no channel, and a declaration resolves neither from the
     /// host.
     #[test]

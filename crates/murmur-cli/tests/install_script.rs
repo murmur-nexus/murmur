@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use murmur_artifact::{current_platform, sha256_hex};
+use murmur_artifact::sha256_hex;
 use tempfile::TempDir;
 
 /// The version the fixture release is published under. Pinning it keeps
@@ -112,6 +112,18 @@ struct Installer {
     home: TempDir,
     log: PathBuf,
     platform: &'static str,
+}
+
+/// This host's tag in `mur`'s release asset names (`mur-<version>-<tag>`), the tag
+/// `scripts/install.sh` derives from `uname`; `unknown` on a host the release publishes nothing for.
+fn current_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        _ => "unknown",
+    }
 }
 
 impl Installer {

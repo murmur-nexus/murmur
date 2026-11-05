@@ -52,18 +52,15 @@ A source answers through the `artifacts-index.json` asset of its latest release,
 2. Read the index from the latest release. A missing, schema 1 or invalid index is refused with [`E-IDX-002`](diagnostics.md#e-idx-002).
 3. Check that the index's `scope` is the source's scope. An index naming another scope is refused with [`E-REG-009`](diagnostics.md#e-reg-009).
 4. Find the artifact whose `name` is `<name>` exactly, and its version `<version>` exactly. `tool-git` never matches `tool-git-validate`, and `1.0.0` never matches `v1.0.0`. A version that does not fit this `mur` is refused here with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) — see [Version selection](#version-selection).
-5. Choose the asset whose `platform` is the host's, else the untagged one. Another platform's asset is never chosen.
-6. Download that asset's `file` from the version's `release`.
-7. Check its SHA-256 against the index's `sha256`, and its packed `name:` and `version:` against the reference. A difference is refused with [`E-REG-002`](diagnostics.md#e-reg-002) and nothing is stored.
+5. Download the version's asset `file` from the version's `release`.
+6. Check its SHA-256 against the index's `sha256`, and its packed `name:` and `version:` against the reference. A difference is refused with [`E-REG-002`](diagnostics.md#e-reg-002) and nothing is stored.
 
-A name, version or platform payload the index does not list is refused with [`E-REG-001`](diagnostics.md#e-reg-001), naming what the index does list.
+A name or version the index does not list is refused with [`E-REG-001`](diagnostics.md#e-reg-001), naming what the index does list.
 
 | Reference | Assets installed |
 |---|---|
-| `<scope>/<name>` or `<scope>/<name>@<version>` | One: the asset the index lists for this platform |
+| `<scope>/<name>` or `<scope>/<name>@<version>` | One: the asset the index lists for that version |
 | `github:<owner>/<repo>@<tag>` | Every `.mur.zip` asset in that release. No index is read |
-
-A platform tag in an asset is the publisher's declaration of which platform those bytes are for. `linux-aarch64` is a supported target for which Murmur's own releases publish no asset: an artifact needed there is built on that host with [`mur build`](cli.md#mur-build) and installed from the resulting path.
 
 ### Version selection { #version-selection }
 
@@ -72,7 +69,7 @@ A version fits this `mur` when every `murmur:` interface it names is one the [WI
 | Reference | Version installed |
 |---|---|
 | `<scope>/<name>@<version>` | `<version>`, when it fits. One that does not is refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched or written, naming each interface that does not fit and the newest version in the index that does |
-| `<scope>/<name>` | The newest version in the index that fits and has a payload for this platform |
+| `<scope>/<name>` | The newest version in the index that fits |
 
 When no version fits, the install is refused with [`E-REG-001`](diagnostics.md#e-reg-001), naming the newest version and the first interface this `mur` does not serve.
 
@@ -81,7 +78,6 @@ The fit is checked on every install that resolves an artifact by name, wherever 
 | Install | Checked against |
 |---|---|
 | `mur install <scope>/<name>@<version>` | The stored payload's interfaces when the global store holds it, else the version's `interfaces` in the index, read before the payload is downloaded |
-| `mur install --all-platforms <scope>/<name>@<version>` | The version's `interfaces` in the index |
 | `mur install` with no argument | Each version `murmur.yaml` pins: the project store's payload, the global store's, or the index's `interfaces`. One that does not fit refuses the whole install, and nothing is written |
 
 These install the bytes they are given without the check; a launch refuses a driver among them that does not fit:
@@ -175,28 +171,21 @@ Prefer a `${NAME}` reference to a literal token in `config.yaml`. The token `gh 
 | Project | `<project root>/.murmur/artifacts/` — the nearest directory at or above the working directory that holds a `murmur.yaml`. Installing without one fails with `E-IO-001` |
 | Global | `~/.murmur/artifacts/` |
 
-Under either root, an artifact occupies `<scope>/<name>/<version>/`, and the files in it are named by the bare `<name>`: `murmur/tool-git@{{ v.murmur_tool_git }}` is filed at `murmur/tool-git/{{ v.murmur_tool_git }}/tool-git-{{ v.murmur_tool_git }}.mur.zip`. A native artifact is a different binary per platform, so its three files carry the platform tag its payload was built for; every other payload is one set of bytes each host resolves, and its files carry no tag:
+Under either root, an artifact occupies `<scope>/<name>/<version>/`, and the files in it are named by the bare `<name>`: `murmur/tool-git@{{ v.murmur_tool_git }}` is filed at `murmur/tool-git/{{ v.murmur_tool_git }}/tool-git-{{ v.murmur_tool_git }}.mur.zip`. Every payload is one set of bytes each host resolves:
 
 | File | Holds |
 |---|---|
 | `<name>-<version>.mur.zip` | The artifact — a WASM component or a static skill |
 | `<name>-<version>.sha256` | Its SHA-256 |
-| `<name>-<version>.meta.json` | Its full name, version, runtime, platforms, description, tags, WIT contracts and, for a payload a source served, the [owner id](#owner-identity) |
-| `<name>-<version>-<platform>.mur.zip` | A native artifact's payload for one platform |
-| `<name>-<version>-<platform>.sha256` | That payload's SHA-256 |
-| `<name>-<version>-<platform>.meta.json` | That payload's metadata, with `platforms` naming the one platform |
+| `<name>-<version>.meta.json` | Its full name, version, runtime, description, tags, WIT contracts and, for a payload a source served, the [owner id](#owner-identity) |
 
 An artifact is filed under the bare name its own `murmur.yaml` declares: a payload whose packed `name:` differs from the bare part of the name it is installed as is refused with [`E-REG-002`](diagnostics.md#e-reg-002).
 
 A store directory in the flat `<name>/<version>/` layout, with no scope directory, is not read by any command. [`mur doctor`](cli.md#mur-doctor) names each one in its `Artifact stores` block as safe to delete.
 
-One version directory holds one payload, hash and metadata file per platform installed, so installing a native artifact for a second platform sits beside the first rather than replacing it. A resolve prefers the tagged payload for the host's platform and falls back to the untagged one, which is how a WASM artifact resolves everywhere; a *native* artifact resolved through that fallback is reported as [`W-REG-001`](diagnostics.md#w-reg-001).
+The `runtime` and `artifact_runtime` keys of the metadata file record what the packed `murmur.yaml` declares: the packaging type (`wasm` or `static`) and the role (`tool`, `skill`, `driver` or `hook`). Every command that resolves an artifact takes both from the artifact bytes, so a metadata file recording something else does not change what is resolved, run or deployed. `mur list` reads the metadata file rather than the artifact, so an artifact whose file records the wrong role is listed with a blank `RUNTIME` column until it is reinstalled.
 
-The `runtime` and `artifact_runtime` keys of the metadata file record what the packed `murmur.yaml` declares: the packaging type (`native`, `wasm` or `static`) and the role (`tool`, `skill`, `driver` or `hook`). Every command that resolves an artifact takes both from the artifact bytes, so a metadata file recording something else does not change what is resolved, run or deployed. `mur list` reads the metadata file rather than the artifact, so an artifact whose file records the wrong role is listed with a blank `RUNTIME` column until it is reinstalled.
-
-The `wit_contracts` key of the metadata file records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
-
-`mur install --all-platforms <scope>/<name>@<version>` installs into the global store, once per platform it downloads for, writing the same three files per platform as any other install.
+The `wit_contracts` key of the metadata file records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
 
 The global root is derived from `$HOME` (or `$USERPROFILE` on Windows). No environment variable overrides it; to relocate the store, set `HOME` before invoking `mur`.
 

@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use murmur_artifact::{current_platform, ArtifactIndex, ArtifactName, MURMUR_SCOPE};
+use murmur_artifact::{ArtifactIndex, ArtifactName, MURMUR_SCOPE};
 
 use crate::commands::search::{fetch_index_text, index_error, IndexSource};
 use crate::error::{CliError, E_NEW_005, E_NEW_006, E_NEW_007};
@@ -140,8 +140,7 @@ impl DefaultVersions {
                 "the artifact index {label} lists no {full_name}"
             )));
         };
-        let platform = current_platform();
-        if let Some(fitting) = newest_fitting(artifact, platform) {
+        if let Some(fitting) = newest_fitting(artifact) {
             return Ok(fitting.version.clone());
         }
         let mut message = format!(
@@ -149,7 +148,7 @@ impl DefaultVersions {
         );
         if let Some(newest) = artifact.versions.first() {
             let version = &newest.version;
-            if let Some(note) = fit_note(full_name, version, &index_fit(newest, platform)) {
+            if let Some(note) = fit_note(full_name, version, &index_fit(newest)) {
                 let why = note
                     .strip_prefix(&format!("{full_name}: {version} "))
                     .unwrap_or(&note);
@@ -228,20 +227,14 @@ mod tests {
         "murmur:tool/run@0.2.0",
     ];
 
-    fn version(
-        name: &str,
-        version: &str,
-        interfaces: &[&str],
-        platform: Option<&str>,
-    ) -> IndexedVersion {
+    fn version(name: &str, version: &str, interfaces: &[&str]) -> IndexedVersion {
         IndexedVersion {
             version: version.to_string(),
             release: "v1.0.0".to_string(),
             built_at_level: Some(1),
             interfaces: interfaces.iter().map(|i| i.to_string()).collect(),
             assets: vec![IndexedAsset {
-                file: murmur_artifact::asset_file_name(name, version, platform),
-                platform: platform.map(str::to_string),
+                file: murmur_artifact::asset_file_name(name, version),
                 sha256: "0".repeat(64),
             }],
         }
@@ -271,9 +264,9 @@ mod tests {
             "murmur",
             "driver-anthropic",
             vec![
-                version("driver-anthropic", "0.12.0", &UNSERVED, None),
-                version("driver-anthropic", "0.11.0", &SERVED, None),
-                version("driver-anthropic", "0.10.0", &SERVED, None),
+                version("driver-anthropic", "0.12.0", &UNSERVED),
+                version("driver-anthropic", "0.11.0", &SERVED),
+                version("driver-anthropic", "0.10.0", &SERVED),
             ],
         );
         assert_eq!(
@@ -283,24 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn a_version_with_only_another_platforms_payload_is_skipped() {
-        let index = index_of(
-            "murmur",
-            "tool-git",
-            vec![
-                version("tool-git", "0.3.0", &SERVED, Some("plan9-mips")),
-                version("tool-git", "0.2.0", &SERVED, Some(current_platform())),
-            ],
-        );
-        assert_eq!(index.newest_fitting("murmur/tool-git").unwrap(), "0.2.0");
-    }
-
-    #[test]
     fn an_unlisted_artifact_is_refused_naming_it_and_the_index() {
         let index = index_of(
             "murmur",
             "driver-openai",
-            vec![version("driver-openai", "0.9.0", &SERVED, None)],
+            vec![version("driver-openai", "0.9.0", &SERVED)],
         );
         let error = index.newest_fitting("murmur/driver-anthropic").unwrap_err();
         assert_eq!(error.code, E_NEW_007);
@@ -325,8 +305,8 @@ mod tests {
             "murmur",
             "driver-anthropic",
             vec![
-                version("driver-anthropic", "0.12.0", &UNSERVED, None),
-                version("driver-anthropic", "0.11.0", &UNSERVED, None),
+                version("driver-anthropic", "0.12.0", &UNSERVED),
+                version("driver-anthropic", "0.11.0", &UNSERVED),
             ],
         );
         let error = index.newest_fitting("murmur/driver-anthropic").unwrap_err();
@@ -346,7 +326,7 @@ mod tests {
         let index = index_of(
             "ana",
             "driver-anthropic",
-            vec![version("driver-anthropic", "0.10.0", &SERVED, None)],
+            vec![version("driver-anthropic", "0.10.0", &SERVED)],
         );
         let error = index.newest_fitting("murmur/driver-anthropic").unwrap_err();
         assert_eq!(error.code, E_NEW_007);
@@ -467,22 +447,8 @@ mod tests {
         use crate::source::DEFAULT_ARTIFACTS_REPO;
 
         let mut source = MemorySource::new(DEFAULT_ARTIFACTS_REPO, MURMUR_SCOPE, 1, "v0.99.0");
-        source.publish(
-            "v0.99.0",
-            "driver-anthropic",
-            "0.11.0",
-            None,
-            &SERVED,
-            vec![1],
-        );
-        source.publish(
-            "v0.99.0",
-            "driver-anthropic",
-            "0.12.0",
-            None,
-            &UNSERVED,
-            vec![2],
-        );
+        source.publish("v0.99.0", "driver-anthropic", "0.11.0", &SERVED, vec![1]);
+        source.publish("v0.99.0", "driver-anthropic", "0.12.0", &UNSERVED, vec![2]);
         let versions = DefaultVersions::from_source(&source).unwrap();
         assert_eq!(
             versions.label(),

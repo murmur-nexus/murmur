@@ -25,6 +25,7 @@ pub const E_REG_008: &str = "E-REG-008"; // no source serves the artifact's scop
 pub const E_REG_009: &str = "E-REG-009"; // a source's index states a scope the source does not own
 pub const E_REG_010: &str = "E-REG-010"; // a scope's GitHub owner id is not the one recorded for it (murmur.lock, a stored payload, or compiled in for murmur)
 pub const E_REG_011: &str = "E-REG-011"; // a payload's packed murmur.yaml ships a malformed models: table, so the store refuses it
+pub const E_REG_012: &str = "E-REG-012"; // a payload's packed murmur.yaml declares implementation: native or execution: native, so the store refuses it
 
 // WIT levels
 pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves
@@ -68,7 +69,6 @@ pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversa
 pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
 pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
 pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle, or MURMUR_SPAWNER_LIFELINE to something that is not this session's spawner lifeline
-pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built for another platform
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
@@ -110,6 +110,7 @@ pub const E_RUN_057: &str = "E-RUN-057"; // a computer tool is declared and a dr
 pub const E_RUN_058: &str = "E-RUN-058"; // an installed artifact ships a malformed provider_tool: block
 pub const E_RUN_059: &str = "E-RUN-059"; // the unconfined stance was chosen for a capsule some source declares a containment floor for
 pub const E_RUN_060: &str = "E-RUN-060"; // --unconfined was given to a launch the runtime started contained (--contained-launch or --spawn-grant-stdin)
+pub const E_RUN_061: &str = "E-RUN-061"; // an installed artifact's murmur.yaml declares implementation: native or execution: native
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -128,7 +129,6 @@ pub const E_CAP_013: &str = "E-CAP-013"; // an artifact claims the name of a too
 pub const E_CAP_014: &str = "E-CAP-014"; // a capsule in the spawn.allow closure declares an env.allow name unset in this environment
 pub const E_CAP_015: &str = "E-CAP-015"; // a capsule declares an env.allow entry the capsule that spawns it does not hold
 pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names a variable the credential backstop strips from every guest
-pub const E_CAP_017: &str = "E-CAP-017"; // a gateway: is declared on a native tool, whose requests never pass the credential gateway
 pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but binds no api_key and does not declare keyless: true
 pub const E_CAP_019: &str = "E-CAP-019"; // a process driver requires a variable capabilities.env.allow does not declare
 pub const E_CAP_020: &str = "E-CAP-020"; // two declared artifacts share a tool name
@@ -150,6 +150,80 @@ pub(crate) const TOP_LEVEL_MUR_VERSION_HINT: &str =
     "move the pin under deploy: as deploy.mur_version — only mur deploy reads it, to choose the \
      mur it installs on the target";
 
+/// The hint on `E-BLD-007`.
+const NATIVE_TOOL_BUILD_HINT: &str =
+    "a tool is a WASM component: build it for wasm32-wasip2, declare the .wasm in \
+     requires_files:, and remove the native declaration — a program the tool needs to run goes in \
+     the capsule's capabilities.shell.allow and is started through murmur:process";
+
+/// The hint on `E-REG-012` and `E-RUN-061`.
+const NATIVE_TOOL_INSTALL_HINT: &str =
+    "install a release of the artifact built as WASM \u{2014} mur build refuses the same \
+     manifest with E-BLD-007";
+
+/// `E-REG-012` for a payload whose own `murmur.yaml` declares `field: native`, refused by
+/// `mur publish` or `mur install` before anything is stored or pinned. `name` is the full
+/// `<scope>/<name>` the payload would be filed under.
+pub(crate) fn native_tool_install_error(name: &str, version: &str, field: &str) -> CliError {
+    CliError::with_hint(
+        E_REG_012,
+        format!(
+            "{name}@{version} declares {field}: native in its murmur.yaml; murmur runs tools only \
+             as WASM components, so the store refuses it"
+        ),
+        NATIVE_TOOL_INSTALL_HINT,
+    )
+}
+
+/// `E-REG-012` when `error`, from reading the packed `murmur.yaml` of `bytes`, is the native-tool
+/// refusal; `None` for any other error. `scope` is the scope the payload would be filed in.
+pub(crate) fn native_payload_refusal(
+    error: &murmur_artifact::ArtifactError,
+    scope: &str,
+    bytes: &[u8],
+) -> Option<CliError> {
+    let murmur_artifact::ArtifactError::Manifest(ManifestError::NativeTool { name, field }) = error
+    else {
+        return None;
+    };
+    Some(native_tool_install_error(
+        &format!("{scope}/{name}"),
+        &packed_version(bytes),
+        field,
+    ))
+}
+
+/// The `version:` the packed `murmur.yaml` of `bytes` declares, read without the checks
+/// `Manifest::from_yaml_str` applies, for naming a payload that parse refused.
+fn packed_version(bytes: &[u8]) -> String {
+    murmur_artifact::load_manifest_yaml_from_artifact_bytes(bytes)
+        .ok()
+        .and_then(|yaml| serde_norway::from_str::<serde_norway::Value>(&yaml).ok())
+        .and_then(|manifest| match manifest.get("version")? {
+            serde_norway::Value::String(version) => Some(version.clone()),
+            serde_norway::Value::Number(version) => Some(version.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "<no version>".to_string())
+}
+
+/// `E-RUN-061` for an installed artifact whose own `murmur.yaml` declares `field: native`,
+/// refused by a launch before any session starts and by `mur doctor`.
+pub(crate) fn native_tool_launch_error(artifact: &str, field: &str) -> CliError {
+    CliError::with_hint(
+        E_RUN_061,
+        format!(
+            "installed artifact {artifact} declares {field}: native in its murmur.yaml; murmur \
+             runs tools only as WASM components"
+        ),
+        format!(
+            "remove {artifact} from the store and from murmur.yaml's artifacts:, or install a \
+             release of it built as WASM \u{2014} mur build refuses the same manifest with \
+             E-BLD-007"
+        ),
+    )
+}
+
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
 pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive
@@ -157,6 +231,7 @@ pub const E_BLD_003: &str = "E-BLD-003"; // packed entry set is not a launchable
 pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired block name
 pub const E_BLD_005: &str = "E-BLD-005"; // driver manifest's models: table is malformed or on a non-driver
 pub const E_BLD_006: &str = "E-BLD-006"; // artifact manifest's provider_tool: block is malformed or on a driver, hook or skill
+pub const E_BLD_007: &str = "E-BLD-007"; // artifact manifest declares implementation: native or execution: native
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -384,7 +459,7 @@ impl From<RuntimeError> for CliError {
             ),
             // The three host-process (OS-level) resource bounds, kept distinct from E-RUN-001's
             // WASM-guest limits above: those fire from a wasmtime trap inside the store, these
-            // from rlimits, a cgroup, or the workdir check applied to native subprocesses.
+            // from rlimits, a cgroup, or the workdir check applied to shell subprocesses.
             // Delegate to the RuntimeError Display text so the message can't drift from
             // capsule-runtime's errors.rs — see the ToolExportMissing precedent below.
             error @ RuntimeError::ShellResourceLimitExceeded { .. } => CliError::with_hint(
@@ -813,8 +888,8 @@ impl From<RuntimeError> for CliError {
             ),
             // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
             // with another: this one is not about the containment ladder at all. A network
-            // namespace is what makes `capabilities.network.allow` mean anything for a native
-            // subprocess since the seccomp connect/sendto interception was retired, and every
+            // namespace is what makes `capabilities.network.allow` mean anything for a
+            // subprocess, and every
             // Linux capsule that can spawn one needs it at every containment class — so neither
             // raising nor lowering a declared floor changes this answer. The hint therefore names
             // the host mechanism, never the manifest.
@@ -993,13 +1068,6 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 GATEWAY_WITHOUT_CREDENTIAL_HINT,
             ),
-            error @ RuntimeError::GatewayOnNativeArtifact { .. } => CliError::with_hint(
-                E_CAP_017,
-                error.to_string(),
-                "a native tool's requests leave through the egress proxy and never pass the \
-                 credential gateway, so no key could be attached; remove gateway: from its entry, \
-                 or use a WASM build of the tool",
-            ),
             ref error @ RuntimeError::GatewayCredentialNotFound { ref variable, .. } => {
                 CliError::with_hint(
                     E_MAN_003,
@@ -1051,16 +1119,7 @@ impl From<RuntimeError> for CliError {
                  --registry-path <store>` — and set MURMUR_ROOST_URL to its base URL, or drop \
                  capabilities.spawn.allow from the manifest if this capsule spawns nothing",
             ),
-            // Delegates to the Display text for the same reason the two arms above do: the
-            // staging refusal names the artifact and both platforms, and the CLI restating that
-            // is one more place for the wording to drift from capsule-runtime's errors.rs.
-            error @ RuntimeError::NativeBinaryPlatformMismatch { .. } => CliError::with_hint(
-                E_RUN_021,
-                error.to_string(),
-                "the installed artifact holds a binary for another platform \u{2014} reinstall it \
-                 on this host with `mur install <name>@<version>`, or publish a build for this \
-                 host's platform",
-            ),
+            RuntimeError::NativeTool { artifact, field } => native_tool_launch_error(&artifact, &field),
             error @ RuntimeError::SpawnerHandleUnreadable { .. } => CliError::with_hint(
                 E_RUN_020,
                 error.to_string(),
@@ -1177,6 +1236,9 @@ impl From<RegistryError> for CliError {
                 "the driver's own murmur.yaml is at fault; use a release of the driver whose \
                  models: table is well formed — mur build refuses the same table with E-BLD-005",
             ),
+            error @ RegistryError::NativeTool { .. } => {
+                CliError::with_hint(E_REG_012, error.to_string(), NATIVE_TOOL_INSTALL_HINT)
+            }
             RegistryError::IntegrityMismatch { name, version, .. } => CliError::with_hint(
                 E_REG_002,
                 format!("artifact integrity check failed for {name}@{version}"),
@@ -1216,6 +1278,9 @@ impl From<ManifestError> for CliError {
             ),
             error @ ManifestError::RegistryBlock => {
                 CliError::with_hint(E_MAN_003, error.to_string(), REGISTRY_BLOCK_HINT)
+            }
+            error @ ManifestError::NativeTool { .. } => {
+                CliError::with_hint(E_BLD_007, error.to_string(), NATIVE_TOOL_BUILD_HINT)
             }
             ManifestError::NotFound(path) => {
                 CliError::new(E_IO_001, format!("{MANIFEST_FILENAME} not found at {path}"))

@@ -23,7 +23,7 @@
 //!
 //! Who gets roots is [`crate::runtime_dir::gets_runtime_dir_preopen`]'s set: a tool narrowed to a
 //! `capabilities.filesystem.scope` keeps exactly its subtree, and drivers, hooks, the capsule's own
-//! store, a script capsule's component and native tools get none.
+//! store and a script capsule's component get none.
 
 use std::path::{Component, Path, PathBuf};
 

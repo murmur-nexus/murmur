@@ -6407,17 +6407,12 @@ mod tests {
 
     // ── the runtime-files line ──────────────────────────────────────────────────
 
-    /// An installed `runtime: tool` artifact `name`, native or WASM.
-    fn installed_tool(name: &str, native: bool) -> crate::types::InstalledArtifactSummary {
+    /// An installed `runtime: tool` artifact `name`.
+    fn installed_tool(name: &str) -> crate::types::InstalledArtifactSummary {
         crate::types::InstalledArtifactSummary {
             name: format!("local/{name}"),
             version: "0.1.0".to_string(),
             runtime: murmur_artifact::ArtifactRuntime::Tool,
-            implementation: Some(if native {
-                murmur_artifact::ArtifactImplementation::Native
-            } else {
-                murmur_artifact::ArtifactImplementation::Wasm
-            }),
             origin: murmur_artifact::LockOrigin::Operator,
         }
     }
@@ -6458,8 +6453,8 @@ mod tests {
             runtime_files_line_for(
                 &["bash"],
                 &[
-                    installed_tool("tool-editor", false),
-                    installed_tool("runtime-dir-probe", false),
+                    installed_tool("tool-editor"),
+                    installed_tool("runtime-dir-probe"),
                 ],
                 &[],
                 Some("murmur.yaml"),
@@ -6486,7 +6481,7 @@ mod tests {
         assert_eq!(
             runtime_files_line_for(
                 &[],
-                &[installed_tool("tool-editor", false)],
+                &[installed_tool("tool-editor")],
                 &[],
                 Some("murmur.yaml")
             )
@@ -6498,27 +6493,12 @@ mod tests {
         );
     }
 
-    /// A native tool sees no `murmur-runtime/` and does not expand `$MURMUR_RUNTIME_DIR` in a
-    /// path argument, so no fixed name reaches the directory from it.
-    #[test]
-    fn runtime_files_line_is_absent_for_a_native_tool_only() {
-        assert_eq!(
-            runtime_files_line_for(
-                &[],
-                &[installed_tool("tool-fixture", true)],
-                &[],
-                Some("murmur.yaml")
-            ),
-            None
-        );
-    }
-
     #[test]
     fn runtime_files_line_is_absent_for_a_scoped_wasm_tool_only() {
         assert_eq!(
             runtime_files_line_for(
                 &[],
-                &[installed_tool("tool-editor", false)],
+                &[installed_tool("tool-editor")],
                 &["tool-editor"],
                 Some("murmur.yaml")
             ),
@@ -6547,13 +6527,8 @@ mod tests {
     #[test]
     fn runtime_files_line_names_no_manifest_for_a_launch_that_read_none() {
         assert_eq!(
-            runtime_files_line_for(
-                &["bash"],
-                &[installed_tool("tool-editor", false)],
-                &[],
-                None
-            )
-            .as_deref(),
+            runtime_files_line_for(&["bash"], &[installed_tool("tool-editor")], &[], None)
+                .as_deref(),
             Some(
                 "Runtime files: MURMUR.md and the installed tools are in a read-only directory: \
                  $MURMUR_RUNTIME_DIR in a shell command; murmur-runtime/ in a path given to \

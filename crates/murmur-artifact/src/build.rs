@@ -166,7 +166,7 @@ pub struct BuiltArtifact {
 /// Pack `source_dir`'s manifest and `requires_files:` into `output_path`, then append
 /// [`BUILD_INFO_FILE`] naming the newest of `levels` the payload's `murmur:*` interfaces fit.
 ///
-/// A payload with no component (a native tool, a skill, a core module) names no `murmur:*`
+/// A payload with no component (a skill, a core module) names no `murmur:*`
 /// interface and so fits every level. Every authored entry is packed byte for byte.
 #[must_use = "artifact path is needed for caller output and follow-up actions"]
 pub fn build_artifact(
@@ -1071,22 +1071,39 @@ mod tests {
         );
     }
 
-    /// The payload-shape rule is the wasm rule. A native or static artifact is packed by the
-    /// same curation without acquiring a `.wasm` requirement it never had.
+    /// A manifest declaring a native tool is refused before anything is packed.
     #[test]
-    fn native_and_static_artifacts_are_not_held_to_the_wasm_payload_shape() {
-        for manifest in [
-            "name: native-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\nrequires_files: []\n",
-            "name: static-thing\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files: []\n",
+    fn a_native_tool_manifest_is_refused_and_no_archive_is_written() {
+        for (manifest, field) in [
+            ("name: nat-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\nrequires_files: []\n", "implementation"),
+            ("name: nat-tool\nversion: 0.1.0\nruntime: tool\nexecution: native\nrequires_files: []\n", "execution"),
         ] {
             let dir = tempdir().unwrap();
             fs::write(dir.path().join(MANIFEST_FILENAME), manifest).unwrap();
-
             let out = dir.path().join("artifact.mur.zip");
-            build_artifact(dir.path(), &out, &[])
-                .unwrap_or_else(|err| panic!("{manifest} should build; got: {err}"));
-            assert_eq!(entry_names(&out), vec![PACKED_MANIFEST_ENTRY.to_string()]);
+            let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("artifact 'nat-tool' declares {field}: native")),
+                "{msg}"
+            );
+            assert!(!out.exists());
         }
+    }
+
+    /// The payload-shape rule is the wasm rule. A static artifact is packed by the same curation
+    /// without acquiring a `.wasm` requirement it never had.
+    #[test]
+    fn static_artifacts_are_not_held_to_the_wasm_payload_shape() {
+        let manifest =
+            "name: static-thing\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files: []\n";
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(MANIFEST_FILENAME), manifest).unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        build_artifact(dir.path(), &out, &[])
+            .unwrap_or_else(|err| panic!("{manifest} should build; got: {err}"));
+        assert_eq!(entry_names(&out), vec![PACKED_MANIFEST_ENTRY.to_string()]);
     }
 
     /// Level 1 and a level 2 that moves only `murmur:tool`, enough to tell the newest fitting

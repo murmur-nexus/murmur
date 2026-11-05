@@ -41,7 +41,7 @@ use crate::workdir_fs::WorkdirRoot;
 pub const RECORDS_DIR_NAME: &str = "records";
 
 /// The variable naming the records directory in every shell command's, plan shell step's,
-/// native tool's and `transport: process` harness's environment. Runtime-owned like
+/// `murmur:process` program's and `transport: process` harness's environment. Runtime-owned like
 /// [`crate::runtime_dir::RUNTIME_DIR_ENV`]: no manifest, override or host value can set it.
 pub const RECORDS_DIR_ENV: &str = "MURMUR_RECORDS_DIR";
 
@@ -50,7 +50,7 @@ pub const RECORDS_DIR_ENV: &str = "MURMUR_RECORDS_DIR";
 pub const HOOKS_SUBDIR: &str = "hooks";
 
 /// The directory beneath `<session-id>/` that is `$HOME` for every shell command, plan shell step
-/// and native tool, created at staging and granted the work folder's rights.
+/// and `murmur:process` program, created at staging and granted the work folder's rights.
 pub const HOME_SUBDIR: &str = "home";
 
 /// The directory beneath `<session-id>/` an agent's `result.txt`, `result_<task-id>.txt` and

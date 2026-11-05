@@ -3,11 +3,7 @@ mod common;
 
 use std::{fs, path::Path, path::PathBuf};
 
-use capsule_runtime::launch_session;
-use serde_json::{json, Value};
 use tempfile::TempDir;
-
-use common::ScriptedServer;
 
 const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
@@ -203,22 +199,20 @@ fn murmur_md_shows_visible_tools_not_drivers() {
     );
     common::publish_local(&home, &driver_artifact).success();
 
-    let native_script = "#!/bin/sh\necho '{\"status\":\"passed\",\"summary\":\"ok\",\"data\":null,\"data_path\":null,\"truncated\":false,\"metadata\":[]}'\n";
-    let native_artifact = common::create_native_artifact(
+    let tool_artifact = common::create_tool_artifact_with_auth(
         artifact_dir.path(),
-        "my-native-tool",
+        "my-wasm-tool",
         "1.0.0",
-        native_script,
-        Some("Processes data and returns results"),
-        None,
+        &fixture_path("run/components/echo-tool.wasm"),
+        "description: Processes data and returns results\n",
     );
-    common::publish_local(&home, &native_artifact).success();
+    common::publish_local(&home, &tool_artifact).success();
 
     let manifest_path = create_agent_manifest(
         project.path(),
         "http://localhost:9999",
         DRIVER_ANTHROPIC_NAME,
-        &[("my-native-tool", "1.0.0", "tool")],
+        &[("my-wasm-tool", "1.0.0", "tool")],
         &[],
         None,
     );
@@ -231,8 +225,8 @@ fn murmur_md_shows_visible_tools_not_drivers() {
         "driver artifact should not appear in MURMUR.md installed tools"
     );
     assert!(
-        content.contains("**my-native-tool**"),
-        "native tool should appear in MURMUR.md installed tools; content:\n{content}"
+        content.contains("**my-wasm-tool**"),
+        "the tool should appear in MURMUR.md installed tools; content:\n{content}"
     );
     assert!(
         content.contains("Processes data and returns results"),
@@ -240,126 +234,7 @@ fn murmur_md_shows_visible_tools_not_drivers() {
     );
 }
 
-/// Test 4: native artifact binary is staged to <runtime dir>/tools/<name>/<name> and is executable.
-#[test]
-fn native_artifact_binary_staged_to_workdir() {
-    let home = TempDir::new().unwrap();
-    let artifact_dir = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-
-    let driver_artifact = create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_ANTHROPIC_NAME,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver_artifact).success();
-
-    let native_script = "#!/bin/sh\necho '{\"status\":\"passed\",\"summary\":\"hello\",\"data\":null,\"data_path\":null,\"truncated\":false,\"metadata\":[]}'\n";
-    let native_artifact = common::create_native_artifact(
-        artifact_dir.path(),
-        "test-native",
-        "0.1.0",
-        native_script,
-        None,
-        None,
-    );
-    common::publish_local(&home, &native_artifact).success();
-
-    let manifest_path = create_agent_manifest(
-        project.path(),
-        "http://localhost:9999",
-        DRIVER_ANTHROPIC_NAME,
-        &[("test-native", "0.1.0", "tool")],
-        &[],
-        None,
-    );
-
-    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-
-    let binary_path = staged
-        .runtime_dir
-        .join("tools")
-        .join("test-native")
-        .join("test-native");
-    assert!(
-        binary_path.exists(),
-        "native binary should exist at <runtime dir>/tools/test-native/test-native"
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&binary_path).unwrap().permissions().mode();
-        assert!(
-            mode & 0o111 != 0,
-            "native binary should be executable (mode: {mode:o})"
-        );
-    }
-}
-
-/// Test 5: native tool dispatch — agent calls a native binary, it executes and returns a result.
-#[cfg(unix)]
-#[test]
-fn native_tool_dispatch_executes_binary_and_returns_result() {
-    if common::skip_without_host_support("native_tool_dispatch_executes_binary_and_returns_result")
-    {
-        return;
-    }
-    let server = ScriptedServer::start(two_turn_responses_with_tool("test-native"));
-
-    let home = TempDir::new().unwrap();
-    let artifact_dir = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-
-    let driver_artifact = create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_ANTHROPIC_NAME,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver_artifact).success();
-
-    // Script creates a marker file so we can assert it actually ran. Shell builtins only: a native
-    // tool runs in the capsule's sandbox, where `mkdir` or `touch` would need `shell.allow`.
-    let native_script = "#!/bin/sh\n: > native-ran-marker.txt\necho '{\"status\":\"passed\",\"summary\":\"native ran ok\",\"data\":\"{}\",\"data_path\":null,\"truncated\":false,\"metadata\":[]}'\n";
-    let native_artifact = common::create_native_artifact(
-        artifact_dir.path(),
-        "test-native",
-        "0.1.0",
-        native_script,
-        Some("A native test tool"),
-        None,
-    );
-    common::publish_local(&home, &native_artifact).success();
-
-    let manifest_path = create_agent_manifest(
-        project.path(),
-        &server.endpoint,
-        DRIVER_ANTHROPIC_NAME,
-        &[("test-native", "0.1.0", "tool")],
-        &[],
-        None,
-    );
-
-    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(
-        staged.accessible_workdir.join("task.md"),
-        "Use test-native.",
-    )
-    .unwrap();
-
-    let launched = launch_session(staged, |_| {}).expect("launch should succeed");
-
-    assert!(
-        launched.workdir.join("native-ran-marker.txt").exists(),
-        "native tool should have created the marker file"
-    );
-    assert!(
-        launched.records_dir.join("out").join("result.txt").exists(),
-        "out/result.txt should exist in the records directory after the agent completes"
-    );
-}
-
-/// Test 6: skill artifact installs skill.md to tools/<name>/skill.md.
+/// Test 4: skill artifact installs skill.md to tools/<name>/skill.md.
 #[test]
 fn skill_artifact_installed_to_tools_dir() {
     let home = TempDir::new().unwrap();
@@ -406,7 +281,7 @@ fn skill_artifact_installed_to_tools_dir() {
     );
 }
 
-/// Test 7: MURMUR.md includes a skills section listing installed skill artifacts.
+/// Test 5: MURMUR.md includes a skills section listing installed skill artifacts.
 #[test]
 fn murmur_md_includes_skills_section_when_skill_installed() {
     let home = TempDir::new().unwrap();
@@ -466,36 +341,4 @@ fn murmur_md_includes_skills_section_when_skill_installed() {
         !content.contains("**my-guide-skill**\n  Input:"),
         "skill artifact must not appear in the Installed Tools list"
     );
-}
-
-fn two_turn_responses_with_tool(tool_name: &str) -> Vec<String> {
-    vec![
-        json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{
-                "type": "tool_use",
-                "id": "toolu_1",
-                "name": tool_name,
-                "input": {"type": "tool", "name": "new-tool", "runtime": "native"}
-            }],
-            "stop_reason": "tool_use",
-            "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 50, "output_tokens": 50}
-        })
-        .to_string(),
-        json!({
-            "id": "msg_2",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{"type": "text", "text": "Done."}],
-            "stop_reason": "end_turn",
-            "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 50, "output_tokens": 50}
-        })
-        .to_string(),
-    ]
 }

@@ -21,14 +21,12 @@ pub trait SourceSupply: Send + Sync {
     fn scopes(&self) -> Vec<String>;
     /// The index on the latest release of `scope`'s source.
     fn index(&self, scope: &str) -> Result<ArtifactIndex, String>;
-    /// `name@version`'s payload for `platform`, fetched from its scope's source and checked
-    /// against the index (SHA-256, packed name and version) and the scope's owner id against
-    /// `lock`. Writes nothing.
+    /// `name@version`'s payload, fetched from its scope's source and checked against the index
+    /// (SHA-256, packed name and version) and the scope's owner id against `lock`. Writes nothing.
     fn fetch(
         &self,
         name: &ArtifactName,
         version: &str,
-        platform: &str,
         lock: &MurmurLock,
     ) -> Result<SourcedArtifact, String>;
 }

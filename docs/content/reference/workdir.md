@@ -52,7 +52,7 @@ else instead, so a work-folder folder of the same name is hidden from that tool:
 | `state/` | Its [durable state store](#state-store) | A tool whose entry grants a store |
 | `murmur-host/` | Host folders: the host's `/` under `mur run --unconfined`, each [`host_paths`](config.md#host-paths) entry otherwise. See [Extra roots](containment.md#wasm-extra-roots) | A `runtime: tool` with no `capabilities.filesystem.scope`, in a session that grants any |
 
-Shell commands, plan shell steps and native tools see every work-folder folder under its own name.
+Shell commands and plan shell steps see every work-folder folder under its own name.
 
 ### What the capsule changed { #what-the-capsule-changed }
 
@@ -155,7 +155,6 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | `runtime/task.md` | The task. See [Task input](#task-input) |
 | `runtime/<manifest file>` | A copy of the manifest file the launch read — `--manifest`, or the project's `murmur.yaml` — under its own name. A capsule launched by name with `--capsule` read none and has none |
 | `runtime/tools/<name>/murmur.yaml` | A staged or pulled artifact's manifest. `<name>` is the artifact's bare name, the part of its full name after the `/`, which is also its tool name |
-| `runtime/tools/<name>/<name>` | A staged or pulled native tool, marked executable |
 | `runtime/tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
 | `runtime/plans/plan-<n>.json` | One submitted plan per file, numbered by this session's own counter, and read back when the plan runs |
 | `runtime/delegations/<delegation-id>.txt` | The whole answer of a sub-capsule whose answer was cut at 64 KiB in what this session was handed — a [`delegate-task` outcome](roost-api.md#how-the-outcome-arrives) or a plan `capsule` step's output. Present only for a cut answer; the cut line names it |
@@ -166,7 +165,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 
 | Reader | Where |
 |---|---|
-| A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` in its environment, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it. A shell interpreter expands it in a command; a native tool or a binary allowed on its own is handed its arguments as written, so a path argument must be absolute |
+| A shell command, a plan's `shell` step, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` in its environment, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it. A shell interpreter expands it in a command; a binary allowed on its own is handed its arguments as written, so a path argument must be absolute |
 | A script capsule's own component, a WASM `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the work folder it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
 | A tool with a `scope`, a driver, a hook | Nothing |
 
@@ -181,7 +180,7 @@ of [`MURMUR.md`](../concepts/session-loop.md#murmur-md), which also gives the ab
 | Applied tier | `runtime/` for the capsule's commands |
 |---|---|
 | `mountns+pivot_root+landlock+seccomp` (`sealed`) | Bound read-only at its own absolute path inside the composed root, and granted read-only by Landlock. A bind that fails ends the session with [`E-RUN-014`](containment.md#field-containment) |
-| `landlock+seccomp` (`scoped`) | Granted read-only by Landlock: reading and listing, no writing, no running. A native tool's entrypoint runs through its own grant |
+| `landlock+seccomp` (`scoped`) | Granted read-only by Landlock: reading and listing, no writing, no running |
 | `seccomp-only` | Not protected: no filesystem mechanism |
 | `none` (macOS and every non-Linux host) | Not protected: no kernel containment for capsule commands |
 
@@ -288,8 +287,8 @@ stays under the old path.
 | `out/result.txt` | The agent's final output. Written on every terminal outcome of a task that ran; a failure writes `error: <message>`, a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap, and a task that ends `canceled` writes `canceled: the task was canceled before it completed, so it has no result`. A task canceled before it started writes nothing | The runtime |
 | `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's: a completed task's answer, or the `canceled:` line above for a canceled one. Only under `lifecycle.conversation: threaded` | The runtime |
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [Compaction summaries](#compaction-summaries) | The runtime |
-| `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp`, `$TMPDIR`, `$TMP` and `$TEMP` to the session's shell commands, plan shell steps and native tools. The runtime writes nothing in it | The capsule's commands |
-| `home/` | The session's home folder: `$HOME` to every shell command, plan shell step and native tool, and the home directory of the synthetic `passwd` entry under `sealed`. The runtime writes nothing in it | The capsule's commands |
+| `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp`, `$TMPDIR`, `$TMP` and `$TEMP` to the session's shell commands and plan shell steps. The runtime writes nothing in it | The capsule's commands |
+| `home/` | The session's home folder: `$HOME` to every shell command and plan shell step, and the home directory of the synthetic `passwd` entry under `sealed`. The runtime writes nothing in it | The capsule's commands |
 | `children/<capsule>-<16 hex>/` | One directory per delegated child launch, each the child's `--workdir`. `<capsule>` is the bare capsule name; the 16 hex characters are fresh per launch | The runtime creates it; the child capsule writes in it |
 
 `tmp/` and `home/` count with the work folder against
@@ -304,9 +303,9 @@ Beside the session directories, a group holds one [eval-run record](observabilit
 
 | Reader | Where |
 |---|---|
-| A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RECORDS_DIR`, the absolute path of the session's records directory. Set by the runtime last, on `$MURMUR_RUNTIME_DIR`'s terms |
-| A shell command, a plan's `shell` step, a native tool | `tmp/`, read-write, as `$TMPDIR`, `$TMP` and `$TEMP`, and as `/tmp` where the session maps it. See [The session's temporary folder](containment.md#temp-folder) |
-| A shell command, a plan's `shell` step, a native tool | `home/`, read-write, as `$HOME` |
+| A shell command, a plan's `shell` step, a `transport: process` harness | `$MURMUR_RECORDS_DIR`, the absolute path of the session's records directory. Set by the runtime last, on `$MURMUR_RUNTIME_DIR`'s terms |
+| A shell command, a plan's `shell` step | `tmp/`, read-write, as `$TMPDIR`, `$TMP` and `$TEMP`, and as `/tmp` where the session maps it. See [The session's temporary folder](containment.md#temp-folder) |
+| A shell command, a plan's `shell` step | `home/`, read-write, as `$HOME` |
 | A hook declared `capabilities.filesystem.records: true` | `hooks/`, as its current directory, read-write |
 | A WASM tool, a driver, any other hook | Nothing |
 
@@ -420,9 +419,6 @@ std::fs::write("state/notes.jsonl", contents)?;   // the store
 std::fs::write("out/result.txt", summary)?;       // the work folder
 ```
 
-A [native tool](containment.md#native-tool-settings) runs with the work folder as its current
-directory and reads the store's absolute path from `MURMUR_STATE_DIR`.
-
 `~/.murmur`, `~/.murmur/state/` and each store directory under it are created mode `0700`, and the
 mode is reasserted on every launch. See [`~/.murmur` modes](config.md#murmur-home-permissions).
 
@@ -447,9 +443,8 @@ one way to point them at one directory, and it has to be written in both manifes
 **The artifact that declared it reaches the store; shell commands and sub-capsules do not.** Under
 the `sealed` containment class the store is absent from the composed root of every shell command,
 so neither a binary allowlisted by `capabilities.shell.allow` nor a sub-capsule allowlisted by
-`capabilities.spawn.allow` can open it. A native tool that declared the store reaches it on every
-tier, and on the tiers with no filesystem scope so does every other subprocess — see
-[A native tool's own config and store](containment.md#native-tool-settings).
+`capabilities.spawn.allow` can open it. On the tiers with no filesystem scope every subprocess
+reaches it.
 
 ### What belongs in the work folder instead
 
@@ -769,12 +764,10 @@ artifacts:
       any: "<sha256>"
     origin: runtime
     session: ses_0190a1b2c3d4...
-  - name: local/some-native-tool
+  - name: local/some-tool
     resolved_version: "0.4.2"
     sha256:
-      platforms:
-        darwin-aarch64: "<sha256>"
-        linux-x86_64: "<sha256>"
+      any: "<sha256>"
     origin: operator
 ```
 
@@ -783,36 +776,23 @@ see [Artifact names](../concepts/registry.md#artifact-names). An entry may carry
 GitHub's numeric id of the scope's owner, written only when known: by `mur install` from a source,
 and by a runtime pull whose source or stored payload records one.
 
-An entry carries exactly one of two hash shapes:
-
-| Key | Pins | Written for |
-|---|---|---|
-| `sha256.any` | One hash for one payload every host resolves | A WASM component or a static skill |
-| `sha256.platforms.<platform>` | One hash per platform tag | A native tool, whose payload is a different binary per platform |
-
-A platform tag is one of `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64`, `linux-x86_64` — the
-same tags [`mur publish --platform`](cli.md#mur-publish) writes and the store files a payload
-under.
-
-A host verifies against the hash pinned for its own platform. A native artifact with no key for
-this host is not pinned here yet — run `mur install` on this host to add it, which leaves every
-other platform's key intact.
+Each entry pins one hash, `sha256.any`: the SHA-256 of the one payload every host resolves. An
+entry carrying `sha256.platforms` is refused with `E-RUN-003`, naming the entry; delete that entry
+from `murmur.lock` and run `mur install` to regenerate it.
 
 Every path below verifies against the pin before writing anything: a registry-resolved artifact
 whose version or hash disagrees with an existing entry is rejected, with nothing written to disk or
-to the lock. A platform the entry has no key for is not a disagreement.
+to the lock.
 
 | Path | When it writes |
 |---|---|
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
-| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. An artifact installed from a file is pinned as `local/<name>`. Skipped for `-g` (no project directory) and for `--all-platforms`, which installs into the global store |
+| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. An artifact installed from a file is pinned as `local/<name>`. Skipped for `-g` (no project directory) |
 | `manage.pull()`, [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` and sets `owner_id` when the source or the stored payload records one; a pull whose owner id differs from one the lock records for the scope is refused — see [Pin origin](#lock-origin) |
 | `manage.remove()`, [`remove-artifact`](runtime-provided-tools.md#remove-artifact) | Deletes one `origin: runtime` entry the manifest does not declare, and rewrites every other entry unchanged — see [Pin origin](#lock-origin) |
 
-An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`
-block only when everything in it is stale: a different `resolved_version`, or a change between the
-`any` and `platforms` shapes.
+An upsert replaces the entry's `sha256` when its `resolved_version` changes.
 
 ### Pin origin { #lock-origin }
 
@@ -864,7 +844,7 @@ A lock of any other `lock_version`, or an entry whose `name` is not a full name,
 any entry is checked, with a message ending "delete murmur.lock and run `mur install` to regenerate
 it". Delete `murmur.lock` and run `mur install` to regenerate it.
 
-A missing entry for a manifest artifact, an entry with no hash for this host's platform, an
+A missing entry for a manifest artifact, an entry carrying `sha256.platforms`, an
 unsupported `lock_version`, or a malformed `origin` / `session` pair fails the run with
 `E-RUN-003`. See [Diagnostics](diagnostics.md).
 

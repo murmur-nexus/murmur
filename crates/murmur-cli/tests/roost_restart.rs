@@ -195,7 +195,6 @@ fn publish(registry: &Path, name: &str, body: &str) {
             version: "0.1.0".to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: "capsule".to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,

@@ -114,7 +114,7 @@ The response is the string `ready`.
 
 ## Step 2 — configure the manifest
 
-Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo's OTLP ingest port. The `murmur/hook-grafana` artifact adds a hook-side enriched span tree on top of the native emission path — both are independent and a failure in one does not suppress the other:
+Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo's OTLP ingest port. The `murmur/hook-grafana` artifact adds a hook-side enriched span tree on top of the runtime's own emission path — both are independent and a failure in one does not suppress the other:
 
 === "Anthropic"
 

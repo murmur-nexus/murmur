@@ -406,7 +406,7 @@ impl HookCapabilityGrant {
 /// Resolve and validate the store name a `capabilities:` block asks for, applying the capsule-name
 /// default. `None` when the block declares no `state`, which is deny.
 ///
-/// Shared by both grants and by a native tool's staging because the rule is one rule: the name
+/// Shared by both grants because the rule is one rule: the name
 /// comes from the capsule operator's own manifest entry, the default is the operator's capsule
 /// name, and a name that is not a single usable path segment fails staging rather than surfacing
 /// later as a confusing denial.
@@ -603,11 +603,9 @@ where
             (_, false) => PreopenSurface::WholeWorkdir,
         };
 
-        // Unresolved until the caller knows whether the installed artifact is WASM or native:
-        // see `containment::resolve_runtime_dir_reaches`.
         let runtime_dir_reach =
             crate::runtime_dir::gets_runtime_dir_preopen(runtime, scope.is_some())
-                .then_some(crate::containment::RuntimeDirReach::Unresolved);
+                .then_some(crate::containment::RuntimeDirReach::MurmurRuntime);
         reports.push(PreopenReport {
             artifact: name.to_string(),
             role: runtime.as_str().to_string(),
@@ -1185,7 +1183,7 @@ mod tests {
                     role: "tool".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
-                    runtime_dir_reach: Some(crate::containment::RuntimeDirReach::Unresolved),
+                    runtime_dir_reach: Some(crate::containment::RuntimeDirReach::MurmurRuntime),
                     extra_roots: Vec::new(),
                 },
                 PreopenReport {

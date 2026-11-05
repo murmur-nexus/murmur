@@ -14,9 +14,9 @@ use bytes::Bytes;
 use capsule_runtime::served_wit_level;
 use murmur_artifact::{
     artifact_name_format_error, load_manifest_from_artifact_bytes, sha256_hex, version_fit,
-    ArtifactIndex, ArtifactIndexError, ArtifactName, FitSubject, IndexedArtifact, IndexedAsset,
-    IndexedVersion, Manifest, MurmurLock, RegistryError, UnservedInterface, VersionFit,
-    ARTIFACT_INDEX_FILE_NAME, MURMUR_SCOPE, RESERVED_SCOPES,
+    ArtifactError, ArtifactIndex, ArtifactIndexError, ArtifactName, FitSubject, IndexedArtifact,
+    IndexedAsset, IndexedVersion, Manifest, ManifestError, MurmurLock, RegistryError,
+    UnservedInterface, VersionFit, ARTIFACT_INDEX_FILE_NAME, MURMUR_SCOPE, RESERVED_SCOPES,
 };
 
 use crate::config::{
@@ -481,8 +481,6 @@ pub(crate) struct Resolved {
     /// The digest the index lists, which the bytes were checked against.
     pub sha256: String,
     pub version: String,
-    /// The platform tag of the asset chosen, or `None` for an untagged one.
-    pub platform: Option<String>,
     /// [`ArtifactSource::label`] of the source that served it.
     pub source: String,
     /// The owner id the source answered with, already checked.
@@ -525,13 +523,17 @@ pub(crate) enum ResolveError {
         version: String,
         listed: Vec<String>,
     },
-    /// The version has no asset this platform runs.
-    NoPayloadFor {
+    /// The index lists the version with no asset.
+    NoPayload {
         source: String,
         name: ArtifactName,
         version: String,
-        platform: String,
-        published: Vec<String>,
+    },
+    /// The payload's packed `murmur.yaml` declares `field: native`.
+    NativeTool {
+        name: ArtifactName,
+        version: String,
+        field: String,
     },
     /// An explicitly named version does not fit the WIT level this mur serves. `fitting` is the
     /// newest version the same index lists that does.
@@ -640,8 +642,7 @@ fn target(name: &ArtifactName, version: Option<&str>) -> String {
 }
 
 /// Fetch `name` from `source`, which must be the source of its scope: `version` exactly, or with
-/// `None` the newest version that fits this mur, as the asset for `platform` (tagged for it, else
-/// untagged). Nothing is written: the caller stores what this returns.
+/// `None` the newest version that fits this mur. Nothing is written: the caller stores what this returns.
 ///
 /// Checked in order, each before anything further is requested: the owner id against `lock` and,
 /// for the [`MURMUR_SCOPE`], against [`MURMUR_OWNER_ID`]; the index's scope against the
@@ -653,7 +654,6 @@ pub(crate) fn resolve(
     name: &ArtifactName,
     version: Option<&str>,
     explicit: ExplicitVersion,
-    platform: &str,
     lock: Option<&MurmurLock>,
 ) -> Result<Resolved, Box<ResolveError>> {
     let label = source.label().to_string();
@@ -725,40 +725,34 @@ pub(crate) fn resolve(
                     .collect(),
             })
         })?,
-        None => newest_fitting(artifact, platform).ok_or_else(|| {
+        None => newest_fitting(artifact).ok_or_else(|| {
             let newest = &artifact.versions[0];
             Box::new(ResolveError::NoneFits {
                 source: label.clone(),
                 name: name.clone(),
                 newest: newest.version.clone(),
-                fit: index_fit(newest, platform),
+                fit: index_fit(newest),
             })
         })?,
     };
 
     if version.is_some() && explicit == ExplicitVersion::FitChecked {
-        if let VersionFit::Unserved(mismatched) = index_fit(chosen, platform) {
+        if let VersionFit::Unserved(mismatched) = index_fit(chosen) {
             return Err(Box::new(ResolveError::DoesNotFit {
                 source: label,
                 name: name.clone(),
                 version: chosen.version.clone(),
                 mismatched,
-                fitting: newest_fitting(artifact, platform).map(|fits| fits.version.clone()),
+                fitting: newest_fitting(artifact).map(|fits| fits.version.clone()),
             }));
         }
     }
 
-    let asset = select_asset(chosen, platform).ok_or_else(|| {
-        Box::new(ResolveError::NoPayloadFor {
+    let asset = select_asset(chosen).ok_or_else(|| {
+        Box::new(ResolveError::NoPayload {
             source: label.clone(),
             name: name.clone(),
             version: chosen.version.clone(),
-            platform: platform.to_string(),
-            published: chosen
-                .assets
-                .iter()
-                .filter_map(|asset| asset.platform.clone())
-                .collect(),
         })
     })?;
 
@@ -786,13 +780,20 @@ pub(crate) fn resolve(
         }));
     }
 
-    let manifest = load_manifest_from_artifact_bytes(&bytes).map_err(|error| {
-        Box::new(ResolveError::Unreadable {
+    let manifest = load_manifest_from_artifact_bytes(&bytes).map_err(|error| match error {
+        ArtifactError::Manifest(ManifestError::NativeTool { field, .. }) => {
+            Box::new(ResolveError::NativeTool {
+                name: name.clone(),
+                version: chosen.version.clone(),
+                field: field.to_string(),
+            })
+        }
+        error => Box::new(ResolveError::Unreadable {
             source: label.clone(),
             target: wanted.clone(),
             file: asset.file.clone(),
             error: error.to_string(),
-        })
+        }),
     })?;
     if manifest.name != name.name() {
         return Err(Box::new(ResolveError::PackedName {
@@ -815,7 +816,6 @@ pub(crate) fn resolve(
         bytes,
         sha256: actual,
         version: chosen.version.clone(),
-        platform: asset.platform.clone(),
         source: label,
         owner_id,
         manifest,
@@ -907,33 +907,21 @@ pub(crate) fn select_version<'a>(
     artifact.versions.iter().find(|v| v.version == version)
 }
 
-/// The newest version of `artifact` that fits this mur on `platform`: it fits the WIT level this
-/// mur serves, and one of its payloads runs on `platform`. The same predicate `mur search` lists
-/// by, so both name the same version.
-pub(crate) fn newest_fitting<'a>(
-    artifact: &'a IndexedArtifact,
-    platform: &str,
-) -> Option<&'a IndexedVersion> {
-    artifact.newest_fitting(served_wit_level(), platform)
+/// The newest version of `artifact` that fits the WIT level this mur serves. The same predicate
+/// `mur search` lists by, so both name the same version.
+pub(crate) fn newest_fitting(artifact: &IndexedArtifact) -> Option<&IndexedVersion> {
+    artifact.newest_fitting(served_wit_level())
 }
 
-/// Whether `version` fits this mur on `platform`, and why not when it does not: the predicate
+/// Whether `version` fits this mur, and why not when it does not: the predicate
 /// [`newest_fitting`] applies to each version.
-pub(crate) fn index_fit(version: &IndexedVersion, platform: &str) -> VersionFit {
-    version_fit(&FitSubject::indexed(version), served_wit_level(), platform)
+pub(crate) fn index_fit(version: &IndexedVersion) -> VersionFit {
+    version_fit(&FitSubject::indexed(version), served_wit_level())
 }
 
-/// The asset of `version` that `platform` runs: the one tagged for it, else the untagged one,
-/// never another platform's.
-pub(crate) fn select_asset<'a>(
-    version: &'a IndexedVersion,
-    platform: &str,
-) -> Option<&'a IndexedAsset> {
-    version
-        .assets
-        .iter()
-        .find(|asset| asset.platform.as_deref() == Some(platform))
-        .or_else(|| version.assets.iter().find(|asset| asset.platform.is_none()))
+/// The payload `version` lists, which every host runs.
+pub(crate) fn select_asset(version: &IndexedVersion) -> Option<&IndexedAsset> {
+    version.assets.first()
 }
 
 // ─── rendering ───────────────────────────────────────────────────────────────
@@ -991,9 +979,6 @@ pub(crate) fn fit_note(full_name: &str, version: &str, fit: &VersionFit) -> Opti
                 crate::stores::served_phrase(first)
             ))
         }
-        VersionFit::NoPayloadFor(platform) => Some(format!(
-            "{full_name}: {version} has no payload for {platform}"
-        )),
     }
 }
 
@@ -1059,30 +1044,23 @@ impl From<ResolveError> for CliError {
                      fits this mur: mur install {name}"
                 ),
             ),
-            ResolveError::NoPayloadFor {
+            ResolveError::NoPayload {
                 source,
                 name,
                 version,
-                platform,
-                published,
-            } => {
-                let publishes = if published.is_empty() {
-                    "it publishes no payload tagged for any platform".to_string()
-                } else {
-                    format!("it publishes {}", published.join(", "))
-                };
-                CliError::with_hint(
-                    E_REG_001,
-                    format!(
-                        "could not resolve {name}@{version}: {source} has no payload of it for \
-                         {platform}; {publishes}"
-                    ),
-                    format!(
-                        "build it on this host with `mur build` then `mur install <path>`, or \
-                         ask the publisher to release a {platform} asset"
-                    ),
-                )
-            }
+            } => CliError::with_hint(
+                E_REG_001,
+                format!(
+                    "could not resolve {name}@{version}: the index of {source} lists no payload \
+                     of it"
+                ),
+                "ask the publisher to upload the version's .mur.zip and regenerate the index",
+            ),
+            ResolveError::NativeTool {
+                name,
+                version,
+                field,
+            } => crate::error::native_tool_install_error(name.as_str(), &version, &field),
             ResolveError::NoneFits {
                 source,
                 name,
@@ -1097,17 +1075,11 @@ impl From<ResolveError> for CliError {
                         "no version of {name} in {source} fits WIT level {level}, the level this \
                          mur serves; the newest is {note}"
                     ),
-                    match fit {
-                        VersionFit::NoPayloadFor(platform) => format!(
-                            "build it on this host with `mur build` then `mur install <path>`, or \
-                             ask its publisher to release a {platform} asset"
-                        ),
-                        VersionFit::Fits | VersionFit::Unserved(_) => format!(
-                            "{WIT_LEVELS_PAGE} lists which mur release serves which WIT level; \
-                             run one that serves the level {name} was built at, or ask its \
-                             publisher to rebuild it against level {level}"
-                        ),
-                    },
+                    format!(
+                        "{WIT_LEVELS_PAGE} lists which mur release serves which WIT level; run \
+                         one that serves the level {name} was built at, or ask its publisher to \
+                         rebuild it against level {level}"
+                    ),
                 )
             }
             ResolveError::DoesNotFit {
@@ -1356,7 +1328,7 @@ pub(crate) mod memory {
             }
         }
 
-        /// Publish `bytes` as `name@version` on `release`, for `platform` or untagged, listing
+        /// Publish `bytes` as `name@version` on `release`, listing
         /// `interfaces`. Versions of one name are kept newest first in publishing order, so
         /// publish older versions first.
         pub(crate) fn publish(
@@ -1364,14 +1336,12 @@ pub(crate) mod memory {
             release: &str,
             name: &str,
             version: &str,
-            platform: Option<&str>,
             interfaces: &[&str],
             bytes: Vec<u8>,
         ) -> &mut Self {
-            let file = murmur_artifact::asset_file_name(name, version, platform);
+            let file = murmur_artifact::asset_file_name(name, version);
             let asset = IndexedAsset {
                 file: file.clone(),
-                platform: platform.map(str::to_string),
                 sha256: sha256_hex(&bytes),
             };
             self.files
@@ -1454,7 +1424,7 @@ pub(crate) mod memory {
 mod tests {
     use std::io::Write;
 
-    use murmur_artifact::{current_platform, LockOrigin, LockedSha256, LOCK_VERSION};
+    use murmur_artifact::{LockOrigin, LockedSha256, LOCK_VERSION};
     use zip::{write::SimpleFileOptions, ZipWriter};
 
     use super::memory::MemorySource;
@@ -1482,14 +1452,6 @@ mod tests {
         format!("murmur:tool/run@{version}")
     }
 
-    fn other_platform() -> &'static str {
-        murmur_artifact::SUPPORTED_PLATFORMS
-            .iter()
-            .copied()
-            .find(|platform| *platform != current_platform())
-            .unwrap()
-    }
-
     fn ana() -> MemorySource {
         let mut source = MemorySource::new("ana/artifacts", "ana", 1111, "v2");
         source
@@ -1497,7 +1459,6 @@ mod tests {
                 "v1",
                 "tool-git",
                 "0.9.0",
-                None,
                 &[],
                 zip_bytes("tool-git", "0.9.0"),
             )
@@ -1505,7 +1466,6 @@ mod tests {
                 "v2",
                 "tool-git",
                 "1.0.0",
-                None,
                 &[],
                 zip_bytes("tool-git", "1.0.0"),
             )
@@ -1513,7 +1473,6 @@ mod tests {
                 "v2",
                 "tool-git-validate",
                 "1.0.0",
-                None,
                 &[],
                 zip_bytes("tool-git-validate", "1.0.0"),
             );
@@ -1534,7 +1493,6 @@ mod tests {
             &name(full),
             version,
             ExplicitVersion::FitChecked,
-            current_platform(),
             None,
         )
     }
@@ -1579,48 +1537,6 @@ mod tests {
         );
     }
 
-    fn tagged_version(assets: &[(Option<&str>, &str)]) -> IndexedVersion {
-        IndexedVersion {
-            version: "1.0.0".to_string(),
-            release: "v1".to_string(),
-            built_at_level: None,
-            interfaces: Vec::new(),
-            assets: assets
-                .iter()
-                .map(|(platform, file)| IndexedAsset {
-                    file: file.to_string(),
-                    platform: platform.map(str::to_string),
-                    sha256: "0".repeat(64),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn this_platforms_tagged_asset_is_chosen_over_the_untagged_one() {
-        let version = tagged_version(&[
-            (Some("darwin-aarch64"), "t-1.0.0-darwin-aarch64.mur.zip"),
-            (None, "t-1.0.0.mur.zip"),
-            (Some("linux-x86_64"), "t-1.0.0-linux-x86_64.mur.zip"),
-        ]);
-        assert_eq!(
-            select_asset(&version, "linux-x86_64").unwrap().file,
-            "t-1.0.0-linux-x86_64.mur.zip"
-        );
-        assert_eq!(
-            select_asset(&version, "linux-aarch64").unwrap().file,
-            "t-1.0.0.mur.zip"
-        );
-    }
-
-    #[test]
-    fn another_platforms_asset_is_never_chosen() {
-        let version = tagged_version(&[(Some("darwin-aarch64"), "t-1.0.0-darwin-aarch64.mur.zip")]);
-        for platform in ["linux-x86_64", "linux-aarch64", "darwin-x86_64"] {
-            assert!(select_asset(&version, platform).is_none(), "{platform}");
-        }
-    }
-
     #[test]
     fn the_newest_fitting_version_is_chosen() {
         let mut source = MemorySource::new("ana/fits", "ana", 1111, "v1");
@@ -1630,7 +1546,6 @@ mod tests {
                 "v1",
                 "tool-x",
                 "0.1.0",
-                None,
                 &[&served],
                 zip_bytes("tool-x", "0.1.0"),
             )
@@ -1638,33 +1553,18 @@ mod tests {
                 "v1",
                 "tool-x",
                 "0.1.1",
-                None,
                 &[&served],
                 zip_bytes("tool-x", "0.1.1"),
             )
             .publish(
                 "v1",
                 "tool-x",
-                "0.2.0",
-                Some(other_platform()),
-                &[&served],
-                zip_bytes("tool-x", "0.2.0"),
-            )
-            .publish(
-                "v1",
-                "tool-x",
                 "0.3.0",
-                None,
                 &["murmur:tool/run@9.9.9"],
                 zip_bytes("tool-x", "0.3.0"),
             );
         let artifact = &source.index.artifacts[0];
-        assert_eq!(
-            newest_fitting(artifact, current_platform())
-                .unwrap()
-                .version,
-            "0.1.1"
-        );
+        assert_eq!(newest_fitting(artifact).unwrap().version, "0.1.1");
         assert_eq!(
             resolve_in(&source, "ana/tool-x", None).unwrap().version,
             "0.1.1"
@@ -1708,7 +1608,6 @@ mod tests {
                 &name("ana/tool-x"),
                 Some("0.3.0"),
                 ExplicitVersion::AsAsked,
-                current_platform(),
                 None,
             )
             .unwrap();
@@ -1723,7 +1622,6 @@ mod tests {
             "v1",
             "tool-none",
             "1.0.0",
-            None,
             &["murmur:tool/run@9.9.9"],
             zip_bytes("tool-none", "1.0.0"),
         );
@@ -1780,7 +1678,6 @@ mod tests {
             "v1",
             "tool-git",
             "1.0.0",
-            None,
             &[],
             zip_bytes("tool-git", "1.0.1"),
         );
@@ -1823,7 +1720,6 @@ mod tests {
             &name("ana/tool-git-validate"),
             Some("1.0.0"),
             ExplicitVersion::FitChecked,
-            current_platform(),
             Some(&lock),
         )
         .unwrap_err();
@@ -1841,14 +1737,7 @@ mod tests {
     #[test]
     fn the_murmur_scope_is_held_to_its_compiled_in_owner() {
         let mut source = MemorySource::new(DEFAULT_ARTIFACTS_REPO, MURMUR_SCOPE, 1, "v1");
-        source.publish(
-            "v1",
-            "tool-x",
-            "0.1.0",
-            None,
-            &[],
-            zip_bytes("tool-x", "0.1.0"),
-        );
+        source.publish("v1", "tool-x", "0.1.0", &[], zip_bytes("tool-x", "0.1.0"));
         let cli = CliError::from(resolve_in(&source, "murmur/tool-x", Some("0.1.0")).unwrap_err());
         assert_eq!(cli.code, E_REG_010);
         assert!(
@@ -2066,12 +1955,15 @@ mod tests {
                 version: version.clone(),
                 listed: vec!["0.9.0".into()],
             },
-            ResolveError::NoPayloadFor {
+            ResolveError::NoPayload {
                 source: source.clone(),
                 name: tool.clone(),
                 version: version.clone(),
-                platform: "linux-x86_64".into(),
-                published: vec!["darwin-aarch64".into()],
+            },
+            ResolveError::NativeTool {
+                name: tool.clone(),
+                version: version.clone(),
+                field: "implementation".into(),
             },
             ResolveError::DoesNotFit {
                 source: source.clone(),
@@ -2084,7 +1976,7 @@ mod tests {
                 source: source.clone(),
                 name: tool.clone(),
                 newest: version.clone(),
-                fit: VersionFit::NoPayloadFor("linux-x86_64".into()),
+                fit: VersionFit::Fits,
             },
             ResolveError::AssetMissing {
                 source: source.clone(),
