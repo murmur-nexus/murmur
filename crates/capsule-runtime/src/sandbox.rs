@@ -2763,7 +2763,7 @@ impl ShellEnforcement {
 
     /// Hand in the `/proc` view this enforcement's commands get, in place of the one
     /// [`Self::resolve`] decided from its probe.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn with_proc_view(mut self, view: crate::proc_view::ProcView) -> Self {
         self.proc_view = view;
         self
@@ -3795,7 +3795,8 @@ pub(crate) fn prepare_enforcement(
     // `resources::apply_nproc_bound`; with one, one `write` to the `cgroup.procs` descriptor the
     // parent opened; two `setns` calls into the session's namespaces; a third `setns` into its PID
     // namespace and a `fork`, after which the forked-from process is the relay — `sigprocmask`,
-    // `close_range`, `waitpid`, `sigaction`, `kill` and `_exit`, never returning — and the child
+    // `close_range` (or `getrlimit` and a `close` loop where it is refused), `waitpid`,
+    // `sigaction`, `kill` and `_exit`, never returning — and the child
     // continues as the command with one `prctl(PR_SET_PDEATHSIG)` and one `getppid`; on a private
     // process view the `unshare`/`mount`/`open` of `proc_view::mount_private_proc`; on a
     // `MountNamespace` spawn
@@ -4850,7 +4851,8 @@ mod linux_enforce {
     /// It blocks every signal (a process-group signal reaches the command directly, and `SIGKILL`
     /// still ends the relay, which `PR_SET_PDEATHSIG` turns into the command's end), closes every
     /// descriptor — `std`'s exec-status pipe, the diagnostic pipe, stdio and the holder's
-    /// lifeline among them, so none stays open on the relay's account — and waits for the
+    /// lifeline among them, so none stays open on the relay's account, even where `close_range`
+    /// is refused (`cgroup::close_range`) — and waits for the
     /// command. It then leaves the command's status as its own: the exit code, or the
     /// terminating signal re-raised with its default disposition, falling back to `128 + sig`.
     /// `wait4` on the relay reports the command's resource use with its own, since Linux counts a
@@ -4864,12 +4866,7 @@ mod linux_enforce {
             let mut all: libc::sigset_t = std::mem::zeroed();
             libc::sigfillset(&mut all);
             libc::sigprocmask(libc::SIG_SETMASK, &all, std::ptr::null_mut());
-            libc::syscall(
-                libc::SYS_close_range,
-                0 as libc::c_uint,
-                libc::c_uint::MAX,
-                0 as libc::c_uint,
-            );
+            crate::cgroup::close_range(0, libc::c_uint::MAX);
             let mut status: libc::c_int = 0;
             loop {
                 let waited = libc::waitpid(command, &mut status, 0);
@@ -9060,8 +9057,7 @@ mod tests {
 
     /// The sealed notice states what `/proc` is: the session's private procfs, with no host
     /// process in it, and the host's only where no private one can be mounted, then refused by
-    /// Landlock with `stat(2)` on `/proc/<pid>` the one thing that still reaches outside. It no
-    /// longer claims the tier creates no PID namespace.
+    /// Landlock with `stat(2)` on `/proc/<pid>` the one thing that still reaches outside.
     #[test]
     fn tier_warning_kernel_sealed_states_what_proc_is() {
         let (code, notice) = tier_warning(EnforcementTier::KernelSealed, false).unwrap();
@@ -13250,8 +13246,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
     }
 
-    /// The script S1 and its sealed twin run: the files `node`, `os.cpus()` and every runtime
-    /// that reads its own process read, each through `/proc`.
+    /// The script the scoped and sealed own-`/proc` tests run: the files `node`, `os.cpus()` and
+    /// every runtime that reads its own process read, each through `/proc`.
     const OWN_PROC_SCRIPT: &str = "head -n 1 /proc/self/status; \
         head -n 1 /proc/thread-self/status; \
         head -n 1 /proc/stat; \
@@ -13282,7 +13278,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert!(lines[4].starts_with("MemTotal:"), "{}", result.stdout);
     }
 
-    /// S1: a `scoped` command reads its own `/proc/self/*` and `/proc/thread-self/*`, and the
+    /// A `scoped` command reads its own `/proc/self/*` and `/proc/thread-self/*`, and the
     /// kernel's `stat`, `cpuinfo` and `meminfo`, through the private `/proc` and its read rule.
     #[test]
     fn a_scoped_command_reads_its_own_proc() {
@@ -13325,7 +13321,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
     }
 
-    /// The script S2 and its sealed twin run against a host process `pid`.
+    /// The script the scoped and sealed host-process tests run against a host process `pid`.
     fn host_process_script(pid: u32) -> String {
         format!("ls /proc; cat /proc/{pid}/cmdline; echo \"cat=$?\"")
     }
@@ -13351,7 +13347,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert!(result.stdout.contains("cat=1"), "{}", result.stdout);
     }
 
-    /// S2: a `scoped` command's `/proc` lists only its own tree. A host process the test started
+    /// A `scoped` command's `/proc` lists only its own tree. A host process the test started
     /// outside any capsule, and the test itself, are absent, and opening one's `cmdline` is
     /// `ENOENT`, not `EACCES`.
     #[test]
@@ -13376,10 +13372,10 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert_sees_no_host_process(&result, &[sleeper.pid(), std::process::id()]);
     }
 
-    /// The OpenSSL configuration a Node build reads at startup on this host family.
+    /// The OpenSSL configuration file a Node build reads at startup.
     const NODE_OPENSSL_CONFIG: &str = "/etc/ssl/openssl.cnf";
 
-    /// S3: `node` under `scoped` counts the host's CPUs and resolves `localhost` to loopback, with
+    /// `node` under `scoped` counts the host's CPUs and resolves `localhost` to loopback, with
     /// no `network.allow` and no grant on `/proc` or `/etc`.
     #[test]
     fn a_scoped_node_counts_cpus_and_resolves_localhost() {
@@ -13442,7 +13438,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
     }
 
-    /// S4: a `scoped` command resolves `localhost` through `/etc/hosts`: both name-resolution
+    /// A `scoped` command resolves `localhost` through `/etc/hosts`: both name-resolution
     /// files read, and the rest of `/etc` — `/etc/passwd`, `/etc/resolv.conf` — stays denied.
     #[test]
     fn a_scoped_command_resolves_localhost_through_etc_hosts() {
@@ -13493,7 +13489,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
     }
 
-    /// S6: the exit code and the terminating signal the runtime sees are the command's, not its
+    /// The exit code and the terminating signal the runtime sees are the command's, not its
     /// relay's, and a command's parent reads as `0` — outside its PID namespace.
     #[test]
     fn a_command_under_its_relay_keeps_its_exit_status_and_signal() {
@@ -13539,7 +13535,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         panic!("no process of this test's sessions is pid {namespace_pid} in its namespace");
     }
 
-    /// S6: a server a command backgrounds survives into the next command, which sees it in the
+    /// A server a command backgrounds survives into the next command, which sees it in the
     /// same PID namespace, and is gone with the namespace's holder once the session ends.
     #[test]
     fn a_backgrounded_process_survives_into_the_next_command_and_ends_with_the_session() {
@@ -13581,7 +13577,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
     }
 
-    /// S6: a session dropped without `end_session` closes its holder's lifeline, which ends the
+    /// A session dropped without `end_session` closes its holder's lifeline, which ends the
     /// holder and every process in its PID namespace.
     #[test]
     fn a_dropped_session_ends_its_holder_and_its_processes() {
@@ -13611,7 +13607,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
     }
 
-    /// S6: `Child::kill()` reaches the relay, the process `Child` refers to, and the command dies
+    /// `Child::kill()` reaches the relay, the process `Child` refers to, and the command dies
     /// with it through `PR_SET_PDEATHSIG`; `wait` then reports the kill.
     #[test]
     fn killing_the_relay_ends_the_command() {
@@ -13656,8 +13652,58 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
     }
 
-    /// S7: S1's and S2's scripts under `sealed`, where the composed root binds the private
-    /// `/proc` the command mounted before it.
+    /// A process-group `SIGTERM`, which a detached `stop` sends, reaches the command past its
+    /// relay, which blocks every signal, and the relay then leaves the command's terminating
+    /// signal as its own status.
+    #[test]
+    fn a_process_group_sigterm_reaches_the_command_past_its_relay() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let test = "a_process_group_sigterm_reaches_the_command_past_its_relay";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "sleep"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let bash = resolve_exec_allowlist(&["bash".to_string()])
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut command = std::process::Command::new(bash);
+        command
+            .args(["-c", "echo $$ > command.pid; exec sleep 300"])
+            .current_dir(&work)
+            .process_group(0);
+        let _handle = prepare_enforcement(&mut command, &enforcement, &work).unwrap();
+        let mut relay = command.spawn().unwrap();
+        let pid_file = work.join("command.pid");
+        for _ in 0..200 {
+            if std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n')) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let command_pid = host_pid(pid_in(&work, "command.pid"));
+        let sent_at = std::time::Instant::now();
+        assert!(crate::formation_launch::signal_group(
+            i64::from(relay.id()),
+            libc::SIGTERM
+        ));
+        let status = relay.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        assert!(
+            sent_at.elapsed() < std::time::Duration::from_secs(5),
+            "the command took {:?} to end",
+            sent_at.elapsed()
+        );
+        assert!(
+            process_gone_within(command_pid, std::time::Duration::from_secs(5)),
+            "command {command_pid} outlived the group SIGTERM"
+        );
+        enforcement.end_session();
+    }
+
+    /// The own-`/proc` and host-process scripts under `sealed`, where the composed root binds the
+    /// private `/proc` the command mounted before it.
     #[test]
     fn a_sealed_command_reads_its_own_proc_and_sees_no_host_process() {
         let test = "a_sealed_command_reads_its_own_proc_and_sees_no_host_process";
@@ -13682,7 +13728,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert_sees_no_host_process(&host, &[sleeper.pid(), std::process::id()]);
     }
 
-    /// S8: a session whose probe could not mount a private `/proc` runs its commands with the
+    /// A session whose probe could not mount a private `/proc` runs its commands with the
     /// host's, where every open beneath `/proc` is refused as before, and says why.
     #[test]
     fn a_host_proc_view_keeps_proc_denied_and_says_why() {
@@ -13720,7 +13766,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             .is_some_and(|reason| reason.contains("failed with EPERM")),);
     }
 
-    /// S8: a private-`/proc` mount that fails at spawn fails the spawn, naming the step and its
+    /// A private-`/proc` mount that fails at spawn fails the spawn, naming the step and its
     /// `errno` under the fixed prefix; nothing runs with the host's `/proc` instead.
     #[test]
     fn a_private_proc_mount_that_fails_at_spawn_fails_the_spawn() {
@@ -13792,7 +13838,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
     }
 
-    /// S8: a creator that cannot create the PID namespace is refused with `E-CAP-005` naming that
+    /// A creator that cannot create the PID namespace is refused with `E-CAP-005` naming that
     /// step, at the session's first command, and nothing runs.
     #[test]
     fn a_creator_refused_the_pid_namespace_is_refused_with_e_cap_005() {

@@ -4,7 +4,8 @@ A coding capsule that changes a JavaScript project should prove its change by ru
 tests, and it should do that inside the same boundary as everything else it runs. This guide builds
 a `scoped` capsule that installs a project's dependencies with `npm ci` and runs its
 [vitest](https://vitest.dev) suite, with only the grants Node needs: the npm package tree, the
-system library folder native addons load from, and an address-space limit V8 can run under. The
+system library folder native addons load from, OpenSSL's configuration file, and an address-space
+limit V8 can run under. The
 capsule's `/proc` and the files that resolve `localhost` come with `scoped` and need no grant.
 
 The relevant manifest options are:

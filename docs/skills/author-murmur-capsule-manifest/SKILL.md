@@ -347,6 +347,8 @@ An allowlisted CPython or Perl interpreter needs no declaration for its own stan
 
 Likewise, allowlisted commands in a capsule with a non-empty `capabilities.network.allow` get the host's TLS trust store read-only on Linux (`mur run --explain-scope` lists it under `trust store`). Do not add `interpreter_runtime` for `/etc/ssl` or another CA-certificate directory.
 
+On Linux kernel tiers every command also gets a private `/proc` (its own processes, `cpuinfo`, `meminfo`, `stat`) and, on `scoped`, read-only `/etc/hosts` and `/etc/nsswitch.conf`. Do not grant `/proc` or those files. A capsule that allows `node` still needs `/etc/ssl/openssl.cnf` (the one file, `list_dir: false`) under `interpreter_runtime` on `node`, the system library folder there if a native addon loads libraries, and `capabilities.resources.memory_bytes` of at least 32 GiB (`W-RUN-010` warns below it); see [How to run Node tests in a capsule](https://docs.murmur.nexus/how-to/run-node-tests-in-capsule/).
+
 If another interpreter, or a directory a recognised one does not report (such as a virtual environment's `site-packages`), needs host runtime directories outside the workdir, use one of:
 
 - `interpreter_runtime` — explicitly grants the required host runtime directories;

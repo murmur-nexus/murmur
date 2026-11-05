@@ -1111,6 +1111,7 @@ mod linux {
         plan: &CapsuleNetnsPlan,
         sock_fd: RawFd,
         lifeline_fd: RawFd,
+        lifeline_write_fd: RawFd,
     ) -> Result<(), CreationFailure> {
         // SAFETY: forked-child context; the caller's `unsafe` contract covers this whole body.
         unsafe {
@@ -1141,7 +1142,10 @@ mod linux {
             }
             // The holder: the first process forked after `CLONE_NEWPID`, so pid 1 of the
             // session's PID namespace. Forked before any socket exists, so it inherits the
-            // fewest descriptors, every one of which it closes.
+            // fewest descriptors, every one of which it closes. The lifeline's write end is
+            // closed first: the holder must never hold its own lifeline, whatever its descriptor
+            // hygiene manages.
+            libc::close(lifeline_write_fd);
             let holder = libc::fork();
             if holder < 0 {
                 return Err(CreationFailure::at(CreationStep::Holder));
@@ -1217,6 +1221,10 @@ mod linux {
     /// `mur` that died by any means — and the holder exits. When pid 1 of a PID namespace exits,
     /// the kernel kills every process left in it and no process can be forked into it again.
     ///
+    /// The creator closed its copy of the write end before forking this process, so the holder
+    /// never holds its own lifeline even where `close_range` is refused;
+    /// [`crate::cgroup::close_range`] then closes the rest one descriptor at a time.
+    ///
     /// # Safety
     /// Post-`fork()` child context only; every call is async-signal-safe and nothing allocates.
     unsafe fn run_holder(lifeline_fd: RawFd) -> ! {
@@ -1230,14 +1238,9 @@ mod linux {
             libc::chdir(c"/".as_ptr());
             let lifeline = lifeline_fd as libc::c_uint;
             if lifeline > 0 {
-                libc::syscall(libc::SYS_close_range, 0 as libc::c_uint, lifeline - 1, 0);
+                crate::cgroup::close_range(0, lifeline - 1);
             }
-            libc::syscall(
-                libc::SYS_close_range,
-                lifeline + 1,
-                libc::c_uint::MAX,
-                0 as libc::c_uint,
-            );
+            crate::cgroup::close_range(lifeline + 1, libc::c_uint::MAX);
             let mut byte = 0u8;
             loop {
                 let read = libc::read(lifeline_fd, (&raw mut byte).cast(), 1);
@@ -1415,13 +1418,14 @@ mod linux {
             )
         };
         let lifeline_fd = lifeline_read.as_raw_fd();
+        let lifeline_write_fd = lifeline_write.as_raw_fd();
 
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child runs only
         // `create_capsule_netns` — `unshare`, `prctl`, `open`/`write`/`close`, `fork`, `socket`,
         // `ioctl`, `bind`, `listen`, `setsockopt`, `sendto`/`recv`/`sendmsg` — then `send` and
-        // `_exit`, and the holder it forks only `sigaction`, `prctl`, `chdir`, `close_range`,
-        // `read` and `_exit`, with no allocation, no locks and no stdio.
+        // `_exit`, and the holder it forks only `sigaction`, `prctl`, `chdir`, `close_range` (or
+        // `getrlimit` and `close`), `read` and `_exit`, with no allocation, no locks and no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(NamespaceAttemptError::Creator(format!(
@@ -1433,7 +1437,7 @@ mod linux {
             // SAFETY: forked-child context, syscalls only; both branches end in `_exit`, so no
             // destructor of the parent's state runs here.
             unsafe {
-                match create_capsule_netns(plan, creator_fd, lifeline_fd) {
+                match create_capsule_netns(plan, creator_fd, lifeline_fd, lifeline_write_fd) {
                     Ok(()) => libc::_exit(0),
                     Err(failure) => {
                         let record = failure.encode();
@@ -2524,6 +2528,143 @@ mod tests {
             })
         );
         assert_eq!(linux::decode_failure_record(99, 0), None);
+    }
+
+    /// A seccomp program that makes `close_range` fail with `ENOSYS`, as a kernel before 5.9 or
+    /// a container profile that does not know the call does, and allows every other syscall.
+    #[cfg(target_os = "linux")]
+    fn close_range_enosys_filter() -> [libc::sock_filter; 7] {
+        // `BPF_LD | BPF_W | BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K` and `BPF_RET | BPF_K`.
+        const BPF_LD_W_ABS: u16 = 0x20;
+        const BPF_JMP_JEQ_K: u16 = 0x15;
+        const BPF_RET_K: u16 = 0x06;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        // `struct seccomp_data`: `nr` at 0, `arch` at 4.
+        const NR: u32 = 0;
+        const ARCH: u32 = 4;
+        #[cfg(target_arch = "x86_64")]
+        const AUDIT_ARCH: u32 = 0xc000_003e;
+        #[cfg(target_arch = "aarch64")]
+        const AUDIT_ARCH: u32 = 0xc000_00b7;
+        let statement = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+        [
+            statement(BPF_LD_W_ABS, 0, 0, ARCH),
+            statement(BPF_JMP_JEQ_K, 1, 0, AUDIT_ARCH),
+            statement(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+            statement(BPF_LD_W_ABS, 0, 0, NR),
+            statement(BPF_JMP_JEQ_K, 0, 1, libc::SYS_close_range as u32),
+            statement(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+            statement(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// Where `close_range` is refused, the holder still ends with its session — at
+    /// [`SessionNetns::end`] and at a drop without it — because the creator closed the
+    /// lifeline's write end before forking it and the holder closes every other descriptor one
+    /// at a time. A holder that kept the write end would wait on itself forever.
+    ///
+    /// The filter is installed on a thread of its own: a seccomp filter binds the thread that
+    /// installs it and every process forked from it, so the creator and the holder inherit it
+    /// and the rest of the test process does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_holder_ends_with_its_session_where_close_range_is_refused() {
+        let test = "the_holder_ends_with_its_session_where_close_range_is_refused";
+        if skip_without_egress_namespace(test) {
+            return;
+        }
+        std::thread::spawn(|| {
+            let filter = close_range_enosys_filter();
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr().cast_mut(),
+            };
+            // SAFETY: two `prctl` calls on this thread; `program` points at `filter`, which
+            // outlives both, and the kernel copies the program when it is installed.
+            unsafe {
+                assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+                assert_eq!(
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &raw const program,
+                    ),
+                    0,
+                    "installing the filter: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: integer arguments only.
+                let refused = libc::syscall(
+                    libc::SYS_close_range,
+                    u32::MAX - 1,
+                    u32::MAX,
+                    0 as libc::c_uint,
+                );
+                assert_eq!(refused, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOSYS)
+                );
+            }
+
+            let policy = || crate::egress_proxy::EgressPolicy::new(Vec::new(), Vec::new());
+            let end_explicitly = |explicit: bool| {
+                let netns = SessionNetns::new();
+                let join = netns
+                    .establish(&[], policy())
+                    .expect("the namespace is created");
+                let holder = host_pid_in_session(std::process::id(), 1)
+                    .expect("the session's holder is pid 1 of its PID namespace");
+                let status = std::fs::read_to_string(format!("/proc/{holder}/status")).unwrap();
+                assert!(
+                    status.lines().any(|line| line == "Seccomp:\t2"),
+                    "the holder is not under the filter: {status}"
+                );
+                // Its descriptor hygiene is done once it blocks on the lifeline.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let held = loop {
+                    let held: Vec<_> = std::fs::read_dir(format!("/proc/{holder}/fd"))
+                        .expect("the holder's descriptor table is readable")
+                        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                        .collect();
+                    if held.len() <= 1 || std::time::Instant::now() >= deadline {
+                        break held;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                assert_eq!(
+                    held.len(),
+                    1,
+                    "the holder keeps only its lifeline: {held:?}"
+                );
+                assert!(
+                    held[0].to_string_lossy().starts_with("pipe:"),
+                    "the holder keeps only its lifeline: {held:?}"
+                );
+                if explicit {
+                    netns.end();
+                } else {
+                    drop(netns);
+                }
+                drop(join);
+                let wait = crate::sandbox::SESSION_END_KILL_WAIT;
+                let deadline = std::time::Instant::now() + wait;
+                while std::path::Path::new(&format!("/proc/{holder}")).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "holder {holder} outlived its session by {wait:?} (ended explicitly: \
+                         {explicit})"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            };
+            end_explicitly(true);
+            end_explicitly(false);
+        })
+        .join()
+        .expect("the filtered thread's assertions hold");
     }
 
     /// The probe is the launch's own construction, so on a host where it reports no failure a

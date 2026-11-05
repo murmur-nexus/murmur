@@ -1493,14 +1493,18 @@ unsafe fn watch(
 }
 
 /// Close every descriptor in `low..=high`: `close_range(2)`, else one `close` per descriptor up to
-/// the open-files limit, for a kernel older than 5.9.
+/// the open-files limit, for a kernel older than 5.9 or a seccomp profile that refuses the call.
+///
+/// The watcher, the session PID namespace's holder and a command's relay each rely on holding
+/// no descriptor they were not meant to keep, so none of them may skip the fallback.
 ///
 /// # Safety
 ///
-/// Async-signal-safe; called only from [`watch`].
+/// Closes descriptors other code may own: post-`fork()` child context only, in a process that
+/// uses none of them again. Async-signal-safe and allocation-free.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-unsafe fn close_range(low: libc::c_uint, high: libc::c_uint) {
+pub(crate) unsafe fn close_range(low: libc::c_uint, high: libc::c_uint) {
     // SAFETY: integer arguments only.
     unsafe {
         if libc::syscall(libc::SYS_close_range, low, high, 0 as libc::c_uint) == 0 {
