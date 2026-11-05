@@ -2,9 +2,9 @@
 //! launch that stages them loads a form instead of compiling.
 //!
 //! The work is [`Precompiler::precompile_all`]'s, the same call `mur install` makes; this command
-//! only reads files, hands them over as one batch and reports. It resolves nothing, touches no artifact store and
-//! writes no `murmur.lock`, which is what lets `mur deploy run` run it on a target whose store it
-//! has just filled by hand.
+//! only reads files, hands them over as one batch and reports. It resolves nothing, touches no
+//! artifact store and writes no `murmur.lock`, which is what lets `mur deploy run` run it on a
+//! target whose store it has just filled by hand.
 
 use std::path::{Path, PathBuf};
 

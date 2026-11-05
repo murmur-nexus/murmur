@@ -1,8 +1,8 @@
 //! Compiling WASM artifacts ahead of their first launch.
 //!
 //! `mur install` and `mur precompile` hand the payloads one command installs or names to
-//! [`Precompiler::precompile_all`], which hands each to [`Precompiler::precompile`]. That stores its
-//! compiled form through the same [`CompiledForms`] handle and the same
+//! [`Precompiler::precompile_all`], which compiles each as [`Precompiler::precompile`] does. Each
+//! compiled form is stored through the same [`CompiledForms`] handle and the same
 //! [`stage_root_component`] that `stage_session` uses, on an engine from the same
 //! [`build_engine`]. A form written here therefore has the name, mode, sidecar and stamp a launch
 //! would have given it, and launch cannot tell the two apart. This module reads and writes no file
