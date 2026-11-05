@@ -574,3 +574,34 @@ async fn a_program_that_exits_takes_what_it_forked_with_it() {
         .collect();
     assert!(left.is_empty(), "group {pgid} still holds {left:?}");
 }
+
+/// A group leader in a process group of its own, which a test must kill itself.
+fn group_leader(seconds: &str) -> (std::process::Child, i32) {
+    use std::os::unix::process::CommandExt as _;
+    let child = std::process::Command::new("sleep")
+        .arg(seconds)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    (child, pgid)
+}
+
+#[test]
+fn a_group_is_signalled_only_while_its_leader_is_unreaped() {
+    let (mut reaped, reaped_pgid) = group_leader("32");
+    let signals = GroupSignals::default();
+    signals.signal(reaped_pgid, libc::SIGKILL);
+    let status = wait_and_kill_group(&mut reaped, reaped_pgid, &signals).unwrap();
+    assert_eq!(crate::shell::exit_code_of(&status), 128 + libc::SIGKILL);
+
+    // Once the leader is reaped its group id may name another group: the same signals must not
+    // reach whatever holds it now, stood in for here by a live group.
+    let (mut other, other_pgid) = group_leader("31");
+    signals.signal(other_pgid, libc::SIGKILL);
+    std::thread::sleep(Duration::from_millis(200));
+    let alive = other.try_wait().unwrap().is_none();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(alive, "a signal after the reap reached group {other_pgid}");
+}

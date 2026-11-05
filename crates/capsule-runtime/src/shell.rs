@@ -1222,7 +1222,7 @@ fn demote(
 /// Until it is reaped the pid stays the child's, so its process group, which it leads, cannot be
 /// taken by an unrelated process while anything signals it. `NOWAIT` leaves the child waitable,
 /// so `Child::wait` still reaps it afterwards.
-fn wait_for_exit_unreaped(pid: i32) -> std::io::Result<()> {
+pub(crate) fn wait_for_exit_unreaped(pid: i32) -> std::io::Result<()> {
     use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
 
     let pid = (pid > 0)

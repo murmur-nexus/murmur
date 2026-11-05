@@ -344,8 +344,8 @@ fn refusal_rule(result: &Value) -> &str {
     result["error"]["rule"].as_str().unwrap()
 }
 
-/// S3, S4 and S10 for `run`: a program runs to completion under the shell's rules, its output is
-/// capped, its time limit kills it, and a program outside `shell.allow` is refused.
+/// `run`: a program runs to completion under the shell's rules, its output is capped, its time
+/// limit kills it, a program outside `shell.allow` is refused, and each is traced.
 #[test]
 fn run_obeys_the_shell_rules() {
     if common::skip_without_host_support("run_obeys_the_shell_rules") {
@@ -375,17 +375,21 @@ fn run_obeys_the_shell_rules() {
         let hello = run.result("hello");
         assert_eq!(hello["exit_code"], 0, "{tier}");
         assert_eq!(hello["stdout"], "hello\n", "{tier}");
+        assert_eq!(hello["stderr"], "", "{tier}");
+        assert_eq!(hello["stdout_truncated"], false, "{tier}");
+        assert_eq!(hello["stderr_truncated"], false, "{tier}");
         let big = run.result("big");
         assert_eq!(big["stdout_len"], 1_048_576, "{tier}");
         assert_eq!(big["stdout_truncated"], true, "{tier}");
         let slow = run.result("slow");
         assert_eq!(slow["timed_out"], true, "{tier}");
         assert_eq!(slow["exit_code"], 137, "{tier}");
-        assert_eq!(refusal_rule(&run.result("ls")), "capabilities.shell.allow");
-        assert_eq!(
-            refusal_rule(&run.result("start-ls")),
-            "capabilities.shell.allow"
-        );
+        for label in ["ls", "start-ls"] {
+            let refused = run.result(label);
+            assert_eq!(refusal_rule(&refused), "capabilities.shell.allow", "{tier}");
+            let reason = refused["error"]["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains("'ls'"), "{tier}: {label}: {reason}");
+        }
 
         let refused = run.events("process_refused");
         assert_eq!(refused.len(), 2, "{tier}: {refused:?}");
@@ -407,11 +411,15 @@ fn run_obeys_the_shell_rules() {
             !pid_exists(sleep_pid),
             "{tier}: the timed-out sleep is gone"
         );
+        assert!(
+            group_is_empty(sleep_pid),
+            "{tier}: the timed-out sleep's group is empty"
+        );
         run.assert_process_lines_are_attributed();
     }
 }
 
-/// S5: an `on-shell` deny hook refuses `run` and `start` on the argv they would run.
+/// An `on-shell` deny hook refuses `run` and `start` on the argv they would run.
 #[test]
 fn an_on_shell_deny_hook_refuses_run_and_start() {
     if common::skip_without_host_support("an_on_shell_deny_hook_refuses_run_and_start") {
@@ -452,8 +460,8 @@ fn an_on_shell_deny_hook_refuses_run_and_start() {
     }
 }
 
-/// S6, S8 and S10 for `start`: a session process is found, written to and read on later calls,
-/// is not started twice under one name, and dies with the session.
+/// `start`: a session process is found, written to and read on later calls, is not started twice
+/// under one name, and dies with the session.
 #[test]
 fn a_session_process_lives_across_calls_and_dies_with_the_session() {
     let name = "a_session_process_lives_across_calls_and_dies_with_the_session";
@@ -501,7 +509,7 @@ fn a_session_process_lives_across_calls_and_dies_with_the_session() {
             1,
             "{tier}"
         );
-        // S8: `keep` is gone with its group, and its exit precedes `session_end`.
+        // `keep` is gone with its group, and its exit precedes `session_end`.
         let keep = starts.iter().find(|start| start["name"] == "keep").unwrap();
         let pid = keep["pid"].as_i64().unwrap();
         assert!(!pid_exists(pid), "{tier}: pid {pid} outlived the session");
@@ -527,7 +535,7 @@ fn a_session_process_lives_across_calls_and_dies_with_the_session() {
     }
 }
 
-/// S7: `connect` reaches a port the handle's own process listens on and nothing else.
+/// `connect` reaches a port the handle's own process listens on and nothing else.
 #[test]
 fn connect_reaches_only_the_handles_own_listener() {
     let name = "connect_reaches_only_the_handles_own_listener";
@@ -609,7 +617,7 @@ fn connect_reaches_only_the_handles_own_listener() {
     }
 }
 
-/// S9: eight session processes start, the ninth is refused, and after one `stop` it starts.
+/// Eight session processes start, the ninth is refused, and after one `stop` it starts.
 #[test]
 fn a_session_holds_at_most_eight_processes() {
     let name = "a_session_holds_at_most_eight_processes";
@@ -680,9 +688,8 @@ fn sleeps_running(arg: &str) -> usize {
         .count()
 }
 
-/// S8 and S9 for a program that forks: when a session process's program exits, what it left in
-/// its process group is killed, so an exited process holds nothing running and the cap counts
-/// what runs.
+/// A program that forks: when a session process's program exits, what it left in its process
+/// group is killed, so an exited process holds nothing running and the cap counts what runs.
 #[test]
 fn a_session_process_that_exits_takes_its_group_with_it() {
     let name = "a_session_process_that_exits_takes_its_group_with_it";
@@ -755,7 +762,7 @@ fn a_session_process_that_exits_takes_its_group_with_it() {
     }
 }
 
-/// S11: a second tool sees none of the first tool's processes and starts its own.
+/// A second tool sees none of the first tool's processes and starts its own.
 #[test]
 fn another_tool_cannot_reach_the_first_tools_processes() {
     let name = "another_tool_cannot_reach_the_first_tools_processes";

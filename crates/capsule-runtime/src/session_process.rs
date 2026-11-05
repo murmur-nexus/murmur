@@ -310,6 +310,7 @@ struct SessionProcess {
     phase: watch::Sender<Phase>,
     /// The group leader's pid, which names its group; `0` until spawned.
     pid: AtomicI32,
+    signals: GroupSignals,
     started: Mutex<Instant>,
     stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
     stdout: Arc<Mutex<OutputRing>>,
@@ -341,9 +342,8 @@ impl SessionProcess {
     }
 
     fn signal(&self, signal: libc::c_int) {
-        let pgid = self.pgid();
-        if pgid > 1 && self.phase() == Phase::Running {
-            crate::formation_launch::signal_group(i64::from(pgid), signal);
+        if self.phase() == Phase::Running {
+            self.signals.signal(self.pgid(), signal);
         }
     }
 
@@ -698,7 +698,8 @@ impl SessionProcesses {
             .await?;
         // No `run` outlives its call: dropping this future (the call cut by its deadline) kills
         // the group.
-        let guard = KillGroupOnDrop(pgid);
+        let signals = Arc::new(GroupSignals::default());
+        let guard = KillGroupOnDrop(pgid, Arc::clone(&signals));
         let process_id = format!("{HANDLE_PREFIX}{}", uuid::Uuid::now_v7().simple());
         self.trace_start(
             ctx,
@@ -721,12 +722,15 @@ impl SessionProcesses {
         let stdout = CappedCapture::spawn(child.stdout.take());
         let stderr = CappedCapture::spawn(child.stderr.take());
 
-        let waiter = tokio::task::spawn_blocking(move || wait_and_kill_group(&mut child, pgid));
+        let reaper_signals = Arc::clone(&signals);
+        let waiter = tokio::task::spawn_blocking(move || {
+            wait_and_kill_group(&mut child, pgid, &reaper_signals)
+        });
         tokio::pin!(waiter);
         let (status, timed_out) = match tokio::time::timeout(limit, &mut waiter).await {
             Ok(joined) => (joined, false),
             Err(_) => {
-                crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
+                signals.signal(pgid, libc::SIGKILL);
                 ((&mut waiter).await, true)
             }
         };
@@ -860,6 +864,7 @@ impl SessionProcesses {
                         )),
                         phase: watch::Sender::new(Phase::Starting),
                         pid: AtomicI32::new(0),
+                        signals: GroupSignals::default(),
                         started: Mutex::new(Instant::now()),
                         stdin: Arc::new(Mutex::new(None)),
                         stdout: Arc::new(Mutex::new(OutputRing::default())),
@@ -953,8 +958,11 @@ impl SessionProcesses {
         let registry = Arc::clone(self);
         let reaped = Arc::clone(&process);
         tokio::spawn(async move {
-            let status =
-                tokio::task::spawn_blocking(move || wait_and_kill_group(&mut child, pgid)).await;
+            let waited = Arc::clone(&reaped);
+            let status = tokio::task::spawn_blocking(move || {
+                wait_and_kill_group(&mut child, pgid, &waited.signals)
+            })
+            .await;
             drop(cgroup_occupancy);
             let exit_code = match status {
                 Ok(Ok(status)) => crate::shell::exit_code_of(&status),
@@ -1199,43 +1207,48 @@ impl Drop for SessionProcesses {
     }
 }
 
+/// Signals the process group a spawned child leads, only while that child is unreaped.
+///
+/// Never signal a group whose leader has been reaped: the group id is then free, and the kernel
+/// may hand it to an unrelated process's group. The reaper marks the leader reaped under the same
+/// lock a signal takes, before it reaps.
+#[derive(Default)]
+struct GroupSignals {
+    leader_reaped: Mutex<bool>,
+}
+
+impl GroupSignals {
+    fn signal(&self, pgid: i32, signal: libc::c_int) {
+        let leader_reaped = lock(&self.leader_reaped);
+        if pgid > 1 && !*leader_reaped {
+            crate::formation_launch::signal_group(i64::from(pgid), signal);
+        }
+    }
+}
+
 /// Waits for a group leader to exit, kills whatever it left in its process group, then reaps it.
 ///
-/// The leader stays a zombie until the kill is sent, so its pid still names its group and no
-/// other process can have taken it: a process a program forked dies when the program exits,
-/// and a session process that has exited holds nothing running.
-#[allow(unsafe_code)]
+/// The kill is sent while the leader is still an unreaped zombie, which pins its group id: a
+/// process a program forked dies when the program exits, so a session process that has exited
+/// holds nothing running.
 fn wait_and_kill_group(
     child: &mut std::process::Child,
     pgid: i32,
+    signals: &GroupSignals,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let pid = libc::id_t::from(child.id());
-    loop {
-        // SAFETY: `siginfo_t` is plain data, for which all zeroes is a valid value.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a live, writable `siginfo_t` that `waitid` only writes into. `pid` is
-        // this process's own unreaped child, and `WNOWAIT` leaves it waitable for `child.wait()`.
-        let waited =
-            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        if waited == 0 {
-            crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
-            break;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            // `child.wait()` reports the same failure; without a zombie leader pinning the group
-            // id, signalling it could reach another process's group.
-            break;
-        }
+    if crate::shell::wait_for_exit_unreaped(pgid).is_ok() {
+        signals.signal(pgid, libc::SIGKILL);
     }
+    *lock(&signals.leader_reaped) = true;
     child.wait()
 }
 
 /// Kills a `run`'s process group if its call's future is dropped before the run finished.
-struct KillGroupOnDrop(i32);
+struct KillGroupOnDrop(i32, Arc<GroupSignals>);
 
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
-        crate::formation_launch::signal_group(i64::from(self.0), libc::SIGKILL);
+        self.1.signal(self.0, libc::SIGKILL);
     }
 }
 
