@@ -297,6 +297,25 @@ impl LockedArtifact {
                 self.name, self.resolved_version, self.name
             ));
         }
+        self.same_version_conflict_with(version, sha256)
+    }
+
+    /// Why `sha256` disagrees with this pin when it was resolved for the very version this entry
+    /// pins, or `None` when it agrees or `version` is a different one.
+    ///
+    /// A different version is a new pin rather than a disagreement: its bytes were never pinned,
+    /// so nothing here can contradict them. For the same version the text is the one
+    /// [`Self::conflict_with`] gives: a change of shape, or a differing hash for `any` or for a
+    /// platform this entry pins. A platform this entry has no key for is not a disagreement.
+    #[must_use]
+    pub fn same_version_conflict_with(
+        &self,
+        version: &str,
+        sha256: &LockedSha256,
+    ) -> Option<String> {
+        if self.resolved_version != version {
+            return None;
+        }
         if !self.sha256.same_shape_as(sha256) {
             return Some(format!(
                 "'{}' is pinned as a {} payload but resolved as a {} one",
@@ -1115,6 +1134,64 @@ mod tests {
             .conflict_with("0.1.0", &LockedSha256::any("wasm-hash"))
             .unwrap();
         assert!(shape_change.contains("per-platform"), "{shape_change}");
+    }
+
+    #[test]
+    fn a_same_version_conflict_ignores_a_new_version_and_an_unpinned_platform() {
+        let wasm = entry("local/tool", "1.0.0", LockedSha256::any("wasm-hash"));
+        assert_eq!(
+            wasm.same_version_conflict_with("1.1.0", &LockedSha256::any("other-hash")),
+            None
+        );
+        assert_eq!(
+            wasm.same_version_conflict_with("1.0.0", &LockedSha256::any("wasm-hash")),
+            None
+        );
+        let new_bytes = wasm
+            .same_version_conflict_with("1.0.0", &LockedSha256::any("other-hash"))
+            .unwrap();
+        assert_eq!(
+            new_bytes,
+            "'local/tool' is pinned at sha256 wasm-hash, but other-hash was resolved"
+        );
+        assert_eq!(
+            wasm.conflict_with("1.0.0", &LockedSha256::any("other-hash")),
+            Some(new_bytes)
+        );
+        let shape_change = wasm
+            .same_version_conflict_with(
+                "1.0.0",
+                &LockedSha256::for_one_platform("linux-x86_64", "wasm-hash"),
+            )
+            .unwrap();
+        assert!(shape_change.contains("per-platform"), "{shape_change}");
+
+        let native = entry(
+            "local/native-tool",
+            "0.1.0",
+            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
+        );
+        assert_eq!(
+            native.same_version_conflict_with(
+                "0.1.0",
+                &LockedSha256::for_one_platform("linux-x86_64", "linux-hash")
+            ),
+            None
+        );
+        let platform_hash = native
+            .same_version_conflict_with(
+                "0.1.0",
+                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
+            )
+            .unwrap();
+        assert!(platform_hash.contains("darwin-aarch64"), "{platform_hash}");
+        assert_eq!(
+            native.same_version_conflict_with(
+                "0.2.0",
+                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
+            ),
+            None
+        );
     }
 
     fn owned_lock() -> MurmurLock {

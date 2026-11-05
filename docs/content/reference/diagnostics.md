@@ -71,7 +71,7 @@ section that explains it.
 | `E-REG-002` | Artifact bytes do not match the sha256 recorded for them or listed in the source's index, or an artifact's packed `name:` or `version:` is not the one it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`), given to `mur publish` or `mur install` | [`mur install`](cli.md#mur-install) |
-| `E-REG-005` | A registry-resolved artifact's version or hash, or a [roster member's](roster.md#murmur-lock), disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-REG-005` | An artifact resolves, at the version its `murmur.lock` entry pins, to another hash or payload shape; under `mur install --frozen`, also a version other than the entry pins, a declared artifact with no entry, or no `murmur.lock`; or a [roster member's](roster.md#murmur-lock) version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused or unreachable — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
 | `E-REG-007` | An artifact name on the command line is not `<scope>/<name>`, or a `github:` owner claims a reserved scope | [E-REG-007](#e-reg-007) |
 | `E-REG-008` | No source serves the artifact's scope | [E-REG-008](#e-reg-008) |

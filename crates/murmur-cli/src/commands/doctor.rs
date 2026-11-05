@@ -2249,7 +2249,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock version mismatch for '{name}': manifest requested {version}, lock pinned {pinned}"
                         );
                         fixes.push(format!(
-                            "{name}: remove the stale murmur.lock entry, then run mur install {ref_str}"
+                            "{name}: run mur install, which moves its murmur.lock entry to {version}"
                         ));
                     }
                     LockVerdict::MissingPlatform { pinned } => {

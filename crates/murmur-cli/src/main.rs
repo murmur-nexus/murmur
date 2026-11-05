@@ -269,6 +269,12 @@ enum Commands {
         /// does it instead.
         #[arg(long)]
         no_precompile: bool,
+
+        /// Install exactly what murmur.lock pins and never write murmur.lock (for CI). Refuses
+        /// with E-REG-005 when there is no murmur.lock, or murmur.yaml declares an artifact the
+        /// lock has no entry for or at another version than the lock pins
+        #[arg(long, conflicts_with_all = ["artifact", "global", "all_platforms"])]
+        frozen: bool,
     },
     /// Compile WASM artifacts (.mur.zip files) for this machine, so their first launch loads them instead of compiling
     Precompile {
@@ -812,7 +818,8 @@ fn main() {
             global,
             all_platforms,
             no_precompile,
-        } => run_install(&artifact, global, all_platforms, no_precompile),
+            frozen,
+        } => run_install(&artifact, global, all_platforms, no_precompile, frozen),
         Commands::Precompile {
             files,
             workdir,

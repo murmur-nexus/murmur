@@ -777,6 +777,9 @@ Fetch and install artifacts from the global store, the configured sources, or a 
 # Install all artifacts declared in the project manifest (reads murmur.yaml in or above CWD)
 mur install
 
+# Install exactly what murmur.lock pins, never writing murmur.lock (CI)
+mur install --frozen
+
 # Install a specific artifact by scope/name@version: the global store, then the configured sources
 mur install <scope/name@version>
 
@@ -796,6 +799,7 @@ mur install --all-platforms <scope/name@version>
 | Form | Behavior |
 |---|---|
 | `mur install` (no args) | Reads `murmur.yaml` in or above CWD; fetches all declared artifacts in parallel into the project-local store (`.murmur/artifacts/` next to the manifest) |
+| `mur install --frozen` | Installs the manifest's artifacts at exactly the versions and hashes `murmur.lock` pins, and never writes `murmur.lock`. Refused with [`E-REG-005`](workdir.md#lockfile-murmurlock) before anything is fetched when there is no `murmur.lock`, when a declared artifact has no entry, or when its `murmur.yaml` version is not the one its entry pins; an artifact whose bytes disagree with its entry, or a native artifact whose entry pins no hash for this platform, fails with `E-REG-005` before it is stored. Takes no reference, `-g` or `--all-platforms` (exit status 2) |
 | `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked. A version that does not [fit this `mur`](installing-artifacts.md#version-selection) is refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched |
 | `mur install <scope/name>` | Fetches the newest version that [fits this `mur`](installing-artifacts.md#version-selection) from the source of the scope |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
@@ -814,6 +818,12 @@ mur install
 mur run
 ```
 
+Example — install what `murmur.lock` pins in CI, failing when `murmur.yaml` and the lock disagree:
+
+```bash
+mur install --frozen
+```
+
 Example — install a specific artifact:
 
 ```bash
@@ -825,7 +835,23 @@ Behavior:
 1. Resolve a `name@version` artifact from the global store `~/.murmur/artifacts/`
 2. On a hit, verify the bytes against the SHA-256 the global store records; on a miss, look the artifact up in the index of its scope's source, download it, and check it against the index — see [Index resolution](installing-artifacts.md#index-resolution)
 3. Store into the project-local store (or global store with `-g`)
-4. Pin the name, resolved version, SHA-256 and, for a payload a source served, the scope's [owner id](installing-artifacts.md#owner-identity) in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
+4. Pin the name, resolved version, SHA-256 and, for a payload a source served, the scope's [owner id](installing-artifacts.md#owner-identity) in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin, and never with `--frozen`. The entries `mur install` (no args) changes:
+
+    | Entry | Change |
+    |---|---|
+    | Pins the version `murmur.yaml` declares, same bytes | None |
+    | Pins the version `murmur.yaml` declares, other bytes or payload shape | None: the artifact fails with [`E-REG-005`](workdir.md#lockfile-murmurlock) and is not stored |
+    | Pins another version than `murmur.yaml` declares | Replaced by the declared version and its SHA-256 |
+    | Missing for a declared artifact | Added |
+    | For an artifact `murmur.yaml` does not declare | None |
+
+    Each replaced entry prints one line, in manifest order, after the lock is written:
+
+    ```text
+    Updated murmur.lock: murmur/tool-report 1.0.0 → 1.1.0
+    ```
+
+    An artifact that fails to install keeps its entry. A named install `mur install <scope/name@version>` refuses other bytes for the pinned version the same way; for another version, one served by a source replaces the entry, and one served by the global store is refused with `E-REG-005`. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
 
     ```text
     Adopted ana/some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
@@ -1165,7 +1191,7 @@ Each artifact resolved from a store is also checked against `murmur.lock` when o
 failure lines:
 
 - `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
-- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares
+- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares; `mur install` moves the entry to the declared version
 - `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
 - `✗ name@version   <platform>   — murmur.lock has no sha256 for 'name' on <platform>: it pins <platforms>` — the lock was written on another platform and has never been installed against on this one
 

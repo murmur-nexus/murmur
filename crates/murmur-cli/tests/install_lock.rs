@@ -703,3 +703,284 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
         .success()
         .stdout(predicate::str::contains("Adopted").not());
 }
+
+/// Run `mur install <args>` in `project_dir`.
+fn run_install_args(
+    home: &TempDir,
+    project_dir: &Path,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    let mut cmd = Command::cargo_bin("mur").unwrap();
+    cmd.env("HOME", home.path())
+        .current_dir(project_dir)
+        .arg("install")
+        .args(args)
+        .assert()
+}
+
+/// A project whose `murmur.lock` pins `local/tool-a@1.0.0` and `local/tool-b@1.0.0` from a first
+/// install, beside a published `local/tool-a@1.1.0`. Returns the 1.1.0 file's sha256.
+fn installed_project(home: &TempDir, work: &TempDir, project: &Path) -> String {
+    common::write_no_source_config(home.path());
+    publish_fixture(work, home, "tool-a", "1.0.0");
+    let sha_a_next = publish_fixture(work, home, "tool-a", "1.1.0");
+    publish_fixture(work, home, "tool-b", "1.0.0");
+    write_manifest_with_deps(project, &[("tool-a", "1.0.0"), ("tool-b", "1.0.0")]);
+    run_install_manifest_deps(home, project).success();
+    sha_a_next
+}
+
+const UPDATED_TOOL_A: &str = "Updated murmur.lock: local/tool-a 1.0.0 \u{2192} 1.1.0";
+
+/// Moving one artifact to a new version in `murmur.yaml` moves its `murmur.lock` entry with it,
+/// says so in one line, and leaves every other entry — one the manifest does not declare too —
+/// exactly as it was.
+#[test]
+fn a_changed_manifest_version_updates_only_that_lock_entry() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let sha_a_next = installed_project(&home, &work, project.path());
+
+    let lock_path = project.path().join("murmur.lock");
+    let mut lock = read_lockfile(&lock_path).unwrap();
+    lock.upsert(
+        "local/stray",
+        "9.9.9",
+        LockedSha256::any("stray-hash"),
+        LockOrigin::Operator,
+    );
+    murmur_artifact::write_lockfile_atomic(&lock_path, &lock).unwrap();
+    let before = read_lockfile(&lock_path).unwrap();
+
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.1.0"), ("tool-b", "1.0.0")]);
+    let output = run_install_manifest_deps(&home, project.path())
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(stdout.matches(UPDATED_TOOL_A).count(), 1, "{text}");
+    assert_eq!(stdout.matches("Updated murmur.lock:").count(), 1, "{text}");
+    assert!(!text.contains("E-REG-005"), "{text}");
+
+    let after = read_lockfile(&lock_path).unwrap();
+    let tool_a = after.artifact_for("local/tool-a").unwrap();
+    assert_eq!(tool_a.resolved_version, "1.1.0");
+    assert_eq!(tool_a.sha256, LockedSha256::any(sha_a_next));
+    for name in ["local/tool-b", "local/stray"] {
+        assert_eq!(
+            after.artifact_for(name),
+            before.artifact_for(name),
+            "{name}"
+        );
+    }
+    assert_eq!(after.artifacts.len(), 3);
+    assert!(project
+        .path()
+        .join(".murmur/artifacts/local/tool-a/1.1.0/tool-a-1.1.0.mur.zip")
+        .exists());
+}
+
+/// On the manifest path the version `murmur.lock` pins, resolving to other bytes, is still a
+/// conflict: nothing is stored for it and its entry is left as it was.
+#[test]
+fn a_manifest_install_refuses_new_bytes_for_the_pinned_version() {
+    let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    publish_fixture(&work, &home, "tool-c", "1.0.0");
+    write_manifest_with_deps(project.path(), &[("tool-c", "1.0.0")]);
+
+    let lock_path = project.path().join("murmur.lock");
+    let pinned = MurmurLock {
+        lock_version: LOCK_VERSION,
+        artifacts: vec![LockedArtifact {
+            name: "local/tool-c".to_string(),
+            resolved_version: "1.0.0".to_string(),
+            sha256: LockedSha256::any("a-completely-different-hash"),
+            origin: LockOrigin::Operator,
+            owner_id: None,
+        }],
+    };
+    murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();
+
+    run_install_manifest_deps(&home, project.path())
+        .failure()
+        .stdout(predicate::str::contains("error[E-REG-005]:"))
+        .stdout(predicate::str::contains("murmur.lock conflict"))
+        .stdout(predicate::str::contains("Updated murmur.lock").not());
+
+    assert_eq!(read_lockfile(&lock_path).unwrap(), pinned);
+    assert!(!project
+        .path()
+        .join(".murmur/artifacts/local/tool-c")
+        .exists());
+}
+
+/// `--frozen` takes no version `murmur.lock` does not pin: a manifest version change is refused
+/// before anything is stored, and the lock keeps its bytes.
+#[test]
+fn a_frozen_install_refuses_a_changed_manifest_version() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    installed_project(&home, &work, project.path());
+    let lock_path = project.path().join("murmur.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.1.0"), ("tool-b", "1.0.0")]);
+    let output = run_install_args(&home, project.path(), &["--frozen"])
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E-REG-005]:"), "{stderr}");
+    assert!(
+        stderr.contains("pinned local/tool-a@1.0.0, but local/tool-a@1.1.0 was resolved"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("hint:") && stderr.contains("--frozen"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert!(!project
+        .path()
+        .join(".murmur/artifacts/local/tool-a/1.1.0")
+        .exists());
+}
+
+/// `--frozen` against a lock that agrees with `murmur.yaml` installs every payload and leaves
+/// `murmur.lock` byte-for-byte as it was.
+#[test]
+fn a_frozen_install_against_an_agreeing_lock_installs_and_writes_no_lock() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    installed_project(&home, &work, project.path());
+    let lock_path = project.path().join("murmur.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    fs::remove_dir_all(project.path().join(".murmur/artifacts")).unwrap();
+
+    run_install_args(&home, project.path(), &["--frozen"])
+        .success()
+        .stdout(predicate::str::contains("Updated murmur.lock").not());
+
+    for name in ["tool-a", "tool-b"] {
+        assert!(project
+            .path()
+            .join(format!(
+                ".murmur/artifacts/local/{name}/1.0.0/{name}-1.0.0.mur.zip"
+            ))
+            .exists());
+    }
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+}
+
+/// `--frozen` refuses the whole install, before anything is stored, when `murmur.lock` has no
+/// entry for a declared artifact or there is no `murmur.lock` at all.
+#[test]
+fn a_frozen_install_refuses_a_missing_entry_and_a_missing_lock() {
+    let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    publish_fixture(&work, &home, "tool-a", "1.0.0");
+    publish_fixture(&work, &home, "tool-b", "1.0.0");
+
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.0.0")]);
+    run_install_manifest_deps(&home, project.path()).success();
+    fs::remove_dir_all(project.path().join(".murmur")).unwrap();
+    let lock_path = project.path().join("murmur.lock");
+    let lock_bytes = fs::read(&lock_path).unwrap();
+
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.0.0"), ("tool-b", "1.0.0")]);
+    let output = run_install_args(&home, project.path(), &["--frozen"])
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E-REG-005]:"), "{stderr}");
+    assert!(
+        stderr.contains("murmur.lock has no entry for 'local/tool-b'"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert!(!project.path().join(".murmur").exists());
+
+    fs::remove_file(&lock_path).unwrap();
+    let output = run_install_args(&home, project.path(), &["--frozen"])
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E-REG-005]:"), "{stderr}");
+    assert!(stderr.contains("there is no murmur.lock"), "{stderr}");
+    assert!(!lock_path.exists());
+    assert!(!project.path().join(".murmur").exists());
+}
+
+/// `--frozen` belongs to the manifest install alone: clap refuses it beside a reference, `-g` or
+/// `--all-platforms`.
+#[test]
+fn frozen_is_refused_beside_a_reference_global_or_all_platforms() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.0.0")]);
+    for (args, conflicting) in [
+        (&["--frozen", "local/tool-a@1.0.0"][..], "[ARTIFACT]..."),
+        (&["--frozen", "-g", "local/tool-a@1.0.0"][..], "--global"),
+        (
+            &["--frozen", "--all-platforms", "murmur/x@1.0.0"][..],
+            "--all-platforms",
+        ),
+        (&["--frozen", "-g"][..], "--global"),
+    ] {
+        run_install_args(&home, project.path(), args)
+            .code(2)
+            .stderr(predicate::str::contains(
+                "the argument '--frozen' cannot be used with",
+            ))
+            .stderr(predicate::str::contains(conflicting));
+    }
+    assert!(!project.path().join(".murmur").exists());
+    assert!(!project.path().join("murmur.lock").exists());
+}
+
+/// When another artifact fails, the entry whose version the manifest moved is still updated and
+/// announced, and an artifact that fails keeps its entry with no `Updated` line.
+#[test]
+fn a_partial_failure_still_updates_the_moved_entry_and_keeps_the_failed_one() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let sha_a_next = installed_project(&home, &work, project.path());
+    let lock_path = project.path().join("murmur.lock");
+    let before = read_lockfile(&lock_path).unwrap();
+
+    write_manifest_with_deps(project.path(), &[("tool-a", "1.1.0"), ("tool-b", "2.0.0")]);
+    let output = run_install_manifest_deps(&home, project.path())
+        .failure()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches(UPDATED_TOOL_A).count(), 1, "{stdout}");
+    assert_eq!(
+        stdout.matches("Updated murmur.lock:").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("local/tool-b@2.0.0"), "{stdout}");
+
+    let after = read_lockfile(&lock_path).unwrap();
+    assert_eq!(
+        after.artifact_for("local/tool-a").unwrap().sha256,
+        LockedSha256::any(sha_a_next)
+    );
+    assert_eq!(
+        after.artifact_for("local/tool-b"),
+        before.artifact_for("local/tool-b")
+    );
+}
