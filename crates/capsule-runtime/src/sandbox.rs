@@ -2763,7 +2763,7 @@ impl ShellEnforcement {
 
     /// Hand in the `/proc` view this enforcement's commands get, in place of the one
     /// [`Self::resolve`] decided from its probe.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_proc_view(mut self, view: crate::proc_view::ProcView) -> Self {
         self.proc_view = view;
         self

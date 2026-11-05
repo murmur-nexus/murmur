@@ -619,6 +619,15 @@ pub fn host_pid_in_session(runtime_pid: u32, namespace_pid: i32) -> Option<i32> 
         .next()
 }
 
+/// [`host_pid_in_session`] off Linux, where commands run in no PID namespace: the pid a command
+/// prints is already its host pid, so it is returned unchanged. `None` for a pid no process can
+/// have.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn host_pid_in_session(_runtime_pid: u32, namespace_pid: i32) -> Option<i32> {
+    (namespace_pid > 0).then_some(namespace_pid)
+}
+
 /// Every host pid [`host_pid_in_session`] could answer: one per session of `runtime_pid` that has
 /// a live process numbered `namespace_pid`, for a test that holds several sessions at once.
 #[cfg(target_os = "linux")]
@@ -687,6 +696,15 @@ pub fn host_pid_in_workdir(workdir: &std::path::Path, namespace_pid: i32) -> Opt
                             == Some(namespace_pid)
                 })
         })
+}
+
+/// [`host_pid_in_workdir`] off Linux, where commands run in no PID namespace: the pid a command
+/// prints is already its host pid, so it is returned unchanged. `None` for a pid no process can
+/// have.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn host_pid_in_workdir(_workdir: &std::path::Path, namespace_pid: i32) -> Option<i32> {
+    (namespace_pid > 0).then_some(namespace_pid)
 }
 
 /// Refuses the launch when a capsule that can spawn native subprocesses is on a host that cannot

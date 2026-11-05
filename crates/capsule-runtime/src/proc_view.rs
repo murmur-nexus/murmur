@@ -295,7 +295,7 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::namespace_probe::{MountAttempt, MountAttemptError, MountStep};
+    use crate::namespace_probe::MountAttempt;
 
     fn reading(private_proc: MountAttempt) -> NamespaceReading {
         NamespaceReading {
@@ -320,6 +320,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_kernel_tier_gets_the_private_view_exactly_when_the_rehearsal_mounted_one() {
+        use crate::namespace_probe::{MountAttemptError, MountStep};
+
         for tier in [
             EnforcementTier::KernelFull,
             EnforcementTier::KernelSealed,
