@@ -165,6 +165,7 @@ nav:
       - Run a capsule on the host as yourself: how-to/run-capsule-on-the-host.md
       - Publish your own artifact source: how-to/publish-artifact-source.md
       - Let a coding capsule pull the tools it needs: how-to/self-healing-coding-capsule.md
+      - Run Node tests in a capsule: how-to/run-node-tests-in-capsule.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
       - Python Tool Quickstart (Native): language-guides/python-native.md

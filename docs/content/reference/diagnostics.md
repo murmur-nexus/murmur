@@ -167,6 +167,7 @@ section that explains it.
 | `W-RUN-007` | A session carries a formation id but no lifeline, so it does not wind down when its formation ends | [W-RUN-007](#w-run-007) |
 | `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
 | `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
+| `W-RUN-010` | `capabilities.shell.allow` names `node` or `nodejs` and the address-space limit its commands run under is below 32 GiB | [W-RUN-010](#w-run-010) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -381,7 +382,7 @@ the class sentence alone. The runtime never falls back to a weaker class, whiche
 |---|---|
 | This platform has no mount namespace and never will | Nothing — macOS and every other non-Linux host stay at `advisory` permanently |
 | AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary. Reported only when the network namespace was refused at `unshare` or `writing uid_map/gid_map` with `EPERM` or `EACCES`, the setting reads `1` and `mur` is unconfined | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. Running a checkout build out of `./target`, which no shipped profile attaches to: `sudo scripts/install-dev-apparmor.sh`. Last resort, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which removes unprivileged-userns hardening from every program on the machine and reports [`W-SEC-013`](#w-sec-013) |
-| A user namespace was refused — the usual answer inside a container, whose runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)`, and `setns`, `mount`, `umount2` and `pivot_root` after it | Run the container with a seccomp profile that permits those calls (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespaces outside the container and run `mur` inside them. Adding capabilities does not lift a seccomp refusal |
+| A user namespace was refused — the usual answer inside a container, whose runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)`, and `setns`, `mount`, `umount2` and `pivot_root` after it | Run the container with a seccomp profile that permits those calls, with `CLONE_NEWPID` among `unshare`'s flags and a PID namespace among `setns`'s (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespaces outside the container and run `mur` inside them. Adding capabilities does not lift a seccomp refusal |
 | The namespace was created but its identity `uid_map`/`gid_map` could not be written, so the process cannot own it | Check that `/proc/sys/user/max_user_namespaces` is non-zero, that no LSM policy blocks `uid_map` writes for this binary, and that `mur` is not already running inside an unmapped user namespace |
 | The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN`, or a container runtime's seccomp profile | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, whose seccomp profile refuses `mount`, `umount2` and `pivot_root` whatever capabilities it holds, run it with a profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or establish the mount namespace outside it |
 | The namespace was created and mounted inside, but `pivot_root(2)` was refused | On an AppArmor host, check the loaded profile carries a `pivot_root,` rule and reload it; inside a container, whose seccomp profile refuses `pivot_root` whatever capabilities it holds, run it with a profile that permits `pivot_root` (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or establish the mount namespace outside the container |
@@ -1646,10 +1647,13 @@ host condition:
 | Failed call and `errno` | Readings line | Host condition | What to do |
 |---|---|---|---|
 | `writing uid_map/gid_map` or `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | `=1`; profile `unconfined` or `not reported` | AppArmor's restriction applies to `mur`, and no `mur-sealed` profile confines it. Ubuntu lets the `unshare` through and refuses the identity map that follows, so the failed call is usually `writing uid_map/gid_map` | Install and load the AppArmor profile shipped with `mur`; for a checkout build, run `scripts/install-dev-apparmor.sh`. The refusal gives both commands. Setting the restriction to `0` host-wide is the last resort |
-| Any call, usually `unshare(…)` with `EPERM` | Profile is another name, such as `docker-default` | A container confined by its own AppArmor profile; that profile and the container runtime's seccomp profile refused the namespace. The restriction setting does not govern it | Run the container with an AppArmor profile and a seccomp profile that permit `unshare(CLONE_NEWUSER)` and `setns` (Docker `--security-opt apparmor=<profile> --security-opt seccomp=<file>`, Kubernetes `appArmorProfile` and `seccompProfile: Localhost`), or create the network namespace outside the container and run `mur` inside it |
-| Any call, usually `unshare(…)` with `EPERM` | `=0`, or `AppArmor not enabled` | A container runtime's seccomp profile, which refuses `unshare(CLONE_NEWUSER)` and `setns` whatever capabilities the container holds, or another security module such as SELinux | Run the container with a seccomp profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the network namespace outside the container; on a bare host, the policy of the security module in use |
+| Any call, usually `unshare(…)` with `EPERM` | Profile is another name, such as `docker-default` | A container confined by its own AppArmor profile; that profile and the container runtime's seccomp profile refused the namespace. The restriction setting does not govern it | Run the container with an AppArmor profile and a seccomp profile that permit `unshare` with `CLONE_NEWUSER`, `CLONE_NEWNET` and `CLONE_NEWPID`, and `setns` (Docker `--security-opt apparmor=<profile> --security-opt seccomp=<file>`, Kubernetes `appArmorProfile` and `seccompProfile: Localhost`), or create the network namespace outside the container and run `mur` inside it |
+| Any call, usually `unshare(…)` with `EPERM` | `=0`, or `AppArmor not enabled` | A container runtime's seccomp profile, which refuses `unshare(CLONE_NEWUSER)` and `setns` whatever capabilities the container holds, or another security module such as SELinux | Run the container with a seccomp profile that permits `unshare` with `CLONE_NEWUSER`, `CLONE_NEWNET` and `CLONE_NEWPID`, and `setns` (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the network namespace outside the container; on a bare host, the policy of the security module in use |
 | Any call | Profile `mur-sealed` | The `mur-sealed` profile confines `mur` and the namespace still failed: the loaded profile may be out of date | `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, then compare the installed profile in `mur doctor` |
 | `writing uid_map/gid_map`, `bringing lo up` or `installing the local default route` | Any other | The namespace was created and then could not be owned (`uid_map`) or configured (`lo`, route) — a confinement that withholds capabilities inside the namespace | As the row matching the readings line |
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNET \| CLONE_NEWPID)`, `EPERM` | Any | The user and network namespaces can be created and a PID namespace with them is refused — a seccomp profile that permits `unshare` but not `CLONE_NEWPID`. No command runs without the session's PID namespace | Permit `unshare` with `CLONE_NEWPID` and `setns` of a PID namespace in the profile |
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNET \| CLONE_NEWPID)`, `ENOSPC` or `EINVAL` | Any | The kernel's PID-namespace limit `user.max_pid_namespaces` is `0` or exhausted (`ENOSPC`), or the kernel is built with `CONFIG_PID_NS=n` (`EINVAL`) | Raise `user.max_pid_namespaces`, or run on a kernel built with `CONFIG_PID_NS=y` |
+| `forking the PID namespace's holder process` | Any | The namespaces were created and their first process could not be forked: a process limit (`RLIMIT_NPROC`, or the `pids.max` of the cgroup `mur` runs in) or memory ran out | Re-run once the limit is relieved |
 | `unshare(…)`, `ENOSPC`, `EINVAL`, `ENOSYS` or `EUSERS` | Any | The kernel does not provide the mechanism: `user.max_user_namespaces` is `0` or exhausted (`ENOSPC`), the kernel is built with `CONFIG_USER_NS=n` (`EINVAL`, `ENOSYS`), or the nesting limit for user namespaces is reached (`EUSERS`) | Raise `user.max_user_namespaces`, run on a kernel built with `CONFIG_USER_NS=y`, or run `mur` fewer user namespaces deep |
 | No call: the runtime's own message, such as `fork() for the namespace creator failed` or `the namespace creator exited without handing anything over (killed by signal …)` | Any | The namespace creator could not run, or stopped before reporting: a process or descriptor limit or memory ran out, or a policy killed it | Re-run once the limit is relieved; if the message names a signal, allow the creator's syscalls in the policy that killed it |
 
@@ -3095,6 +3099,34 @@ The warning prints once per such choice, at staging, to stderr and `logs/bootstr
 Set `context.max_tokens` to the model's context window, or install a release of the driver that
 lists the model.
 
+### W-RUN-010 — `node` under an address-space limit below 32 GiB { #w-run-010 }
+
+```text
+[capsule-runtime] warning[W-RUN-010]: capabilities.shell.allow names node, and its commands run under an address-space limit of 2147483648 bytes (the default of capabilities.resources.memory_bytes, which is not declared). memory_bytes is RLIMIT_AS, and V8 reserves far more address space than it uses, so node can fail with "Cannot allocate Wasm memory" below 34359738368 bytes (32 GiB). memory_bytes: 68719476736 (64 GiB) works; cap RAM with capabilities.resources.cgroup_memory_bytes instead (https://docs.murmur.nexus/reference/diagnostics/#w-run-010)
+```
+
+**Fires when** an entry of `capabilities.shell.allow` is named `node` or `nodejs` and the
+address-space limit its commands run under is below 34359738368 bytes (32 GiB). That limit is
+[`capabilities.resources.memory_bytes`](resource-limits.md#host-resource-limits):
+
+| Session | Limit checked |
+|---|---|
+| Contained (`advisory`, `scoped`, `sealed`) | `memory_bytes` as declared, or its default, 2147483648 (2 GiB) |
+| Unconfined | `memory_bytes` as declared; no warning when it is not declared, since none is set |
+
+`memory_bytes` is `RLIMIT_AS`, a bound on address space rather than on memory in use. V8 reserves
+far more address space than it uses, so `node` fails well below its real memory use — WebAssembly
+instantiation with `RangeError: WebAssembly.instantiate(): Out of memory: Cannot allocate Wasm
+memory` is the usual symptom. The JVM reserves address space the same way, and draws no warning.
+
+Nothing is refused. The warning prints once at staging, to stderr, and
+[`mur doctor`](cli.md#mur-doctor) prints the same text and counts it among its warnings.
+
+**What to do:** set `capabilities.resources.memory_bytes: 68719476736` (64 GiB) and cap the RAM the
+subprocess tree may use with
+[`capabilities.resources.cgroup_memory_bytes`](resource-limits.md#host-resource-limits). See
+[How to run Node tests in a capsule](../how-to/run-node-tests-in-capsule.md).
+
 ---
 
 ## Security warnings
@@ -3221,17 +3253,21 @@ warn rather than stay silent, because each is a scope with documented exceptions
 imply it has none.
 
 **What the message says.** On the Full tier it names what the Landlock scope, the fixed device set,
-the `socket(2)` domain deny and the default-deny syscall allowlist cover — see
+the `socket(2)` domain deny and the default-deny syscall allowlist cover, including the read-only
+[name-resolution files](containment.md#command-name-resolution-files) and the read-and-list grant on
+the session's [private `/proc`](containment.md#capsule-proc) — see
 [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers) for the full grant. On
-the Sealed tier it names what the composed root adds and states its one exception: `/proc` is a bind
-of the host's, because this tier creates no PID namespace and mounting a private procfs
-unprivileged needs one. Landlock refuses reading host `/proc` content at both `scoped` and
-`sealed`. What still reaches outside the capsule:
+the Sealed tier it names what the composed root adds, and that its `/proc` is a bind of the
+session's private `procfs`: the session's own processes and the kernel's world-readable files, with
+no host process in it. Commands on both tiers run in the session's own PID namespace, so no host
+process can be signalled from inside.
+
+Where the host cannot mount a private `procfs`, `/proc` is the host's on both tiers and Landlock
+refuses every open beneath it. What still reaches outside the capsule then:
 
 | Call | What it reaches |
 |---|---|
-| `stat(2)` on `/proc/<pid>` | That a process exists, its owner and its start time |
-| `kill(2)` | Signal delivery to any process of the same user |
+| `stat(2)` on `/proc/<pid>` | That a host process exists, its owner and its start time |
 
 **The one documented exception a manifest controls.**
 [`capabilities.network.unix_sockets: true`](manifest.md#field-capabilities) re-widens the

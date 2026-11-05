@@ -64,6 +64,15 @@ pub const W_RUN_008: &str = "W-RUN-008";
 /// staging, and by `mur doctor` with the same text.
 pub const W_RUN_009: &str = "W-RUN-009";
 
+/// `capabilities.shell.allow` names a V8 binary (`node`, `nodejs`) and the address-space limit
+/// its commands run under — `capabilities.resources.memory_bytes`, which is `RLIMIT_AS`, declared
+/// or its 2 GiB default on a contained tier, declared on an unconfined one — is below 32 GiB.
+///
+/// V8 reserves far more address space than it uses, so `node` can fail with "Cannot allocate Wasm
+/// memory" below that. Nothing is refused. Printed once at staging, and by `mur doctor` with the
+/// same text.
+pub const W_RUN_010: &str = "W-RUN-010";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -78,7 +87,7 @@ mod tests {
     #[test]
     fn every_code_is_unique_and_well_formed() {
         let codes = [
-            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009,
+            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

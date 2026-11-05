@@ -613,55 +613,39 @@ grep " /proc " /proc/self/mountinfo
 ls /proc | grep -c '^[0-9]'
 ```
 
-Expected: `/proc` exists (so tooling that reads `/proc/self/*` keeps working), carries
-`nosuid,nodev,noexec`, and — on a bare host — is a **bind of the host's `/proc`**, so the pid count
-on the second line is the host's:
+Expected: `/proc` exists, carries `nosuid,nodev,noexec`, and is a bind of the private `procfs` the
+command mounted in the session's PID namespace before the composed root was built, so it carries a
+`hidepid` option and the pid count on the second line is the capsule's own processes — `grep` and
+the shell running it, a handful at most:
 
 ```text
-2096 2072 0:26 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
-356
+2096 2072 0:83 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=...
+2
 ```
 
-!!! warning "Known limitation, not a defect to file: `/proc` is not masked on a bare host"
+Then check that no host process is reachable and the capsule's own process is:
 
-    Mounting a private `procfs` needs `CAP_SYS_ADMIN` over the user namespace owning the **PID**
-    namespace. `unshare(CLONE_NEWUSER | CLONE_NEWNS)` leaves the process in the host's initial PID
-    namespace, owned by the initial user namespace, where an unprivileged process has nothing — so
-    all three `hidepid` spellings the runtime tries (`hidepid=2`, `hidepid=invisible`, unmasked;
-    `sealed::PROC_HIDEPID_OPTIONS`) return `EPERM` and the executor falls back to binding the
-    host's `/proc`. Adding `CLONE_NEWPID` does not fix it: `unshare` moves only *future children*
-    into the new PID namespace, so the mounting process is still judged against the old one. The
-    real fix is to fork so the child becomes PID 1, which changes reaping and signal semantics for
-    the whole capsule subprocess tree and is deliberately out of scope here.
+```sh
+cat /proc/1/cmdline 2>&1 | head -c 60; echo
+head -n 1 /proc/self/status
+```
 
-    What this costs, stated plainly: `/proc` is the **one** part of the root where "outside does
-    not exist" degrades to `scoped`'s "outside is denied". Landlock refuses reading host `/proc`
-    content at both `scoped` and `sealed`, so another process's command line, environment and
-    memory maps cannot be read. What still reaches outside the capsule:
+Expected — pid 1 of the session's PID namespace is its holder, which `hidepid` hides, and the
+command reads its own status:
 
-    | Call | What it reaches |
-    |---|---|
-    | `stat(2)` on `/proc/<pid>` | That a host process exists, its owner and its start time |
-    | `kill(2)` | Signal delivery to any process of the same user |
+```text
+cat: /proc/1/cmdline: No such file or directory
+Name:	head
+```
 
-    Every other axis (steps 3a–3d) is absolute. Verify it yourself here rather than taking this
-    paragraph's word for it:
+!!! note "On a host that cannot mount a private `procfs`"
 
-    ```sh
-    cat /proc/1/cmdline 2>&1 | head -c 60; echo
-    stat -c '%U %y' /proc/1
-    ```
-
-    Expected — the host's init cannot be read, and `stat` still answers:
-
-    ```text
-    cat: /proc/1/cmdline: Permission denied
-    root <start time>
-    ```
-
-    On a host where `mount -t proc` *does* succeed (running as root, or in a container granted
-    `CAP_SYS_ADMIN` whose seccomp profile permits `mount`), the mountinfo line reads
-    `- proc proc rw,hidepid=...` instead and the pid count drops to the capsule's own processes. Record which of the two you got.
+    `mur doctor`'s `private proc:` line reads `refused — mounting proc over /proc failed with
+    <ERRNO>` there, and the `Process view` block of `mur run --explain-scope` reads `/proc:     host
+    — …`. The composed root then binds the host's `/proc`, the pid count on the second line is the
+    host's, and Landlock refuses every open beneath it: `cat /proc/1/cmdline` reads `Permission
+    denied` and `stat -c '%U %y' /proc/1` still answers with the host init's owner and start time.
+    Record which of the two you got.
 
 ## Step 4 — `trace.jsonl`
 
@@ -1993,21 +1977,21 @@ unverified, and say so in the next entry rather than assuming an earlier run mus
 These are known, deliberate gaps in what the composed root delivers. None of them is a defect to
 file; each is a scoping decision this slice made explicitly.
 
-- **No PID namespace, so `/proc` is a bind of the host's rather than a masked private `procfs`.**
-  This is the one place the composed root's "outside does not exist" promise degrades to `scoped`'s
-  "outside is denied". See the warning under step 3e for the kernel rule that forces it and for what
-  it costs.
+- **`/proc` falls back to the host's where no private `procfs` can be mounted.** Commands always
+  run in the session's PID namespace, and `/proc` is its private `procfs`; on a host whose probe
+  cannot mount one, `/proc` is a bind of the host's and "outside does not exist" degrades to
+  `scoped`'s "outside is denied" there. See the note under step 3e.
 - **`/etc/passwd` and `/etc/group` are synthetic.** They are written into the session's
   `sealed-etc/` directory beside its [runtime directory](workdir.md#runtime-directory), which no
   command can open, and bound read-only, so `touch /etc/passwd` is `EROFS`.
 - **Read-only binds are not recursively read-only.** A submount underneath a bound directory (a
   separate `/usr/local` partition, say) keeps its own mount flags. `MS_REMOUNT | MS_BIND | MS_RDONLY`
   applies to one mount; walking the subtree is a follow-up.
-- **`devpts` and `/proc` are new inodes the parent could not pre-open**, so Landlock — which builds
-  its rules from parent-opened file descriptors — has no rule covering them. `/dev/ptmx` and
-  `/proc/self/*` therefore exist in the root but are not openable. This matches the existing
-  `scoped` tier, which grants neither, so it is not a regression; it is worth knowing before
-  debugging a pty failure.
+- **`devpts` is a new inode the parent could not pre-open**, so Landlock — which builds its rules
+  from parent-opened file descriptors — has no rule covering it. `/dev/ptmx` therefore exists in
+  the root but is not openable. This matches the `scoped` tier, which does not grant it either; it
+  is worth knowing before debugging a pty failure. `/proc` has its rule: the command opens the
+  private `procfs` it mounted and grants read and list beneath it before the root is built.
 - **The composed root applies to every subprocess path.** Shell commands, plan shell steps and
   native tools are all spawned through `sandbox::prepare_enforcement`; see
   [Native tools](containment.md#native-tools).

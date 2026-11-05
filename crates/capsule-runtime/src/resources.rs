@@ -73,6 +73,56 @@ pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Default `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling — 2 GiB per subprocess.
 pub const DEFAULT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The address-space limit below which `W-RUN-010` warns for a V8 binary: 32 GiB. V8 reserves
+/// far more address space than it uses, and `node` failed with "Cannot allocate Wasm memory" at
+/// 16 GiB and ran at 32 GiB under `ulimit -v`.
+pub const V8_ADDRESS_SPACE_FLOOR_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// The `capabilities.shell.allow` file names `W-RUN-010` treats as V8.
+pub const V8_BINARY_NAMES: &[&str] = &["node", "nodejs"];
+
+/// `W-RUN-010` as staging and `mur doctor` print it, or `None` when it does not fire.
+///
+/// It fires when an entry of `shell_allow` is named (by its file name) one of
+/// [`V8_BINARY_NAMES`] and the effective address-space limit is below
+/// [`V8_ADDRESS_SPACE_FLOOR_BYTES`]: `declared_memory_bytes` or [`DEFAULT_MEMORY_BYTES`] on a
+/// contained tier, where the limit always applies; `declared_memory_bytes` alone on an unconfined
+/// one, where an undeclared limit sets none.
+#[must_use]
+pub fn v8_address_space_warning(
+    shell_allow: &[String],
+    declared_memory_bytes: Option<u64>,
+    unconfined: bool,
+) -> Option<String> {
+    use murmur_artifact::{runtime_warning_link, W_RUN_010};
+    let binary = shell_allow.iter().find_map(|entry| {
+        let name = std::path::Path::new(entry).file_name()?.to_str()?;
+        V8_BINARY_NAMES.contains(&name).then_some(name)
+    })?;
+    let limit = match (declared_memory_bytes, unconfined) {
+        (Some(declared), _) => declared,
+        (None, false) => DEFAULT_MEMORY_BYTES,
+        (None, true) => return None,
+    };
+    if limit >= V8_ADDRESS_SPACE_FLOOR_BYTES {
+        return None;
+    }
+    let source = if declared_memory_bytes.is_some() {
+        "capabilities.resources.memory_bytes"
+    } else {
+        "the default of capabilities.resources.memory_bytes, which is not declared"
+    };
+    Some(format!(
+        "warning[{W_RUN_010}]: capabilities.shell.allow names {binary}, and its commands run under \
+         an address-space limit of {limit} bytes ({source}). memory_bytes is RLIMIT_AS, and V8 \
+         reserves far more address space than it uses, so {binary} can fail with \
+         \"Cannot allocate Wasm memory\" below {V8_ADDRESS_SPACE_FLOOR_BYTES} bytes (32 GiB). \
+         memory_bytes: 68719476736 (64 GiB) works; cap RAM with \
+         capabilities.resources.cgroup_memory_bytes instead ({})",
+        runtime_warning_link(W_RUN_010)
+    ))
+}
+
 /// Default cgroup `memory.max` — 4 GiB aggregate across the whole subprocess tree. Above the
 /// per-process ceiling on purpose: the tree bound exists to catch what *many* processes do
 /// together, so setting it at or below the single-process bound would make it redundant.
@@ -961,6 +1011,61 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `W-RUN-010` keys on the effective address-space limit: the 2 GiB default and a declared
+    /// 16 GiB warn for `node` and `nodejs`, 64 GiB does not, a binary that is not V8 never does,
+    /// and an unconfined session with no declared limit has none to warn about.
+    #[test]
+    fn w_run_010_fires_below_the_floor_for_a_v8_binary() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let allow = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
+        let undeclared = v8_address_space_warning(&allow(&["bash", "node"]), None, false).unwrap();
+        assert!(
+            undeclared.starts_with("warning[W-RUN-010]: "),
+            "{undeclared}"
+        );
+        assert!(undeclared.contains("2147483648 bytes"), "{undeclared}");
+        assert!(undeclared.contains("RLIMIT_AS"), "{undeclared}");
+        assert!(
+            undeclared.contains("Cannot allocate Wasm memory"),
+            "{undeclared}"
+        );
+        assert!(
+            undeclared.contains("68719476736 (64 GiB) works"),
+            "{undeclared}"
+        );
+        assert!(undeclared.contains("cgroup_memory_bytes"), "{undeclared}");
+        assert!(
+            undeclared.ends_with("diagnostics/#w-run-010)"),
+            "{undeclared}"
+        );
+        let declared = v8_address_space_warning(&allow(&["node"]), Some(16 * GIB), false).unwrap();
+        assert!(declared.contains("17179869184 bytes"), "{declared}");
+        assert!(
+            v8_address_space_warning(&allow(&["/usr/bin/nodejs"]), Some(16 * GIB), false).is_some()
+        );
+        assert!(v8_address_space_warning(&allow(&["node"]), Some(16 * GIB), true).is_some());
+        assert_eq!(
+            v8_address_space_warning(&allow(&["node"]), Some(64 * GIB), false),
+            None
+        );
+        assert_eq!(
+            v8_address_space_warning(&allow(&["node"]), Some(32 * GIB), false),
+            None
+        );
+        assert_eq!(
+            v8_address_space_warning(&allow(&["cat"]), Some(GIB), false),
+            None
+        );
+        assert_eq!(
+            v8_address_space_warning(&allow(&["node"]), None, true),
+            None
+        );
+        assert_eq!(
+            v8_address_space_warning(&allow(&["nodemon"]), None, false),
+            None
+        );
+    }
 
     /// What an unconfined session applies is what the manifest declares, field by field: the
     /// workdir guard only for a declared `workdir_max_bytes`, a scope only for a `cgroup_*` field,

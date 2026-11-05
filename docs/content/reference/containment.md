@@ -358,9 +358,10 @@ the namespaces a session needs, in the order a session needs them:
 
 | Attempt | What the child does | Decides |
 |---|---|---|
-| Network | `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, the identity `uid_map`/`gid_map`, `lo` up, the local default route, the namespace's sockets, the hand-off to the runtime | [`E-CAP-005`](diagnostics.md#e-cap-005) for a capsule that can spawn a subprocess |
+| Network | `unshare(CLONE_NEWUSER \| CLONE_NEWNET \| CLONE_NEWPID)`, the identity `uid_map`/`gid_map`, the PID namespace's first process forked, `lo` up, the local default route, the namespace's sockets, the hand-off to the runtime | [`E-CAP-005`](diagnostics.md#e-cap-005) for a capsule that can spawn a subprocess |
 | Mount | Joins that network namespace as every command does, then `unshare(CLONE_NEWNS)`, `/` made `MS_REC\|MS_PRIVATE`, a bind over `/tmp` | Whether a literal `/tmp` is mapped by a mount namespace ([temporary folder](#temp-folder)) |
 | Sealed root | Joins that network namespace, then `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` nested inside it, the identity maps, `/` made `MS_REC\|MS_PRIVATE`, a `tmpfs`, `pivot_root(2)`, the old root detached | The Sealed tier, and [`E-CAP-003`](diagnostics.md#e-cap-003) for a `sealed` capsule |
+| Private proc | Joins that network namespace and its PID namespace, forks into it as every command does, then `unshare(CLONE_NEWNS)`, `/` made `MS_REC\|MS_PRIVATE`, and `proc` mounted over `/proc` | Whether commands see [their own `/proc`](#capsule-proc) |
 
 Each attempt is created, refused at a named call with its `errno`, or not attempted because the
 network namespace it nests in could not be created. A refused network attempt therefore leaves
@@ -384,6 +385,7 @@ AppArmor / user namespaces
   network namespace: created (a real probe created one; the readings above explain a refusal, they never cause one)
   mount namespace: created (a private mount namespace inside the session's user namespace was created, so /tmp can be mapped)
   sealed root: created (a nested user+mount namespace inside the session's was created and pivot_root(2) entered a composed root, so sealed can be backed)
+  private proc: created (a process in the session's PID namespace mounted its own procfs over /proc, so commands see only the session's processes)
 ```
 
 A refused attempt reads `refused — <call> failed with <ERRNO>`, and an attempt after a refused
@@ -396,7 +398,9 @@ its `errno` and the readings identify the host condition:
 | `mur-sealed` loaded | created | created | `=1; … mur-sealed` | Nothing refused |
 | A container whose profile and seccomp policy permit the namespace | created | created | `=1; … <container profile>` | Nothing refused |
 | A container profile that denies `mount` | created | refused at `making / MS_REC\|MS_PRIVATE` | `=1; … <container profile>` | `/tmp` not mapped; `sealed` refused as `mount(2)` refused. Run the container with a profile that permits `mount` |
-| A container runtime that refuses `unshare` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`; `sealed` refused as the namespace refused. The container runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)` and `setns`: run the container with a profile that permits them (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespace outside the container |
+| A container runtime that refuses `unshare` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`; `sealed` refused as the namespace refused. The container runtime's seccomp profile refuses `unshare(CLONE_NEWUSER)` and `setns`: run the container with a profile that permits `unshare` with `CLONE_NEWUSER`, `CLONE_NEWNET` and `CLONE_NEWPID`, and `setns` of a user, network and PID namespace (Docker `--security-opt seccomp=<file>`, Kubernetes `seccompProfile: Localhost`), or create the namespace outside the container |
+| A seccomp profile that permits `unshare` but not `CLONE_NEWPID` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET \| CLONE_NEWPID)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`: no command runs without the session's PID namespace. Permit `CLONE_NEWPID` in the profile |
+| A container runtime that overmounts parts of `/proc` | created | mount and sealed root created; private proc refused at `mounting proc over /proc`, `EPERM` | names the container profile | Nothing refused. Commands see the host's `/proc`, and on `scoped` and `sealed` every open beneath it is refused; see [A capsule's own `/proc`](#capsule-proc) |
 | `user.max_user_namespaces=0` | refused at `unshare(…)`, `ENOSPC` | not attempted | any | `E-CAP-005`; `sealed` refused as unsupported by the kernel. Raise `user.max_user_namespaces` |
 | `mur` running inside a `chroot` | refused at `unshare(…)`, `EPERM` | not attempted | any | `E-CAP-005`. The kernel refuses a user namespace to a chrooted process; run `mur` outside the `chroot` |
 
@@ -412,7 +416,7 @@ strongest, above the operator's own `unconfined` stance:
 | `unconfined` | No containment: the capsule's commands run as the operator. Chosen only by the operator, never declared — see [Running unconfined](#unconfined). |
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs a seccomp profile permitting `unshare(CLONE_NEWUSER)`, `setns`, `mount`, `umount2` and `pivot_root`, which the container runtime's default profile refuses, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
+| `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs a seccomp profile permitting `unshare` with `CLONE_NEWUSER` and `CLONE_NEWPID`, `setns` (including of a PID namespace), `mount`, `umount2` and `pivot_root`, which the container runtime's default profile refuses, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
 
 `advisory` is user-level trust. What a capsule's shell can write, including the compiled WASM
 artifacts in [`~/.murmur/compiled/`](config.md#murmur-home-permissions) that every later launch
@@ -424,19 +428,15 @@ from, depends on the [tier](#subprocess-enforcement-tiers) the host achieves:
 | Seccomp-only, Environment-only | Anything you can | Writable. A later `scoped` or `sealed` launch loads the compiled artifacts and grants the paths the host facts the shell wrote there name. The checksum stored beside each compiled artifact and the file stamps in each host facts entry detect damage and are no defence against code running as you |
 | Full, Sealed | Its workdir only | Writable only when `~/.murmur` lies inside the workdir. `mur` then neither reads nor writes either directory for that launch, but a later launch from another workdir uses what the shell wrote there |
 
-!!! note "`sealed`'s one documented exception: `/proc`"
+!!! note "`/proc` inside a composed root"
 
-    A private `procfs` needs a PID namespace, which this tier does not create, so on most hosts a
-    `sealed` root carries the host's `/proc` instead. Landlock refuses reading host `/proc` content
-    at both `scoped` and `sealed`: another process's command line, environment and memory maps
-    cannot be read. What reaches outside the capsule is:
-
-    - `stat(2)` on `/proc/<pid>`, which shows that a process exists, its owner and its start time
-    - `kill(2)`, which delivers a signal to any process of the same user
-
-    Every other axis of the root — `/etc`, `/dev`, block devices, sockets, other users'
-    homes — is absent, not merely denied. Where the runtime does hold that privilege, a private
-    masked `/proc` is used and this exception does not apply.
+    A `sealed` command runs in the session's PID namespace, and the composed root's `/proc` is a
+    bind of the private `procfs` the command mounted: it lists only the session's own processes and
+    the kernel's world-readable files, and no host process appears in it. Where the host cannot
+    mount a private `procfs`, `/proc` is a bind of the host's instead and Landlock refuses every
+    open beneath it; `stat(2)` on `/proc/<pid>` then still shows that a host process exists, its
+    owner and its start time. [A capsule's own `/proc`](#capsule-proc) says which applies and how
+    to tell.
 
 **Declaring a floor.** Three independent sources can each declare a minimum class, and they combine
 by taking the **strongest** requested — never the weakest:
@@ -867,7 +867,7 @@ onto. It holds exactly what the sections above put there, and every other path i
 | `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32` | The [runtime-tree grant](#sealed-runtime-tree-grant), bind-mounted read-only from the host | lists |
 | The sixteen [`/etc` allowlist](#sealed-etc-grant) entries | Bind-mounted read-only, the account databases synthetic | lists, on the six directory entries |
 | `/dev` | A private tmpfs carrying the [OCI device set](#capsule-device-set) | `Permission denied` |
-| `/proc` | Masked with `hidepid` where the kernel allows it, bound from the host where it does not | `Permission denied` |
+| `/proc` | A bind of the session's [private `procfs`](#capsule-proc); the host's where no private one can be mounted | lists the session's processes; `Permission denied` on the host's |
 | `/tmp` | The [session's temporary folder](#temp-folder), `tmp/` in the records directory, bound read-write | lists |
 | The work folder, at its own absolute host path | The capsule's work folder, read-write | lists |
 | The [runtime directory](workdir.md#runtime-directory) and the [records directory](workdir.md#records-directory), each at its own absolute host path | Bound read-only | lists |
@@ -893,8 +893,10 @@ the fork that builds the root. A bind-mounted subtree carries its host inode thr
 `pivot_root`, so its rule follows it — which is why `ls /usr` lists. The root `tmpfs` and the
 directories created inside it after the fork are new inodes that did not exist when those
 descriptors were opened, so no rule was ever taken on them and the capsule's own default-deny
-Landlock domain applies. That is also why `ls /` is refused, and why `/dev` and `/proc` hold nodes
-the capsule can open inside directories it cannot enumerate.
+Landlock domain applies. That is also why `ls /` is refused, and why `/dev` holds nodes the capsule
+can open inside a directory it cannot enumerate. `/proc` lists because its rule is taken on the
+private `procfs` the command mounted before the root was built, which the root binds by the same
+inode.
 
 Enumerating the root is refused; opening a path inside it is not. Read a file under `/usr` or
 `/etc` directly rather than listing the directory that holds it.
@@ -1021,6 +1023,70 @@ Every session has a private home folder: `home/` in its
 
 As with the temporary folder, no record can be moved or hard-linked into the home folder, and the
 folder itself cannot be renamed.
+
+## A capsule's own `/proc` { #capsule-proc }
+
+Every command on a Linux kernel tier — `landlock+seccomp`, `mountns+pivot_root+landlock+seccomp`
+and `seccomp-only` — runs inside its session's PID namespace and, where the host allows it, sees a
+private `/proc` of that namespace.
+
+| Property | Value |
+|---|---|
+| PID namespace | One per session, created with the session's network namespace. Its pid 1 holds the namespace open and runs nothing else; when the session ends, or `mur` exits by any means, it exits and the kernel kills every process left in the namespace |
+| A command's pids | Namespace pids. `$$` and `$!` are small numbers that name nothing on the host, and `$PPID` reads `0`: each command has a relay process outside the namespace that waits for it and reports its exit code or signal to the runtime |
+| A backgrounded process | Lives on into the session's later commands, which see it at the same pid, until the session ends |
+| `/proc` | A `procfs` of the session's PID namespace, mounted over `/proc` in each command's private mount namespace |
+| Landlock rights on it | `scoped` and `sealed`: read and list. Never execute, never a write right. `seccomp-only` has no Landlock, so nothing restricts it |
+
+What a command reaches through its `/proc`:
+
+| Visible | Hidden |
+|---|---|
+| `/proc/self`, `/proc/thread-self` and the processes of its own command tree | Every host process: `/proc/<host pid>` is `ENOENT` (`No such file or directory`) |
+| The kernel's world-readable files: `cpuinfo`, `meminfo`, `stat`, `loadavg`, `/proc/sys` read-only, and the rest every user can read | The namespace's pid 1, and on `scoped` and `sealed` the processes of the session's other commands, which `hidepid` masks because the reader may not inspect them |
+
+`os.cpus()` in `node` and `/proc/self/*` reads in any runtime work on this view with no grant in
+the manifest.
+
+A process an earlier command left running, such as a backgrounded server, is absent from a later
+command's `/proc` listing, and a later command can still signal it by its pid, which the earlier
+command printed (`kill -0 <pid>` succeeds).
+
+**When the host cannot mount one.** The namespace probe's private-proc attempt (see
+[Telling host conditions apart](#telling-host-conditions-apart)) decides the view once per run. A
+host that refuses it — a container runtime that overmounts parts of its own `/proc` is the usual
+case — runs commands with the host's `/proc`, and on `scoped` and `sealed` every open beneath it is
+`Permission denied`. A host that allows the probe and then refuses the mount at a command's spawn
+fails that spawn:
+
+```text
+sandbox: could not mount this session's private /proc: <step> failed: <ERRNO> (<errno text>)
+```
+
+`mur run --explain-scope` prints a `Process view` block after the `Temporary folder` block, and
+`mur doctor` prints the same block after its own, besides its `private proc:` line:
+
+```text
+Process view
+  /proc:     private (pid-namespace) — the session's own processes and the kernel's world-readable files; no host process
+  grant:     read and list (scoped, sealed); never execute or write
+```
+
+Where the view is the host's, the block reads `/proc:     host — <reason>`:
+
+| Case | Reason |
+|---|---|
+| The probe could not mount a private `procfs` | `this host cannot mount a private /proc in the session's PID namespace (<failed call>), so commands keep the host's /proc, and on scoped and sealed every open beneath it is refused` |
+| No kernel containment | `this host has no kernel containment for capsule commands, so they see the host's own /proc` |
+| The session runs unconfined | `the session runs unconfined, so commands see the host's own /proc` |
+
+`--explain-scope --json` and `trace.jsonl`'s `session_start.effective_grants` carry the block as
+[`process_view`](observability-schemas.md#session-trace-tracejsonl).
+
+| Property | What it means |
+|---|---|
+| Each running command holds two tasks | The command and its relay, both counted against [`cgroup_pids_max`](resource-limits.md#host-resource-limits) and `max_processes` |
+| A `capabilities.shell.interpreter_runtime` entry naming `/proc` | Accepted, and grants the host's `procfs`, which the command's `/proc` does not show: the private `procfs` is mounted over it. It reaches nothing a command can open |
 
 ## Host paths { #host-paths }
 
@@ -1187,6 +1253,23 @@ systemd-resolved's *stub listener* is unaffected: on a host whose `/etc/resolv.c
 `127.0.0.53`, the runtime speaks ordinary DNS to it like any other nameserver. It is the NSS module
 that is bypassed, not the daemon.
 
+### What a command reads { #command-name-resolution-files }
+
+A command's own C library resolves `localhost` and every other name `/etc/hosts` carries before
+any query reaches the runtime's resolver. On `scoped` a command reads two host files for that,
+whatever `capabilities.network.allow` says:
+
+| File | `scoped` | `sealed` |
+|---|---|---|
+| `/etc/hosts` | read | read, in the [`/etc` allowlist](#sealed-etc-grant) |
+| `/etc/nsswitch.conf` | read | read, in the [`/etc` allowlist](#sealed-etc-grant) |
+
+Neither is listable, executable or writable. The rest of the host's `/etc`, `/etc/resolv.conf` and
+`/etc/passwd` included, stays `Permission denied` on `scoped`. `mur run --explain-scope` lists both
+files under `name resolution` in its `Effective grants`, and `--explain-scope --json` and
+`session_start.effective_grants` carry them as
+[`name_resolution`](observability-schemas.md#session-trace-tracejsonl).
+
 ## Network reach limits { #network-reach-limits }
 
 - **Only proxy-reachable ports work.** The namespace binds a listener for each port the allowlist
@@ -1331,6 +1414,44 @@ needs that library named in `capabilities.shell.interpreter_runtime`.
 ```
 
 On macOS nothing is derived and nothing is run.
+
+### Native addons { #native-addons }
+
+The sandbox grants each `capabilities.shell.allow` binary its own `DT_NEEDED` closure: the shared
+libraries the binary names, file by file. A native addon — a `.node` file a package installs into
+`node_modules` — arrives after staging, inside the workdir, and the system libraries it loads are
+unknown until it loads. One it cannot open fails at that moment:
+
+```text
+Error: librt.so.1: cannot open shared object file: No such file or directory
+```
+
+A capsule that loads one names the folder holding those libraries in
+`capabilities.shell.interpreter_runtime`, on the `node` binary:
+
+```yaml
+interpreter_runtime:
+  - binary: node
+    dirs:
+      - path: /usr/lib/x86_64-linux-gnu
+        list_dir: false
+```
+
+`ldd <addon>.node` inside the workdir names the libraries and the folder they resolve to.
+
+The runtime does not grant that folder itself: doing so would widen every capsule with a shell for
+the few that load addons, without its manifest saying so. Naming it has a cost the manifest states:
+
+| Cost | What it means |
+|---|---|
+| `Execute` | An `interpreter_runtime` directory grants execute as well as read, so every file beneath the folder can be run, not only loaded as a library |
+| [`W-SEC-009`](diagnostics.md#w-sec-009) | Fires at staging for the grant |
+
+`node` itself also reads OpenSSL's configuration file at startup, outside the workdir, and exits
+with code 13 (`node: OpenSSL configuration error`) when `scoped` refuses it. A capsule that runs
+`node` names that one file the same way, as a `dirs` entry with `list_dir: false`; the error names
+the path, usually `/etc/ssl/openssl.cnf`. [How to run Node tests in a capsule](../how-to/run-node-tests-in-capsule.md)
+shows both grants in a complete manifest.
 
 ### Kept host facts { #host-facts }
 

@@ -81,6 +81,7 @@ pub(crate) mod peer_tasks;
 mod pinned_port;
 pub mod plan;
 pub mod precompile;
+pub mod proc_view;
 pub mod process_driver;
 pub(crate) mod protected_paths;
 pub mod provider_tool;

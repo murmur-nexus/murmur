@@ -7,7 +7,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use capsule_runtime::launch_session;
 use serde_json::{json, Value};
@@ -96,21 +100,46 @@ fn a_server_from_one_shell_call_answers_the_next() {
                         break; sleep 0.1; done; read -r reply <&3; echo \"$reply\"; \
                         kill -0 \"$(<sleeper.pid)\" && echo sleeper-alive";
 
-    let server = common::ScriptedServer::start(vec![
-        tool_call(
-            "msg_1",
-            "toolu_server",
-            "bash",
-            json!({"command": start_server}),
-        ),
-        tool_call(
-            "msg_2",
-            "toolu_client",
-            "bash",
-            json!({"command": reach_server}),
-        ),
-        end_turn("msg_3", "The server answered."),
-    ]);
+    // The sleeper's pid file holds its pid in the session's PID namespace. Its host pid is read
+    // while the session still runs — on the second request, after the first call wrote the file —
+    // because only a live session holds the namespace the translation goes through.
+    let pid_file: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let sleeper_host: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let mut turn = 0;
+    let server = common::ScriptedServer::start_answering(3, {
+        let pid_file = Arc::clone(&pid_file);
+        let sleeper_host = Arc::clone(&sleeper_host);
+        move |_| {
+            turn += 1;
+            match turn {
+                1 => tool_call(
+                    "msg_1",
+                    "toolu_server",
+                    "bash",
+                    json!({"command": start_server}),
+                ),
+                2 => {
+                    let path = pid_file.lock().unwrap().clone();
+                    let namespace_pid = path
+                        .and_then(|path| fs::read_to_string(path).ok())
+                        .and_then(|text| text.trim().parse::<i32>().ok());
+                    *sleeper_host.lock().unwrap() = namespace_pid.and_then(|pid| {
+                        capsule_runtime::network_namespace::host_pid_in_session(
+                            std::process::id(),
+                            pid,
+                        )
+                    });
+                    tool_call(
+                        "msg_2",
+                        "toolu_client",
+                        "bash",
+                        json!({"command": reach_server}),
+                    )
+                }
+                _ => end_turn("msg_3", "The server answered."),
+            }
+        }
+    });
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -128,6 +157,7 @@ fn a_server_from_one_shell_call_answers_the_next() {
     let records = staged.records_dir.clone();
     let accessible = staged.accessible_workdir.clone();
     fs::write(accessible.join("task.md"), "Start a server, then reach it.").unwrap();
+    *pid_file.lock().unwrap() = Some(accessible.join("sleeper.pid"));
 
     launch_session(staged, |_| {}).expect("the session launches");
 
@@ -141,11 +171,14 @@ fn a_server_from_one_shell_call_answers_the_next() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|event| event["event_type"] == "shell")
         .collect();
-    let sleeper: i32 = fs::read_to_string(accessible.join("sleeper.pid"))
-        .expect("the first call wrote sleeper.pid")
-        .trim()
-        .parse()
-        .unwrap();
+    assert!(
+        accessible.join("sleeper.pid").exists(),
+        "the first call wrote sleeper.pid"
+    );
+    let sleeper: i32 = sleeper_host
+        .lock()
+        .unwrap()
+        .expect("the sleeper was a live process of the session on the second call");
     // The sleeper is the runtime's grandchild, orphaned to `init` when its shell exited; its
     // `/proc` entry goes once `init` reaps it, a moment after the kill.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -262,6 +295,24 @@ fn a_hard_killed_runtime_leaves_nothing_running(test_name: &str, sleeper: &str) 
             fs::read_to_string(logs.path().join("stderr")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(50));
+    };
+    // The pid file holds the sleeper's pid in the session's PID namespace; its host pid is the
+    // live process with that namespace pid running in this test's workdir.
+    let sleeper_pid = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) =
+                capsule_runtime::network_namespace::host_pid_in_workdir(workdir.path(), sleeper_pid)
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no process in {} is pid {sleeper_pid} in its namespace",
+                workdir.path().display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     };
     assert!(
         Path::new(&format!("/proc/{sleeper_pid}")).exists(),

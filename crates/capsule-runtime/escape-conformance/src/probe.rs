@@ -86,9 +86,11 @@ def probe_open(path, flags=os.O_RDONLY):
 def proc_reachable():
     """Attribution control for every /proc case.
 
-    Under KernelFull /proc is not among the Landlock grants, so an openat of anything under it
-    fails with EACCES. A /proc case that reports REFUSED without this control cannot tell
-    'the re-open route is closed' from 'the whole of /proc is closed' -- and
+    Under KernelFull and KernelSealed /proc is the session's private procfs, which Landlock
+    grants read and list, so this open succeeds and the control reports reachable; on a host
+    that cannot mount a private procfs /proc is the host's, carries no grant, and the open fails
+    with EACCES. A /proc case that reports REFUSED without this control cannot tell 'the re-open
+    route is closed' from 'the whole of /proc is closed' -- and
     subprocess-fd-hygiene-verification.md's 'Why not /proc/self/fd' section is the record of
     that exact mistake being made once already."""
     fd, note = probe_open("/proc/self/status")

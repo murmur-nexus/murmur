@@ -562,6 +562,7 @@ fn a_deadline_stops_a_running_check() {
         "",
     ));
     let begun = Instant::now();
+    let check = watch_for_session_process("sleep\x00600\x00", project.dir.path().to_path_buf());
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
     assert!(
         begun.elapsed() < Duration::from_secs(90),
@@ -599,15 +600,77 @@ fn a_deadline_stops_a_running_check() {
     assert_eq!(trace[task_end]["done_check"]["met"], false);
     assert_eq!(run.result(), "answer");
 
+    // `check.pid` holds the check's pid in the session's PID namespace; the watcher found the
+    // same process by its host pid while the run went.
     let pid: i32 = fs::read_to_string(run.workdir().join("check.pid"))
         .expect("the check wrote its pid")
         .trim()
         .parse()
         .unwrap();
+    let (host_pid, namespace_pid) = check
+        .join()
+        .unwrap()
+        .expect("the check ran as a process of mur's session");
+    assert_eq!(namespace_pid, pid, "the watcher found another process");
     assert!(
-        !common::pid_alive(pid),
-        "the check's process {pid} outlived the deadline"
+        !common::pid_alive(host_pid),
+        "the check's process {host_pid} outlived the deadline"
     );
+}
+
+/// Watches, on its own thread, for a process whose `/proc/<pid>/cmdline` is `cmdline`, running
+/// in a PID namespace below this one with its working directory beneath `under`, and returns its
+/// host pid and its pid inside the namespace, or `None` after 90 s. Commands run in their
+/// session's PID namespace, so the pid a command writes is a namespace pid; the project folder
+/// is this test's own temporary directory, so the working directory tells its run's processes
+/// from every other test's.
+fn watch_for_session_process(
+    cmdline: &'static str,
+    under: PathBuf,
+) -> std::thread::JoinHandle<Option<(i32, i32)>> {
+    std::thread::spawn(move || {
+        let under = fs::canonicalize(&under).unwrap_or(under);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            let pids: Vec<i32> = fs::read_dir("/proc")
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pid in pids {
+                let in_project = fs::read_link(format!("/proc/{pid}/cwd"))
+                    .is_ok_and(|cwd| cwd.starts_with(&under));
+                if !in_project
+                    || !fs::read(format!("/proc/{pid}/cmdline"))
+                        .is_ok_and(|bytes| bytes == cmdline.as_bytes())
+                {
+                    continue;
+                }
+                let namespace_pids: Vec<i32> = fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("NSpid:"))
+                            .map(|fields| {
+                                fields
+                                    .split_whitespace()
+                                    .filter_map(|field| field.parse().ok())
+                                    .collect()
+                            })
+                    })
+                    .unwrap_or_default();
+                if namespace_pids.len() >= 2 {
+                    return namespace_pids.last().map(|inner| (pid, *inner));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    })
 }
 
 // ── The timeout ───────────────────────────────────────────────────────────────

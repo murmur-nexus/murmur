@@ -307,7 +307,7 @@ def main():
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
                       is never mistaken for a contained read.\
-                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
@@ -365,9 +365,9 @@ def main():
                       case refuses for real at `scoped` (EPERM) and still reports EXDEV at \
                       `sealed`. Asserting a verdict here would be asserting the mount layout, not \
                       containment. A second consequence of the \
-                      same layout: /proc/sys is unreachable in the composed root, so \
-                      `protected_hardlinks` reads back as `unknown` and even the EPERM/EACCES \
-                      attribution above is unavailable at this class.",
+                      same layout: on a host without a private procfs /proc/sys is unreachable in \
+                      the composed root, so `protected_hardlinks` reads back as `unknown` and even \
+                      the EPERM/EACCES attribution above is unavailable at this class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: NotAsserted,
@@ -464,11 +464,12 @@ def main():
                       always is. That is not a boundary crossing and must not be scored as one; \
                       the crossing is reaching a path outside the workdir through it, which is \
                       what this case asserts. The re-open result and the `proc_reachable()` \
-                      control (ordinary /proc files carry no grant and are expected to be EACCES) \
-                      are both reported in DETAIL as context — the same distinction \
+                      control (the session's private /proc is granted read and list, so ordinary \
+                      /proc files are expected to be reachable, and the refusal is the walk's \
+                      target, not /proc) are both reported in DETAIL as context — the same distinction \
                       subprocess-fd-hygiene-verification.md's 'Why not /proc/self/fd' section \
                       exists to make.\
-                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: the walk reaches the *composed root's* `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` — the curated allowlist the root bind-mounts read-only and (since slice fb1eea97) grants read on. Everything a walk out of the workdir can arrive at is bounded by what the composed root exposes, and `/etc/shadow` is not on that list and is absent from the root entirely (see `read-etc-shadow`, which stays REFUSED). \
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: the walk reaches the *composed root's* `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` — the curated allowlist the root bind-mounts read-only and grants read on. Everything a walk out of the workdir can arrive at is bounded by what the composed root exposes, and `/etc/shadow` is not on that list and is absent from the root entirely (see `read-etc-shadow`, which stays REFUSED). \
                       This case is one of the four documented/actual mismatches the 2026-08-09 \
                       bare-metal run had to resolve, and the resolution is that the earlier \
                       REFUSED reading was a defect in *this probe*, not a containment finding. The \
@@ -527,9 +528,11 @@ def main():
         summary: "reads /etc/passwd through /proc/<pid>/root, the filesystem-root alias",
         attribution: "Same /proc-reachability control as the other two /proc cases. /proc/<pid>/root \
                       is the alias that would defeat a chroot-shaped boundary; against a Landlock \
-                      ruleset it is only another path, and it is expected to be refused because \
-                      /proc carries no grant.\
-                      At `sealed` the measured verdict is ALLOWED, and the reason is worth stating precisely because it is easy to misread as the chroot-shaped escape this route is famous for. `/proc` in the composed root is a *fresh* proc mount made inside the capsule's own mount namespace (step 4 of `sealed::plan_composed_root`), so `/proc/<pid>/root` is an alias for the composed root — not for the host's `/`. What the read reaches is therefore the composed root's `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` and is granted read since slice fb1eea97. The alias works and lands nowhere the class did not already expose; `/etc/shadow` is absent from the root entirely, so the same route cannot reach it (see `read-etc-shadow`). Note the /proc control still reports `proc_itself=denied`: ordinary /proc files carry no Landlock grant even here, which is why the reachable path is the magic alias and not /proc at large.",
+                      ruleset it is only another path. The session's private /proc is readable, \
+                      so the alias itself resolves, and at `scoped` it lands on the host's \
+                      /etc/passwd, which no rule grants: refused by the file's own path, with \
+                      `proc_reachable()` reporting /proc reachable.\
+                      At `sealed` the measured verdict is ALLOWED, and the reason is worth stating precisely because it is easy to misread as the chroot-shaped escape this route is famous for. `/proc` in the composed root is a bind of the session's private procfs, which the command mounted in its own mount namespace before the composed root bound it (step 4 of `sealed::plan_composed_root`), so `/proc/<pid>/root` is an alias for the composed root — not for the host's `/`. What the read reaches is therefore the composed root's `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` and is granted read. The alias works and lands nowhere the class did not already expose; `/etc/shadow` is absent from the root entirely, so the same route cannot reach it (see `read-etc-shadow`). The /proc control reports `proc_itself=reachable`: the private procfs is granted read and list, and it lists only the session's own processes.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
@@ -1095,9 +1098,10 @@ def main():
                       can and folds the value into DETAIL, so a reader can tell a seccomp \
                       refusal from a host-policy one.\
                       Measured REFUSED with EPERM at `sealed` — but note the attribution control \
-                      is *weaker* at this class, not stronger: /proc/sys is not part of the \
-                      composed root's /proc, so the sysctl reads back as `unknown` and the \
-                      host-policy reading cannot be excluded from inside the capsule. The verdict \
+                      is *weaker* at this class on a host without a private procfs: /proc/sys is \
+                      then not part of the composed root's /proc, so the sysctl reads back as \
+                      `unknown` and the host-policy reading cannot be excluded from inside the \
+                      capsule. With the private procfs the sysctl reads back at both classes. The verdict \
                       is asserted because the seccomp filter is identical on both kernel classes \
                       and `scoped`, where the sysctl is readable, is the run that attributes it.",
         advisory: NotAsserted,
@@ -1184,9 +1188,10 @@ def main():
                       EFAULT would mean the call reached its implementation with the NULL attr \
                       pointer, i.e. it was permitted.\
                       Measured REFUSED with EPERM at `sealed`, with the sysctl reading back as \
-                      `unknown` — /proc/sys is not in the composed root's /proc, so as with \
-                      `syscall-userfaultfd` the attribution control is unavailable at this class \
-                      and `scoped` is the run that supplies it.",
+                      `unknown` on a host without a private procfs — /proc/sys is then not in the \
+                      composed root's /proc, so as with `syscall-userfaultfd` the attribution \
+                      control is unavailable at this class and `scoped` is the run that supplies \
+                      it. With the private procfs the sysctl reads back at both classes.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),

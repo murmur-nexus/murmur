@@ -89,3 +89,7 @@
 *[capabilities.env.allow]: environment variable names the harness subprocess may see · the whole environment it gets · process transport only
 *[capabilities.install.tool]: tool artifacts a running capsule may pull · exact name | scope/prefix* | *
 *[capabilities.install.from]: stores: project then global store · default | stores, sources: also scope's GitHub source
+*[capabilities.shell.interpreter_runtime]: binary + host dirs · read · execute · list_dir optional · fires W-SEC-009
+*[capabilities.resources.memory_bytes]: RLIMIT_AS per command · address space not RAM · default 2 GiB · node needs 32 GiB+
+*[capabilities.resources.cgroup_memory_bytes]: memory.max · whole command tree · real RAM cap · default 4 GiB
+*[lifecycle.done_check]: command run when agent stops · exit 0 ends task · limit: reopens · 0 = record only

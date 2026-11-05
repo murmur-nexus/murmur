@@ -625,24 +625,6 @@ fn process_gone_within(pid: u32, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Kills the pid written in each file that still names a live process when dropped, so a
-/// failing test leaves nothing running.
-struct KillPidFilesOnDrop(Vec<PathBuf>);
-
-impl Drop for KillPidFilesOnDrop {
-    fn drop(&mut self) {
-        for file in &self.0 {
-            if let Some(pid) = fs::read_to_string(file)
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok())
-                .filter(|pid| *pid > 1)
-            {
-                common::signal(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
 /// The agent reads a demoted command's progress and then its exit through the work id, so its
 /// result arrives inside the task that started it and no completion task follows. The completion
 /// is recorded at the call that returned the exit, right after that call's `background_command`
@@ -800,6 +782,9 @@ fn a_demoted_command_is_read_back_through_its_handle() {
     );
 }
 
+/// Each pid file a test reads, with the host pid its namespace pid named while the session ran.
+type HostPids = Vec<(&'static str, Option<i32>)>;
+
 /// A task that ends with a demoted command still running names it on its `task_end` record, and
 /// the session's end kills the command and the process it started in its group.
 #[test]
@@ -808,14 +793,41 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
     if common::skip_without_host_support(TEST) {
         return;
     }
-    let server = ScriptedServer::start(vec![
-        bash_call(
-            "msg_1",
-            "toolu_server",
-            "echo $$ > leader.pid; sleep 300 > /dev/null 2>&1 & echo $! > child.pid; sleep 300",
-        ),
-        end_turn("msg_2", "Started it."),
-    ]);
+    // The pid files hold pids in the session's PID namespace. Their host pids are read on the
+    // second request, while the session — which holds the namespace the translation goes through
+    // — still runs and the demoted command is still alive.
+    let workdir_slot: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
+    let host_pids: std::sync::Arc<std::sync::Mutex<HostPids>> = Default::default();
+    let mut turn = 0;
+    let server = ScriptedServer::start_answering(2, {
+        let workdir_slot = std::sync::Arc::clone(&workdir_slot);
+        let host_pids = std::sync::Arc::clone(&host_pids);
+        move |_| {
+            turn += 1;
+            if turn == 1 {
+                return bash_call(
+                    "msg_1",
+                    "toolu_server",
+                    "echo $$ > leader.pid; sleep 300 > /dev/null 2>&1 & echo $! > child.pid; \
+                     sleep 300",
+                );
+            }
+            let workdir = workdir_slot.lock().unwrap().clone().unwrap();
+            for file in ["leader.pid", "child.pid"] {
+                let host = fs::read_to_string(workdir.join(file))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                    .and_then(|pid| {
+                        capsule_runtime::network_namespace::host_pid_in_session(
+                            std::process::id(),
+                            pid,
+                        )
+                    });
+                host_pids.lock().unwrap().push((file, host));
+            }
+            end_turn("msg_2", "Started it.")
+        }
+    });
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -835,8 +847,8 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
     );
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.accessible_workdir.clone();
-    let _guard = KillPidFilesOnDrop(vec![workdir.join("leader.pid"), workdir.join("child.pid")]);
     fs::write(workdir.join("task.md"), "Start the server.").unwrap();
+    *workdir_slot.lock().unwrap() = Some(workdir.clone());
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -851,14 +863,12 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
     assert_eq!(abandoned.len(), 1);
     assert_eq!(abandoned[0]["work_id"], work_id);
 
-    for file in ["leader.pid", "child.pid"] {
-        let pid: u32 = fs::read_to_string(workdir.join(file))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+    let host_pids = host_pids.lock().unwrap().clone();
+    assert_eq!(host_pids.len(), 2, "{host_pids:?}");
+    for (file, pid) in host_pids {
+        let pid = pid.unwrap_or_else(|| panic!("{file} named no live process of the session"));
         assert!(
-            process_gone_within(pid, std::time::Duration::from_secs(2)),
+            process_gone_within(pid as u32, std::time::Duration::from_secs(2)),
             "{file}'s process {pid} outlived its session"
         );
     }

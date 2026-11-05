@@ -170,7 +170,7 @@ Keep these facts separate in the assessment:
 
 A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest declarable class, and lets the operator run the capsule [unconfined](https://docs.murmur.nexus/reference/containment/#unconfined); any declared floor, `advisory` included, refuses that. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
 
-Do not overstate guarantees. Filesystem mediation may govern read/write/execute operations without hiding path metadata. Strong root isolation can make outside paths absent, yet under `sealed` a process can still learn that another process exists, its owner and start time (`stat(2)` on `/proc/<pid>`), and can signal processes of the same user. Record exceptions that matter to the workload.
+Do not overstate guarantees. Filesystem mediation may govern read/write/execute operations without hiding path metadata. Strong root isolation can make outside paths absent. On `scoped` and `sealed` a command runs in the session's own PID namespace and sees a private `/proc` listing only the session's processes; on a host that cannot mount one (`mur doctor`'s `private proc:` line reads `refused`), `/proc` is the host's, every open beneath it is refused, and `stat(2)` on `/proc/<pid>` still shows that a host process exists, its owner and start time. Record exceptions that matter to the workload.
 
 ## Bound denial-of-service authority
 
@@ -199,7 +199,7 @@ Treat these diagnostics as security-significant:
 
 - `W-SEC-001` / `W-SEC-003`: declared subprocess filesystem or network restrictions are not fully enforced on this host;
 - `W-SEC-004`: a literal secret appears in the manifest;
-- `W-SEC-005`: kernel enforcement is in force; it states what the tier covers and what still reaches outside (under `sealed`, `stat(2)` on `/proc/<pid>` and signals to same-user processes);
+- `W-SEC-005`: kernel enforcement is in force; it states what the tier covers, including the read-only `/etc/hosts` and `/etc/nsswitch.conf` and the session's private `/proc`, and what still reaches outside where no private `/proc` can be mounted (`stat(2)` on `/proc/<pid>`);
 - `W-SEC-007`: an artifact network entry was outside the ceiling and was dropped;
 - `W-SEC-008`: an artifact-local capability key is inert or the artifact cannot be narrowed that way;
 - `E-CAP-002`: an artifact filesystem scope used an absolute path or escaped its allowed root.
