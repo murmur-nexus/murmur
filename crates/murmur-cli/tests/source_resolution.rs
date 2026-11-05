@@ -1522,3 +1522,109 @@ fn a_github_release_install_records_and_checks_the_owner() {
     );
     assert!(stub.paths().is_empty(), "{:?}", stub.paths());
 }
+
+// ─── the lock follows the manifest ───────────────────────────────────────────
+
+/// `ana/artifacts` listing `ana/tool-x` at 1.0.0 and 1.1.0, both of which fit.
+fn two_fitting_tool_x_versions(stub: &MockGitHub) {
+    let staging = tempfile::tempdir().unwrap();
+    let dir = staging.path();
+    stub.repository(ANA, 1111);
+    let version = |version: &'static str| -> HandVersion<'static> {
+        (
+            version,
+            vec![served_tool_run()],
+            vec![(
+                None,
+                format!("tool-x-{version}.mur.zip"),
+                zip_of(dir, "tool-x", version),
+            )],
+        )
+    };
+    publish_hand_index(
+        stub,
+        ANA,
+        "ana",
+        "v1",
+        vec![("tool-x", vec![version("1.1.0"), version("1.0.0")])],
+    );
+}
+
+/// A source-served artifact follows a manifest version change into `murmur.lock`, while the
+/// version the lock pins, served with other bytes than it pins, is refused before anything is
+/// stored — on the manifest install and on a named install alike.
+#[test]
+fn a_source_served_version_change_re_pins_but_new_bytes_for_the_pinned_version_are_refused() {
+    let stub = MockGitHub::start();
+    two_fitting_tool_x_versions(&stub);
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_config(home.path(), ANA_CONFIG);
+    write_project(project.path(), &[("ana/tool-x", "1.0.0")]);
+    install(home.path(), project.path(), &stub, &[])
+        .assert()
+        .success();
+    let lock_path = project.path().join("murmur.lock");
+    let project_store = project.path().join(".murmur/artifacts");
+
+    // (a) The manifest moves to 1.1.0, and the lock with it.
+    write_project(project.path(), &[("ana/tool-x", "1.1.0")]);
+    let assert = install(home.path(), project.path(), &stub, &[])
+        .assert()
+        .success();
+    let stdout = stdout_of(&assert);
+    assert_eq!(
+        stdout
+            .matches("Updated murmur.lock: ana/tool-x 1.0.0 \u{2192} 1.1.0")
+            .count(),
+        1,
+        "{stdout}"
+    );
+    let served = fs::read(project_store.join("ana/tool-x/1.1.0/tool-x-1.1.0.mur.zip")).unwrap();
+    let lock = read_lockfile(&lock_path).unwrap();
+    let entry = lock.artifact_for("ana/tool-x").unwrap();
+    assert_eq!(entry.resolved_version, "1.1.0");
+    assert_eq!(
+        entry.sha256.any.as_deref(),
+        Some(sha256_hex(&served).as_str())
+    );
+    assert_eq!(entry.owner_id, Some(1111));
+    assert!(!global_store(home.path()).join("ana/tool-x").exists());
+
+    // (b) The pinned version's hash no longer matches what the source serves.
+    let mut lock = read_lockfile(&lock_path).unwrap();
+    lock.artifacts
+        .iter_mut()
+        .find(|entry| entry.name == "ana/tool-x")
+        .unwrap()
+        .sha256 = murmur_artifact::LockedSha256::any("a-completely-different-hash");
+    murmur_artifact::write_lockfile_atomic(&lock_path, &lock).unwrap();
+    let lock_bytes = fs::read(&lock_path).unwrap();
+    fs::remove_dir_all(&project_store).unwrap();
+
+    let assert = install(home.path(), project.path(), &stub, &[])
+        .assert()
+        .failure();
+    let stdout = stdout_of(&assert);
+    assert_contains(
+        &stdout,
+        &[
+            "error[E-REG-005]:",
+            "murmur.lock conflict for 'ana/tool-x'",
+            "a-completely-different-hash",
+        ],
+    );
+    assert!(!stdout.contains("Updated murmur.lock"), "{stdout}");
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert!(!project_store.join("ana/tool-x/1.1.0").exists());
+
+    // (c) A named install of that version is refused the same way.
+    let stderr = refused(
+        install(home.path(), project.path(), &stub, &["ana/tool-x@1.1.0"]),
+        "E-REG-005",
+        &[&project_store, &global_store(home.path())],
+    );
+    assert_contains(&stderr, &["murmur.lock conflict for 'ana/tool-x'"]);
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
+    assert!(!project_store.join("ana/tool-x/1.1.0").exists());
+}

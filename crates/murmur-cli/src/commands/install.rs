@@ -33,32 +33,138 @@ use crate::{
 
 use super::runtime_manifest_error_to_cli;
 
-/// Compare a registry-resolved artifact against any existing `murmur.lock` pin at
-/// `lock_path`, refusing to install when they disagree. A missing lockfile is not a
-/// conflict — the artifact simply isn't pinned yet.
+/// What an install holds a resolved payload to against its `murmur.lock` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockCheck {
+    /// The pinned version and, for that version, the pinned bytes: a named install from the
+    /// global store, which takes no version the lock does not already pin.
+    VersionAndPin,
+    /// The pinned bytes of the pinned version only. A different version is a new pin, so the
+    /// entry follows `murmur.yaml` on a manifest install and follows the reference on a named
+    /// install from a source.
+    PinOnly,
+    /// `mur install --frozen`: the pinned version and bytes, and a hash pinned for this payload's
+    /// platform, since the lock is never written to add one.
+    Frozen,
+}
+
+/// The hint for a payload whose bytes disagree with the `murmur.lock` pin of the same version.
+const CHANGED_BYTES_HINT: &str = "the bytes served for this version changed since murmur.lock \
+                                  was written; to accept the new bytes, remove this entry from \
+                                  murmur.lock and install again";
+
+/// The hint for every `--frozen` refusal: nothing is pinned or re-pinned under it.
+fn frozen_hint(what: &str) -> String {
+    format!("--frozen does not change murmur.lock; run `mur install` without --frozen to {what}")
+}
+
+/// Compare a resolved `name@version` with pin `sha256` against its entry in `lock`, refusing
+/// with `E-REG-005` when `check` says they disagree. No lock, or no entry for `name`, is not a
+/// conflict: the artifact simply isn't pinned yet. `--frozen` refuses a missing entry before
+/// anything is resolved (see [`check_frozen_lock`]).
+fn check_lock_entry(
+    lock: Option<&MurmurLock>,
+    name: &str,
+    version: &str,
+    sha256: &LockedSha256,
+    check: LockCheck,
+) -> Result<(), CliError> {
+    let Some(entry) = lock.and_then(|lock| lock.artifact_for(name)) else {
+        return Ok(());
+    };
+    let conflict = |message: String, hint: String| {
+        Err(CliError::with_hint(
+            E_REG_005,
+            format!("murmur.lock conflict for '{name}': {message}"),
+            hint,
+        ))
+    };
+    if let Some(message) = entry.same_version_conflict_with(version, sha256) {
+        return conflict(message, CHANGED_BYTES_HINT.to_string());
+    }
+    if check != LockCheck::PinOnly {
+        if let Some(message) = entry.conflict_with(version, sha256) {
+            let hint = if check == LockCheck::Frozen {
+                frozen_hint(&format!("take {version}"))
+            } else {
+                format!(
+                    "to move {name} to {version}, change its version in murmur.yaml and run \
+                     `mur install`"
+                )
+            };
+            return conflict(message, hint);
+        }
+    }
+    if check == LockCheck::Frozen {
+        if let Some(platform) = sha256
+            .platforms
+            .keys()
+            .find(|platform| !entry.sha256.platforms.contains_key(*platform))
+        {
+            return conflict(
+                format!("'{name}' has no sha256 pinned for {platform}"),
+                frozen_hint(&format!("pin {name}@{version} for {platform}")),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`check_lock_entry`] against the `murmur.lock` at `lock_path`, read now.
 fn check_lock_conflict(
     lock_path: &Path,
     name: &str,
     version: &str,
     sha256: &LockedSha256,
+    check: LockCheck,
 ) -> Result<(), CliError> {
-    match read_lockfile(lock_path) {
-        Ok(lock) => {
-            if let Some(entry) = lock.artifact_for(name) {
-                if let Some(conflict) = entry.conflict_with(version, sha256) {
-                    return Err(CliError::with_hint(
-                        E_REG_005,
-                        format!("murmur.lock conflict for '{name}': {conflict}"),
-                        "if this is an intentional upgrade, remove the stale entry from \
-                         murmur.lock before installing again",
-                    ));
-                }
-            }
-            Ok(())
+    let lock = read_lock_if_any(lock_path)?;
+    check_lock_entry(lock.as_ref(), name, version, sha256, check)
+}
+
+/// `E-REG-005` for the whole `mur install --frozen` before anything is fetched or written: there
+/// is no `murmur.lock`, or a declared artifact has no entry in it, or its `murmur.yaml` version is
+/// not the one its entry pins.
+fn check_frozen_lock(
+    lock: Option<&MurmurLock>,
+    lock_path: &Path,
+    names: &[ArtifactName],
+    artifacts: &[&murmur_artifact::RuntimeArtifact],
+) -> Result<(), CliError> {
+    let Some(lock) = lock else {
+        return Err(CliError::with_hint(
+            E_REG_005,
+            format!(
+                "--frozen installs what murmur.lock pins, but there is no murmur.lock at {}",
+                lock_path.display()
+            ),
+            frozen_hint("write it"),
+        ));
+    };
+    for (name, artifact) in names.iter().zip(artifacts) {
+        let Some(entry) = lock.artifact_for(name.as_str()) else {
+            return Err(CliError::with_hint(
+                E_REG_005,
+                format!(
+                    "murmur.lock has no entry for '{name}', which murmur.yaml declares at {}",
+                    artifact.version
+                ),
+                frozen_hint(&format!("pin {name}@{}", artifact.version)),
+            ));
+        };
+        if entry.resolved_version != artifact.version {
+            return Err(CliError::with_hint(
+                E_REG_005,
+                format!(
+                    "murmur.lock conflict for '{name}': pinned {name}@{}, but {name}@{} was \
+                     resolved",
+                    entry.resolved_version, artifact.version
+                ),
+                frozen_hint(&format!("take {}", artifact.version)),
+            ));
         }
-        Err(LockfileError::NotFound(_)) => Ok(()),
-        Err(err) => Err(super::lockfile_error_to_cli(err)),
     }
+    Ok(())
 }
 
 /// The `murmur.lock` pin for a payload the store has just recorded.
@@ -157,10 +263,11 @@ fn upsert_lock_entry(
     })
 }
 
-/// Print each adoption line [`upsert_lock_entry`] returned, once the progress bars are finished.
-fn print_adoptions(adoptions: &[String]) {
-    for adoption in adoptions {
-        capsule_runtime::report_println!("{adoption}");
+/// Print each line announcing a `murmur.lock` change — an `Updated` line or an adoption line
+/// [`upsert_lock_entry`] returned — once the progress bars are finished.
+fn print_lock_changes(lines: &[String]) {
+    for line in lines {
+        capsule_runtime::report_println!("{line}");
     }
 }
 
@@ -226,7 +333,8 @@ fn install_resolved(
 }
 
 /// Write `meta`'s payload to `local_registry` and, when `lock_path` is given, pin it there with
-/// the owner id `meta` records.
+/// the owner id `meta` records. A payload of the version `lock_path` pins whose bytes disagree
+/// with the pin is refused with `E-REG-005` before anything is stored; another version re-pins.
 fn store_and_pin(
     local_registry: &LocalRegistry,
     meta: ArtifactMeta,
@@ -238,6 +346,9 @@ fn store_and_pin(
     let name = meta.name.to_string();
     let version = meta.version.clone();
     let owner_id = meta.owner_id;
+    if let Some(lock_path) = lock_path {
+        check_lock_conflict(lock_path, &name, &version, &pin, LockCheck::PinOnly)?;
+    }
     local_registry
         .store_installed_overwrite(meta, bytes, sha256)
         .map_err(CliError::from)?;
@@ -449,12 +560,14 @@ fn format_bytes(n: u64) -> String {
 }
 
 /// `mur install [<ref>...]`: the manifest's artifacts with no reference, else each reference in
-/// the order given.
+/// the order given. `frozen` holds the manifest install to exactly what `murmur.lock` pins and
+/// never writes the lock; clap accepts it only with no reference, `-g` or `--all-platforms`.
 pub(crate) fn run_install(
     artifact_refs: &[String],
     global: bool,
     all_platforms: bool,
     no_precompile: bool,
+    frozen: bool,
 ) -> Result<(), CliError> {
     // Refusals that need no store come first, so a refused install creates nothing: every
     // reference is parsed before any is installed.
@@ -473,7 +586,7 @@ pub(crate) fn run_install(
     let project_root_path = project_root.as_deref();
 
     match parsed.len() {
-        0 => install_manifest_deps(&store, &project_root, no_precompile),
+        0 => install_manifest_deps(&store, &project_root, no_precompile, frozen),
         1 => {
             let mut stored = Vec::new();
             let installed =
@@ -745,7 +858,13 @@ fn install_from_global_store(
         None => format!("{}-{version}", name.name()),
     };
     if let Some(lock_path) = lock_path {
-        check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
+        check_lock_conflict(
+            lock_path,
+            name.as_str(),
+            version,
+            &pin,
+            LockCheck::VersionAndPin,
+        )?;
     }
     let owner_id = resolved.meta.owner_id;
     store
@@ -771,10 +890,18 @@ fn install_from_global_store(
     })
 }
 
+/// `mur install` with no reference: every artifact `murmur.yaml` declares, at the version it
+/// declares.
+///
+/// An entry of `murmur.lock` whose version the manifest changed is replaced, and announced with an
+/// `Updated murmur.lock:` line; every other entry stays as it was. Under `frozen` the install
+/// takes only what the lock pins, refusing a missing lock, a missing entry or a changed version
+/// before anything is fetched, and the lock is never written.
 fn install_manifest_deps(
     store: &LocalRegistry,
     project_root: &Option<PathBuf>,
     no_precompile: bool,
+    frozen: bool,
 ) -> Result<(), CliError> {
     let root = match project_root {
         Some(r) => r.clone(),
@@ -807,6 +934,12 @@ fn install_manifest_deps(
         capsule_runtime::report_println!("No artifacts in manifest.");
         return Ok(());
     }
+    let check = if frozen {
+        check_frozen_lock(lock.as_ref(), &lock_path, &full_names, &artifacts)?;
+        LockCheck::Frozen
+    } else {
+        LockCheck::PinOnly
+    };
 
     let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let sources = Sources::load()?;
@@ -922,7 +1055,7 @@ fn install_manifest_deps(
                 &sources,
                 lock.as_ref(),
                 store,
-                &lock_path,
+                check,
             );
 
             if use_download_bar {
@@ -984,17 +1117,23 @@ fn install_manifest_deps(
 
     // Upsert murmur.lock sequentially (not inside the parallel fetch loop) so concurrent
     // fetches never race on the same lockfile write. Every success is pinned regardless of
-    // how many other artifacts failed.
-    let mut adoptions = Vec::new();
-    for (_, outcome) in &successes {
+    // how many other artifacts failed; `--frozen` pins nothing. Each entry whose version the
+    // manifest moved gets its `Updated` line, judged against the lock as it was read above.
+    let mut lock_changes = Vec::new();
+    for (_, outcome) in successes.iter().filter(|_| !frozen) {
         if let Some((name, version, sha256, owner_id)) = &outcome.lock_upsert {
-            adoptions.extend(upsert_lock_entry(
-                &lock_path,
-                name,
-                version,
-                sha256.clone(),
-                *owner_id,
-            )?);
+            let previous = lock
+                .as_ref()
+                .and_then(|lock| lock.artifact_for(name))
+                .map(|entry| entry.resolved_version.as_str())
+                .filter(|previous| previous != version);
+            let adoption = upsert_lock_entry(&lock_path, name, version, sha256.clone(), *owner_id)?;
+            if let Some(previous) = previous {
+                lock_changes.push(format!(
+                    "Updated murmur.lock: {name} {previous} \u{2192} {version}"
+                ));
+            }
+            lock_changes.extend(adoption);
         }
     }
 
@@ -1027,7 +1166,7 @@ fn install_manifest_deps(
             &done_style,
             format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
         );
-        print_adoptions(&adoptions);
+        print_lock_changes(&lock_changes);
         keep_host_facts(no_precompile, Some(&root));
         return Ok(());
     }
@@ -1037,7 +1176,7 @@ fn install_manifest_deps(
         &done_style,
         format!("{} ↓ artifacts  failed", style("✗").red().bold()),
     );
-    print_adoptions(&adoptions);
+    print_lock_changes(&lock_changes);
     if !successes.is_empty() {
         keep_host_facts(no_precompile, Some(&root));
     }
@@ -1247,7 +1386,8 @@ fn check_fits(
 }
 
 /// Pin one artifact `store` already holds, or copy it from the global store, or fetch it from its
-/// scope's source, and write it to `store`.
+/// scope's source, and write it to `store`. Each payload is held to its entry in `lock` as `check`
+/// says before it is stored.
 fn fetch_and_store(
     name: &ArtifactName,
     version: &str,
@@ -1255,12 +1395,12 @@ fn fetch_and_store(
     sources: &Sources,
     lock: Option<&MurmurLock>,
     store: &LocalRegistry,
-    lock_path: &Path,
+    check: LockCheck,
 ) -> Result<FetchOutcome, CliError> {
     match held? {
         Held::Project(held) => {
             let pin = lock_pin(&held.meta, &held.sha256);
-            check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
+            check_lock_entry(lock, name.as_str(), version, &pin, check)?;
             Ok(FetchOutcome {
                 bytes_len: held.bytes.len() as u64,
                 lock_upsert: Some((
@@ -1274,7 +1414,7 @@ fn fetch_and_store(
         }
         Held::Global(resolved) => {
             let pin = lock_pin(&resolved.meta, &resolved.sha256);
-            check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
+            check_lock_entry(lock, name.as_str(), version, &pin, check)?;
             let len = resolved.bytes.len() as u64;
             let owner_id = resolved.meta.owner_id;
             store
@@ -1305,6 +1445,7 @@ fn fetch_and_store(
                 resolved.owner_id,
             );
             let pin = lock_pin(&meta, &resolved.sha256);
+            check_lock_entry(lock, name.as_str(), version, &pin, check)?;
             store
                 .store_installed_overwrite(meta, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
@@ -1610,5 +1751,90 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
         assert_eq!(recorded["meta"]["runtime"], "native");
         assert_eq!(recorded["meta"]["artifact_runtime"], "tool");
+    }
+
+    fn native_lock() -> murmur_artifact::MurmurLock {
+        let mut lock = murmur_artifact::MurmurLock {
+            lock_version: murmur_artifact::LOCK_VERSION,
+            artifacts: Vec::new(),
+        };
+        lock.upsert(
+            "ana/tool",
+            "1.0.0",
+            murmur_artifact::LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
+            murmur_artifact::LockOrigin::Operator,
+        );
+        lock
+    }
+
+    /// Each lock check against an entry pinning `ana/tool@1.0.0` for `darwin-aarch64`.
+    #[test]
+    fn each_lock_check_refuses_only_what_it_holds_the_entry_to() {
+        use super::{check_lock_entry, LockCheck, CHANGED_BYTES_HINT};
+        use murmur_artifact::LockedSha256;
+
+        let lock = native_lock();
+        let check = |version: &str, sha256: LockedSha256, mode: LockCheck| {
+            check_lock_entry(Some(&lock), "ana/tool", version, &sha256, mode).err()
+        };
+        let mac = |hash: &str| LockedSha256::for_one_platform("darwin-aarch64", hash);
+        let linux = LockedSha256::for_one_platform("linux-x86_64", "linux-hash");
+        let all = [
+            LockCheck::VersionAndPin,
+            LockCheck::PinOnly,
+            LockCheck::Frozen,
+        ];
+
+        for mode in all {
+            assert!(check("1.0.0", mac("mac-hash"), mode).is_none(), "{mode:?}");
+            let changed = check("1.0.0", mac("other-hash"), mode).unwrap();
+            assert_eq!(changed.code, "E-REG-005");
+            assert_eq!(
+                changed.message,
+                "murmur.lock conflict for 'ana/tool': 'ana/tool' is pinned at sha256 mac-hash \
+                 for darwin-aarch64, but other-hash was resolved"
+            );
+            assert_eq!(changed.hint.as_deref(), Some(CHANGED_BYTES_HINT));
+            let shape = check("1.0.0", LockedSha256::any("mac-hash"), mode).unwrap();
+            assert!(shape.message.contains("per-platform"), "{}", shape.message);
+            assert!(check_lock_entry(None, "ana/tool", "2.0.0", &mac("x"), mode).is_ok());
+        }
+
+        assert!(check("1.1.0", mac("new-hash"), LockCheck::PinOnly).is_none());
+        let moved = check("1.1.0", mac("new-hash"), LockCheck::VersionAndPin).unwrap();
+        assert_eq!(
+            moved.message,
+            "murmur.lock conflict for 'ana/tool': pinned ana/tool@1.0.0, but ana/tool@1.1.0 was \
+             resolved"
+        );
+        assert_eq!(
+            moved.hint.as_deref(),
+            Some("to move ana/tool to 1.1.0, change its version in murmur.yaml and run `mur install`")
+        );
+        let frozen = check("1.1.0", mac("new-hash"), LockCheck::Frozen).unwrap();
+        assert_eq!(frozen.message, moved.message);
+        assert_eq!(
+            frozen.hint.as_deref(),
+            Some(
+                "--frozen does not change murmur.lock; run `mur install` without --frozen to take \
+                 1.1.0"
+            )
+        );
+
+        assert!(check("1.0.0", linux.clone(), LockCheck::PinOnly).is_none());
+        assert!(check("1.0.0", linux.clone(), LockCheck::VersionAndPin).is_none());
+        let unpinned = check("1.0.0", linux, LockCheck::Frozen).unwrap();
+        assert_eq!(
+            unpinned.message,
+            "murmur.lock conflict for 'ana/tool': 'ana/tool' has no sha256 pinned for linux-x86_64"
+        );
+        assert!(
+            unpinned
+                .hint
+                .as_deref()
+                .unwrap()
+                .starts_with("--frozen does not change murmur.lock"),
+            "{unpinned:?}"
+        );
     }
 }
