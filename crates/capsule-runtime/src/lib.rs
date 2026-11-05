@@ -64,6 +64,7 @@ pub mod lanes;
 pub mod lifeline;
 pub mod limits;
 pub mod mac_token;
+pub mod manifest_files;
 pub(crate) mod member_call;
 pub mod model_limits;
 pub mod murmur_home;
@@ -144,6 +145,9 @@ pub use containment::{
     HOST_PROCESS_MECHANISM, UNCONFINED_APPLIES_TO,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
+pub use manifest_files::{
+    manifest_file_reports, InstalledCapsule, ManifestFileReport, ManifestFiles,
+};
 // `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the
 // same function `stage_session` does, so the report and the session's grants name one set.
 // `mur install` keeps host facts through the same derivation, so the first launch keeps them.

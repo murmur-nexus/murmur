@@ -374,6 +374,37 @@ deploy:                   # optional: read by mur deploy only
 | `name` | string | yes | Capsule identity: the capsule's bare name, as for any [artifact](#artifact-manifest). |
 | `version` | string | yes | Capsule version. |
 
+#### Paths a manifest names { #manifest-relative-paths }
+
+These fields name a file by path:
+
+- `inference.system_prompt_file`
+- `inference.compaction.system_prompt_file`
+- `artifacts[].source`, for a [local-source artifact](#local-source-skills)
+
+A relative path resolves against the manifest, wherever the manifest came from:
+
+| Launch | A relative path is read from | Shown as |
+|---|---|---|
+| `mur run --manifest <path>` | The folder holding `murmur.yaml` | `<folder>/<path>` |
+| `mur run --capsule <scope>/<name> --capsule-version <version>` | The installed package | `<scope>/<name>@<version>!/<path>` |
+
+An absolute path is read from that path on the host under either launch.
+
+An installed capsule reads only what its package holds, so a file it names must be packed: list it
+under [`requires_files`](#artifact-manifest) and rebuild. The work folder and the current directory
+are never searched. Under `--capsule`, a missing file fails with
+`E-RUN-009` for a prompt file and `E-IO-001` for a skill source, and a
+path with a `..` component is refused as naming a path outside the installed package.
+
+[`mur run --explain-scope`](cli.md#mur-run) prints where each declared path resolves, in its
+`Manifest files` block:
+
+```text
+Manifest files
+  inference.system_prompt_file: ./instructions.md -> local/my-agent@0.1.0!/instructions.md
+```
+
 #### `artifacts` { #field-artifacts }
 
 | Field | Type | Required | Notes |
@@ -829,8 +860,9 @@ Rules:
 - **`version` is optional when `source` is set.** A local file has no registry version, so the
   runtime substitutes the literal `local` wherever a version is shown (the installed-path label and
   the `MURMUR.md` listing). A `version` set anyway is ignored, and a warning is printed to stderr.
-- **Relative paths resolve against the directory containing `murmur.yaml`**, not the current
-  working directory. Absolute paths are used as-is.
+- **A relative path resolves against the manifest**: the folder holding `murmur.yaml`, or the
+  installed package of a capsule run by name — see
+  [Paths a manifest names](#manifest-relative-paths). Absolute paths are used as-is.
 - **For a skill, `source` may point at a `skill.md` file or at a skill folder.**
 
     | `source` | Installed under `tools/<name>/` |
@@ -1165,7 +1197,7 @@ model. These fields are read under both transports:
 | `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` runs a harness CLI as a subprocess. See [Inference configuration](#inference-config). |
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: no cap. Must be > 0. A hook's counted `run-inference` call is one of them: it is in `task_end.turns`, and an attempt [reopened](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) after it is handed only the turns the task has left. See [Turn cap](#inference-max-turns). |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
-| `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
+| `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt. A relative path resolves against the manifest — see [Paths a manifest names](#manifest-relative-paths). |
 | `inference.system_prompt_artifact` | string | no | The `name`, as written, of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 | `inference.instruction_files` | list of strings | no | Default: none. Files in the work folder appended to the system prompt at launch, each as one labelled block after the manifest's own prompt. Each entry must be a relative path with no `..` component; an empty, absolute or escaping entry fails with `E-MAN-003`. See [`inference.instruction_files`](#inference-instruction-files). |
 
@@ -1303,7 +1335,7 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the call's [input budget](#inference-max-tokens) at which compaction fires. Default: `0.98`. Checked after each response against the provider's count of the call when the driver reports usage, and the runtime's estimate otherwise — see [Context compaction](../concepts/context.md). |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
-| `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
+| `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. A relative path resolves against the manifest — see [Paths a manifest names](#manifest-relative-paths). Read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
 | `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session's [records directory](workdir.md#compaction-summaries), recording the verbatim summary text plus token counts. |
 | `inference.compaction.max_tokens` | integer | no | Output cap of every `run-inference` call a hook makes while it serves `on-compaction` — the threshold trigger, [`mur run --resume … --resume-mode compact`](cli.md#mur-run) and a seed's overflow summary — and the amount a [spend ceiling](#inference-max-session-tokens) reserves for each. Default: the cap any other hook call sends, under [Output cap sent](#inference-max-tokens). Must be > 0. A value above the `max_output_tokens` the primary driver's [`models:`](#driver-models) table declares for the compaction model (`inference.compaction.model`, else `inference.model`) refuses the launch with [`E-RUN-054`](diagnostics.md#e-run-054); a model the table does not list takes any value. A value at or above the compaction model's window (`context.max_tokens`, else that table entry's `context_window`) leaves compaction calls no input budget and refuses the launch with [`E-RUN-055`](diagnostics.md#e-run-055). Invalid for `transport: process`. |
 | `inference.compaction.driver_config` | mapping | no | Laid over [`inference.driver.config`](#inference-config) for the same calls `inference.compaction.max_tokens` caps, and no others. Shallow: each top-level key replaces the same-named key of `inference.driver.config` or is added beside it, and every other key is kept; a nested mapping replaces the whole value. With no `inference.driver.config`, the mapping alone is sent. The driver validates the merged object as it validates `inference.driver.config`, and names it `inference.driver.config` in its refusal. Default: none, so compaction calls get `inference.driver.config` unchanged. A non-mapping value is refused. Invalid for `transport: process`. |
@@ -2054,7 +2086,8 @@ Rules:
 
 - **At most one prompt source.** Setting more than one of `system_prompt`, `system_prompt_file`
   and [`system_prompt_artifact`](#inference-system-prompt-artifact) fails with `E-MAN-003`.
-- **File paths are relative to the directory containing `murmur.yaml`**, not to the work folder.
+- **A relative file path resolves against the manifest**: the folder holding `murmur.yaml`, or
+  the installed package — see [Paths a manifest names](#manifest-relative-paths).
 - **The file is read once at launch**, before any inference call. If it is missing or unreadable,
   `mur run` exits with `E-RUN-009` before making any API call.
 - **File content is used verbatim** — whitespace is preserved and no trimming is applied. Inline

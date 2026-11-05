@@ -207,6 +207,7 @@ mod tests {
         ("detached.rs", include_str!("detached.rs")),
         ("hooks.rs", include_str!("hooks.rs")),
         ("instruction_files.rs", include_str!("instruction_files.rs")),
+        ("manifest_files.rs", include_str!("manifest_files.rs")),
         ("murmur_md.rs", include_str!("murmur_md.rs")),
         ("otel.rs", include_str!("otel.rs")),
         ("network_policy.rs", include_str!("network_policy.rs")),
@@ -1084,21 +1085,28 @@ mod tests {
              outside every workdir.",
         ),
         (
+            "manifest_files.rs",
+            "read_to_string",
+            "A prompt file the manifest names, relative to the manifest folder or by absolute \
+             host path, read before any workdir exists.",
+        ),
+        (
+            "manifest_files.rs",
+            "package_entries",
+            "`.is_dir()` on an entry of the installed package's zip archive, read from bytes in \
+             memory; no host path is touched.",
+        ),
+        (
+            "manifest_files.rs",
+            "read_host_skill_source",
+            "A local skill source the manifest names, relative to the manifest folder or by \
+             absolute host path, read before any workdir exists.",
+        ),
+        (
             "runtime.rs",
             "copy_manifest_into_runtime_dir",
             "Reads the project's `murmur.yaml` from the manifest directory; the copy into the \
              runtime directory goes through `WorkdirRoot`.",
-        ),
-        (
-            "runtime.rs",
-            "load_local_skill_files",
-            "A local skill source named relative to the manifest directory, read before any \
-             workdir exists.",
-        ),
-        (
-            "runtime.rs",
-            "read_prompt_file",
-            "A prompt file named relative to the manifest directory.",
         ),
         (
             "runtime.rs",

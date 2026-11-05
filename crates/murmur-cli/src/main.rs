@@ -294,7 +294,8 @@ enum Commands {
         /// Run an installed registry artifact by name instead of a project directory.
         /// Requires --capsule-version. The capsule is resolved from the project store, then
         /// the global store, and staged from the artifact bytes in memory: --workdir is the
-        /// only directory involved, and no murmur.yaml is read from disk.
+        /// only directory involved, no murmur.yaml is read from disk, and relative paths the
+        /// manifest names are read from inside the package.
         #[arg(
             long,
             value_name = "NAME",

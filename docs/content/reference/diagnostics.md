@@ -94,7 +94,7 @@ section that explains it.
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
 | `E-RUN-007` | Agent loop failed at runtime | — |
 | `E-RUN-008` | Required artifact not installed locally | [`mur run`](cli.md#mur-run) |
-| `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read | [`inference.system_prompt`](manifest.md#inference-system-prompt) |
+| `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read. For an installed capsule the path is shown as `<scope>/<name>@<version>!/<entry>`, and a missing entry means the package was built without the file | [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only). `mur run --explain-scope` reports it ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |

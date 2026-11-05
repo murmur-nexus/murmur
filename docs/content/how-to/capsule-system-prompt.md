@@ -118,7 +118,7 @@ inference:
   system_prompt_file: conventions.md
 ```
 
-The path is **relative to the directory containing `murmur.yaml`**, not to the work folder. A typical layout:
+The path is **relative to the manifest**: the directory containing `murmur.yaml`, and for an installed capsule the package, which must list the file under `requires_files:` (see [Paths a manifest names](../reference/manifest.md#manifest-relative-paths)). A typical layout:
 
 ```text
 my-capsule/
@@ -283,7 +283,7 @@ On a capsule with no `inference:` block there is no prompt to override, and the 
 | Setting | Behaviour |
 |---|---|
 | `inference.system_prompt: \|` | Inline text; injected verbatim on every inference turn |
-| `inference.system_prompt_file: path.md` | File content; read once at launch; path is relative to manifest directory |
+| `inference.system_prompt_file: path.md` | File content; read once at launch; path is [relative to the manifest](../reference/manifest.md#manifest-relative-paths), installed or not |
 | `inference.system_prompt_artifact: name` | Skill artifact's `skill.md` read at launch and used as system prompt; skill not separately callable |
 | More than one field set simultaneously | Parse error `error[E-MAN-003]` |
 | File or skill.md missing or unreadable | Launch error `error[E-RUN-009]` — session never starts |

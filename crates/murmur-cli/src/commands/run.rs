@@ -194,8 +194,9 @@ pub(crate) fn run_run(
         .join("workdir");
 
     // `--capsule NAME --capsule-version VERSION` runs an installed artifact rather than a project
-    // directory: nothing is read from disk beside the artifact itself, and the only directory
-    // involved is the workdir. It is the path a delegated child is launched on.
+    // directory: the manifest, and every relative path it names, are read from the artifact's own
+    // package, and the only directory involved is the workdir. It is the path a delegated child
+    // and a formation member are launched on.
     let installed_capsule = capsule_arg.zip(capsule_version_arg);
     if let Some(name) = capsule_arg {
         crate::error::artifact_name_arg(name)
@@ -220,8 +221,9 @@ pub(crate) fn run_run(
                     )
                 })?,
             };
-            // Never read; the manifest comes out of the artifact. Kept so the two modes share one
-            // `manifest_dir`, which is what a manifest-relative system prompt resolves against.
+            // No manifest is read here: it, and the files it names by relative path, come out of
+            // the package (`StageRequest::capsule_artifact`). `dir` is the project directory for
+            // what is not the manifest's: the stores, `murmur.lock` and the default workdir root.
             (dir.join("murmur.yaml"), dir)
         }
         None => {
@@ -683,6 +685,35 @@ pub(crate) fn run_run(
             &capability_policy.network_allow,
             &capsule_runtime::capsule_writable_roots(&placement),
         );
+        // Where each path the manifest names resolves, from the inputs `stage_session` reports:
+        // the package bytes already in memory, or the project directory, and the inference
+        // `--system-prompt` would leave, which names no `system_prompt_file`.
+        let manifest_files = match (installed_capsule, &installed_bytes) {
+            (Some((name, version)), Some(bytes)) => {
+                capsule_runtime::ManifestFiles::Package(capsule_runtime::InstalledCapsule {
+                    artifact: name.to_string(),
+                    version: version.to_string(),
+                    package: bytes.clone(),
+                })
+            }
+            _ => capsule_runtime::ManifestFiles::Directory(project_dir.clone()),
+        };
+        let reported_inference = runtime_manifest.inference.clone().map(|mut inference| {
+            if system_prompt_arg.is_some() {
+                inference.system_prompt_file = None;
+            }
+            inference
+        });
+        let manifest_file_rows = capsule_runtime::manifest_file_reports(
+            &manifest_files,
+            reported_inference.as_ref(),
+            runtime_manifest.artifacts.iter().filter_map(|artifact| {
+                artifact
+                    .source
+                    .as_deref()
+                    .map(|source| (artifact.name.as_str(), source))
+            }),
+        );
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
@@ -717,7 +748,8 @@ pub(crate) fn run_run(
                 .as_ref()
                 .map(|inference| inference.transport.as_str()),
         )
-        .with_cgroup_scope(scope_probe.cgroup_scope);
+        .with_cgroup_scope(scope_probe.cgroup_scope)
+        .with_manifest_files(manifest_file_rows);
         // The staging check on the tier this report names, so a read-write host path over
         // something the capsule may run refuses here as the launch would.
         capsule_runtime::host_paths::check_policy_execute_roots(
@@ -752,8 +784,9 @@ pub(crate) fn run_run(
     // `StageRequest.inference`, rather than inside the runtime's own prompt resolution: the tool
     // inventory and MURMUR.md's skill listing read `system_prompt_artifact` straight off this
     // same struct, so clearing the manifest's declaration here is what keeps every reader of it
-    // agreeing with the override. Placed after the `--explain-scope` return above, which reports
-    // capability grants and is unaffected by a system prompt.
+    // agreeing with the override. Placed after the `--explain-scope` return above, which refuses
+    // nothing for a system prompt: it applies the override's one effect on the report, dropping
+    // the `inference.system_prompt_file` row, itself.
     let (staged_inference, system_prompt_overridden) = apply_system_prompt_override(
         runtime_manifest.inference.clone(),
         system_prompt_arg,
@@ -947,7 +980,13 @@ pub(crate) fn run_run(
         manifest_dir: project_dir.clone(),
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),
-        capsule_artifact: installed_capsule.map(|(name, _)| name.to_string()),
+        capsule_artifact: installed_capsule.zip(installed_bytes).map(
+            |((name, version), package)| capsule_runtime::InstalledCapsule {
+                artifact: name.to_string(),
+                version: version.to_string(),
+                package,
+            },
+        ),
         capsule_component_bytes,
         artifacts: staged_artifacts,
         allowlisted_tools,
