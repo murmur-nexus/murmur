@@ -2622,18 +2622,33 @@ mod tests {
                     status.lines().any(|line| line == "Seccomp:\t2"),
                     "the holder is not under the filter: {status}"
                 );
-                // Its descriptor hygiene is done once it blocks on the lifeline.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let held = loop {
-                    let held: Vec<_> = std::fs::read_dir(format!("/proc/{holder}/fd"))
+                // Its descriptor hygiene is done once it blocks in `read` on the lifeline. The
+                // descriptor table empties long before that: the fallback calls `close` on every
+                // number up to the open-files limit, which nextest raises to about a million, and
+                // a session ended mid-loop is only noticed once the loop finishes. Past the last
+                // open descriptor those calls never sleep, so a holder holding one descriptor and
+                // sleeping is in that `read`.
+                let held_fds = || -> Vec<_> {
+                    std::fs::read_dir(format!("/proc/{holder}/fd"))
                         .expect("the holder's descriptor table is readable")
                         .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-                        .collect();
-                    if held.len() <= 1 || std::time::Instant::now() >= deadline {
+                        .collect()
+                };
+                let sleeping = || {
+                    std::fs::read_to_string(format!("/proc/{holder}/stat")).is_ok_and(|stat| {
+                        stat.rsplit_once(") ")
+                            .is_some_and(|(_, rest)| rest.starts_with('S'))
+                    })
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let held = loop {
+                    let held = held_fds();
+                    if (held.len() <= 1 && sleeping()) || std::time::Instant::now() >= deadline {
                         break held;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 };
+                assert!(sleeping(), "holder {holder} never blocked on its lifeline");
                 assert_eq!(
                     held.len(),
                     1,
@@ -2649,9 +2664,17 @@ mod tests {
                     drop(netns);
                 }
                 drop(join);
+                // A holder that exited stays in `/proc` as a zombie until its reaper collects it;
+                // only a holder still running fails.
+                let running = |pid: i32| {
+                    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                        stat.rsplit_once(") ")
+                            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+                    })
+                };
                 let wait = crate::sandbox::SESSION_END_KILL_WAIT;
                 let deadline = std::time::Instant::now() + wait;
-                while std::path::Path::new(&format!("/proc/{holder}")).exists() {
+                while running(holder) {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "holder {holder} outlived its session by {wait:?} (ended explicitly: \
