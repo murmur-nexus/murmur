@@ -182,7 +182,19 @@ fn sealed_root_line(is_linux: bool, reading: &NamespaceReading) -> String {
     )
 }
 
-/// One mount attempt's line, in the four shapes the two lines share.
+/// The `private proc:` line: whether a process forked into the probe's PID namespace mounted a
+/// private `procfs` over `/proc` — which decides the session's process view.
+fn private_proc_line(is_linux: bool, reading: &NamespaceReading) -> String {
+    attempt_line(
+        is_linux,
+        &reading.private_proc,
+        "a process in the session's PID namespace mounted its own procfs over /proc, so commands \
+         see only the session's processes",
+        "a private procfs",
+    )
+}
+
+/// One mount attempt's line, in the four shapes the three lines share.
 fn attempt_line(is_linux: bool, attempt: &MountAttempt, created: &str, mechanism: &str) -> String {
     match attempt {
         _ if !is_linux => format!("n/a ({mechanism} is a Linux mechanism)"),
@@ -442,6 +454,7 @@ fn report_userns_grant(probe: &HostProbe) {
         mount_namespace_line(is_linux, reading)
     );
     capsule_runtime::report_println!("  sealed root: {}", sealed_root_line(is_linux, reading));
+    capsule_runtime::report_println!("  private proc: {}", private_proc_line(is_linux, reading));
 
     match inspect_installed_profile() {
         InstalledProfileState::Matches => {
@@ -2292,6 +2305,20 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         &mut warnings,
     );
 
+    // `W-RUN-010` in the words a launch prints at staging, counted as a warning.
+    if let Some(line) = capsule_runtime::resources::v8_address_space_warning(
+        &capability_policy.shell_allow,
+        capability_policy.declared_resources.memory_bytes,
+        declared_floor == murmur_artifact::ContainmentClass::Unconfined,
+    ) {
+        capsule_runtime::report_eprintln!("[mur doctor] {line}");
+        warnings.push(
+            "set capabilities.resources.memory_bytes to 68719476736 (64 GiB) for node, and cap \
+             RAM with capabilities.resources.cgroup_memory_bytes"
+                .to_string(),
+        );
+    }
+
     // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
     // reported but neither fails nor warns.
     if let Some(lock) = &lock {
@@ -2365,6 +2392,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             capsule_runtime::report_print!("{}", render_records_dir(&reports.records_dir));
             capsule_runtime::report_println!();
             capsule_runtime::report_print!("{}", render_temp_dir(&reports.temp_dir));
+            capsule_runtime::report_println!();
+            capsule_runtime::report_print!(
+                "{}",
+                capsule_runtime::proc_view::render_process_view(&reports.process_view)
+            );
             if reports.placement.inside_workdir() {
                 capsule_runtime::report_eprintln!(
                     "[mur doctor] {}",
@@ -2641,6 +2673,7 @@ mod tests {
             },
             mount,
             sealed_root,
+            private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::Withheld,
             attachment: ProfileAttachment::Unconfined,
         }
@@ -2693,6 +2726,26 @@ mod tests {
             assert!(mount_namespace_line(false, &reading).starts_with("n/a ("));
             assert!(sealed_root_line(false, &reading).starts_with("n/a ("));
         }
+    }
+
+    /// The `private proc:` line reports the private-procfs rehearsal in the same shapes.
+    #[test]
+    fn the_private_proc_line_reports_the_rehearsal() {
+        use capsule_runtime::MountStep;
+        let mut created = reading(true, MountAttempt::Created, MountAttempt::Created);
+        created.private_proc = MountAttempt::Created;
+        assert_eq!(
+            private_proc_line(true, &created),
+            "created (a process in the session's PID namespace mounted its own procfs over /proc, \
+             so commands see only the session's processes)"
+        );
+        let mut refusing = created.clone();
+        refusing.private_proc = refused(MountStep::MountProc, libc::EPERM);
+        assert_eq!(
+            private_proc_line(true, &refusing),
+            "refused \u{2014} mounting proc over /proc failed with EPERM"
+        );
+        assert!(private_proc_line(false, &created).starts_with("n/a ("));
     }
 
     /// The install-the-profile advice follows a failed network or sealed-root attempt, never the

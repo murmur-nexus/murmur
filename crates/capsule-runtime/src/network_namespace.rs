@@ -16,14 +16,19 @@
 //! namespace of the session that submitted the plan.
 //!
 //! The namespace is built once by a dedicated *creator* child, forked for nothing else, which
-//! hands the parent the namespace's listening sockets and a descriptor for each of its two
-//! namespaces in one `SCM_RIGHTS` message and then exits. The namespace outlives the creator
-//! because the runtime holds those descriptors. Every command then enters it with
-//! [`join_session_netns`] — `setns(2)` into the user namespace, then into the network namespace —
-//! in its own `pre_exec` window, where it is single-threaded and still unfiltered. The runtime's
-//! own threads never call `setns` or `unshare`. The namespace is released when the session ends:
-//! [`SessionNetns::end`] stops the session's egress proxy and closes the descriptors, after
-//! `ShellEnforcement::end_session` has killed every process the session started.
+//! hands the parent the namespace's listening sockets and a descriptor for each of its three
+//! namespaces — user, network and PID — in one `SCM_RIGHTS` message and then exits. The network
+//! namespace outlives the creator because the runtime holds those descriptors; the PID namespace
+//! outlives it because of its *holder*, pid 1 of that namespace, which the creator forks and which
+//! lives exactly as long as the runtime holds its lifeline. Every command then enters the
+//! namespaces with [`join_session_netns`] — `setns(2)` into the user namespace, then into the
+//! network namespace — and `setns(2)` into the PID namespace followed by a fork, all in its own
+//! `pre_exec` window, where it is single-threaded and still unfiltered (`sandbox::linux_enforce`'s
+//! relay). The runtime's own threads never call `setns` or `unshare`. The namespaces are released
+//! when the session ends: [`SessionNetns::end`] stops the session's egress proxy, closes the
+//! descriptors and closes the holder's lifeline, after `ShellEnforcement::end_session` has killed
+//! the session's cgroup scope; the holder's exit then kills whatever is left in the PID
+//! namespace.
 //!
 //! ## Whether a host can create one
 //!
@@ -41,8 +46,10 @@
 //! each command's forked child before the seccomp filter (which denies `unshare`, `setns` and
 //! `socket(AF_NETLINK)` outright) and before [`crate::sealed`]'s composed root:
 //!
-//!   1. `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, then the identity `uid_map`/`gid_map` writes that
-//!      make the child the owner of both. The user namespace is not incidental: `CLONE_NEWNET`
+//!   1. `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)`, then the identity
+//!      `uid_map`/`gid_map` writes that make the child the owner of all three, then a fork: the
+//!      forked process is pid 1 of the new PID namespace, the holder, and keeps only its lifeline
+//!      (see [`SessionNetns::end`]). The user namespace is not incidental: `CLONE_NEWNET`
 //!      alone needs `CAP_NET_ADMIN`, which an unprivileged process does not have, and creating it
 //!      inside a user namespace it owns is what supplies that capability *there and nowhere else*.
 //!      This is the same primitive `sealed` uses, and AppArmor's unprivileged-userns
@@ -60,8 +67,9 @@
 //!      schedule against a blackhole.
 //!   4. The listening sockets are created here, *inside* the namespace — one TCP listener per
 //!      port the allowlist implies, then one wildcard UDP :53 resolver socket — and handed back
-//!      to the parent in a single `SCM_RIGHTS` message, followed by the `/proc/self/ns/user` and
-//!      `/proc/self/ns/net` descriptors later commands join through. A socket belongs to the
+//!      to the parent in a single `SCM_RIGHTS` message, followed by the `/proc/self/ns/user`,
+//!      `/proc/self/ns/net` and `/proc/self/ns/pid_for_children` descriptors later commands join
+//!      through. A socket belongs to the
 //!      namespace it was **created** in, not the one it is used from, which is the whole reason
 //!      this inversion works: the runtime serves them while staying in the host's namespace, with
 //!      real internet access for the upstream half. The listeners are held for the whole session,
@@ -73,7 +81,7 @@
 //! **host's** network namespace, which means real root. This design needs no host privilege at
 //! all, which is what lets `mur` install per-user.
 //!
-//! *No proxy process inside the namespace, and no holder process.* A multithreaded process cannot
+//! *No proxy process inside the namespace, and a holder that forks nothing.* A multithreaded process cannot
 //! enter a user namespace: `setns(user_fd, CLONE_NEWUSER)` from the runtime fails (`EINVAL`, or
 //! `EPERM` from one of its threads). A freshly forked child is single-threaded, and the euid that
 //! owns the session's user namespace holds every capability in it, so the same `setns` from a
@@ -85,6 +93,10 @@
 //! It would make every command its child rather than the runtime's, so every `Child` the shell
 //! path keys on would need a proxy layer, and it would re-implement `std::process::Command`'s spawn
 //! over a request protocol. Joining in `pre_exec` changes one step of the existing spawn instead.
+//! The PID namespace's holder is not that process: it is only pid 1, forks nothing, runs no
+//! capsule code and holds no descriptor but its lifeline. A command still enters the namespace in
+//! its own `pre_exec` window, through a relay: the process `Child` refers to stays outside the
+//! namespace and waits for the command it forks into it.
 //!
 //! *No `iptables`/`nft`/`TPROXY`.* Nothing here needs a netfilter rule, so there is no dependency
 //! on netfilter modules being present, no `iptables` binary to shell out to, and no rule set that
@@ -106,12 +118,16 @@
 /// One TCP listener per allowlisted port, plus the single wildcard UDP :53 resolver socket.
 pub(crate) const MAX_NAMESPACE_SOCKETS: usize = crate::egress_proxy::MAX_EGRESS_TCP_PORTS + 1;
 
-/// Every descriptor the creator child sends: the namespace sockets, then the user and network
-/// namespace handles.
+/// The namespace handles the creator sends after the sockets: `/proc/self/ns/user`,
+/// `/proc/self/ns/net` and `/proc/self/ns/pid_for_children`.
+pub(crate) const NAMESPACE_HANDLE_COUNT: usize = 3;
+
+/// Every descriptor the creator child sends: the namespace sockets, then the user, network and
+/// PID namespace handles.
 ///
 /// Bounds the one `SCM_RIGHTS` message, and therefore the fixed stack buffers the creator builds
 /// it in.
-pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + 2;
+pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + NAMESPACE_HANDLE_COUNT;
 
 // ---------------------------------------------------------------- the creation's steps
 
@@ -129,10 +145,14 @@ pub enum CreationStep {
     Resolver = 6,
     NamespaceHandles = 7,
     HandOff = 8,
+    /// The user and network namespaces were created and a PID namespace with them was refused.
+    PidNamespace = 9,
+    /// Forking the PID namespace's first process, the holder, failed.
+    Holder = 10,
 }
 
 impl CreationStep {
-    const ALL: [CreationStep; 8] = [
+    const ALL: [CreationStep; 10] = [
         Self::Unshare,
         Self::IdentityMaps,
         Self::Loopback,
@@ -141,6 +161,8 @@ impl CreationStep {
         Self::Resolver,
         Self::NamespaceHandles,
         Self::HandOff,
+        Self::PidNamespace,
+        Self::Holder,
     ];
 
     /// The step a failure record's code names, or `None` for a code no step carries.
@@ -158,8 +180,12 @@ impl CreationStep {
             Self::LocalRoute => "installing the local default route",
             Self::TcpListener => "binding a TCP listener inside the namespace",
             Self::Resolver => "binding UDP 53 inside the namespace",
-            Self::NamespaceHandles => "opening /proc/self/ns/user and /proc/self/ns/net",
+            Self::NamespaceHandles => {
+                "opening /proc/self/ns/user, /proc/self/ns/net and /proc/self/ns/pid_for_children"
+            }
             Self::HandOff => "handing the namespace to the runtime",
+            Self::PidNamespace => "unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)",
+            Self::Holder => "forking the PID namespace's holder process",
         }
     }
 }
@@ -263,7 +289,9 @@ impl EgressNamespaceFailure {
 
     fn cause(&self) -> String {
         match self.blocker {
-            EgressNamespaceBlocker::KernelSupportMissing => kernel_cause(self.errno).to_string(),
+            EgressNamespaceBlocker::KernelSupportMissing => {
+                kernel_cause(self.step(), self.errno).to_string()
+            }
             EgressNamespaceBlocker::CreatorUnavailable => {
                 "Likely cause: the namespace creator could not run or stopped before reporting — \
                  a process or descriptor limit, or memory, ran out, or a policy killed it (its \
@@ -271,6 +299,15 @@ impl EgressNamespaceFailure {
                  the namespace is unknown, and the capsule is refused rather than run without \
                  it. Re-run once the limit is relieved, or allow the creator's syscalls."
                     .to_string()
+            }
+            EgressNamespaceBlocker::CapabilityGrantMissing
+                if self.step() == Some(CreationStep::Holder) =>
+            {
+                format!(
+                    "{} Likely cause: a process limit (RLIMIT_NPROC, or the pids.max of the cgroup \
+                     mur runs in) or memory ran out. Re-run once the limit is relieved.",
+                    step_context(CreationStep::Holder).unwrap_or_default()
+                )
             }
             EgressNamespaceBlocker::CapabilityGrantMissing => {
                 let cause = grant_cause(self.userns_grant, &self.attachment);
@@ -325,6 +362,14 @@ fn step_context(step: CreationStep) -> Option<&'static str> {
         CreationStep::Loopback | CreationStep::LocalRoute => Some(
             "The namespace was created and owned, and configuring it was refused — the mark of a \
              confinement that withholds CAP_NET_ADMIN inside the namespace.",
+        ),
+        CreationStep::PidNamespace => Some(
+            "The user and network namespaces were created without CLONE_NEWPID, and creating a \
+             PID namespace with them was refused — the mark of a seccomp profile or confinement \
+             that permits unshare but not CLONE_NEWPID.",
+        ),
+        CreationStep::Holder => Some(
+            "The namespaces were created, and forking the PID namespace's first process failed.",
         ),
         CreationStep::TcpListener
         | CreationStep::Resolver
@@ -400,8 +445,21 @@ fn grant_cause(
     }
 }
 
-/// The likely cause of an `unshare` the kernel could not honour, by its `errno`.
-fn kernel_cause(errno: Option<i32>) -> &'static str {
+/// The likely cause of an `unshare` the kernel could not honour, by the step and its `errno`.
+fn kernel_cause(step: Option<CreationStep>, errno: Option<i32>) -> &'static str {
+    if step == Some(CreationStep::PidNamespace) {
+        return match errno {
+            Some(libc::ENOSPC) => {
+                "Likely cause: the kernel's limit on PID namespaces — user.max_pid_namespaces is \
+                 0, or every namespace it allows is in use. Raise it where it is set \
+                 (`sudo sysctl -w user.max_pid_namespaces=10000`), then re-run."
+            }
+            _ => {
+                "Likely cause: this kernel does not provide PID namespaces (built with \
+                 CONFIG_PID_NS=n). Run mur on a kernel built with CONFIG_PID_NS=y."
+            }
+        };
+    }
     match errno {
         Some(libc::ENOSPC) => {
             "Likely cause: the kernel's limit on user namespaces — user.max_user_namespaces is 0, \
@@ -491,7 +549,10 @@ fn failure_of(
                 (
                     CreationStep::Unshare,
                     libc::ENOSPC | libc::EINVAL | libc::ENOSYS | libc::EUSERS,
-                ) => EgressNamespaceBlocker::KernelSupportMissing,
+                )
+                | (CreationStep::PidNamespace, libc::ENOSPC | libc::EINVAL) => {
+                    EgressNamespaceBlocker::KernelSupportMissing
+                }
                 _ => EgressNamespaceBlocker::CapabilityGrantMissing,
             };
             (blocker, step.describe().to_string(), Some(errno))
@@ -539,6 +600,93 @@ pub fn skip_without_egress_namespace(test_name: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// The host pid of the process a session's command knows as `namespace_pid` (its `$$` or `$!`),
+/// or `None` when no live process matches.
+///
+/// Test support, not a runtime code path. Commands run in their session's PID namespace, so a pid
+/// a command prints is a namespace pid. `runtime_pid` is the process that runs the session — the
+/// test process itself for an in-process session, the `mur` child for a launched one — which holds
+/// a descriptor of each of its sessions' PID namespaces (`pid:[<inode>]`). The match is the
+/// process in one of those namespaces whose `NSpid:` line ends in `namespace_pid`, so two
+/// sessions on one host, which number their processes alike, are never confused.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn host_pid_in_session(runtime_pid: u32, namespace_pid: i32) -> Option<i32> {
+    host_pids_in_sessions(runtime_pid, namespace_pid)
+        .into_iter()
+        .next()
+}
+
+/// Every host pid [`host_pid_in_session`] could answer: one per session of `runtime_pid` that has
+/// a live process numbered `namespace_pid`, for a test that holds several sessions at once.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn host_pids_in_sessions(runtime_pid: u32, namespace_pid: i32) -> Vec<i32> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{runtime_pid}/fd")) else {
+        return Vec::new();
+    };
+    let held: Vec<std::path::PathBuf> = fds
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy().starts_with("pid:["))
+        .collect();
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            let in_session = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                .is_ok_and(|namespace| held.contains(&namespace));
+            in_session
+                && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("NSpid:"))
+                        .and_then(|fields| fields.split_whitespace().last())
+                        .and_then(|last| last.parse::<i32>().ok())
+                        == Some(namespace_pid)
+                })
+        })
+        .collect()
+}
+
+/// The host pid of the live process whose working directory is `workdir` and whose pid inside
+/// its PID namespace is `namespace_pid`, for a session run by a `mur` this process did not start
+/// in-process.
+///
+/// Test support, not a runtime code path. [`host_pid_in_session`] reads the namespace handles
+/// the runtime holds, which a separate `mur` process does not let another process read (it is
+/// non-dumpable); a command's process is dumpable once it has exec'd, so its working directory
+/// and its `NSpid:` line are readable. A test's workdir is its own temporary directory, so the
+/// working directory tells its session's processes from every other session's. `None` when no
+/// such process is live.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn host_pid_in_workdir(workdir: &std::path::Path, namespace_pid: i32) -> Option<i32> {
+    let workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .find(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd == workdir)
+                && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+                    let fields: Vec<&str> = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("NSpid:"))
+                        .map(|fields| fields.split_whitespace().collect())
+                        .unwrap_or_default();
+                    fields.len() >= 2
+                        && fields.last().and_then(|last| last.parse::<i32>().ok())
+                            == Some(namespace_pid)
+                })
+        })
 }
 
 /// Refuses the launch when a capsule that can spawn native subprocesses is on a host that cannot
@@ -615,6 +763,37 @@ pub(crate) struct CapsuleNetnsPlan {
     /// that into `uid_map` is refused on every host.
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// [`FORCE_PID_NAMESPACE_FAILURE`] as armed on the thread that resolved this plan: the
+    /// creator then reports [`CreationStep::PidNamespace`] with `EPERM`.
+    #[cfg(test)]
+    pub(crate) force_pid_namespace_failure: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes the creator refuse the PID namespace as a host whose seccomp profile
+    /// denies `CLONE_NEWPID` would, after creating the user and network namespaces.
+    pub(crate) static FORCE_PID_NAMESPACE_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII arm for [`FORCE_PID_NAMESPACE_FAILURE`].
+#[cfg(test)]
+pub(crate) struct ForcePidNamespaceFailure;
+
+#[cfg(test)]
+impl ForcePidNamespaceFailure {
+    pub(crate) fn arm() -> Self {
+        FORCE_PID_NAMESPACE_FAILURE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcePidNamespaceFailure {
+    fn drop(&mut self) {
+        FORCE_PID_NAMESPACE_FAILURE.with(|flag| flag.set(false));
+    }
 }
 
 impl CapsuleNetnsPlan {
@@ -628,6 +807,8 @@ impl CapsuleNetnsPlan {
             tcp_ports,
             uid,
             gid,
+            #[cfg(test)]
+            force_pid_namespace_failure: FORCE_PID_NAMESPACE_FAILURE.with(std::cell::Cell::get),
         }
     }
 
@@ -666,8 +847,8 @@ enum SessionNetnsState {
     Ended,
 }
 
-/// What a command's `pre_exec` window needs to join its session's namespace: the user and network
-/// namespace descriptors.
+/// What a command's `pre_exec` window needs to join its session's namespaces: the user, network
+/// and PID namespace descriptors.
 ///
 /// Shares the session's descriptors rather than duplicating them, so they stay open for as long as
 /// the `Command` holding this does, even if the session ends between `establish` and the spawn: a
@@ -677,6 +858,7 @@ enum SessionNetnsState {
 pub(crate) struct SessionNetnsJoin {
     user_ns: std::sync::Arc<std::os::fd::OwnedFd>,
     net_ns: std::sync::Arc<std::os::fd::OwnedFd>,
+    pid_ns: std::sync::Arc<std::os::fd::OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -685,6 +867,13 @@ impl SessionNetnsJoin {
     pub(crate) fn raw_fds(&self) -> (std::os::fd::RawFd, std::os::fd::RawFd) {
         use std::os::fd::AsRawFd;
         (self.user_ns.as_raw_fd(), self.net_ns.as_raw_fd())
+    }
+
+    /// The session's PID namespace (`/proc/<creator>/ns/pid_for_children`), which a command's
+    /// relay enters with `setns(2)` before forking the command into it.
+    pub(crate) fn pid_ns_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.pid_ns.as_raw_fd()
     }
 }
 
@@ -747,11 +936,14 @@ impl SessionNetns {
         Ok(join)
     }
 
-    /// Releases the namespace: stops the session's egress proxy and closes the namespace
-    /// descriptors. Idempotent, and final — [`Self::establish`] refuses every call after it.
+    /// Releases the namespace: stops the session's egress proxy, closes the namespace descriptors
+    /// and closes the holder's lifeline. Idempotent, and final — [`Self::establish`] refuses every
+    /// call after it.
     ///
-    /// The namespace itself is gone once its last process is: the caller kills the session's
-    /// processes first (`ShellEnforcement::end_session`).
+    /// The holder, pid 1 of the session's PID namespace, exits when its lifeline closes, and the
+    /// kernel then kills every process left in that namespace: a command a cgroup scope did not
+    /// catch, or every command on a host without one. The caller kills the scope first
+    /// (`ShellEnforcement::end_session`).
     pub(crate) fn end(&self) {
         let previous = std::mem::replace(
             &mut *self
@@ -816,7 +1008,7 @@ mod linux {
     use super::{
         decode_step_record, encode_step_record, CapsuleNetnsPlan, CreationStep,
         NamespaceAttemptError, SessionNetnsJoin, MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
-        STEP_RECORD_LEN,
+        NAMESPACE_HANDLE_COUNT, STEP_RECORD_LEN,
     };
 
     // ------------------------------------------------------------ netlink constants
@@ -890,9 +1082,19 @@ mod linux {
         }
     }
 
-    /// Builds the session's network namespace and hands it to the parent: its listening sockets,
-    /// then descriptors for its user and network namespaces, in one `SCM_RIGHTS` message ordered
-    /// `[tcp listeners…, udp53, user_ns, net_ns]`.
+    /// Builds the session's network and PID namespaces and hands them to the parent: the network
+    /// namespace's listening sockets, then descriptors for its user, network and PID namespaces,
+    /// in one `SCM_RIGHTS` message ordered `[tcp listeners…, udp53, user_ns, net_ns, pid_ns]`.
+    ///
+    /// One `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)` creates all three, so the PID
+    /// namespace is owned by the session's user namespace. When that call fails, a second
+    /// `unshare` without `CLONE_NEWPID` tells the two refusals apart: if it succeeds, the failure
+    /// is [`CreationStep::PidNamespace`] with the first call's `errno`, and the namespaces it made
+    /// die with this child. Either way there is no namespace.
+    ///
+    /// After the identity maps the creator forks the holder ([`run_holder`]), which becomes pid 1
+    /// of the PID namespace and keeps only `lifeline_fd`, the read end of the pipe whose write end
+    /// the runtime holds.
     ///
     /// Runs only in the creator child [`create_session_netns`] forks, which runs no capsule code,
     /// installs no seccomp filter or Landlock domain and joins no cgroup scope; it `_exit`s as
@@ -908,14 +1110,44 @@ mod linux {
     unsafe fn create_capsule_netns(
         plan: &CapsuleNetnsPlan,
         sock_fd: RawFd,
+        lifeline_fd: RawFd,
     ) -> Result<(), CreationFailure> {
         // SAFETY: forked-child context; the caller's `unsafe` contract covers this whole body.
         unsafe {
-            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
-                return Err(CreationFailure::at(CreationStep::Unshare));
+            #[cfg(test)]
+            let forced = plan.force_pid_namespace_failure;
+            #[cfg(not(test))]
+            let forced = false;
+            let pid_namespace_refused = if forced {
+                Some(libc::EPERM)
+            } else if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWPID)
+                == 0
+            {
+                None
+            } else {
+                Some(*libc::__errno_location())
+            };
+            if let Some(errno) = pid_namespace_refused {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                    return Err(CreationFailure::at(CreationStep::Unshare));
+                }
+                return Err(CreationFailure {
+                    step: CreationStep::PidNamespace,
+                    errno,
+                });
             }
             if write_identity_maps(plan.uid, plan.gid).is_err() {
                 return Err(CreationFailure::at(CreationStep::IdentityMaps));
+            }
+            // The holder: the first process forked after `CLONE_NEWPID`, so pid 1 of the
+            // session's PID namespace. Forked before any socket exists, so it inherits the
+            // fewest descriptors, every one of which it closes.
+            let holder = libc::fork();
+            if holder < 0 {
+                return Err(CreationFailure::at(CreationStep::Holder));
+            }
+            if holder == 0 {
+                run_holder(lifeline_fd);
             }
             if bring_loopback_up().is_err() {
                 return Err(CreationFailure::at(CreationStep::Loopback));
@@ -925,7 +1157,7 @@ mod linux {
             }
 
             // One TCP listener per allowlisted port, then the resolver socket — the order the
-            // parent's `start_egress_proxy` splits them back apart in — then the two namespace
+            // parent's `start_egress_proxy` splits them back apart in — then the three namespace
             // handles, which the parent takes off the end.
             let mut fds = [-1 as RawFd; MAX_SESSION_NETNS_FDS];
             let mut count = 0usize;
@@ -950,8 +1182,14 @@ mod linux {
             fds[count] = resolver;
             count += 1;
 
-            // Opened after the maps are written, so both name the namespaces this child now owns.
-            for namespace in [c"/proc/self/ns/user", c"/proc/self/ns/net"] {
+            // Opened after the maps are written, so each names a namespace this child now owns.
+            // `pid_for_children` is the PID namespace the holder is pid 1 of; this child itself
+            // stays in the runtime's.
+            for namespace in [
+                c"/proc/self/ns/user",
+                c"/proc/self/ns/net",
+                c"/proc/self/ns/pid_for_children",
+            ] {
                 let fd = libc::open(namespace.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                 if fd < 0 {
                     let failure = CreationFailure::at(CreationStep::NamespaceHandles);
@@ -966,6 +1204,52 @@ mod linux {
             let failure = CreationFailure::at(CreationStep::HandOff);
             close_all(&fds[..count]);
             sent.map_err(|()| failure)
+        }
+    }
+
+    /// The holder's whole life: pid 1 of the session's PID namespace, which runs no capsule code
+    /// and forks nothing.
+    ///
+    /// It ignores `SIGCHLD`, so the kernel reaps every process reparented to it as soon as it
+    /// exits; closes every descriptor except `lifeline_fd`, the read end of the pipe whose write
+    /// end the runtime holds (`EstablishedNetns`); and blocks reading it. The read returns
+    /// end-of-file once no process holds the write end — `SessionNetns::end`, its `Drop`, or a
+    /// `mur` that died by any means — and the holder exits. When pid 1 of a PID namespace exits,
+    /// the kernel kills every process left in it and no process can be forked into it again.
+    ///
+    /// # Safety
+    /// Post-`fork()` child context only; every call is async-signal-safe and nothing allocates.
+    unsafe fn run_holder(lifeline_fd: RawFd) -> ! {
+        // SAFETY: the caller's contract; each call takes integers or live stack locals.
+        unsafe {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigaction(libc::SIGCHLD, &ignore, std::ptr::null_mut());
+            libc::prctl(libc::PR_SET_NAME, c"mur-pidns-init".as_ptr());
+            // Pins no mount of the runtime's working directory.
+            libc::chdir(c"/".as_ptr());
+            let lifeline = lifeline_fd as libc::c_uint;
+            if lifeline > 0 {
+                libc::syscall(libc::SYS_close_range, 0 as libc::c_uint, lifeline - 1, 0);
+            }
+            libc::syscall(
+                libc::SYS_close_range,
+                lifeline + 1,
+                libc::c_uint::MAX,
+                0 as libc::c_uint,
+            );
+            let mut byte = 0u8;
+            loop {
+                let read = libc::read(lifeline_fd, (&raw mut byte).cast(), 1);
+                if read < 0 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                if read > 0 {
+                    continue;
+                }
+                break;
+            }
+            libc::_exit(0)
         }
     }
 
@@ -994,18 +1278,27 @@ mod linux {
         Ok(())
     }
 
-    /// What the creator handed over: the namespace sockets, ready for the egress proxy, and the
-    /// two namespace handles.
+    /// What the creator handed over: the namespace sockets, ready for the egress proxy, the
+    /// three namespace handles, and the write end of the holder's lifeline.
+    ///
+    /// Dropping it closes the lifeline, which ends the holder and with it the PID namespace.
     pub(crate) struct CreatedNetns {
         sockets: Vec<OwnedFd>,
         user_ns: OwnedFd,
         net_ns: OwnedFd,
+        pid_ns: OwnedFd,
+        lifeline: OwnedFd,
     }
 
     impl CreatedNetns {
         /// `(user_ns, net_ns)`, for [`join_session_netns`] in a child forked while this is held.
         pub(crate) fn namespace_handles(&self) -> (RawFd, RawFd) {
             (self.user_ns.as_raw_fd(), self.net_ns.as_raw_fd())
+        }
+
+        /// The PID namespace's handle, for `setns(2)` in a child forked while this is held.
+        pub(crate) fn pid_namespace_handle(&self) -> RawFd {
+            self.pid_ns.as_raw_fd()
         }
 
         /// Starts the session's egress proxy on the namespace sockets.
@@ -1021,17 +1314,24 @@ mod linux {
             Ok(EstablishedNetns {
                 user_ns: Arc::new(self.user_ns),
                 net_ns: Arc::new(self.net_ns),
+                pid_ns: Arc::new(self.pid_ns),
+                lifeline: self.lifeline,
                 proxy,
             })
         }
     }
 
-    /// An established session namespace: the two handles commands join through, and the proxy
-    /// serving its listeners.
+    /// An established session namespace: the three handles commands join through, the write end
+    /// of the holder's lifeline, and the proxy serving its listeners.
+    ///
+    /// The lifeline is held here and nowhere else in the runtime: a [`SessionNetnsJoin`] carries
+    /// only the handles, so a `Command` that outlives the session keeps no holder alive.
     #[derive(Debug)]
     pub(super) struct EstablishedNetns {
         user_ns: Arc<OwnedFd>,
         net_ns: Arc<OwnedFd>,
+        pid_ns: Arc<OwnedFd>,
+        lifeline: OwnedFd,
         proxy: crate::egress_proxy::EgressProxyHandle,
     }
 
@@ -1040,12 +1340,15 @@ mod linux {
             SessionNetnsJoin {
                 user_ns: Arc::clone(&self.user_ns),
                 net_ns: Arc::clone(&self.net_ns),
+                pid_ns: Arc::clone(&self.pid_ns),
             }
         }
 
-        /// Stops the proxy and drops this session's hold on the namespace handles.
+        /// Stops the proxy, closes the holder's lifeline and drops this session's hold on the
+        /// namespace handles.
         pub(super) fn release(self) {
             self.proxy.shutdown();
+            drop(self.lifeline);
         }
     }
 
@@ -1093,11 +1396,32 @@ mod linux {
             unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
         let creator_fd = creator_end.as_raw_fd();
 
+        // The holder's lifeline. Both ends `O_CLOEXEC`, so no program the runtime execs inherits
+        // either; the holder keeps the read end and the runtime keeps only the write end.
+        let mut lifeline = [0i32; 2];
+        // SAFETY: `lifeline` is a 2-element stack array, exactly the size `pipe2` writes into.
+        if unsafe { libc::pipe2(lifeline.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(NamespaceAttemptError::Creator(format!(
+                "pipe2() for the PID namespace holder's lifeline failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: both fds were just returned by the successful `pipe2` and nothing else owns
+        // them.
+        let (lifeline_read, lifeline_write) = unsafe {
+            (
+                OwnedFd::from_raw_fd(lifeline[0]),
+                OwnedFd::from_raw_fd(lifeline[1]),
+            )
+        };
+        let lifeline_fd = lifeline_read.as_raw_fd();
+
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child runs only
-        // `create_capsule_netns` — `unshare`, `prctl`, `open`/`write`/`close`, `socket`, `ioctl`,
-        // `bind`, `listen`, `setsockopt`, `sendto`/`recv`/`sendmsg` — then `send` and `_exit`,
-        // with no allocation, no locks and no stdio.
+        // `create_capsule_netns` — `unshare`, `prctl`, `open`/`write`/`close`, `fork`, `socket`,
+        // `ioctl`, `bind`, `listen`, `setsockopt`, `sendto`/`recv`/`sendmsg` — then `send` and
+        // `_exit`, and the holder it forks only `sigaction`, `prctl`, `chdir`, `close_range`,
+        // `read` and `_exit`, with no allocation, no locks and no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(NamespaceAttemptError::Creator(format!(
@@ -1109,7 +1433,7 @@ mod linux {
             // SAFETY: forked-child context, syscalls only; both branches end in `_exit`, so no
             // destructor of the parent's state runs here.
             unsafe {
-                match create_capsule_netns(plan, creator_fd) {
+                match create_capsule_netns(plan, creator_fd, lifeline_fd) {
                     Ok(()) => libc::_exit(0),
                     Err(failure) => {
                         let record = failure.encode();
@@ -1120,6 +1444,7 @@ mod linux {
             }
         }
         drop(creator_end);
+        drop(lifeline_read);
 
         // The hand-off is read only after the creator is reaped: a `SOCK_DGRAM` pair reports no
         // end-of-file when its peer closes, so reading first would block forever on a creator that
@@ -1133,12 +1458,15 @@ mod linux {
             .map_err(NamespaceAttemptError::Creator)?
         {
             Received::Handles(mut fds) => {
+                let pid_ns = fds.pop().expect("the count was checked on receipt");
                 let net_ns = fds.pop().expect("the count was checked on receipt");
                 let user_ns = fds.pop().expect("the count was checked on receipt");
                 Ok(CreatedNetns {
                     sockets: fds,
                     user_ns,
                     net_ns,
+                    pid_ns,
+                    lifeline: lifeline_write,
                 })
             }
             Received::Failure(failure) => Err(failure.into()),
@@ -1184,7 +1512,7 @@ mod linux {
 
     /// The creator's one message.
     enum Received {
-        /// `[tcp listeners…, udp53, user_ns, net_ns]`, every one `CLOEXEC`.
+        /// `[tcp listeners…, udp53, user_ns, net_ns, pid_ns]`, every one `CLOEXEC`.
         Handles(Vec<OwnedFd>),
         Failure(CreationFailure),
         Nothing,
@@ -1516,9 +1844,10 @@ mod linux {
     ///
     /// Non-blocking, because the creator has already been reaped by the time this runs: whatever
     /// it sent is queued, and an empty queue means it sent nothing. A descriptor count other than
-    /// `expected_sockets + 2` is an error rather than a best-effort start, because a proxy missing
-    /// one of its sockets is a capsule whose network half-works in a way nothing downstream would
-    /// report.
+    /// `expected_sockets + NAMESPACE_HANDLE_COUNT` is an error rather than a best-effort start,
+    /// because a proxy missing one of its sockets is a capsule whose network half-works in a way
+    /// nothing downstream would report. A creator that failed after forking the holder leaves it waiting on the lifeline,
+    /// whose write end the caller drops on that error path.
     fn receive_session_netns(sock_fd: RawFd, expected_sockets: usize) -> Result<Received, String> {
         // SAFETY: `sock_fd` is a valid unix socket; all buffers are live locals sized for the
         // largest message the creator can send, and the control buffer is 8-byte aligned.
@@ -1576,11 +1905,11 @@ mod linux {
             if msg.msg_flags & libc::MSG_CTRUNC != 0 {
                 return Err("the namespace hand-off was truncated".to_string());
             }
-            if count != expected_sockets + 2 {
+            if count != expected_sockets + NAMESPACE_HANDLE_COUNT {
                 return Err(format!(
                     "the namespace creator handed over {count} descriptors; {} were expected \
-                     ({expected_sockets} sockets and 2 namespace handles)",
-                    expected_sockets + 2
+                     ({expected_sockets} sockets and {NAMESPACE_HANDLE_COUNT} namespace handles)",
+                    expected_sockets + NAMESPACE_HANDLE_COUNT
                 ));
             }
             Ok(Received::Handles(fds))
@@ -2083,6 +2412,7 @@ mod tests {
             tcp_ports: vec![80, 443],
             uid: 1000,
             gid: 1000,
+            force_pid_namespace_failure: false,
         };
         assert_eq!(plan.socket_count(), 3);
     }
@@ -2095,6 +2425,7 @@ mod tests {
             tcp_ports: Vec::new(),
             uid: 1000,
             gid: 1000,
+            force_pid_namespace_failure: false,
         };
         assert_eq!(plan.socket_count(), 1);
     }
@@ -2105,10 +2436,11 @@ mod tests {
             tcp_ports: (0..crate::egress_proxy::MAX_EGRESS_TCP_PORTS as u16).collect(),
             uid: 1000,
             gid: 1000,
+            force_pid_namespace_failure: false,
         };
         assert!(plan.socket_count() <= MAX_NAMESPACE_SOCKETS);
-        // The two namespace handles ride in the same message.
-        assert_eq!(MAX_SESSION_NETNS_FDS, MAX_NAMESPACE_SOCKETS + 2);
+        // The three namespace handles ride in the same message.
+        assert_eq!(MAX_SESSION_NETNS_FDS, MAX_NAMESPACE_SOCKETS + 3);
     }
 
     // ---- the session's namespace ---------------------------------------------------------

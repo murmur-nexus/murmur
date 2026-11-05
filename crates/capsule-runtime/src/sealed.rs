@@ -25,9 +25,10 @@
 //!      root inside it: the host runtime directories ([`SEALED_RUNTIME_PATHS`]) and a fixed,
 //!      narrow `/etc` set ([`SEALED_ETC_PATHS`]) bind-mounted **read-only**, the session workdir
 //!      bind-mounted **read-write at its own absolute path**, a private `/dev` tmpfs carrying the
-//!      OCI default device set ([`SEALED_DEVICE_NODES`]), and a `/proc` — masked with `hidepid`
-//!      where the kernel permits it, bound from the host where it does not
-//!      ([`PROC_HIDEPID_OPTIONS`] documents which is which, and why).
+//!      OCI default device set ([`SEALED_DEVICE_NODES`]), and a `/proc` — a bind of the session's
+//!      private procfs, which the command mounted before this step ([`crate::proc_view`]), or of
+//!      the host's where none could be mounted ([`PROC_HIDEPID_OPTIONS`] documents which is
+//!      which, and why).
 //!   4. `pivot_root`s onto it, detaches the old root, remounts the new root read-only, and
 //!      `chdir`s back into the workdir.
 //!
@@ -36,11 +37,12 @@
 //! `scoped` has to enumerate and refuse (pathname unix sockets, device nodes, metadata visibility,
 //! stdlib directory enumeration) stop being reachable rather than being individually denied.
 //!
-//! `/proc` is the one exception to that sentence: mounting a private `procfs` unprivileged needs a
-//! PID namespace this module deliberately does not create, so on a bare host the composed root
-//! carries a bind of the host's `/proc` and
-//! host process metadata stays *visible* there (opens through it are still Landlock's to refuse).
-//! See [`PROC_HIDEPID_OPTIONS`].
+//! `/proc` holds to that sentence too: every command runs in its session's PID namespace and
+//! mounts a private `procfs` of it over `/proc` before this module runs, so the composed root's
+//! `/proc` is a bind of that mount, listing only the session's own processes, and Landlock grants
+//! it read and list. Only on a host whose probe could not mount a private `procfs` does the bind
+//! carry the host's `/proc`, where host process metadata stays *visible* (opens through it are
+//! Landlock's to refuse). See [`PROC_HIDEPID_OPTIONS`].
 //!
 //! ## What it does *not* replace
 //!
@@ -637,7 +639,9 @@ pub(crate) fn sealed_shortfall(
                 | CreationStep::TcpListener
                 | CreationStep::Resolver
                 | CreationStep::NamespaceHandles
-                | CreationStep::HandOff => SealedBlocker::NetworkNamespaceUnavailable,
+                | CreationStep::HandOff
+                | CreationStep::PidNamespace
+                | CreationStep::Holder => SealedBlocker::NetworkNamespaceUnavailable,
             };
             return Some(shortfall(
                 blocker,
@@ -677,10 +681,14 @@ pub(crate) fn sealed_shortfall(
                 MountStep::PivotPrepare | MountStep::PivotRoot | MountStep::DetachOldRoot => {
                     SealedBlocker::PivotRootDenied
                 }
-                // The `/tmp` rehearsal's steps; the sealed-root rehearsal never reports them.
-                MountStep::UnshareMount | MountStep::MakePrivate | MountStep::BindTmp => {
-                    SealedBlocker::MountDenied
-                }
+                // The `/tmp` and private-procfs rehearsals' steps; the sealed-root rehearsal never
+                // reports them.
+                MountStep::UnshareMount
+                | MountStep::MakePrivate
+                | MountStep::BindTmp
+                | MountStep::JoinPidNamespace
+                | MountStep::ForkIntoPidNamespace
+                | MountStep::MountProc => SealedBlocker::MountDenied,
             };
             return Some(shortfall(
                 blocker,
@@ -1143,28 +1151,31 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// `mount -t proc`. The numeric form is the legacy parser's; `invisible` is the Linux 5.8+
 /// spelling; the empty string is a plain private `procfs` with no masking.
 ///
-/// **On a bare host none of the three succeeds, and that is a kernel rule.**
-/// `proc_fill_super` requires `CAP_SYS_ADMIN` over the user namespace *owning the PID namespace*.
-/// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` leaves the process in the host's initial PID namespace,
-/// whose owner is the initial user namespace — where an unprivileged process has no capabilities
-/// at all — so every `mount -t proc` returns `EPERM`. Adding `CLONE_NEWPID` does not help either:
-/// `unshare` moves only *future children* into the new PID namespace, so the mounting process is
-/// still judged against the old one. Mounting a private `procfs` unprivileged genuinely requires
-/// forking so the child becomes PID 1, which changes reaping and signal semantics for the whole
-/// capsule subprocess tree and is out of scope here (see the PID-namespace note in
-/// `docs/content/reference/sealed-containment-manual-verification.md`).
+/// The same list, in the same order, is what [`crate::proc_view`] mounts a command's private
+/// `/proc` with, before the composed root exists.
 ///
-/// They are still tried first, and in this order, because they *do* succeed where the process has
-/// that privilege — as root, and inside a container granted `CAP_SYS_ADMIN` — and because
-/// a later PID-namespace slice makes them succeed everywhere without touching this list.
+/// **Inside the composed root none of the three succeeds, and that is a kernel rule.**
+/// `proc_fill_super` requires `CAP_SYS_ADMIN` over the user namespace *owning the mounter's PID
+/// namespace*. A command runs in its session's PID namespace, owned by the session's user
+/// namespace; the composed root's `unshare(CLONE_NEWUSER | CLONE_NEWNS)` nests a user namespace
+/// inside that one, and a process in a descendant user namespace holds no capability in its
+/// ancestor, so every `mount -t proc` here returns `EPERM`. That is why the command mounts its
+/// private `procfs` *before* this step, while it still holds the session user namespace's
+/// capabilities (`proc_view::mount_private_proc`).
 ///
-/// When they all fail the executor binds the host's `/proc` instead. The capsule can then
-/// enumerate host PIDs and read the `/proc/<pid>/root` and `/proc/<pid>/cwd` symlinks, so `/proc`
-/// is the one part of the composed root where "outside does not exist" degrades to `scoped`'s
-/// "outside is denied" — Landlock's ruleset covers no path under `/proc`, so opens through it are
-/// refused, and `ptrace_may_access` gates the rest. Every other axis of the root stays absolute. The alternative is a capsule with no `/proc` at all, which
-/// breaks `/dev/fd`, process substitution and every runtime that reads `/proc/self/*`.
-const PROC_HIDEPID_OPTIONS: &[&str] = &["hidepid=2", "hidepid=invisible", ""];
+/// They are still tried first, and in this order, because they succeed where the process has that
+/// privilege — as root, and inside a container granted `CAP_SYS_ADMIN`.
+///
+/// When they all fail the executor binds `/proc` from the mount namespace the command built: the
+/// session's private `procfs`, which lists only the session's own processes and which Landlock
+/// grants read and list. On a host whose probe could not mount a private `procfs`, that `/proc` is
+/// the host's: the capsule can then enumerate host PIDs and read the `/proc/<pid>/root` and
+/// `/proc/<pid>/cwd` symlinks, so `/proc` is the one part of the composed root where "outside does
+/// not exist" degrades to `scoped`'s "outside is denied" — no Landlock rule covers it, so opens
+/// through it are refused, and `ptrace_may_access` gates the rest. The alternative is a capsule
+/// with no `/proc` at all, which breaks `/dev/fd`, process substitution and every runtime that
+/// reads `/proc/self/*`.
+pub(crate) const PROC_HIDEPID_OPTIONS: &[&str] = &["hidepid=2", "hidepid=invisible", ""];
 
 // ---------------------------------------------------------------- host layout (test seam)
 
@@ -1433,8 +1444,8 @@ pub(crate) fn plan_composed_root(
     }
     builder.push(RootOp::RemountReadOnly(dev), false);
 
-    // 4. /proc — masked with hidepid where the kernel allows it, bound from the host where it does
-    //    not. See `PROC_HIDEPID_OPTIONS`.
+    // 4. /proc — a bind of the session's private procfs the command mounted, or of the host's
+    //    where none could be mounted. See `PROC_HIDEPID_OPTIONS`.
     let proc = base.join("proc");
     builder.push(RootOp::MkDir(proc.clone()), true);
     builder.push(RootOp::Proc { target: proc }, true);
@@ -2568,11 +2579,12 @@ mod linux {
                     }
                 }
 
-                // Last resort: bind the host's `/proc` in. `mount -t proc` needs `CAP_SYS_ADMIN`
-                // over the *PID* namespace's user namespace, which an unprivileged user namespace
-                // never has, so on a bare host every spelling above fails with `EPERM` and this is
-                // the branch that actually runs. A bind of an existing mount needs no such
-                // privilege. Recursive so the `/proc` submounts a modern host carries come with it
+                // Last resort: bind the `/proc` of the mount namespace the command built — the
+                // session's private procfs, or the host's where none could be mounted.
+                // `mount -t proc` needs `CAP_SYS_ADMIN` over the *PID* namespace's user
+                // namespace, which this nested user namespace never has, so every spelling above
+                // fails with `EPERM` and this is the branch that actually runs. A bind of an
+                // existing mount needs no such privilege. Recursive so the `/proc` submounts a modern host carries come with it
                 // rather than leaving empty stubs.
                 if libc::mount(
                     c"/proc".as_ptr(),
@@ -4164,6 +4176,7 @@ mod tests {
                 network: Ok(()),
                 mount: MountAttempt::Created,
                 sealed_root: MountAttempt::Created,
+                private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
                 userns_grant: grant,
                 attachment,
             }

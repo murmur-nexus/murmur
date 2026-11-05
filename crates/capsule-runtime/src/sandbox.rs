@@ -1692,6 +1692,37 @@ pub(crate) fn resolve_sealed_etc_landlock_grants(tier: EnforcementTier) -> Vec<L
         .collect()
 }
 
+/// The host files a `scoped` command reads to resolve `localhost` and the other names
+/// `/etc/hosts` carries: the resolver's configuration and the hosts table. Each is also in
+/// [`crate::sealed::SEALED_ETC_PATHS`], which grants them on `sealed`.
+pub(crate) const SCOPED_NAME_RESOLUTION_PATHS: &[&str] = &["/etc/hosts", "/etc/nsswitch.conf"];
+
+/// One `ReadFile`-only grant per [`SCOPED_NAME_RESOLUTION_PATHS`] entry on `KernelFull`, and
+/// nothing on any other tier: `KernelSealed` grants them through
+/// [`resolve_sealed_etc_landlock_grants`], and the tiers without Landlock grant nothing.
+///
+/// Not gated on `network.allow`: `localhost` resolves without a network, and a server a command
+/// starts on `localhost` is reached by name. Neither file names a secret — `/etc/resolv.conf`,
+/// `/etc/passwd` and the rest of `/etc` stay denied on `scoped` — and neither is ever writable.
+///
+/// Pure and syscall-free, like the resolvers above.
+pub(crate) fn resolve_scoped_name_resolution_landlock_grants(
+    tier: EnforcementTier,
+) -> Vec<LandlockGrant> {
+    if tier != EnforcementTier::KernelFull {
+        return Vec::new();
+    }
+    SCOPED_NAME_RESOLUTION_PATHS
+        .iter()
+        .map(|path| LandlockGrant {
+            path: PathBuf::from(path),
+            list_dir: false,
+            executable: false,
+            pinned: None,
+        })
+        .collect()
+}
+
 // ---- fixed capsule device set ------------------------------------------------------------
 //
 // Everything above derives its grants from the manifest: `shell.allow` binaries and their
@@ -2502,6 +2533,10 @@ pub(crate) struct ShellEnforcement {
     /// or [`crate::temp_dir::tier_temp_mapping`] of [`Self::tier`] until one is handed in. Read
     /// only while the enforcement holds a folder.
     pub(crate) temp_mapping: crate::temp_dir::TempMapping,
+    /// Which `/proc` this enforcement's commands see: [`crate::proc_view::proc_view`] of the
+    /// probe [`Self::resolve`] was handed, or one handed in through [`Self::with_proc_view`].
+    /// Read through [`Self::installed_proc_view`], which keys it on [`Self::tier`].
+    pub(crate) proc_view: crate::proc_view::ProcView,
     /// The durable store of the one native tool this enforcement spawns, set by
     /// [`Self::for_native_entrypoint`] on that spawn's clone alone; `None` on the session's own
     /// enforcement, which every shell command uses.
@@ -2598,6 +2633,9 @@ impl ShellEnforcement {
         // failed inside a composed root. Tier-gated by the resolver itself, exactly as above: on
         // `KernelFull` these rules would apply to the *host's* /etc.
         landlock_grants.extend(resolve_sealed_etc_landlock_grants(tier));
+        // And, on `KernelFull` only, `/etc/hosts` and `/etc/nsswitch.conf` read-only, so
+        // `localhost` resolves; `sealed` has them from the line above.
+        landlock_grants.extend(resolve_scoped_name_resolution_landlock_grants(tier));
         let sealed_bind_dirs = resolve_sealed_bind_dirs(&exec_allow_paths, policy);
         let staged_runtime_dirs = resolve_staged_runtime_dirs(policy);
         Ok(Self {
@@ -2619,6 +2657,7 @@ impl ShellEnforcement {
             runtime_dir: None,
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(tier),
+            proc_view: crate::proc_view::proc_view(tier, &probe.namespaces),
             native_state_dir: None,
             host_paths: policy.host_paths.clone(),
             host_path_read_only_binds,
@@ -2719,6 +2758,30 @@ impl ShellEnforcement {
                 TempMapping::NotMapped(reason),
             ) => TempMapping::NotMapped(reason),
             (tier, _) => crate::temp_dir::tier_temp_mapping(tier),
+        }
+    }
+
+    /// Hand in the `/proc` view this enforcement's commands get, in place of the one
+    /// [`Self::resolve`] decided from its probe.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_proc_view(mut self, view: crate::proc_view::ProcView) -> Self {
+        self.proc_view = view;
+        self
+    }
+
+    /// What this enforcement installs for `/proc`: the private view on the kernel tiers when
+    /// [`Self::proc_view`] says so, the host's otherwise. Keyed on [`Self::tier`], so no tier is
+    /// told of a mechanism it does not install.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn installed_proc_view(&self) -> crate::proc_view::ProcView {
+        match (self.tier, &self.proc_view) {
+            (
+                EnforcementTier::KernelFull
+                | EnforcementTier::KernelSealed
+                | EnforcementTier::KernelSeccompOnly,
+                view,
+            ) => view.clone(),
+            (tier, _) => crate::proc_view::tier_proc_view(tier),
         }
     }
 
@@ -2829,6 +2892,7 @@ impl ShellEnforcement {
             runtime_dir: None,
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(EnforcementTier::EnvironmentOnly),
+            proc_view: crate::proc_view::tier_proc_view(EnforcementTier::EnvironmentOnly),
             native_state_dir: None,
             host_paths: Vec::new(),
             host_path_read_only_binds: Vec::new(),
@@ -3006,7 +3070,11 @@ derived read+execute scope outside the workdir (the allowlisted binaries, their 
 shared libraries — nothing writable), read-only access to the directories an allowlisted \
 CPython or Perl interpreter reports on its own import path, read-only access to the host's TLS \
 trust store when capabilities.network.allow is also non-empty, each host_paths entry in \
-~/.murmur/config.yaml at its own access, never executable, and no other directory granted \
+~/.murmur/config.yaml at its own access, never executable, read-only access to /etc/hosts and \
+/etc/nsswitch.conf so localhost resolves, read and list access to the session's private /proc \
+(commands run in the session's own PID namespace and its procfs lists only the session's processes \
+and the kernel's world-readable files — no host process; where this host cannot mount one, /proc \
+is the host's and every open beneath it is denied), and no other directory granted \
 wholesale, plus a fixed device set \
 every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
 folders and any read-write host_paths entry, the only writable paths outside the workdir), \
@@ -3031,12 +3099,12 @@ its temporary folder at /tmp, its home folder at $HOME and any read-write host_p
 writable paths, each host_paths entry in ~/.murmur/config.yaml bound at its own path, a private \
 /dev tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
-rather than denied — with one documented exception: /proc is a bind of the host's, because this \
-tier creates no PID namespace and mounting a private procfs unprivileged needs one. Landlock \
-refuses reading host /proc content at both scoped and sealed, so another process's command line, \
-environment and memory maps cannot be read; what still reaches outside the capsule is stat(2) on \
-/proc/<pid>, which shows that a process exists, its owner and its start time, and kill(2), which \
-delivers a signal to any process of the same user.";
+rather than denied. Commands run in the session's own PID namespace, and /proc is a bind of the \
+session's private procfs: it lists only the session's own processes and the kernel's \
+world-readable files, readable and listable, and no host process appears in it or can be \
+signalled. Where this host cannot mount a private procfs (mur doctor's private proc line), /proc \
+is a bind of the host's instead, Landlock refuses every open beneath it, and stat(2) on \
+/proc/<pid> still shows that a host process exists, its owner and its start time.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -3240,6 +3308,29 @@ thread_local! {
     /// namespace syscall, so a failed mapping's path is testable on any Linux host.
     pub(crate) static FORCE_TMP_MAP_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Fails the private `/proc` mount of a spawn whose view is private, at the mount itself and
+    /// with `EPERM`, so the fail-closed path is testable on any host that mounts one.
+    pub(crate) static FORCE_PRIVATE_PROC_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII arm for [`FORCE_PRIVATE_PROC_FAILURE`].
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ForcePrivateProcFailureGuard;
+
+#[cfg(all(test, target_os = "linux"))]
+impl ForcePrivateProcFailureGuard {
+    pub(crate) fn new() -> Self {
+        FORCE_PRIVATE_PROC_FAILURE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ForcePrivateProcFailureGuard {
+    fn drop(&mut self) {
+        FORCE_PRIVATE_PROC_FAILURE.with(|flag| flag.set(false));
+    }
 }
 
 /// RAII arm for [`FORCE_TMP_MAP_FAILURE`].
@@ -3678,6 +3769,15 @@ pub(crate) fn prepare_enforcement(
     )?;
 
     let tier = enforcement.tier;
+    // Whether this spawn mounts the session's private `/proc`, and whether the `/tmp` mapping
+    // already entered the private mount namespace it goes in.
+    let private_proc =
+        enforcement
+            .installed_proc_view()
+            .is_private()
+            .then_some(linux_enforce::PrivateProc {
+                mount_namespace_entered: tmp_map_spec.is_some(),
+            });
     // Copied out before the `move` closure below takes ownership of everything it touches, the
     // same clone-before-move shape `tier` and the Landlock fds already use.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
@@ -3693,7 +3793,12 @@ pub(crate) fn prepare_enforcement(
     // narrow pre_exec window where only async-signal-safe operations are permitted. In order, it
     // performs: without a cgroup scope, the `RLIMIT_NPROC` `getrlimit`/`setrlimit` pair of
     // `resources::apply_nproc_bound`; with one, one `write` to the `cgroup.procs` descriptor the
-    // parent opened; two `setns` calls into the session's namespaces; on a `MountNamespace` spawn
+    // parent opened; two `setns` calls into the session's namespaces; a third `setns` into its PID
+    // namespace and a `fork`, after which the forked-from process is the relay — `sigprocmask`,
+    // `close_range`, `waitpid`, `sigaction`, `kill` and `_exit`, never returning — and the child
+    // continues as the command with one `prctl(PR_SET_PDEATHSIG)` and one `getppid`; on a private
+    // process view the `unshare`/`mount`/`open` of `proc_view::mount_private_proc`; on a
+    // `MountNamespace` spawn
     // the `unshare`/`mount`/`open`/`mkdirat`/`chdir` sequence of `temp_dir::map_private_tmp`, and
     // on `KernelSealed` the `unshare`/`open`/`write`/`mount`/`pivot_root` sequence of
     // `sealed::construct_composed_root`, both over paths and buffers built here; the
@@ -3728,8 +3833,12 @@ pub(crate) fn prepare_enforcement(
             let (user_ns_fd, net_ns_fd) = netns.raw_fds();
             if let Err(error) = linux_enforce::child_install_enforcement(
                 tier,
-                user_ns_fd,
-                net_ns_fd,
+                linux_enforce::SessionNamespaces {
+                    user_ns_fd,
+                    net_ns_fd,
+                    pid_ns_fd: netns.pid_ns_fd(),
+                },
+                private_proc,
                 tmp_map_spec.as_ref(),
                 sealed_spec.as_ref(),
                 landlock_fds.as_ref(),
@@ -4483,9 +4592,11 @@ mod linux_enforce {
         }
     }
 
-    /// Runs inside the forked child, pre-exec: joins the session's network namespace through
-    /// `user_ns_fd`/`net_ns_fd`, maps `/tmp` onto the session's temporary folder when
-    /// `tmp_map_spec` is given, strips the child's Linux capabilities, installs the seccomp filter
+    /// Runs inside the forked child, pre-exec: joins the session's user and network namespaces,
+    /// enters its PID namespace through a relay (this process waits outside it and never returns;
+    /// the command continues in a child forked into it), maps `/tmp` onto the session's
+    /// temporary folder when `tmp_map_spec` is given, mounts the session's private `/proc` when
+    /// `private_proc` is given, strips the child's Linux capabilities, installs the seccomp filter
     /// (the `socket()` domain denials keyed on `unix_sockets_allowed`, over a default-deny syscall
     /// allowlist), and (on `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope —
     /// which is also what enforces `capabilities.shell.allow`. Returning `Err` here aborts the
@@ -4493,8 +4604,8 @@ mod linux_enforce {
     /// `io::Error`) — the fail-closed path for setup failures that happen after fork.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
-        user_ns_fd: RawFd,
-        net_ns_fd: RawFd,
+        namespaces: SessionNamespaces,
+        private_proc: Option<PrivateProc>,
         tmp_map_spec: Option<&crate::temp_dir::TmpMapSpec>,
         sealed_spec: Option<&crate::sealed::SealedRootSpec>,
         landlock_fds: Option<&LandlockChildFds>,
@@ -4521,13 +4632,27 @@ mod linux_enforce {
         // SAFETY: post-`fork()`, pre-exec child context — exactly the window this function
         // documents itself as running in, and the one `join_session_netns` requires. Both
         // descriptors are held open by the join handle the `pre_exec` closure owns.
-        unsafe { crate::network_namespace::join_session_netns(user_ns_fd, net_ns_fd) }.map_err(
-            |error| {
-                io::Error::other(format!(
-                    "sandbox: joining this session's network namespace failed: {error}"
-                ))
-            },
-        )?;
+        unsafe {
+            crate::network_namespace::join_session_netns(
+                namespaces.user_ns_fd,
+                namespaces.net_ns_fd,
+            )
+        }
+        .map_err(|error| {
+            io::Error::other(format!(
+                "sandbox: joining this session's network namespace failed: {error}"
+            ))
+        })?;
+
+        // NEXT: the session's PID namespace. This process becomes the command's relay, which
+        // stays outside the namespace and never returns from here; the process that does return
+        // is its child, forked into the namespace, and every step below runs in it. `setns` of
+        // a PID namespace needs `CAP_SYS_ADMIN` in the user namespace owning it, which the join
+        // above just handed out, and the seccomp filter below denies `setns`.
+        //
+        // SAFETY: post-`fork()`, pre-exec child context, inside the session's user namespace; the
+        // descriptor is held open by the join handle the `pre_exec` closure owns.
+        unsafe { enter_session_pid_namespace(namespaces.pid_ns_fd) }?;
 
         // NEXT, and only on a `MountNamespace` spawn: a private mount namespace, owned by the
         // session's user namespace, in which the session's temporary folder is bound over `/tmp`.
@@ -4549,6 +4674,37 @@ mod linux_enforce {
             unsafe { crate::temp_dir::map_private_tmp(spec) }
                 .map_err(|failure| io::Error::other(spec.describe(failure)))?;
         }
+
+        // NEXT, when the session's view is private: a `procfs` of the session's PID namespace
+        // over `/proc`, in the private mount namespace the `/tmp` mapping entered or one entered
+        // here. Before the composed root, whose `/proc` step then binds this mount, and before the
+        // filter, which denies `unshare` and `mount`. The staging probe mounted one, so a mount
+        // that fails here fails the spawn; nothing runs with the host's `/proc` instead.
+        let proc_fd = match private_proc {
+            None => None,
+            Some(private_proc) => {
+                #[cfg(test)]
+                if super::FORCE_PRIVATE_PROC_FAILURE.with(|flag| flag.get()) {
+                    return Err(io::Error::other(format!(
+                        "{} (forced by test seam)",
+                        crate::proc_view::describe_mount_failure(
+                            crate::proc_view::ProcMountStep::MountProc,
+                            libc::EPERM
+                        )
+                    )));
+                }
+                // SAFETY: post-`fork()`, pre-exec child context, inside the session's user and
+                // PID namespaces with the capabilities the join handed out, before the filter.
+                let fd = unsafe {
+                    crate::proc_view::mount_private_proc(!private_proc.mount_namespace_entered)
+                }
+                .map_err(|(step, errno)| {
+                    io::Error::other(crate::proc_view::describe_mount_failure(step, errno))
+                })?;
+                // SAFETY: `fd` was just returned by a successful `open` and nothing else owns it.
+                Some(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+            }
+        };
 
         // NEXT, and only on `KernelSealed`: build the private mount namespace and pivot onto the
         // composed root. This has to precede every *remaining* step in this closure, because
@@ -4611,11 +4767,137 @@ mod linux_enforce {
             EnforcementTier::KernelFull | EnforcementTier::KernelSealed
         ) {
             if let Some(fds) = landlock_fds {
-                apply_landlock_scope(fds).map_err(io::Error::other)?;
+                apply_landlock_scope(fds, proc_fd.as_ref()).map_err(io::Error::other)?;
             }
         }
 
         Ok(())
+    }
+
+    /// The session's namespace descriptors a command enters, all held open by the join handle
+    /// the `pre_exec` closure owns.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct SessionNamespaces {
+        pub(super) user_ns_fd: RawFd,
+        pub(super) net_ns_fd: RawFd,
+        pub(super) pid_ns_fd: RawFd,
+    }
+
+    /// A spawn that mounts the session's private `/proc`.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct PrivateProc {
+        /// Whether the `/tmp` mapping already entered a private mount namespace.
+        pub(super) mount_namespace_entered: bool,
+    }
+
+    /// The exit status a command forked into the session's PID namespace leaves when it finds
+    /// its relay already gone, before running anything.
+    const RELAY_GONE_EXIT: i32 = 125;
+
+    /// Enters the session's PID namespace for the command: `setns(pid_ns_fd, CLONE_NEWPID)`, then
+    /// `fork()`. Returns only in the forked child — the command, inside the namespace — and only
+    /// once it has made its relay's death its own (`PR_SET_PDEATHSIG`) and seen the relay alive.
+    /// The calling process becomes the relay ([`run_relay`]) and never returns.
+    ///
+    /// The command stays in the relay's process group and cgroup: both are inherited across the
+    /// fork. A live relay is outside the namespace, so `getppid()` reads `0` in the command; any
+    /// other value is the namespace's holder, which inherited the command because the relay
+    /// already died, and the command exits before running anything.
+    ///
+    /// # Safety
+    /// Post-`fork()`, pre-exec child context only, after `join_session_netns`.
+    unsafe fn enter_session_pid_namespace(pid_ns_fd: RawFd) -> io::Result<()> {
+        // SAFETY: the caller's contract; every call takes integers or live stack locals, and the
+        // relay branch never returns.
+        unsafe {
+            if libc::setns(pid_ns_fd, libc::CLONE_NEWPID) != 0 {
+                return Err(io::Error::other(format!(
+                    "sandbox: joining this session's PID namespace failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            // The relay `waitpid`s its command, which an ignored `SIGCHLD` would turn into
+            // `ECHILD` once the kernel had reaped it.
+            let mut default: libc::sigaction = std::mem::zeroed();
+            default.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGCHLD, &default, std::ptr::null_mut());
+            let command = libc::fork();
+            if command < 0 {
+                return Err(io::Error::other(format!(
+                    "sandbox: forking the command into this session's PID namespace failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            if command > 0 {
+                run_relay(command);
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(io::Error::other(format!(
+                    "sandbox: prctl(PR_SET_PDEATHSIG) in the command failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            if libc::getppid() != 0 {
+                libc::_exit(RELAY_GONE_EXIT);
+            }
+        }
+        Ok(())
+    }
+
+    /// The relay's whole life: the process `std::process::Child` refers to, outside the session's
+    /// PID namespace, which runs no capsule code and holds no descriptor.
+    ///
+    /// It blocks every signal (a process-group signal reaches the command directly, and `SIGKILL`
+    /// still ends the relay, which `PR_SET_PDEATHSIG` turns into the command's end), closes every
+    /// descriptor — `std`'s exec-status pipe, the diagnostic pipe, stdio and the holder's
+    /// lifeline among them, so none stays open on the relay's account — and waits for the
+    /// command. It then leaves the command's status as its own: the exit code, or the
+    /// terminating signal re-raised with its default disposition, falling back to `128 + sig`.
+    /// `wait4` on the relay reports the command's resource use with its own, since Linux counts a
+    /// reaped child's waited-for children.
+    ///
+    /// # Safety
+    /// Post-`fork()` child context only; every call is async-signal-safe and nothing allocates.
+    unsafe fn run_relay(command: libc::pid_t) -> ! {
+        // SAFETY: the caller's contract; every call takes integers or live stack locals.
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::sigprocmask(libc::SIG_SETMASK, &all, std::ptr::null_mut());
+            libc::syscall(
+                libc::SYS_close_range,
+                0 as libc::c_uint,
+                libc::c_uint::MAX,
+                0 as libc::c_uint,
+            );
+            let mut status: libc::c_int = 0;
+            loop {
+                let waited = libc::waitpid(command, &mut status, 0);
+                if waited == command {
+                    break;
+                }
+                if waited < 0 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                libc::_exit(1);
+            }
+            if libc::WIFEXITED(status) {
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                let signal = libc::WTERMSIG(status);
+                let mut default: libc::sigaction = std::mem::zeroed();
+                default.sa_sigaction = libc::SIG_DFL;
+                libc::sigaction(signal, &default, std::ptr::null_mut());
+                let mut only: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut only);
+                libc::sigaddset(&mut only, signal);
+                libc::sigprocmask(libc::SIG_UNBLOCK, &only, std::ptr::null_mut());
+                libc::kill(libc::getpid(), signal);
+                libc::_exit(128 + signal);
+            }
+            libc::_exit(1)
+        }
     }
 
     /// Marks every file descriptor at or above [`super::FD_HYGIENE_FIRST_FD`] close-on-exec, so
@@ -5199,7 +5481,15 @@ mod linux_enforce {
     /// (shrink-not-fail, matching `resolve_exec_allowlist`) rather than failing the whole scope —
     /// it only narrows what is allowed. A genuine ruleset-construction failure still returns `Err`,
     /// preserving the module's fail-closed invariant.
-    fn apply_landlock_scope(fds: &LandlockChildFds) -> Result<(), String> {
+    ///
+    /// `proc_fd` is the root of the session's private `/proc`, mounted and opened in this child by
+    /// `crate::proc_view::mount_private_proc`: `ReadFile | ReadDir` beneath it, never `Execute`
+    /// and never a write right. `None` when the view is the host's, which then keeps no rule and
+    /// every open beneath `/proc` is refused.
+    fn apply_landlock_scope(
+        fds: &LandlockChildFds,
+        proc_fd: Option<&OwnedFd>,
+    ) -> Result<(), String> {
         #[cfg(test)]
         if super::FORCE_LANDLOCK_FAILURE.with(|flag| flag.get()) {
             return Err("landlock: ruleset construction failed (forced by test seam)".to_string());
@@ -5252,6 +5542,16 @@ mod linux_enforce {
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
             .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), writable_rights))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
+
+        // The session's private `/proc`: read and list, nothing else. On `KernelSealed` the
+        // composed root binds this same mount, so the rule reaches it there by the same inode.
+        if let Some(proc_fd) = proc_fd {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(proc_fd.as_fd(), read_list & handled))
+                .map_err(|error| {
+                    format!("landlock: add_rule for the session's private /proc failed: {error}")
+                })?;
+        }
 
         // The session's temporary folder, whenever the enforcement holds one. A rule on the
         // workdir does not reach a bind mounted over `/tmp`; see [`LandlockChildFds::temp_dir_fd`].
@@ -6356,6 +6656,7 @@ mod tests {
             network: Ok(()),
             mount: crate::namespace_probe::MountAttempt::Created,
             sealed_root: crate::namespace_probe::MountAttempt::Created,
+            private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
             userns_grant: crate::sealed::UsernsGrant::Withheld,
             attachment: crate::sealed::ProfileAttachment::Unconfined,
         }
@@ -6369,6 +6670,7 @@ mod tests {
             )),
             mount: crate::namespace_probe::MountAttempt::NotAttempted,
             sealed_root: crate::namespace_probe::MountAttempt::NotAttempted,
+            private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
             userns_grant: crate::sealed::UsernsGrant::Withheld,
             attachment: crate::sealed::ProfileAttachment::NotReported,
         }
@@ -7281,10 +7583,28 @@ mod tests {
         )
         .expect("an empty policy resolves")
         .with_test_session_dirs();
+        // The two name-resolution files are the one exception, granted read-only by
+        // `resolve_scoped_name_resolution_landlock_grants`; nothing else of the list is.
+        let name_resolution = |grant: &LandlockGrant| {
+            SCOPED_NAME_RESOLUTION_PATHS
+                .iter()
+                .any(|path| Path::new(path) == grant.path)
+        };
         assert!(
-            !scoped.landlock_grants.iter().any(is_etc_grant),
+            !scoped
+                .landlock_grants
+                .iter()
+                .any(|grant| is_etc_grant(grant) && !name_resolution(grant)),
             "a scoped capsule runs Landlock over the real host filesystem — /etc/shadow's \
              neighbours must not become readable there",
+        );
+        assert_eq!(
+            scoped
+                .landlock_grants
+                .iter()
+                .filter(|grant| name_resolution(grant))
+                .count(),
+            SCOPED_NAME_RESOLUTION_PATHS.len()
         );
 
         let sealed = ShellEnforcement::resolve_declared(
@@ -8738,33 +9058,24 @@ mod tests {
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
     }
 
-    /// The sealed notice states what `/proc` leaks: Landlock refuses reading host
-    /// `/proc` content at both classes, and only `stat(2)` on `/proc/<pid>` and same-user signals
-    /// reach outside the capsule.
+    /// The sealed notice states what `/proc` is: the session's private procfs, with no host
+    /// process in it, and the host's only where no private one can be mounted, then refused by
+    /// Landlock with `stat(2)` on `/proc/<pid>` the one thing that still reaches outside. It no
+    /// longer claims the tier creates no PID namespace.
     #[test]
-    fn tier_warning_kernel_sealed_states_what_proc_still_leaks() {
+    fn tier_warning_kernel_sealed_states_what_proc_is() {
         let (code, notice) = tier_warning(EnforcementTier::KernelSealed, false).unwrap();
         assert_eq!(code, W_SEC_005);
-        assert!(!notice.contains("stays visible"), "{notice}");
+        assert!(!notice.contains("no PID namespace"), "{notice}");
+        assert!(notice.contains("own PID namespace"), "{notice}");
+        assert!(notice.contains("private procfs"), "{notice}");
+        assert!(notice.contains("no host process appears"), "{notice}");
         assert!(
-            !notice.contains("exactly as it is under scoped"),
-            "{notice}"
-        );
-        assert!(notice.contains("no PID namespace"), "{notice}");
-        assert!(
-            notice
-                .contains("Landlock refuses reading host /proc content at both scoped and sealed"),
+            notice.contains("Landlock refuses every open beneath it"),
             "{notice}"
         );
         assert!(notice.contains("stat(2) on /proc/<pid>"), "{notice}");
-        assert!(
-            notice.contains("exists, its owner and its start time"),
-            "{notice}"
-        );
-        assert!(
-            notice.contains("kill(2)") && notice.contains("any process of the same user"),
-            "{notice}"
-        );
+        assert!(!notice.contains("any process of the same user"), "{notice}");
         assert_eq!(tier_warning(EnforcementTier::KernelSealed, true), None);
     }
 
@@ -9600,6 +9911,7 @@ mod linux_integration_tests {
             tier: EnforcementTier::Unconfined,
             declared_resources: declared,
             temp_mapping: crate::temp_dir::tier_temp_mapping(EnforcementTier::Unconfined),
+            proc_view: crate::proc_view::tier_proc_view(EnforcementTier::Unconfined),
             ..ShellEnforcement::environment_only()
         }
         .with_test_session_dirs()
@@ -11778,10 +12090,22 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
         // Both servers bound the same port: each is still running, waiting for its one client.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        for dir in [&dir_a, &dir_b] {
-            let pid = pid_in(dir.path(), "server.pid");
-            assert!(process_exists(pid), "a server's bind on {port} failed");
-        }
+        // Each pid file holds a pid in its session's PID namespace, where the two servers may
+        // well share a number: both must be live host processes.
+        let servers: std::collections::HashSet<i32> = [&dir_a, &dir_b]
+            .iter()
+            .flat_map(|dir| {
+                crate::network_namespace::host_pids_in_sessions(
+                    std::process::id(),
+                    pid_in(dir.path(), "server.pid"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            servers.len(),
+            2,
+            "a server's bind on {port} failed: {servers:?}"
+        );
 
         let host = std::net::TcpStream::connect(("127.0.0.1", port));
         let host_error = host.expect_err("the host must not reach a session's loopback server");
@@ -11979,8 +12303,9 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         )
         .expect("the command runs");
         assert_eq!(started.exit_code, 0, "stderr: {}", started.stderr);
-        let sleeper = pid_in(temp.path(), "sleeper.pid");
-        let server = pid_in(temp.path(), "server.pid");
+        // The pid files hold pids in the session's PID namespace.
+        let sleeper = host_pid(pid_in(temp.path(), "sleeper.pid"));
+        let server = host_pid(pid_in(temp.path(), "server.pid"));
         assert!(process_exists(sleeper), "the setsid sleeper is running");
         assert!(process_exists(server), "the background server is running");
 
@@ -12869,6 +13194,636 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
     }
 
+    // ---- the session's PID namespace and its private /proc ----
+
+    /// A policy allowlisting `shell_allow` and nothing else.
+    fn allow_only(shell_allow: &[&str]) -> CapabilityPolicy {
+        CapabilityPolicy {
+            shell_allow: shell_allow.iter().map(|name| name.to_string()).collect(),
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    /// A `sealed` session's enforcement for `policy` from a live probe, or `None` (after a skip
+    /// line naming `test`) on a host that does not reach `KernelSealed`.
+    fn sealed_landlock_enforcement(
+        test: &str,
+        policy: &CapabilityPolicy,
+    ) -> Option<(ShellEnforcement, tempfile::TempDir)> {
+        if crate::network_namespace::skip_without_egress_namespace(test) {
+            return None;
+        }
+        let probe = HostProbe::probe();
+        if probe.tier() != EnforcementTier::KernelSealed {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT SEALED ON THIS HOST: {test} needs a host that \
+                 reaches KernelSealed; detected {:?}",
+                probe.tier()
+            );
+            return None;
+        }
+        let runtime = tempfile::tempdir().unwrap();
+        let enforcement = ShellEnforcement::resolve_declared(
+            policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            probe,
+        )
+        .unwrap()
+        .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+        assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
+        Some((enforcement, runtime))
+    }
+
+    /// Whether `enforcement` mounts a private `/proc`, printing a skip line naming `test` when
+    /// this host's probe could not mount one.
+    fn mounts_private_proc(test: &str, enforcement: &ShellEnforcement) -> bool {
+        match enforcement.installed_proc_view() {
+            crate::proc_view::ProcView::Private => true,
+            crate::proc_view::ProcView::Host(reason) => {
+                eprintln!(
+                    "SKIP — PROVES NOTHING: {test} needs a host that mounts a private procfs; \
+                     {}",
+                    reason.describe()
+                );
+                false
+            }
+        }
+    }
+
+    /// The script S1 and its sealed twin run: the files `node`, `os.cpus()` and every runtime
+    /// that reads its own process read, each through `/proc`.
+    const OWN_PROC_SCRIPT: &str = "head -n 1 /proc/self/status; \
+        head -n 1 /proc/thread-self/status; \
+        head -n 1 /proc/stat; \
+        n=0; while read -r line; do case $line in processor*) n=$((n+1));; esac; done \
+        < /proc/cpuinfo; echo \"processors=$n\"; \
+        head -n 1 /proc/meminfo; \
+        while read -r _ point kind options _; do \
+        if [ \"$point\" = /proc ]; then echo \"proc-mount: $kind $options\"; fi; \
+        done < /proc/self/mounts";
+
+    fn assert_reads_own_proc(result: &crate::shell::ShellResult) {
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert!(
+            !result.stderr.contains("Permission denied"),
+            "{}",
+            result.stderr
+        );
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert!(lines.len() >= 5, "{}", result.stdout);
+        assert!(lines[0].starts_with("Name:"), "{}", result.stdout);
+        assert!(lines[1].starts_with("Name:"), "{}", result.stdout);
+        assert!(lines[2].starts_with("cpu "), "{}", result.stdout);
+        let processors: u32 = lines[3]
+            .strip_prefix("processors=")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{}", result.stdout));
+        assert!(processors > 0, "{}", result.stdout);
+        assert!(lines[4].starts_with("MemTotal:"), "{}", result.stdout);
+    }
+
+    /// S1: a `scoped` command reads its own `/proc/self/*` and `/proc/thread-self/*`, and the
+    /// kernel's `stat`, `cpuinfo` and `meminfo`, through the private `/proc` and its read rule.
+    #[test]
+    fn a_scoped_command_reads_its_own_proc() {
+        let test = "a_scoped_command_reads_its_own_proc";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "cat", "head"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        if !mounts_private_proc(test, &enforcement) {
+            return;
+        }
+        let result = run_bash_in(&work, OWN_PROC_SCRIPT, &policy, &enforcement);
+        enforcement.end_session();
+        assert_reads_own_proc(&result);
+    }
+
+    /// A process outside every capsule, which the test kills when it goes out of scope.
+    struct HostSleeper(std::process::Child);
+
+    impl HostSleeper {
+        fn start() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("300")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for HostSleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The script S2 and its sealed twin run against a host process `pid`.
+    fn host_process_script(pid: u32) -> String {
+        format!("ls /proc; cat /proc/{pid}/cmdline; echo \"cat=$?\"")
+    }
+
+    fn assert_sees_no_host_process(result: &crate::shell::ShellResult, host_pids: &[u32]) {
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        let entries: Vec<u32> = result
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        assert!(!entries.is_empty(), "no process listed: {}", result.stdout);
+        // The command's own tree: bash and the `ls` it forked. The holder is hidden.
+        assert!(entries.len() <= 3, "{entries:?}");
+        for pid in host_pids {
+            assert!(!entries.contains(pid), "host pid {pid} listed: {entries:?}");
+        }
+        assert!(
+            result.stderr.contains("No such file or directory"),
+            "{}",
+            result.stderr
+        );
+        assert!(result.stdout.contains("cat=1"), "{}", result.stdout);
+    }
+
+    /// S2: a `scoped` command's `/proc` lists only its own tree. A host process the test started
+    /// outside any capsule, and the test itself, are absent, and opening one's `cmdline` is
+    /// `ENOENT`, not `EACCES`.
+    #[test]
+    fn a_scoped_command_cannot_see_host_processes() {
+        let test = "a_scoped_command_cannot_see_host_processes";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "ls", "cat"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        if !mounts_private_proc(test, &enforcement) {
+            return;
+        }
+        let sleeper = HostSleeper::start();
+        let result = run_bash_in(
+            &work,
+            &host_process_script(sleeper.pid()),
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_sees_no_host_process(&result, &[sleeper.pid(), std::process::id()]);
+    }
+
+    /// The OpenSSL configuration a Node build reads at startup on this host family.
+    const NODE_OPENSSL_CONFIG: &str = "/etc/ssl/openssl.cnf";
+
+    /// S3: `node` under `scoped` counts the host's CPUs and resolves `localhost` to loopback, with
+    /// no `network.allow` and no grant on `/proc` or `/etc`.
+    #[test]
+    fn a_scoped_node_counts_cpus_and_resolves_localhost() {
+        let test = "a_scoped_node_counts_cpus_and_resolves_localhost";
+        if resolve_exec_allowlist(&["node".to_string()]).is_empty() {
+            eprintln!("SKIP — PROVES NOTHING: {test} needs node on PATH");
+            return;
+        }
+        let (_base, work, _outside) = work_and_outside();
+        let mut policy = allow_only(&["node"]);
+        // V8's address-space reservation; see `W-RUN-010`.
+        policy.resources.memory_bytes = 64 * 1024 * 1024 * 1024;
+        // Node reads OpenSSL's configuration at startup and exits 13 when it is refused, so it is
+        // granted the one file, as the how-to grants it; nothing here grants `/proc` or `/etc/hosts`.
+        if Path::new(NODE_OPENSSL_CONFIG).is_file() {
+            policy.shell_interpreter_runtime = vec![murmur_artifact::InterpreterRuntimeGrant {
+                binary: "node".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: NODE_OPENSSL_CONFIG.to_string(),
+                    list_dir: false,
+                }],
+            }];
+        }
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        if !mounts_private_proc(test, &enforcement) {
+            return;
+        }
+        let result = execute(
+            "node",
+            &[
+                "-e",
+                "console.log('cpus=' + require('os').cpus().length); \
+                 require('dns').lookup('localhost', (error, address) => \
+                 console.log(error ? 'lookup=' + error.code : 'lookup=' + address));",
+            ],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        let cpus: u32 = result
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("cpus="))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{}", result.stdout));
+        assert!(cpus > 0, "{}", result.stdout);
+        let address = result
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("lookup="))
+            .unwrap_or_else(|| panic!("{}", result.stdout));
+        assert!(
+            address == "127.0.0.1" || address == "::1",
+            "{}",
+            result.stdout
+        );
+    }
+
+    /// S4: a `scoped` command resolves `localhost` through `/etc/hosts`: both name-resolution
+    /// files read, and the rest of `/etc` — `/etc/passwd`, `/etc/resolv.conf` — stays denied.
+    #[test]
+    fn a_scoped_command_resolves_localhost_through_etc_hosts() {
+        let test = "a_scoped_command_resolves_localhost_through_etc_hosts";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "cat", "getent"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let result = run_bash_in(
+            &work,
+            "getent hosts localhost; echo \"getent=$?\"; \
+             cat /etc/hosts > /dev/null; echo \"hosts=$?\"; \
+             cat /etc/nsswitch.conf > /dev/null; echo \"nsswitch=$?\"; \
+             cat /etc/passwd > /dev/null; echo \"passwd=$?\"; \
+             cat /etc/resolv.conf > /dev/null; echo \"resolv=$?\"",
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        let stdout = &result.stdout;
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("127.0.0.1") || line.starts_with("::1")),
+            "{stdout}"
+        );
+        for read in ["getent=0", "hosts=0", "nsswitch=0"] {
+            assert!(stdout.lines().any(|line| line == read), "{read}: {stdout}");
+        }
+        for denied in ["passwd=1", "resolv=1"] {
+            assert!(
+                stdout.lines().any(|line| line == denied),
+                "{denied}: {stdout}"
+            );
+        }
+        assert!(
+            result.stderr.contains("/etc/passwd: Permission denied"),
+            "{}",
+            result.stderr
+        );
+        assert!(
+            result
+                .stderr
+                .contains("/etc/resolv.conf: Permission denied"),
+            "{}",
+            result.stderr
+        );
+    }
+
+    /// S6: the exit code and the terminating signal the runtime sees are the command's, not its
+    /// relay's, and a command's parent reads as `0` — outside its PID namespace.
+    #[test]
+    fn a_command_under_its_relay_keeps_its_exit_status_and_signal() {
+        let test = "a_command_under_its_relay_keeps_its_exit_status_and_signal";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let exited = run_bash_in(&work, "exit 7", &policy, &enforcement);
+        let killed = run_bash_in(&work, "kill -KILL $$", &policy, &enforcement);
+        let parent = run_bash_in(&work, "echo \"ppid=$PPID pid=$$\"", &policy, &enforcement);
+        enforcement.end_session();
+        assert_eq!(exited.exit_code, 7);
+        assert_eq!(killed.exit_code, 128 + libc::SIGKILL);
+        assert!(
+            parent.stdout.starts_with("ppid=0 pid="),
+            "{}",
+            parent.stdout
+        );
+        let pid: i32 = parent
+            .stdout
+            .trim()
+            .rsplit('=')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(pid > 1 && pid < 100, "a namespace pid: {}", parent.stdout);
+    }
+
+    /// The host pid of `namespace_pid` in this test process's sessions, polled briefly: the pid
+    /// file is written before the process it names is guaranteed to be visible.
+    fn host_pid(namespace_pid: i32) -> i32 {
+        for _ in 0..100 {
+            if let Some(pid) =
+                crate::network_namespace::host_pid_in_session(std::process::id(), namespace_pid)
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("no process of this test's sessions is pid {namespace_pid} in its namespace");
+    }
+
+    /// S6: a server a command backgrounds survives into the next command, which sees it in the
+    /// same PID namespace, and is gone with the namespace's holder once the session ends.
+    #[test]
+    fn a_backgrounded_process_survives_into_the_next_command_and_ends_with_the_session() {
+        let test =
+            "a_backgrounded_process_survives_into_the_next_command_and_ends_with_the_session";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "sleep"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let started = run_bash_in(
+            &work,
+            "sleep 300 >/dev/null 2>&1 & echo $! > sleeper.pid",
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(started.exit_code, 0, "{}", started.stderr);
+        let namespace_pid = pid_in(&work, "sleeper.pid");
+        let sleeper = host_pid(namespace_pid);
+        let holder = host_pid(1);
+        assert_ne!(sleeper, namespace_pid, "the pid file holds a namespace pid");
+        let seen = run_bash_in(
+            &work,
+            "kill -0 \"$(< sleeper.pid)\" && echo alive",
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(seen.stdout.trim(), "alive", "{}", seen.stderr);
+        assert!(process_exists(sleeper));
+        enforcement.end_session();
+        let wait = SESSION_END_KILL_WAIT + std::time::Duration::from_secs(3);
+        assert!(
+            process_gone_within(holder, wait),
+            "holder {holder} outlived the session"
+        );
+        assert!(
+            process_gone_within(sleeper, wait),
+            "sleeper {sleeper} outlived the session"
+        );
+    }
+
+    /// S6: a session dropped without `end_session` closes its holder's lifeline, which ends the
+    /// holder and every process in its PID namespace.
+    #[test]
+    fn a_dropped_session_ends_its_holder_and_its_processes() {
+        let test = "a_dropped_session_ends_its_holder_and_its_processes";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "sleep"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let started = run_bash_in(
+            &work,
+            "sleep 300 >/dev/null 2>&1 & echo $! > sleeper.pid",
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(started.exit_code, 0, "{}", started.stderr);
+        let sleeper = host_pid(pid_in(&work, "sleeper.pid"));
+        let holder = host_pid(1);
+        drop(enforcement);
+        assert!(
+            process_gone_within(holder, SESSION_END_KILL_WAIT),
+            "holder {holder} outlived its dropped session"
+        );
+        assert!(
+            process_gone_within(sleeper, SESSION_END_KILL_WAIT),
+            "sleeper {sleeper} outlived its dropped session"
+        );
+    }
+
+    /// S6: `Child::kill()` reaches the relay, the process `Child` refers to, and the command dies
+    /// with it through `PR_SET_PDEATHSIG`; `wait` then reports the kill.
+    #[test]
+    fn killing_the_relay_ends_the_command() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let test = "killing_the_relay_ends_the_command";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "sleep"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let bash = resolve_exec_allowlist(&["bash".to_string()])
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut command = std::process::Command::new(bash);
+        command
+            .args(["-c", "echo $$ > command.pid; exec sleep 300"])
+            .current_dir(&work)
+            .process_group(0);
+        let _handle = prepare_enforcement(&mut command, &enforcement, &work).unwrap();
+        let mut relay = command.spawn().unwrap();
+        let pid_file = work.join("command.pid");
+        for _ in 0..200 {
+            if std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n')) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let command_pid = host_pid(pid_in(&work, "command.pid"));
+        assert_ne!(
+            command_pid,
+            relay.id() as i32,
+            "the command is not its relay"
+        );
+        relay.kill().unwrap();
+        let status = relay.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            process_gone_within(command_pid, std::time::Duration::from_secs(5)),
+            "command {command_pid} outlived its relay"
+        );
+        enforcement.end_session();
+    }
+
+    /// S7: S1's and S2's scripts under `sealed`, where the composed root binds the private
+    /// `/proc` the command mounted before it.
+    #[test]
+    fn a_sealed_command_reads_its_own_proc_and_sees_no_host_process() {
+        let test = "a_sealed_command_reads_its_own_proc_and_sees_no_host_process";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "cat", "head", "ls"]);
+        let Some((enforcement, _runtime)) = sealed_landlock_enforcement(test, &policy) else {
+            return;
+        };
+        if !mounts_private_proc(test, &enforcement) {
+            return;
+        }
+        let own = run_bash_in(&work, OWN_PROC_SCRIPT, &policy, &enforcement);
+        let sleeper = HostSleeper::start();
+        let host = run_bash_in(
+            &work,
+            &host_process_script(sleeper.pid()),
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_reads_own_proc(&own);
+        assert_sees_no_host_process(&host, &[sleeper.pid(), std::process::id()]);
+    }
+
+    /// S8: a session whose probe could not mount a private `/proc` runs its commands with the
+    /// host's, where every open beneath `/proc` is refused as before, and says why.
+    #[test]
+    fn a_host_proc_view_keeps_proc_denied_and_says_why() {
+        let test = "a_host_proc_view_keeps_proc_denied_and_says_why";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash", "cat", "ls"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let refused =
+            crate::proc_view::ProcView::Host(crate::proc_view::HostProcReason::MountRefused(
+                "mounting proc over /proc failed with EPERM".to_string(),
+            ));
+        let enforcement = enforcement.with_proc_view(refused.clone());
+        assert_eq!(enforcement.installed_proc_view(), refused);
+        let result = run_bash_in(
+            &work,
+            "cat /proc/self/status; echo \"cat=$?\"; ls /proc/1 >/dev/null; echo \"ls=$?\"",
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert!(result.stdout.contains("cat=1"), "{}", result.stdout);
+        assert!(
+            result
+                .stderr
+                .contains("/proc/self/status: Permission denied"),
+            "{}",
+            result.stderr
+        );
+        let report = crate::proc_view::process_view_report(&refused);
+        assert!(!report.private);
+        assert!(report
+            .not_private_because
+            .is_some_and(|reason| reason.contains("failed with EPERM")),);
+    }
+
+    /// S8: a private-`/proc` mount that fails at spawn fails the spawn, naming the step and its
+    /// `errno` under the fixed prefix; nothing runs with the host's `/proc` instead.
+    #[test]
+    fn a_private_proc_mount_that_fails_at_spawn_fails_the_spawn() {
+        let test = "a_private_proc_mount_that_fails_at_spawn_fails_the_spawn";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        if !mounts_private_proc(test, &enforcement) {
+            return;
+        }
+        let _armed = ForcePrivateProcFailureGuard::new();
+        let error = crate::shell::execute_shell(
+            "bash",
+            &["-c", "echo ran > ran.txt"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(&work).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect_err("a failed private /proc mount must fail the spawn");
+        enforcement.end_session();
+        let error = error.to_string();
+        assert!(
+            error.contains(crate::proc_view::PRIVATE_PROC_FAILURE_PREFIX),
+            "{error}"
+        );
+        assert!(
+            error.contains("mounting proc over /proc failed: EPERM"),
+            "{error}"
+        );
+        assert!(!work.join("ran.txt").exists());
+    }
+
+    /// Every name-resolution file `scoped` grants is one `sealed` already grants, and the
+    /// resolver issues them read-only, unlistable and unexecutable on `KernelFull` alone.
+    #[test]
+    fn scoped_name_resolution_grants_are_a_read_only_subset_of_sealed_etc() {
+        for path in SCOPED_NAME_RESOLUTION_PATHS {
+            assert!(
+                crate::sealed::SEALED_ETC_PATHS
+                    .iter()
+                    .any(|entry| entry.path == *path && !entry.directory),
+                "{path} is not a SEALED_ETC_PATHS file"
+            );
+        }
+        let grants = resolve_scoped_name_resolution_landlock_grants(EnforcementTier::KernelFull);
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/etc/hosts"),
+                PathBuf::from("/etc/nsswitch.conf")
+            ]
+        );
+        assert!(grants
+            .iter()
+            .all(|grant| !grant.list_dir && !grant.executable && grant.pinned.is_none()));
+        for tier in [
+            EnforcementTier::KernelSealed,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+            EnforcementTier::Unconfined,
+        ] {
+            assert!(resolve_scoped_name_resolution_landlock_grants(tier).is_empty());
+        }
+    }
+
+    /// S8: a creator that cannot create the PID namespace is refused with `E-CAP-005` naming that
+    /// step, at the session's first command, and nothing runs.
+    #[test]
+    fn a_creator_refused_the_pid_namespace_is_refused_with_e_cap_005() {
+        let test = "a_creator_refused_the_pid_namespace_is_refused_with_e_cap_005";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = allow_only(&["bash"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let _armed = crate::network_namespace::ForcePidNamespaceFailure::arm();
+        let error = crate::shell::execute_shell(
+            "bash",
+            &["-c", "echo ran > ran.txt"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(&work).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect_err("a session without its PID namespace must not run");
+        enforcement.end_session();
+        let error = error.to_string();
+        assert!(error.contains("E-CAP-005"), "{error}");
+        assert!(
+            error
+                .contains("unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID) failed with EPERM"),
+            "{error}"
+        );
+        assert!(error.contains("CLONE_NEWPID"), "{error}");
+        assert!(!work.join("ran.txt").exists());
+    }
+
     /// The trust-store grant reaches the certificates and nothing beside them: not the directory
     /// above, its OpenSSL configuration or its private keys, and nothing is writable.
     #[test]
@@ -13356,6 +14311,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 )),
                 mount: crate::namespace_probe::MountAttempt::NotAttempted,
                 sealed_root: crate::namespace_probe::MountAttempt::NotAttempted,
+                private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
                 userns_grant: crate::sealed::UsernsGrant::Withheld,
                 attachment: crate::sealed::ProfileAttachment::NotReported,
             },

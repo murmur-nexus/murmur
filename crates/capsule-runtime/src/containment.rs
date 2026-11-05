@@ -1201,6 +1201,10 @@ pub struct ScopeReport {
     /// `network.allow` is empty or the host has none of the locations
     /// [`crate::trust_store`] checks.
     pub trust_store: Vec<String>,
+    /// The host files a command reads to resolve `localhost` and the other names `/etc/hosts`
+    /// carries, granted read-only by the tier: `/etc/hosts` and `/etc/nsswitch.conf` on the
+    /// Landlock tiers (`scoped`, `sealed`), `[]` on every other. Always serialized.
+    pub name_resolution: Vec<String>,
     /// Every host folder `~/.murmur/config.yaml`'s `host_paths:` lends this session, in config
     /// order, with what the applied tier does with it (see [`crate::host_paths`]). Always
     /// serialized, `[]` with none. A grant from the operator's global config, never the manifest,
@@ -1345,6 +1349,10 @@ pub struct ScopeReport {
     /// [`temp_dir_report`] on the session's [`crate::temp_dir::temp_mapping`] answer — the one
     /// its enforcement installs. Always serialized.
     pub temp_dir: TempDirReport,
+    /// Which `/proc` the session's commands see, from [`crate::proc_view::process_view_report`]
+    /// on the view the session's probe decided ([`Self::with_process_view`]) — the one its
+    /// enforcement installs. Always serialized.
+    pub process_view: crate::proc_view::ProcessViewReport,
     /// Who the capsule's subprocesses run as when the session is unconfined; `null` on every
     /// contained session. Always serialized.
     pub unconfined: Option<UnconfinedReport>,
@@ -1542,6 +1550,8 @@ impl ScopeReport {
         out.push_str(&render_records_dir(&self.records_dir));
         out.push('\n');
         out.push_str(&render_temp_dir(&self.temp_dir));
+        out.push('\n');
+        out.push_str(&crate::proc_view::render_process_view(&self.process_view));
 
         out.push_str(&render_not_protected(&self.filesystem_boundary));
 
@@ -1591,6 +1601,7 @@ impl ScopeReport {
             &self.derived_interpreter_runtime,
         );
         push_list(&mut out, "trust store", &self.trust_store);
+        push_list(&mut out, "name resolution", &self.name_resolution);
         push_list(
             &mut out,
             "host paths",
@@ -1758,6 +1769,14 @@ impl ScopeReport {
         rows: Vec<crate::manifest_files::ManifestFileReport>,
     ) -> Self {
         self.manifest_files = rows;
+        self
+    }
+
+    /// This report with [`Self::process_view`] stating `view`, the `/proc` the session's probe
+    /// decided its commands see.
+    #[must_use]
+    pub fn with_process_view(mut self, view: &crate::proc_view::ProcView) -> Self {
+        self.process_view = crate::proc_view::process_view_report(view);
         self
     }
 
@@ -2006,7 +2025,11 @@ pub fn explain_scope(
         &placement,
         temp_mapping,
         io_max,
-    ))
+    )
+    .with_process_view(&crate::proc_view::proc_view(
+        decision.applied_tier(),
+        probe.namespaces(),
+    )))
 }
 
 /// `mur doctor`'s `Runtime directory`, `Records directory` and `Temporary folder` sections for a
@@ -2031,6 +2054,10 @@ pub fn doctor_runtime_dir(
         runtime_dir: runtime_dir_report(applied, abi, &placement),
         records_dir: records_dir_report(applied, abi, &placement),
         temp_dir: temp_dir_report(temp_mapping, &placement),
+        process_view: crate::proc_view::process_view_report(&crate::proc_view::proc_view(
+            applied,
+            probe.namespaces(),
+        )),
         placement,
     })
 }
@@ -2041,6 +2068,7 @@ pub struct DoctorDirReports {
     pub runtime_dir: RuntimeDirReport,
     pub records_dir: RuntimeDirReport,
     pub temp_dir: TempDirReport,
+    pub process_view: crate::proc_view::ProcessViewReport,
     pub placement: RuntimeDirPlacement,
 }
 
@@ -2201,6 +2229,17 @@ pub(crate) fn scope_report_for_tier(
                     .collect::<Vec<_>>()
             })
             .collect(),
+        // Keyed on the applied tier: the Landlock tiers grant these files whatever the manifest
+        // says, and every other tier grants nothing.
+        name_resolution: match applied {
+            EnforcementTier::KernelFull | EnforcementTier::KernelSealed => {
+                crate::sandbox::SCOPED_NAME_RESOLUTION_PATHS
+                    .iter()
+                    .map(|path| (*path).to_string())
+                    .collect()
+            }
+            _ => Vec::new(),
+        },
         trust_store: policy
             .shell_trust_store
             .iter()
@@ -2246,6 +2285,11 @@ pub(crate) fn scope_report_for_tier(
         runtime_dir,
         records_dir,
         temp_dir: temp_dir_report(temp_mapping, runtime_dir_placement),
+        // Until a caller holding the session's probe states it through `with_process_view`, the
+        // report claims no private view.
+        process_view: crate::proc_view::process_view_report(&crate::proc_view::tier_proc_view(
+            applied,
+        )),
         unconfined,
     }
 }

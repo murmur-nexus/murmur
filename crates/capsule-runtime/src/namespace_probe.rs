@@ -17,10 +17,17 @@
 //!   3. **sealed root** — in a second joining child, the composed root's nested construction:
 //!      `unshare(CLONE_NEWUSER | CLONE_NEWNS)`, identity maps, `MS_REC | MS_PRIVATE`, a `tmpfs`,
 //!      `pivot_root(2)`, detaching the old root.
+//!   4. **private proc** — in a third joining child that also enters the session's PID namespace
+//!      and forks into it, as a command's relay does: `unshare(CLONE_NEWNS)`, `MS_REC |
+//!      MS_PRIVATE`, and `mount -t proc` over `/proc` with the `hidepid` spellings
+//!      [`crate::proc_view`] mounts with.
 //!
-//! The two mount attempts run inside the probe's network namespace because no command runs
-//! outside one: a command joins its session's namespace first, on every tier, and only then builds
-//! its mount namespace. A host that cannot create the network namespace attempts neither.
+//! The creator the network attempt runs also creates the session's PID namespace and its holder,
+//! so that attempt exercises the PID namespace too; dropping its handles ends the holder.
+//!
+//! The mount attempts run inside the probe's network namespace because no command runs outside
+//! one: a command joins its session's namespaces first, on every tier, and only then builds its
+//! mount namespace. A host that cannot create the network namespace attempts none of them.
 //!
 //! AppArmor's unprivileged-userns restriction and the profile confining `mur` are read with the
 //! attempts, and only ever choose the words of a refusal: no decision reads them.
@@ -49,12 +56,18 @@ pub enum MountStep {
     PivotPrepare = 9,
     PivotRoot = 10,
     DetachOldRoot = 11,
+    /// `setns(2)` into the session's PID namespace.
+    JoinPidNamespace = 12,
+    /// Forking into the session's PID namespace.
+    ForkIntoPidNamespace = 13,
+    /// `mount -t proc` over `/proc`, every `hidepid` spelling refused.
+    MountProc = 14,
 }
 
 impl MountStep {
     // Only the Linux probe decodes a step; tests on every OS check the encoding round-trips.
     #[cfg(any(target_os = "linux", test))]
-    const ALL: [MountStep; 11] = [
+    const ALL: [MountStep; 14] = [
         Self::JoinSession,
         Self::UnshareMount,
         Self::MakePrivate,
@@ -66,6 +79,9 @@ impl MountStep {
         Self::PivotPrepare,
         Self::PivotRoot,
         Self::DetachOldRoot,
+        Self::JoinPidNamespace,
+        Self::ForkIntoPidNamespace,
+        Self::MountProc,
     ];
 
     /// The step a rehearsal record's code names, or `None` for a code no step carries.
@@ -91,6 +107,9 @@ impl MountStep {
             Self::PivotPrepare => "creating the old root's parking directory and entering the root",
             Self::PivotRoot => "pivot_root(2)",
             Self::DetachOldRoot => "detaching the old root",
+            Self::JoinPidNamespace => "joining the session's PID namespace (setns)",
+            Self::ForkIntoPidNamespace => "forking into the session's PID namespace",
+            Self::MountProc => "mounting proc over /proc",
         }
     }
 }
@@ -152,6 +171,9 @@ pub struct NamespaceReading {
     /// The composed root's nested user+mount namespace and `pivot_root(2)`, inside the network
     /// namespace.
     pub sealed_root: MountAttempt,
+    /// A private `procfs` mounted over `/proc` by a process forked into the session's PID
+    /// namespace, in its own mount namespace: what decides [`crate::proc_view::proc_view`].
+    pub private_proc: MountAttempt,
     /// AppArmor's unprivileged-userns restriction as read with the attempts. Words a refusal;
     /// decides nothing.
     pub userns_grant: UsernsGrant,
@@ -168,6 +190,7 @@ impl NamespaceReading {
             network: Ok(()),
             mount: MountAttempt::NotAttempted,
             sealed_root: MountAttempt::NotAttempted,
+            private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::default(),
             attachment: ProfileAttachment::NotReported,
         }
@@ -190,6 +213,13 @@ impl NamespaceReading {
     #[must_use]
     pub fn mount_namespace_created(&self) -> bool {
         self.network.is_ok() && self.mount == MountAttempt::Created
+    }
+
+    /// Whether a command can mount a private `procfs` of the session's PID namespace over
+    /// `/proc`.
+    #[must_use]
+    pub fn private_proc_created(&self) -> bool {
+        self.network.is_ok() && self.private_proc == MountAttempt::Created
     }
 
     /// Whether the composed root `sealed` runs in was built: the nested user+mount namespace,
@@ -251,25 +281,35 @@ pub(crate) fn probe_failure_sentence(failed_call: &str, errno: i32) -> String {
 pub(crate) fn probe_namespaces() -> NamespaceReading {
     use crate::network_namespace::{create_session_netns, CapsuleNetnsPlan};
 
-    let (network, mount, sealed_root) =
+    let (network, mount, sealed_root, private_proc) =
         match create_session_netns(&CapsuleNetnsPlan::resolve(Vec::new())) {
             Err(error) => (
                 Err(error),
                 MountAttempt::NotAttempted,
                 MountAttempt::NotAttempted,
+                MountAttempt::NotAttempted,
             ),
             Ok(created) => {
                 let (user_fd, net_fd) = created.namespace_handles();
-                let mount = linux::rehearse(linux::Rehearsal::PrivateTmp, user_fd, net_fd);
-                let sealed_root = linux::rehearse(linux::Rehearsal::SealedRoot, user_fd, net_fd);
+                let pid_fd = created.pid_namespace_handle();
+                let handles = linux::Handles {
+                    user_fd,
+                    net_fd,
+                    pid_fd,
+                };
+                let mount = linux::rehearse(linux::Rehearsal::PrivateTmp, handles);
+                let sealed_root = linux::rehearse(linux::Rehearsal::SealedRoot, handles);
+                let private_proc = linux::rehearse(linux::Rehearsal::PrivateProc, handles);
+                // Closes the holder's lifeline too, which ends the probe's PID namespace.
                 drop(created);
-                (Ok(()), mount, sealed_root)
+                (Ok(()), mount, sealed_root, private_proc)
             }
         };
     NamespaceReading {
         network,
         mount,
         sealed_root,
+        private_proc,
         userns_grant: crate::sealed::userns_grant(),
         attachment: crate::sealed::inspect_profile_attachment(),
     }
@@ -307,7 +347,7 @@ mod linux {
         OLD_ROOT_PIVOTED_C, SEALED_ROOT_BASE_CANDIDATES,
     };
 
-    /// Which of the two mount rehearsals to run.
+    /// Which of the three mount rehearsals to run.
     #[derive(Debug, Clone, Copy)]
     pub(super) enum Rehearsal {
         /// A command's `/tmp` mapping: `unshare(CLONE_NEWNS)`, private propagation, a bind over
@@ -315,6 +355,9 @@ mod linux {
         PrivateTmp,
         /// The composed root's nested namespace, maps, mounts and pivot.
         SealedRoot,
+        /// A command's private `/proc`: `setns` into the PID namespace, a fork into it, then in
+        /// the forked process `unshare(CLONE_NEWNS)`, private propagation and `mount -t proc`.
+        PrivateProc,
     }
 
     impl Rehearsal {
@@ -322,8 +365,17 @@ mod linux {
             match self {
                 Rehearsal::PrivateTmp => "mount rehearsal",
                 Rehearsal::SealedRoot => "sealed-root rehearsal",
+                Rehearsal::PrivateProc => "private-procfs rehearsal",
             }
         }
+    }
+
+    /// The session namespace handles a rehearsal joins, held open by the caller.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct Handles {
+        pub(super) user_fd: RawFd,
+        pub(super) net_fd: RawFd,
+        pub(super) pid_fd: RawFd,
     }
 
     /// Every path the child uses, built in the parent before `fork()`.
@@ -365,9 +417,9 @@ mod linux {
         }
     }
 
-    /// Runs `rehearsal` in a child that first joins the namespaces `user_fd` and `net_fd` name,
-    /// and reports what it did.
-    pub(super) fn rehearse(rehearsal: Rehearsal, user_fd: RawFd, net_fd: RawFd) -> MountAttempt {
+    /// Runs `rehearsal` in a child that first joins the user and network namespaces `handles`
+    /// name, and reports what it did.
+    pub(super) fn rehearse(rehearsal: Rehearsal, handles: Handles) -> MountAttempt {
         let failed = |detail: String| MountAttempt::Failed(MountAttemptError::Rehearsal(detail));
         let paths = match Paths::resolve() {
             Ok(paths) => paths,
@@ -394,8 +446,8 @@ mod linux {
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child runs only `setns`,
         // `unshare`, `prctl`, `mount`, `open`/`write`/`close`, `mkdir`, `chdir`, `pivot_root`
-        // via `syscall` and `umount2` over paths built above, then `write` and `_exit`: no
-        // allocation, no locks, no stdio.
+        // via `syscall`, `umount2`, `fork` and `waitpid` over paths built above, then `write`
+        // and `_exit`: no allocation, no locks, no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return failed(format!(
@@ -408,7 +460,7 @@ mod linux {
             // SAFETY: forked-child context, syscalls only; the block ends in `_exit`, so no
             // destructor of the parent's state runs here.
             unsafe {
-                let record = match run(rehearsal, &paths, user_fd, net_fd) {
+                let record = match run(rehearsal, &paths, handles, write_fd) {
                     Ok(()) => encode_step_record(0, 0),
                     Err((step, errno)) => encode_step_record(step as u32, errno),
                 };
@@ -457,17 +509,69 @@ mod linux {
     unsafe fn run(
         rehearsal: Rehearsal,
         paths: &Paths,
-        user_fd: RawFd,
-        net_fd: RawFd,
+        handles: Handles,
+        report_fd: RawFd,
     ) -> Result<(), (MountStep, i32)> {
         // SAFETY: the caller's contract covers this whole body.
         unsafe {
             let errno = || *libc::__errno_location();
             // Every command joins its session's namespaces before anything else, on every tier.
-            if let Err(error) = crate::network_namespace::join_session_netns(user_fd, net_fd) {
+            if let Err(error) =
+                crate::network_namespace::join_session_netns(handles.user_fd, handles.net_fd)
+            {
                 return Err((MountStep::JoinSession, error.raw_os_error().unwrap_or(0)));
             }
             match rehearsal {
+                // A command's relay and command: `setns` into the PID namespace, then a fork, so
+                // the mounting process is a member of the namespace its `procfs` describes.
+                Rehearsal::PrivateProc => {
+                    if libc::setns(handles.pid_fd, libc::CLONE_NEWPID) != 0 {
+                        return Err((MountStep::JoinPidNamespace, errno()));
+                    }
+                    let member = libc::fork();
+                    if member < 0 {
+                        return Err((MountStep::ForkIntoPidNamespace, errno()));
+                    }
+                    if member == 0 {
+                        // The member reports for the whole rehearsal, then exits `0`.
+                        let record = match crate::proc_view::mount_private_proc(true) {
+                            Ok(_) => encode_step_record(0, 0),
+                            Err((step, step_errno)) => {
+                                let step = match step {
+                                    crate::proc_view::ProcMountStep::UnshareMount => {
+                                        MountStep::UnshareMount
+                                    }
+                                    crate::proc_view::ProcMountStep::MakePrivate => {
+                                        MountStep::MakePrivate
+                                    }
+                                    crate::proc_view::ProcMountStep::MountProc
+                                    | crate::proc_view::ProcMountStep::OpenProc => {
+                                        MountStep::MountProc
+                                    }
+                                };
+                                encode_step_record(step as u32, step_errno)
+                            }
+                        };
+                        libc::write(report_fd, record.as_ptr().cast(), record.len());
+                        libc::_exit(0);
+                    }
+                    let mut status = 0;
+                    loop {
+                        let waited = libc::waitpid(member, &mut status, 0);
+                        if waited == member {
+                            break;
+                        }
+                        if waited < 0 && errno() == libc::EINTR {
+                            continue;
+                        }
+                        return Err((MountStep::ForkIntoPidNamespace, errno()));
+                    }
+                    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                        // The member wrote the rehearsal's record; this child adds none.
+                        libc::_exit(0);
+                    }
+                    return Err((MountStep::ForkIntoPidNamespace, 0));
+                }
                 // `temp_dir::map_private_tmp`'s namespace and propagation, then a bind over `/tmp`
                 // with its flags: recursive, because a mount namespace owned by a less privileged
                 // user namespace refuses a plain bind of a tree with mounts beneath it (`EINVAL`).
@@ -587,6 +691,7 @@ mod tests {
             network: Ok(()),
             mount: MountAttempt::Created,
             sealed_root: MountAttempt::Created,
+            private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::Withheld,
             attachment: ProfileAttachment::Unconfined,
         }

@@ -606,9 +606,9 @@ fn an_unconfined_command_runs_as_the_operator() {
     ] {
         assert!(seen.contains(&expected), "{expected} not in {text}");
     }
-    // Landlock grants no `/proc/self/status` read under `scoped`, so the contained command
-    // cannot even print its `NoNewPrivs`; the sandbox's own tests pin that it is set.
-    assert!(!seen.iter().any(|line| line.starts_with("nnp=")), "{text}");
+    // Under `scoped` the command reads its own `/proc/self/status` through the session's private
+    // `/proc`, and its `NoNewPrivs` is set.
+    assert!(seen.contains(&"nnp=1"), "{text}");
     let home_line = seen.iter().find(|line| line.starts_with("home=")).unwrap();
     assert_ne!(*home_line, format!("home={home}"), "{text}");
     assert!(home_line.ends_with("/home"), "{text}");

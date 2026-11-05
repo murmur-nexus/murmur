@@ -81,6 +81,22 @@ Three mechanisms enforce the block, in descending order of portability:
 | A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host. `cgroup_cpu_percent` is the scope's `cpu.max`, written only when declared |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The [work folder](workdir.md#work-folder-ceiling), the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) are walked every 10 seconds and their sizes summed. The cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` — `work folder, $HOME and $TMPDIR together grew to <N> bytes, past the <M> byte ceiling (capabilities.resources.workdir_max_bytes)` — and blocks any further subprocess. The breach's `logs/bootstrap.log` line appends `; measured: <work folder>, <tmp>, <home>` |
 
+### `memory_bytes` and `cgroup_memory_bytes` { #address-space-and-memory }
+
+The two memory fields bound different things:
+
+| Field | Bounds | Mechanism |
+|---|---|---|
+| `memory_bytes` | Each process's address space: what it reserves, used or not | `RLIMIT_AS` on Linux, `RLIMIT_DATA` on macOS |
+| `cgroup_memory_bytes` | The memory the whole subprocess tree actually uses | The cgroup scope's `memory.max` |
+
+Runtimes that reserve far more address space than they use fail under `memory_bytes` well below
+their real memory use: V8, the engine in `node`, fails with `Cannot allocate Wasm memory`, and the
+JVM fails to start its heap. For those, set `memory_bytes` high —
+`68719476736` (64 GiB) runs `node` — and cap RAM with `cgroup_memory_bytes`. A capsule whose
+`capabilities.shell.allow` names `node` or `nodejs` under a limit below 32 GiB, the 2 GiB default
+included, draws [`W-RUN-010`](diagnostics.md#w-run-010).
+
 ### `max_processes` by platform { #max-processes-headroom }
 
 `RLIMIT_NPROC` counts everything the user account owns on the host rather than the processes in the
@@ -95,6 +111,10 @@ bounds the tree:
 
 The count is taken at each spawn, so threads and processes the rest of the host starts during a
 session do not use up the capsule's headroom.
+
+On a Linux kernel tier each running command holds one task more than the program itself: a relay
+outside the session's [PID namespace](containment.md#capsule-proc) that waits for it. The relay
+counts against `cgroup_pids_max`, or against `max_processes` where no scope bounds the tree.
 
 ### Platform behavior { #platform-behavior }
 

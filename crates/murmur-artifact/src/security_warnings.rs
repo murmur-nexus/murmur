@@ -37,11 +37,13 @@ pub const W_SEC_004: &str = "W-SEC-004";
 /// `domain` refuses `AF_UNIX` unless `capabilities.network.unix_sockets` is declared and refuses
 /// `AF_NETLINK`/`AF_PACKET` unconditionally, so a capsule cannot reach a host daemon socket such as
 /// `/var/run/docker.sock`; and the forked shell child drops every Linux
-/// capability and sets `no_new_privs` before `execve`. Fires on both Linux kernel tiers, the
-/// sealed one with its own notice: there `/proc` is a bind of the host's, because the tier creates
-/// no PID namespace. Landlock refuses reading host `/proc` content at both `scoped` and `sealed`;
-/// what still reaches outside the capsule is `stat(2)` on `/proc/<pid>` (existence, owner, start
-/// time) and signal delivery to any process of the same user.
+/// capability and sets `no_new_privs` before `execve`. On both tiers it also grants read-only
+/// `/etc/hosts` and `/etc/nsswitch.conf`, and commands run in the session's own PID namespace with
+/// a private, read-and-list `/proc` that lists only the session's processes and the kernel's
+/// world-readable files. Fires on both Linux kernel tiers, the sealed one with its own notice:
+/// there `/proc` is a bind of that private procfs. Where the host cannot mount a private procfs,
+/// `/proc` is the host's on both tiers and Landlock refuses every open beneath it; what still
+/// reaches outside the capsule then is `stat(2)` on `/proc/<pid>` (existence, owner, start time).
 pub const W_SEC_005: &str = "W-SEC-005";
 
 /// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,

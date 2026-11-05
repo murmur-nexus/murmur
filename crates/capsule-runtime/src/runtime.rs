@@ -2602,6 +2602,11 @@ pub fn stage_session(
         // `prepare_scope`'s real write outcome before `session_start` is written.
         crate::cgroup::IoMaxReport::default(),
     )
+    // The view `ShellEnforcement::resolve` installs from the same probe.
+    .with_process_view(&crate::proc_view::proc_view(
+        containment.applied_tier(),
+        host_probe.namespaces(),
+    ))
     .with_parent_workdir(request.parent_workdir_snapshot.clone())
     .with_images(
         request
@@ -2692,6 +2697,15 @@ pub fn stage_session(
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
     warn_on_interpreter_runtime_grants(&request.capability_policy.shell_interpreter_runtime);
+    // Beside it, for the same reason: a capsule-wide declaration — here an address-space limit
+    // V8 cannot run under — whose cost the operator should read once, before anything happens.
+    if let Some(line) = crate::resources::v8_address_space_warning(
+        &request.capability_policy.shell_allow,
+        request.capability_policy.declared_resources.memory_bytes,
+        unconfined,
+    ) {
+        crate::runtime_err!("[capsule-runtime] {line}");
+    }
     // Same seam, same reason: a capsule-wide declaration whose cost the operator should see stated
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
