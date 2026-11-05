@@ -2,17 +2,18 @@
 // runtime applies. The input is `{"op": …}`, or `{"op":"seq","steps":[…]}` for several in one
 // call; the data is JSON: the operation's output, or `{"error":{"kind","rule","reason"}}`.
 //
-// Ops: `run` (`program`, `args`, `env`, `stdin` or `stdin_repeat`, `timeout_ms`, `quiet`), `start` (`name`, `program`,
-// `args`, `env`), `find` (`name`), `status`, `write` (`data`), `read` (`max`), `wait_output`
-// (`contains`, `timeout_ms`), `stop`, and `connect` (`port`, `send`, `timeout_ms`). The ops after
-// `start` and `find` take `handle`, or `name` to find it first.
+// Ops: `run` (`program`, `args`, `env`, `stdin` or `stdin_repeat`, `timeout_ms`, `quiet`),
+// `start` (`name`, `program`, `args`, `env`), `find` (`name`), `status`, `write` (`data`), `read`
+// (`max`), `wait_output` (`contains`, `timeout_ms`), `wait_exit` (`timeout_ms`), `stop`, and
+// `connect` (`port`, `send`, `timeout_ms`). The ops after `start` and `find` take `handle`, or
+// `name` to find it first.
 wit_bindgen::generate!({
     path: "../../../../../../capsule-runtime/wit/guest",
     world: "tool",
     generate_all,
 });
 
-use murmur::process::process as process;
+use murmur::process::process;
 use serde_json::{json, Value};
 
 struct ProcessProbe;
@@ -93,7 +94,8 @@ fn handle_of(request: &Value) -> Result<String, Value> {
         return Ok(handle.to_string());
     }
     let name = request["name"].as_str().unwrap_or_default();
-    process::find(name).ok_or_else(|| json!({"error": {"kind": "not-found", "rule": "", "reason": name}}))
+    process::find(name)
+        .ok_or_else(|| json!({"error": {"kind": "not-found", "rule": "", "reason": name}}))
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -103,9 +105,14 @@ fn text(bytes: &[u8]) -> String {
 fn op(request: &Value) -> Value {
     match request["op"].as_str().unwrap_or_default() {
         "run" => {
-            let stdin = request["stdin"].as_str().map(|s| s.as_bytes().to_vec()).or_else(|| {
-                request["stdin_repeat"].as_u64().map(|count| vec![b'x'; count as usize])
-            });
+            let stdin = request["stdin"]
+                .as_str()
+                .map(|s| s.as_bytes().to_vec())
+                .or_else(|| {
+                    request["stdin_repeat"]
+                        .as_u64()
+                        .map(|count| vec![b'x'; count as usize])
+                });
             match process::run(&process::RunRequest {
                 program: request["program"].as_str().unwrap_or_default().to_string(),
                 args: strings(&request["args"]),
@@ -141,7 +148,9 @@ fn op(request: &Value) -> Value {
             args: strings(&request["args"]),
             env: env(&request["env"]),
         }) {
-            Ok(started) => json!({"handle": started.handle, "already_running": started.already_running}),
+            Ok(started) => {
+                json!({"handle": started.handle, "already_running": started.already_running})
+            }
             Err(error) => error_json(error),
         },
         "find" => json!({"handle": process::find(request["name"].as_str().unwrap_or_default())}),
@@ -194,6 +203,23 @@ fn op(request: &Value) -> Value {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     waited += 50;
+                }
+            }
+            Err(error) => error,
+        },
+        "wait_exit" => match handle_of(request) {
+            Ok(handle) => {
+                let timeout = request["timeout_ms"].as_u64().unwrap_or(10_000);
+                let mut waited = 0u64;
+                loop {
+                    match process::status(&handle) {
+                        Ok(process::State::Running) if waited < timeout => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            waited += 50;
+                        }
+                        Ok(state) => break state_json(state),
+                        Err(error) => break error_json(error),
+                    }
                 }
             }
             Err(error) => error,

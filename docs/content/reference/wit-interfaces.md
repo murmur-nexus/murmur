@@ -603,7 +603,7 @@ The interface is served to an agent capsule's tool calls, on `transport: http` a
 
 | Function | What it does |
 |---|---|
-| `run(request)` | Runs `program` with `args`, `env` and optional `stdin` bytes (then end-of-file) and returns its exit code and output. The time limit is `timeout-ms`, clamped to what is left of the tool call's [`deadline_seconds`](manifest.md); past it the process group is killed (`SIGKILL`), and the output so far returns with `timed-out` set and exit code `137`. A non-zero exit is data, not an error. Nothing it starts outlives the tool call |
+| `run(request)` | Runs `program` with `args`, `env` and optional `stdin` bytes (then end-of-file) and returns its exit code and output. The time limit is `timeout-ms`, clamped to what is left of the tool call's [`deadline_seconds`](manifest.md); past it the process group is killed (`SIGKILL`), and the output so far returns with `timed-out` set and exit code `137`. A non-zero exit is data, not an error. Whatever it leaves running in its process group is killed when it exits, so nothing it starts outlives the tool call |
 | `start(request)` | Starts `program` under `name` and returns its handle. A name already running for this tool returns that handle with `already-running` set, before anything is checked or asked: nothing new runs. A name whose process has exited starts a new one |
 | `find(name)` | This tool's latest handle under `name`, running or exited; `none` if it started none |
 | `status(handle)` | `running` or `exited(code)` |
@@ -621,15 +621,17 @@ The interface is served to an agent capsule's tool calls, on `transport: http` a
 
 A handle is `prc_` followed by lowercase hex. It resolves only for the tool that started the
 process: any other tool gets `unknown-handle`, and its `find` of the same name returns `none`.
-Every session process is killed with its process group when the session ends.
+When a session process's program exits, whatever it left running in its process group is
+killed, so an exited process holds nothing running. Every session process is killed with its
+process group when the session ends.
 
 `connect` reaches a port only while a process in the handle's process group holds a socket
 listening on it at a loopback or wildcard address, as that process's own network namespace
 reports it. Every other port is refused with rule `connect`, whatever listens there: another
 session process, the session's egress proxy, or on the unconfined tier any host service.
 
-A refusal is `refused({ rule, reason })`, nothing ran, and a `process_refused` line is
-[traced](observability-schemas.md#process-refused):
+A refusal is `refused({ rule, reason })` and nothing ran. Every refusal except `unavailable` and
+`session-ended` writes a [`process_refused`](observability-schemas.md#process-refused) trace line:
 
 | `rule` | Refused because |
 |---|---|

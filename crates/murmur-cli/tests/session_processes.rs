@@ -667,6 +667,94 @@ fn a_session_holds_at_most_eight_processes() {
     }
 }
 
+/// How many processes run `sleep <arg>`, read from the host's `/proc` (a zombie has no command
+/// line, so the dead are not counted).
+fn sleeps_running(arg: &str) -> usize {
+    let wanted = format!("sleep\0{arg}\0");
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| cmdline == wanted.as_bytes())
+        })
+        .count()
+}
+
+/// S8 and S9 for a program that forks: when a session process's program exits, what it left in
+/// its process group is killed, so an exited process holds nothing running and the cap counts
+/// what runs.
+#[test]
+fn a_session_process_that_exits_takes_its_group_with_it() {
+    let name = "a_session_process_that_exits_takes_its_group_with_it";
+    if common::skip_without_host_support(name) {
+        return;
+    }
+    let fixture = Fixture::new();
+    for (tier, sleep_arg) in tiers(name).into_iter().zip(["297.25", "297.75"]) {
+        let program = format!("sleep {sleep_arg} & echo started $!");
+        let steps: Vec<Value> = (1..=9)
+            .flat_map(|index| {
+                let name = format!("fork-{index}");
+                [
+                    json!({"op": "start", "name": name, "program": "sh", "args": ["-c", program]}),
+                    json!({"op": "wait_output", "name": name, "contains": "started"}),
+                    json!({"op": "wait_exit", "name": name}),
+                ]
+            })
+            .collect();
+
+        // A host-side watch over the whole run: the most `sleep`s of this scenario alive at once.
+        let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let watcher = {
+            let watching = std::sync::Arc::clone(&watching);
+            let sleep_arg = sleep_arg.to_string();
+            std::thread::spawn(move || {
+                let mut most = 0;
+                while watching.load(std::sync::atomic::Ordering::SeqCst) {
+                    most = most.max(sleeps_running(&sleep_arg));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                most
+            })
+        };
+        let run = fixture.run(
+            tier,
+            &shell_allow(&["sh", "sleep"]),
+            vec![call("forks", json!({"op": "seq", "steps": steps}))],
+            false,
+            false,
+        );
+        watching.store(false, std::sync::atomic::Ordering::SeqCst);
+        let most = watcher.join().unwrap();
+
+        let forks = run.result("forks");
+        for step in forks.as_array().unwrap().chunks(3) {
+            let label = format!("{tier}: {step:?}");
+            assert_eq!(step[0]["already_running"], false, "{label}");
+            assert_eq!(step[1]["found"], true, "{label}");
+            assert_eq!(step[2]["state"], "exited", "{label}");
+        }
+        // Nine programs each forked a `sleep`; each `sleep` died with its program, before the next
+        // started. Without that, nine would run at once.
+        assert!(
+            most <= 2,
+            "{tier}: {most} sleeps of exited programs ran at once"
+        );
+        assert!(run.events("process_refused").is_empty(), "{tier}");
+        let starts = run.events("process_start");
+        assert_eq!(starts.len(), 9, "{tier}");
+        for exit in run.events("process_exit") {
+            assert_eq!(exit["reason"], "exited", "{tier}: {exit}");
+        }
+        for start in &starts {
+            let pgid = start["pid"].as_i64().unwrap();
+            assert!(group_is_empty(pgid), "{tier}: group {pgid} is not empty");
+        }
+        assert_eq!(sleeps_running(sleep_arg), 0, "{tier}");
+        run.assert_process_lines_are_attributed();
+    }
+}
+
 /// S11: a second tool sees none of the first tool's processes and starts its own.
 #[test]
 fn another_tool_cannot_reach_the_first_tools_processes() {

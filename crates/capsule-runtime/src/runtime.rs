@@ -12759,12 +12759,10 @@ impl GatedStepCall {
     /// The same [`ResolvedCall`] the decision point is shown for the equivalent call made
     /// directly, so a plan step and an agent turn are judged on the same values.
     ///
-    /// The shell arm is resolved here rather than through [`resolve_shell_call`] because the two
-    /// forms differ: a shell *tool* call carries a `command` string the runtime always hands to
-    /// the interpreter as `-c`, while a plan step carries a whole argv the scheduler execs
-    /// directly. `script` is therefore set only for the `-c` form that actually reaches a shell —
-    /// which is exactly the distinction `ProtectedPaths::check_shell` draws between a body whose
-    /// redirections are live and an argv where `>` is a literal argument.
+    /// The shell arm goes through [`ResolvedCall::shell_from_argv`] rather than
+    /// [`resolve_shell_call`] because the two forms differ: a shell *tool* call carries a
+    /// `command` string the runtime always hands to the interpreter as `-c`, while a plan step
+    /// carries a whole argv the scheduler execs directly.
     fn resolve(&self, workdir: &WorkdirRoot) -> ResolvedCall {
         match self {
             Self::Tool { name, input_json } => ResolvedCall::Tool {
@@ -12776,22 +12774,7 @@ impl GatedStepCall {
                 binary,
                 command,
                 argv,
-            } => {
-                let script = (is_shell_interpreter(binary)
-                    && argv.first().is_some_and(|first| first == "-c"))
-                .then(|| argv.get(1).cloned().unwrap_or_default());
-                let recipe = match script {
-                    Some(_) => None,
-                    None => crate::recipes::resolve_recipe(workdir, binary, argv),
-                };
-                ResolvedCall::Shell {
-                    binary: crate::sandbox::resolve_invoked_binary_path(binary),
-                    command: command.clone(),
-                    argv: argv.clone(),
-                    script,
-                    recipe,
-                }
-            }
+            } => ResolvedCall::shell_from_argv(binary, command.clone(), argv, workdir),
         }
     }
 }

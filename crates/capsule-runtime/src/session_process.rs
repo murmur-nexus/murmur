@@ -55,12 +55,10 @@ const RUN_DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 /// How long `connect` waits for the TCP handshake with a loopback listener.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The closed vocabulary of rules a refusal names.
+/// The closed vocabulary of rules a refusal names, with [`crate::agent::PROTECTED_PATH_RULE`].
 pub(crate) mod rule {
     pub(crate) const SHELL_ALLOW: &str = "capabilities.shell.allow";
     pub(crate) const ON_SHELL: &str = "on-shell";
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const READ_ONLY: &str = crate::agent::PROTECTED_PATH_RULE;
     pub(crate) const WORKDIR_BUDGET: &str = "capabilities.resources.max_workdir_bytes";
     pub(crate) const CAP: &str = "session-process-cap";
     pub(crate) const NAME: &str = "name";
@@ -150,20 +148,7 @@ pub(crate) fn resolve_process_call(
     args: &[String],
     workdir: &WorkdirRoot,
 ) -> ResolvedCall {
-    let script =
-        (crate::shell::is_shell_interpreter(program) && args.len() >= 2 && args[0] == "-c")
-            .then(|| args[1].clone());
-    let recipe = match script {
-        Some(_) => None,
-        None => crate::recipes::resolve_recipe(workdir, program, args),
-    };
-    ResolvedCall::Shell {
-        binary: crate::sandbox::resolve_invoked_binary_path(program),
-        command: posix_command_line(args),
-        argv: args.to_vec(),
-        script,
-        recipe,
-    }
+    ResolvedCall::shell_from_argv(program, posix_command_line(args), args, workdir)
 }
 
 /// `args` as one POSIX shell line: each argument as it is when it needs no quoting, else
@@ -736,7 +721,7 @@ impl SessionProcesses {
         let stdout = CappedCapture::spawn(child.stdout.take());
         let stderr = CappedCapture::spawn(child.stderr.take());
 
-        let waiter = tokio::task::spawn_blocking(move || child.wait());
+        let waiter = tokio::task::spawn_blocking(move || wait_and_kill_group(&mut child, pgid));
         tokio::pin!(waiter);
         let (status, timed_out) = match tokio::time::timeout(limit, &mut waiter).await {
             Ok(joined) => (joined, false),
@@ -745,7 +730,6 @@ impl SessionProcesses {
                 ((&mut waiter).await, true)
             }
         };
-        // Whatever the leader left running in its group goes with it.
         drop(guard);
         drop(cgroup_occupancy);
         let exit_code = match status {
@@ -969,7 +953,8 @@ impl SessionProcesses {
         let registry = Arc::clone(self);
         let reaped = Arc::clone(&process);
         tokio::spawn(async move {
-            let status = tokio::task::spawn_blocking(move || child.wait()).await;
+            let status =
+                tokio::task::spawn_blocking(move || wait_and_kill_group(&mut child, pgid)).await;
             drop(cgroup_occupancy);
             let exit_code = match status {
                 Ok(Ok(status)) => crate::shell::exit_code_of(&status),
@@ -1212,6 +1197,37 @@ impl Drop for SessionProcesses {
             process.signal(libc::SIGKILL);
         }
     }
+}
+
+/// Waits for a group leader to exit, kills whatever it left in its process group, then reaps it.
+///
+/// The leader stays a zombie until the kill is sent, so its pid still names its group and no
+/// other process can have taken it: a process a program forked dies when the program exits,
+/// and a session process that has exited holds nothing running.
+#[allow(unsafe_code)]
+fn wait_and_kill_group(
+    child: &mut std::process::Child,
+    pgid: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    let pid = libc::id_t::from(child.id());
+    loop {
+        // SAFETY: `siginfo_t` is plain data, for which all zeroes is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable `siginfo_t` that `waitid` only writes into. `pid` is
+        // this process's own unreaped child, and `WNOWAIT` leaves it waitable for `child.wait()`.
+        let waited =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if waited == 0 {
+            crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // `child.wait()` reports the same failure; without a zombie leader pinning the group
+            // id, signalling it could reach another process's group.
+            break;
+        }
+    }
+    child.wait()
 }
 
 /// Kills a `run`'s process group if its call's future is dropped before the run finished.
@@ -1516,10 +1532,21 @@ mod linux_connect {
         } else {
             libc::AF_INET6
         };
+        // A blocking `connect` gives up after the socket's send timeout, so a listener whose
+        // accept queue is full holds the child no longer than `CONNECT_TIMEOUT`.
+        let handshake_limit = libc::timeval {
+            tv_sec: libc::time_t::try_from(super::CONNECT_TIMEOUT.as_secs()).unwrap_or(5),
+            tv_usec: 0,
+        };
+        let no_limit = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let timeval_length = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
 
-        // SAFETY: the child runs only `setns`, `socket`, `connect`, `sendmsg`, `send` and
-        // `_exit` — async-signal-safe syscalls over stack locals and buffers built before the
-        // fork — with no allocation, no locks and no stdio.
+        // SAFETY: the child runs only `setns`, `socket`, `setsockopt`, `connect`, `sendmsg`,
+        // `send` and `_exit` — async-signal-safe syscalls over stack locals and buffers built
+        // before the fork — with no allocation, no locks and no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(format!(
@@ -1537,10 +1564,32 @@ mod linux_connect {
                 if socket < 0 {
                     fail(child_fd);
                 }
+                if libc::setsockopt(
+                    socket,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    (&raw const handshake_limit).cast(),
+                    timeval_length,
+                ) != 0
+                {
+                    fail(child_fd);
+                }
                 if libc::connect(
                     socket,
                     (&raw const storage).cast::<libc::sockaddr>(),
                     length,
+                ) != 0
+                {
+                    fail(child_fd);
+                }
+                // The tool's writes on the connection are bounded by its own call, not by the
+                // handshake's limit.
+                if libc::setsockopt(
+                    socket,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    (&raw const no_limit).cast(),
+                    timeval_length,
                 ) != 0
                 {
                     fail(child_fd);

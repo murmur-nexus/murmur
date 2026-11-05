@@ -34,7 +34,7 @@ grants it the same way:
 | Grant | Where | What it allows |
 |---|---|---|
 | The program's name | [`capabilities.shell.allow`](../reference/manifest.md) | Running it at all |
-| A containment class | [`capabilities.containment`](../reference/containment.md#wasm-tool-programs) | Nothing extra: the program runs at the session's tier, in its cgroup scope and network namespace |
+| A containment class | [`capabilities.containment`](../reference/containment.md#wasm-tool-programs) | The tier the program runs at: the session's, in its cgroup scope and network namespace |
 | Hosts it reaches | `capabilities.network.allow` | Outbound connections through the session's egress proxy, as for a shell command |
 
 ```yaml
@@ -52,8 +52,13 @@ and returns `refused` naming the rule:
 {"rule": "capabilities.shell.allow", "reason": "binary 'ls' is not in capabilities.shell.allow"}
 ```
 
-A session holds at most 8 running processes, and all of them are killed when it ends. Each tool
-sees only the processes it started.
+`capabilities.shell.allow` is one list for the whole capsule: every WASM tool in it can run every
+program the list names, as the model's shell calls can. A session holds at most 8 running
+processes, and all of them are killed when it ends. Each tool sees only the processes it started.
+
+A session process lives as long as the program `start` ran: when it exits, whatever it left
+running in its process group is killed. Start a server in its foreground mode, not one that
+forks into the background and exits.
 
 ## Tool dispatch
 

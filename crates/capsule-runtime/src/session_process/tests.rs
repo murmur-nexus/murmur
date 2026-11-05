@@ -134,7 +134,7 @@ async fn the_decision_point_sees_the_argv_that_runs_and_its_refusal_names_its_ru
                 lock(&seen).push((argv.clone(), command.clone(), script.clone()));
             }
             let _ = request.reply.send(Some(ProcessRefusal {
-                rule: rule::READ_ONLY,
+                rule: crate::agent::PROTECTED_PATH_RULE,
                 reason: "no".to_string(),
             }));
             true
@@ -150,7 +150,7 @@ async fn the_decision_point_sees_the_argv_that_runs_and_its_refusal_names_its_ru
         .run(run_request("touch", &["a b", "c"], None))
         .await
         .unwrap_err();
-    assert_eq!(rule_of(&error), Some(rule::READ_ONLY));
+    assert_eq!(rule_of(&error), Some(crate::agent::PROTECTED_PATH_RULE));
     assert!(!workdir.path().join("c").exists());
     let seen = lock(&seen);
     let (argv, command, script) = &seen[0];
@@ -487,4 +487,90 @@ async fn connect_reaches_a_real_listener_of_the_handles_own_group() {
     assert_eq!(bytes, b"pong");
     drop(listener);
     registry.end_session().await;
+}
+
+/// Whether `pid` has died (gone, or a zombie awaiting its reaper), waiting up to five seconds.
+async fn dies(pid: i32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let close = stat.rfind(')')?;
+                stat[close + 1..]
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned)
+            });
+        if state.is_none_or(|state| state == "Z") {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The pid a `sh -c '<child> & echo $!'` program printed.
+fn printed_pid(stdout: &[u8]) -> i32 {
+    String::from_utf8_lossy(stdout).trim().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_program_that_exits_takes_what_it_forked_with_it() {
+    let (registry, _workdir) = registry(&["sh"]);
+    let access = ctx(&registry, "probe", GateRoute::Ungated);
+    let mut table = ResourceTable::new();
+    let mut view = ProcessView {
+        access: &access,
+        table: &mut table,
+    };
+
+    let output = view
+        .run(run_request("sh", &["-c", "sleep 34 & echo $!"], None))
+        .await
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
+    let forked = printed_pid(&output.stdout);
+    assert!(
+        dies(forked).await,
+        "the run's forked pid {forked} outlived it"
+    );
+
+    let started = view
+        .start(start_request("fork", "sh", &["-c", "sleep 33 & echo $!"]))
+        .await
+        .unwrap();
+    let leader = registry.lookup("probe", &started.handle).unwrap();
+    assert!(leader.wait_exit(Duration::from_secs(10)).await);
+    assert!(matches!(
+        view.status(started.handle.clone()).await,
+        Ok(wit::State::Exited(0))
+    ));
+    let output = view.read(started.handle.clone(), 4096).await.unwrap();
+    let forked = printed_pid(&output.stdout);
+    assert!(
+        dies(forked).await,
+        "pid {forked} outlived its exited leader {}",
+        leader.pgid()
+    );
+    assert!(lock(&registry.state).live_count() == 0);
+
+    registry.end_session().await;
+    let pgid = leader.pgid().to_string();
+    let left: Vec<_> = std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("stat")).is_ok_and(|stat| {
+                stat.rfind(')').is_some_and(|close| {
+                    let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+                    fields.first() != Some(&"Z") && fields.get(2) == Some(&pgid.as_str())
+                })
+            })
+        })
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left.is_empty(), "group {pgid} still holds {left:?}");
 }
