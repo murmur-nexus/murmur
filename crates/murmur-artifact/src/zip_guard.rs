@@ -81,6 +81,20 @@ pub fn sanitize_entry_path(raw_name: &str) -> Result<PathBuf, ZipGuardError> {
     Ok(path.to_path_buf())
 }
 
+/// `raw_name` as a `/`-separated relative name with `.` components dropped (`./a//b.md` →
+/// `a/b.md`), so two spellings of one entry compare equal. Refused as [`sanitize_entry_path`]
+/// refuses it.
+pub fn normalized_entry_name(raw_name: &str) -> Result<String, ZipGuardError> {
+    Ok(sanitize_entry_path(raw_name)?
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
 /// Sanitize `raw_name` (see [`sanitize_entry_path`]) and join it to `base`, verifying that
 /// the resolved path is still contained within `base`.
 ///
@@ -188,6 +202,13 @@ mod tests {
     fn sanitize_entry_path_rejects_embedded_parent_dir_component() {
         let err = sanitize_entry_path("sub/../../evil.wasm").unwrap_err();
         assert!(matches!(err, ZipGuardError::UnsafeEntryPath { .. }));
+    }
+
+    #[test]
+    fn normalized_entry_name_joins_normal_components() {
+        assert_eq!(normalized_entry_name("./a//b.md").unwrap(), "a/b.md");
+        assert_eq!(normalized_entry_name("/skill.md").unwrap(), "skill.md");
+        assert!(normalized_entry_name("a/../../b").is_err());
     }
 
     #[test]

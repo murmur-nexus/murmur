@@ -16,7 +16,10 @@ use std::path::{Component, Path, PathBuf};
 
 use bytes::Bytes;
 use murmur_artifact::payload_shape::SKILL_MD_ENTRY;
-use murmur_artifact::{zip_guard, SkillFolderError, BUILD_INFO_FILE, MANIFEST_FILENAME};
+use murmur_artifact::{
+    classify_skill_folder_root_file, skill_folder_skips, zip_guard, SkillFolderError,
+    SkillFolderRootFile,
+};
 use serde::Serialize;
 use zip::ZipArchive;
 
@@ -198,22 +201,6 @@ fn normalise_declared(declared: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// An archive entry name normalised as [`normalise_declared`] normalises a declared path. `None`
-/// for a name `zip_guard` refuses.
-fn normalise_entry(raw_name: &str) -> Option<String> {
-    let sanitized = zip_guard::sanitize_entry_path(raw_name).ok()?;
-    Some(
-        sanitized
-            .components()
-            .filter_map(|component| match component {
-                Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/"),
-    )
-}
-
 /// One file entry of a package: its raw archive name, its normalised name, and whether it is a
 /// symlink.
 struct PackageEntry {
@@ -245,7 +232,9 @@ fn package_entries(archive: &mut ZipArchive<Cursor<&[u8]>>) -> io::Result<Vec<Pa
             .name()
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?
             .into_owned();
-        let Some(name) = normalise_entry(&raw) else {
+        // Normalised as `normalise_declared` normalises a declared path; a name the guard
+        // refuses is never a match.
+        let Ok(name) = zip_guard::normalized_entry_name(&raw) else {
             continue;
         };
         if name.is_empty() {
@@ -322,11 +311,7 @@ fn read_package_skill_source(
             continue;
         };
         found_any = true;
-        // Skipped at any depth, as `collect_skill_folder` skips them on disk.
-        if relative
-            .split('/')
-            .any(|part| part.starts_with('.') || part.to_lowercase().ends_with(".mur.zip"))
-        {
+        if relative.split('/').any(skill_folder_skips) {
             continue;
         }
         if entry.symlink {
@@ -338,25 +323,26 @@ fn read_package_skill_source(
             supporting.push((relative.to_string(), entry));
             continue;
         }
-        let lower = relative.to_lowercase();
-        if lower == SKILL_MD_ENTRY {
-            if let Some(first) = skill_md {
-                let first_name = first.name.rsplit('/').next().unwrap_or_default();
-                return Err(refused(SkillFolderError::DuplicateSkillMd {
-                    dir: folder.clone(),
-                    first: first_name.to_string(),
-                    second: relative.to_string(),
+        match classify_skill_folder_root_file(relative) {
+            SkillFolderRootFile::SkillMd => {
+                if let Some(first) = skill_md {
+                    let first_name = first.name.rsplit('/').next().unwrap_or_default();
+                    return Err(refused(SkillFolderError::DuplicateSkillMd {
+                        dir: folder.clone(),
+                        first: first_name.to_string(),
+                        second: relative.to_string(),
+                    }));
+                }
+                skill_md = Some(entry);
+            }
+            // The skill's own manifest is never installed: staging writes one there.
+            SkillFolderRootFile::Manifest => {}
+            SkillFolderRootFile::ReservedBuildInfo => {
+                return Err(refused(SkillFolderError::ReservedBuildInfo {
+                    path: folder.join(relative),
                 }));
             }
-            skill_md = Some(entry);
-        } else if lower == MANIFEST_FILENAME {
-            // The skill's own manifest is never installed: staging writes one there.
-        } else if relative == BUILD_INFO_FILE {
-            return Err(refused(SkillFolderError::ReservedBuildInfo {
-                path: folder.join(relative),
-            }));
-        } else {
-            supporting.push((relative.to_string(), entry));
+            SkillFolderRootFile::Supporting => supporting.push((relative.to_string(), entry)),
         }
     }
     if !found_any {

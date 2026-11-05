@@ -392,8 +392,8 @@ A relative path resolves against the manifest, wherever the manifest came from:
 An absolute path is read from that path on the host under either launch.
 
 An installed capsule reads only what its package holds, so a file it names must be packed: list it
-under [`requires_files`](#artifact-manifest) and rebuild. The work folder and the current directory
-are never searched. Under `--capsule`, a missing file fails with
+under [`requires_files`](#artifact-manifest) and rebuild. For a folder `source:`, list each file in
+the folder. The work folder and the current directory are never searched. Under `--capsule`, a missing file fails with
 `E-RUN-009` for a prompt file and `E-IO-001` for a skill source, and a
 path with a `..` component is refused as naming a path outside the installed package.
 

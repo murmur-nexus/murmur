@@ -194,16 +194,8 @@ fn extract_skill_files_capped(
             .name()
             .map_err(|err| archive_error(err.to_string()))?
             .into_owned();
-        let relative = zip_guard::sanitize_entry_path(&raw_name)
+        let relative = zip_guard::normalized_entry_name(&raw_name)
             .map_err(|err| archive_error(err.to_string()))?;
-        let relative = relative
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
         if relative.is_empty()
             || [SKILL_MD_ENTRY, PACKED_MANIFEST_ENTRY, BUILD_INFO_FILE].contains(&relative.as_str())
         {
