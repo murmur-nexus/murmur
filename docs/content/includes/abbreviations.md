@@ -42,7 +42,7 @@
 
 *[inference.system_prompt]: inline system prompt · injected on every API call · exclusive with system_prompt_file
 
-*[inference.system_prompt_file]: file path relative to murmur.yaml · used as system prompt · exclusive with system_prompt
+*[inference.system_prompt_file]: file path relative to the manifest, installed or not · used as system prompt · exclusive with system_prompt
 
 *[network.internal_port]: fixed port the worker binds on · OS-assigned when omitted · errors if port already in use
 

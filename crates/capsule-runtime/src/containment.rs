@@ -1285,6 +1285,16 @@ pub struct ScopeReport {
     /// The same set whatever [`Self::enforcement_tier`] and [`Self::achieved_containment`] say:
     /// no row turns on the tier. See [`crate::workdir_writes`].
     pub runtime_writes: Vec<crate::workdir_writes::RuntimeWriteReport>,
+    /// Every path the manifest names a file by — `inference.system_prompt_file`,
+    /// `inference.compaction.system_prompt_file`, each local-source `artifacts[].source` — and
+    /// where it is read from: the manifest folder, the installed package, or the host path itself.
+    /// Always serialized as an array (never skipped), on the same terms as
+    /// [`Self::state_stores`]; `[]` when the manifest names no file.
+    ///
+    /// Reports where a path resolves, not whether the file is there: nothing is read to build it.
+    /// Changes no class and no floor. Set through [`Self::with_manifest_files`] from
+    /// [`crate::manifest_files::manifest_file_reports`].
+    pub manifest_files: Vec<crate::manifest_files::ManifestFileReport>,
     /// The declared `capabilities.resources.cgroup_io_bytes_per_sec` ceiling, and whether it is
     /// actually on this session's cgroup scope.
     ///
@@ -1663,6 +1673,9 @@ impl ScopeReport {
         out.push_str(&crate::workdir_writes::render_runtime_writes(
             &self.runtime_writes,
         ));
+        out.push_str(&crate::manifest_files::render_manifest_files(
+            &self.manifest_files,
+        ));
 
         if !self.floor_met {
             out.push_str(
@@ -1735,6 +1748,16 @@ impl ScopeReport {
             transport,
         );
         self.routes = route_table(&inputs, self.enforcement_tier);
+        self
+    }
+
+    /// This report with [`Self::manifest_files`] set to `rows`.
+    #[must_use]
+    pub fn with_manifest_files(
+        mut self,
+        rows: Vec<crate::manifest_files::ManifestFileReport>,
+    ) -> Self {
+        self.manifest_files = rows;
         self
     }
 
@@ -2206,6 +2229,9 @@ pub(crate) fn scope_report_for_tier(
         // and a diagnostic that created the directory it describes would be answering a question
         // it had changed.
         runtime_writes: crate::workdir_writes::runtime_writes(),
+        // Set through `with_manifest_files` by the caller that knows where the manifest's
+        // relative paths resolve.
+        manifest_files: Vec::new(),
         // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
         // at launch and `cgroup::probe_scope` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.

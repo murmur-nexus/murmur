@@ -3,7 +3,10 @@
 //! body points at.
 //!
 //! [`collect_skill_folder`] is the one walker for a manifest-less `mur build <folder>` and for a
-//! local-source skill whose `source:` is a directory, so both pack and install the same files.
+//! local-source skill whose `source:` is a directory, so both pack and install the same files. A
+//! local-source folder read out of an installed package applies the same per-entry rules,
+//! [`skill_folder_skips`] and [`classify_skill_folder_root_file`]; change them there, never in a
+//! walker.
 
 use std::{
     fs, io,
@@ -168,6 +171,41 @@ pub enum SkillFolderError {
     },
 }
 
+/// Whether the skill-folder walk leaves out an entry named `file_name`, at any depth: a name
+/// starting with `.` (`.git/`, `.DS_Store`) or ending `.mur.zip` (any casing).
+#[must_use]
+pub fn skill_folder_skips(file_name: &str) -> bool {
+    file_name.starts_with('.') || file_name.to_lowercase().ends_with(".mur.zip")
+}
+
+/// What a regular file at the root of a skill folder is to the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillFolderRootFile {
+    /// `skill.md` in any casing: the payload.
+    SkillMd,
+    /// `murmur.yaml` in any casing: the skill's own manifest, never a supporting file.
+    Manifest,
+    /// `murmur-build.json`, reserved for `mur build`: the folder is refused.
+    ReservedBuildInfo,
+    /// Anything else: a supporting file.
+    Supporting,
+}
+
+/// Classify a regular file at the root of a skill folder by its name.
+#[must_use]
+pub fn classify_skill_folder_root_file(file_name: &str) -> SkillFolderRootFile {
+    let lower = file_name.to_lowercase();
+    if lower == "skill.md" {
+        SkillFolderRootFile::SkillMd
+    } else if lower == MANIFEST_FILENAME {
+        SkillFolderRootFile::Manifest
+    } else if file_name == BUILD_INFO_FILE {
+        SkillFolderRootFile::ReservedBuildInfo
+    } else {
+        SkillFolderRootFile::Supporting
+    }
+}
+
 /// Walk a skill folder.
 ///
 /// Recursive. Skipped: every entry whose name starts with `.` (at any depth — `.git/`,
@@ -181,7 +219,6 @@ pub fn collect_skill_folder(dir: &Path) -> Result<SkillFolder, SkillFolderError>
     let mut supporting_files = Vec::new();
 
     for (file_name, path) in read_dir_sorted(dir)? {
-        let lower = file_name.to_lowercase();
         let file_type = file_type_of(&path)?;
         if file_type.is_dir() {
             walk_supporting(&path, &file_name, &mut supporting_files)?;
@@ -190,23 +227,26 @@ pub fn collect_skill_folder(dir: &Path) -> Result<SkillFolder, SkillFolderError>
         if !file_type.is_file() {
             continue;
         }
-        if lower == "skill.md" {
-            if let Some(first) = &skill_md {
-                return Err(SkillFolderError::DuplicateSkillMd {
-                    dir: dir.to_path_buf(),
-                    first: display_name(first),
-                    second: file_name,
-                });
+        match classify_skill_folder_root_file(&file_name) {
+            SkillFolderRootFile::SkillMd => {
+                if let Some(first) = &skill_md {
+                    return Err(SkillFolderError::DuplicateSkillMd {
+                        dir: dir.to_path_buf(),
+                        first: display_name(first),
+                        second: file_name,
+                    });
+                }
+                skill_md = Some(path);
             }
-            skill_md = Some(path);
-        } else if lower == MANIFEST_FILENAME {
-            if manifest.is_none() || file_name == MANIFEST_FILENAME {
-                manifest = Some(path);
+            SkillFolderRootFile::Manifest => {
+                if manifest.is_none() || file_name == MANIFEST_FILENAME {
+                    manifest = Some(path);
+                }
             }
-        } else if file_name == BUILD_INFO_FILE {
-            return Err(SkillFolderError::ReservedBuildInfo { path });
-        } else {
-            supporting_files.push((file_name, path));
+            SkillFolderRootFile::ReservedBuildInfo => {
+                return Err(SkillFolderError::ReservedBuildInfo { path });
+            }
+            SkillFolderRootFile::Supporting => supporting_files.push((file_name, path)),
         }
     }
 
@@ -249,7 +289,7 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<(String, PathBuf)>, SkillFolderErro
     for entry in fs::read_dir(dir).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if file_name.starts_with('.') || file_name.to_lowercase().ends_with(".mur.zip") {
+        if skill_folder_skips(&file_name) {
             continue;
         }
         entries.push((file_name, entry.path()));

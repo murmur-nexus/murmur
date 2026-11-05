@@ -17,10 +17,10 @@ use murmur_artifact::{
     ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
     ConversationMode, DoneCheck, HookBinding, InferenceConfig, InterpreterRuntimeGrant,
     KeepWorking, LifecycleConfig, LockOrigin, LockedSha256, LockfileError, MurmurLock,
-    NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType, SkillFolderError,
-    TaskAcceptance, LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008,
-    W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance,
+    LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003,
+    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_016,
+    W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -80,6 +80,7 @@ use crate::{
         classify_guest_failure, wall_deadline_message, CallDeadlines, ComponentRole, EpochTicker,
         ExecutionLimiter, GuestFailure,
     },
+    manifest_files::ManifestFiles,
     murmur_md,
     network_policy::{
         effective_tool_network_rules, parse_network_allow_rules, resolve_scoped_dir,
@@ -2381,6 +2382,21 @@ pub fn stage_session(
     mut request: StageRequest,
 ) -> Result<StagedSession, RuntimeError> {
     validate_capability_policy(&request.capability_policy)?;
+    let manifest_files = match &request.capsule_artifact {
+        Some(capsule) => ManifestFiles::Package(capsule.clone()),
+        None => ManifestFiles::Directory(request.manifest_dir.clone()),
+    };
+    // A package is already in memory, so the prompt files `launch_session` reads from it are
+    // read once here too, and a package built without one refuses before anything is created.
+    // A project's are read at launch only.
+    if let (ManifestFiles::Package(_), Some(inference)) = (&manifest_files, &request.inference) {
+        if inference.system_prompt.is_none() {
+            if let Some(path) = &inference.system_prompt_file {
+                read_system_prompt_file(&manifest_files, path)?;
+            }
+        }
+        resolve_compaction_system_prompt(&manifest_files, inference.compaction.as_ref())?;
+    }
     // Before any registry pull, component compile or workdir creation: if this session cannot
     // achieve the declared floor, refuse rather than launch something weaker than was asked for.
     // The achieved class is the class of the tier the session's commands run on — the live
@@ -2597,7 +2613,19 @@ pub fn stage_session(
             .inference
             .as_ref()
             .map(|inference| inference.transport.as_str()),
-    );
+    )
+    // From the inference `mur run` hands over with `--system-prompt` already applied, the inputs
+    // its `--explain-scope` report is built from.
+    .with_manifest_files(crate::manifest_files::manifest_file_reports(
+        &manifest_files,
+        request.inference.as_ref(),
+        request.artifacts.iter().filter_map(|artifact| {
+            artifact
+                .source
+                .as_deref()
+                .map(|source| (artifact.name.as_str(), source))
+        }),
+    ));
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
     // sleep` withdraws that bound on purpose. Once withdrawn, the declared lifetime is the only
@@ -2784,7 +2812,7 @@ pub fn stage_session(
         // Local-source skill: resolve skill.md directly from the filesystem and skip the
         // registry/lock pipeline entirely. Validated as skill-only at manifest parse time.
         if let Some(source) = &artifact.source {
-            let files = load_local_skill_files(&request.manifest_dir, source)?;
+            let files = load_local_skill_files(&manifest_files, source)?;
             skill_files.push((artifact.name.clone(), files));
             // The manifest a published skill carries in its package, so the skill is in the
             // model's tool list, and MURMUR.md names it, on the same terms.
@@ -3307,8 +3335,8 @@ pub fn stage_session(
         crate::process_driver::check_component_level(
             request
                 .capsule_artifact
-                .as_deref()
-                .unwrap_or(&request.capsule_name),
+                .as_ref()
+                .map_or(&request.capsule_name, |capsule| &capsule.artifact),
             &request.capsule_version,
             murmur_contracts(&engine, component),
             crate::served_wit_level(),
@@ -3671,9 +3699,11 @@ pub fn stage_session(
         murmur_md,
         instruction_files,
         manifest_dir: request.manifest_dir,
-        capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
-            format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
-        }),
+        capsule_artifact: request.capsule_artifact.map_or_else(
+            || format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name),
+            |capsule| capsule.artifact,
+        ),
+        manifest_files,
         capsule_name: request.capsule_name,
         capsule_version: request.capsule_version,
         capsule_url: String::new(), // set by launch_session after port binding
@@ -3999,7 +4029,8 @@ fn launch(
         // Before anything decides whether there is a task: the one read of the operator's task
         // from the workdir.
         import_task_input(&accessible_root, &runtime_root, inference);
-        let system_prompt = resolve_system_prompt(&staged.manifest_dir, &runtime_root, inference)?;
+        let system_prompt =
+            resolve_system_prompt(&staged.manifest_files, &runtime_root, inference)?;
         // What the agent loop and the process driver receive: the resolved prompt followed by
         // the instruction-file blocks staging read. `system_prompt` itself stays what the
         // manifest or `--system-prompt` said, which is what the trace records.
@@ -4007,8 +4038,10 @@ fn launch(
             system_prompt.as_deref(),
             staged.instruction_files.as_ref(),
         );
-        let compaction_system_prompt =
-            resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
+        let compaction_system_prompt = resolve_compaction_system_prompt(
+            &staged.manifest_files,
+            inference.compaction.as_ref(),
+        )?;
         let session_id = staged.session_id.clone();
         let created_workdirs = staged.created_workdirs.clone();
         let accessible_workdir = staged.accessible_workdir.clone();
@@ -6413,15 +6446,18 @@ impl Drop for DelegationReport {
     }
 }
 
-/// Reads a manifest-relative prompt file, returning the resolved path alongside any I/O
-/// error so the caller can map it to its own `RuntimeError` variant.
-fn read_prompt_file(manifest_dir: &Path, path: &str) -> Result<String, (PathBuf, std::io::Error)> {
-    let prompt_path = manifest_dir.join(path);
-    fs::read_to_string(&prompt_path).map_err(|source| (prompt_path, source))
+/// The text of `inference.system_prompt_file`, read from where `files` resolves `path`.
+fn read_system_prompt_file(files: &ManifestFiles, path: &str) -> Result<String, RuntimeError> {
+    files
+        .read_to_string(path)
+        .map_err(|(path, source)| RuntimeError::SystemPromptFileRead { path, source })
 }
 
+/// The capsule's system prompt: `inference.system_prompt`, else the file
+/// `inference.system_prompt_file` names, read relative to the manifest (`files`), else the
+/// `skill.md` of the staged `inference.system_prompt_artifact`.
 fn resolve_system_prompt(
-    manifest_dir: &Path,
+    files: &ManifestFiles,
     runtime_root: &WorkdirRoot,
     inference: &murmur_artifact::InferenceConfig,
 ) -> Result<Option<String>, RuntimeError> {
@@ -6430,12 +6466,7 @@ fn resolve_system_prompt(
     }
 
     if let Some(path) = inference.system_prompt_file.as_ref() {
-        return read_prompt_file(manifest_dir, path)
-            .map(Some)
-            .map_err(|(prompt_path, source)| RuntimeError::SystemPromptFileRead {
-                path: prompt_path.display().to_string(),
-                source,
-            });
+        return read_system_prompt_file(files, path).map(Some);
     }
 
     if let Some(art_name) = inference.system_prompt_artifact.as_ref() {
@@ -6458,13 +6489,13 @@ fn resolve_system_prompt(
 /// Resolves the compaction system prompt from the two mutually exclusive manifest
 /// sources — the inline `inference.compaction.system_prompt` string, or the contents of
 /// the file named by `inference.compaction.system_prompt_file`, read relative to the
-/// manifest directory. Absence stays absence: no default prompt is substituted, and the
+/// manifest (`files`). Absence stays absence: no default prompt is substituted, and the
 /// hook receives `option::none`.
 ///
 /// Mutual exclusion is enforced at manifest parse time, so an inline prompt winning here
 /// is unreachable for a manifest that loaded successfully.
 fn resolve_compaction_system_prompt(
-    manifest_dir: &Path,
+    files: &ManifestFiles,
     compaction: Option<&murmur_artifact::CompactionConfig>,
 ) -> Result<Option<String>, RuntimeError> {
     let Some(compaction) = compaction else {
@@ -6476,13 +6507,11 @@ fn resolve_compaction_system_prompt(
     }
 
     if let Some(path) = compaction.system_prompt_file.as_ref() {
-        return read_prompt_file(manifest_dir, path)
+        return files
+            .read_to_string(path)
             .map(Some)
             .map_err(
-                |(prompt_path, source)| RuntimeError::CompactionSystemPromptFileRead {
-                    path: prompt_path.display().to_string(),
-                    source,
-                },
+                |(path, source)| RuntimeError::CompactionSystemPromptFileRead { path, source },
             );
     }
 
@@ -12130,56 +12159,17 @@ fn collect_skill_supporting_files(
 /// Resolve and read a local-source skill's files: each as its `/`-separated path under
 /// `tools/<name>/` and its bytes, `skill.md` first.
 ///
-/// `source` may be a relative or absolute path. Relative paths resolve against `manifest_dir`
-/// (the directory containing `murmur.yaml`). The resolved path may be:
-///   - a file (assumed to be `skill.md` itself), read directly and installed alone, or
-///   - a directory, walked by [`murmur_artifact::collect_skill_folder`] — the walk `mur build`
-///     packs a manifest-less skill folder with. Its `skill.md` (any casing) installs as
-///     `skill.md` and every supporting file at its relative path; its own `murmur.yaml` is
+/// `source` may be a relative or absolute path; a relative one resolves against the manifest
+/// (`files`). It may name:
+///   - a file (assumed to be `skill.md` itself), installed alone, or
+///   - a folder, walked by the rules of [`murmur_artifact::collect_skill_folder`] — the walk
+///     `mur build` packs a manifest-less skill folder with. Its `skill.md` (any casing) installs
+///     as `skill.md` and every supporting file at its relative path; its own `murmur.yaml` is
 ///     never installed, since staging writes the skill's manifest there.
 ///
 /// Errors before the workdir is created so that failures exit non-zero with no side effects.
-fn load_local_skill_files(manifest_dir: &Path, source: &str) -> Result<SkillFiles, RuntimeError> {
-    let raw = Path::new(source);
-    let path = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        manifest_dir.join(raw)
-    };
-
-    if !path.exists() {
-        return Err(RuntimeError::SkillSourceNotFound {
-            path: path.display().to_string(),
-        });
-    }
-
-    let read = |file: &Path| {
-        fs::read(file).map_err(|source| RuntimeError::SkillSourceRead {
-            path: file.display().to_string(),
-            source,
-        })
-    };
-    if !path.is_dir() {
-        return Ok(vec![(SKILL_MD_ENTRY.to_string(), read(&path)?)]);
-    }
-
-    let folder = murmur_artifact::collect_skill_folder(&path).map_err(|error| match error {
-        SkillFolderError::MissingSkillMd { .. } => RuntimeError::SkillSourceMissingSkillMd {
-            path: path.display().to_string(),
-        },
-        SkillFolderError::Io { path, source } => RuntimeError::SkillSourceRead {
-            path: path.display().to_string(),
-            source,
-        },
-        refused => RuntimeError::SkillSourceRefused {
-            message: refused.to_string(),
-        },
-    })?;
-    let mut files = vec![(SKILL_MD_ENTRY.to_string(), read(&folder.skill_md)?)];
-    for (relative, file) in &folder.supporting_files {
-        files.push((relative.clone(), read(file)?));
-    }
-    Ok(files)
+fn load_local_skill_files(files: &ManifestFiles, source: &str) -> Result<SkillFiles, RuntimeError> {
+    files.read_skill_source(source)
 }
 
 /// Write each skill's files under `tools/<name>/`, through the runtime directory's
@@ -16167,6 +16157,12 @@ inference:
         );
     }
 
+    /// What a project launch resolves manifest-relative paths against: `dir`, the folder holding
+    /// `murmur.yaml`.
+    fn dir_files(dir: &Path) -> ManifestFiles {
+        ManifestFiles::Directory(dir.to_path_buf())
+    }
+
     /// An `InferenceConfig` with every system-prompt field empty, for the prompt-resolution
     /// tests below to fill in one at a time.
     fn inference_without_prompt() -> murmur_artifact::InferenceConfig {
@@ -16193,7 +16189,7 @@ inference:
     fn resolve_system_prompt_returns_none_when_nothing_is_declared() {
         let tmp = TempDir::new().unwrap();
         let resolved = resolve_system_prompt(
-            tmp.path(),
+            &dir_files(tmp.path()),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &inference_without_prompt(),
         )
@@ -16209,7 +16205,7 @@ inference:
             ..inference_without_prompt()
         };
         let resolved = resolve_system_prompt(
-            tmp.path(),
+            &dir_files(tmp.path()),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &inference,
         )
@@ -16231,7 +16227,7 @@ inference:
             ..inference_without_prompt()
         };
         let resolved = resolve_system_prompt(
-            manifest_dir.path(),
+            &dir_files(manifest_dir.path()),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &inference,
         )
@@ -16247,7 +16243,7 @@ inference:
             ..inference_without_prompt()
         };
         match resolve_system_prompt(
-            tmp.path(),
+            &dir_files(tmp.path()),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &inference,
         ) {
@@ -16274,7 +16270,7 @@ inference:
             ..inference_without_prompt()
         };
         let resolved = resolve_system_prompt(
-            manifest_dir.path(),
+            &dir_files(manifest_dir.path()),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &inference,
         )
@@ -16290,7 +16286,7 @@ inference:
             ..inference_without_prompt()
         };
         match resolve_system_prompt(
-            tmp.path(),
+            &dir_files(tmp.path()),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &inference,
         ) {
@@ -16314,7 +16310,7 @@ inference:
             ..inference_without_prompt()
         };
         let resolved = resolve_system_prompt(
-            tmp.path(),
+            &dir_files(tmp.path()),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &inference,
         )
@@ -16371,7 +16367,7 @@ inference:
         fs::write(manifest_dir.path().join("compaction-instructions.md"), body).unwrap();
 
         let resolved = resolve_compaction_system_prompt(
-            manifest_dir.path(),
+            &dir_files(manifest_dir.path()),
             Some(&compaction_config(None, Some("compaction-instructions.md"))),
         )
         .expect("file resolves");
@@ -16385,7 +16381,7 @@ inference:
         let manifest_dir = TempDir::new().unwrap();
 
         let resolved = resolve_compaction_system_prompt(
-            manifest_dir.path(),
+            &dir_files(manifest_dir.path()),
             Some(&compaction_config(Some("inline prompt"), None)),
         )
         .expect("inline prompt resolves");
@@ -16401,14 +16397,14 @@ inference:
 
         assert_eq!(
             resolve_compaction_system_prompt(
-                manifest_dir.path(),
+                &dir_files(manifest_dir.path()),
                 Some(&compaction_config(None, None))
             )
             .unwrap(),
             None
         );
         assert_eq!(
-            resolve_compaction_system_prompt(manifest_dir.path(), None).unwrap(),
+            resolve_compaction_system_prompt(&dir_files(manifest_dir.path()), None).unwrap(),
             None
         );
     }
@@ -16421,7 +16417,7 @@ inference:
         let manifest_dir = TempDir::new().unwrap();
 
         let err = resolve_compaction_system_prompt(
-            manifest_dir.path(),
+            &dir_files(manifest_dir.path()),
             Some(&compaction_config(None, Some("nope.md"))),
         )
         .expect_err("missing file must fail");
@@ -16442,6 +16438,132 @@ inference:
         assert!(err
             .to_string()
             .contains("inference.compaction.system_prompt_file"));
+    }
+
+    /// An installed capsule `local/house@0.1.0` whose package holds `entries`.
+    fn package_files(entries: &[(&str, &str)]) -> ManifestFiles {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        ManifestFiles::Package(crate::manifest_files::InstalledCapsule {
+            artifact: "local/house".to_string(),
+            version: "0.1.0".to_string(),
+            package: bytes::Bytes::from(writer.finish().unwrap().into_inner()),
+        })
+    }
+
+    #[test]
+    fn resolve_system_prompt_reads_the_prompt_file_from_an_installed_package() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("instructions.md"), "Decoy.").unwrap();
+        let files = package_files(&[
+            ("murmur.yaml", "name: house\n"),
+            ("./instructions.md", "From the package."),
+        ]);
+        for declared in [
+            "instructions.md",
+            "./instructions.md",
+            "././instructions.md",
+        ] {
+            let inference = murmur_artifact::InferenceConfig {
+                system_prompt_file: Some(declared.to_string()),
+                ..inference_without_prompt()
+            };
+            let resolved = resolve_system_prompt(
+                &files,
+                &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+                &inference,
+            )
+            .unwrap();
+            assert_eq!(resolved.as_deref(), Some("From the package."), "{declared}");
+        }
+    }
+
+    #[test]
+    fn resolve_system_prompt_names_the_package_path_of_a_missing_entry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("instructions.md"), "Decoy.").unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_file: Some("./instructions.md".to_string()),
+            ..inference_without_prompt()
+        };
+        match resolve_system_prompt(
+            &package_files(&[("murmur.yaml", "name: house\n")]),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        ) {
+            Err(RuntimeError::SystemPromptFileRead { path, source }) => {
+                assert_eq!(path, "local/house@0.1.0!/instructions.md");
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                assert!(source.to_string().contains("requires_files"), "{source}");
+            }
+            other => panic!("expected SystemPromptFileRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_system_prompt_refuses_a_package_path_that_climbs_out() {
+        let tmp = TempDir::new().unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_file: Some("../outside.md".to_string()),
+            ..inference_without_prompt()
+        };
+        match resolve_system_prompt(
+            &package_files(&[("murmur.yaml", "name: house\n")]),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        ) {
+            Err(RuntimeError::SystemPromptFileRead { path, source }) => {
+                assert_eq!(path, "local/house@0.1.0!/../outside.md");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected SystemPromptFileRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_system_prompt_file_reads_from_an_installed_package() {
+        let files = package_files(&[("compaction.md", "Summarise tersely.")]);
+        let resolved = resolve_compaction_system_prompt(
+            &files,
+            Some(&compaction_config(None, Some("compaction.md"))),
+        )
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("Summarise tersely."));
+
+        match resolve_compaction_system_prompt(
+            &files,
+            Some(&compaction_config(None, Some("./missing.md"))),
+        ) {
+            Err(RuntimeError::CompactionSystemPromptFileRead { path, source }) => {
+                assert_eq!(path, "local/house@0.1.0!/missing.md");
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                assert!(source.to_string().contains("requires_files"), "{source}");
+            }
+            other => panic!("expected CompactionSystemPromptFileRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_local_skill_files_reads_a_folder_from_an_installed_package() {
+        let files = package_files(&[
+            ("skills/house/SKILL.md", "# House skill"),
+            ("skills/house/references/a.md", "reference a"),
+            ("skills/house/.hidden", "hidden"),
+        ]);
+        let skill = load_local_skill_files(&files, "./skills/house").unwrap();
+        assert_eq!(
+            skill,
+            [
+                ("skill.md".to_string(), b"# House skill".to_vec()),
+                ("references/a.md".to_string(), b"reference a".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -17014,7 +17136,7 @@ inference:
         let dir = tempfile::tempdir().unwrap();
         let skill = dir.path().join("skill.md");
         fs::write(&skill, b"# hi from file").unwrap();
-        let files = load_local_skill_files(dir.path(), "skill.md").unwrap();
+        let files = load_local_skill_files(&dir_files(dir.path()), "skill.md").unwrap();
         assert_eq!(
             files,
             [("skill.md".to_string(), b"# hi from file".to_vec())]
@@ -17028,14 +17150,15 @@ inference:
         fs::create_dir_all(&skill_dir).unwrap();
         // Uppercase filename — must still be found.
         fs::write(skill_dir.join("SKILL.MD"), b"# upper").unwrap();
-        let files = load_local_skill_files(manifest_dir.path(), "skills/my-skill").unwrap();
+        let files =
+            load_local_skill_files(&dir_files(manifest_dir.path()), "skills/my-skill").unwrap();
         assert_eq!(files, [("skill.md".to_string(), b"# upper".to_vec())]);
     }
 
     #[test]
     fn load_local_skill_files_missing_path_errors_with_name() {
         let dir = tempfile::tempdir().unwrap();
-        let err = load_local_skill_files(dir.path(), "does/not/exist").unwrap_err();
+        let err = load_local_skill_files(&dir_files(dir.path()), "does/not/exist").unwrap_err();
         match err {
             RuntimeError::SkillSourceNotFound { path } => {
                 assert!(path.contains("does/not/exist"), "path was: {path}");
@@ -17049,7 +17172,7 @@ inference:
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty");
         fs::create_dir_all(&empty).unwrap();
-        let err = load_local_skill_files(dir.path(), "empty").unwrap_err();
+        let err = load_local_skill_files(&dir_files(dir.path()), "empty").unwrap_err();
         match err {
             RuntimeError::SkillSourceMissingSkillMd { path } => {
                 assert!(path.contains("empty"), "path was: {path}");
@@ -17064,7 +17187,9 @@ inference:
         let elsewhere = tempfile::tempdir().unwrap();
         let skill = elsewhere.path().join("skill.md");
         fs::write(&skill, b"# absolute").unwrap();
-        let files = load_local_skill_files(manifest_dir.path(), &skill.to_string_lossy()).unwrap();
+        let files =
+            load_local_skill_files(&dir_files(manifest_dir.path()), &skill.to_string_lossy())
+                .unwrap();
         assert_eq!(files, [("skill.md".to_string(), b"# absolute".to_vec())]);
     }
 
@@ -17078,7 +17203,7 @@ inference:
         fs::write(skill_dir.join("murmur.yaml"), b"name: authored").unwrap();
         fs::write(skill_dir.join("references/forms.md"), b"# Forms").unwrap();
         fs::write(skill_dir.join(".git/HEAD"), b"ref").unwrap();
-        let files = load_local_skill_files(manifest_dir.path(), "pdf").unwrap();
+        let files = load_local_skill_files(&dir_files(manifest_dir.path()), "pdf").unwrap();
         assert_eq!(
             files,
             [
@@ -17096,7 +17221,7 @@ inference:
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("SKILL.md"), b"# pdf").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", skill_dir.join("passwd")).unwrap();
-        let err = load_local_skill_files(manifest_dir.path(), "pdf").unwrap_err();
+        let err = load_local_skill_files(&dir_files(manifest_dir.path()), "pdf").unwrap_err();
         match err {
             RuntimeError::SkillSourceRefused { message } => {
                 assert!(message.contains("passwd"), "message was: {message}");

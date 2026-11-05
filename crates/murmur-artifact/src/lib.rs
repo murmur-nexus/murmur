@@ -142,8 +142,9 @@ pub use security_warnings::{
 };
 pub use shell_words::split_shell_words;
 pub use skill_folder::{
-    collect_skill_folder, parse_skill_front_block, skill_md_description, SkillFolder,
-    SkillFolderError, SkillFrontBlock,
+    classify_skill_folder_root_file, collect_skill_folder, parse_skill_front_block,
+    skill_folder_skips, skill_md_description, SkillFolder, SkillFolderError, SkillFolderRootFile,
+    SkillFrontBlock,
 };
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,

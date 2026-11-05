@@ -220,7 +220,7 @@ inference:
       Preserve this nuance when summarizing.
 ```
 
-For a longer, versioned instruction set, keep it in its own file and point at it with `system_prompt_file` instead. The path is resolved relative to the manifest directory and read when the session launches, and the file's contents are passed to the hook verbatim:
+For a longer, versioned instruction set, keep it in its own file and point at it with `system_prompt_file` instead. The path is resolved [relative to the manifest](../reference/manifest.md#manifest-relative-paths), installed or not, and read when the session launches, and the file's contents are passed to the hook verbatim:
 
 ```yaml
 inference:
