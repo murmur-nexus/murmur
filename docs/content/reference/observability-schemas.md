@@ -1073,7 +1073,7 @@ is accounted for and before `session_end`. A session in no formation writes none
 | `"sent"` | — | The member's door answered. A non-2xx status or a JSON-RPC error is `sent`, with its `http_status` |
 | `"refused"` | `"not_a_virtual_address"` | The address is not `http://<name>.formation.invalid`: another scheme, a port, user info, or more or fewer labels |
 | `"refused"` | `"not_a_callee"` | The roster does not let this member call the name, whether or not such a member exists |
-| `"refused"` | `"address_not_arrived"` | The callee's address did not arrive within the member's address wait |
+| `"refused"` | `"address_not_arrived"` | The callee's door address did not arrive within 10 seconds — see [formation peers](roster.md#formation-peers) |
 | `"refused"` | `"egress_not_allowed"` | `capabilities.network.allow` does not reach the callee's door |
 | `"refused"` | `"unreadable_address"` | The callee's door address is not a URL a request can be sent to |
 | `"failed"` | `"connection_failed"` | No response arrived: the connection or the write failed |

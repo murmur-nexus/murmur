@@ -9656,7 +9656,10 @@ impl CapsuleStoreState {
             return Err(format!("tool '{name}' is not available in this session"));
         };
         let extra_roots = self.extra_roots_preopen(name);
-        invoke_tool_component(
+        // Boxed: the invocation's state machine is large, and inlined into every caller's future
+        // it overflows a 2 MiB thread stack on the process transport's bridged path, which
+        // `launch_session` drives on the caller's own thread.
+        Box::pin(invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
@@ -9689,7 +9692,7 @@ impl CapsuleStoreState {
             name,
             component,
             input,
-        )
+        ))
         .await
     }
 
