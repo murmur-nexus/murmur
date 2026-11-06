@@ -153,6 +153,10 @@ pub(crate) struct TraceWriter {
     /// `call_deadline` lines ahead of every line this writer writes. Set by
     /// [`Self::set_call_deadlines`]; `None` drains nothing.
     call_deadlines: Option<crate::limits::CallDeadlines>,
+    /// The session's record of requests routed to a member's virtual address, drained into
+    /// `member_request` lines at the same points as [`Self::call_deadlines`]. Set by
+    /// [`Self::set_member_requests`]; `None` drains nothing.
+    member_requests: Option<crate::member_request::MemberRequests>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -1235,6 +1239,10 @@ struct A2aTaskReceivedEvent {
     /// `caller: "credential"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     caller_credential: Option<String>,
+    /// The caller's `member_request` id, present only with `caller: "member"` and only when the
+    /// request carried a well-formed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_request_id: Option<String>,
     /// The `sha256` of the task's message text, omitted under `capture: none`. Under `content`
     /// the text is stored as the blob of that name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1784,6 +1792,41 @@ struct CallDeadlineEvent {
     deadline_seconds: u64,
     /// How long the stopped phase had run, from the start of that phase.
     elapsed_ms: u64,
+}
+
+/// One request the runtime routed to a member's virtual address, refusals included. Written once
+/// per request, after it was accounted for and before `session_end`. Never holds a door address,
+/// a token, a header value or a body.
+#[derive(Serialize)]
+struct MemberRequestEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// [`crate::member_request::MemberRequest::call_id`]: `mrq_` and 32 lowercase hex digits.
+    call_id: String,
+    /// The calling task; absent when the request was sent for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// The roster name the virtual address names; absent when its host names no single member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member: Option<String>,
+    component: String,
+    /// [`crate::limits::ComponentRole::wire_name`].
+    role: &'static str,
+    /// [`crate::member_request::MemberRequestVia::wire_name`].
+    via: &'static str,
+    /// `sent`, `refused` or `failed`.
+    outcome: &'static str,
+    /// Present exactly for `refused` and `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_task_id: Option<String>,
+    duration_ms: u64,
 }
 
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
@@ -2651,6 +2694,7 @@ impl TraceWriter {
             machine_tokens_per_day: None,
             session_status: None,
             call_deadlines: None,
+            member_requests: None,
         })
     }
 
@@ -2658,6 +2702,12 @@ impl TraceWriter {
     /// `call_deadline` line per firing ahead of each line it writes, `session_end` included.
     pub(crate) fn set_call_deadlines(&mut self, deadlines: crate::limits::CallDeadlines) {
         self.call_deadlines = Some(deadlines);
+    }
+
+    /// The session's [`crate::member_request::MemberRequests`], which this writer drains into one
+    /// `member_request` line per request wherever it drains [`Self::set_call_deadlines`]' latch.
+    pub(crate) fn set_member_requests(&mut self, requests: crate::member_request::MemberRequests) {
+        self.member_requests = Some(requests);
     }
 
     /// The session's standing, which every later `inference`, `task_start` and `task_end` write
@@ -2910,7 +2960,7 @@ impl TraceWriter {
         self.write_event(&event).await?;
         self.session_started = true;
         // A firing from before the session frame existed — an `on-stage` hook's — hangs off it.
-        self.write_call_deadlines().await
+        self.write_latched().await
     }
 
     /// `input_tokens`/`output_tokens` are what the session and task totals accumulate: the
@@ -3101,7 +3151,7 @@ impl TraceWriter {
             None => (None, None, None),
         };
         // Drained under the previous turn, before this line becomes the turn node.
-        self.write_call_deadlines().await?;
+        self.write_latched().await?;
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
         // so it hangs off the task and everything the turn goes on to produce hangs off it. A
@@ -3528,6 +3578,7 @@ impl TraceWriter {
         traceparent_from_caller: Option<&str>,
         caller: &crate::identity::TaskCaller,
         caller_member: Option<&str>,
+        member_request_id: Option<&str>,
         message_text: &str,
     ) -> std::io::Result<()> {
         use crate::identity::TaskCaller;
@@ -3561,6 +3612,7 @@ impl TraceWriter {
             caller: received_from,
             caller_member: caller_member.map(str::to_string),
             caller_credential,
+            member_request_id: member_request_id.map(str::to_string),
             message_sha256,
         };
         self.write_event(&event).await
@@ -3662,7 +3714,7 @@ impl TraceWriter {
         attachments: Vec<AttachmentRecord>,
     ) -> std::io::Result<()> {
         // Drained under the ids in force before this task, which the lines below replace.
-        self.write_call_deadlines().await?;
+        self.write_latched().await?;
         // Reset per-task counters for this task
         self.task_turns = 0;
         self.task_input_tokens = 0;
@@ -3717,7 +3769,7 @@ impl TraceWriter {
         done_check: Option<DoneCheckSummary>,
     ) -> std::io::Result<()> {
         // Drained inside the task, before the lines below clear its ids.
-        self.write_call_deadlines().await?;
+        self.write_latched().await?;
         let duration_ms = self
             .task_start_instant
             .take()
@@ -4545,11 +4597,54 @@ impl TraceWriter {
     }
 
     /// Write `event` as one line, after a `call_deadline` line for each firing the session's
-    /// latch holds. Draining here, ahead of every line, is what puts a cut call's
-    /// `call_deadline` before the record of that call and every one before `session_end`.
+    /// latch holds and a `member_request` line for each request its other latch holds. Draining
+    /// here, ahead of every line, is what puts a cut call's `call_deadline` before the record of
+    /// that call and every one of both before `session_end`.
     async fn write_event(&mut self, event: &impl Serialize) -> std::io::Result<()> {
-        self.write_call_deadlines().await?;
+        self.write_latched().await?;
         self.write_line(event).await
+    }
+
+    /// Drains both of the session's latches: [`Self::write_call_deadlines`], then
+    /// [`Self::write_member_requests`].
+    async fn write_latched(&mut self) -> std::io::Result<()> {
+        self.write_call_deadlines().await?;
+        self.write_member_requests().await
+    }
+
+    /// One `member_request` line per request [`Self::member_requests`] holds, parented to the
+    /// session node. Nothing before `session_start`. Each line carries the task its own record
+    /// names, never the writer's active task.
+    async fn write_member_requests(&mut self) -> std::io::Result<()> {
+        let Some(requests) = self
+            .member_requests
+            .as_ref()
+            .filter(|_| self.session_started)
+        else {
+            return Ok(());
+        };
+        for request in requests.take() {
+            let event = MemberRequestEvent {
+                event_type: "member_request",
+                event_id: new_event_id(),
+                parent_id: self.session_parent(),
+                session_id: self.session_id.clone(),
+                timestamp: timestamp_ms(),
+                reason: request.outcome.reason(),
+                outcome: request.outcome.wire_name(),
+                call_id: request.call_id,
+                task_id: request.task_id,
+                member: request.member,
+                component: request.component,
+                role: request.role.wire_name(),
+                via: request.via.wire_name(),
+                http_status: request.http_status,
+                member_task_id: request.member_task_id,
+                duration_ms: request.duration_ms,
+            };
+            self.write_line(&event).await?;
+        }
+        Ok(())
     }
 
     /// One `call_deadline` line per firing [`Self::call_deadlines`] holds, parented to the turn
@@ -6357,9 +6452,18 @@ mod tests {
                 Some(caller) => crate::identity::TaskCaller::Credential(format!("member:{caller}")),
                 None => crate::identity::TaskCaller::Operator,
             };
-            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, &door_caller, caller, "hi")
-                .await
-                .unwrap();
+            w.write_a2a_task_received(
+                "tsk_1",
+                "ctx_1",
+                "msg_1",
+                None,
+                &door_caller,
+                caller,
+                None,
+                "hi",
+            )
+            .await
+            .unwrap();
             w.flush().await.unwrap();
             let content = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
             let lines: Vec<Value> = content
@@ -6427,9 +6531,18 @@ mod tests {
             w.write_session_start(Some(10), None, Vec::new())
                 .await
                 .unwrap();
-            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, &door_caller, member, "hi")
-                .await
-                .unwrap();
+            w.write_a2a_task_received(
+                "tsk_1",
+                "ctx_1",
+                "msg_1",
+                None,
+                &door_caller,
+                member,
+                None,
+                "hi",
+            )
+            .await
+            .unwrap();
             w.flush().await.unwrap();
             let received = read_events(dir.path())
                 .into_iter()
@@ -6466,6 +6579,7 @@ mod tests {
                 "msg_1",
                 None,
                 &crate::identity::TaskCaller::Operator,
+                None,
                 None,
                 text,
             )

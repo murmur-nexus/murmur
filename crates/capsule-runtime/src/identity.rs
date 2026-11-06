@@ -830,6 +830,10 @@ async fn handle_connection(
     let mut task_trust: Option<String> = None;
     let mut delegation_id: Option<String> = None;
     let mut completion_session: Option<String> = None;
+    // Every member request id header, as sent: one well-formed value is kept, and only for a
+    // request a formation token let in.
+    let mut member_request_ids: Vec<String> = Vec::new();
+    let member_request_id_prefix = format!("{}:", crate::member_call::MEMBER_REQUEST_ID_HEADER);
     let mut authorization: Option<String> = None;
     // Every `authorization` header, in order: a door token is refused when more than one is sent.
     let mut authorizations: Vec<String> = Vec::new();
@@ -895,6 +899,12 @@ async fn handle_connection(
             delegation_id = Some(rest.trim().to_string());
         } else if let Some(rest) = lower.strip_prefix(&format!("{COMPLETION_SESSION_HEADER}:")) {
             completion_session = Some(rest.trim().to_string());
+        } else if lower.starts_with(&member_request_id_prefix) {
+            // Taken from the line as sent: the id is checked in exactly the shape it is minted in.
+            let value = line.trim_end()[member_request_id_prefix.len()..]
+                .trim()
+                .to_string();
+            member_request_ids.push(value);
         }
     }
 
@@ -971,6 +981,15 @@ async fn handle_connection(
         .as_ref()
         .and_then(|grant| grant.formation_caller())
         .map(str::to_string);
+    // The caller's id for this request, joined to its `member_request` line. Kept only beside a
+    // formation caller, and only when exactly one well-formed value came: any other caller's task
+    // is recorded as if the header had not been sent.
+    let member_request_id = match member_request_ids.as_slice() {
+        [id] if caller_member.is_some() && crate::member_call::is_member_request_id(id) => {
+            Some(id.clone())
+        }
+        _ => None,
+    };
     // Which tasks the caller reaches, by the one rule every task-addressing method reads.
     let caller = TaskCaller::of(grant.as_ref());
 
@@ -1159,6 +1178,7 @@ async fn handle_connection(
                         traceparent,
                         provenance,
                         caller_member,
+                        member_request_id,
                         caller,
                     },
                     forgettable_session,
@@ -1178,6 +1198,7 @@ async fn handle_connection(
                         traceparent,
                         provenance,
                         caller_member,
+                        member_request_id,
                         caller,
                     },
                     forgettable_session,
@@ -2049,6 +2070,8 @@ pub(crate) struct MessageSender {
     /// The formation member that sent it, when the door let it in on a formation token. Recorded
     /// on the task it starts for the trace, and decides nothing.
     pub caller_member: Option<String>,
+    /// The sender's member request id, present only beside `caller_member`.
+    pub member_request_id: Option<String>,
     /// Which tasks the sender reaches, and so whom a task it starts belongs to.
     pub caller: TaskCaller,
 }
@@ -2256,6 +2279,7 @@ fn start_task(
         source: crate::a2a::SOURCE_A2A,
         forget_session: message.forget_session,
         caller_member: sender.caller_member,
+        member_request_id: sender.member_request_id,
         caller: Some(sender.caller),
         reference_task_ids: message.reference_task_ids,
         part_kinds,
@@ -3962,6 +3986,7 @@ mod tests {
             traceparent: None,
             provenance: TaskProvenance::derive(TaskOrigin::User, None),
             caller_member: caller.map(str::to_string),
+            member_request_id: None,
             caller: caller.map_or(TaskCaller::Operator, |member| {
                 TaskCaller::Credential(format!("member:{member}"))
             }),

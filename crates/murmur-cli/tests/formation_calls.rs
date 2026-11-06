@@ -1269,6 +1269,15 @@ fn a_repeated_call_is_refused_and_the_answer_still_arrives() {
 
     let worker_trace = project.trace_of(&formation_id, "worker");
     assert_eq!(records(&worker_trace, "a2a_task_received").len(), 1);
+    // A `call-member` call is joined by its message id: it sends no member request id, and its
+    // caller writes no `member_request`.
+    assert!(
+        records(&worker_trace, "a2a_task_received")[0]
+            .get("member_request_id")
+            .is_none(),
+        "{worker_trace:?}"
+    );
+    assert!(records(&project.trace_of(&formation_id, "lead"), "member_request").is_empty());
     assert_no_member_remains(
         project.path(),
         &reported_pids(&formation, Some(&readiness)),

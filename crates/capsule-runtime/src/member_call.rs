@@ -71,6 +71,34 @@ pub(crate) fn mint_call_id() -> String {
     format!("{MEMBER_CALL_ID_PREFIX}{}", uuid::Uuid::now_v7().simple())
 }
 
+/// What every member request id starts with.
+const MEMBER_REQUEST_ID_PREFIX: &str = "mrq_";
+
+/// The header a request routed to a member's virtual address carries its member request id on.
+/// The runtime sets it after removing every value the component set; the callee's door keeps it
+/// only on a request a formation token let in.
+pub const MEMBER_REQUEST_ID_HEADER: &str = "x-murmur-member-request-id";
+
+/// A fresh member request id: [`MEMBER_REQUEST_ID_PREFIX`] and 32 lowercase hex digits.
+pub(crate) fn mint_member_request_id() -> String {
+    format!(
+        "{MEMBER_REQUEST_ID_PREFIX}{}",
+        uuid::Uuid::now_v7().simple()
+    )
+}
+
+/// Whether `value` has exactly the shape [`mint_member_request_id`] mints.
+pub(crate) fn is_member_request_id(value: &str) -> bool {
+    value
+        .strip_prefix(MEMBER_REQUEST_ID_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 // ── Routing ───────────────────────────────────────────────────────────────────
 
 /// Why a call to a member is not sent.

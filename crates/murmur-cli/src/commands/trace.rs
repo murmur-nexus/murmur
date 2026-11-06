@@ -21,7 +21,8 @@ use crate::formation_trace::{
     fold_member_call, fold_member_call_busy, fold_member_call_start, formation_rows,
     no_answer_below_note, search_formation, sender_kind_counts, CallEnding, FormationCall,
     FormationRow, FormationSearch, FormationTask, MemberCallBusyLine, MemberCallLine,
-    MemberCallRecord, MemberCallStartLine, ReceivedCallerFields, ReceivedFrom, RecordedMember,
+    MemberCallRecord, MemberCallStartLine, MemberRequestLine, ReceivedCallerFields, ReceivedFrom,
+    RecordedMember,
 };
 use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
@@ -1369,6 +1370,7 @@ enum TraceEvent {
     MemberCallBusy(MemberCallBusyLine),
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
+    MemberRequest(MemberRequestLine),
     PlanStart(PlanStartEvent),
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
@@ -2946,6 +2948,8 @@ fn compute_metrics(
             TraceEvent::MemberCallBusy(e) => fold_member_call_busy(&mut member_calls, e),
             TraceEvent::MemberCallStart(e) => fold_member_call_start(&mut member_calls, e),
             TraceEvent::MemberCall(e) => fold_member_call(&mut member_calls, e),
+            // Joined with the callee's side in the Formation section, which reads the trace itself.
+            TraceEvent::MemberRequest(_) => {}
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
                 plan_id: e.plan_id,
                 step_count: e.step_count,
@@ -4839,12 +4843,22 @@ fn call_cells(call: &FormationCall) -> [String; 6] {
         ),
         CallEnding::Outstanding => ("outstanding".to_string(), "-".to_string(), ""),
         CallEnding::Unknown => ("unknown".to_string(), "-".to_string(), ""),
+        CallEnding::TaskEnded {
+            status,
+            duration_ms,
+        } => (status.clone(), fmt_dur(*duration_ms), ""),
+        CallEnding::Refused => ("refused".to_string(), "-".to_string(), ""),
+        CallEnding::Failed { duration_ms } => ("failed".to_string(), fmt_dur(*duration_ms), ""),
     };
     let note = call
-        .gap
-        .as_ref()
-        .map(|gap| gap.note(&call.caller, &call.callee))
+        .request_note
+        .clone()
         .into_iter()
+        .chain(
+            call.gap
+                .as_ref()
+                .map(|gap| gap.note(&call.caller, &call.callee)),
+        )
         .chain((call.busy_offers > 0).then(|| busy_note(call.busy_offers)))
         .chain(no_answer_below_note(&call.no_answer_below))
         .collect::<Vec<_>>()
@@ -5248,6 +5262,21 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             no_answer_below_note(&e.no_answer_below)
                 .map(|note| format!("  {note}"))
                 .unwrap_or_default()
+        ),
+        TraceEvent::MemberRequest(e) => format!(
+            "{}{}  {}  {}{}  {}  {}",
+            kind("member_request"),
+            e.member.as_deref().unwrap_or("-"),
+            e.call_id,
+            e.outcome,
+            match (&e.reason, e.http_status) {
+                (Some(reason), Some(status)) => format!(" {reason}  {status}"),
+                (Some(reason), None) => format!(" {reason}"),
+                (None, Some(status)) => format!("  {status}"),
+                (None, None) => String::new(),
+            },
+            fmt_dur(e.duration_ms),
+            e.via_note()
         ),
         TraceEvent::TaskFailed(e) => {
             let reason: String = e.reason.chars().take(120).collect();
@@ -7930,6 +7959,7 @@ mod tests {
             delegated_children: Vec::new(),
             calls_made: Vec::new(),
             tasks_received: Vec::new(),
+            requests_made: Vec::new(),
         }
     }
 
@@ -7971,6 +8001,7 @@ mod tests {
             member_task_id: None,
             busy_offers: 0,
             no_answer_below: Vec::new(),
+            request_note: None,
         }
     }
 
@@ -8019,6 +8050,75 @@ mod tests {
             listed,
             ["mcl_1  lead → p  no_answer  2.5s  delivered  busy ×1; no answer below: q (timed_out), \
               r (rejected)"]
+        );
+    }
+
+    /// A member request's row reads `<mrq id>  <caller> → <callee>  <status>  <duration>` with no
+    /// delivery and a note that begins `via <role> <component>`: a joined request's status and
+    /// duration are its callee task's, a refused one has no duration, a failed one has its own.
+    /// Each counts on the `calls:` line, and its `steps` row names its outcome and component.
+    #[test]
+    fn member_request_rows_render_their_callee_status_and_via_note() {
+        use crate::formation_trace::CallGap;
+        let request = |id: &str, pair: (&str, &str), ending: CallEnding, note: &str| {
+            FormationRow::Call(FormationCall {
+                request_note: Some(note.to_string()),
+                ..formation_call(0, Some(id), pair, ending, None)
+            })
+        };
+        let rows = [
+            request(
+                "mrq_0193a1",
+                ("planner", "coder"),
+                CallEnding::TaskEnded {
+                    status: "completed".to_string(),
+                    duration_ms: 1500,
+                },
+                "via tool formation-probe",
+            ),
+            request(
+                "mrq_0193a2",
+                ("planner", "reviewer"),
+                CallEnding::Refused,
+                "via tool formation-probe; not_a_callee",
+            ),
+            request(
+                "mrq_0193a3",
+                ("planner", "coder"),
+                CallEnding::Failed { duration_ms: 7 },
+                "via tool formation-probe; connection_failed",
+            ),
+            FormationRow::Call(FormationCall {
+                request_note: Some("via hook audit".to_string()),
+                ..formation_call(
+                    0,
+                    Some("mrq_0193a4"),
+                    ("planner", "ghost"),
+                    CallEnding::Unknown,
+                    Some(CallGap::CalleeTraceNotFound),
+                )
+            }),
+        ];
+        assert_eq!(
+            formation_row_lines(&rows),
+            [
+                "mrq_0193a1  planner → coder     completed  1.5s    via tool formation-probe",
+                "mrq_0193a2  planner → reviewer  refused    -       via tool formation-probe; not_a_callee",
+                "mrq_0193a3  planner → coder     failed     7ms     via tool formation-probe; connection_failed",
+                "mrq_0193a4  planner → ghost     unknown    -       via hook audit; ghost's trace not found",
+            ]
+        );
+        assert_eq!(formation_summary_lines(&rows), ["calls:      4"]);
+
+        let sent = r#"{"event_type":"member_request","event_id":"evt_2","parent_id":"evt_1","session_id":"s","timestamp":9,"call_id":"mrq_0193a1","task_id":"tsk_p","member":"coder","component":"formation-probe","role":"tool","via":"wasi_http","outcome":"sent","http_status":200,"member_task_id":"tsk_c","duration_ms":12}"#;
+        let refused = r#"{"event_type":"member_request","event_id":"evt_3","parent_id":"evt_1","session_id":"s","timestamp":9,"call_id":"mrq_0193a2","task_id":"tsk_p","member":"reviewer","component":"formation-probe","role":"tool","via":"wasi_http","outcome":"refused","reason":"not_a_callee","duration_ms":0}"#;
+        assert_eq!(
+            row(sent),
+            "member_request coder  mrq_0193a1  sent  200  12ms  via tool formation-probe"
+        );
+        assert_eq!(
+            row(refused),
+            "member_request reviewer  mrq_0193a2  refused not_a_callee  0ms  via tool formation-probe"
         );
     }
 

@@ -793,6 +793,10 @@ pub struct StagedSession {
     /// beside the epoch ticker and cloned into every store that runs a component and into the
     /// session's trace writer, which drains it.
     pub(crate) call_deadlines: CallDeadlines,
+    /// The session's record of every request routed to a member's virtual address, created at
+    /// staging beside [`Self::call_deadlines`] and cloned the same way: into every store that can
+    /// route one and into the session's trace writer, which drains it.
+    pub(crate) member_requests: crate::member_request::MemberRequests,
     /// The credential this session presents when it asks `mur-roost` to spawn a capsule.
     ///
     /// `None` for every session that cannot delegate, which is nearly all of them. Set by the

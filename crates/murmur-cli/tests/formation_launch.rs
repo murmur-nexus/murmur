@@ -772,6 +772,257 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     );
 }
 
+/// The `member_request` lines of one trace, in file order.
+fn member_requests(trace: &[Value]) -> Vec<&Value> {
+    trace
+        .iter()
+        .filter(|event| event["event_type"] == "member_request")
+        .collect()
+}
+
+/// Whether `id` is `mrq_` and 32 lowercase hex digits.
+fn is_member_request_id(id: &Value) -> bool {
+    id.as_str()
+        .and_then(|id| id.strip_prefix("mrq_"))
+        .is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// The ids a line carries, which a port number may appear inside by chance.
+const ID_FIELDS: &[&str] = &[
+    "event_id",
+    "parent_id",
+    "session_id",
+    "call_id",
+    "task_id",
+    "member_task_id",
+    "context_id",
+    "message_id",
+    "member_request_id",
+    "message_sha256",
+    "traceparent_from_caller",
+];
+
+/// `line` holds no formation token, no `Bearer`, no loopback address and none of `ports`.
+fn assert_holds_no_secret(line: &Value, ports: &[u16]) {
+    let text = line.to_string();
+    for needle in ["mft1.", "Bearer", "127.0.0.1:", "localhost:"] {
+        assert!(!text.contains(needle), "{needle} in {text}");
+    }
+    for (key, value) in line.as_object().unwrap() {
+        for port in ports {
+            match value {
+                Value::Number(number) => {
+                    assert_ne!(number.as_u64(), Some(u64::from(*port)), "{key}: {text}")
+                }
+                Value::String(string) if !ID_FIELDS.contains(&key.as_str()) => {
+                    assert!(!string.contains(&port.to_string()), "{key}: {text}")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Every request a member's probe routes to a virtual address is one `member_request` line in its
+/// own trace, refusals included, and the callee's `a2a_task_received` records the id of the one
+/// that started its task. `mur trace show frm_<id>` — and the entry member's own `mur trace show`
+/// — join the two into a call row, and print each refusal as a row of its own. No line names a
+/// token, a door address or a door port.
+#[test]
+fn every_member_request_is_one_line_the_formation_view_joins() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(&[CODER, REVIEWER, PLANNER], CHAIN_REACH, &chain_probes());
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_requests("coder", 2);
+    project.await_requests("reviewer", 1);
+    project.release.send(()).unwrap();
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+
+    let planner_trace = project.trace_of("planner");
+    let coder_trace = project.trace_of("coder");
+    let reviewer_trace = project.trace_of("reviewer");
+    let planner_task = planner_trace
+        .iter()
+        .find(|event| event["event_type"] == "task_start")
+        .unwrap()["task_id"]
+        .clone();
+    let coder_received: Vec<&Value> = coder_trace
+        .iter()
+        .filter(|event| event["event_type"] == "a2a_task_received")
+        .collect();
+    assert_eq!(coder_received.len(), 1, "{coder_trace:?}");
+    let coder_task = coder_received[0]["task_id"].clone();
+
+    // planner: a card fetch and a SendMessage to coder, sent; two refusals each for reviewer and
+    // nosuch.
+    let planner_requests = member_requests(&planner_trace);
+    println!("planner's member_request lines:");
+    for line in &planner_requests {
+        println!("{line}");
+    }
+    let to = |requests: &[&Value], member: &str| -> Vec<Value> {
+        requests
+            .iter()
+            .filter(|line| line["member"] == member)
+            .map(|line| (*line).clone())
+            .collect()
+    };
+    let to_coder = to(&planner_requests, "coder");
+    assert_eq!(to_coder.len(), 2, "{planner_requests:?}");
+    for line in planner_requests.iter() {
+        assert!(is_member_request_id(&line["call_id"]), "{line}");
+        assert_eq!(line["component"], "formation-probe", "{line}");
+        assert_eq!(line["role"], "tool", "{line}");
+        assert_eq!(line["via"], "wasi_http", "{line}");
+        assert_eq!(line["task_id"], planner_task, "{line}");
+    }
+    let (card, send) = (&to_coder[0], &to_coder[1]);
+    assert_eq!(card["outcome"], "sent", "{card}");
+    assert_eq!(card["http_status"], 200, "{card}");
+    assert!(card.get("member_task_id").is_none(), "{card}");
+    assert!(card.get("reason").is_none(), "{card}");
+    assert_eq!(send["outcome"], "sent", "{send}");
+    assert_eq!(send["http_status"], 200, "{send}");
+    assert_eq!(send["member_task_id"], coder_task, "{send}");
+    assert_eq!(
+        coder_received[0]["member_request_id"], send["call_id"],
+        "{coder_received:?}"
+    );
+    assert_eq!(coder_received[0]["caller_member"], "planner");
+    for member in ["reviewer", "nosuch"] {
+        let refused = to(&planner_requests, member);
+        assert_eq!(refused.len(), 2, "{member}: {planner_requests:?}");
+        for line in &refused {
+            assert_eq!(line["outcome"], "refused", "{line}");
+            assert_eq!(line["reason"], "not_a_callee", "{line}");
+            assert!(line.get("http_status").is_none(), "{line}");
+        }
+    }
+    assert_eq!(planner_requests.len(), 6, "{planner_requests:?}");
+
+    // coder: two sent to reviewer, from the task planner handed it; two refused for planner.
+    let coder_requests = member_requests(&coder_trace);
+    println!("coder's member_request lines:");
+    for line in &coder_requests {
+        println!("{line}");
+    }
+    assert_eq!(coder_requests.len(), 4, "{coder_requests:?}");
+    let refused = to(&coder_requests, "planner");
+    assert_eq!(refused.len(), 2, "{coder_requests:?}");
+    assert!(refused
+        .iter()
+        .all(|line| line["outcome"] == "refused" && line["reason"] == "not_a_callee"));
+    let to_reviewer = to(&coder_requests, "reviewer");
+    assert!(to_reviewer.iter().all(|line| line["task_id"] == coder_task));
+    let reviewer_received: Vec<&Value> = reviewer_trace
+        .iter()
+        .filter(|event| event["event_type"] == "a2a_task_received")
+        .collect();
+    assert_eq!(
+        reviewer_received[0]["member_request_id"], to_reviewer[1]["call_id"],
+        "{reviewer_received:?}"
+    );
+
+    // No line names a token, a door address or a door port.
+    let mut ports: Vec<u16> = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(std::iter::once(&planner))
+        .filter_map(|peer| peer["url"].as_str())
+        .filter_map(|url| url.rsplit(':').next()?.trim_end_matches('/').parse().ok())
+        .collect();
+    ports.sort_unstable();
+    assert_eq!(ports.len(), 3, "{formation} {planner}");
+    for trace in [&planner_trace, &coder_trace, &reviewer_trace] {
+        for line in trace.iter().filter(|line| {
+            line["event_type"] == "member_request" || line["event_type"] == "a2a_task_received"
+        }) {
+            assert_holds_no_secret(line, &ports);
+        }
+    }
+    let stdout = launcher.stdout();
+    assert_no_formation_token(&project, &stdout, &launcher.stderr());
+
+    // The formation view joins the SendMessage to coder's task and lists every refusal.
+    let coder_end = coder_trace
+        .iter()
+        .find(|event| event["event_type"] == "task_end" && event["task_id"] == coder_task)
+        .expect("coder's task ended");
+    let status = coder_end["exit_status"].as_str().unwrap();
+    let duration_ms = coder_end["duration_ms"].as_u64().unwrap();
+    let duration = if duration_ms < 1000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    };
+    let send_id = send["call_id"].as_str().unwrap();
+    let planner_trace_path = project.session_of("planner").join("trace.jsonl");
+    for args in [
+        vec!["trace", "show", formation_id.as_str()],
+        vec!["trace", "show", planner_trace_path.to_str().unwrap()],
+    ] {
+        let shown = project.run(&args, &[]);
+        println!("$ mur {}\n{}", args.join(" "), shown.stdout);
+        assert!(shown.status.success(), "{}\n{}", shown.stdout, shown.stderr);
+        let row = shown
+            .stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with(send_id))
+            .unwrap_or_else(|| panic!("no row for {send_id}:\n{}", shown.stdout));
+        let cells: Vec<&str> = row
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert_eq!(cells[1], "planner → coder", "{row}");
+        assert_eq!(cells[2], status, "{row}");
+        assert_eq!(cells[3], duration, "{row}");
+        assert!(cells[4].starts_with("via tool formation-probe"), "{row}");
+        assert!(!shown.stdout.contains("(no call id)"), "{}", shown.stdout);
+        let unknown: Vec<&str> = shown
+            .stdout
+            .lines()
+            .filter(|line| line.contains(" → ") && line.contains(" unknown "))
+            .collect();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        let refused_rows = shown
+            .stdout
+            .lines()
+            .filter(|line| {
+                line.contains(" refused ")
+                    && line.contains("via tool formation-probe; not_a_callee")
+            })
+            .count();
+        assert_eq!(refused_rows, 6, "{}", shown.stdout);
+        for pair in ["planner → reviewer", "planner → nosuch", "coder → planner"] {
+            assert_eq!(
+                shown
+                    .stdout
+                    .lines()
+                    .filter(|line| line.contains(pair) && line.contains(" refused "))
+                    .count(),
+                2,
+                "{pair}:\n{}",
+                shown.stdout
+            );
+        }
+    }
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
+
 /// `mft1.` appears nowhere the run produced — the launcher's two streams, any file under the
 /// project or the scratch `HOME` (every session directory, records directory and running record
 /// among them), or any request any member's model was sent.

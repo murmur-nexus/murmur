@@ -54,6 +54,9 @@ pub(crate) struct RecordedMember {
     /// whoever sent it: another member's `call-member` call, the operator, a declared credential,
     /// a public-door caller, or a caller an older trace does not name.
     pub(crate) tasks_received: Vec<ReceivedTask>,
+    /// Every request the session's runtime routed to a member's virtual address, one per
+    /// `member_request` line, in file order.
+    pub(crate) requests_made: Vec<MemberRequestLine>,
 }
 
 impl RecordedMember {
@@ -116,6 +119,45 @@ pub(crate) fn no_answer_below_note(below: &[NoAnswerBelow]) -> Option<String> {
             .join(", ");
         format!("no answer below: {named}")
     })
+}
+
+/// One `member_request` line: a request the runtime routed to a member's virtual address, from a
+/// component's own `wasi:http` or a script capsule's `murmur:message/send`, refusals included.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct MemberRequestLine {
+    /// The `mrq_` id the runtime minted; the callee's `a2a_task_received.member_request_id`.
+    pub(crate) call_id: String,
+    /// The calling task; `None` for a request sent for no task.
+    #[serde(default)]
+    pub(crate) task_id: Option<String>,
+    /// The roster name the address named; `None` when it named no single member.
+    #[serde(default)]
+    pub(crate) member: Option<String>,
+    #[serde(default)]
+    pub(crate) component: String,
+    #[serde(default)]
+    pub(crate) role: String,
+    #[serde(default)]
+    pub(crate) via: String,
+    /// `sent`, `refused` or `failed`.
+    pub(crate) outcome: String,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) http_status: Option<u16>,
+    #[serde(default)]
+    pub(crate) member_task_id: Option<String>,
+    #[serde(default)]
+    pub(crate) duration_ms: u64,
+    #[serde(default)]
+    pub(crate) timestamp: u64,
+}
+
+impl MemberRequestLine {
+    /// The note a request's row begins with: `via <role> <component>`.
+    pub(crate) fn via_note(&self) -> String {
+        format!("via {} {}", self.role, self.component)
+    }
 }
 
 /// One `member_call_start` line: a `call-member` call whose callee holds the task.
@@ -262,6 +304,9 @@ pub(crate) struct ReceivedTask {
     /// The `mcl_` call id the caller minted, read from the message id `msg_<call id>`; `None`
     /// for a message id of any other shape.
     pub(crate) call_id: Option<String>,
+    /// The `mrq_` id of the caller's `member_request`, from `a2a_task_received.member_request_id`;
+    /// `None` for a task a member request did not start.
+    pub(crate) member_request_id: Option<String>,
     /// Who sent it.
     pub(crate) from: ReceivedFrom,
     pub(crate) received_ms: u64,
@@ -411,6 +456,8 @@ struct A2aTaskReceivedLine {
     task_id: String,
     #[serde(default)]
     message_id: String,
+    #[serde(default)]
+    member_request_id: Option<String>,
     #[serde(flatten)]
     caller: ReceivedCallerFields,
     #[serde(default)]
@@ -459,6 +506,7 @@ enum Line {
     MemberCallBusy(MemberCallBusyLine),
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
+    MemberRequest(MemberRequestLine),
     A2aTaskReceived(A2aTaskReceivedLine),
     TaskEnd {
         task_id: String,
@@ -615,6 +663,13 @@ pub(crate) enum CallEnding {
     Outstanding,
     /// No caller trace was found, so nothing says how the call ended.
     Unknown,
+    /// A member request whose callee task was found and ended: its `task_end` status and
+    /// duration.
+    TaskEnded { status: String, duration_ms: u64 },
+    /// A member request the runtime refused before any connection.
+    Refused,
+    /// A member request that was routed and did not complete, after `duration_ms`.
+    Failed { duration_ms: u64 },
 }
 
 /// The side of a call the found traces are missing, at most one per call.
@@ -672,6 +727,9 @@ pub(crate) struct FormationCall {
     pub(crate) busy_offers: u32,
     /// The members further down the callee reported as giving it no answer.
     pub(crate) no_answer_below: Vec<NoAnswerBelow>,
+    /// For a member request's row: `via <role> <component>`, then the line's reason when it has
+    /// one. `None` for a `call-member` call and for a call only its callee recorded.
+    pub(crate) request_note: Option<String>,
 }
 
 /// A task a member's door let in that no member sent: one the operator, a declared credential,
@@ -761,12 +819,14 @@ impl FormationRow {
     }
 }
 
-/// Every `call-member` call `members` record, once each, and every task a member received that
-/// no member sent, in display order.
+/// Every `call-member` call `members` record, once each, every member request that makes a row
+/// (see [`request_row`]), and every task a member received that no member sent, in display order.
 ///
 /// A call's caller side is its caller's [`MemberCallRecord`]; its callee side is the member's
-/// [`ReceivedTask`] whose task id is the call's `member_task_id`. Every caller-side call is a
-/// row, and so is every member's received task no caller-side call matched. Every received task
+/// [`ReceivedTask`] whose task id is the call's `member_task_id`. A member request's caller side
+/// is its caller's [`MemberRequestLine`]; its callee side is the member's [`ReceivedTask`] whose
+/// `member_request_id` is the request's `call_id`. Every caller-side call is a row, and so is
+/// every member's received task no caller-side call or request matched. Every received task
 /// no member sent is a [`FormationTask`] row. A call row's parent is the row that handed over the
 /// task it was made from: the row whose task is its calling task and whose member is its caller.
 /// Rows with no parent come first by `(started, id)`, a task row's id being its task id, each
@@ -821,7 +881,29 @@ pub(crate) fn formation_rows(members: &[RecordedMember]) -> Vec<FormationRow> {
                 member_task_id: call.member_task_id.clone(),
                 busy_offers: call.busy_offers,
                 no_answer_below: call.no_answer_below.clone(),
+                request_note: None,
             }));
+        }
+    }
+    // Each member task a member request started, by that request's id.
+    let mut by_request: HashMap<&str, &ReceivedTask> = HashMap::new();
+    for member in members {
+        for task in &member.tasks_received {
+            if let (ReceivedFrom::Member(_), Some(id)) = (&task.from, &task.member_request_id) {
+                by_request.entry(id.as_str()).or_insert(task);
+            }
+        }
+    }
+    let found_members: BTreeSet<&str> =
+        members.iter().filter_map(|m| m.member.as_deref()).collect();
+    for member in members {
+        for request in &member.requests_made {
+            if let Some(task) = by_request.get(request.call_id.as_str()).copied() {
+                matched.insert(task.task_id.as_str());
+            }
+            rows.extend(
+                request_row(member, request, &by_request, &found_members).map(FormationRow::Call),
+            );
         }
     }
     for member in members {
@@ -830,7 +912,10 @@ pub(crate) fn formation_rows(members: &[RecordedMember]) -> Vec<FormationRow> {
                 ReceivedFrom::Member(_) if matched.contains(task.task_id.as_str()) => continue,
                 ReceivedFrom::Member(caller) => FormationRow::Call(FormationCall {
                     depth: 0,
-                    call_id: task.call_id.clone(),
+                    call_id: task
+                        .call_id
+                        .clone()
+                        .or_else(|| task.member_request_id.clone()),
                     caller: caller.clone(),
                     callee: member.name().to_string(),
                     started_ms: task.received_ms,
@@ -840,6 +925,7 @@ pub(crate) fn formation_rows(members: &[RecordedMember]) -> Vec<FormationRow> {
                     member_task_id: Some(task.task_id.clone()),
                     busy_offers: 0,
                     no_answer_below: Vec::new(),
+                    request_note: None,
                 }),
                 from => FormationRow::Task(FormationTask {
                     depth: 0,
@@ -863,6 +949,80 @@ pub(crate) fn formation_rows(members: &[RecordedMember]) -> Vec<FormationRow> {
         }
     }
     nest(rows)
+}
+
+/// The row one `member_request` line of `caller`'s makes, or `None` for a line that makes none.
+///
+/// | The line | Row |
+/// |---|---|
+/// | a callee task recorded its id | joined: the task's `task_end` status and duration, `outstanding` without one |
+/// | `refused` | `refused`, no duration |
+/// | `failed` | `failed`, the request's duration |
+/// | `sent` with a `member_task_id`, and no found member is the callee | `unknown`, `<callee>'s trace not found` |
+/// | any other `sent` — a card fetch, a `GetTask` poll | none |
+///
+/// Every row's note begins `via <role> <component>`, followed by the line's reason when it has one.
+fn request_row(
+    caller: &RecordedMember,
+    request: &MemberRequestLine,
+    by_request: &HashMap<&str, &ReceivedTask>,
+    found_members: &BTreeSet<&str>,
+) -> Option<FormationCall> {
+    let callee = request.member.clone().unwrap_or_else(|| "-".to_string());
+    let (ending, gap, member_task_id) = match by_request.get(request.call_id.as_str()) {
+        Some(task) => (
+            match &task.ending {
+                Some(status) => CallEnding::TaskEnded {
+                    status: status.clone(),
+                    duration_ms: task.duration_ms,
+                },
+                None => CallEnding::Outstanding,
+            },
+            None,
+            Some(task.task_id.clone()),
+        ),
+        None => match request.outcome.as_str() {
+            "refused" => (CallEnding::Refused, None, None),
+            "failed" => (
+                CallEnding::Failed {
+                    duration_ms: request.duration_ms,
+                },
+                None,
+                request.member_task_id.clone(),
+            ),
+            _ if request.member_task_id.is_some()
+                && !request
+                    .member
+                    .as_deref()
+                    .is_some_and(|member| found_members.contains(member)) =>
+            {
+                (
+                    CallEnding::Unknown,
+                    Some(CallGap::CalleeTraceNotFound),
+                    request.member_task_id.clone(),
+                )
+            }
+            _ => return None,
+        },
+    };
+    let request_note = std::iter::once(request.via_note())
+        .chain(request.reason.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(FormationCall {
+        depth: 0,
+        call_id: Some(request.call_id.clone()),
+        caller: caller.name().to_string(),
+        callee,
+        started_ms: request.timestamp.saturating_sub(request.duration_ms),
+        ending,
+        gap,
+        calling_task_id: request.task_id.clone(),
+        member_task_id,
+        busy_offers: 0,
+        no_answer_below: Vec::new(),
+        request_note: Some(request_note),
+    })
 }
 
 /// `rows` in display order, each with its depth: see [`formation_rows`].
@@ -933,6 +1093,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
         delegated_children: Vec::new(),
         calls_made: Vec::new(),
         tasks_received: Vec::new(),
+        requests_made: Vec::new(),
     };
     let Ok(file) = fs::File::open(session_dir.join("trace.jsonl")) else {
         return member;
@@ -963,6 +1124,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
             Line::MemberCallBusy(busy) => fold_member_call_busy(&mut member.calls_made, busy),
             Line::MemberCallStart(start) => fold_member_call_start(&mut member.calls_made, start),
             Line::MemberCall(end) => fold_member_call(&mut member.calls_made, end),
+            Line::MemberRequest(request) => member.requests_made.push(request),
             Line::A2aTaskReceived(received) => {
                 let from = received.caller.sender();
                 let message_sha256 = blob_name(received.caller.message_sha256);
@@ -974,6 +1136,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
                 });
                 member.tasks_received.push(ReceivedTask {
                     call_id: call_id_of_message(&received.message_id),
+                    member_request_id: received.member_request_id,
                     task_id: received.task_id,
                     from,
                     received_ms: received.timestamp,
@@ -1212,6 +1375,7 @@ mod tests {
                     delegated_children: vec![child_here.clone(), child_away.clone()],
                     calls_made: Vec::new(),
                     tasks_received: Vec::new(),
+                    requests_made: Vec::new(),
                 },
                 RecordedMember {
                     session_id: killed.clone(),
@@ -1224,6 +1388,7 @@ mod tests {
                     delegated_children: Vec::new(),
                     calls_made: Vec::new(),
                     tasks_received: Vec::new(),
+                    requests_made: Vec::new(),
                 },
                 RecordedMember {
                     session_id: child_here.clone(),
@@ -1236,6 +1401,7 @@ mod tests {
                     delegated_children: Vec::new(),
                     calls_made: Vec::new(),
                     tasks_received: Vec::new(),
+                    requests_made: Vec::new(),
                 },
             ]
         );
@@ -1806,8 +1972,10 @@ mod tests {
                     duration_ms: 1,
                     message_sha256: None,
                     message_stored: false,
+                    member_request_id: None,
                 })
                 .collect(),
+            requests_made: Vec::new(),
         }
     }
 
@@ -2208,6 +2376,349 @@ mod tests {
                 "lead→worker".into(),
                 "worker's task ended completed".into()
             )]
+        );
+    }
+
+    /// A `member_request` line as the runtime writes it; `extra` adds `task_id`, `reason`,
+    /// `http_status` or `member_task_id`.
+    fn request(
+        call: &str,
+        member: Option<&str>,
+        (role, component): (&str, &str),
+        outcome: &str,
+        (duration_ms, at): (u64, u64),
+        extra: serde_json::Value,
+    ) -> String {
+        let mut line = json!({
+            "event_type": "member_request", "event_id": format!("evt_{call}"),
+            "parent_id": "evt_0", "session_id": "ses", "timestamp": at, "call_id": call,
+            "component": component, "role": role, "via": "wasi_http", "outcome": outcome,
+            "duration_ms": duration_ms,
+        });
+        if let Some(member) = member {
+            line["member"] = member.into();
+        }
+        for (key, value) in extra.as_object().unwrap() {
+            line[key] = value.clone();
+        }
+        line.to_string()
+    }
+
+    /// A task a member request from `caller` started, as its callee's door records it.
+    fn received_request(task: &str, caller: &str, request_id: &str, at: u64) -> String {
+        received_as(
+            task,
+            "formation-probe",
+            json!({"caller": "member", "caller_member": caller, "member_request_id": request_id}),
+            at,
+        )
+    }
+
+    fn call_by_id<'a>(calls: &'a [FormationCall], id: &str) -> &'a FormationCall {
+        calls
+            .iter()
+            .find(|call| call.call_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("no row {id}: {calls:#?}"))
+    }
+
+    /// Every row rule for member requests: a request a callee task recorded is joined to that
+    /// task's ending, or `outstanding` without one; a refused or failed request is a row of its
+    /// own; a sent request naming a callee task whose member was not found says so; any other sent
+    /// request makes no row; a callee task naming a request no caller trace records stays an
+    /// `unknown` row under the `mrq_` id; a hook's request made for no task is a root row; and a
+    /// request made from a task a request handed over nests under that request's row.
+    #[test]
+    fn member_request_rows_follow_every_row_rule() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let (planner, coder, reviewer) = (
+            session_after(&formation, 10, "1"),
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 30, "3"),
+        );
+        let probe = ("tool", "formation-probe");
+        write_trace(
+            root.path(),
+            &planner,
+            &[
+                member_start(&planner, &formation, Some("planner"), &["coder"], "p"),
+                request(
+                    "mrq_card",
+                    Some("coder"),
+                    probe,
+                    "sent",
+                    (3, 100),
+                    json!({"task_id": "tsk_p", "http_status": 200}),
+                ),
+                request(
+                    "mrq_send",
+                    Some("coder"),
+                    probe,
+                    "sent",
+                    (5, 110),
+                    json!({"task_id": "tsk_p", "http_status": 200, "member_task_id": "tsk_c"}),
+                ),
+                request(
+                    "mrq_poll",
+                    Some("coder"),
+                    probe,
+                    "sent",
+                    (2, 120),
+                    json!({"task_id": "tsk_p", "http_status": 200, "member_task_id": "tsk_c"}),
+                ),
+                request(
+                    "mrq_refused",
+                    Some("reviewer"),
+                    probe,
+                    "refused",
+                    (0, 130),
+                    json!({"task_id": "tsk_p", "reason": "not_a_callee"}),
+                ),
+                request(
+                    "mrq_bare",
+                    None,
+                    probe,
+                    "refused",
+                    (0, 131),
+                    json!({"task_id": "tsk_p", "reason": "not_a_virtual_address"}),
+                ),
+                request(
+                    "mrq_failed",
+                    Some("coder"),
+                    probe,
+                    "failed",
+                    (7, 140),
+                    json!({"task_id": "tsk_p", "reason": "connection_failed"}),
+                ),
+                request(
+                    "mrq_ghost",
+                    Some("ghost"),
+                    probe,
+                    "sent",
+                    (4, 150),
+                    json!({"task_id": "tsk_p", "http_status": 200, "member_task_id": "tsk_g"}),
+                ),
+                request(
+                    "mrq_open",
+                    Some("coder"),
+                    probe,
+                    "sent",
+                    (4, 160),
+                    json!({"task_id": "tsk_p", "http_status": 200, "member_task_id": "tsk_o"}),
+                ),
+                request(
+                    "mrq_hook",
+                    Some("coder"),
+                    ("hook", "audit"),
+                    "sent",
+                    (4, 170),
+                    json!({"http_status": 200, "member_task_id": "tsk_h"}),
+                ),
+                end("completed"),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &coder,
+            &[
+                member_start(&coder, &formation, Some("coder"), &["reviewer"], "c"),
+                received_request("tsk_c", "planner", "mrq_send", 111),
+                request(
+                    "mrq_nested",
+                    Some("reviewer"),
+                    probe,
+                    "sent",
+                    (6, 300),
+                    json!({"task_id": "tsk_c", "http_status": 200, "member_task_id": "tsk_r"}),
+                ),
+                task_end_after("tsk_c", "completed", 1500),
+                received_request("tsk_o", "planner", "mrq_open", 161),
+                received_request("tsk_h", "planner", "mrq_hook", 171),
+                task_end_after("tsk_h", "failed", 20),
+                received_request("tsk_x", "planner", "mrq_lost", 180),
+                task_end_after("tsk_x", "completed", 9),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &reviewer,
+            &[
+                member_start(&reviewer, &formation, Some("reviewer"), &[], "r"),
+                received_request("tsk_r", "coder", "mrq_nested", 301),
+                task_end_after("tsk_r", "completed", 40),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        let rows = formation_rows(&members);
+        assert!(
+            rows.iter().all(|row| matches!(row, FormationRow::Call(_))),
+            "{rows:#?}"
+        );
+        let calls = formation_calls(&members);
+        let ids: BTreeSet<&str> = calls.iter().filter_map(|c| c.call_id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "mrq_send",
+                "mrq_refused",
+                "mrq_bare",
+                "mrq_failed",
+                "mrq_ghost",
+                "mrq_open",
+                "mrq_hook",
+                "mrq_nested",
+                "mrq_lost",
+            ]),
+            "a card fetch and a GetTask poll make no row"
+        );
+        assert_eq!(calls.len(), ids.len(), "every callee task is listed once");
+
+        let send = call_by_id(&calls, "mrq_send");
+        assert_eq!(
+            (send.caller.as_str(), send.callee.as_str()),
+            ("planner", "coder")
+        );
+        assert_eq!(
+            send.ending,
+            CallEnding::TaskEnded {
+                status: "completed".into(),
+                duration_ms: 1500
+            }
+        );
+        assert_eq!(send.gap, None);
+        assert_eq!(
+            send.request_note.as_deref(),
+            Some("via tool formation-probe")
+        );
+        assert_eq!(send.calling_task_id.as_deref(), Some("tsk_p"));
+        assert_eq!(send.member_task_id.as_deref(), Some("tsk_c"));
+        assert_eq!(send.started_ms, 105);
+
+        let nested = call_by_id(&calls, "mrq_nested");
+        assert_eq!(
+            nested.depth,
+            send.depth + 1,
+            "nested under the request that handed tsk_c"
+        );
+        assert_eq!(
+            (nested.caller.as_str(), nested.callee.as_str()),
+            ("coder", "reviewer")
+        );
+
+        let refused = call_by_id(&calls, "mrq_refused");
+        assert_eq!(refused.ending, CallEnding::Refused);
+        assert_eq!(
+            refused.request_note.as_deref(),
+            Some("via tool formation-probe; not_a_callee")
+        );
+        assert_eq!(refused.member_task_id, None);
+        assert_eq!(call_by_id(&calls, "mrq_bare").callee, "-");
+
+        let failed = call_by_id(&calls, "mrq_failed");
+        assert_eq!(failed.ending, CallEnding::Failed { duration_ms: 7 });
+        assert_eq!(
+            failed.request_note.as_deref(),
+            Some("via tool formation-probe; connection_failed")
+        );
+
+        let ghost = call_by_id(&calls, "mrq_ghost");
+        assert_eq!(ghost.ending, CallEnding::Unknown);
+        assert_eq!(ghost.gap, Some(CallGap::CalleeTraceNotFound));
+        assert_eq!(
+            ghost.gap.as_ref().unwrap().note("planner", "ghost"),
+            "ghost's trace not found"
+        );
+
+        assert_eq!(
+            call_by_id(&calls, "mrq_open").ending,
+            CallEnding::Outstanding
+        );
+
+        let hook = call_by_id(&calls, "mrq_hook");
+        assert_eq!(hook.depth, 0, "a request made for no task is a root row");
+        assert_eq!(hook.calling_task_id, None);
+        assert_eq!(hook.request_note.as_deref(), Some("via hook audit"));
+        assert_eq!(
+            hook.ending,
+            CallEnding::TaskEnded {
+                status: "failed".into(),
+                duration_ms: 20
+            }
+        );
+
+        let lost = call_by_id(&calls, "mrq_lost");
+        assert_eq!(lost.ending, CallEnding::Unknown);
+        assert_eq!(lost.request_note, None);
+        assert_eq!(
+            lost.gap,
+            Some(CallGap::CallerTraceNotFound(Some("completed".into())))
+        );
+    }
+
+    /// A script member's `message_send` request joins its callee's task the same way, and the row
+    /// names the script capsule.
+    #[test]
+    fn member_request_from_a_script_member_joins_its_callee() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let (sender, peer) = (
+            session_after(&formation, 10, "1"),
+            session_after(&formation, 20, "2"),
+        );
+        let mut sent = serde_json::from_str::<serde_json::Value>(&request(
+            "mrq_script",
+            Some("peer"),
+            ("capsule", "formation-sender"),
+            "sent",
+            (9, 100),
+            json!({"http_status": 200, "member_task_id": "tsk_peer"}),
+        ))
+        .unwrap();
+        sent["via"] = "message_send".into();
+        write_trace(
+            root.path(),
+            &sender,
+            &[
+                member_start(
+                    &sender,
+                    &formation,
+                    Some("sender"),
+                    &["peer"],
+                    "formation-sender",
+                ),
+                sent.to_string(),
+                end("completed"),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &peer,
+            &[
+                member_start(&peer, &formation, Some("peer"), &[], "peer"),
+                received_request("tsk_peer", "sender", "mrq_script", 95),
+                task_end_after("tsk_peer", "completed", 30),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        let calls = formation_calls(&members);
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        let call = &calls[0];
+        assert_eq!(call.call_id.as_deref(), Some("mrq_script"));
+        assert_eq!(
+            (call.caller.as_str(), call.callee.as_str()),
+            ("sender", "peer")
+        );
+        assert_eq!(call.depth, 0);
+        assert_eq!(
+            call.request_note.as_deref(),
+            Some("via capsule formation-sender")
+        );
+        assert_eq!(
+            call.ending,
+            CallEnding::TaskEnded {
+                status: "completed".into(),
+                duration_ms: 30
+            }
         );
     }
 }

@@ -2959,13 +2959,14 @@ Output sections, in the order they are printed:
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, counted by who the door let each in as, most first — `received:   3 tasks — member 2, operator 1`, the kinds being `operator`, `member`, `credential`, `public` and `unknown caller` for a line that names none — then messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown: turns, tokens, exit status and duration, then the task's reopens and `capped: <n>`, its turns stopped at the output cap, when either is non-zero |
 | Member calls | one or more [`member_call_busy`](observability-schemas.md#member-call-busy)/[`member_call_start`](observability-schemas.md#member-call-start)/[`member_call`](observability-schemas.md#member-call) records | One row per [`call-member`](runtime-provided-tools.md#call-member) call: its `mcl_` id, the member, the member's task id — `(not started)` for a call the member never held — and how it ended with its duration, `outstanding` for a call this trace never saw end, `not delivered` for an answer the task never received. `busy ×<n>` follows when the member turned `<n>` offers of the task away busy, and `no answer below: <member> (<status>), …` when the call's [`member_call.no_answer_below`](observability-schemas.md#member-call) names members further down that gave it no answer |
-| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, every `call-member` call between them, and every task a member received that no member sent |
+| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, every `call-member` call and every [member request](observability-schemas.md#member-request) between them, and every task a member received that no member sent |
 
 #### Listing a formation { #mur-trace-show-formation }
 
 `mur trace show <formation-id>` lists every session whose trace names that formation, by session
 id, with its roster name and how it ended, then every [`call-member`](runtime-provided-tools.md#call-member)
-call between the members and every task a member's door let in that no member sent: the
+call between the members, every request a member's component sent to another member's
+[virtual address](roster.md#formation-peers), and every task a member's door let in that no member sent: the
 operator's, a declared credential's, or a public-door caller's. It searches these [records groups](workdir.md#records-directory), in
 order:
 
@@ -3021,18 +3022,41 @@ tsk_019f01a9c18e7a2b3c4d5e6f708192a3      operator → worker-b2  ok         12.
 | `delegated children not under these roots` | Members' delegated children whose traces are in another records group. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
 | `calls:` | How many call rows follow. Only when the members' traces record at least one call |
 | `tasks:` | `<n> not from a member — operator <a>, credential <b>, public <c>, unknown caller <d>`: how many task rows follow, and how many of them each kind of sender sent, in that order, a kind with none left out. Only when there is at least one task row |
-| One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one, `busy ×<n>` when the callee turned `<n>` offers away busy, and `no answer below: <member> (<status>), …` when the call names members further down that gave no answer, joined by `; `. Columns are aligned |
+| One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then, for a member request, `via <role> <component>` and its `reason` when it has one, then the note for a missing side when there is one, `busy ×<n>` when the callee turned `<n>` offers away busy, and `no answer below: <member> (<status>), …` when the call names members further down that gave no answer, joined by `; `. Columns are aligned |
 | One per task | `<task id>  <sender> → <member>  <status>  <duration>`, an empty delivery column, then where the task's message is. Aligned with the call rows |
 
 Each call row carries:
 
 | Field | Value |
 |---|---|
-| Call id | The `mcl_` id the caller's model was given. `(no call id)` for a task received with a message id that names none |
+| Call id | The `mcl_` id the caller's model was given, or a member request's `mrq_` id. `(no call id)` for a task received with neither a message id that names one nor a `member_request_id` |
 | `<caller> → <callee>` | Roster names: the caller is the calling session's `formation_member`, or its session id when it has none; the callee is the call's [`member_call.member`](observability-schemas.md#member-call). A call only the callee recorded takes its caller from [`a2a_task_received.caller_member`](observability-schemas.md#session-trace-tracejsonl) |
-| Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer`. `outstanding` for a call with a `member_call_start` or `member_call_busy` and no `member_call`; `unknown` for a call only the callee recorded |
+| Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer`. `outstanding` for a call with a `member_call_start` or `member_call_busy` and no `member_call`; `unknown` for a call only the callee recorded. A member request's row is in the table below |
 | Duration | From the tool call to the outcome. `-` for `outstanding` and `unknown` |
-| Delivery | `delivered`, or `not delivered` for an answer the calling task never received. Empty for `outstanding` and `unknown` |
+| Delivery | `delivered`, or `not delivered` for an answer the calling task never received. Empty for `outstanding`, `unknown` and every member request |
+
+A member request's row comes from the sender's [`member_request`](observability-schemas.md#member-request)
+line, joined to the callee's task whose `a2a_task_received.member_request_id` is its `call_id`. The
+caller is the sender's roster name; the callee is the line's `member`, `-` when it names none:
+
+| The `member_request` line | Status | Duration | Note |
+|---|---|---|---|
+| A callee task recorded its id | The callee task's `task_end.exit_status`; `outstanding` without one | The callee task's `task_end.duration_ms`; `-` while `outstanding` | `via <role> <component>` |
+| `outcome: "refused"` | `refused` | `-` | `via <role> <component>; <reason>` |
+| `outcome: "failed"` | `failed` | The request's `duration_ms` | `via <role> <component>; <reason>` |
+| `outcome: "sent"` with a `member_task_id`, and no searched root holds the callee | `unknown` | `-` | `via <role> <component>; <callee>'s trace not found` |
+| Any other `outcome: "sent"` — an agent card fetch, a `GetTask` poll | No row | | |
+
+A task a member request started whose sender's trace was not found keeps the `unknown` row with
+`<caller>'s trace not found`, under the `mrq_` id. A request sent for no task, such as a hook's, has
+nothing above it.
+
+```text
+mrq_019f01a9612a7b3c8d9e0f1a2b3c4d5e    planner → coder     ok       4.1s    via tool formation-probe
+  mrq_019f01a9633b7c4d9e0f1a2b3c4d5e6f  coder → reviewer    ok       1.2s    via tool formation-probe
+  mrq_019f01a9644c7d5e0f1a2b3c4d5e6f70  coder → planner     refused  -       via tool formation-probe; not_a_callee
+mrq_019f01a9625d7e6f1a2b3c4d5e6f7081    planner → reviewer  refused  -       via tool formation-probe; not_a_callee
+```
 
 Each task row carries one task a member's door let in, from its
 [`a2a_task_received`](observability-schemas.md#a2a-task-received) and `task_end`:

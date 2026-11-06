@@ -732,6 +732,9 @@ pub(crate) struct HookEnvVars<'a> {
     /// stops is recorded. Not an environment variable: carried here because every hook store is
     /// built from this group.
     pub call_deadlines: CallDeadlines,
+    /// The session's latch, where a request a hook routes to a member's virtual address is
+    /// recorded. Carried here for the same reason as `call_deadlines`.
+    pub(crate) member_requests: crate::member_request::MemberRequests,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -887,8 +890,12 @@ async fn call_stage_once(
             gateway: staged.gateway.clone(),
             formation: env_vars.formation_member.cloned(),
             // A hook runs for no task of its own, so a formation call from it stamps
-            // `untrusted`.
+            // `untrusted`, and its `member_request` names no task.
             task_provenance: None,
+            member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
+                &env_vars.member_requests,
+                staged.name.clone(),
+            )),
         },
         inference_purpose: HookInferencePurpose::Lifecycle,
         call_deadlines: env_vars.call_deadlines.clone(),
@@ -1755,8 +1762,12 @@ async fn instantiate_hook(
             gateway: staged.gateway.clone(),
             formation: env_vars.formation_member.cloned(),
             // A hook runs for no task of its own, so a formation call from it stamps
-            // `untrusted`.
+            // `untrusted`, and its `member_request` names no task.
             task_provenance: None,
+            member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
+                &env_vars.member_requests,
+                staged.name.clone(),
+            )),
         },
         inference_purpose: HookInferencePurpose::Lifecycle,
         call_deadlines: env_vars.call_deadlines.clone(),
@@ -3836,6 +3847,7 @@ mod tests {
             retry: Default::default(),
             deadline: None,
             call_deadlines: CallDeadlines::default(),
+            member_requests: Default::default(),
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3920,6 +3932,7 @@ mod tests {
             retry: Default::default(),
             deadline: None,
             call_deadlines: CallDeadlines::default(),
+            member_requests: Default::default(),
         })
     }
 
@@ -5184,6 +5197,7 @@ mod tests {
                 gateway,
                 formation: None,
                 task_provenance: None,
+                member_requests: None,
             },
             inference_purpose: HookInferencePurpose::Lifecycle,
             call_deadlines: CallDeadlines::default(),

@@ -1129,6 +1129,7 @@ mod tests {
             gateway: Some(gateway),
             formation: None,
             task_provenance: None,
+            member_requests: None,
         }
     }
 

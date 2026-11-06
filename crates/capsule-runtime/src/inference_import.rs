@@ -202,6 +202,9 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) deadline: Option<SessionDeadline>,
     /// The session's latch, where a driver call the wall-clock bound stops is recorded.
     pub(crate) call_deadlines: CallDeadlines,
+    /// The session's latch, where a request the driver routes to a member's virtual address is
+    /// recorded.
+    pub(crate) member_requests: crate::member_request::MemberRequests,
 }
 
 impl HookInferenceCtx {
@@ -483,6 +486,9 @@ impl HookInferenceCtx {
                 task_provenance: None,
                 role: ComponentRole::Driver,
                 call_deadlines: &self.call_deadlines,
+                member_requests: &self.member_requests,
+                // Nor is its `member_request` sent for any task.
+                task_id: None,
                 process: crate::session_process::ProcessAccess::Unavailable(
                     crate::session_process::unavailable::DRIVER,
                 ),
@@ -1126,6 +1132,7 @@ mod tests {
             retry: Default::default(),
             deadline: None,
             call_deadlines: CallDeadlines::default(),
+            member_requests: Default::default(),
         }
     }
 

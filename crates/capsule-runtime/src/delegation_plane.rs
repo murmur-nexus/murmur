@@ -1369,9 +1369,11 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
-        .expect_err("the same door refuses a peer message");
+        .expect_err("the same door refuses a peer message")
+        .message;
         assert!(refused.contains("403 peer_not_accepted"), "{refused}");
     }
 

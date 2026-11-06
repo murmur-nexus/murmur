@@ -66,6 +66,7 @@ pub mod limits;
 pub mod mac_token;
 pub mod manifest_files;
 pub(crate) mod member_call;
+pub(crate) mod member_request;
 pub mod model_limits;
 pub mod murmur_home;
 pub(crate) mod murmur_md;
