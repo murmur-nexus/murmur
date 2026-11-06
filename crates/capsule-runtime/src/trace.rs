@@ -699,7 +699,7 @@ struct ToolCallEvent {
     output_bytes: u64,
     duration_ms: u64,
     status: String,
-    /// The runtime's own text when it could not run the call, such as a native tool or shell
+    /// The runtime's own text when it could not run the call, such as a shell
     /// command whose sandbox setup failed before exec. Written under every [`TraceCapture`],
     /// unlike `output`; peer handle tokens are redacted and the text is capped at
     /// [`MAX_TASK_FAILURE_REASON_BYTES`] on a character boundary. Absent when the tool ran,
@@ -8060,7 +8060,7 @@ mod tests {
             Some("toolu_1".to_string()),
             serde_json::json!({}),
             2,
-            "native tool execution failed",
+            "shell execution failed early",
             28,
             3,
             "error".to_string(),
@@ -8077,7 +8077,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_error_is_written_without_output_under_meta() {
         let dir = tempfile::tempdir().unwrap();
-        let text = "sandbox: native tool enforcement setup failed before exec: Landlock: \
+        let text = "sandbox: shell enforcement setup failed before exec: Landlock: \
                     Too many open files (os error 24)";
         let e = tool_call_with_error(dir.path(), TraceCapture::Meta, Some(text)).await;
         assert_eq!(e["error"], text);
@@ -9032,7 +9032,6 @@ mod tests {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             runtime,
-            implementation: None,
             origin: LockOrigin::Runtime {
                 session: "ses_puller".to_string(),
             },

@@ -122,7 +122,7 @@ holds.
 
 | Boundary | Content | Source name |
 |---|---|---|
-| Tool result | Every agent-facing tool dispatch except a skill — WASM tool, native subprocess tool, shell binary, and the runtime's own peer-handoff tools | `tool:<artifact name>` |
+| Tool result | Every agent-facing tool dispatch except a skill — WASM tool, shell binary, and the runtime's own peer-handoff tools | `tool:<artifact name>` |
 | Skill result | A skill whose `murmur.lock` origin is `runtime`, on every call | `skill:<artifact name>` |
 | Task payload | A task whose trust class is `untrusted` | `task:<origin>` |
 | Delegation outcome | Every [`delegate-task`](roost-api.md#how-the-outcome-arrives) outcome delivered into the task that delegated, whatever that task's trust | `delegation:<capsule>` |

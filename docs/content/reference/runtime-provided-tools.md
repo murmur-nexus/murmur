@@ -28,9 +28,9 @@ Each one appears only when the declaration in the second column is present.
 | `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
 | `background-command` | An [`inference:`](manifest.md#field-inference) block, a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
 
-Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
-`implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
-hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
+Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. Nothing was fetched, so
+nothing is version-pinned, nothing is hash-verified, and no entry appears for them in
+`murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
@@ -78,9 +78,8 @@ operator's own list, so there is no fixed set to reserve — and a capsule may d
 artifact whose bare name is `bash`, such as `local/bash`, and `bash` in its shell allowlist. Staging writes the artifact's manifest
 first and the shell manifest yields to it, so the inventory describes the artifact.
 
-Dispatch resolves such a pair by [precedence](../concepts/tools.md#tool-dispatch): a native
-artifact answers ahead of the shell binary, and the shell binary answers ahead of a WASM artifact
-of the same name.
+Dispatch resolves such a pair by [precedence](../concepts/tools.md#tool-dispatch): the shell binary
+answers ahead of a WASM artifact of the same name.
 
 ## `session-status` { #session-status }
 

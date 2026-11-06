@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -10,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::artifact_name::ArtifactName;
-use crate::registry::{ResolvedArtifact, RuntimeType};
 
 /// The only `lock_version` this build reads or writes.
 ///
@@ -73,7 +71,7 @@ impl LockOrigin {
 struct RawLockedArtifact {
     name: String,
     resolved_version: String,
-    sha256: LockedSha256,
+    sha256: RawLockedSha256,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +87,19 @@ impl TryFrom<RawLockedArtifact> for LockedArtifact {
     /// without `session`, and `operator` with one. A blank `session` is carried through and
     /// refused by [`MurmurLock::validate`], which the write path runs too.
     fn try_from(raw: RawLockedArtifact) -> Result<Self, Self::Error> {
+        if raw.sha256.platforms.is_some() {
+            return Err(format!(
+                "artifact '{}' pins per-platform hashes (sha256.platforms), which murmur does not \
+                 read: an entry pins one sha256.any {REGENERATE_HINT}",
+                raw.name
+            ));
+        }
+        let Some(any) = raw.sha256.any else {
+            return Err(format!(
+                "artifact '{}' pins no hash (expected sha256.any)",
+                raw.name
+            ));
+        };
         let origin = match (raw.origin.as_deref(), raw.session) {
             (None | Some(ORIGIN_OPERATOR), None) => LockOrigin::Operator,
             (None | Some(ORIGIN_OPERATOR), Some(_)) => {
@@ -116,7 +127,7 @@ impl TryFrom<RawLockedArtifact> for LockedArtifact {
         Ok(Self {
             name: raw.name,
             resolved_version: raw.resolved_version,
-            sha256: raw.sha256,
+            sha256: LockedSha256 { any },
             origin,
             owner_id: raw.owner_id,
         })
@@ -132,7 +143,10 @@ impl From<LockedArtifact> for RawLockedArtifact {
         Self {
             name: entry.name,
             resolved_version: entry.resolved_version,
-            sha256: entry.sha256,
+            sha256: RawLockedSha256 {
+                any: Some(entry.sha256.any),
+                platforms: None,
+            },
             origin: Some(origin.to_string()),
             session,
             owner_id: entry.owner_id,
@@ -140,132 +154,43 @@ impl From<LockedArtifact> for RawLockedArtifact {
     }
 }
 
-/// The pinned hash (or hashes) of one artifact's payload.
-///
-/// Exactly one of the two fields is populated. Which one is a property of the payload, not of
-/// the host that wrote the lock: a WASM component or a static skill is one set of bytes every
-/// host resolves, and a native tool is a different binary per platform.
+/// The pinned hash of one artifact's payload: one set of bytes every host resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockedSha256 {
-    /// Hash of a platform-independent payload (WASM component, static skill).
-    /// Mutually exclusive with [`Self::platforms`].
+    /// Hash of the payload, written as `sha256.any`.
+    pub any: String,
+}
+
+/// The on-disk shape of a [`LockedSha256`]. `platforms` is read only so an entry carrying it is
+/// refused by name; it is never written.
+#[derive(Serialize, Deserialize)]
+struct RawLockedSha256 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub any: Option<String>,
-    /// Hash per platform tag (`"linux-x86_64"` → sha256), for native payloads.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub platforms: BTreeMap<String, String>,
+    any: Option<String>,
+    #[serde(default, skip_serializing)]
+    platforms: Option<serde_norway::Value>,
 }
 
 impl LockedSha256 {
-    /// One platform-independent hash, for a WASM or static payload.
+    /// The pin for a payload whose hash is `sha256`.
     #[must_use]
     pub fn any(sha256: impl Into<String>) -> Self {
-        Self {
-            any: Some(sha256.into()),
-            platforms: BTreeMap::new(),
-        }
+        Self { any: sha256.into() }
     }
 
-    /// One hash pinned to one platform tag, for a native payload.
-    #[must_use]
-    pub fn for_one_platform(platform: &str, sha256: impl Into<String>) -> Self {
-        let mut platforms = BTreeMap::new();
-        platforms.insert(platform.to_string(), sha256.into());
-        Self {
-            any: None,
-            platforms,
-        }
-    }
-
-    /// The pin for `resolved`, fetched for `platform`: a native binary is pinned under that
-    /// platform, everything else under `any`.
-    #[must_use]
-    pub fn for_resolved(resolved: &ResolvedArtifact, platform: &str) -> Self {
-        if resolved.meta.runtime == RuntimeType::Native {
-            Self::for_one_platform(platform, resolved.sha256.clone())
-        } else {
-            Self::any(resolved.sha256.clone())
-        }
-    }
-
-    /// The hash to verify a payload resolved on `platform` against.
-    ///
-    /// A populated `platforms` map is answered from that map alone — never from [`Self::any`].
-    /// Falling back would verify this host's payload against another platform's hash and report
-    /// a hash mismatch, which sends the operator to re-publish an artifact that is correct.
-    #[must_use]
-    pub fn for_platform(&self, platform: &str) -> Option<&str> {
-        if self.platforms.is_empty() {
-            return self.any.as_deref();
-        }
-        self.platforms.get(platform).map(String::as_str)
-    }
-
-    /// The platform tags this entry does carry, in sorted order, for an error message naming
-    /// what a host that found no hash for itself could have used.
-    #[must_use]
-    pub fn platform_tags(&self) -> Vec<&str> {
-        self.platforms.keys().map(String::as_str).collect()
-    }
-
-    /// Whether `other` pins the same kind of payload — both platform-independent, or both
-    /// per-platform. A shape change means every hash held here describes different bytes.
-    fn same_shape_as(&self, other: &Self) -> bool {
-        self.platforms.is_empty() == other.platforms.is_empty()
-    }
-
-    /// Reject an entry that pins nothing, pins both shapes at once, or pins an empty string.
-    /// `artifact_name` names the offending entry in the message.
+    /// Reject an empty hash. `artifact_name` names the offending entry in the message.
     fn validate(&self, artifact_name: &str) -> Result<(), LockfileError> {
-        match (&self.any, self.platforms.is_empty()) {
-            (None, true) => {
-                return Err(LockfileError::Invalid(format!(
-                    "artifact '{artifact_name}' pins no hash (expected either sha256.any or \
-                     sha256.platforms)"
-                )))
-            }
-            (Some(_), false) => {
-                return Err(LockfileError::Invalid(format!(
-                    "artifact '{artifact_name}' pins both sha256.any and sha256.platforms \
-                     (expected exactly one)"
-                )))
-            }
-            _ => {}
+        if self.any.trim().is_empty() {
+            return Err(LockfileError::Invalid(format!(
+                "artifact '{artifact_name}' has empty sha256.any"
+            )));
         }
-
-        if let Some(any) = &self.any {
-            if any.trim().is_empty() {
-                return Err(LockfileError::Invalid(format!(
-                    "artifact '{artifact_name}' has empty sha256.any"
-                )));
-            }
-        }
-
-        for (platform, sha256) in &self.platforms {
-            if platform.trim().is_empty() {
-                return Err(LockfileError::Invalid(format!(
-                    "artifact '{artifact_name}' has an empty platform key under sha256.platforms"
-                )));
-            }
-            if sha256.trim().is_empty() {
-                return Err(LockfileError::Invalid(format!(
-                    "artifact '{artifact_name}' has empty sha256.platforms.{platform}"
-                )));
-            }
-        }
-
         Ok(())
     }
 }
 
 impl LockedArtifact {
-    /// Merge a freshly resolved pin into this entry.
-    ///
-    /// Adding a platform to an artifact already pinned for another one must not discard the
-    /// hash that other platform verifies against — a lock is shared across the machines that
-    /// build against it. So the incoming hashes are merged into the existing map, and the whole
-    /// `sha256` is replaced only when everything already in it is stale: a different
-    /// `resolved_version`, or a change of shape between platform-independent and per-platform.
+    /// Replace this entry's pin with a freshly resolved one.
     ///
     /// A [`LockOrigin::Operator`] pin makes the entry operator-declared, whatever it was. A
     /// [`LockOrigin::Runtime`] pin leaves the entry's origin as it was: a runtime pull never
@@ -274,21 +199,12 @@ impl LockedArtifact {
         if origin == LockOrigin::Operator {
             self.origin = LockOrigin::Operator;
         }
-        let stale =
-            self.resolved_version != resolved_version || !self.sha256.same_shape_as(&sha256);
-        if stale || sha256.platforms.is_empty() {
-            self.sha256 = sha256;
-        } else {
-            self.sha256.platforms.extend(sha256.platforms);
-        }
+        self.sha256 = sha256;
         self.resolved_version = resolved_version.to_string();
     }
 
     /// Why this pin disagrees with a freshly resolved `version`/`sha256`, or `None` when they
     /// agree.
-    ///
-    /// A platform this entry has no key for is not a disagreement — it is a platform that has
-    /// not been pinned yet, which is what installing on a second machine produces.
     #[must_use]
     pub fn conflict_with(&self, version: &str, sha256: &LockedSha256) -> Option<String> {
         if self.resolved_version != version {
@@ -305,8 +221,7 @@ impl LockedArtifact {
     ///
     /// A different version is a new pin rather than a disagreement: its bytes were never pinned,
     /// so nothing here can contradict them. For the same version the text is the one
-    /// [`Self::conflict_with`] gives: a change of shape, or a differing hash for `any` or for a
-    /// platform this entry pins. A platform this entry has no key for is not a disagreement.
+    /// [`Self::conflict_with`] gives: a differing `sha256.any`.
     #[must_use]
     pub fn same_version_conflict_with(
         &self,
@@ -316,43 +231,13 @@ impl LockedArtifact {
         if self.resolved_version != version {
             return None;
         }
-        if !self.sha256.same_shape_as(sha256) {
+        if self.sha256.any != sha256.any {
             return Some(format!(
-                "'{}' is pinned as a {} payload but resolved as a {} one",
-                self.name,
-                shape_label(&self.sha256),
-                shape_label(sha256),
+                "'{}' is pinned at sha256 {}, but {} was resolved",
+                self.name, self.sha256.any, sha256.any
             ));
         }
-        if let Some(incoming) = &sha256.any {
-            let pinned = self.sha256.any.as_deref()?;
-            if pinned != incoming {
-                return Some(format!(
-                    "'{}' is pinned at sha256 {pinned}, but {incoming} was resolved",
-                    self.name
-                ));
-            }
-        }
-        for (platform, incoming) in &sha256.platforms {
-            let Some(pinned) = self.sha256.platforms.get(platform) else {
-                continue;
-            };
-            if pinned != incoming {
-                return Some(format!(
-                    "'{}' is pinned at sha256 {pinned} for {platform}, but {incoming} was resolved",
-                    self.name
-                ));
-            }
-        }
         None
-    }
-}
-
-fn shape_label(sha256: &LockedSha256) -> &'static str {
-    if sha256.platforms.is_empty() {
-        "platform-independent"
-    } else {
-        "per-platform"
     }
 }
 
@@ -629,11 +514,6 @@ mod tests {
         let path = dir.path().join("murmur.lock");
         let lock = lock_with(vec![
             entry("local/echo-tool", "0.0.1", LockedSha256::any("abc123")),
-            entry(
-                "local/native-tool",
-                "0.1.0",
-                LockedSha256::for_one_platform("linux-x86_64", "def456"),
-            ),
             LockedArtifact {
                 origin: runtime("ses_0190a1b2"),
                 ..entry("local/pulled-tool", "1.2.3", LockedSha256::any("fed789"))
@@ -656,11 +536,7 @@ mod tests {
             &path,
             &lock_with(vec![
                 entry("local/component-tool", "0.1.0", LockedSha256::any("aaa")),
-                entry(
-                    "local/native-tool",
-                    "0.1.0",
-                    LockedSha256::for_one_platform("linux-x86_64", "bbb"),
-                ),
+                entry("local/skill", "0.1.0", LockedSha256::any("bbb")),
             ]),
         )
         .unwrap();
@@ -672,7 +548,8 @@ mod tests {
             "a v1 sha256.wasm key survived: {raw}"
         );
         assert!(raw.contains("any: aaa"), "{raw}");
-        assert!(raw.contains("linux-x86_64: bbb"), "{raw}");
+        assert!(raw.contains("any: bbb"), "{raw}");
+        assert!(!raw.contains("platforms"), "{raw}");
         assert_eq!(raw.matches("origin: operator").count(), 2, "{raw}");
         assert!(!raw.contains("session:"), "{raw}");
     }
@@ -683,7 +560,7 @@ mod tests {
         let path = dir.path().join("murmur.lock");
         fs::write(
             &path,
-            "lock_version: 3\nartifacts:\n  - name: local/echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: local/native-tool\n    resolved_version: 0.1.0\n    sha256:\n      platforms:\n        linux-x86_64: def\n",
+            "lock_version: 3\nartifacts:\n  - name: local/echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: local/skill\n    resolved_version: 0.1.0\n    sha256:\n      any: def\n",
         )
         .unwrap();
 
@@ -779,11 +656,7 @@ mod tests {
             origin: runtime("ses_puller"),
             ..entry("local/pulled-tool", "1.2.3", LockedSha256::any("bbb"))
         };
-        let last = entry(
-            "local/native-tool",
-            "0.2.0",
-            LockedSha256::for_one_platform("linux-x86_64", "ccc"),
-        );
+        let last = entry("local/skill", "0.2.0", LockedSha256::any("ccc"));
         let mut lock = lock_with(vec![first.clone(), middle.clone(), last.clone()]);
 
         assert_eq!(lock.remove("local/pulled-tool"), Some(middle));
@@ -792,7 +665,7 @@ mod tests {
         assert_eq!(lock.artifacts.len(), 2);
 
         lock.remove("local/operator-tool").unwrap();
-        lock.remove("local/native-tool").unwrap();
+        lock.remove("local/skill").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("murmur.lock");
         write_lockfile_atomic(&path, &lock).unwrap();
@@ -936,218 +809,99 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_must_pin_exactly_one_shape() {
-        let neither = lock_with(vec![entry(
-            "local/tool",
-            "0.1.0",
-            LockedSha256 {
-                any: None,
-                platforms: BTreeMap::new(),
-            },
-        )]);
-        assert!(neither
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("pins no hash"));
+    fn an_entry_pinning_per_platform_hashes_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 3\nartifacts:\n  - name: local/echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: local/nat-tool\n    resolved_version: 0.1.0\n    sha256:\n      platforms:\n        linux-x86_64: def\n",
+        )
+        .unwrap();
 
-        let mut both = LockedSha256::any("aaa");
-        both.platforms
-            .insert("linux-x86_64".to_string(), "bbb".to_string());
-        let both = lock_with(vec![entry("local/tool", "0.1.0", both)]);
-        assert!(both
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("pins both"));
+        let message = read_lockfile(&path).unwrap_err().to_string();
+        assert!(message.contains("'local/nat-tool'"), "{message}");
+        assert!(message.contains("sha256.platforms"), "{message}");
+        assert!(message.contains("mur install"), "{message}");
     }
 
     #[test]
-    fn empty_hashes_and_empty_platform_keys_are_rejected() {
+    fn an_entry_pinning_no_hash_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 3\nartifacts:\n  - name: local/tool\n    resolved_version: 0.1.0\n    sha256: {}\n",
+        )
+        .unwrap();
+        let message = read_lockfile(&path).unwrap_err().to_string();
+        assert!(message.contains("pins no hash"), "{message}");
+    }
+
+    /// A WASM-only lock written by the last release reads and writes back byte for byte.
+    #[test]
+    fn a_wasm_only_version_3_lock_round_trips_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        let written = "lock_version: 3\nartifacts:\n- name: local/echo-tool\n  resolved_version: 0.0.1\n  sha256:\n    any: abc\n  origin: operator\n";
+        fs::write(&path, written).unwrap();
+        let lock = read_lockfile(&path).unwrap();
+        write_lockfile_atomic(&path, &lock).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn an_empty_hash_is_rejected() {
         let empty_any = lock_with(vec![entry("local/tool", "0.1.0", LockedSha256::any("  "))]);
         assert!(empty_any
             .validate()
             .unwrap_err()
             .to_string()
             .contains("empty sha256.any"));
+    }
 
-        let empty_platform_hash = lock_with(vec![entry(
+    #[test]
+    fn a_new_pin_replaces_the_old_one() {
+        let mut lock = lock_with(vec![entry("local/tool", "0.1.0", LockedSha256::any("old"))]);
+        lock.upsert(
             "local/tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("linux-x86_64", ""),
-        )]);
-        assert!(empty_platform_hash
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("empty sha256.platforms.linux-x86_64"));
-
-        let empty_key = lock_with(vec![entry(
-            "local/tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("  ", "aaa"),
-        )]);
-        assert!(empty_key
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("empty platform key"));
-    }
-
-    #[test]
-    fn for_platform_answers_a_platform_map_from_that_map_alone() {
-        let native = LockedSha256::for_one_platform("darwin-aarch64", "mac-hash");
-        assert_eq!(native.for_platform("darwin-aarch64"), Some("mac-hash"));
-        // No fallback to `any` — and `any` is not even populated here, which is the invariant.
-        assert_eq!(native.for_platform("linux-x86_64"), None);
-
-        let independent = LockedSha256::any("one-hash");
-        assert_eq!(independent.for_platform("linux-x86_64"), Some("one-hash"));
-        assert_eq!(independent.for_platform("darwin-aarch64"), Some("one-hash"));
-    }
-
-    #[test]
-    fn a_second_platform_is_added_beside_the_first() {
-        let mut lock = lock_with(vec![entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        )]);
-
-        lock.upsert(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
-            LockOrigin::Operator,
-        );
-
-        let pinned = &lock.artifact_for("local/native-tool").unwrap().sha256;
-        assert_eq!(pinned.for_platform("darwin-aarch64"), Some("mac-hash"));
-        assert_eq!(pinned.for_platform("linux-x86_64"), Some("linux-hash"));
-    }
-
-    #[test]
-    fn one_platforms_hash_is_replaced_without_touching_the_others() {
-        let mut lock = lock_with(vec![entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        )]);
-        lock.upsert(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
-            LockOrigin::Operator,
-        );
-
-        lock.upsert(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("linux-x86_64", "rebuilt-linux-hash"),
-            LockOrigin::Operator,
-        );
-
-        let pinned = &lock.artifact_for("local/native-tool").unwrap().sha256;
-        assert_eq!(
-            pinned.for_platform("linux-x86_64"),
-            Some("rebuilt-linux-hash")
-        );
-        assert_eq!(pinned.for_platform("darwin-aarch64"), Some("mac-hash"));
-    }
-
-    #[test]
-    fn a_new_version_discards_every_hash_pinned_for_the_old_one() {
-        let mut lock = lock_with(vec![entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        )]);
-
-        lock.upsert(
-            "local/native-tool",
             "0.2.0",
-            LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
+            LockedSha256::any("new"),
             LockOrigin::Operator,
         );
-
-        let pinned = &lock.artifact_for("local/native-tool").unwrap();
+        let pinned = lock.artifact_for("local/tool").unwrap();
         assert_eq!(pinned.resolved_version, "0.2.0");
-        assert_eq!(pinned.sha256.platform_tags(), vec!["linux-x86_64"]);
+        assert_eq!(pinned.sha256.any, "new");
     }
 
     #[test]
-    fn a_shape_change_discards_the_hashes_of_the_old_shape() {
-        let mut lock = lock_with(vec![entry(
-            "local/tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        )]);
-
-        lock.upsert(
-            "local/tool",
-            "0.1.0",
-            LockedSha256::any("wasm-hash"),
-            LockOrigin::Operator,
-        );
-
-        let pinned = &lock.artifact_for("local/tool").unwrap().sha256;
-        assert_eq!(pinned.any.as_deref(), Some("wasm-hash"));
-        assert!(pinned.platforms.is_empty());
-    }
-
-    #[test]
-    fn an_unpinned_platform_is_not_a_conflict_but_a_differing_hash_is() {
-        let pinned = entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        );
-
+    fn a_differing_version_or_hash_is_a_conflict() {
+        let pinned = entry("local/tool", "0.1.0", LockedSha256::any("hash"));
         assert_eq!(
-            pinned.conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("linux-x86_64", "linux-hash")
-            ),
+            pinned.conflict_with("0.1.0", &LockedSha256::any("hash")),
             None
         );
-
-        let same_platform_new_hash = pinned
-            .conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
-            )
+        let new_hash = pinned
+            .conflict_with("0.1.0", &LockedSha256::any("other"))
             .unwrap();
-        assert!(
-            same_platform_new_hash.contains("darwin-aarch64"),
-            "{same_platform_new_hash}"
-        );
-
+        assert!(new_hash.contains("other"), "{new_hash}");
         let new_version = pinned
-            .conflict_with(
-                "0.2.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-            )
+            .conflict_with("0.2.0", &LockedSha256::any("hash"))
             .unwrap();
         assert!(new_version.contains("0.2.0"), "{new_version}");
-
-        let shape_change = pinned
-            .conflict_with("0.1.0", &LockedSha256::any("wasm-hash"))
-            .unwrap();
-        assert!(shape_change.contains("per-platform"), "{shape_change}");
     }
 
     #[test]
-    fn a_same_version_conflict_ignores_a_new_version_and_an_unpinned_platform() {
-        let wasm = entry("local/tool", "1.0.0", LockedSha256::any("wasm-hash"));
+    fn a_same_version_conflict_ignores_a_new_version() {
+        let pinned = entry("local/tool", "1.0.0", LockedSha256::any("wasm-hash"));
         assert_eq!(
-            wasm.same_version_conflict_with("1.1.0", &LockedSha256::any("other-hash")),
+            pinned.same_version_conflict_with("1.1.0", &LockedSha256::any("other-hash")),
             None
         );
         assert_eq!(
-            wasm.same_version_conflict_with("1.0.0", &LockedSha256::any("wasm-hash")),
+            pinned.same_version_conflict_with("1.0.0", &LockedSha256::any("wasm-hash")),
             None
         );
-        let new_bytes = wasm
+        let new_bytes = pinned
             .same_version_conflict_with("1.0.0", &LockedSha256::any("other-hash"))
             .unwrap();
         assert_eq!(
@@ -1155,42 +909,8 @@ mod tests {
             "'local/tool' is pinned at sha256 wasm-hash, but other-hash was resolved"
         );
         assert_eq!(
-            wasm.conflict_with("1.0.0", &LockedSha256::any("other-hash")),
+            pinned.conflict_with("1.0.0", &LockedSha256::any("other-hash")),
             Some(new_bytes)
-        );
-        let shape_change = wasm
-            .same_version_conflict_with(
-                "1.0.0",
-                &LockedSha256::for_one_platform("linux-x86_64", "wasm-hash"),
-            )
-            .unwrap();
-        assert!(shape_change.contains("per-platform"), "{shape_change}");
-
-        let native = entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        );
-        assert_eq!(
-            native.same_version_conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("linux-x86_64", "linux-hash")
-            ),
-            None
-        );
-        let platform_hash = native
-            .same_version_conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
-            )
-            .unwrap();
-        assert!(platform_hash.contains("darwin-aarch64"), "{platform_hash}");
-        assert_eq!(
-            native.same_version_conflict_with(
-                "0.2.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
-            ),
-            None
         );
     }
 

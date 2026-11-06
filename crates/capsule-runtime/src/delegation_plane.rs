@@ -500,14 +500,11 @@ impl DelegationPlane {
                 "cannot read what '{capsule}@{version}' declares under {key}: {error}"
             ))
         })?;
-        let resolved = self
-            .registry
-            .resolve_with_platform(&name, version, Some(murmur_artifact::current_platform()))
-            .map_err(|error| {
-                RuntimeError::Runtime(format!(
-                    "cannot read what '{capsule}@{version}' declares under {key}: {error}"
-                ))
-            })?;
+        let resolved = self.registry.resolve(&name, version).map_err(|error| {
+            RuntimeError::Runtime(format!(
+                "cannot read what '{capsule}@{version}' declares under {key}: {error}"
+            ))
+        })?;
         crate::artifact::extract_manifest_yaml(capsule, version, &resolved.bytes)
     }
 
@@ -1636,7 +1633,6 @@ mod tests {
                 version: "0.1.0".to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,

@@ -112,8 +112,7 @@ fn create_project(project_dir: &Path, artifacts_yaml: &str) {
     .unwrap();
 }
 
-/// A registry-resolvable skill artifact. Skills are platform-agnostic, so this
-/// resolves on whatever host the suite runs on.
+/// A registry-resolvable skill artifact.
 fn skill_artifact(dir: &TempDir, name: &str, version: &str) -> std::path::PathBuf {
     common::create_skill_artifact(dir.path(), name, version, "# guidance\n")
 }
@@ -163,12 +162,6 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
     .unwrap();
 }
 
-/// The platform string the CLI resolves against — the same value `mur run` uses.
-/// Asserting on this rather than a hardcoded tuple keeps the suite host-agnostic.
-fn platform() -> &'static str {
-    murmur_artifact::current_platform()
-}
-
 // ── Environment requirements fixture helpers ─────────────────────────────────
 
 /// Install a capsule into `store_root` whose packed `murmur.yaml` is exactly `manifest_yaml`.
@@ -196,7 +189,6 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
                 version: version.to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -325,7 +317,7 @@ fn doctor_passes_when_declared_artifact_is_in_project_store() {
         .stdout(predicate::str::contains(
             "\u{2713}  local/doctor-skill@0.1.0",
         ))
-        .stdout(predicate::str::contains(platform()));
+        .stdout(predicate::str::contains("murmur.yaml..."));
 }
 
 #[test]
@@ -1751,10 +1743,7 @@ fn an_unresolvable_reference_in_the_project_manifest_is_reported_not_refused() {
             "solo@0.0.1 (artifacts.local/murmur-driver-anthropic.gateway.api_key)",
         ))
         .stdout(predicate::str::contains("Fix: export SOLO_PROVIDER_KEY"))
-        .stdout(predicate::str::contains(format!(
-            "murmur.yaml for {}...",
-            platform()
-        )))
+        .stdout(predicate::str::contains("murmur.yaml..."))
         .stderr(predicate::str::contains("E-CAP-014"))
         .get_output()
         .clone();
@@ -2379,54 +2368,5 @@ fn doctor_reports_the_formations_directory_as_owner_only() {
             .lines()
             .any(|line| line.contains("warning[W-SEC-028]") && line.contains(&worker)),
         "{stderr}"
-    );
-}
-
-/// A capsule declaring a native tool gets a `Native tools` block naming it and the mechanism it
-/// runs under on this host, spelled the way `mur run --explain-scope` spells a tier.
-#[test]
-fn doctor_names_each_native_tool_and_the_mechanism_it_runs_under() {
-    let home = TempDir::new().unwrap();
-    let artifacts = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-    let Some(binary) = common::fixture_native_tool_binary() else {
-        eprintln!("[SKIP] doctor_names_each_native_tool: the fixture tool could not be built");
-        return;
-    };
-    let manifest = fs::read(common::fixture_native_tool_manifest()).unwrap();
-    let artifact = common::create_native_tool_zip(
-        artifacts.path(),
-        common::FIXTURE_NATIVE_TOOL_NAME,
-        "0.1.0",
-        &manifest,
-        &binary,
-    );
-    common::publish_local(&home, &artifact).success();
-    create_project(
-        project.path(),
-        "  - name: local/tool-fixture\n    version: 0.1.0\n    runtime: tool\n",
-    );
-
-    let output = mur_doctor(&home, project.path()).get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    println!("{stdout}");
-
-    // No floor is declared, so the tier is this host's capped at `advisory`'s.
-    let mechanism = capsule_runtime::applied_mechanism(
-        &capsule_runtime::HostProbe::probe(),
-        murmur_artifact::ContainmentClass::Advisory,
-    );
-    let line = if mechanism == "none" {
-        "  - local/tool-fixture@0.1.0: runs with no kernel confinement on this host (rlimits only)"
-            .to_string()
-    } else {
-        format!(
-            "  - local/tool-fixture@0.1.0: runs under {mechanism} with this capsule's \
-             capabilities.filesystem, capabilities.network.allow and capabilities.shell.allow"
-        )
-    };
-    assert!(
-        stdout.contains(&format!("Native tools\n{line}")),
-        "{stdout}"
     );
 }

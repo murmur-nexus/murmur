@@ -116,7 +116,6 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
                 version: version.to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
-                platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -1032,18 +1031,9 @@ impl murmur_artifact::Registry for ProjectThenGlobal {
         name: &murmur_artifact::ArtifactName,
         version: &str,
     ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
-        self.resolve_with_platform(name, version, None)
-    }
-
-    fn resolve_with_platform(
-        &self,
-        name: &murmur_artifact::ArtifactName,
-        version: &str,
-        platform: Option<&str>,
-    ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
-        match self.project.resolve_with_platform(name, version, platform) {
+        match self.project.resolve(name, version) {
             Err(murmur_artifact::RegistryError::NotFound { .. }) => {
-                self.global.resolve_with_platform(name, version, platform)
+                self.global.resolve(name, version)
             }
             other => other,
         }

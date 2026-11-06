@@ -343,18 +343,6 @@ pub fn wasm_tool_zip(dir: &Path, name: &str, version: &str) -> PathBuf {
     path
 }
 
-/// A native tool artifact for `platform`, `dir/<name>-<version>-<platform>.mur.zip`, whose binary
-/// holds `filler` so payloads of two platforms differ.
-pub fn native_tool_zip(dir: &Path, name: &str, version: &str, platform: &str) -> PathBuf {
-    let path = dir.join(format!("{name}-{version}-{platform}.mur.zip"));
-    write_zip(
-        &path,
-        &format!("name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"),
-        &[(&format!("bin/{name}"), platform.as_bytes())],
-    );
-    path
-}
-
 /// A `.mur.zip` at `path` packing `manifest` as its `murmur.yaml` and `entries`.
 pub fn write_zip(path: &Path, manifest: &str, entries: &[(&str, &[u8])]) {
     let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());

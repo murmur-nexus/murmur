@@ -14,11 +14,12 @@ section that explains it.
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
 | `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
 | `E-BLD-006` | An artifact's `provider_tool:` block is malformed, or declared on a `driver`, `hook` or `skill` artifact | [E-BLD-006](#e-bld-006) |
+| `E-BLD-007` | An artifact's `murmur.yaml` declares `implementation: native` or `execution: native` | [E-BLD-007](#e-bld-007) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host, or a declared provider tool needs `sealed` and the effective floor is below it | [E-CAP-003](#e-cap-003) |
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
-| `E-CAP-005` | Creating a network namespace for the capsule's native subprocess tree — shell commands, spawned capsules and native tools — failed on this host, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
+| `E-CAP-005` | Creating a network namespace for the capsule's subprocess tree — shell commands, the programs WASM tools run, and spawned capsules — failed on this host, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
 | `E-CAP-007` | an export root resolves outside the work folder | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
@@ -30,7 +31,6 @@ section that explains it.
 | `E-CAP-014` | A variable this project needs is set by nothing in the environment | [E-CAP-014](#e-cap-014) |
 | `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
 | `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every WASM component | [E-CAP-016](#e-cap-016) |
-| `E-CAP-017` | A `gateway:` is declared on a native tool, whose requests never pass the credential gateway | [E-CAP-017](#e-cap-017) |
 | `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
 | `E-CAP-019` | A process driver requires a variable `capabilities.env.allow` does not declare | [E-CAP-019](#e-cap-019) |
 | `E-CAP-020` | Two declared artifacts share a tool name, the part of their names after the `/` | [E-CAP-020](#e-cap-020) |
@@ -67,17 +67,18 @@ section that explains it.
 | `E-NEW-005` | `mur new` was given `--index local`, the global store, which is not a published artifact index | [`mur new`](cli.md#mur-new) |
 | `E-NEW-006` | `mur new` could not read the artifact index it takes default-artifact versions from | [E-NEW-006](#e-new-006) |
 | `E-NEW-007` | The artifact index `mur new` read lists no version of a default artifact that fits this `mur` | [E-NEW-007](#e-new-007) |
-| `E-REG-001` | The scope's index lists no such name, no such version, or no payload of it for the host platform, or no version that fits this `mur`; or a `local/` artifact is not in the store, and no source serves the `local` scope | [E-REG-001](#e-reg-001) |
+| `E-REG-001` | The scope's index lists no such name, no such version, or no version that fits this `mur`; or a `local/` artifact is not in the store, and no source serves the `local` scope | [E-REG-001](#e-reg-001) |
 | `E-REG-002` | Artifact bytes do not match the sha256 recorded for them or listed in the source's index, or an artifact's packed `name:` or `version:` is not the one it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`), given to `mur publish` or `mur install` | [`mur install`](cli.md#mur-install) |
-| `E-REG-005` | An artifact resolves, at the version its `murmur.lock` entry pins, to another hash or payload shape; under `mur install --frozen`, also a version other than the entry pins, a declared artifact with no entry, or no `murmur.lock`; or a [roster member's](roster.md#murmur-lock) version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-REG-005` | An artifact resolves, at the version its `murmur.lock` entry pins, to another hash; under `mur install --frozen`, also a version other than the entry pins, a declared artifact with no entry, or no `murmur.lock`; or a [roster member's](roster.md#murmur-lock) version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused or unreachable — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
 | `E-REG-007` | An artifact name on the command line is not `<scope>/<name>`, or a `github:` owner claims a reserved scope | [E-REG-007](#e-reg-007) |
 | `E-REG-008` | No source serves the artifact's scope | [E-REG-008](#e-reg-008) |
 | `E-REG-009` | A source's index states a scope the source does not own | [E-REG-009](#e-reg-009) |
 | `E-REG-010` | A scope's GitHub owner id is not the one recorded for it in `murmur.lock`, in the stored payload, or compiled in for `murmur` | [E-REG-010](#e-reg-010) |
 | `E-REG-011` | `mur install` or `mur publish` was handed a payload whose packed `murmur.yaml` ships a malformed `models:` table | [E-REG-011](#e-reg-011) |
+| `E-REG-012` | `mur install` or `mur publish` was handed a payload whose packed `murmur.yaml` declares `implementation: native` or `execution: native` | [E-REG-012](#e-reg-012) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -88,7 +89,7 @@ section that explains it.
 | `E-ROS-008` | A `reachability` rule lists the entry member in `to` | [E-ROS-008](#e-ros-008) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry that pins per-platform hashes (`sha256.platforms`), or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
@@ -96,8 +97,8 @@ section that explains it.
 | `E-RUN-008` | Required artifact not installed locally | [`mur run`](cli.md#mur-run) |
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read. For an installed capsule the path is shown as `<scope>/<name>@<version>!/<entry>`, and a missing entry means the package was built without the file | [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
-| `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
-| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only). `mur run --explain-scope` reports it ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |
+| `E-RUN-011` | A subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
+| `E-RUN-012` | The capsule can spawn subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only). `mur run --explain-scope` reports it ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |
 | `E-RUN-013` | The work folder, `$HOME` and `$TMPDIR` together grew past `capabilities.resources.workdir_max_bytes` | [Size ceiling](workdir.md#work-folder-ceiling) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
@@ -106,7 +107,6 @@ section that explains it.
 | `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
 | `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle, or `MURMUR_SPAWNER_LIFELINE` to something that is not this session's spawner lifeline | [E-RUN-020](#e-run-020) |
-| `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
 | `E-RUN-022` | A session address or formation id names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-RUN-024` | The session or formation named could not be ended and is still running, or `mur trace rm` named a session that is still running | [E-RUN-024](#e-run-024) |
@@ -145,6 +145,7 @@ section that explains it.
 | `E-RUN-058` | A stored tool artifact ships a malformed `provider_tool:` block, or one on an artifact that is not a tool | [E-RUN-058](#e-run-058) |
 | `E-RUN-059` | The unconfined stance was chosen for a capsule the manifest or a config file declares a containment floor for | [E-RUN-059](#e-run-059) |
 | `E-RUN-060` | `--unconfined` was given to a launch the runtime started contained | [E-RUN-060](#e-run-060) |
+| `E-RUN-061` | An installed artifact's `murmur.yaml` declares `implementation: native` or `execution: native`; refused by a launch, `mur doctor` and a runtime pull | [E-RUN-061](#e-run-061) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -156,7 +157,6 @@ section that explains it.
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
 | `W-DEPLOY-001` | A deploy's target compiled none, or not all, of the uploaded artifacts; those compile on the capsule's first launch | [W-DEPLOY-001](#w-deploy-001) |
 | `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
-| `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-REG-003` | An installed artifact does not fit the WIT level this `mur` serves | [W-REG-003](#w-reg-003) |
 | `W-ROS-001` | A roster lets more members call a member than its `lifecycle` holds at once | [W-ROS-001](#w-ros-001) |
@@ -613,37 +613,9 @@ error[E-RUN-020]: MURMUR_SPAWNER_LIFELINE does not carry this session's spawner 
 A blank `MURMUR_SPAWNER_LIFELINE` is absent. The variable needs no `MURMUR_SPAWNER` and no
 `MURMUR_FORMATION_ID` beside it.
 
-### E-RUN-021 — the native binary is built for another platform { #e-run-021 }
+### E-RUN-021 — retired { #e-run-021 }
 
-A native tool artifact carries a host executable at `bin/<name>`. Staging compares the platform
-that binary was built for against this host's, before any of the session's native binaries is
-written to the workdir:
-
-```text
-error[E-RUN-021]: native tool 'tool-git' cannot run on this host: its binary is built for darwin-aarch64, this host is linux-x86_64
-  hint: the installed artifact holds a binary for another platform — reinstall it on this host with `mur install <name>@<version>`, or publish a build for this host's platform
-```
-
-The check reads the binary's header and recognises these formats:
-
-| Format | Identified from | Platforms |
-|---|---|---|
-| ELF64 | `e_machine` | `linux-x86_64`, `linux-aarch64` |
-| Mach-O 64-bit | `cputype` | `darwin-x86_64`, `darwin-aarch64` |
-| Fat Mach-O | `0xCAFEBABE` magic | any `darwin-*` host |
-
-Architecture is compared as strictly as operating system: an `x86_64` ELF on an `aarch64` Linux
-host is refused on the same terms as a Mach-O on Linux.
-
-Refusal requires a positive identification of both sides. A payload in a format the check does not
-recognise — a shell script, a WASM module, a 32-bit image — stages and runs, and so does any
-payload on a host outside the four platform targets.
-
-When a capsule declares several native tools, one unrunnable binary refuses all of them: a refused
-session leaves no tool binaries in its workdir.
-
-[`mur doctor`](cli.md#mur-doctor) reads the same header of the same installed bytes and fails that
-artifact's line, so the mismatch is reportable without launching a session.
+Nothing raises this code and nothing reuses it.
 
 ### E-RUN-022 — the address names no running capsule { #e-run-022 }
 
@@ -870,7 +842,7 @@ it names is at the version the level lists for its package. Two commands refuse 
 
 | Command | Refuses |
 |---|---|
-| `mur install` | A version it resolves by name, before anything is fetched or written: `<scope>/<name>@<version>`, `--all-platforms <scope>/<name>@<version>`, and each version `murmur.yaml` pins when run with no argument, whether its payload would come from the project store, the global store or the scope's source |
+| `mur install` | A version it resolves by name, before anything is fetched or written: `<scope>/<name>@<version>` and each version `murmur.yaml` pins when run with no argument, whether its payload would come from the project store, the global store or the scope's source |
 | `mur run`, `mur eval`, `mur new` | A driver, at staging, before any driver runs |
 
 `mur install ./<file>.mur.zip`, `mur install github:<owner>/<repo>@<tag>`, `mur publish` and
@@ -1602,6 +1574,30 @@ error[E-RUN-060]: --unconfined cannot be given to a launch the runtime started o
   hint: a delegated child, a plan capsule step, a contained roster member, a deployed capsule and a spawn-approval redemption run contained; only a capsule the operator launches with --unconfined themselves runs unconfined
 ```
 
+### E-RUN-061 — an installed artifact declares a native implementation { #e-run-061 }
+
+A tool is a WASM component. An installed artifact whose own `murmur.yaml` declares
+`implementation: native` or `execution: native` is refused, naming the artifact and the field:
+
+```text
+error[E-RUN-061]: installed artifact local/nat-tool declares implementation: native in its murmur.yaml; murmur runs tools only as WASM components
+  hint: remove local/nat-tool from the store and from murmur.yaml's artifacts:, or install a release of it built as WASM — mur build refuses the same manifest with E-BLD-007
+```
+
+| Where | What happens |
+|---|---|
+| `mur run`, and every launch that stages artifacts | The launch stops before any session starts |
+| [`mur doctor`](cli.md#mur-doctor) | That artifact's check fails |
+| A runtime pull — `manage.pull()` or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool | The call returns an error carrying `E-RUN-061`, the artifact and the field, and nothing is staged |
+
+A store written by an older `mur` can hold such a payload, with a metadata sidecar that records
+`runtime: native`. It is refused the same way. [`mur list`](cli.md#mur-list) still lists it, so you
+can find it and delete its `<scope>/<name>/<version>/` folder from the store — see
+[Local artifact cache](installing-artifacts.md#local-artifact-cache).
+
+`mur install` and `mur publish` refuse the same payload with [`E-REG-012`](#e-reg-012), and
+`mur build` refuses the manifest with [`E-BLD-007`](#e-bld-007).
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -1627,7 +1623,7 @@ The check reads the declared floor alone, so it fires identically on a host that
 
 ### E-CAP-005 — no network namespace for the subprocess tree { #e-cap-005 }
 
-`capabilities.network.allow` is enforced for a native subprocess by putting its whole tree in a
+`capabilities.network.allow` is enforced for a subprocess by putting its whole tree in a
 network namespace of its own, whose only way out is an egress proxy in the runtime process. A
 Linux host where that namespace cannot be created refuses the launch:
 
@@ -1661,17 +1657,11 @@ This applies to **every** Linux capsule that can spawn a subprocess, including o
 `capabilities.network.allow` is empty: with the namespace missing, an empty allowlist would mean
 unrestricted egress rather than none. There is no path that continues at reduced enforcement.
 
-A capsule can spawn a subprocess through any of the routes below, and `mur run` checks each at a
-different point:
+A capsule can spawn a subprocess when `capabilities.shell.allow` or `capabilities.spawn.allow` is
+non-empty; a WASM tool runs programs through `murmur:process` only from `capabilities.shell.allow`.
+`mur run` checks at staging, before any artifact is pulled.
 
-| Route | Checked |
-|---|---|
-| `capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty | At staging, before any artifact is pulled |
-| `capabilities.install.tool` is non-empty: a pattern can match a native tool a pull installs | At staging, before any artifact is pulled |
-| A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
-| A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with `E-CAP-005` and the same reason |
-
-Every check point and `mur doctor` print the same reason. `mur doctor` reports the answer as the
+`mur run` and `mur doctor` print the same reason. `mur doctor` reports the answer as the
 `network namespace:` line of its `AppArmor / user namespaces` block, for every project, beside the
 `mount namespace:` and `sealed root:` lines. How the three lines and the readings tell host
 conditions apart: [Telling host conditions apart](containment.md#telling-host-conditions-apart).
@@ -1981,18 +1971,9 @@ matches. A name the backstop keeps but that looks like a credential is reported 
 
 ---
 
-### E-CAP-017 — a gateway on a native tool { #e-cap-017 }
+### E-CAP-017 — retired { #e-cap-017 }
 
-A `runtime: tool` entry declares [`gateway:`](manifest.md#artifact-gateway), and the artifact it
-names ships a native implementation.
-
-```text
-error[E-CAP-017]: artifact 'my-native-tool' declares 'gateway:' but ships a native implementation, whose requests never pass the credential gateway
-  hint: a native tool's requests leave through the egress proxy and never pass the credential gateway, so no key could be attached; remove gateway: from its entry, or use a WASM build of the tool
-```
-
-`mur run` refuses at staging, before a session directory is created. A native tool runs as a host
-subprocess whose requests the runtime cannot attach a key to.
+Nothing raises this code and nothing reuses it.
 
 ### E-CAP-018 — a gateway that binds no credential { #e-cap-018 }
 
@@ -2188,8 +2169,7 @@ payload selection at `mur run` time:
 - two or more, none named `capsule.wasm` → `multiple root .wasm files found`
 
 A `*.wasm` in a subdirectory is not a root entry and does not count. This check applies only to
-wasm artifacts — native (`implementation: native`) and static (`runtime: skill`,
-`execution: static`) artifacts are packed without it.
+wasm artifacts — static artifacts (`runtime: skill`, `execution: static`) are packed without it.
 
 ### E-BLD-004 — manifest declares a retired block name { #e-bld-004 }
 
@@ -2245,6 +2225,26 @@ error[E-BLD-006]: murmur.yaml: field 'provider_tool.display_width' must be an in
 
 The block's shape is in [`provider_tool:` block](manifest.md#provider-tool).
 
+### E-BLD-007 — the manifest declares a native implementation { #e-bld-007 }
+
+```text
+error[E-BLD-007]: murmur.yaml: artifact 'nat-tool' declares implementation: native; murmur runs tools only as WASM components
+  hint: a tool is a WASM component: build it for wasm32-wasip2, declare the .wasm in requires_files:, and remove the native declaration — a program the tool needs to run goes in the capsule's capabilities.shell.allow and is started through murmur:process
+```
+
+`mur build` refuses before writing the `.mur.zip`, naming the artifact and the field:
+
+| Field | Accepts | `native` | Any other value |
+|---|---|---|---|
+| `implementation` | `wasm` | `E-BLD-007` | Invalid-type error naming `implementation`, expected `wasm` |
+| `execution` | `wasm`, `static` | `E-BLD-007` | Invalid-type error naming `execution` |
+
+A program a tool needs goes in the capsule's [`capabilities.shell.allow`](manifest.md#field-capabilities),
+and the tool starts it through `murmur:process` — see
+[Programs a WASM tool runs](containment.md#wasm-tool-programs). An already-built payload that
+declares a native implementation is refused by `mur install` and `mur publish` with
+[`E-REG-012`](#e-reg-012), and by a launch with [`E-RUN-061`](#e-run-061).
+
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
 ```text
@@ -2276,7 +2276,7 @@ Keep exactly one root `*.wasm`: drop `capsule.wasm`, or rename the payload you m
 warning[W-BLD-003]: compiled artifact packages build inputs: <names>
 ```
 
-A wasm or native artifact declares an obvious build input in `requires_files:` — `Cargo.toml`,
+A wasm artifact declares an obvious build input in `requires_files:` — `Cargo.toml`,
 `Cargo.lock`, a `*.rs` file, or anything under a `target/` path. A compiled artifact ships its
 payload, not the sources it was built from, so this is almost always a stray declaration.
 
@@ -2417,8 +2417,7 @@ error[E-NEW-007]: the artifact index github:murmur-nexus/default-artifacts v1.0.
   hint: upgrade mur, or pass --index <PATH|URL> naming an artifact index that lists a version of murmur/driver-anthropic this mur fits
 ```
 
-A version fits when this `mur` serves its WIT level and one of its payloads runs on this platform
-— see [WIT levels](wit-levels.md).
+A version fits when this `mur` serves its WIT level — see [WIT levels](wit-levels.md).
 
 ### E-IDX-001 — a file cannot be indexed { #e-idx-001 }
 
@@ -2426,7 +2425,7 @@ A version fits when this `mur` serves its WIT level and one of its payloads runs
 file and the reason:
 
 ```text
-error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file name does not match its packed name 'tool-editor' and version '0.6.0': expected tool-editor-0.6.0.mur.zip, or tool-editor-0.6.0-<platform>.mur.zip with <platform> one of darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64
+error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file name does not match its packed name 'tool-editor' and version '0.6.0': expected tool-editor-0.6.0.mur.zip
 ```
 
 | Reason | Fix |
@@ -2435,15 +2434,11 @@ error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file 
 | `its packed name '<name>' …` | Give the artifact a valid `name:` — see [Artifact names](../concepts/registry.md#artifact-names) |
 | `its packed version '<v>' is not a semantic version`, `… is reserved` | Set `version:` to a semantic version such as `1.0.0` |
 | `its file name does not match its packed name … and version …` | Rename the file to `<name>-<version>.mur.zip`, or rebuild it |
-| `a native payload names its platform` | Name the file `<name>-<version>-<platform>.mur.zip` |
-| `a wasm payload runs on every platform`, `a static payload …` | Drop the platform from the file name |
 | `its wasm payload cannot be read as a component: it has no root .wasm entry …`, `… its root .wasm entries are ambiguous: …` | A wasm payload carries its component as `capsule.wasm` or as its one root `*.wasm`; rebuild it with `mur build` |
 | `its wasm payload cannot be read as a component: its root .wasm entry <file> is a core module, not a component` | Build the payload as a component (`--target wasm32-wasip2`), then `mur build` |
 | `its wasm payload cannot be read as a component: its root .wasm entry <file> does not parse as a component: …` | The file is not wasm, or is truncated; rebuild it |
 | `its wasm payload cannot be read as a component: its root .wasm entry <file> is over the <N>-byte decompression cap` | The component is larger than `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` allows |
-| `it packs runtime '<a>' …, and <file> of the same <name>@<version> packs runtime '<b>'` | Build every platform's payload of one version from the same `murmur.yaml` |
 | `its packed murmur-build.json is not JSON …`, `… sets no built_at_level`, `… sets built_at_level to <value>, which is not a non-negative integer` | Rebuild the artifact with `mur build`, which writes the file |
-| `its packed murmur-build.json sets built_at_level <a>, and <file> of the same <name>@<version> sets built_at_level <b>` | Build every platform's payload of one version with the same `mur` |
 
 A payload whose packaging is wasm must carry a component `mur index` can read, because the index
 records the interfaces it names, and an empty list would fit every `mur`:
@@ -2452,7 +2447,7 @@ records the interfaces it names, and an empty list would fit every `mur`:
 error[E-IDX-001]: release/tool-w-0.1.0.mur.zip cannot be indexed: its wasm payload cannot be read as a component: its root .wasm entry capsule.wasm is a core module, not a component
 ```
 
-A native payload and a skill carry no component and are indexed with no interfaces.
+A skill carries no component and is indexed with no interfaces.
 
 A directory with no `.mur.zip` directly inside it is refused too:
 
@@ -2513,7 +2508,7 @@ error[E-IDX-003]: --merge previous.json indexes scope 'bob', and --repo ana/tool
 ### E-REG-001 — the source does not list the artifact { #e-reg-001 }
 
 The scope's source answered, and its [index](installing-artifacts.md#index-resolution) lists no
-artifact of that exact name, no such version, or no payload of the version for this platform:
+artifact of that exact name, or no such version:
 
 ```text
 error[E-REG-001]: could not resolve ana/tool-git@2.0.0: the index of github:ana/artifacts lists ana/tool-git at 1.0.0, 0.9.0
@@ -2524,7 +2519,6 @@ error[E-REG-001]: could not resolve ana/tool-git@2.0.0: the index of github:ana/
 |---|---|
 | `the index of <source> (release <tag>) lists no <scope>/<name>` | Check the name. A name matches exactly: `ana/tool-git` is not `ana/tool-git-validate` |
 | `lists <scope>/<name> at <versions>` | Name one of the listed versions, or leave the version out |
-| `has no payload of it for <platform>; it publishes …` | Build it on this host with `mur build` and install the file, or ask the publisher to release that platform's asset |
 | `no version of <scope>/<name> in <source> fits WIT level <N>, the level this mur serves; the newest is …` | The reference named no version and no version [fits](installing-artifacts.md#version-selection); the hint links the [WIT levels](wit-levels.md) page, which lists the `mur` release serving each level |
 | `the index of <source> lists it as <file> on release <tag>, and …` | The index and the releases disagree; the publisher regenerates the index |
 
@@ -2580,7 +2574,7 @@ error[E-REG-002]: artifact ana/tool-x@1.0.0 declares name 'tool-y' in its murmur
 
 ### E-REG-006 — a source did not answer the lookup { #e-reg-006 }
 
-`mur install`, `mur install --all-platforms` and `mur deploy run` ask the
+`mur install` and `mur deploy run` ask the
 [source of the artifact's scope](installing-artifacts.md#sources-and-scopes). When that source fails
 to answer a request, the install fails with `E-REG-006` rather than
 [`E-REG-001`](#e-reg-001): the source may publish the artifact. The message gives what the source
@@ -2702,6 +2696,21 @@ error[E-REG-011]: local/murmur-driver-anthropic@0.1.0 cannot be stored: its murm
 
 A payload with no readable `murmur.yaml` declares no table, and is stored.
 
+### E-REG-012 — a payload declares a native implementation { #e-reg-012 }
+
+`mur install` — from a file, GitHub, the global store or a manifest's dependencies — and
+`mur publish` read the payload's packed `murmur.yaml` before anything is stored. A payload that
+declares `implementation: native` or `execution: native` is refused, naming the artifact and the
+field, and neither the store nor `murmur.lock` is written:
+
+```text
+error[E-REG-012]: local/nat-tool@0.1.0 declares implementation: native in its murmur.yaml; murmur runs tools only as WASM components, so the store refuses it
+  hint: install a release of the artifact built as WASM — mur build refuses the same manifest with E-BLD-007
+```
+
+When one install names several artifacts, the others still install, and the native one is reported
+as failed; the command exits non-zero.
+
 ---
 
 ## Registry warnings
@@ -2710,30 +2719,9 @@ A payload with no readable `murmur.yaml` declares no table, and is stored.
 carries a `W-REG-NNN` code and a link back to its section on this page, and none of them changes
 the exit code of `mur doctor`.
 
-### W-REG-001 — installed native artifact with no recorded platform { #w-reg-001 }
+### W-REG-001 — retired { #w-reg-001 }
 
-```text
-warning[W-REG-001]: murmur/tool-git@0.4.2 is a native artifact with no recorded platform — it resolved from the generic store path, where every host resolves the same payload
-  Fix: mur install murmur/tool-git@0.4.2
-  (https://docs.murmur.nexus/reference/diagnostics/#w-reg-001)
-```
-
-A native tool is a different binary per platform, so the store files it at
-`<name>-<version>-<platform>.mur.zip` with a metadata sidecar of the same name. This artifact is at
-the untagged `<name>-<version>.mur.zip` instead, which is where an install that recorded no platform
-puts it. Two consequences:
-
-- Every host resolves that one payload, whichever platform it was built for.
-- Installing a second platform into the same version directory would overwrite it rather than sit
-  beside it.
-
-Reinstalling refiles the payload under this host's platform tag:
-`mur install <name>@<version>`. There is no separate migration command, and nothing rewrites a
-store in place — `mur install` overwrites what is there.
-
-`mur doctor` marks that artifact's checklist line, prints the same `Fix:` line, and counts it as a
-warning rather than an error, so a store holding an untagged native payload does not fail a CI
-pre-flight check.
+Nothing raises this code and nothing reuses it.
 
 ### W-REG-002 — a capsule in the spawn closure could not be inspected { #w-reg-002 }
 
@@ -3347,30 +3335,15 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
 
 ### W-SEC-008 — Unapplied per-artifact grant on a tool or driver { #w-sec-008 }
 
-**Fires when:** either
+**Fires when:** a `runtime: tool`/`runtime: driver` entry's `capabilities:` block declares `shell`,
+`spawn`, `env`, `limits`, `resources` or `containment` — a per-artifact grant only reads `network`,
+`filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
+`task_io` is honored as well).
 
-- a `runtime: tool`/`runtime: driver` entry's `capabilities:` block declares `shell`, `spawn`,
-  `env`, `limits`, `resources` or `containment` — a per-artifact grant only reads `network`,
-  `filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
-  `task_io` is honored as well); or
-- a `runtime: tool` entry with a **native** (non-WASM) implementation declares any `capabilities:`
-  sub-block other than `state`. A native tool runs under the capsule-wide
-  `capabilities.filesystem`, `capabilities.network.allow`, `capabilities.network.unix_sockets` and
-  `capabilities.shell.allow`, enforced by the same sandbox as a shell command; a per-artifact block
-  does not narrow them. `capabilities.state` is the one sub-block that applies to a native tool
-  ([A native tool's own config and store](containment.md#native-tool-settings)), so a block that
-  holds only `state` prints nothing.
-
-```text
-[capsule-runtime] warning[W-SEC-008]: artifact 'local/tool-fixture' declares capabilities.network but ships a native implementation — capabilities.state is the one sub-block that applies to a native tool, and the rest run under the capsule-wide capabilities, enforced by the same sandbox as shell commands, which this block does not narrow (https://docs.murmur.nexus/reference/diagnostics/#w-sec-008)
-```
-
-**Why it matters:** a declared-but-unapplied grant reads like a scoped artifact. In the native
-case the tool keeps the whole capsule ceiling despite an entry that looks like it narrowed it.
+**Why it matters:** a declared-but-unapplied grant reads like a scoped artifact.
 
 **What to do:** for an inert sub-key, remove it and declare it in the top-level `capabilities:`
-block instead. For a native tool, keep `state` if it needs a store, narrow the capsule-wide block
-itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's.
+block instead.
 
 ---
 
@@ -3428,8 +3401,8 @@ carries no host-layout coupling and fires no `W-SEC-009`.
 
 ### W-SEC-010 — No aggregate bound on the subprocess tree { #w-sec-010 }
 
-**Fires when:** the capsule can spawn a native subprocess by any route
-(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact) and
+**Fires when:** the capsule can spawn a subprocess by any route
+(`capabilities.shell.allow` or `capabilities.spawn.allow`) and
 the host is not Linux — so no cgroup v2 scope can exist for its process tree.
 
 **Why it matters:** `capabilities.resources` bounds subprocesses with two independent mechanisms,
@@ -3683,9 +3656,7 @@ what that artifact reaches.
 
 ### W-SEC-015 — retired { #w-sec-015 }
 
-Nothing raises this code and nothing reuses it. A native tool receives its entry's `config:` block
-as `MURMUR_ARTIFACT_CONFIG`, as a WASM tool does — see
-[A native tool's own config and store](containment.md#native-tool-settings).
+Nothing raises this code and nothing reuses it.
 
 ---
 
@@ -3854,7 +3825,7 @@ see [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
 scope did not succeed. Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max and pids.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/reference/diagnostics/#w-sec-021)
+[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's subprocess tree has no I/O bandwidth bound; memory.max and pids.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/reference/diagnostics/#w-sec-021)
 ```
 
 **Why it matters:** `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block
@@ -4175,7 +4146,7 @@ door, which speaks plain HTTP. Or bind to loopback.
 ```
 
 **Why it matters:** the capsule's commands can rewrite the task, `MURMUR.md`, a submitted plan
-before it runs, an installed native tool before its next call, or the trace and eval scores every
+before it runs, an installed tool before its next call, or the trace and eval scores every
 later reader trusts.
 
 **What the runtime does about it:** the launch runs, records `achieved_containment: advisory`, and
@@ -4200,10 +4171,10 @@ warning names every such route and the artifacts on it:
 | `mur doctor` | For the project's declared floor |
 
 ```text
-[capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands, plan shell steps and native tools; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
+[capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands and plan shell steps; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
 ```
 
-**Why it matters:** the class confines shell commands, plan shell steps and native tools. WASM
+**Why it matters:** the class confines shell commands and plan shell steps. WASM
 tools, drivers and hooks run inside the `mur` process, held by their WASI preopens and the network
 allowlist; the process harness and its tools run with your authority.
 
@@ -4257,7 +4228,7 @@ launch, after staging succeeds; `mur run --explain-scope` does not print it. It 
 warnings `W-SEC-001`, `W-SEC-002`, `W-SEC-005` and `W-SEC-010`.
 
 ```text
-[capsule-runtime] warning[W-SEC-036]: this capsule runs unconfined: its shell commands, plan shell steps, native tools and process harness run as ana (uid 1000) with HOME /home/ana, the whole environment mur run was started with (credential variables included), the host filesystem and network as that account has them, and no no_new_privs, so sudo works wherever that account's sudoers allows it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-036)
+[capsule-runtime] warning[W-SEC-036]: this capsule runs unconfined: its shell commands, plan shell steps and process harness run as ana (uid 1000) with HOME /home/ana, the whole environment mur run was started with (credential variables included), the host filesystem and network as that account has them, and no no_new_privs, so sudo works wherever that account's sudoers allows it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-036)
 ```
 
 **What to do:** nothing, when you meant to run the capsule as yourself. Otherwise run without

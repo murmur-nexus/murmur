@@ -398,7 +398,7 @@ mur run --manifest murmur.yaml --task task.md
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |
 | Inference config | Config file (`inference:` in `~/.murmur/config.yaml`) → env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → interactive first-run wizard |
 | Generator artifacts | `murmur/driver-anthropic` (or `murmur/driver-openai`), `murmur/tool-registry-search`, `murmur/tool-editor` and `murmur/skill-create-manifest` must all be in the global store; install them with `mur install -g` |
-| Artifact discovery | `murmur/tool-registry-search` is a native tool and runs in the generator capsule's sandbox; [What each native tool needs](../reference/default-artifacts.md#native-tool-needs) lists what it can reach |
+| Artifact discovery | `murmur/tool-registry-search` reads the index on the latest default-artifacts release; the generator capsule's `network.allow` lists `https://github.com` and `https://release-assets.githubusercontent.com` for it |
 | `inference.model` | Chosen by the generator; change it in the generated manifest if needed |
 
 ---

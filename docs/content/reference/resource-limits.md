@@ -56,8 +56,8 @@ Its other `limits` fields are inert there and draw [`W-SEC-006`](diagnostics.md#
 ## Host resource limits { #host-resource-limits }
 
 `capabilities.resources` bounds the operating-system processes the runtime spawns:
-`capabilities.shell.allow` binaries, `capabilities.spawn.allow` sub-capsules, and
-native-implementation tool artifacts. A capsule that cannot escape its containment can still
+`capabilities.shell.allow` binaries, whether a shell command or a WASM tool starts them, and
+`capabilities.spawn.allow` sub-capsules. A capsule that cannot escape its containment can still
 wedge the host it runs on by forking, allocating, opening files or writing without bound; this
 block is what stops that.
 
@@ -118,9 +118,8 @@ counts against `cgroup_pids_max`, or against `max_processes` where no scope boun
 
 ### Platform behavior { #platform-behavior }
 
-**Linux.** A capsule that can spawn any native subprocess — through `capabilities.shell.allow`,
-`capabilities.spawn.allow`, `capabilities.install.tool` (a tool it may pull can be native), or a
-native-implementation artifact — refuses to launch with
+**Linux.** A capsule that can spawn any subprocess — through `capabilities.shell.allow` or
+`capabilities.spawn.allow` — refuses to launch with
 `E-RUN-012` when the host cannot delegate a cgroup, rather than running that tree with no aggregate
 ceiling. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
 the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any
@@ -158,7 +157,7 @@ Every session reports what became of the ceiling, in an `io_max` object carried 
 |---|---|
 | `enforced` | The `io.max` write succeeded against the device backing the workdir. The ceiling is on the scope |
 | `unavailable` | A scope exists and the write did not succeed. `memory.max` and `pids.max` are still enforced on it, and so is `cpu.max` when `cgroup_cpu_percent` is set; I/O bandwidth is not bounded. [`W-SEC-021`](diagnostics.md#w-sec-021) reports it |
-| `not-required` | No scope was asked for: the capsule can reach no native subprocess, or this is not Linux |
+| `not-required` | No scope was asked for: the capsule can reach no subprocess, or this is not Linux |
 | `not-probed` | The write was never attempted, so nothing is claimed either way |
 
 `mur run --explain-scope` reports the status a launch would reach: it creates a throwaway cgroup,
@@ -196,8 +195,8 @@ one limit, the `shell` event in `trace.jsonl` carries a `resource_limit` field:
 |---|---|
 | `cpu_seconds` | The process was killed by `SIGXCPU` |
 | `max_file_size_bytes` | The process was killed by `SIGXFSZ` |
-| `cgroup_memory_bytes` | The scope's `memory.events` `oom_kill` counter moved, and no other shell command or native tool ran in the scope while this one did |
-| `cgroup_pids_max` | The scope's `pids.events` `max` counter moved, and no other shell command or native tool ran in the scope while this one did |
+| `cgroup_memory_bytes` | The scope's `memory.events` `oom_kill` counter moved, and no other shell command ran in the scope while this one did |
+| `cgroup_pids_max` | The scope's `pids.events` `max` counter moved, and no other shell command ran in the scope while this one did |
 
 A process that ignores `SIGXCPU` is killed one second later with `SIGKILL`, which is left unnamed.
 

@@ -355,12 +355,9 @@ fn execute_inner(
 
     // Aggregate process bounding for this plan's shell steps, on the same fail-closed terms as
     // `runtime::launch_session`: a plan that can run a subprocess on Linux does not start at all
-    // unless its tree can be put in a cgroup scope. `has_native_artifact` is `false` here — a
-    // plan step reaches native binaries only through `invoke_tool`, which routes back into the
-    // session that already established its own scope.
+    // unless its tree can be put in a cgroup scope.
     let cgroup_scope = match crate::cgroup::prepare_policy_scope(
         &ctx.capability_policy,
-        false,
         &plan.id,
         ctx.accessible_workdir.path(),
     ) {

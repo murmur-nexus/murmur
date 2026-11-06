@@ -36,15 +36,7 @@ mur build ./tool-editor --output release/
 mur build ./hook-audit --output release/
 ```
 
-Each artifact becomes `<name>-<version>.mur.zip`. A native tool needs one file per platform, named
-`<name>-<version>-<platform>.mur.zip`. Build it on each platform and give `--output` that file
-name:
-
-```bash
-mur build ./tool-git --output release/tool-git-0.2.0-linux-x86_64.mur.zip
-```
-
-`<platform>` is one of `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`.
+Each artifact becomes `<name>-<version>.mur.zip`, one file every host installs.
 
 ## Step 2 — write the index
 

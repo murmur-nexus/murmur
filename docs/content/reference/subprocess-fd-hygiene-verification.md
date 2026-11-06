@@ -19,9 +19,6 @@ above 3 close-on-exec inside the forked child's `pre_exec` window:
 | Subprocess | Entry point | Where the step runs |
 |---|---|---|
 | shell tool | `shell::execute_shell` → `sandbox::prepare_enforcement` | `sandbox::linux_enforce::child_install_enforcement`, after the namespace join and composed root |
-| native tool | `runtime::dispatch_native_tool` → `sandbox::prepare_enforcement` | the same |
-
-Both go through `sandbox::prepare_enforcement`, so they cannot drift apart on this dimension.
 
 The property under test is a negative: **a descriptor open in the runtime process at spawn time
 must not be visible inside the spawned child**. Landlock cannot substitute for this. Landlock
@@ -32,7 +29,7 @@ workdir scope. On the `KernelSeccompOnly` tier there is no Landlock at all — w
 fd-hygiene step runs on both kernel tiers rather than only under `KernelFull`.
 
 Fds 0/1/2 are deliberately **excluded** and are expected to be present in every result below.
-That is the correct outcome, not a leak: both subprocess kinds install `Stdio::piped()` handles
+That is the correct outcome, not a leak: the shell tool installs `Stdio::piped()` handles
 before `pre_exec` runs precisely so the exec'd program inherits them and talks to the parent
 over them. See `sandbox::FD_HYGIENE_FIRST_FD` for the recorded decision.
 
@@ -77,8 +74,8 @@ and `pread64`, which the probe also uses.
   `ANTHROPIC_API_KEY`; any driver works.
 - Confirm the host actually resolves to a kernel-enforcement tier before trusting anything.
   A capsule that logs `W-SEC-003` (`capabilities.shell.allow is non-empty and this host ...`)
-  did **not** resolve to `KernelFull`/`KernelSeccompOnly`, and the shell half of this procedure
-  proves nothing on that machine:
+  did **not** resolve to `KernelFull`/`KernelSeccompOnly`, and this procedure proves nothing on
+  that machine:
 
 ```bash
 uname -r
@@ -89,9 +86,8 @@ mur doctor
 
 ## Step 1 — build the fd probe
 
-The probe is the same binary in both roles: it enumerates its own descriptors, writes the
-result to a file in the capsule workdir, and prints a Murmur native `ToolResult` envelope on
-stdout so it also works unchanged as a native tool artifact.
+The probe enumerates its own descriptors, writes the result to a file in the capsule workdir, and
+prints a one-line summary on stdout.
 
 Two details are load-bearing and are commented in the source: it enumerates **before** opening
 its own output file (opening it first would occupy a descriptor and appear in the results), and
@@ -165,9 +161,8 @@ int main(int argc, char **argv) {
         apnd("LEAKED fd %d first_bytes: %s\n", open_fds[i], buf);
     }
 
-    /* argv[1] tags the output file so the two spawn paths write separate results;
-       the native path passes no arguments. */
-    snprintf(tag, sizeof tag, "%s", (argc > 1 && argv[1][0]) ? argv[1] : "native");
+    /* argv[1] tags the output file; the capsule's shell call passes "shell". */
+    snprintf(tag, sizeof tag, "%s", (argc > 1 && argv[1][0]) ? argv[1] : "probe");
     for (i = 0; tag[i]; i++)
         if (!((tag[i] >= 'a' && tag[i] <= 'z') || (tag[i] >= '0' && tag[i] <= '9')))
             tag[i] = '_';
@@ -175,8 +170,7 @@ int main(int argc, char **argv) {
     out = fopen(path, "w");
     if (out) { fputs(report, out); fclose(out); }
 
-    printf("{\"status\":\"passed\",\"summary\":\"extra_fds=%d\",\"data\":\"wrote %s\","
-           "\"truncated\":false,\"metadata\":{}}\n", extra, path);
+    printf("extra_fds=%d wrote %s\n", extra, path);
     return 0;
 }
 EOF
@@ -205,9 +199,7 @@ LEAKED fd 7 first_bytes: <your hostname>
 
 ---
 
-## Step 2 — install the probe in both roles
-
-### 2a — as a `capabilities.shell.allow` binary
+## Step 2 — install the probe as a `capabilities.shell.allow` binary
 
 `shell.allow` entries are resolved against the launching process's `PATH`, so the probe must be
 on it under a bare name:
@@ -215,30 +207,6 @@ on it under a bare name:
 ```bash
 sudo install -m 0755 /tmp/fdhygiene/bin/fdprobe /usr/local/bin/fdprobe
 command -v fdprobe
-```
-
-### 2b — as a native tool artifact
-
-The runtime reads a native artifact's binary from the archive entry `bin/<artifact-name>` and
-stages it to `<workdir>/tools/<artifact-name>/<artifact-name>`, so the file name must match the
-artifact name exactly:
-
-```bash
-mkdir -p /tmp/fdhygiene/tool/bin
-cp /tmp/fdhygiene/bin/fdprobe /tmp/fdhygiene/tool/bin/fdprobe-native
-cat > /tmp/fdhygiene/tool/murmur.yaml <<'EOF'
-name: fdprobe-native
-version: "0.1.0"
-runtime: tool
-implementation: native
-description: "Enumerates its own open file descriptors and writes them to the capsule workdir."
-input_schema: '{"type":"object","properties":{},"required":[]}'
-requires_files:
-  - bin/fdprobe-native
-EOF
-cd /tmp/fdhygiene/tool
-mur build .
-mur publish fdprobe-native-0.1.0.mur.zip
 ```
 
 ---
@@ -258,9 +226,6 @@ artifacts:
     gateway:
       endpoint: https://api.anthropic.com
       api_key: ${ANTHROPIC_API_KEY}
-  - name: local/fdprobe-native
-    version: "0.1.0"
-    runtime: tool
 
 capabilities:
   shell:
@@ -276,8 +241,7 @@ inference:
 EOF
 cat > /tmp/fdhygiene/capsule/task.md <<'EOF'
 Call the `fdprobe` tool exactly once, with the command field set to the single word: shell
-Then call the `fdprobe-native` tool exactly once, with an empty input object.
-Then stop. Do not call any other tool and do not retry either call.
+Then stop. Do not call any other tool and do not retry the call.
 EOF
 cd /tmp/fdhygiene/capsule
 mur install
@@ -311,10 +275,9 @@ WD=<the workdir path printed above>
 
 ```bash
 cat "$WD/fdprobe-shell.txt"
-cat "$WD/fdprobe-native.txt"
 ```
 
-**Expected — both files, identically:**
+**Expected:**
 
 ```text
 open_fds: 0 1 2
@@ -322,7 +285,7 @@ fd_limit_probed: 1024
 extra_fds: 0
 ```
 
-`extra_fds: 0` and no `LEAKED` line is the pass condition, on both paths. `fd_limit_probed`
+`extra_fds: 0` and no `LEAKED` line is the pass condition. `fd_limit_probed`
 varies by host and is informational.
 
 **A failure looks like this** — any `LEAKED` line at all, e.g.:
@@ -334,7 +297,7 @@ extra_fds: 1
 LEAKED fd 7 first_bytes: <hostname>
 ```
 
-If a file is missing entirely, the agent did not make that tool call — check
+If the file is missing entirely, the agent did not make the tool call — check
 `mur trace show` for the tool calls it actually made and re-run. A missing file is **not** a
 pass.
 
@@ -346,7 +309,7 @@ A probe that reports "clean" on a machine where it cannot see anything is worthl
 harness can detect the leak it is looking for by removing the fix and re-running.
 
 In `crates/capsule-runtime/src/sandbox.rs`, comment out the `mark_inherited_fds_cloexec` call in
-`linux_enforce::child_install_enforcement`, which both subprocess kinds run:
+`linux_enforce::child_install_enforcement`, which the shell tool runs:
 
 ```bash
 # in child_install_enforcement:
@@ -354,9 +317,9 @@ In `crates/capsule-runtime/src/sandbox.rs`, comment out the `mark_inherited_fds_
 cargo build -p capsule-runtime --release
 ```
 
-Rebuild and reinstall `mur` from that tree, then repeat steps 4 and 5. **Both** files must now
+Rebuild and reinstall `mur` from that tree, then repeat steps 4 and 5. The file must now
 show fd 7 with a `LEAKED` line whose `first_bytes` is the host's name — proving that the fd
-crossed into the child, that the probe sees it, and (for the shell path) that Landlock's workdir
+crossed into the child, that the probe sees it, and that Landlock's workdir
 scope did nothing to stop a descriptor that was already open.
 
 Restore the line and rebuild before recording any result.
@@ -368,14 +331,13 @@ Restore the line and rebuild before recording any result.
 **PENDING — not yet run. No result has been recorded, and none should be inferred.**
 
 No real Linux host was available when this document was written. Everything above is derived
-from the code — the syscall allowlist entries, the Landlock grant shape, the artifact staging
-paths — and the expected outputs are what that code implies, not observed output.
+from the code — the syscall allowlist entries and the Landlock grant shape — and the expected outputs are what that code implies, not observed output.
 
 When someone runs the procedure, replace this subsection with:
 
 - `uname -r` and the distribution, plus the `mur doctor` line confirming the enforcement tier;
-- the verbatim contents of `fdprobe-shell.txt` and `fdprobe-native.txt` from step 5;
-- the verbatim contents of both files from the step 6 negative control, showing the leak is
+- the verbatim contents of `fdprobe-shell.txt` from step 5;
+- the verbatim contents of the file from the step 6 negative control, showing the leak is
   detectable;
 - any deviation from the commands as written, and why.
 
@@ -387,7 +349,7 @@ page states an implemented mechanism and an **unverified** end-to-end result.
 Stated plainly, because it is a real, user-visible consequence rather than a footnote: on a
 Linux kernel older than 5.11, `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` fails (`ENOSYS` before
 5.9, `EINVAL` for the flag on 5.9/5.10). The error propagates out of `pre_exec` and
-`Command::spawn()` fails, so **every shell-tool and native-tool spawn on such a host fails** rather than
+`Command::spawn()` fails, so **every shell command spawn on such a host fails** rather than
 silently running without fd hygiene — on both the `KernelFull` and `KernelSeccompOnly` tiers.
 
 That is deliberate and it is this module's established fail-closed discipline:

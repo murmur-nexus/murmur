@@ -29,7 +29,7 @@
 //! member's runtime inside its own WASM guests, never by a launcher in a process environment: each
 //! callee at its virtual address `http://<name>.formation.invalid`, which only the runtime's egress
 //! can reach. `mur run` refuses a launch whose own environment carries the variable
-//! ([`refuse_formation_peers_in_process_env`]). A delegated child and a native process are never
+//! ([`refuse_formation_peers_in_process_env`]). A delegated child and a subprocess are never
 //! handed it.
 
 use std::fmt;
@@ -157,7 +157,7 @@ impl<'de> Deserialize<'de> for FormationId {
 /// The variable a formation member's runtime sets in each of its WASM guests, naming every member
 /// the roster lets it call at that member's virtual address.
 ///
-/// Runtime-owned: no declaration supplies or displaces it, no native process or delegated child is
+/// Runtime-owned: no declaration supplies or displaces it, no subprocess or delegated child is
 /// handed it, and `mur run` refuses a process environment that carries it.
 pub const FORMATION_PEERS_ENV: &str = "MURMUR_FORMATION_PEERS";
 
@@ -239,7 +239,7 @@ impl FormationPeers {
 /// Whether `name` is one of the variables that carry what a formation member was handed —
 /// [`FORMATION_PEERS_ENV`], [`crate::formation_credentials::FORMATION_CHANNEL_ENV`] or
 /// [`crate::lifeline::FORMATION_LIFELINE_ENV`]. None is ever resolved from the host for a guest or
-/// a native process, or handed to a delegated child: the channel and the lifeline name
+/// a subprocess, or handed to a delegated child: the channel and the lifeline name
 /// descriptors of the member's own process.
 pub(crate) fn is_member_grant_env(name: &str) -> bool {
     name == FORMATION_PEERS_ENV

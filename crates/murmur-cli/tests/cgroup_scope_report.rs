@@ -445,9 +445,9 @@ fn a_capsule_with_no_subprocess_route_is_not_refused_for_a_read_only_hierarchy()
         doctor.all()
     );
     assert!(
-        doctor.stdout.contains(
-            "  this capsule runs no native subprocess, so a launch creates no scope for it"
-        ),
+        doctor
+            .stdout
+            .contains("  this capsule runs no subprocess, so a launch creates no scope for it"),
         "{}",
         doctor.all()
     );

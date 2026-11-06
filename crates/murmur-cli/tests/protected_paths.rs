@@ -29,14 +29,21 @@ const PROTECTED_CONTENTS: &str = "def test_foo():\n    assert compute() == 42\n"
 
 /// The file the fixture tool creates when it actually runs. Its absence is how a scenario shows
 /// the tool was never dispatched.
-const MARKER: &str = "marker.txt";
+const MARKER: &str = "img-1.png";
 
-/// A native tool that writes [`MARKER`] and reports success. It ignores its input entirely: what
-/// is under test is whether the runtime dispatches it at all.
-fn writer_tool_script() -> String {
-    format!(
-        "#!/bin/sh\n: > {MARKER}\necho '{}'\n",
-        r#"{"status":"passed","summary":"ok","data":"wrote","data_path":null,"truncated":false,"metadata":[]}"#
+/// A tool artifact named `name` that writes [`MARKER`] and reports success, carrying `schema` as
+/// its `input_schema`. It is the `image-tool` fixture, which reads no input field but `mode`, so
+/// what is under test is whether the runtime dispatches it at all.
+fn writer_tool_artifact(dir: &Path, name: &str, schema: Option<&str>) -> PathBuf {
+    let schema = schema
+        .map(|schema| format!("input_schema: |\n  {schema}\n"))
+        .unwrap_or_default();
+    common::create_tool_artifact_with_auth(
+        dir,
+        name,
+        "0.1.0",
+        &common::fixture_path("image-tool/tool/image-tool.wasm"),
+        &format!("description: Fixture writer tool\n{schema}"),
     )
 }
 
@@ -116,8 +123,8 @@ impl Session {
     }
 }
 
-/// One capsule to stage: what it declares read-only, which binaries it allows, and which native
-/// tools it carries.
+/// One capsule to stage: what it declares read-only, which binaries it allows, and which tools it
+/// carries.
 ///
 /// Each tool is a name and the `input_schema` its artifact manifest carries — `None` for a tool
 /// that publishes no schema, which is what leaves it on the key-name rules.
@@ -183,7 +190,7 @@ fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) ->
     project_dir.join("murmur.yaml")
 }
 
-/// Publish the driver and every native tool, stage the capsule, seed its workdir, run it, and
+/// Publish the driver and every tool, stage the capsule, seed its workdir, run it, and
 /// collect what it left.
 ///
 /// `seed` runs after staging and before launch, so a scenario can put the protected file — or a
@@ -203,14 +210,7 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>, seed: impl FnOnce(
     common::publish_local(&home, &driver_artifact).success();
 
     for (name, schema) in capsule.tools {
-        let artifact = common::create_native_artifact(
-            artifact_dir.path(),
-            name,
-            "0.1.0",
-            &writer_tool_script(),
-            Some("Fixture writer tool"),
-            *schema,
-        );
+        let artifact = writer_tool_artifact(artifact_dir.path(), name, *schema);
         common::publish_local(&home, &artifact).success();
     }
 
@@ -828,14 +828,7 @@ fn an_absolute_path_resolves_to_the_same_rule() {
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
     );
     common::publish_local(&home, &driver_artifact).success();
-    let tool_artifact = common::create_native_artifact(
-        artifact_dir.path(),
-        "writer",
-        "0.1.0",
-        &writer_tool_script(),
-        Some("Fixture writer tool"),
-        None,
-    );
+    let tool_artifact = writer_tool_artifact(artifact_dir.path(), "writer", None);
     common::publish_local(&home, &tool_artifact).success();
 
     let manifest_path = create_manifest(
@@ -1134,7 +1127,7 @@ fn no_declaration_means_no_warning() {
         .stderr(predicate::str::contains("W-SEC-017").not());
 }
 
-/// A script capsule that installs one native tool, so staging has a tool schema to judge.
+/// A script capsule that installs one tool, so staging has a tool schema to judge.
 ///
 /// The tool is published into `home` first: `mur run` resolves the artifact out of the local
 /// store the same way a real capsule does.
@@ -1145,14 +1138,7 @@ fn staging_project_with_tool(
     tool: &str,
     schema: Option<&str>,
 ) -> tempfile::TempDir {
-    let artifact = common::create_native_artifact(
-        artifact_dir,
-        tool,
-        "0.1.0",
-        &writer_tool_script(),
-        Some("Fixture writer tool"),
-        schema,
-    );
+    let artifact = writer_tool_artifact(artifact_dir, tool, schema);
     common::publish_local(home, &artifact).success();
 
     let project = tempfile::tempdir().unwrap();

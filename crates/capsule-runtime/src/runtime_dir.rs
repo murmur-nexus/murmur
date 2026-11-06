@@ -40,9 +40,9 @@ use crate::workdir_fs::WorkdirRoot;
 /// identical.
 pub const SESSION_ID_PLACEHOLDER: &str = "<session-id>";
 
-/// The variable naming the runtime directory in every shell command's, plan shell step's, native
-/// tool's and `transport: process` harness's environment. Runtime-owned like `HOME`: no
-/// manifest, override or host value can set it.
+/// The variable naming the runtime directory in every shell command's, plan shell step's,
+/// `murmur:process` program's and `transport: process` harness's environment. Runtime-owned like
+/// `HOME`: no manifest, override or host value can set it.
 pub const RUNTIME_DIR_ENV: &str = "MURMUR_RUNTIME_DIR";
 
 /// The guest path a `runtime: tool` with no `capabilities.filesystem.scope` finds the runtime
@@ -61,18 +61,14 @@ pub(crate) fn gets_runtime_dir_preopen(
 }
 
 /// The tool names, sorted, of the artifacts in `installed` whose guest is preopened at
-/// [`RUNTIME_DIR_GUEST_PATH`]: the WASM ones [`gets_runtime_dir_preopen`] holds for. `scoped`
+/// [`RUNTIME_DIR_GUEST_PATH`]: the ones [`gets_runtime_dir_preopen`] holds for. `scoped`
 /// answers, by tool name, whether the operator's entry declares a `capabilities.filesystem.scope`.
-/// A native tool is a host process and sees no preopen, whatever its runtime.
 pub(crate) fn runtime_dir_preopened_tools<'a>(
     installed: impl IntoIterator<Item = &'a crate::types::InstalledArtifactSummary>,
     scoped: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut names: Vec<String> = installed
         .into_iter()
-        .filter(|artifact| {
-            artifact.implementation == Some(murmur_artifact::ArtifactImplementation::Wasm)
-        })
         .map(|artifact| {
             (
                 murmur_artifact::tool_name_of(&artifact.name),

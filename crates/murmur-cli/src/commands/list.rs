@@ -104,7 +104,6 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
     const H_NAME: &str = "NAME";
     const H_VERSION: &str = "VERSION";
     const H_RUNTIME: &str = "RUNTIME";
-    const H_PLATFORMS: &str = "PLATFORMS";
 
     let nw = index
         .iter()
@@ -126,13 +125,10 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
         .max(H_RUNTIME.len());
 
     let Some(prefix) = contract else {
-        capsule_runtime::report_println!(
-            "{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
-        );
+        capsule_runtime::report_println!("{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME}");
         for meta in index {
-            let platforms = format_platforms(&meta.platforms);
             capsule_runtime::report_println!(
-                "{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms}",
+                "{name:<nw$}  {version:<vw$}  {runtime}",
                 name = meta.name,
                 version = meta.version,
                 runtime = meta.artifact_runtime,
@@ -141,20 +137,12 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
         return;
     };
 
-    let pw = index
-        .iter()
-        .map(|m| format_platforms(&m.platforms).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(H_PLATFORMS.len());
-
     capsule_runtime::report_println!(
-        "{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
+        "{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_CONTRACTS}"
     );
     for meta in index {
-        let platforms = format_platforms(&meta.platforms);
         capsule_runtime::report_println!(
-            "{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms:<pw$}  {contracts}",
+            "{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {contracts}",
             name = meta.name,
             version = meta.version,
             runtime = meta.artifact_runtime,
@@ -168,7 +156,6 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
     const H_NAME: &str = "NAME";
     const H_VERSION: &str = "VERSION";
     const H_RUNTIME: &str = "RUNTIME";
-    const H_PLATFORMS: &str = "PLATFORMS";
 
     let sw = entries
         .iter()
@@ -197,12 +184,11 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
 
     let Some(prefix) = contract else {
         capsule_runtime::report_println!(
-            "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
+            "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME}"
         );
         for (scope, meta) in entries {
-            let platforms = format_platforms(&meta.platforms);
             capsule_runtime::report_println!(
-                "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms}",
+                "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime}",
                 name = meta.name,
                 version = meta.version,
                 runtime = meta.artifact_runtime,
@@ -211,35 +197,16 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
         return;
     };
 
-    let pw = entries
-        .iter()
-        .map(|(_, m)| format_platforms(&m.platforms).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(H_PLATFORMS.len());
-
     capsule_runtime::report_println!(
-        "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
+        "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_CONTRACTS}"
     );
     for (scope, meta) in entries {
-        let platforms = format_platforms(&meta.platforms);
         capsule_runtime::report_println!(
-            "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms:<pw$}  {contracts}",
+            "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime:<rw$}  {contracts}",
             name = meta.name,
             version = meta.version,
             runtime = meta.artifact_runtime,
             contracts = format_contracts(meta, prefix),
         );
     }
-}
-
-fn format_platforms(platforms: &[(String, String)]) -> String {
-    if platforms.is_empty() {
-        return String::from("\u{2014}"); // em dash
-    }
-    platforms
-        .iter()
-        .map(|(os, arch)| format!("{os}-{arch}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }

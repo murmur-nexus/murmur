@@ -25,7 +25,7 @@ pub const W_BLD_001: &str = "W-BLD-001";
 /// selects `capsule.wasm`, so the other payload is shipped but never executed.
 pub const W_BLD_002: &str = "W-BLD-002";
 
-/// A wasm or native artifact packages an obvious build input (`Cargo.toml`, `Cargo.lock`, a
+/// A wasm artifact packages an obvious build input (`Cargo.toml`, `Cargo.lock`, a
 /// `*.rs` source file, or something under `target/`) — almost always a stray `requires_files:`
 /// entry rather than a payload.
 pub const W_BLD_003: &str = "W-BLD-003";
@@ -131,10 +131,7 @@ fn capsule_wasm_ambiguity(plan: &PackedPlan) -> Vec<BuildWarning> {
 
 /// W-BLD-003 — build inputs riding along in a compiled artifact.
 fn packaged_build_inputs(manifest: &Manifest, plan: &PackedPlan) -> Vec<BuildWarning> {
-    if !matches!(
-        manifest.registry_runtime(),
-        RuntimeType::Wasm | RuntimeType::Native
-    ) {
+    if manifest.registry_runtime() != RuntimeType::Wasm {
         return Vec::new();
     }
 
@@ -298,10 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn a_native_artifact_shipping_cargo_toml_warns() {
+    fn a_core_module_artifact_shipping_cargo_toml_warns() {
         let warnings = lint(
-            "name: native-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\nrequires_files:\n  - bin/native-tool\n  - Cargo.toml\n",
-            &[("bin/native-tool", b"ELF"), ("Cargo.toml", b"[package]")],
+            "name: core-tool\nversion: 0.1.0\nruntime: tool\nrequires_files:\n  - tool.wasm\n  - Cargo.toml\n",
+            &[("tool.wasm", b"\0asm\x01\0\0\0"), ("Cargo.toml", b"[package]")],
         );
 
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");

@@ -24,8 +24,7 @@
 //! one of [`ACKNOWLEDGING_REPLIES`] runs it.
 
 use murmur_artifact::{
-    current_platform, ArtifactName, ArtifactRuntime, ContainmentClass, ProviderTool,
-    ProviderToolKind,
+    ArtifactName, ArtifactRuntime, ContainmentClass, ProviderTool, ProviderToolKind,
 };
 use serde_json::Value;
 
@@ -150,9 +149,7 @@ pub(crate) fn provider_tools_in_store(
         })
         .filter_map(|artifact| {
             let name = ArtifactName::parse(&artifact.name).ok()?;
-            let resolved = registry
-                .resolve_with_platform(&name, &artifact.version, Some(current_platform()))
-                .ok()?;
+            let resolved = registry.resolve(&name, &artifact.version).ok()?;
             let manifest_yaml = crate::artifact::extract_manifest_yaml(
                 &artifact.name,
                 &artifact.version,

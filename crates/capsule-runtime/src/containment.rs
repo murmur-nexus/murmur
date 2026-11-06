@@ -85,7 +85,7 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
 ///
 /// Why `runtime_dir_inside_workdir` caps at [`ContainmentClass::Advisory`] too: with
 /// `~/.murmur/sessions` inside the workdir the capsule's commands write, they can rewrite the
-/// task, `MURMUR.md`, a submitted plan or an installed tool's entrypoint, which every class above
+/// task, `MURMUR.md`, a submitted plan or an installed tool's manifest, which every class above
 /// `advisory` claims they cannot.
 fn achieved_containment_class(
     tier: EnforcementTier,
@@ -464,16 +464,13 @@ pub struct PreopenReport {
     /// applied.
     pub surface: PreopenSurface,
     /// How the artifact reaches the session's runtime directory, read-only: at `murmur-runtime/`
-    /// for a WASM `runtime: tool` with no `capabilities.filesystem.scope`, through
-    /// `$MURMUR_RUNTIME_DIR` for a native one, `unresolved` where the report could not tell which
-    /// the installed artifact is. `None` — serialized `null` — for every other entry, which has
-    /// no reach.
+    /// for a `runtime: tool` with no `capabilities.filesystem.scope`. `None` — serialized
+    /// `null` — for every other entry, which has no reach.
     pub runtime_dir_reach: Option<RuntimeDirReach>,
     /// The host folders the guest is also preopened into, under `murmur-host`
     /// ([`crate::guest_roots`]), in preopen order. Filled for exactly the entries that reach the
-    /// runtime directory, from the session's unconfined stance or `host_paths`; cleared once the
-    /// entry is known to be native, whose host process reaches host paths through its own
-    /// grants. Always serialized: `[]` for every other entry.
+    /// runtime directory, from the session's unconfined stance or `host_paths`. Always
+    /// serialized: `[]` for every other entry.
     pub extra_roots: Vec<ExtraRootReport>,
 }
 
@@ -502,9 +499,8 @@ impl From<&crate::guest_roots::GuestRoot> for ExtraRootReport {
 }
 
 /// Every report that reaches the runtime directory given `roots`, the session's extra roots
-/// ([`crate::guest_roots::extra_guest_roots`]). Called before [`resolve_runtime_dir_reaches`],
-/// which clears them from a native entry; `stage_session`, `mur run --explain-scope` and
-/// `mur doctor` all call both, so the three agree.
+/// ([`crate::guest_roots::extra_guest_roots`]). `stage_session`, `mur run --explain-scope` and
+/// `mur doctor` all call it, so the three agree.
 pub fn attach_extra_roots(reports: &mut [PreopenReport], roots: &[crate::guest_roots::GuestRoot]) {
     for report in reports {
         report.extra_roots = if report.runtime_dir_reach.is_some() {
@@ -520,82 +516,23 @@ pub fn attach_extra_roots(reports: &mut [PreopenReport], roots: &[crate::guest_r
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeDirReach {
-    /// A WASM tool's read-only preopen at `murmur-runtime/`.
+    /// A tool's read-only preopen at `murmur-runtime/`.
     MurmurRuntime,
-    /// A native tool's `$MURMUR_RUNTIME_DIR`, read-only by Landlock where the host enforces it.
-    Environment,
-    /// A tool whose implementation the report could not resolve: no lock entry pins it.
-    Unresolved,
-}
-
-/// `reach` once the artifact's implementation is known: native reaches the runtime directory
-/// through its environment, WASM through its preopen, and an unknown implementation stays
-/// unresolved. No reach stays none.
-#[must_use]
-pub fn resolve_runtime_dir_reach(
-    reach: Option<RuntimeDirReach>,
-    implementation: Option<murmur_artifact::ArtifactImplementation>,
-) -> Option<RuntimeDirReach> {
-    reach?;
-    Some(match implementation {
-        Some(murmur_artifact::ArtifactImplementation::Native) => RuntimeDirReach::Environment,
-        Some(murmur_artifact::ArtifactImplementation::Wasm) => RuntimeDirReach::MurmurRuntime,
-        None => RuntimeDirReach::Unresolved,
-    })
-}
-
-/// Every report's [`PreopenReport::runtime_dir_reach`] resolved through `implementation_of`, the
-/// implementation of the artifact a report names, or `None` where it is not known. A native
-/// entry's [`PreopenReport::extra_roots`] are cleared: it holds no preopen.
-pub fn resolve_runtime_dir_reaches(
-    reports: &mut [PreopenReport],
-    implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
-) {
-    for report in reports {
-        report.runtime_dir_reach = resolve_runtime_dir_reach(
-            report.runtime_dir_reach,
-            implementation_of(&report.artifact),
-        );
-        if !matches!(
-            report.runtime_dir_reach,
-            Some(RuntimeDirReach::MurmurRuntime | RuntimeDirReach::Unresolved)
-        ) {
-            report.extra_roots.clear();
-        }
-    }
 }
 
 impl PreopenReport {
     /// The single line this preopen renders as, shared by [`ScopeReport::render`] and by
     /// `mur doctor` so the two cannot word the same grant differently.
-    ///
-    /// `runtime_dir_protected` is [`RuntimeDirReport::read_only_to_commands`] for the session:
-    /// whether a native tool's `$MURMUR_RUNTIME_DIR` is read-only on this host. A WASM tool's
-    /// preopen is read-only on every host.
-    pub fn render(&self, runtime_dir_protected: bool) -> String {
+    pub fn render(&self) -> String {
         let artifact = &self.artifact;
         let role = &self.role;
         let surface = self.surface.summary();
         let guest = crate::runtime_dir::RUNTIME_DIR_GUEST_PATH;
-        let env = crate::runtime_dir::RUNTIME_DIR_ENV;
-        let runtime_dir = match (self.runtime_dir_reach, runtime_dir_protected) {
-            (None, _) => String::new(),
-            (Some(RuntimeDirReach::MurmurRuntime), _) => {
+        let runtime_dir = match self.runtime_dir_reach {
+            None => String::new(),
+            Some(RuntimeDirReach::MurmurRuntime) => {
                 format!("; runtime directory read-only at {guest}/")
             }
-            (Some(RuntimeDirReach::Environment), true) => {
-                format!("; runtime directory read-only at ${env}")
-            }
-            (Some(RuntimeDirReach::Environment), false) => {
-                format!("; runtime directory at ${env}, which commands can change on this host")
-            }
-            (Some(RuntimeDirReach::Unresolved), true) => {
-                format!("; runtime directory read-only at {guest}/ if WASM, at ${env} if native")
-            }
-            (Some(RuntimeDirReach::Unresolved), false) => format!(
-                "; runtime directory read-only at {guest}/ if WASM, at ${env} if native, which \
-                 commands can change on this host"
-            ),
         };
         let extra_roots = self.render_extra_roots();
         match &self.scope {
@@ -610,34 +547,25 @@ impl PreopenReport {
         }
     }
 
-    /// The `; …` fragment naming [`Self::extra_roots`], empty when there are none. An entry whose
-    /// implementation is unresolved holds them only if it is WASM, and says so.
+    /// The `; …` fragment naming [`Self::extra_roots`], empty when there are none.
     fn render_extra_roots(&self) -> String {
         if self.extra_roots.is_empty() {
             return String::new();
         }
         let guest = crate::guest_roots::HOST_ROOT_GUEST_PATH;
-        let qualifier = if self.runtime_dir_reach == Some(RuntimeDirReach::Unresolved) {
-            " if WASM"
-        } else {
-            ""
-        };
         let whole_host = self
             .extra_roots
             .iter()
             .any(|root| root.source == crate::guest_roots::GuestRootSource::Unconfined);
         if whole_host {
-            return format!("; whole host read-write under {guest}/{qualifier}");
+            return format!("; whole host read-write under {guest}/");
         }
         let folders: Vec<String> = self
             .extra_roots
             .iter()
             .map(|root| format!("{} ({})", root.path, root.access))
             .collect();
-        format!(
-            "; host folders under {guest}/{qualifier}: {}",
-            folders.join(", ")
-        )
+        format!("; host folders under {guest}/: {}", folders.join(", "))
     }
 }
 
@@ -728,8 +656,8 @@ const PATH_REWRITING_NOT_PROTECTED: &str =
 
 /// What an unconfined session leaves unrestricted: everything, which is the one statement made.
 pub(crate) const UNCONFINED_NOT_PROTECTED: &str =
-    "Nothing is contained: this session runs unconfined, so its shell commands, plan shell steps, \
-     native tools and process harness run as the operator, with the operator's HOME, environment \
+    "Nothing is contained: this session runs unconfined, so its shell commands, plan shell steps \
+     and process harness run as the operator, with the operator's HOME, environment \
      (credential variables included), filesystem and network, and sudo works wherever the \
      operator's sudoers allows it. The trace and the records directory are written as always but \
      are not protected from those commands.";
@@ -1063,14 +991,14 @@ pub struct ScopeReport {
     /// The tier this session installs, as a stable wire name: the host's tier capped by the
     /// declared floor, from [`ContainmentDecision::enforcement_tier`].
     pub enforcement_tier: &'static str,
-    /// Every route this capsule could run code on, and what holds each: eight [`RouteReport`]
-    /// rows in [`Route::ALL`]'s order, from [`route_table`]. A route the session's class covers
-    /// names [`Self::enforcement_tier`]; one it does not names [`HOST_PROCESS_MECHANISM`] and says
-    /// what it does run under.
+    /// Every route this capsule could run code on, and what holds each: one [`RouteReport`] row per
+    /// [`Route::ALL`] entry, in that order, from [`route_table`]. A route the session's class
+    /// covers names [`Self::enforcement_tier`]; one it does not names [`HOST_PROCESS_MECHANISM`]
+    /// and says what it does run under.
     ///
-    /// Always serialized, all eight rows, on every tier and platform: an absent key identifies a
+    /// Always serialized, every row, on every tier and platform: an absent key identifies a
     /// runtime that predates it. Set again through [`Self::with_routes`] by the caller that knows
-    /// each tool's implementation and the inference transport.
+    /// the inference transport.
     pub routes: Vec<RouteReport>,
     /// Where this host's permission to create an unprivileged user namespace comes from, as
     /// [`UsernsGrant::wire_name`], or `null` off Linux, where AppArmor does not exist and the
@@ -1177,9 +1105,9 @@ pub struct ScopeReport {
     /// It opens no host resource of its own. A pulled skill adds text to what the model reads and
     /// gains no grant.
     pub install_skill: Vec<String>,
-    /// `capabilities.install.tool`, verbatim: which tool artifacts, WASM or native, a pull may
-    /// install. Always serialized, on [`Self::install_skill`]'s terms. A pulled tool joins the
-    /// dispatch allowlist, runs on this capsule's own grants and gains none of its own.
+    /// `capabilities.install.tool`, verbatim: which tool artifacts a pull may install. Always
+    /// serialized, on [`Self::install_skill`]'s terms. A pulled tool joins the dispatch allowlist,
+    /// runs on this capsule's own grants and gains none of its own.
     pub install_tool: Vec<String>,
     /// `capabilities.install.from`: `["stores"]`, or `["stores", "sources"]` when a pull the
     /// stores cannot answer is fetched from the scope's GitHub source. `[]` for a capsule with no
@@ -1377,8 +1305,7 @@ pub struct UnconfinedReport {
 
 /// The subprocess routes an unconfined session runs as the operator, as
 /// [`UnconfinedReport::applies_to`] names them.
-pub const UNCONFINED_APPLIES_TO: &[&str] =
-    &["shell", "plan-shell-step", "native-tool", "process-harness"];
+pub const UNCONFINED_APPLIES_TO: &[&str] = &["shell", "plan-shell-step", "process-harness"];
 
 impl UnconfinedReport {
     /// The report for this process: its uid, that uid's account name, its `HOME`, and the fields
@@ -1403,7 +1330,6 @@ impl UnconfinedReport {
             .map(|route| match *route {
                 "shell" => "shell commands",
                 "plan-shell-step" => "plan shell steps",
-                "native-tool" => "native tools",
                 "process-harness" => "process harness",
                 other => other,
             })
@@ -1432,8 +1358,8 @@ pub(crate) fn unconfined_warning(report: &UnconfinedReport) -> String {
     };
     let home = report.home.as_deref().unwrap_or("<unset>");
     format!(
-        "this capsule runs unconfined: its shell commands, plan shell steps, native tools and \
-         process harness run as {user} with HOME {home}, the whole environment mur run was \
+        "this capsule runs unconfined: its shell commands, plan shell steps and process harness \
+         run as {user} with HOME {home}, the whole environment mur run was \
          started with (credential variables included), the host filesystem and network as that \
          account has them, and no no_new_privs, so sudo works wherever that account's sudoers \
          allows it"
@@ -1571,7 +1497,7 @@ impl ScopeReport {
             &self
                 .preopens
                 .iter()
-                .map(|preopen| preopen.render(self.runtime_dir.read_only_to_commands))
+                .map(PreopenReport::render)
                 .collect::<Vec<_>>(),
         );
         push_list(&mut out, "network allow", &self.network_allow);
@@ -1696,7 +1622,7 @@ impl ScopeReport {
         } else if self.cgroup_scope.status == CgroupScopeStatus::Unavailable {
             out.push_str(
                 "\nThis is a report only — `mur run` without --explain-scope would refuse to \
-                 launch here with E-RUN-012: this capsule can run a native subprocess and no \
+                 launch here with E-RUN-012: this capsule can run a subprocess and no \
                  cgroup scope can be created to bound it (see `cgroup scope:` above).\n",
             );
         }
@@ -1739,23 +1665,17 @@ impl ScopeReport {
     }
 
     /// This report with [`Self::routes`] built again by [`route_table`], now that the caller
-    /// knows each tool's implementation (`implementation_of`, `None` where it cannot tell) and the
-    /// inference `transport` (`None` for a capsule with no `inference:` block).
+    /// knows the inference `transport` (`None` for a capsule with no `inference:` block).
     ///
     /// Reads [`Self::preopens`] for the capsule's tool, driver and hook entries, and the grants
     /// beside them, so the table and the rest of the report describe one capsule.
     #[must_use]
-    pub fn with_routes(
-        mut self,
-        implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
-        transport: Option<&str>,
-    ) -> Self {
+    pub fn with_routes(mut self, transport: Option<&str>) -> Self {
         let inputs = RouteInputs::new(
             &self.shell_allow,
             self.plan_submit,
             &self.install_tool,
             &self.preopens,
-            implementation_of,
             transport,
         );
         self.routes = route_table(&inputs, self.enforcement_tier);
@@ -2121,15 +2041,13 @@ pub(crate) fn scope_report_for_tier(
     let records_dir = records_dir_report(applied, landlock_abi, runtime_dir_placement);
     let mut filesystem_boundary = filesystem_boundary(applied);
     let enforcement_tier = decision.enforcement_tier();
-    // Built again by `with_routes` once the caller knows each tool's implementation and the
-    // transport; until then every tool reads as one of unknown implementation.
+    // Built again by `with_routes` once the caller knows the transport.
     let routes = route_table(
         &RouteInputs::new(
             &policy.shell_allow,
             policy.plan_submit,
             &policy.install_tool,
             &preopens,
-            |_| None,
             None,
         ),
         enforcement_tier,
@@ -2351,8 +2269,6 @@ pub enum Route {
     Shell,
     /// A plan's shell step.
     PlanShellSteps,
-    /// A native `runtime: tool` artifact, declared or pulled.
-    NativeTools,
     /// A WASM `runtime: tool` artifact, declared or pulled.
     WasmTools,
     /// A `runtime: driver` artifact.
@@ -2367,10 +2283,9 @@ pub enum Route {
 
 impl Route {
     /// Every route, in the order [`route_table`] reports them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Shell,
         Self::PlanShellSteps,
-        Self::NativeTools,
         Self::WasmTools,
         Self::Drivers,
         Self::Hooks,
@@ -2384,7 +2299,6 @@ impl Route {
         match self {
             Self::Shell => "shell commands",
             Self::PlanShellSteps => "plan shell steps",
-            Self::NativeTools => "native tools",
             Self::WasmTools => "WASM tools",
             Self::Drivers => "drivers",
             Self::Hooks => "hooks",
@@ -2400,7 +2314,7 @@ impl Route {
     #[must_use]
     pub fn under_class(self) -> bool {
         match self {
-            Self::Shell | Self::PlanShellSteps | Self::NativeTools => true,
+            Self::Shell | Self::PlanShellSteps => true,
             Self::WasmTools
             | Self::Drivers
             | Self::Hooks
@@ -2414,7 +2328,7 @@ impl Route {
     #[must_use]
     pub fn runs_unconfined(self) -> bool {
         match self {
-            Self::Shell | Self::PlanShellSteps | Self::NativeTools | Self::ProcessHarness => true,
+            Self::Shell | Self::PlanShellSteps | Self::ProcessHarness => true,
             Self::WasmTools | Self::Drivers | Self::Hooks | Self::HarnessTools => false,
         }
     }
@@ -2424,7 +2338,7 @@ impl Route {
     #[must_use]
     pub fn note(self) -> Option<&'static str> {
         match self {
-            Self::Shell | Self::PlanShellSteps | Self::NativeTools => None,
+            Self::Shell | Self::PlanShellSteps => None,
             Self::WasmTools => Some(
                 "Runs inside the mur process, held by its WASI preopens and the host-side network \
                  allowlist only.",
@@ -2478,10 +2392,10 @@ pub struct RouteInputs {
     pub shell_allow: bool,
     /// `capabilities.plan.submit`.
     pub plan_submit: bool,
-    /// `capabilities.install.tool` is non-empty, so a pull may install a WASM or native tool.
+    /// `capabilities.install.tool` is non-empty, so a pull may install a tool.
     pub install_tool: bool,
-    /// Every `runtime: tool` entry and its implementation, `None` where it is not known.
-    pub tools: Vec<(String, Option<murmur_artifact::ArtifactImplementation>)>,
+    /// Every `runtime: tool` entry.
+    pub tools: Vec<String>,
     /// Every `runtime: driver` entry.
     pub drivers: Vec<String>,
     /// Every `runtime: hook` entry.
@@ -2492,15 +2406,13 @@ pub struct RouteInputs {
 
 impl RouteInputs {
     /// The inputs for a capsule with these grants, these resolved `preopens` (one per tool,
-    /// driver and hook entry), each tool's implementation from `implementation_of` and the
-    /// inference `transport`.
+    /// driver and hook entry) and the inference `transport`.
     #[must_use]
     pub fn new(
         shell_allow: &[String],
         plan_submit: bool,
         install_tool: &[String],
         preopens: &[PreopenReport],
-        implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
         transport: Option<&str>,
     ) -> Self {
         let named = |role: murmur_artifact::ArtifactRuntime| {
@@ -2514,13 +2426,7 @@ impl RouteInputs {
             shell_allow: !shell_allow.is_empty(),
             plan_submit,
             install_tool: !install_tool.is_empty(),
-            tools: named(murmur_artifact::ArtifactRuntime::Tool)
-                .into_iter()
-                .map(|name| {
-                    let implementation = implementation_of(&name);
-                    (name, implementation)
-                })
-                .collect(),
+            tools: named(murmur_artifact::ArtifactRuntime::Tool),
             drivers: named(murmur_artifact::ArtifactRuntime::Driver),
             hooks: named(murmur_artifact::ArtifactRuntime::Hook),
             process_transport: transport == Some("process"),
@@ -2536,18 +2442,7 @@ impl RouteInputs {
 /// from them.
 #[must_use]
 pub fn route_table(inputs: &RouteInputs, enforcement_tier: &'static str) -> Vec<RouteReport> {
-    use murmur_artifact::ArtifactImplementation;
     let unconfined = enforcement_tier == enforcement_tier_name(EnforcementTier::Unconfined);
-    let tools_of = |native: bool| -> Vec<String> {
-        inputs
-            .tools
-            .iter()
-            .filter(|(_, implementation)| {
-                (*implementation == Some(ArtifactImplementation::Native)) == native
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
     Route::ALL
         .into_iter()
         .map(|route| {
@@ -2555,16 +2450,10 @@ pub fn route_table(inputs: &RouteInputs, enforcement_tier: &'static str) -> Vec<
                 Route::Shell => (inputs.shell_allow, Vec::new()),
                 // A plan's shell step runs only a binary `shell.allow` names (see `plan.rs`).
                 Route::PlanShellSteps => (inputs.plan_submit && inputs.shell_allow, Vec::new()),
-                Route::NativeTools => {
-                    let native = tools_of(true);
-                    (!native.is_empty() || inputs.install_tool, native)
-                }
-                // A tool of unknown implementation is reported here: it is WASM unless its
-                // installed manifest says otherwise.
-                Route::WasmTools => {
-                    let wasm = tools_of(false);
-                    (!wasm.is_empty() || inputs.install_tool, wasm)
-                }
+                Route::WasmTools => (
+                    !inputs.tools.is_empty() || inputs.install_tool,
+                    inputs.tools.clone(),
+                ),
                 Route::Drivers => (!inputs.drivers.is_empty(), inputs.drivers.clone()),
                 Route::Hooks => (!inputs.hooks.is_empty(), inputs.hooks.clone()),
                 Route::ProcessHarness | Route::HarnessTools => {
@@ -2662,7 +2551,7 @@ pub fn uncovered_route_warning(
         "the declared {declared} floor does not confine every route this capsule runs code on: \
          {named} run outside the class, with none of its Landlock, seccomp or network namespace \
          around them (`mur run --explain-scope` lists what holds each under Routes). The class \
-         confines shell commands, plan shell steps and native tools; nothing is refused"
+         confines shell commands and plan shell steps; nothing is refused"
     ))
 }
 
@@ -2688,7 +2577,7 @@ pub fn warn_on_uncovered_routes(
     }
 }
 
-/// The wire name of the tier a native tool of a capsule declaring `declared` runs under on the
+/// The wire name of the tier a shell command of a capsule declaring `declared` runs under on the
 /// host `probe` read: [`ContainmentDecision::enforcement_tier`], which is what
 /// `ShellEnforcement::resolve` installs for every subprocess. Spelled as
 /// [`ScopeReport::enforcement_tier`] spells a tier.
@@ -3411,9 +3300,7 @@ mod tests {
         assert!(rendered.contains("  uid:       "), "{rendered}");
         assert!(rendered.contains("  HOME:      "), "{rendered}");
         assert!(
-            rendered.contains(
-                "applies to: shell commands, plan shell steps, native tools, process harness"
-            ),
+            rendered.contains("applies to: shell commands, plan shell steps, process harness"),
             "{rendered}"
         );
         assert!(unconfined_warning(unconfined).contains("sudo"));
@@ -4575,7 +4462,7 @@ mod tests {
                 PreopenSurface::WholeWorkdir
             },
             runtime_dir_reach: (role == "tool" && scope.is_none())
-                .then_some(RuntimeDirReach::Unresolved),
+                .then_some(RuntimeDirReach::MurmurRuntime),
             extra_roots: Vec::new(),
         }
     }
@@ -4642,41 +4529,20 @@ mod tests {
         );
     }
 
-    /// A native entry's roots are cleared once its implementation is known; a WASM entry keeps
-    /// them, and an unresolved one keeps them and says "if WASM".
+    /// A tool's extra roots render after its runtime directory: each host folder with its access,
+    /// or the whole host when the session is unconfined.
     #[test]
-    fn extra_roots_clear_for_native_and_qualify_when_unresolved() {
-        let mut reports = vec![
-            extra_roots_preopen("wasm-tool", "tool", None),
-            extra_roots_preopen("native-tool", "tool", None),
-            extra_roots_preopen("unknown-tool", "tool", None),
-        ];
+    fn extra_roots_render_after_the_runtime_directory() {
+        let mut reports = vec![extra_roots_preopen("wasm-tool", "tool", None)];
         attach_extra_roots(&mut reports, &two_host_folders());
-        resolve_runtime_dir_reaches(&mut reports, |name| match name {
-            "wasm-tool" => Some(murmur_artifact::ArtifactImplementation::Wasm),
-            "native-tool" => Some(murmur_artifact::ArtifactImplementation::Native),
-            _ => None,
-        });
         assert_eq!(reports[0].extra_roots.len(), 2);
-        assert!(reports[1].extra_roots.is_empty());
-        assert_eq!(reports[2].extra_roots.len(), 2);
-
         assert!(
-            reports[0].render(true).ends_with(
+            reports[0].render().ends_with(
                 "; runtime directory read-only at murmur-runtime/; host folders under \
                  murmur-host/: /data/ref (read), /data/out (read-write)"
             ),
             "{}",
-            reports[0].render(true)
-        );
-        assert!(!reports[1].render(true).contains("murmur-host"));
-        assert!(
-            reports[2].render(true).ends_with(
-                "; host folders under murmur-host/ if WASM: /data/ref (read), /data/out \
-                 (read-write)"
-            ),
-            "{}",
-            reports[2].render(true)
+            reports[0].render()
         );
 
         let mut whole = vec![extra_roots_preopen("wasm-tool", "tool", None)];
@@ -4684,17 +4550,9 @@ mod tests {
             &mut whole,
             &crate::guest_roots::extra_guest_roots_for(ContainmentClass::Unconfined, &[]),
         );
-        let unresolved = whole[0].render(true);
-        assert!(
-            unresolved.ends_with("; whole host read-write under murmur-host/ if WASM"),
-            "{unresolved}"
-        );
-        resolve_runtime_dir_reaches(&mut whole, |_| {
-            Some(murmur_artifact::ArtifactImplementation::Wasm)
-        });
-        assert!(whole[0].render(true).ends_with(
+        assert!(whole[0].render().ends_with(
             "; runtime directory read-only at murmur-runtime/; whole host read-write \
-                        under murmur-host/"
+             under murmur-host/"
         ));
     }
 
@@ -4704,10 +4562,9 @@ mod tests {
         let mut reports = vec![extra_roots_preopen("wasm-tool", "tool", None)];
         attach_extra_roots(&mut reports, &[]);
         assert_eq!(
-            reports[0].render(true),
+            reports[0].render(),
             "wasm-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
-             declared; runtime directory read-only at murmur-runtime/ if WASM, at \
-             $MURMUR_RUNTIME_DIR if native"
+             declared; runtime directory read-only at murmur-runtime/"
         );
     }
 
@@ -5110,7 +4967,7 @@ mod tests {
             ),
             (
                 "resources",
-                "The same, for native subprocesses: rlimits, the Linux cgroup v2 scope and the \
+                "The same, for subprocesses: rlimits, the Linux cgroup v2 scope and the \
                  workdir size ceiling. A ceiling, not a grant, on exactly `limits`' terms.",
             ),
             (
@@ -5376,22 +5233,14 @@ mod tests {
 
     /// Every presence input the table reads, one at a time, with its expected present routes.
     fn presence_cases() -> Vec<(&'static str, RouteInputs, Vec<Route>)> {
-        use murmur_artifact::ArtifactImplementation::{Native, Wasm};
-        let tool = |implementation| RouteInputs {
-            tools: vec![("t".to_string(), implementation)],
-            ..RouteInputs::default()
-        };
         vec![
             ("nothing", RouteInputs::default(), vec![]),
-            ("one WASM tool", tool(Some(Wasm)), vec![Route::WasmTools]),
             (
-                "one native tool",
-                tool(Some(Native)),
-                vec![Route::NativeTools],
-            ),
-            (
-                "a tool of unknown implementation",
-                tool(None),
+                "one tool",
+                RouteInputs {
+                    tools: vec!["t".to_string()],
+                    ..RouteInputs::default()
+                },
                 vec![Route::WasmTools],
             ),
             (
@@ -5416,7 +5265,7 @@ mod tests {
                     install_tool: true,
                     ..RouteInputs::default()
                 },
-                vec![Route::NativeTools, Route::WasmTools],
+                vec![Route::WasmTools],
             ),
             (
                 "transport: process",
@@ -5454,9 +5303,10 @@ mod tests {
         ]
     }
 
-    /// The table over every tier, every declared class and every presence input: eight rows in
-    /// the fixed order; the first three covered by the applied tier's mechanism and the other five
-    /// `host-process` with their note, whatever the tier; presence exactly as each input implies.
+    /// The table over every tier, every declared class and every presence input: one row per
+    /// [`Route::ALL`] entry in the fixed order; the first two covered by the applied tier's
+    /// mechanism and the rest `host-process` with their note, whatever the tier; presence exactly
+    /// as each input implies.
     #[test]
     fn the_route_table_holds_its_invariants_on_every_input() {
         for tier in ALL_TIERS {
@@ -5475,10 +5325,7 @@ mod tests {
                         "{case}"
                     );
                     for row in &rows {
-                        let covered = matches!(
-                            row.route,
-                            Route::Shell | Route::PlanShellSteps | Route::NativeTools
-                        );
+                        let covered = matches!(row.route, Route::Shell | Route::PlanShellSteps);
                         assert_eq!(row.under_class, covered, "{case}: {row:?}");
                         if covered {
                             assert_eq!(row.mechanism, mechanism, "{case}: {row:?}");
@@ -5526,10 +5373,9 @@ mod tests {
         assert!(notes(Route::HarnessTools).contains("arguments the process driver passes"));
     }
 
-    /// The artifacts on each route come from the preopens by role, and each tool lands on the
-    /// route its implementation names.
+    /// The artifacts on each route come from the preopens by role.
     #[test]
-    fn route_inputs_read_roles_and_implementations_off_the_preopens() {
+    fn route_inputs_read_roles_off_the_preopens() {
         let preopen = |artifact: &str, role: &str| PreopenReport {
             artifact: artifact.to_string(),
             role: role.to_string(),
@@ -5544,39 +5390,26 @@ mod tests {
             preopen("driver-anthropic", "driver"),
             preopen("audit", "hook"),
         ];
-        let inputs = RouteInputs::new(
-            &[],
-            false,
-            &[],
-            &preopens,
-            |name| (name == "browser").then_some(murmur_artifact::ArtifactImplementation::Native),
-            Some("http"),
-        );
+        let inputs = RouteInputs::new(&[], false, &[], &preopens, Some("http"));
         let rows = route_table(&inputs, "landlock+seccomp");
         let row = |route: Route| rows.iter().find(|row| row.route == route).unwrap();
-        assert_eq!(row(Route::WasmTools).artifacts, vec!["fs-tool"]);
-        assert_eq!(row(Route::NativeTools).artifacts, vec!["browser"]);
+        assert_eq!(row(Route::WasmTools).artifacts, vec!["fs-tool", "browser"]);
         assert_eq!(row(Route::Drivers).artifacts, vec!["driver-anthropic"]);
         assert_eq!(row(Route::Hooks).artifacts, vec!["audit"]);
         assert!(!row(Route::ProcessHarness).present);
-        assert!(
-            RouteInputs::new(&[], false, &[], &[], |_| None, Some("process")).process_transport
-        );
+        assert!(RouteInputs::new(&[], false, &[], &[], Some("process")).process_transport);
     }
 
-    /// The `routes` key as `--explain-scope --json` and `session_start` carry it: eight rows,
+    /// The `routes` key as `--explain-scope --json` and `session_start` carry it: seven rows,
     /// always serialized, every key on every row.
     #[test]
     fn the_routes_json_is_pinned() {
         let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelFull)
-            .with_routes(
-                |_| Some(murmur_artifact::ArtifactImplementation::Wasm),
-                Some("process"),
-            );
+            .with_routes(Some("process"));
         let json = serde_json::to_value(&report).unwrap();
         assert!(json.get("mechanism_covers").is_none(), "{json}");
         let routes = json["routes"].as_array().expect("routes is an array");
-        assert_eq!(routes.len(), 8);
+        assert_eq!(routes.len(), 7);
         let shell_present = !report.shell_allow.is_empty();
         assert_eq!(
             routes[0],
@@ -5590,7 +5423,7 @@ mod tests {
             })
         );
         assert_eq!(
-            routes[6],
+            routes[5],
             serde_json::json!({
                 "route": "process-harness",
                 "present": true,
@@ -5608,7 +5441,6 @@ mod tests {
             [
                 "shell",
                 "plan-shell-steps",
-                "native-tools",
                 "wasm-tools",
                 "drivers",
                 "hooks",
@@ -5648,7 +5480,7 @@ mod tests {
             crate::temp_dir::tier_temp_mapping(EnforcementTier::KernelFull),
             IoMaxReport::default(),
         )
-        .with_routes(|_| None, None);
+        .with_routes(None);
         let rendered = report.render();
         assert!(!rendered.contains("covers:"), "{rendered}");
         let routes = rendered.find("\nRoutes\n").expect("a Routes block");
@@ -5688,7 +5520,7 @@ mod tests {
     fn the_uncovered_route_warning_names_exactly_the_present_uncovered_routes() {
         let inputs = RouteInputs {
             shell_allow: true,
-            tools: vec![("fs-tool".to_string(), None)],
+            tools: vec!["fs-tool".to_string()],
             drivers: vec!["driver-anthropic".to_string()],
             ..RouteInputs::default()
         };
@@ -5702,10 +5534,6 @@ mod tests {
             &RouteInputs {
                 shell_allow: true,
                 plan_submit: true,
-                tools: vec![(
-                    "browser".to_string(),
-                    Some(murmur_artifact::ArtifactImplementation::Native),
-                )],
                 ..RouteInputs::default()
             },
             "landlock+seccomp",

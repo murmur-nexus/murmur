@@ -6,7 +6,7 @@
 //! package it *imports* is. The two lists here are the floor an installed artifact was built
 //! against, read out of the component bytes rather than declared anywhere by hand.
 //!
-//! Extraction is best-effort by design. A native tool, a skill, a core module, or a payload
+//! Extraction is best-effort by design. A skill, a core module, or a payload
 //! that does not parse simply has nothing to record; that is not an error, and
 //! [`wit_contracts_from_artifact_bytes`] is total for exactly that reason.
 //! [`read_component_contracts`] is the strict reader, for a payload packaged as wasm, where a

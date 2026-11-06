@@ -64,8 +64,7 @@ pub(crate) enum ImageRefusal {
     TooLarge { bytes: Option<u64>, max_bytes: u64 },
     /// This model turn's tool calls already returned `context.images.max_per_turn` images.
     TurnLimit { max_per_turn: u32 },
-    /// The entry names no path or no media type, or a native tool's entry is not an object of
-    /// two strings.
+    /// The entry names no path or no media type, or its raw bytes are not base64.
     Malformed(String),
     /// The image was accepted but its blob could not be written.
     StoreFailed(String),

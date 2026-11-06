@@ -81,7 +81,6 @@ fn seed_global(home: &Path, file: &Path) {
         version: "1.0.0".to_string(),
         runtime: RuntimeType::Wasm,
         artifact_runtime: "driver".to_string(),
-        platforms: Vec::new(),
         description: None,
         tags: Vec::new(),
         wit_contracts: None,

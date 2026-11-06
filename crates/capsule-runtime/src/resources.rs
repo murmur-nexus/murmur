@@ -1,4 +1,4 @@
-//! Host-process resource bounds for every native subprocess this runtime spawns.
+//! Host-process resource bounds for every subprocess this runtime spawns.
 //!
 //! Sibling of [`crate::limits`], and deliberately not a replacement for it: that module bounds
 //! a WASM *guest* inside its wasmtime store (linear memory, tables, epoch deadline), this one

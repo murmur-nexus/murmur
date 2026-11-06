@@ -3,8 +3,8 @@
 //! the model is told which fields were missing, and `trace.jsonl` carries a `tool_input_refused`
 //! record beside the failed `tool_call`.
 //!
-//! The tool is a local native fixture named `murmur-tool-editor` whose schema mirrors the
-//! editor's, so nothing here depends on a `default-artifacts` checkout.
+//! The tool is the `image-tool` WASM fixture published as `murmur-tool-editor` with a schema that
+//! mirrors the editor's, so nothing here depends on a `default-artifacts` checkout.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -27,18 +27,14 @@ const EDITOR: &str = "murmur-tool-editor";
 const EDITOR_SCHEMA: &str = r#"{"type":"object","properties":{"operation":{"type":"string","enum":["write_file","replace_in_file"]},"dest_path":{"type":"string"},"content":{"type":"string"}},"required":["operation","dest_path"]}"#;
 
 /// The file the fixture tool writes whenever it runs. Its absence is the measurement.
-const MARKER: &str = "tool-ran.txt";
+const MARKER: &str = "img-1.png";
 
-/// The file the fixture tool writes as its "edit".
+/// What the fixture tool answers whenever it runs.
+const TOOL_OUTPUT: &str = "attached img-1.png";
+
+/// The file every editor call names as its destination. The fixture reads no input field but
+/// `mode`, so it never writes this file.
 const NOTES: &str = "notes.txt";
-
-/// A native tool that writes [`MARKER`] and [`NOTES`] into the workdir and answers `passed`.
-fn editor_script() -> String {
-    format!(
-        "#!/bin/sh\n: > {MARKER}\necho hello > {NOTES}\necho '{}'\n",
-        r#"{"status":"passed","summary":"ok","data":"EDITOR-RAN","data_path":null,"truncated":false,"metadata":[]}"#
-    )
-}
 
 fn tool_call(id: &str, tool_use_id: &str, name: &str, input: Value) -> String {
     json!({
@@ -68,7 +64,7 @@ fn end_turn(id: &str, text: &str) -> String {
     .to_string()
 }
 
-/// One capsule to run: its native tools with their schemas, an optional deny-all
+/// One capsule to run: its tools with their schemas, an optional deny-all
 /// `on-tool-call` hook, an optional turn budget, and whether it may submit plans.
 #[derive(Default)]
 struct Capsule<'a> {
@@ -191,10 +187,6 @@ impl Session {
         self.workdir.join(MARKER).exists()
     }
 
-    fn wrote_notes(&self) -> bool {
-        self.workdir.join(NOTES).exists()
-    }
-
     /// The text of the tool result the driver was handed for `tool_use_id`.
     fn tool_result_text(&self, tool_use_id: &str) -> String {
         let block = common::find_tool_result(&self.requests, tool_use_id)
@@ -228,8 +220,8 @@ impl Session {
     }
 }
 
-/// Publish the driver, the hook if any and every native tool, stage the capsule, run it, and
-/// collect what it left.
+/// Publish the driver, the hook if any and every tool, stage the capsule, run it, and collect
+/// what it left.
 fn run_session(responses: Vec<String>, capsule: &Capsule<'_>) -> Session {
     let server = common::ScriptedServer::start(responses);
     let home = tempfile::tempdir().unwrap();
@@ -255,15 +247,16 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>) -> Session {
         common::publish_local(&home, &artifact).success();
     }
 
-    let script = editor_script();
     for (name, schema) in &capsule.tools {
-        let artifact = common::create_native_artifact(
+        let schema = schema
+            .map(|schema| format!("input_schema: |\n  {schema}\n"))
+            .unwrap_or_default();
+        let artifact = common::create_tool_artifact_with_auth(
             artifact_dir.path(),
             name,
             "0.1.0",
-            &script,
-            Some("Fixture editor"),
-            *schema,
+            &common::fixture_path("image-tool/tool/image-tool.wasm"),
+            &format!("description: Fixture editor\n{schema}"),
         );
         common::publish_local(&home, &artifact).success();
     }
@@ -319,7 +312,6 @@ fn http_call_missing_operation_is_refused() {
     );
 
     assert!(!session.ran(), "the refused tool must not run");
-    assert!(!session.wrote_notes(), "the refused call must not write");
 
     let text = session.tool_result_text("toolu_edit");
     assert!(
@@ -391,9 +383,7 @@ fn a_complete_call_runs() {
     let calls = session.tool_calls(EDITOR);
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["status"], "ok");
-    assert!(session
-        .tool_result_text("toolu_edit")
-        .contains("EDITOR-RAN"));
+    assert!(session.tool_result_text("toolu_edit").contains(TOOL_OUTPUT));
 }
 
 /// S5: a tool that declares no `input_schema` is not checked, whatever it is called with.

@@ -17,9 +17,9 @@ use std::{
 use assert_cmd::Command;
 use capsule_runtime::SERVED_WIT_PACKAGES;
 use common::github_release::{
-    mur_index, native_tool_zip, publish_dir, release_assets, wasm_tool_zip, write_zip, MockGitHub,
+    mur_index, publish_dir, release_assets, wasm_tool_zip, write_zip, MockGitHub,
 };
-use murmur_artifact::{current_platform, read_lockfile, sha256_hex};
+use murmur_artifact::{read_lockfile, sha256_hex};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -563,20 +563,8 @@ fn served_tool_run() -> String {
     format!("{package}/run@{version}")
 }
 
-fn other_platform() -> &'static str {
-    if current_platform() == "darwin-aarch64" {
-        "linux-x86_64"
-    } else {
-        "darwin-aarch64"
-    }
-}
-
-/// One version of a hand-written index: `(version, interfaces, [(platform, file, bytes)])`.
-type HandVersion<'a> = (
-    &'a str,
-    Vec<String>,
-    Vec<(Option<&'a str>, String, Vec<u8>)>,
-);
+/// One version of a hand-written index: `(version, interfaces, [(file, bytes)])`.
+type HandVersion<'a> = (&'a str, Vec<String>, Vec<(String, Vec<u8>)>);
 
 /// Publish a hand-written schema 2 index of `scope` on release `tag` of `repo`, with the real
 /// SHA-256 of every file, and every file as an asset.
@@ -593,12 +581,8 @@ fn publish_hand_index(
         let mut versions_json = Vec::new();
         for (version, interfaces, files) in versions {
             let mut assets_json = Vec::new();
-            for (platform, file, bytes) in files {
-                let mut asset = json!({ "file": file, "sha256": sha256_hex(&bytes) });
-                if let Some(platform) = platform {
-                    asset["platform"] = json!(platform);
-                }
-                assets_json.push(asset);
+            for (file, bytes) in files {
+                assets_json.push(json!({ "file": file, "sha256": sha256_hex(&bytes) }));
                 assets.push((file, bytes));
             }
             versions_json.push(json!({
@@ -647,7 +631,6 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
                     "1.0.0",
                     vec![unserved.clone()],
                     vec![(
-                        None,
                         "tool-none-1.0.0.mur.zip".to_string(),
                         zip_of(dir, "tool-none", "1.0.0"),
                     )],
@@ -660,25 +643,14 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
                         "0.3.0",
                         vec![unserved],
                         vec![(
-                            None,
                             "tool-x-0.3.0.mur.zip".to_string(),
                             zip_of(dir, "tool-x", "0.3.0"),
-                        )],
-                    ),
-                    (
-                        "0.2.0",
-                        vec![served.clone()],
-                        vec![(
-                            Some(other_platform()),
-                            format!("tool-x-0.2.0-{}.mur.zip", other_platform()),
-                            zip_of(dir, "tool-x", "0.2.0"),
                         )],
                     ),
                     (
                         "0.1.1",
                         vec![served.clone()],
                         vec![(
-                            None,
                             "tool-x-0.1.1.mur.zip".to_string(),
                             zip_of(dir, "tool-x", "0.1.1"),
                         )],
@@ -687,7 +659,6 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
                         "0.1.0",
                         vec![served],
                         vec![(
-                            None,
                             "tool-x-0.1.0.mur.zip".to_string(),
                             zip_of(dir, "tool-x", "0.1.0"),
                         )],
@@ -791,7 +762,6 @@ fn two_tool_x_versions(stub: &MockGitHub) {
                     "2.0.0",
                     vec!["murmur:tool/run@9.9.9".to_string()],
                     vec![(
-                        None,
                         "tool-x-2.0.0.mur.zip".to_string(),
                         zip_of(dir, "tool-x", "2.0.0"),
                     )],
@@ -800,7 +770,6 @@ fn two_tool_x_versions(stub: &MockGitHub) {
                     "1.0.0",
                     vec![served_tool_run()],
                     vec![(
-                        None,
                         "tool-x-1.0.0.mur.zip".to_string(),
                         zip_of(dir, "tool-x", "1.0.0"),
                     )],
@@ -829,7 +798,6 @@ fn seed_unfitting_tool_x(store: &Path) {
         version: "2.0.0".to_string(),
         runtime: murmur_artifact::RuntimeType::Wasm,
         artifact_runtime: "tool".to_string(),
-        platforms: Vec::new(),
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
@@ -869,11 +837,9 @@ fn an_explicit_version_that_does_not_fit_is_refused_before_anything_is_fetched()
     write_config(home.path(), ANA_CONFIG);
     let global = global_store(home.path());
 
-    // From the source, by name and by --all-platforms: the index is read, no payload is.
-    for args in [
-        &["-g", "ana/tool-x@2.0.0"][..],
-        &["--all-platforms", "ana/tool-x@2.0.0"][..],
-    ] {
+    // From the source by name: the index is read, no payload is.
+    let args = &["-g", "ana/tool-x@2.0.0"][..];
+    {
         stub.clear_requests();
         let stderr = refused(
             install(home.path(), cwd.path(), &stub, args),
@@ -997,7 +963,6 @@ fn a_payload_other_than_the_index_describes_is_refused() {
                 "1.0.0",
                 Vec::new(),
                 vec![(
-                    None,
                     "tool-git-1.0.0.mur.zip".to_string(),
                     fs::read(&mislabelled).unwrap(),
                 )],
@@ -1033,7 +998,6 @@ fn a_payload_other_than_the_index_describes_is_refused() {
                 "1.0.0",
                 Vec::new(),
                 vec![(
-                    None,
                     "tool-git-1.0.0.mur.zip".to_string(),
                     fs::read(&mislabelled).unwrap(),
                 )],
@@ -1363,107 +1327,6 @@ fn a_source_without_a_schema_2_index_is_refused() {
     assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 }
 
-// ─── platforms ───────────────────────────────────────────────────────────────
-
-#[test]
-fn a_platform_payload_is_installed_by_its_exact_file_or_refused() {
-    let stub = MockGitHub::start();
-    let staging = tempfile::tempdir().unwrap();
-    let dir = staging.path();
-    native_tool_zip(dir, "tool-n", "0.1.0", "darwin-aarch64");
-    native_tool_zip(dir, "tool-n", "0.1.0", "linux-x86_64");
-    native_tool_zip(dir, "tool-d", "0.1.0", other_platform());
-    stub.repository(ANA, 1111);
-    publish_dir(&stub, ANA, "v1", dir);
-
-    let home = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
-    write_config(home.path(), ANA_CONFIG);
-    let store = global_store(home.path());
-    let host = current_platform();
-
-    if ["darwin-aarch64", "linux-x86_64"].contains(&host) {
-        install(home.path(), cwd.path(), &stub, &["-g", "ana/tool-n@0.1.0"])
-            .assert()
-            .success();
-        let file = format!("tool-n-0.1.0-{host}.mur.zip");
-        assert_eq!(
-            stored(home.path(), "ana/tool-n", "0.1.0", &file),
-            fs::read(dir.join(&file)).unwrap()
-        );
-    } else {
-        let stderr = refused(
-            install(home.path(), cwd.path(), &stub, &["-g", "ana/tool-n@0.1.0"]),
-            "E-REG-001",
-            &[&store],
-        );
-        assert_contains(&stderr, &[host, "darwin-aarch64, linux-x86_64"]);
-    }
-
-    stub.clear_requests();
-    let stderr = refused(
-        install(home.path(), cwd.path(), &stub, &["-g", "ana/tool-d@0.1.0"]),
-        "E-REG-001",
-        &[&store],
-    );
-    assert_contains(&stderr, &[host, other_platform()]);
-    assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
-}
-
-#[test]
-fn all_platforms_installs_each_published_file_and_warns_for_the_rest() {
-    let stub = MockGitHub::start();
-    let staging = tempfile::tempdir().unwrap();
-    let dir = staging.path();
-    native_tool_zip(dir, "tool-n", "0.1.0", "darwin-aarch64");
-    native_tool_zip(dir, "tool-n", "0.1.0", "linux-x86_64");
-    native_tool_zip(dir, "tool-d", "0.1.0", "darwin-aarch64");
-    stub.repository(ANA, 1111);
-    publish_dir(&stub, ANA, "v1", dir);
-
-    let home = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
-    write_config(home.path(), ANA_CONFIG);
-
-    install(
-        home.path(),
-        cwd.path(),
-        &stub,
-        &["--all-platforms", "ana/tool-n@0.1.0"],
-    )
-    .assert()
-    .success();
-    for platform in ["darwin-aarch64", "linux-x86_64"] {
-        let file = format!("tool-n-0.1.0-{platform}.mur.zip");
-        assert_eq!(
-            stored(home.path(), "ana/tool-n", "0.1.0", &file),
-            fs::read(dir.join(&file)).unwrap(),
-            "{platform}"
-        );
-    }
-
-    let assert = install(
-        home.path(),
-        cwd.path(),
-        &stub,
-        &["--all-platforms", "ana/tool-d@0.1.0"],
-    )
-    .assert()
-    .success();
-    assert_contains(
-        &stderr_of(&assert),
-        &["warning: could not install ana/tool-d@0.1.0 for linux-x86_64"],
-    );
-    assert_eq!(
-        files_under(&global_store(home.path()).join("ana/tool-d")),
-        [
-            "0.1.0/tool-d-0.1.0-darwin-aarch64.meta.json",
-            "0.1.0/tool-d-0.1.0-darwin-aarch64.mur.zip",
-            "0.1.0/tool-d-0.1.0-darwin-aarch64.sha256",
-        ]
-    );
-}
-
 // ─── the github: form ────────────────────────────────────────────────────────
 
 #[test]
@@ -1535,7 +1398,6 @@ fn two_fitting_tool_x_versions(stub: &MockGitHub) {
             version,
             vec![served_tool_run()],
             vec![(
-                None,
                 format!("tool-x-{version}.mur.zip"),
                 zip_of(dir, "tool-x", version),
             )],
@@ -1584,10 +1446,7 @@ fn a_source_served_version_change_re_pins_but_new_bytes_for_the_pinned_version_a
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock.artifact_for("ana/tool-x").unwrap();
     assert_eq!(entry.resolved_version, "1.1.0");
-    assert_eq!(
-        entry.sha256.any.as_deref(),
-        Some(sha256_hex(&served).as_str())
-    );
+    assert_eq!(entry.sha256.any, sha256_hex(&served));
     assert_eq!(entry.owner_id, Some(1111));
     assert!(!global_store(home.path()).join("ana/tool-x").exists());
 

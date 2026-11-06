@@ -36,7 +36,7 @@
 
 /// The variable a formation launcher sets in each member's environment: the decimal number of the
 /// descriptor holding that member's lifeline read end. Runtime-owned: never resolved from the host
-/// for a guest, a shell, a native tool or a hook, and never handed to a delegated child.
+/// for a guest, a shell command or a hook, and never handed to a delegated child.
 pub const FORMATION_LIFELINE_ENV: &str = "MURMUR_FORMATION_LIFELINE";
 
 /// The variable a parent's runtime sets in each delegated child's environment, beside

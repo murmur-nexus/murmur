@@ -19,10 +19,10 @@ use capsule_runtime::{
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
-    current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
-    registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactName, ArtifactRuntime,
-    ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError,
-    MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    load_dotenv_non_override, load_runtime_manifest, read_lockfile, sha256_hex,
+    write_lockfile_atomic, ArtifactName, ArtifactRuntime, ContainmentClass, InferenceConfig,
+    LocalRegistry, LockOrigin, LockedArtifact, LockfileError, MurmurLock, Registry, RegistryError,
+    ResolvedArtifact, LOCK_VERSION,
 };
 use murmur_artifact::{runtime_warning_link, W_RUN_007};
 
@@ -30,8 +30,8 @@ use crate::{
     commands::trace::{resolve_session_dir, trace_head},
     config::load_effective_mur_config_if_any_exists,
     error::{
-        CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
-        E_RUN_047, E_RUN_051, E_RUN_053,
+        native_tool_launch_error, CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015,
+        E_RUN_016, E_RUN_019, E_RUN_047, E_RUN_051, E_RUN_053,
     },
     stores::FallbackRegistry,
 };
@@ -40,34 +40,6 @@ use super::{
     fail_run, locked_sha256, lockfile_error_to_cli, print_run_output,
     runtime_manifest_error_to_cli, RunStatus,
 };
-
-/// Report a native payload the store served off its generic, untagged path: it runs here, but
-/// nothing recorded which platform it is for, so installing a second platform into that version
-/// directory would overwrite it. Printed once per artifact, at staging.
-fn warn_untagged_native(name: &str, version: &str) {
-    capsule_runtime::runtime_err!(
-        "warning[{W_REG_001}]: {name}@{version} is a native artifact with no recorded platform \u{2014} \
-         it resolved from the generic store path, where every host resolves the same payload\n  \
-         Fix: mur install {name}@{version}\n  {}",
-        registry_warning_link(W_REG_001)
-    );
-}
-
-/// A lock that pins this artifact for other platforms but not for this one.
-///
-/// A missing entry for this host, not an integrity failure: the artifact on disk is fine and
-/// nothing has been tampered with — the lock was written somewhere else and has never been
-/// installed against here.
-fn missing_platform_hash(name: &str, host_platform: &str, entry: &LockedArtifact) -> CliError {
-    let pinned = entry.sha256.platform_tags().join(", ");
-    CliError::with_hint(
-        E_RUN_003,
-        format!(
-            "murmur.lock has no sha256 for '{name}' on platform {host_platform} \u{2014} it pins {pinned}"
-        ),
-        "run `mur install` on this host to add this platform's hash to murmur.lock",
-    )
-}
 
 /// In --json mode errors must not produce any stdout output — return the error as-is.
 /// In human mode, delegate to fail_run which prints the status line.
@@ -625,21 +597,6 @@ pub(crate) fn run_run(
             &mut preopens,
             &capsule_runtime::guest_roots::extra_guest_roots(&capability_policy),
         );
-        // Whether a tool reaches the runtime directory through its preopen or its environment is
-        // a property of the installed artifact, which this block reads no store to learn. The
-        // project's `murmur.lock` says it for every locked entry: only a native payload is pinned
-        // per platform. An unlocked entry, an installed capsule's and a lock that cannot be read
-        // stay unresolved.
-        let lock = installed_capsule
-            .is_none()
-            .then(|| read_lockfile(&project_dir.join("murmur.lock")).ok())
-            .flatten();
-        let locked_implementation_of = |name: &str| {
-            lock.as_ref()
-                .and_then(|lock| lock.artifact_for(name))
-                .map(|entry| locked_implementation(&entry.sha256))
-        };
-        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, locked_implementation_of);
         // Answered by doing what a launch does, not by inferring it from a delegated controller
         // list: `explain_scope_probe` applies the unconfined stance's rules, then `probe_scope`
         // resolves the delegated base and creates a throwaway cgroup through the calls
@@ -649,17 +606,9 @@ pub(crate) fn run_run(
         // runs ahead of every side effect — so the probe resolves the backing device from its
         // nearest existing ancestor.
         //
-        // A capsule that can reach no native subprocess is given no scope at launch, so the
-        // diagnostic reports `not-required` for it rather than exercising a scope the launch would
-        // never create.
-        //
-        // `has_native_artifact` is `false` here and not read from the manifest: an entry's
-        // implementation is a property of the *installed* artifact, which only a registry read
-        // resolves, and this block is placed ahead of every side effect including that one. The
-        // condition evaluated is therefore `shell.allow`, `spawn.allow` or `install.tool` alone,
-        // so a capsule that declares none of them and installs a native tool reports
-        // `not-required` here while its launch does create a scope and does report the real
-        // status in `session_start`.
+        // A capsule that can reach no subprocess is given no scope at launch, so the diagnostic
+        // reports `not-required` for it rather than exercising a scope the launch would never
+        // create.
         //
         // The `not-required` reports come from the constructors `prepare_scope` uses rather than
         // being spelled out here, because `session_start.effective_grants` must be the
@@ -739,10 +688,8 @@ pub(crate) fn run_run(
                 .as_ref()
                 .map(|inference| inference.transport.as_str()),
         )
-        // The route table `session_start.effective_grants.routes` records, each tool's
-        // implementation read off the lock as the reaches above are.
+        // The route table `session_start.effective_grants.routes` records.
         .with_routes(
-            locked_implementation_of,
             runtime_manifest
                 .inference
                 .as_ref()
@@ -887,22 +834,10 @@ pub(crate) fn run_run(
                             gateway: artifact.gateway.clone(),
                             capabilities: artifact.capabilities.clone(),
                         });
-                        // The hash to verify against is this host's, never another
-                        // platform's: a lock written on one machine pins the payload that
-                        // machine resolved, and for a native tool that is different bytes.
-                        let host_platform = current_platform();
-                        let Some(sha256) = entry.sha256.for_platform(host_platform) else {
-                            return Err(fail(
-                                &session_id,
-                                &workdir,
-                                missing_platform_hash(&artifact.name, host_platform, entry),
-                                json,
-                            ));
-                        };
                         expectations.push(LockExpectation {
                             name: artifact.name.clone(),
                             resolved_version: entry.resolved_version.clone(),
-                            sha256: sha256.to_string(),
+                            sha256: entry.sha256.any.clone(),
                             origin: entry.origin.clone(),
                         });
                     }
@@ -1234,18 +1169,6 @@ pub(crate) fn run_run(
     }
 }
 
-/// The implementation a `murmur.lock` pin says its payload is: every writer pins a native binary
-/// per platform and anything else under `any`.
-pub(crate) fn locked_implementation(
-    sha256: &murmur_artifact::LockedSha256,
-) -> murmur_artifact::ArtifactImplementation {
-    if sha256.platforms.is_empty() {
-        murmur_artifact::ArtifactImplementation::Wasm
-    } else {
-        murmur_artifact::ArtifactImplementation::Native
-    }
-}
-
 /// Whether a `mur run` is a formation member nothing will wind down when its formation ends: it
 /// carries a formation id, was handed no lifeline, and is no delegated child — a delegated child
 /// carries its parent's formation id without a lifeline, and its parent session contains it.
@@ -1310,7 +1233,7 @@ fn run_status_for(error: &RuntimeError) -> RunStatus {
     }
 }
 
-/// Whether one declared artifact is available to a session on the current platform.
+/// Whether one declared artifact is available to a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ArtifactPresence {
     /// Declared with a local `source:` path — resolved from the filesystem at stage
@@ -1321,17 +1244,19 @@ pub(crate) enum ArtifactPresence {
     /// hashing them against `murmur.lock`) reads exactly the copy reported here rather
     /// than re-deriving the store order for itself.
     Installed(Box<ResolvedArtifact>),
+    /// Held by a store, but its own `murmur.yaml` declares `field: native`, so no session
+    /// stages it. A store an older mur filled can hold one.
+    NativeTool { field: String },
     /// Resolved from neither store.
     Missing,
 }
 
-/// Resolve one artifact the way a session will: project store first, then global store,
-/// both for the current platform.
+/// Resolve one artifact the way a session will: project store first, then global store. A
+/// native-tool refusal from either store is the answer, never a miss to fall through.
 pub(crate) fn artifact_presence(
     project_registry: &LocalRegistry,
     global_registry: &LocalRegistry,
     artifact: &ArtifactRequest,
-    platform: &str,
 ) -> ArtifactPresence {
     if artifact.source.is_some() {
         return ArtifactPresence::LocalSource;
@@ -1339,36 +1264,36 @@ pub(crate) fn artifact_presence(
     let Ok(name) = ArtifactName::parse(&artifact.name) else {
         return ArtifactPresence::Missing;
     };
-    match project_registry
-        .resolve_with_platform(&name, &artifact.version, Some(platform))
-        .or_else(|_| {
-            global_registry.resolve_with_platform(&name, &artifact.version, Some(platform))
-        }) {
+    let resolved = match project_registry.resolve(&name, &artifact.version) {
+        Err(error) if !matches!(error, RegistryError::NativeTool { .. }) => {
+            global_registry.resolve(&name, &artifact.version)
+        }
+        project => project,
+    };
+    match resolved {
         Ok(resolved) => ArtifactPresence::Installed(Box::new(resolved)),
+        Err(RegistryError::NativeTool { field, .. }) => ArtifactPresence::NativeTool { field },
         Err(_) => ArtifactPresence::Missing,
     }
 }
 
-/// Resolve every declared artifact the way staging will, refusing the session when one is
-/// missing and reporting `W-REG-001` for each native payload that only resolved off the generic,
-/// untagged path. Both answers come from the same resolve, so the payloads are read once.
+/// Resolve every declared artifact the way staging will, refusing the session with `E-RUN-061`
+/// for the first one a store holds as a native tool, else with `E-RUN-008` naming every one
+/// that is missing.
 fn check_artifacts_installed(
     project_registry: &LocalRegistry,
     global_registry: &LocalRegistry,
     artifacts: &[ArtifactRequest],
 ) -> Result<(), CliError> {
-    let platform = current_platform();
     let mut missing = Vec::new();
 
     for artifact in artifacts {
-        match artifact_presence(project_registry, global_registry, artifact, platform) {
+        match artifact_presence(project_registry, global_registry, artifact) {
             ArtifactPresence::Missing => {
                 missing.push(format!("{}@{}", artifact.name, artifact.version));
             }
-            ArtifactPresence::Installed(resolved)
-                if resolved.platform_match == PlatformMatch::UntaggedFallback =>
-            {
-                warn_untagged_native(&artifact.name, &artifact.version);
+            ArtifactPresence::NativeTool { field } => {
+                return Err(native_tool_launch_error(&artifact.name, &field));
             }
             ArtifactPresence::Installed(_) | ArtifactPresence::LocalSource => {}
         }
@@ -1563,7 +1488,7 @@ fn resolve_installed_capsule(
         primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
     }
-    .resolve_with_platform(&artifact_name, version, Some(current_platform()))
+    .resolve(&artifact_name, version)
     .map_err(|source| {
         CliError::with_hint(
             E_RUN_008,

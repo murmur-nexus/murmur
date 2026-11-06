@@ -239,11 +239,7 @@ pub(crate) fn read_optional_lockfile(project_dir: &Path) -> Result<Option<Murmur
     }
 }
 
-/// The `murmur.lock` pin for a payload staging resolved, mirroring `mur install`'s rule: a
-/// native binary is pinned under the platform it was resolved for, everything else under `any`.
+/// The `murmur.lock` pin for a payload staging resolved.
 pub(crate) fn locked_sha256(entry: &ResolvedLockArtifact) -> LockedSha256 {
-    match &entry.platform {
-        Some(platform) => LockedSha256::for_one_platform(platform, entry.sha256.clone()),
-        None => LockedSha256::any(entry.sha256.clone()),
-    }
+    LockedSha256::any(entry.sha256.clone())
 }

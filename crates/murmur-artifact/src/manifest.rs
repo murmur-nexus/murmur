@@ -11,10 +11,9 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub runtime: String,
-    pub implementation: Option<String>,
-    /// Declared packaging type, from `execution:` (`wasm` | `native` | `static`). When present it
-    /// is authoritative for [`Manifest::registry_runtime`]; when absent that method falls back to
-    /// deriving the type from `runtime:` + `implementation:`.
+    /// Declared packaging type, from `execution:` (`wasm` | `static`). When present it is
+    /// authoritative for [`Manifest::registry_runtime`]; when absent that method derives the type
+    /// from `runtime:`.
     pub execution: Option<RuntimeType>,
     /// Companion files that must sit beside this manifest for `build_artifact` to succeed.
     /// Declared via `requires_files:`; when absent it defaults to `["skill.md"]` for
@@ -45,6 +44,10 @@ pub enum ManifestError {
     },
     #[error("{}: field '{field}' {message}", MANIFEST_FILENAME)]
     InvalidValue { field: String, message: String },
+    /// The manifest declares `implementation: native` or `execution: native`. Raised by
+    /// [`refuse_native_tool`].
+    #[error("{}: {}", MANIFEST_FILENAME, native_tool_message(.name, .field))]
+    NativeTool { name: String, field: &'static str },
     /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
     #[error("{}", REGISTRY_BLOCK_MESSAGE)]
     RegistryBlock,
@@ -90,8 +93,7 @@ impl Manifest {
     /// The registry's packaging type for this artifact.
     ///
     /// A declared `execution:` field is authoritative. Only when it is absent does the type get
-    /// derived from the role: `runtime: skill` → `Static`; `runtime: tool` +
-    /// `implementation: native` → `Native`; everything else → `Wasm`.
+    /// derived from the role: `runtime: skill` → `Static`; everything else → `Wasm`.
     #[must_use]
     pub fn registry_runtime(&self) -> RuntimeType {
         if let Some(execution) = self.execution {
@@ -99,8 +101,6 @@ impl Manifest {
         }
         if self.runtime == "skill" {
             RuntimeType::Static
-        } else if self.runtime == "tool" && self.implementation.as_deref() == Some("native") {
-            RuntimeType::Native
         } else {
             RuntimeType::Wasm
         }
@@ -135,9 +135,10 @@ impl Manifest {
         }
 
         let name = required_string(root, "name")?;
+        refuse_native_tool(&name, &value)?;
         let version = required_string(root, "version")?;
         let runtime = required_string(root, "runtime")?;
-        let implementation = optional_string(root, "implementation");
+        refuse_unknown_implementation(root)?;
         let execution = optional_runtime_type(root, "execution")?;
         let requires_files = optional_string_seq(root, "requires_files")?
             .unwrap_or_else(|| default_requires_files(&runtime));
@@ -147,11 +148,70 @@ impl Manifest {
             name,
             version,
             runtime,
-            implementation,
             execution,
             requires_files,
             description,
         })
+    }
+}
+
+/// The packaging fields whose value `native` declares a native tool, in the order they are
+/// checked.
+const NATIVE_TOOL_FIELDS: [&str; 2] = ["implementation", "execution"];
+
+/// The one message every native-tool refusal carries, whichever command meets the artifact.
+#[must_use]
+pub fn native_tool_message(name: &str, field: &str) -> String {
+    format!("artifact '{name}' declares {field}: native; murmur runs tools only as WASM components")
+}
+
+/// Refuses a manifest that declares `implementation: native` or `execution: native`. `name`
+/// is the artifact name the refusal reports; `manifest` is the parsed `murmur.yaml`. A
+/// manifest that is not a mapping, or sets neither field to `native`, passes.
+pub fn refuse_native_tool(name: &str, manifest: &Value) -> Result<(), ManifestError> {
+    let Some(root) = manifest.as_mapping() else {
+        return Ok(());
+    };
+    for field in NATIVE_TOOL_FIELDS {
+        let declared = root
+            .get(Value::String(field.to_string()))
+            .and_then(Value::as_str);
+        if declared.is_some_and(|value| value.eq_ignore_ascii_case("native")) {
+            return Err(ManifestError::NativeTool {
+                name: name.to_string(),
+                field,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// [`refuse_native_tool`] over the `murmur.yaml` packed in `.mur.zip` bytes. Bytes that carry no
+/// readable `murmur.yaml`, or one that is not YAML, pass: whatever reads the payload next reports
+/// that.
+pub fn refuse_native_payload(name: &str, bytes: &[u8]) -> Result<(), ManifestError> {
+    let Ok(text) = crate::artifact::load_manifest_yaml_from_artifact_bytes(bytes) else {
+        return Ok(());
+    };
+    let Ok(value) = serde_norway::from_str::<Value>(&text) else {
+        return Ok(());
+    };
+    refuse_native_tool(name, &value)
+}
+
+/// `implementation:` accepts exactly `wasm`; `native` is refused earlier by
+/// [`refuse_native_tool`].
+fn refuse_unknown_implementation(root: &serde_norway::Mapping) -> Result<(), ManifestError> {
+    let Some(value) = root.get(Value::String("implementation".to_string())) else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some("wasm") => Ok(()),
+        other => Err(ManifestError::InvalidType {
+            field: "implementation".to_string(),
+            expected: "wasm".to_string(),
+            got: other.map_or_else(|| yaml_type_name(value), str::to_string),
+        }),
     }
 }
 
@@ -187,7 +247,7 @@ fn optional_runtime_type(
         .map(Some)
         .map_err(|_| ManifestError::InvalidType {
             field: field.to_string(),
-            expected: "one of: wasm, native, static".to_string(),
+            expected: "one of: wasm, static".to_string(),
             got: raw.to_string(),
         })
 }
@@ -1320,12 +1380,81 @@ mod tests {
     }
 
     #[test]
-    fn registry_runtime_tool_native_returns_native() {
-        let manifest = Manifest::from_yaml_str(
-            "name: my-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
+    fn implementation_native_is_refused_naming_the_artifact_and_the_field() {
+        let err = Manifest::from_yaml_str(
+            "name: nat-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ManifestError::NativeTool { name, field: "implementation" } if name == "nat-tool"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "murmur.yaml: artifact 'nat-tool' declares implementation: native; murmur runs tools \
+             only as WASM components"
+        );
+    }
+
+    #[test]
+    fn execution_native_is_refused_naming_execution() {
+        let err = Manifest::from_yaml_str(
+            "name: nat-tool\nversion: 0.1.0\nruntime: tool\nexecution: Native\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ManifestError::NativeTool {
+                    field: "execution",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn implementation_other_than_wasm_is_an_invalid_type() {
+        let err = Manifest::from_yaml_str(
+            "name: t\nversion: 0.1.0\nruntime: tool\nimplementation: rust\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "murmur.yaml: field 'implementation' has invalid type (expected wasm, got rust)"
+        );
+        let ok = Manifest::from_yaml_str(
+            "name: t\nversion: 0.1.0\nruntime: tool\nimplementation: wasm\n",
         )
         .unwrap();
-        assert_eq!(manifest.registry_runtime(), RuntimeType::Native);
+        assert_eq!(ok.registry_runtime(), RuntimeType::Wasm);
+    }
+
+    #[test]
+    fn refuse_native_payload_reads_the_packed_manifest() {
+        use std::io::Write as _;
+        let zip = |yaml: &str| {
+            let mut out = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(&mut out);
+            writer
+                .start_file("murmur.yaml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(yaml.as_bytes()).unwrap();
+            writer.finish().unwrap();
+            out.into_inner()
+        };
+        let native = zip("name: nat-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n");
+        let err = refuse_native_payload("local/nat-tool", &native).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("artifact 'local/nat-tool' declares implementation"));
+        let wasm = zip("name: w\nversion: 0.1.0\nruntime: tool\n");
+        assert!(refuse_native_payload("local/w", &wasm).is_ok());
+        assert!(refuse_native_payload("local/x", b"not a zip").is_ok());
     }
 
     #[test]
@@ -1367,15 +1496,10 @@ mod tests {
     #[test]
     fn execution_absent_preserves_all_derived_branches() {
         let skill = Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\n").unwrap();
-        let native = Manifest::from_yaml_str(
-            "name: n\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
-        )
-        .unwrap();
         let wasm = Manifest::from_yaml_str("name: w\nversion: 0.1.0\nruntime: tool\n").unwrap();
 
         assert_eq!(skill.execution, None);
         assert_eq!(skill.registry_runtime(), RuntimeType::Static);
-        assert_eq!(native.registry_runtime(), RuntimeType::Native);
         assert_eq!(wasm.registry_runtime(), RuntimeType::Wasm);
     }
 
@@ -1387,7 +1511,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("field 'execution'"), "error was: {msg}");
-        assert!(msg.contains("wasm, native, static"), "error was: {msg}");
+        assert!(msg.contains("wasm, static"), "error was: {msg}");
         assert!(msg.contains("got banana"), "error was: {msg}");
     }
 

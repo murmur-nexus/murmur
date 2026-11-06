@@ -4,8 +4,8 @@
 //!
 //! The model is the `image-probe-driver` fixture: its task line scripts the tool calls it asks for,
 //! and its final text reports every block of the last request it was handed, with the sha256 of
-//! each image's decoded bytes. What runs is real: the staged session, the WASM `image-tool` and the
-//! native fixture tool, the conversation record, the trace, the door and its stream.
+//! each image's decoded bytes. What runs is real: the staged session, the WASM `image-tool`, the
+//! conversation record, the trace, the door and its stream.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -27,7 +27,6 @@ use tempfile::TempDir;
 
 const DRIVER: &str = "local/image-probe-driver";
 const TOOL: &str = "local/image-tool";
-const NATIVE_TOOL: &str = "local/tool-fixture";
 const VERSION: &str = "0.1.0";
 const ENDPOINT: &str = "http://127.0.0.1:9";
 
@@ -44,28 +43,22 @@ const PNG_1X1: [u8; 67] = [
     0x42, 0x60, 0x82,
 ];
 
-/// The capsule's manifest: the probe driver, the WASM image tool, and the native fixture tool when
-/// `native` is set, with `context_extra` under `context:` beside its own record store.
-fn manifest(name: &str, native: bool, context_extra: &str, extra: &str) -> String {
-    let native_entry = if native {
-        format!("  - name: {NATIVE_TOOL}\n    version: {VERSION}\n    runtime: tool\n")
-    } else {
-        String::new()
-    };
+/// The capsule's manifest: the probe driver and the WASM image tool, with `context_extra` under
+/// `context:` beside its own record store.
+fn manifest(name: &str, context_extra: &str, extra: &str) -> String {
     format!(
         "name: {name}\nversion: 0.1.0\n\
          artifacts:\n  - name: {DRIVER}\n    version: {VERSION}\n    runtime: driver\n    \
          gateway:\n      endpoint: {ENDPOINT}\n      api_key: test-key\n  - name: {TOOL}\n    \
-         version: {VERSION}\n    runtime: tool\n{native_entry}\
+         version: {VERSION}\n    runtime: tool\n\
          capabilities:\n  network:\n    allow:\n      - {ENDPOINT}\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER}\n\
          context:\n  record_store: {name}\n{context_extra}{extra}"
     )
 }
 
-/// A scratch home with the probe driver, the image tool and, when it can be built, the native
-/// fixture tool published into it. `None` for `native` when the native tool cannot be built.
-fn publish_fixtures(native: bool) -> Option<(TempDir, TempDir)> {
+/// A scratch home with the probe driver and the image tool published into it.
+fn publish_fixtures() -> (TempDir, TempDir) {
     let home = TempDir::new().unwrap();
     let artifacts = TempDir::new().unwrap();
     let driver = common::create_driver_artifact(
@@ -82,19 +75,7 @@ fn publish_fixtures(native: bool) -> Option<(TempDir, TempDir)> {
         &common::fixture_path("image-tool/tool/image-tool.wasm"),
     );
     common::publish_local(&home, &tool).success();
-    if native {
-        let binary = common::fixture_native_tool_binary()?;
-        let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
-        let zip = common::create_native_tool_zip(
-            artifacts.path(),
-            common::FIXTURE_NATIVE_TOOL_NAME,
-            VERSION,
-            &manifest_bytes,
-            &binary,
-        );
-        common::publish_local(&home, &zip).success();
-    }
-    Some((home, artifacts))
+    (home, artifacts)
 }
 
 /// One launched session and what it left behind.
@@ -157,11 +138,11 @@ impl Run {
 
 /// Stages and runs one session of the capsule named `name`, whose probe asks for `turns` of
 /// `tool`.
-fn run(name: &str, native: bool, context_extra: &str, tool: &str, turns: Value) -> Option<Run> {
-    let (home, artifacts) = publish_fixtures(native)?;
+fn run(name: &str, context_extra: &str, tool: &str, turns: Value) -> Run {
+    let (home, artifacts) = publish_fixtures();
     let project = TempDir::new().unwrap();
     let manifest_path = project.path().join("murmur.yaml");
-    fs::write(&manifest_path, manifest(name, native, context_extra, "")).unwrap();
+    fs::write(&manifest_path, manifest(name, context_extra, "")).unwrap();
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
@@ -179,14 +160,14 @@ fn run(name: &str, native: bool, context_extra: &str, tool: &str, turns: Value) 
         .map(|entry| entry.unwrap().path())
         .find(|path| path.join("conversation.jsonl").is_file())
         .expect("the session recorded its conversation");
-    Some(Run {
+    Run {
         report,
         trace,
         records_dir,
         workdir,
         context_dir,
         _dirs: (home, artifacts, project),
-    })
+    }
 }
 
 /// The three things every accepted image leaves: the driver got its bytes, the record holds its
@@ -248,40 +229,13 @@ fn assert_attached(run: &Run, file: &str) {
 
 #[test]
 fn wasm_tool_png() {
-    let run = run("img-wasm", false, "", "image-tool", json!([{"index": 1}])).unwrap();
+    let run = run("img-wasm", "", "image-tool", json!([{"index": 1}]));
     assert_attached(&run, "img-1.png");
 }
 
 #[test]
-fn native_tool_png() {
-    // A native tool runs in the capsule's own network namespace, which a host refusing
-    // unprivileged user namespaces to this binary cannot make: staging refuses the launch there.
-    if capsule_runtime::skip_without_egress_namespace("native_tool_png") {
-        return;
-    }
-    let Some(run) = run(
-        "img-native",
-        true,
-        "",
-        common::FIXTURE_NATIVE_TOOL_NAME,
-        json!([{"operation": "image", "path": "shot.png", "index": 7}]),
-    ) else {
-        eprintln!("[SKIP] native_tool_png: the fixture native tool could not be built");
-        return;
-    };
-    assert_attached(&run, "shot.png");
-}
-
-#[test]
 fn text_named_png_is_refused() {
-    let run = run(
-        "img-text",
-        false,
-        "",
-        "image-tool",
-        json!([{"mode": "text_png"}]),
-    )
-    .unwrap();
+    let run = run("img-text", "", "image-tool", json!([{"mode": "text_png"}]));
     assert!(run.shown_images().is_empty(), "{}", run.report);
     assert!(!run.record().contains("\"type\":\"image\""));
     let record = run.record();
@@ -317,7 +271,6 @@ fn text_named_png_is_refused() {
 fn refusals() {
     let run = run(
         "img-refusals",
-        false,
         "  images:\n    max_bytes: 1Ki\n",
         "image-tool",
         json!([
@@ -326,8 +279,7 @@ fn refusals() {
             {"mode": "escape"},
             {"mode": "many", "count": 6}
         ]),
-    )
-    .unwrap();
+    );
     let calls = run.tool_calls();
     let refused = |index: usize| -> Vec<String> {
         calls[index]["attachments"]
@@ -356,25 +308,6 @@ fn refusals() {
     assert!(record.contains("attachment 'img-6.png' was not attached: "));
     assert_eq!(run.blob_names().len(), 5);
     assert_eq!(run.shown_images().len(), 5);
-
-    // A native tool's entry that is not two strings is refused `malformed`. The native tool needs
-    // the capsule's network namespace, as in `native_tool_png`.
-    if capsule_runtime::skip_without_egress_namespace("refusals: a native tool's malformed entry") {
-        return;
-    }
-    if let Some(native) = self::run(
-        "img-malformed",
-        true,
-        "",
-        common::FIXTURE_NATIVE_TOOL_NAME,
-        json!([{"operation": "image", "malformed": true}]),
-    ) {
-        let call = native.tool_calls()[0];
-        assert_eq!(call["attachments"][0]["refused"], "malformed", "{call}");
-        assert!(native.record().contains("(malformed)"));
-    } else {
-        eprintln!("[SKIP] refusals: the fixture native tool could not be built");
-    }
 }
 
 /// With six distinct images and the default `keep: 5`, the oldest reaches the driver as one line
@@ -383,7 +316,7 @@ fn refusals() {
 fn images_age_out_after_keep() {
     let turns = |n: u64| Value::Array((1..=n).map(|index| json!({"index": index})).collect());
 
-    let six = run("img-age-six", false, "", "image-tool", turns(6)).unwrap();
+    let six = run("img-age-six", "", "image-tool", turns(6));
     let shas: Vec<String> = (1..=6)
         .map(|index| sha256_hex(&fs::read(six.workdir.join(format!("img-{index}.png"))).unwrap()))
         .collect();
@@ -405,7 +338,7 @@ fn images_age_out_after_keep() {
     assert_eq!(six.blob_names().len(), 6);
     assert_eq!(six.record().matches("\"type\":\"file\"").count(), 6);
 
-    let five = run("img-age-five", false, "", "image-tool", turns(5)).unwrap();
+    let five = run("img-age-five", "", "image-tool", turns(5));
     assert_eq!(five.shown_images().len(), 5, "{}", five.report);
     assert!(!five.report.contains("[image not shown"));
     assert_eq!(five.blob_names().len(), 5);
@@ -475,7 +408,7 @@ fn conversation_truncate_removes_orphan_blobs() {
     assert!(dir.join("blobs").join(&new).exists());
 
     // `context.retain.max_messages` at launch removes the same set.
-    let (home, artifacts) = publish_fixtures(false).unwrap();
+    let (home, artifacts) = publish_fixtures();
     let project = TempDir::new().unwrap();
     let name = "trunc-launch";
     let dir = home
@@ -487,7 +420,7 @@ fn conversation_truncate_removes_orphan_blobs() {
     let manifest_path = project.path().join("murmur.yaml");
     fs::write(
         &manifest_path,
-        manifest(name, false, "  retain:\n    max_messages: 2\n", ""),
+        manifest(name, "  retain:\n    max_messages: 2\n", ""),
     )
     .unwrap();
     let output = Command::cargo_bin("mur")
@@ -534,14 +467,12 @@ struct Door {
 
 impl Door {
     fn start(name: &str, extra: &str) -> Door {
-        let (home, artifacts) = publish_fixtures(false).unwrap();
+        let (home, artifacts) = publish_fixtures();
         let project = TempDir::new().unwrap();
         let manifest_path = project.path().join("murmur.yaml");
         fs::write(
             &manifest_path,
-            manifest(
-                name,
-                false,
+            manifest(name,
                 "",
                 &format!("lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n{extra}"),
             ),
@@ -771,12 +702,12 @@ fn stream_and_door_serve_attachments() {
 
 #[test]
 fn explain_scope_reports_images() {
-    let (home, _artifacts) = publish_fixtures(false).unwrap();
+    let (home, _artifacts) = publish_fixtures();
     let project = TempDir::new().unwrap();
     let manifest_path = project.path().join("murmur.yaml");
     fs::write(
         &manifest_path,
-        manifest("img-scope", false, "  images:\n    keep: 3\n", ""),
+        manifest("img-scope", "  images:\n    keep: 3\n", ""),
     )
     .unwrap();
     let human = Command::cargo_bin("mur")
@@ -853,7 +784,7 @@ fn explain_scope_reports_images() {
 
 #[test]
 fn old_level_tool_is_refused() {
-    let (home, artifacts) = publish_fixtures(false).unwrap();
+    let (home, artifacts) = publish_fixtures();
     let old = common::create_tool_artifact(
         artifacts.path(),
         "local/tool-v1",
@@ -865,7 +796,7 @@ fn old_level_tool_is_refused() {
     let manifest_path = project.path().join("murmur.yaml");
     fs::write(
         &manifest_path,
-        manifest("img-old", false, "", "").replace(
+        manifest("img-old", "", "").replace(
             "capabilities:",
             &format!(
                 "  - name: local/tool-v1\n    version: {VERSION}\n    runtime: tool\ncapabilities:"

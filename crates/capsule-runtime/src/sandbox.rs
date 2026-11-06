@@ -649,7 +649,7 @@ pub(crate) trait ElfSource {
     fn read_at(&self, offset: u64, len: u64) -> Option<std::borrow::Cow<'_, [u8]>>;
 }
 
-/// An image already in memory, such as a native tool the runtime has just written.
+/// An image already in memory.
 impl ElfSource for [u8] {
     fn size(&self) -> u64 {
         self.len() as u64
@@ -1038,21 +1038,10 @@ fn resolve_landlock_grants_in(
     exec_allow_paths: &[PathBuf],
     search_dirs: &[PathBuf],
 ) -> Vec<PathBuf> {
-    resolve_landlock_grants_outside(exec_allow_paths, search_dirs, &[])
-}
-
-/// [`resolve_landlock_grants_in`], skipping every path under one of the canonical `excluded`
-/// roots: such a path is neither granted nor read for further dependencies. For a closure that
-/// must not be decided by files the capsule can write.
-pub(crate) fn resolve_landlock_grants_outside(
-    exec_allow_paths: &[PathBuf],
-    search_dirs: &[PathBuf],
-    excluded: &[PathBuf],
-) -> Vec<PathBuf> {
     let Ok(grants) = walk_dependency_closure(
         exec_allow_paths,
         search_dirs,
-        excluded,
+        &[],
         |path| -> Result<_, std::convert::Infallible> { Ok(read_elf_dependencies(path)) },
     );
     grants
@@ -1064,9 +1053,10 @@ fn read_elf_dependencies(path: &Path) -> Option<ElfDependencies> {
     parse_elf_dependencies(&ElfFile::open_host(path).ok()?)
 }
 
-/// The walk behind [`resolve_landlock_grants_outside`], with each visited file's dependencies
-/// taken from `dependencies`, which is asked once per visited path. An error from it ends the
-/// walk with that error.
+/// The walk behind [`resolve_landlock_grants_in`], with each visited file's dependencies taken
+/// from `dependencies`, which is asked once per visited path. An error from it ends the walk with
+/// that error. A path under one of the canonical `excluded` roots is neither granted nor read for
+/// further dependencies.
 pub(crate) fn walk_dependency_closure<E>(
     exec_allow_paths: &[PathBuf],
     search_dirs: &[PathBuf],
@@ -1167,33 +1157,6 @@ pub(crate) struct LandlockGrant {
     pub(crate) list_dir: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) executable: bool,
-    /// When set, the rule is added only if `path` still opens to this inode, and is otherwise
-    /// dropped (shrink-not-fail). For a grant on a capsule-writable path: the capsule can replace
-    /// the file, or a directory above it, with a symlink to any host binary, and an unpinned grant
-    /// would follow it and put `Execute` on that binary. A pin tells one live file from another,
-    /// not new content from old: an inode number freed by a delete can be reused by the next file.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) pinned: Option<FileIdentity>,
-}
-
-/// A file's `(st_dev, st_ino)`: which inode a path named when the runtime recorded it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FileIdentity {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    dev: u64,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    ino: u64,
-}
-
-impl FileIdentity {
-    #[cfg(unix)]
-    pub(crate) fn of(metadata: &std::fs::Metadata) -> FileIdentity {
-        use std::os::unix::fs::MetadataExt;
-        FileIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        }
-    }
 }
 
 impl LandlockGrant {
@@ -1207,7 +1170,6 @@ impl LandlockGrant {
                 path,
                 list_dir: false,
                 executable: true,
-                pinned: None,
             })
             .collect()
     }
@@ -1235,7 +1197,6 @@ pub(crate) fn resolve_interpreter_runtime_grants(
                 // Executable: an `interpreter_runtime` directory is named by an author precisely so
                 // the interpreter it belongs to can run out of it, helper binaries included.
                 executable: true,
-                pinned: None,
             })
         })
         .collect()
@@ -1256,7 +1217,6 @@ pub(crate) fn resolve_derived_interpreter_grants(
         path: path.to_path_buf(),
         list_dir,
         executable: false,
-        pinned: None,
     };
     derived
         .iter()
@@ -1290,7 +1250,6 @@ pub(crate) fn resolve_trust_store_grants(
             path: entry.path.clone(),
             list_dir: entry.directory,
             executable: false,
-            pinned: None,
         })
         .collect()
 }
@@ -1404,8 +1363,7 @@ pub(crate) fn host_path_mechanism(tier: EnforcementTier) -> crate::host_paths::H
 }
 
 /// Adds `candidate` to `dirs` as an optional composed-root bind unless it is relative, already
-/// inside a fixed [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, or already listed. The one filter
-/// [`resolve_sealed_bind_dirs`] and [`ShellEnforcement::for_native_entrypoint`] share.
+/// inside a fixed [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, or already listed.
 fn push_sealed_bind_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !candidate.is_absolute() {
         return;
@@ -1420,117 +1378,6 @@ fn push_sealed_bind_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
         return;
     }
     dirs.push(candidate);
-}
-
-/// The most bytes [`shebang_interpreter`] reads from the head of a native entrypoint. The
-/// kernel's own `#!` buffer (`BINPRM_BUF_SIZE`) is 256 bytes, so a longer line names nothing the
-/// kernel would run.
-const SHEBANG_READ_LIMIT: u64 = 256;
-
-/// The interpreter the kernel runs when it execs the script `image`: the first token of a leading
-/// `#!` line, when that token is an absolute path. `None` for an ELF binary, a relative
-/// interpreter and a line with no token.
-///
-/// Looks at no more than the first [`SHEBANG_READ_LIMIT`] bytes. Only the interpreter itself is
-/// named: for `#!/usr/bin/env python3` that is `env`, and `python3` is whatever `env` then finds,
-/// which needs its own `capabilities.shell.allow` entry like any other program a tool runs.
-pub(crate) fn shebang_interpreter(image: &[u8]) -> Option<PathBuf> {
-    let head = &image[..image.len().min(SHEBANG_READ_LIMIT as usize)];
-    let line = crate::reachability::shebang_line_of(head)?;
-    let interpreter = PathBuf::from(line.split_whitespace().next()?);
-    interpreter.is_absolute().then_some(interpreter)
-}
-
-/// What the kernel executes to start one installed native tool, derived once, when the runtime
-/// writes the tool into the session workdir, from the image bytes it writes.
-///
-/// The workdir is capsule-writable, so nothing here is read back from it: the `#!` interpreter and
-/// the `PT_INTERP`/`DT_NEEDED` entries come from the runtime's own copy of the image, the
-/// dependency walk searches only absolute locations and neither grants nor reads a file under the
-/// accessible workdir, and the entrypoint's own grant is pinned to the inode the runtime wrote. A
-/// symlink or any other existing file put in the entrypoint's place loses its `Execute` rule. A
-/// capsule that rewrites the entrypoint runs its own code under these grants, including when it
-/// deletes the file and the filesystem hands a new one the freed inode number.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeEntrypoint {
-    path: PathBuf,
-    pinned: Option<FileIdentity>,
-    interpreter: Option<PathBuf>,
-    closure: Vec<PathBuf>,
-}
-
-impl NativeEntrypoint {
-    /// Derives the grants for the tool the runtime has just written at `path` from `image`, the
-    /// bytes it wrote. `accessible_workdir` is the capsule-writable tree the walk stays out of.
-    pub(crate) fn derive(path: &Path, image: &[u8], accessible_workdir: &Path) -> NativeEntrypoint {
-        let search_dirs: Vec<PathBuf> = DEFAULT_LIBRARY_SEARCH_DIRS
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        Self::derive_in(path, image, accessible_workdir, &search_dirs)
-    }
-
-    fn derive_in(
-        path: &Path,
-        image: &[u8],
-        accessible_workdir: &Path,
-        search_dirs: &[PathBuf],
-    ) -> NativeEntrypoint {
-        let interpreter = shebang_interpreter(image);
-        let mut seeds: Vec<PathBuf> = interpreter.iter().cloned().collect();
-        if let Some(deps) = parse_elf_dependencies(image) {
-            // Only absolute locations are searched. `$ORIGIN` is the entrypoint's own directory in
-            // the capsule-writable workdir, and a relative entry resolves against this process's
-            // working directory, which may be the workdir too: a symlink planted there would
-            // carry the lookup to any host file, and canonicalising it hides that from the
-            // exclusion below. A library the tool ships beside itself is readable through the
-            // workdir's own rule and needs no grant.
-            let absolute = |entry: &&String| Path::new(entry.as_str()).is_absolute();
-            seeds.extend(deps.interp.iter().filter(absolute).map(PathBuf::from));
-            let runpaths: Vec<String> = deps
-                .runpaths
-                .iter()
-                .filter(|entry| absolute(entry) && !entry.contains("ORIGIN"))
-                .cloned()
-                .collect();
-            seeds.extend(
-                deps.needed
-                    .iter()
-                    .filter(|soname| !soname.contains('/') || absolute(soname))
-                    .filter_map(|soname| {
-                        resolve_soname(soname, Path::new("/"), &runpaths, search_dirs)
-                    }),
-            );
-        }
-        let excluded = std::fs::canonicalize(accessible_workdir)
-            .unwrap_or_else(|_| accessible_workdir.to_path_buf());
-        NativeEntrypoint {
-            path: path.to_path_buf(),
-            pinned: pinned_identity(path),
-            interpreter,
-            closure: resolve_landlock_grants_outside(&seeds, search_dirs, &[excluded]),
-        }
-    }
-
-    /// The installed entrypoint, the path the tool is spawned from.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// The identity of the regular file at `path`, not following a final symlink. `None` when there is
-/// none, which leaves the entrypoint without a grant rather than with an unpinned one.
-#[cfg(unix)]
-fn pinned_identity(path: &Path) -> Option<FileIdentity> {
-    std::fs::symlink_metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|meta| FileIdentity::of(&meta))
-}
-
-#[cfg(not(unix))]
-fn pinned_identity(_path: &Path) -> Option<FileIdentity> {
-    None
 }
 
 /// The `source_path` of each declared `capabilities.shell.staged_runtime` grant, as the composed
@@ -1596,7 +1443,6 @@ pub(crate) fn resolve_staged_runtime_landlock_grants(
             path,
             list_dir: true,
             executable: true,
-            pinned: None,
         })
         .collect()
 }
@@ -1635,7 +1481,6 @@ pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> V
             path: PathBuf::from(path),
             list_dir: true,
             executable: false,
-            pinned: None,
         })
         .collect()
 }
@@ -1687,7 +1532,6 @@ pub(crate) fn resolve_sealed_etc_landlock_grants(tier: EnforcementTier) -> Vec<L
             path: PathBuf::from(entry.path),
             list_dir: entry.directory,
             executable: false,
-            pinned: None,
         })
         .collect()
 }
@@ -1718,7 +1562,6 @@ pub(crate) fn resolve_scoped_name_resolution_landlock_grants(
             path: PathBuf::from(path),
             list_dir: false,
             executable: false,
-            pinned: None,
         })
         .collect()
 }
@@ -2499,14 +2342,13 @@ pub(crate) struct ShellEnforcement {
     /// every other tier sets [`Self::resource_limits`].
     pub(crate) declared_resources: murmur_artifact::ResourceCapabilities,
     /// The session's cgroup v2 scope, when the host could delegate one (Linux only, and only
-    /// for capsules that can actually spawn a native subprocess). `None` on macOS always, and on
+    /// for capsules that can actually spawn a subprocess). `None` on macOS always, and on
     /// Linux only for capsules with no subprocess capability at all — a Linux capsule that *can*
     /// spawn one and could not be given a scope never reaches here, because the launch is
     /// refused first with `RuntimeError::CgroupDelegationUnavailable`.
     ///
     /// Its presence decides each spawn's `RLIMIT_NPROC` ([`Self::nproc_bound`]): a spawn that
-    /// joins it is bounded by `pids.max` alone. A native tool can still be dispatched on a
-    /// session whose policy required no scope, so a spawn path never assumes one is here.
+    /// joins it is bounded by `pids.max` alone.
     pub(crate) cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
     /// The session's periodic workdir-size check. Consulted before every subprocess spawn, so a
     /// disk filler stops writing at the first spawn after the ceiling is crossed rather than
@@ -2537,17 +2379,6 @@ pub(crate) struct ShellEnforcement {
     /// probe [`Self::resolve`] was handed, or one handed in through [`Self::with_proc_view`].
     /// Read through [`Self::installed_proc_view`], which keys it on [`Self::tier`].
     pub(crate) proc_view: crate::proc_view::ProcView,
-    /// The durable store of the one native tool this enforcement spawns, set by
-    /// [`Self::for_native_entrypoint`] on that spawn's clone alone; `None` on the session's own
-    /// enforcement, which every shell command uses.
-    ///
-    /// On `KernelFull` and `KernelSealed` it gets a read-write Landlock rule without `Execute`,
-    /// re-exposed writable behind a private `/tmp`, and on `KernelSealed` a verified read-write
-    /// bind at its own absolute path, required like the home folder's. On the tiers with no
-    /// filesystem scope nothing is added: the tool is handed the path in its environment and
-    /// reaches it as every subprocess there reaches every host file.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) native_state_dir: Option<PathBuf>,
     /// The host folders `~/.murmur/config.yaml` lends this session ([`CapabilityPolicy::host_paths`]),
     /// in config order. On `KernelFull` and `KernelSealed` each gets a Landlock rule, `ReadFile |
     /// ReadDir` for `read` and the workdir's rights without `Execute` for `read-write`, taken on a
@@ -2658,7 +2489,6 @@ impl ShellEnforcement {
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(tier),
             proc_view: crate::proc_view::proc_view(tier, &probe.namespaces),
-            native_state_dir: None,
             host_paths: policy.host_paths.clone(),
             host_path_read_only_binds,
         })
@@ -2893,7 +2723,6 @@ impl ShellEnforcement {
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(EnforcementTier::EnvironmentOnly),
             proc_view: crate::proc_view::tier_proc_view(EnforcementTier::EnvironmentOnly),
-            native_state_dir: None,
             host_paths: Vec::new(),
             host_path_read_only_binds: Vec::new(),
         }
@@ -2918,71 +2747,6 @@ impl ShellEnforcement {
     ) -> Self {
         self.session_netns = session_netns;
         self
-    }
-
-    /// This enforcement for one native tool spawn: a clone whose exec allowlist also holds what
-    /// the kernel itself executes to start `entrypoint`.
-    ///
-    /// That is the entrypoint, pinned to the inode the runtime installed, and the closure
-    /// [`NativeEntrypoint`] derived from the installed image: the absolute interpreter on its `#!`
-    /// line, and the `PT_INTERP`/`DT_NEEDED` closure — the native-tool counterpart of what
-    /// `capabilities.shell.allow` derives for a shell binary. The entrypoint needs its own
-    /// `Execute` rule because it sits in the runtime directory, whose rule grants reading and
-    /// nothing else. On `KernelSealed` the interpreter's directory is also bound into the composed
-    /// root when no fixed runtime path carries it; the entrypoint needs no bind, because the root
-    /// binds the runtime directory at its own path.
-    ///
-    /// `state_dir` is the store the tool's own entry declared, from
-    /// [`crate::types::NativeToolSettings::state_dir`]; it becomes [`Self::native_state_dir`] on
-    /// this clone, so the store is granted to this tool's process tree and to no shell command or
-    /// other tool. Sibling Landlock domains cannot `ptrace` each other or read each other's
-    /// `/proc/<pid>/fd`, so a descriptor the tool holds on it does not leak either.
-    ///
-    /// Nothing else is added, and nothing is read from the workdir here. Whatever the tool reads
-    /// or runs once started is granted by the capsule, exactly as for a shell command. Every clone
-    /// shares `session_netns`, so the tool joins the session's one namespace and egress proxy.
-    pub(crate) fn for_native_entrypoint(
-        &self,
-        entrypoint: &NativeEntrypoint,
-        state_dir: Option<&Path>,
-    ) -> ShellEnforcement {
-        let mut enforcement = self.clone();
-        enforcement.native_state_dir = state_dir.map(Path::to_path_buf);
-        if let Some(pinned) = entrypoint.pinned {
-            enforcement.landlock_grants.push(LandlockGrant {
-                path: entrypoint.path.clone(),
-                list_dir: false,
-                executable: true,
-                pinned: Some(pinned),
-            });
-        }
-        enforcement
-            .landlock_grants
-            .extend(LandlockGrant::non_listable_files(
-                entrypoint.closure.clone(),
-            ));
-        if self.tier == EnforcementTier::KernelSealed {
-            if let Some(dir) = entrypoint.interpreter.as_deref().and_then(Path::parent) {
-                push_sealed_bind_dir(&mut enforcement.sealed_bind_dirs, dir.to_path_buf());
-                // An interpreter inside a read-write host path is bound read-only on top of it,
-                // as the session's own execute roots are.
-                let inside_read_write = self.host_paths.iter().any(|host_path| {
-                    host_path.access == crate::host_paths::HostPathAccess::ReadWrite
-                        && dir.starts_with(&host_path.path)
-                });
-                if inside_read_write
-                    && !enforcement
-                        .host_path_read_only_binds
-                        .iter()
-                        .any(|bound| bound == dir)
-                {
-                    enforcement
-                        .host_path_read_only_binds
-                        .push(dir.to_path_buf());
-                }
-            }
-        }
-        enforcement
     }
 
     /// End the session: kill every process it started, then release its network namespace.
@@ -3156,7 +2920,7 @@ pub(crate) fn tier_warning(
     }
 }
 
-const NO_AGGREGATE_BOUNDING_WARNING: &str = "this capsule can spawn native subprocesses, but \
+const NO_AGGREGATE_BOUNDING_WARNING: &str = "this capsule can spawn subprocesses, but \
 this platform has no cgroup v2 (Linux-only), so no aggregate bound exists across the subprocess \
 tree: nothing caps its total memory, task count or CPU. Per-process rlimits from \
 capabilities.resources still apply (hard, not soft), but RLIMIT_NPROC is a per-uid ceiling and \
@@ -3423,7 +3187,7 @@ pub(crate) fn test_runtime_dir(base: &Path) -> crate::runtime_dir::RuntimeDirRoo
 /// primitives that exist on some hosts; `setrlimit` is POSIX and exists on all of them, and the
 /// cgroup self-move is a single `write(2)` to a descriptor the parent already opened. So this is
 /// the whole of `prepare_enforcement` on `EnvironmentOnly` and off Linux, through which every
-/// shell command, plan shell step and native tool is spawned.
+/// shell command, plan shell step and `murmur:process` program is spawned.
 ///
 /// Everything the returned closure does runs in the forked child between `fork` and `execve`,
 /// so it is restricted to syscalls: `getrlimit`/`setrlimit` pairs and one `write`. No
@@ -3498,8 +3262,7 @@ fn attach_unconfined_limits(command: &mut std::process::Command, enforcement: &S
 /// **Stdio is NOT marked close-on-exec, and is NOT reopened.** The `Stdio::piped()` handles a
 /// spawn installs *before* `pre_exec` runs exist so the exec'd program inherits them across its
 /// own `execve` and talks to the parent over them — `execute_shell` reads the subprocess's
-/// stdout/stderr, and `dispatch_native_tool` additionally writes its `ToolInput` JSON to the
-/// subprocess's stdin and parses its `ToolResult` JSON back off stdout. Marking 0/1/2
+/// stdout/stderr. Marking 0/1/2
 /// close-on-exec would leave the exec'd program with those descriptors closed, breaking every
 /// invocation, and there is nothing meaningful to reopen them onto: the pipes themselves are the
 /// intended destination. The gap this constant closes is everything *above*
@@ -3586,23 +3349,8 @@ pub(crate) fn prepare_enforcement(
         .map(|home| home.path_fd().map(Arc::new))
         .transpose()
         .map_err(|error| format!("sandbox: failed to open the session's home folder: {error}"))?;
-    // A native tool's store, on the home folder's terms on both Landlock tiers and opened on no
-    // other, where nothing is scoped. Fail-closed: a tool that declared a store is never spawned
-    // without it.
-    let state_dir_fd = enforcement
-        .native_state_dir
-        .as_deref()
-        .filter(|_| {
-            matches!(
-                enforcement.tier,
-                EnforcementTier::KernelFull | EnforcementTier::KernelSealed
-            )
-        })
-        .map(|path| linux_enforce::open_state_dir(path).map(|fd| (Arc::new(fd), path)))
-        .transpose()?;
-    // Every host path, on the store's terms: opened on both Landlock tiers and on no other, and
-    // fail-closed. A configured host path that can no longer be opened fails this spawn naming
-    // it; it is never dropped.
+    // Every host path: opened on both Landlock tiers and on no other, and fail-closed. A configured
+    // host path that can no longer be opened fails this spawn naming it; it is never dropped.
     let host_path_fds: Vec<HostPathFd> = if matches!(
         enforcement.tier,
         EnforcementTier::KernelFull | EnforcementTier::KernelSealed
@@ -3632,9 +3380,6 @@ pub(crate) fn prepare_enforcement(
             enforcement,
             temp_dir_fd.as_ref(),
             home_dir_fd.as_ref(),
-            state_dir_fd
-                .as_ref()
-                .map(|(fd, path)| (Arc::clone(fd), path.to_path_buf())),
         )?)
     } else {
         None
@@ -3700,7 +3445,6 @@ pub(crate) fn prepare_enforcement(
                 sealed: sealed_sources.as_ref(),
                 temp_dir_fd,
                 home_dir_fd,
-                state_dir_fd: state_dir_fd.map(|(fd, _)| fd),
                 runtime_dir_fd,
                 records_dir_fd,
                 host_path_fds: host_path_fds
@@ -3900,13 +3644,11 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// canonical `/tmp`, and every path beneath the host's `/tmp` the command still needs re-exposed
 /// at its own path.
 ///
-/// Those paths are the accessible workdir, the session's home folder and a native tool's store,
-/// bound read-write, and the runtime and
-/// records directories and every Landlock grant path, which already carries the `shell.allow`
-/// closure, the interpreter and staged runtimes and a native tool's entrypoint closure, bound
-/// read-only. Landlock adds the folder's rights to everything bound beneath it, which are the
-/// workdir's own; a read-only bind is what keeps them from writing the rest. See
-/// [`crate::temp_dir::reexposed_paths`].
+/// Those paths are the accessible workdir and the session's home folder, bound read-write, and the
+/// runtime and records directories and every Landlock grant path, which already carries the
+/// `shell.allow` closure and the interpreter and staged runtimes, bound read-only. Landlock adds
+/// the folder's rights to everything bound beneath it, which are the workdir's own; a read-only
+/// bind is what keeps them from writing the rest. See [`crate::temp_dir::reexposed_paths`].
 #[cfg(target_os = "linux")]
 fn build_tmp_map_spec(
     enforcement: &ShellEnforcement,
@@ -3940,9 +3682,7 @@ fn build_tmp_map_spec(
     );
     let reexposed = crate::temp_dir::reexposed_paths(
         &canonical_tmp,
-        std::iter::once(accessible_workdir)
-            .chain(enforcement.home_dir_path())
-            .chain(enforcement.native_state_dir.as_deref()),
+        std::iter::once(accessible_workdir).chain(enforcement.home_dir_path()),
         read_only,
     );
     crate::temp_dir::TmpMapSpec::new(
@@ -4036,10 +3776,6 @@ pub(crate) struct SealedSourceFds {
     /// The session's home folder, reopened from its root's held descriptor, and its absolute
     /// path: its rule's fd and its read-write bind at that same path.
     home_dir: (Arc<std::os::fd::OwnedFd>, PathBuf),
-    /// A native tool's store, the descriptor `prepare_enforcement` took on
-    /// [`ShellEnforcement::native_state_dir`], and its absolute path: its rule's fd and its
-    /// read-write bind at that same path. `None` for every other spawn.
-    state_dir: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     /// The runtime directory, reopened from its root's held descriptor: its rule's fd.
     runtime_dir: Arc<std::os::fd::OwnedFd>,
     /// The runtime directory's absolute path, which the bind reproduces inside the root and the
@@ -4058,15 +3794,13 @@ pub(crate) struct SealedSourceFds {
 #[cfg(target_os = "linux")]
 impl SealedSourceFds {
     /// Writes the synthetic `/etc` files and takes every descriptor, with `temp_dir_fd` and
-    /// `home_dir_fd` the descriptors `prepare_enforcement` took on the session's temporary and
-    /// home folders, and `state_dir` the one it took on a native tool's store. A sealed root
-    /// cannot be composed for an enforcement that holds no runtime directory, no temporary folder
-    /// or no home folder.
+    /// `home_dir_fd` the descriptors `prepare_enforcement` took on the session's temporary and home
+    /// folders. A sealed root cannot be composed for an enforcement that holds no runtime
+    /// directory, no temporary folder or no home folder.
     fn open(
         enforcement: &ShellEnforcement,
         temp_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
         home_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
-        state_dir: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     ) -> Result<Self, String> {
         let roots = enforcement.runtime_dir.as_ref().ok_or_else(|| {
             "sealed: a composed root needs the session's runtime directory, and this \
@@ -4107,7 +3841,6 @@ impl SealedSourceFds {
             tmp_store,
             tmp_store_path: temp.path().to_path_buf(),
             home_dir,
-            state_dir,
             runtime_dir,
             runtime_dir_path: roots.runtime.path().to_path_buf(),
             records_dir,
@@ -4211,13 +3944,6 @@ fn build_sealed_root(
                 &sources.home_dir.1,
                 SealedSourceFds::identity_of(&sources.home_dir.0)?,
             )),
-            state_dir: sources
-                .state_dir
-                .as_ref()
-                .map(|(fd, path)| {
-                    SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
-                })
-                .transpose()?,
             host_paths: &host_path_binds,
             host_path_read_only,
         },
@@ -4305,11 +4031,6 @@ mod linux_enforce {
         /// enforcement holds one. On `KernelSealed` the same descriptor is the read-write bind's
         /// source.
         home_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        /// A native tool's store ([`super::ShellEnforcement::native_state_dir`]), on
-        /// [`Self::home_dir_fd`]'s terms but never with `Execute`: the store holds data, never
-        /// code. `None` for every spawn but that tool's. On `KernelSealed` the same descriptor is
-        /// the read-write bind's source.
-        state_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The synthetic `/etc/passwd`/`/etc/group` in the session's `sealed-etc/`, opened on
         /// `KernelSealed` and empty on every other tier.
         ///
@@ -4354,12 +4075,6 @@ mod linux_enforce {
             self.home_dir_fd.as_deref()
         }
 
-        /// A native tool's store fd, for the tier-gate test, on the same terms.
-        #[cfg(test)]
-        pub(super) fn state_dir_fd(&self) -> Option<&OwnedFd> {
-            self.state_dir_fd.as_deref()
-        }
-
         /// The runtime directory's fd, for the tier-gate test, on the same terms.
         #[cfg(test)]
         pub(super) fn runtime_dir_fd(&self) -> Option<&OwnedFd> {
@@ -4377,12 +4092,6 @@ mod linux_enforce {
         #[cfg(test)]
         pub(super) fn sealed_identity_fd_count(&self) -> usize {
             self.sealed_identity_fds.len()
-        }
-
-        /// How many grant fds were opened, for the pinned-grant test. A count, for the same reason.
-        #[cfg(test)]
-        pub(super) fn grant_count(&self) -> usize {
-            self.grants.len()
         }
     }
 
@@ -4474,7 +4183,7 @@ mod linux_enforce {
     }
 
     /// A host path's `PathBeneath` rights: `ReadFile | ReadDir` for `read`, and
-    /// [`workdir_access_rights`]`(false)` for `read-write` — the native tool store's right-set.
+    /// [`workdir_access_rights`]`(false)` for `read-write`.
     /// Never `Execute`, whatever `workdir_exec` grants the workdir: a host path makes files
     /// reachable, never runnable, so `shell.allow` stays the whole list of what can run.
     pub(super) fn host_path_access_rights(read_write: bool) -> BitFlags<AccessFs> {
@@ -5570,19 +5279,6 @@ mod linux_enforce {
                 })?;
         }
 
-        // A native tool's store: written and read by that tool, never executed, whatever
-        // `workdir_exec` grants the workdir.
-        if let Some(state_dir_fd) = &fds.state_dir_fd {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    state_dir_fd.as_fd(),
-                    workdir_access_rights(false) & handled,
-                ))
-                .map_err(|error| {
-                    format!("landlock: add_rule for the native tool's state store failed: {error}")
-                })?;
-        }
-
         // Every host path the operator's global config lends this session. A runtime folder
         // beneath one keeps its own rule below; on `KernelSealed` its bind is what keeps it
         // read-only, since Landlock rights accumulate down the tree.
@@ -5595,8 +5291,7 @@ mod linux_enforce {
                 .map_err(|error| format!("landlock: add_rule for a host path failed: {error}"))?;
         }
 
-        // The runtime directory: readable and listable, never writable or executable. A native
-        // tool's entrypoint inside it runs through its own pinned `Execute` grant.
+        // The runtime directory: readable and listable, never writable or executable.
         if let Some(runtime_dir_fd) = &fds.runtime_dir_fd {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(
@@ -5697,8 +5392,6 @@ mod linux_enforce {
         pub(super) temp_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The session's home folder's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) home_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        /// A native tool's store's descriptor, from [`open_state_dir`], on the same terms.
-        pub(super) state_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The runtime directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The records directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
@@ -5722,7 +5415,6 @@ mod linux_enforce {
                 sealed: None,
                 temp_dir_fd: None,
                 home_dir_fd: None,
-                state_dir_fd: None,
                 runtime_dir_fd: None,
                 records_dir_fd: None,
                 host_path_fds: Vec::new(),
@@ -5755,7 +5447,6 @@ mod linux_enforce {
             sealed,
             temp_dir_fd,
             home_dir_fd,
-            state_dir_fd,
             runtime_dir_fd,
             records_dir_fd,
             host_path_fds,
@@ -5791,15 +5482,6 @@ mod linux_enforce {
         let mut grants = Vec::with_capacity(landlock_grants.len());
         for grant in landlock_grants {
             match open_o_path(&grant.path) {
-                Ok(file)
-                    if grant.pinned.is_some_and(|pinned| {
-                        file.metadata()
-                            .map(|meta| super::FileIdentity::of(&meta) != pinned)
-                            .unwrap_or(true)
-                    }) =>
-                {
-                    continue
-                }
                 Ok(file) => grants.push(OpenLandlockGrant {
                     // `ReadDir` is meaningful only on a directory, and the kernel does not merely
                     // ignore it elsewhere: `landlock_append_fs_rule` returns `EINVAL` for a
@@ -5836,7 +5518,6 @@ mod linux_enforce {
             abi,
             temp_dir_fd,
             home_dir_fd,
-            state_dir_fd,
             sealed_identity_fds,
             runtime_dir_fd,
             records_dir_fd,
@@ -5860,25 +5541,6 @@ mod linux_enforce {
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
             .open(path)
-    }
-
-    /// An `O_PATH` handle on a native tool's store, its Landlock rule's fd and its sealed bind's
-    /// identity. `O_NOFOLLOW | O_DIRECTORY`: a link planted at the store's own name, or anything
-    /// but a directory, is refused rather than granted. The store is
-    /// `~/.murmur/state/<store>/`, created `0700` by the runtime outside every workdir.
-    pub(super) fn open_state_dir(path: &Path) -> Result<OwnedFd, String> {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(path)
-            .map(OwnedFd::from)
-            .map_err(|error| {
-                format!(
-                    "sandbox: failed to open the native tool's state store {}: {error}",
-                    path.display()
-                )
-            })
     }
 
     /// An `O_PATH` handle on a host path, its Landlock rule's fd and its sealed bind's identity.
@@ -6673,8 +6335,8 @@ mod tests {
         }
     }
 
-    /// `mur doctor`'s native-tool mechanism is read from the decision on the reading it is handed:
-    /// on a sealed-capable reading a capsule declaring `scoped` runs its native tools on
+    /// `mur doctor`'s shell mechanism is read from the decision on the reading it is handed: on a
+    /// sealed-capable reading a capsule declaring `scoped` runs its shell commands on
     /// `landlock+seccomp` and one declaring `sealed` on the composed root.
     #[test]
     fn doctor_reads_the_decision_from_the_probe_it_is_handed() {
@@ -7386,7 +7048,6 @@ mod tests {
                 path: PathBuf::from("/opt/py"),
                 list_dir: true,
                 executable: true,
-                pinned: None,
             }],
             "a staged tree is walked by the runtime that uses it, so it must be listable",
         );
@@ -7412,7 +7073,6 @@ mod tests {
                     path: PathBuf::from(path),
                     list_dir: true,
                     executable: false,
-                    pinned: None,
                 })
                 .collect::<Vec<_>>(),
             "the composed root binds exactly these, so exactly these must be enumerable — \
@@ -7510,7 +7170,6 @@ mod tests {
                     path: PathBuf::from(entry.path),
                     list_dir: entry.directory,
                     executable: false,
-                    pinned: None,
                 })
                 .collect::<Vec<_>>(),
             "the composed root binds exactly these /etc entries, so exactly these must be \
@@ -8391,13 +8050,11 @@ mod tests {
                     path: PathBuf::from("/usr/lib/python3.11"),
                     list_dir: true,
                     executable: true,
-                    pinned: None,
                 },
                 LandlockGrant {
                     path: PathBuf::from("/usr/lib/python3.11/lib-dynload"),
                     list_dir: false,
                     executable: true,
-                    pinned: None,
                 },
             ]
         );
@@ -8419,13 +8076,11 @@ mod tests {
                     path: PathBuf::from("/opt/py/nonexistent"),
                     list_dir: false,
                     executable: true,
-                    pinned: None,
                 },
                 LandlockGrant {
                     path: PathBuf::from("/opt/rb/also-nonexistent"),
                     list_dir: true,
                     executable: true,
-                    pinned: None,
                 },
             ]
         );
@@ -8448,319 +8103,6 @@ mod tests {
                 PathBuf::from("/usr/bin/bash"),
             ]
         );
-    }
-
-    // ---- native tool entrypoints ------------------------------------------------------------
-
-    fn write_entrypoint(dir: &Path, name: &str, head: &[u8]) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, head).unwrap();
-        path
-    }
-
-    /// `path` as the runtime records a native tool it has just written there, inside `workdir`.
-    fn installed(path: &Path, workdir: &Path) -> NativeEntrypoint {
-        NativeEntrypoint::derive(path, &std::fs::read(path).unwrap(), workdir)
-    }
-
-    #[test]
-    fn shebang_interpreter_reads_the_absolute_interpreter_and_nothing_else() {
-        let cases: &[(&[u8], Option<&str>)] = &[
-            (b"#!/bin/sh\necho hi\n", Some("/bin/sh")),
-            (b"#! /usr/bin/python3 -u\n", Some("/usr/bin/python3")),
-            // `env` is what the kernel runs; `python3` is found by `env` and needs its own grant.
-            (b"#!/usr/bin/env python3\n", Some("/usr/bin/env")),
-            (b"#!sh\n", None),
-            (b"#!\n", None),
-            (b"\x7fELF\x02\x01\x01", None),
-            (b"", None),
-        ];
-        for (head, expected) in cases {
-            assert_eq!(
-                shebang_interpreter(head),
-                expected.map(PathBuf::from),
-                "{:?}",
-                String::from_utf8_lossy(head)
-            );
-        }
-
-        // A `#!` line longer than the kernel's own buffer names nothing past it.
-        let mut long = b"#!".to_vec();
-        long.extend(std::iter::repeat_n(b' ', SHEBANG_READ_LIMIT as usize));
-        long.extend(b"/bin/sh\n");
-        assert_eq!(shebang_interpreter(&long), None);
-    }
-
-    /// The entrypoint, pinned to its inode, and its interpreter are added as `Execute + ReadFile`
-    /// file grants, and nothing is taken away from the enforcement they extend.
-    #[test]
-    fn for_native_entrypoint_adds_the_pinned_entrypoint_and_its_interpreter_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let entrypoint = write_entrypoint(dir.path(), "tool", b"#!/bin/sh\ncat\n");
-        let existing = LandlockGrant {
-            path: PathBuf::from("/usr/bin/git"),
-            list_dir: false,
-            executable: true,
-            pinned: None,
-        };
-        let base = ShellEnforcement {
-            tier: EnforcementTier::KernelFull,
-            landlock_grants: vec![existing.clone()],
-            ..ShellEnforcement::environment_only().with_test_session_dirs()
-        };
-
-        let native = base.for_native_entrypoint(&installed(&entrypoint, dir.path()), None);
-
-        assert_eq!(native.landlock_grants[0], existing);
-        let added: Vec<&LandlockGrant> = native.landlock_grants[1..].iter().collect();
-        let identity = FileIdentity::of(&std::fs::metadata(&entrypoint).unwrap());
-        assert!(
-            added
-                .iter()
-                .any(|grant| grant.path == entrypoint && grant.pinned == Some(identity)),
-            "the entrypoint must be granted, pinned to its inode: {added:?}"
-        );
-        let canonical_sh = std::fs::canonicalize("/bin/sh").unwrap();
-        assert!(
-            added.iter().any(|grant| grant.path == canonical_sh),
-            "/bin/sh must be granted: {added:?}"
-        );
-        assert!(
-            added
-                .iter()
-                .all(|grant| grant.executable && !grant.list_dir),
-            "{added:?}"
-        );
-        // The closure is files, never a directory such as the workdir or /etc.
-        assert!(added.iter().all(|grant| !grant.path.is_dir()), "{added:?}");
-        assert!(native.sealed_bind_dirs.is_empty(), "not sealed: no binds");
-        assert!(
-            Arc::ptr_eq(&native.session_netns, &base.session_netns),
-            "a native spawn joins the session's own namespace"
-        );
-        assert_eq!(
-            base.landlock_grants.len(),
-            1,
-            "the session's grants are untouched"
-        );
-    }
-
-    /// A store handed to one native spawn is that spawn's alone: the clone carries exactly that
-    /// path, and neither the session's enforcement nor a spawn with no store carries any.
-    #[test]
-    fn for_native_entrypoint_sets_exactly_the_given_store_and_the_session_holds_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let entrypoint = installed(
-            &write_entrypoint(
-                dir.path(),
-                "tool",
-                b"#!/bin/sh
-",
-            ),
-            dir.path(),
-        );
-        let store = dir.path().join("state").join("config-capsule");
-        for tier in [
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSealed,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            let session = ShellEnforcement {
-                tier,
-                ..ShellEnforcement::environment_only().with_test_session_dirs()
-            };
-            let native = session.for_native_entrypoint(&entrypoint, Some(&store));
-            assert_eq!(
-                native.native_state_dir.as_deref(),
-                Some(store.as_path()),
-                "{tier:?}"
-            );
-            assert_eq!(session.native_state_dir, None, "{tier:?}");
-            assert_eq!(
-                session
-                    .for_native_entrypoint(&entrypoint, None)
-                    .native_state_dir,
-                None,
-                "{tier:?}"
-            );
-            // The store is a writable rule of its own, never an exec grant or a read-only bind.
-            assert!(
-                native
-                    .landlock_grants
-                    .iter()
-                    .all(|grant| !grant.path.starts_with(&store)),
-                "{tier:?}"
-            );
-            assert!(
-                native
-                    .sealed_bind_dirs
-                    .iter()
-                    .all(|bind| !bind.starts_with(&store)),
-                "{tier:?}"
-            );
-        }
-    }
-
-    /// On `KernelSealed`, an interpreter outside the fixed runtime paths has its directory bound
-    /// into the composed root as an optional bind; one inside them adds nothing.
-    #[test]
-    fn for_native_entrypoint_binds_an_interpreter_outside_the_runtime_paths_when_sealed() {
-        let dir = tempfile::tempdir().unwrap();
-        let sealed = ShellEnforcement {
-            tier: EnforcementTier::KernelSealed,
-            ..ShellEnforcement::environment_only().with_test_session_dirs()
-        };
-
-        let system = installed(
-            &write_entrypoint(dir.path(), "system", b"#!/bin/sh\n"),
-            dir.path(),
-        );
-        assert!(sealed
-            .for_native_entrypoint(&system, None)
-            .sealed_bind_dirs
-            .is_empty());
-
-        let custom = installed(
-            &write_entrypoint(dir.path(), "custom", b"#!/opt/tools/bin/run\n"),
-            dir.path(),
-        );
-        assert_eq!(
-            sealed.for_native_entrypoint(&custom, None).sealed_bind_dirs,
-            vec![PathBuf::from("/opt/tools/bin")]
-        );
-
-        let scoped = ShellEnforcement {
-            tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only().with_test_session_dirs()
-        };
-        assert!(scoped
-            .for_native_entrypoint(&custom, None)
-            .sealed_bind_dirs
-            .is_empty());
-    }
-
-    /// The capsule can rewrite the installed entrypoint between calls. Whatever it writes, the
-    /// next spawn is granted exactly what the installed image was: a new `#!` interpreter, on any
-    /// tier, adds no exec grant and no composed-root bind.
-    #[test]
-    fn a_rewritten_entrypoint_gains_no_grant() {
-        let dir = tempfile::tempdir().unwrap();
-        let entrypoint = write_entrypoint(dir.path(), "tool", b"#!/bin/sh\ncat\n");
-        let native = installed(&entrypoint, dir.path());
-
-        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
-            let base = ShellEnforcement {
-                tier,
-                ..ShellEnforcement::environment_only().with_test_session_dirs()
-            };
-            let before = base.for_native_entrypoint(&native, None);
-
-            std::fs::write(&entrypoint, b"#!/opt/elsewhere/bin/run\n").unwrap();
-            let after = base.for_native_entrypoint(&native, None);
-            std::fs::write(&entrypoint, b"#!/bin/sh\ncat\n").unwrap();
-
-            assert_eq!(after.landlock_grants, before.landlock_grants, "{tier:?}");
-            assert_eq!(after.sealed_bind_dirs, before.sealed_bind_dirs, "{tier:?}");
-            assert!(
-                after
-                    .landlock_grants
-                    .iter()
-                    .all(|grant| !grant.path.starts_with("/opt/elsewhere")),
-                "{tier:?}: {:?}",
-                after.landlock_grants
-            );
-        }
-    }
-
-    /// The dependency walk neither grants nor reads a file under the accessible workdir, where the
-    /// capsule could plant a library whose own entries widen the closure.
-    #[test]
-    fn the_entrypoint_closure_does_not_reach_into_the_workdir() {
-        let temp = tempfile::tempdir().unwrap();
-        let workdir = temp.path().join("workdir");
-        let tool_dir = workdir.join("tools").join("tool");
-        std::fs::create_dir_all(&tool_dir).unwrap();
-        let system = temp.path().join("system");
-        std::fs::create_dir(&system).unwrap();
-        std::fs::write(system.join("libsys.so"), "x").unwrap();
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("libpicked.so"), "x").unwrap();
-
-        // Planted next to the entrypoint, found through `$ORIGIN`, and naming a file outside.
-        std::fs::write(
-            tool_dir.join("libplanted.so"),
-            build_elf64(
-                None,
-                &[outside.join("libpicked.so").to_str().unwrap()],
-                None,
-            ),
-        )
-        .unwrap();
-        // A symlink next to the entrypoint: canonicalising it lands outside the workdir, so only
-        // refusing the `$ORIGIN` lookup itself keeps the host file out of the closure.
-        std::fs::write(outside.join("host-binary"), "x").unwrap();
-        std::os::unix::fs::symlink(outside.join("host-binary"), tool_dir.join("liblinked.so"))
-            .unwrap();
-        let image = build_elf64(
-            None,
-            &["libplanted.so", "liblinked.so", "libsys.so"],
-            Some("$ORIGIN"),
-        );
-        let entrypoint = tool_dir.join("tool");
-        std::fs::write(&entrypoint, &image).unwrap();
-
-        let native = NativeEntrypoint::derive_in(
-            &entrypoint,
-            &image,
-            &workdir,
-            std::slice::from_ref(&system),
-        );
-
-        let sys = std::fs::canonicalize(system.join("libsys.so")).unwrap();
-        assert_eq!(native.closure, vec![sys]);
-    }
-
-    /// A pinned grant whose path no longer opens to the pinned inode is dropped: replacing the
-    /// entrypoint, here with a symlink to a host binary, leaves it with no `Execute` rule.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_replaced_entrypoint_loses_its_pinned_grant() {
-        let accessible = tempfile::tempdir().unwrap();
-        let session = accessible
-            .path()
-            .join(".murmur")
-            .join("ses_native_entrypoint");
-        std::fs::create_dir_all(&session).unwrap();
-        let entrypoint = write_entrypoint(&session, "tool", b"#!/bin/sh\n");
-        let native = installed(&entrypoint, accessible.path());
-        let grants = ShellEnforcement {
-            tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only().with_test_session_dirs()
-        }
-        .for_native_entrypoint(&native, None)
-        .landlock_grants;
-        let open = |grants: &[LandlockGrant]| {
-            linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
-                landlock_grants: grants,
-                ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
-            })
-            .unwrap()
-            .grant_count()
-        };
-        let installed_count = open(&grants);
-        // Holds the installed inode for the rest of the test. Freed, its number may be handed to
-        // the next file created on this filesystem, which would then match the pin.
-        std::fs::hard_link(&entrypoint, session.join("installed")).unwrap();
-
-        std::fs::remove_file(&entrypoint).unwrap();
-        std::os::unix::fs::symlink("/bin/sh", &entrypoint).unwrap();
-        assert_eq!(open(&grants), installed_count - 1, "symlink swapped in");
-
-        std::fs::remove_file(&entrypoint).unwrap();
-        std::fs::write(&entrypoint, b"#!/bin/sh\n").unwrap();
-        assert_eq!(open(&grants), installed_count - 1, "new file, new inode");
     }
 
     // ---- `CAPSULE_DEVICE_GRANTS` (fixed device set) ----------------------------------------
@@ -9548,7 +8890,6 @@ mod linux_integration_tests {
             &enforcement,
             temp_dir_fd.as_ref(),
             home_dir_fd_of(&enforcement).as_ref(),
-            None,
         )
         .expect("a real, writable workdir must yield the sealed sources");
         assert_eq!(
@@ -9598,51 +8939,6 @@ mod linux_integration_tests {
         assert!(fds.home_dir_fd().is_none());
     }
 
-    /// A native tool's store is opened with no link followed at its own name, carried into the
-    /// sealed sources at its own path and into the Landlock fds, and absent from both for a spawn
-    /// with no store.
-    #[test]
-    fn a_native_tools_store_is_opened_for_landlock_and_the_sealed_bind() {
-        let accessible = tempfile::tempdir().unwrap();
-        let runtime = tempfile::tempdir().unwrap();
-        let enforcement = sealed_with_runtime_dir(runtime.path());
-        let store = runtime.path().join("state").join("config-capsule");
-        std::fs::create_dir_all(&store).unwrap();
-        let store_fd = Arc::new(linux_enforce::open_state_dir(&store).unwrap());
-        let sources = SealedSourceFds::open(
-            &enforcement,
-            temp_dir_fd_of(&enforcement).as_ref(),
-            home_dir_fd_of(&enforcement).as_ref(),
-            Some((Arc::clone(&store_fd), store.clone())),
-        )
-        .unwrap();
-        assert_eq!(
-            sources.state_dir.as_ref().map(|(_, path)| path.as_path()),
-            Some(store.as_path()),
-            "the composed root binds the store at its own path"
-        );
-        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
-            sealed: Some(&sources),
-            state_dir_fd: Some(Arc::clone(&store_fd)),
-            ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
-        })
-        .unwrap();
-        assert!(fds.state_dir_fd().is_some());
-        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest::workdir_only(
-            accessible.path(),
-        ))
-        .unwrap();
-        assert!(fds.state_dir_fd().is_none());
-
-        let link = runtime.path().join("state").join("linked");
-        std::os::unix::fs::symlink(&store, &link).unwrap();
-        let error = linux_enforce::open_state_dir(&link).expect_err("refused");
-        assert!(error.contains("state store"), "{error}");
-        let file = runtime.path().join("state").join("file");
-        std::fs::write(&file, "x").unwrap();
-        assert!(linux_enforce::open_state_dir(&file).is_err());
-    }
-
     /// A sealed root cannot be composed without the session's temporary folder: the refusal is
     /// the parent's, names the folder, and comes before anything is spawned.
     #[test]
@@ -9655,14 +8951,10 @@ mod linux_integration_tests {
             ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(roots, None);
-        let error = SealedSourceFds::open(
-            &enforcement,
-            None,
-            home_dir_fd_of(&enforcement).as_ref(),
-            None,
-        )
-        .err()
-        .expect("refused");
+        let error =
+            SealedSourceFds::open(&enforcement, None, home_dir_fd_of(&enforcement).as_ref())
+                .err()
+                .expect("refused");
         assert!(error.contains("temporary folder"), "{error}");
     }
 
@@ -9680,14 +8972,10 @@ mod linux_integration_tests {
             ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(roots, None);
-        let error = SealedSourceFds::open(
-            &enforcement,
-            temp_dir_fd_of(&enforcement).as_ref(),
-            None,
-            None,
-        )
-        .err()
-        .expect("refused");
+        let error =
+            SealedSourceFds::open(&enforcement, temp_dir_fd_of(&enforcement).as_ref(), None)
+                .err()
+                .expect("refused");
         assert!(error.contains("no home folder"), "{error}");
         assert!(!runtime
             .path()
@@ -9712,7 +9000,6 @@ mod linux_integration_tests {
             &enforcement,
             temp_dir_fd_of(&enforcement).as_ref(),
             home_dir_fd_of(&enforcement).as_ref(),
-            None,
         )
         .unwrap();
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
@@ -9759,7 +9046,7 @@ mod linux_integration_tests {
             tier: EnforcementTier::KernelSealed,
             ..ShellEnforcement::environment_only()
         };
-        let error = SealedSourceFds::open(&enforcement, None, None, None)
+        let error = SealedSourceFds::open(&enforcement, None, None)
             .err()
             .expect("refused");
         assert!(error.contains("runtime directory"), "{error}");
@@ -11347,7 +10634,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 path: tree.path().to_path_buf(),
                 list_dir: true,
                 executable,
-                pinned: None,
             });
             enforcement
         };
@@ -11452,7 +10738,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 path: bundle.clone(),
                 list_dir,
                 executable: false,
-                pinned: None,
             });
             enforcement
         };
@@ -12506,54 +11791,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         ];
         expected.sort();
         assert_eq!(spec.reexposed_sources(), expected);
-    }
-
-    /// A native tool's store beneath `/tmp` is re-exposed writable behind the private `/tmp` for
-    /// that tool's spawn, and for no spawn without it.
-    #[test]
-    fn a_native_tools_store_under_tmp_is_reexposed_writable() {
-        let base = tempfile::tempdir_in(crate::temp_dir::canonical_tmp()).unwrap();
-        let workdir = tempfile::tempdir().unwrap();
-        let store = base.path().join("state").join("config-capsule");
-        std::fs::create_dir_all(&store).unwrap();
-        let session = ShellEnforcement {
-            tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only().with_test_session_dirs()
-        }
-        .with_runtime_dir(test_runtime_dir(base.path()), None)
-        .with_temp_mapping(crate::temp_dir::TempMapping::MountNamespace);
-        let folder = session
-            .runtime_dir
-            .as_ref()
-            .and_then(|roots| roots.temp.as_ref())
-            .unwrap()
-            .path_fd()
-            .unwrap();
-        let canonical_store = std::fs::canonicalize(&store)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        let native = ShellEnforcement {
-            native_state_dir: Some(store.clone()),
-            ..session.clone()
-        };
-        let spec = build_tmp_map_spec(&native, &folder, workdir.path()).unwrap();
-        assert!(
-            spec.reexposed_sources()
-                .contains(&(canonical_store.clone(), false)),
-            "{:?}",
-            spec.reexposed_sources()
-        );
-
-        let spec = build_tmp_map_spec(&session, &folder, workdir.path()).unwrap();
-        assert!(
-            spec.reexposed_sources()
-                .iter()
-                .all(|(source, _)| source != &canonical_store),
-            "{:?}",
-            spec.reexposed_sources()
-        );
     }
 
     /// At `scoped` and at `advisory`, a literal `/tmp` path lands in the session's temporary
@@ -13837,7 +13074,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
         assert!(grants
             .iter()
-            .all(|grant| !grant.list_dir && !grant.executable && grant.pinned.is_none()));
+            .all(|grant| !grant.list_dir && !grant.executable));
         for tier in [
             EnforcementTier::KernelSealed,
             EnforcementTier::KernelSeccompOnly,
@@ -14000,13 +13237,11 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                     path: PathBuf::from("/etc/ssl/certs"),
                     list_dir: true,
                     executable: false,
-                    pinned: None,
                 },
                 LandlockGrant {
                     path: PathBuf::from("/etc/pki/tls/cacert.pem"),
                     list_dir: false,
                     executable: false,
-                    pinned: None,
                 },
             ]
         );
@@ -14197,7 +13432,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
     // ---------------------------------------------------------------- host paths
 
     /// The rights each host-path rule is built with: `ReadFile | ReadDir` for `read`, the
-    /// native tool store's right-set for `read-write`, and `Execute` never.
+    /// workdir's right-set without `Execute` for `read-write`, and `Execute` never.
     #[test]
     fn host_path_landlock_rights_are_read_list_or_the_workdir_set_without_execute() {
         use landlock::AccessFs;

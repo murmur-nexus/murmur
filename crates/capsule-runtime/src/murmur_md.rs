@@ -427,7 +427,7 @@ fn build_tools_section(runtime_root: &WorkdirRoot, system_prompt_artifact: Optio
                 "driver" => ArtifactRuntime::Driver,
                 "hook" => ArtifactRuntime::Hook,
                 "skill" => ArtifactRuntime::Skill,
-                _ => ArtifactRuntime::Tool, // covers "tool", legacy "wasm"/"native"
+                _ => ArtifactRuntime::Tool, // covers "tool" and "wasm"
             };
             if !runtime.is_llm_visible() {
                 continue;
@@ -1523,7 +1523,7 @@ mod tests {
         fs::create_dir_all(&curl_dir).unwrap();
         fs::write(
             curl_dir.join(PACKED_MANIFEST_ENTRY),
-            "name: curl\nversion: 0.0.0\nruntime: tool\nimplementation: native\n\
+            "name: curl\nversion: 0.0.0\nruntime: tool\n\
              description: \"Run curl in the capsule workdir.\"\n\
              input_schema: '{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}'\n",
         )

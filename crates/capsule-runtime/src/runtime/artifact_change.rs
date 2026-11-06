@@ -9,14 +9,15 @@
 //! 1. the `capabilities.install` grant on the name and version alone
 //!    ([`install_grant::refuse_before_resolve`]) and the tool name being free;
 //! 2. the version: as asked, or with none the newest by semver precedence that fits the WIT level
-//!    this mur serves and has a payload for this platform, among every stored version and, under
+//!    this mur serves, among every stored version and, under
 //!    `install.from: [stores, sources]`, every version the scope's source indexes; the store
 //!    wins a tie;
 //! 3. for a source pull, the tier and fit read off the index, so a refused source pull requests
 //!    no asset;
 //! 4. the payload: the stores first, the source only for a version no store holds; its hash, its
-//!    tier ([`install_grant::refuse_after_resolve`]), its fit against the served level, and the
-//!    scope's owner id against `murmur.lock`;
+//!    tier ([`install_grant::refuse_after_resolve`]), its packed `murmur.yaml` declaring no native
+//!    tool ([`refuse_native_payload`]), its fit against the served level, and the scope's owner
+//!    id against `murmur.lock`;
 //! 5. the lock entry an operator or an earlier pull already holds;
 //! 6. for a payload whose manifest declares `provider_tool:`, the terms staging holds a declared
 //!    one to: the `sealed` floor and no driver choice whose model is `vision: false`
@@ -27,9 +28,9 @@
 //! updates the session: a tool joins `allowlisted_tools`, and `installed_generation` moves by one.
 //! A source pull writes to no store.
 //!
-//! Every refusal leads with one token: [`NOT_GRANTED`], [`NOT_FOUND`], [`DOES_NOT_FIT`] or
-//! [`NOT_FETCHED`]. A pinned lock entry that conflicts is refused with its own sentence. A
-//! refusal changes nothing.
+//! Every refusal leads with one token: [`NOT_GRANTED`], [`NOT_FOUND`], [`DOES_NOT_FIT`],
+//! [`NOT_FETCHED`] or [`NATIVE_TOOL`]. A pinned lock entry that conflicts is refused with its own
+//! sentence. A refusal changes nothing.
 //!
 //! # The agent path
 //!
@@ -61,6 +62,9 @@ pub(crate) const NOT_FOUND: &str = "not-found:";
 pub(crate) const DOES_NOT_FIT: &str = "does-not-fit:";
 /// The leading token of a pull refused because its source could not be read or failed a check.
 pub(crate) const NOT_FETCHED: &str = "not-fetched:";
+/// The leading token of a pull refused because the payload's packed `murmur.yaml` declares a
+/// native tool: the code `mur run` refuses the same payload with at launch.
+pub(crate) const NATIVE_TOOL: &str = "E-RUN-061:";
 
 /// The most matches one listing returns; the rest are counted in [`PullListing::omitted`].
 const MAX_LISTED: usize = 50;
@@ -120,9 +124,6 @@ pub(crate) struct ListedArtifact {
     pub(crate) newest_fitting: Option<String>,
     /// Where the versions are held: stores first, then the source.
     pub(crate) held_in: Vec<String>,
-    /// Whether a payload is a native binary, for `manage.search`'s `runtime-type`.
-    #[serde(skip)]
-    pub(crate) native: bool,
 }
 
 /// Where a version is held.
@@ -293,15 +294,13 @@ impl CapsuleStoreState {
         // and stays, so a later pull of the same version is warm.
         let tool = murmur_artifact::tool_name_of(name).to_string();
         self.tool_components.remove(&tool);
-        self.native_entrypoints.remove(&tool);
-        self.native_tool_settings.remove(&tool);
         self.allowlisted_tools.remove(&tool);
         self.installed_artifacts
             .retain(|artifact| artifact.name != name);
         self.removed_artifacts.insert(tool.clone());
         self.installed_generation += 1;
 
-        // 3. The files: manifest, `skill.md`, native binary.
+        // 3. The files: manifest, `skill.md`.
         // Removed by descriptor beneath the runtime directory: a link at `tools` or at the tool's
         // directory is refused, never followed into what it names.
         let rel = format!("tools/{tool}");
@@ -359,7 +358,6 @@ impl CapsuleStoreState {
         }
 
         let level = crate::served_wit_level();
-        let platform = current_platform();
         let mut notes = Vec::new();
         let mut found: BTreeMap<String, (ListedArtifact, Vec<Candidate>)> = BTreeMap::new();
         let admitted = |name: &ArtifactName, tier: InstallTier| {
@@ -393,7 +391,6 @@ impl CapsuleStoreState {
                                 versions: Vec::new(),
                                 newest_fitting: None,
                                 held_in: Vec::new(),
-                                native: false,
                             },
                             Vec::new(),
                         )
@@ -401,10 +398,9 @@ impl CapsuleStoreState {
                     if entry.0.description.is_none() {
                         entry.0.description.clone_from(&meta.description);
                     }
-                    entry.0.native |= meta.runtime == RuntimeType::Native;
                     entry.1.push(Candidate {
                         version: meta.version.clone(),
-                        fit: version_fit(&FitSubject::stored(&meta, None), level, platform),
+                        fit: version_fit(&FitSubject::stored(&meta, None), level),
                         place,
                     });
                 }
@@ -417,12 +413,7 @@ impl CapsuleStoreState {
                 let Ok(name) = ArtifactName::from_parts(&scope, &artifact.name) else {
                     continue;
                 };
-                let tagged = artifact
-                    .versions
-                    .iter()
-                    .flat_map(|version| &version.assets)
-                    .any(|asset| asset.platform.is_some());
-                let Some(tier) = InstallTier::of_indexed(&artifact.runtime, tagged) else {
+                let Some(tier) = InstallTier::of_indexed(&artifact.runtime) else {
                     continue;
                 };
                 if !admitted(&name, tier) {
@@ -437,7 +428,6 @@ impl CapsuleStoreState {
                             versions: Vec::new(),
                             newest_fitting: None,
                             held_in: Vec::new(),
-                            native: false,
                         },
                         Vec::new(),
                     )
@@ -445,11 +435,10 @@ impl CapsuleStoreState {
                 if entry.0.description.is_none() {
                     entry.0.description.clone_from(&artifact.description);
                 }
-                entry.0.native |= tagged;
                 for version in &artifact.versions {
                     entry.1.push(Candidate {
                         version: version.version.clone(),
-                        fit: version_fit(&FitSubject::indexed(version), level, platform),
+                        fit: version_fit(&FitSubject::indexed(version), level),
                         place: Place::Source(label.clone()),
                     });
                 }
@@ -565,10 +554,7 @@ impl CapsuleStoreState {
 
     /// A pull with a version: the stores, then the scope's source for a version no store holds.
     fn resolve_exact(&self, name: &ArtifactName, version: &str) -> Result<Chosen, String> {
-        match self
-            .registry
-            .resolve_with_platform(name, version, Some(current_platform()))
-        {
+        match self.registry.resolve(name, version) {
             Ok(resolved) => {
                 let place = store_label(self.registry.as_ref(), name, version);
                 Ok(Chosen::Store(Box::new(resolved), place))
@@ -578,6 +564,9 @@ impl CapsuleStoreState {
                     return Ok(Chosen::Source(version.to_string()));
                 }
                 Err(self.not_in_stores(name, Some(version)))
+            }
+            Err(RegistryError::NativeTool { name, field }) => {
+                Err(native_tool_refusal(&name, &field))
             }
             Err(err) => Err(format!(
                 "{NOT_FOUND} failed to resolve {name}@{version}: {err}"
@@ -610,7 +599,6 @@ impl CapsuleStoreState {
     /// version its source indexes. An unreadable index is the `Err` half.
     fn candidates(&self, name: &ArtifactName) -> (Vec<Candidate>, Option<String>) {
         let level = crate::served_wit_level();
-        let platform = current_platform();
         let mut candidates: Vec<Candidate> = self
             .registry
             .list_stored()
@@ -619,7 +607,7 @@ impl CapsuleStoreState {
             .filter(|meta| meta.name == *name)
             .map(|meta| Candidate {
                 place: Place::Store(store_label(self.registry.as_ref(), name, &meta.version)),
-                fit: version_fit(&FitSubject::stored(&meta, None), level, platform),
+                fit: version_fit(&FitSubject::stored(&meta, None), level),
                 version: meta.version,
             })
             .collect();
@@ -629,7 +617,7 @@ impl CapsuleStoreState {
                 if let Some(artifact) = indexed(&index, name) {
                     candidates.extend(artifact.versions.iter().map(|version| Candidate {
                         version: version.version.clone(),
-                        fit: version_fit(&FitSubject::indexed(version), level, platform),
+                        fit: version_fit(&FitSubject::indexed(version), level),
                         place: Place::Source(label.clone()),
                     }));
                 }
@@ -719,13 +707,8 @@ impl CapsuleStoreState {
                 name.name()
             ));
         };
-        let tagged = artifact
-            .versions
-            .iter()
-            .flat_map(|version| &version.assets)
-            .any(|asset| asset.platform.is_some());
         let policy = &self.capability_policy;
-        let Some(tier) = InstallTier::of_indexed(&artifact.runtime, tagged) else {
+        let Some(tier) = InstallTier::of_indexed(&artifact.runtime) else {
             return Err(format!(
                 "{NOT_GRANTED} '{name}' is a '{}' artifact ({label}'s index); \
                  capabilities.install grants only skills and tools",
@@ -759,7 +742,6 @@ impl CapsuleStoreState {
         let fit = version_fit(
             &FitSubject::indexed(indexed_version),
             crate::served_wit_level(),
-            current_platform(),
         );
         if fit != VersionFit::Fits {
             return Err(fit_refusal(name, version, &fit, &self.fit_hint(name)));
@@ -769,7 +751,7 @@ impl CapsuleStoreState {
             .as_ref()
             .ok_or_else(|| self.not_in_stores(name, Some(version)))?;
         let sourced = supply
-            .fetch(name, version, current_platform(), lock)
+            .fetch(name, version, lock)
             .map_err(|error| format!("{NOT_FETCHED} {error}"))?;
         Ok(Payload {
             version: sourced.resolved.meta.version.clone(),
@@ -795,6 +777,14 @@ impl CapsuleStoreState {
                  reported hash does not match the bytes"
             )
         })?;
+        refuse_native_payload(name.as_str(), &resolved.bytes).map_err(|error| {
+            match native_tool_error(name.as_str(), error) {
+                RuntimeError::NativeTool { artifact, field } => {
+                    native_tool_refusal(&artifact, &field)
+                }
+                other => format!("{NOT_FETCHED} {other}"),
+            }
+        })?;
         if let Some(refusal) =
             install_grant::refuse_after_resolve(&self.capability_policy, name, &resolved.meta)
         {
@@ -803,7 +793,6 @@ impl CapsuleStoreState {
         let fit = version_fit(
             &FitSubject::stored(&resolved.meta, Some(&resolved.bytes)),
             crate::served_wit_level(),
-            current_platform(),
         );
         if fit != VersionFit::Fits {
             return Err(fit_refusal(name, version, &fit, &self.fit_hint(name)));
@@ -865,9 +854,7 @@ impl CapsuleStoreState {
             owner_id,
         } = payload;
 
-        // An entry that has no key for this platform yet is not a conflict — it is a platform
-        // nobody has installed on before.
-        let incoming_sha256 = LockedSha256::for_resolved(&resolved, current_platform());
+        let incoming_sha256 = LockedSha256::any(resolved.sha256.clone());
         if let Some(existing) = lock.artifact_for(&name) {
             if let Some(conflict) = existing.conflict_with(&version, &incoming_sha256) {
                 return Err(format!(
@@ -885,7 +872,7 @@ impl CapsuleStoreState {
         write_tool_manifest(&self.runtime_root, &tool, &manifest_yaml)
             .map_err(|err| err.to_string())?;
 
-        let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
+        let (artifact_runtime, wasm_component) = match resolved.meta.runtime {
             RuntimeType::Wasm => {
                 let wasm_bytes = extract_root_wasm(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
@@ -893,36 +880,14 @@ impl CapsuleStoreState {
                     .compiled_forms
                     .compile(&self.engine, &resolved.sha256, &wasm_bytes)
                     .map_err(|err| format!("failed to compile pulled component '{name}': {err}"))?;
-                (
-                    ArtifactRuntime::Tool,
-                    Some(ArtifactImplementation::Wasm),
-                    Some(component),
-                )
-            }
-            RuntimeType::Native => {
-                // The binary is packed at `bin/<bare name>`, the artifact's own `name:`.
-                let binary = extract_native_binary(&tool, &version, &resolved.bytes)
-                    .map_err(|err| err.to_string())?;
-                let installed = install_native_binaries(
-                    &self.runtime_root,
-                    &self.accessible_workdir,
-                    vec![(tool.clone(), binary)],
-                    &HashMap::from([(tool.clone(), name.clone())]),
-                )
-                .map_err(|err| err.to_string())?;
-                self.native_entrypoints.extend(installed);
-                (
-                    ArtifactRuntime::Tool,
-                    Some(ArtifactImplementation::Native),
-                    None,
-                )
+                (ArtifactRuntime::Tool, Some(component))
             }
             RuntimeType::Static => {
                 let files = extract_skill_files(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
                 install_skill_files(&self.runtime_root, vec![(tool.clone(), files)])
                     .map_err(|err| err.to_string())?;
-                (ArtifactRuntime::Skill, None, None)
+                (ArtifactRuntime::Skill, None)
             }
         };
 
@@ -954,7 +919,6 @@ impl CapsuleStoreState {
             name: name.clone(),
             version,
             runtime: artifact_runtime,
-            implementation,
             origin,
         };
         if let Some(existing) = self
@@ -1113,6 +1077,17 @@ fn places_of(candidates: &[Candidate]) -> Vec<String> {
     places
 }
 
+/// The refusal of a pull whose payload declares a native tool, the launch's
+/// [`RuntimeError::NativeTool`] behind [`NATIVE_TOOL`]. Nothing is staged and no lock entry is
+/// written.
+fn native_tool_refusal(artifact: &str, field: &str) -> String {
+    let error = RuntimeError::NativeTool {
+        artifact: artifact.to_string(),
+        field: field.to_string(),
+    };
+    format!("{NATIVE_TOOL} {error}")
+}
+
 /// The refusal of `name@version` for `fit`, which is not [`VersionFit::Fits`].
 fn fit_refusal(name: &ArtifactName, version: &str, fit: &VersionFit, hint: &str) -> String {
     let level = crate::served_wit_level().level;
@@ -1125,9 +1100,6 @@ fn fit_refusal(name: &ArtifactName, version: &str, fit: &VersionFit, hint: &str)
                 mismatched: mismatched.clone(),
             };
             format!("{DOES_NOT_FIT} [{E_WIT_LEVEL_001}] {mismatch}; {hint}")
-        }
-        VersionFit::NoPayloadFor(platform) => {
-            format!("{DOES_NOT_FIT} '{name}@{version}' has no payload for {platform}; {hint}")
         }
         VersionFit::Fits => format!("{DOES_NOT_FIT} '{name}@{version}'"),
     }
@@ -1146,7 +1118,7 @@ pub(super) fn write_artifact_change_tool_manifests(
     write_runtime_provided_tool_manifest(
         runtime_root,
         PULL_ARTIFACT_TOOL,
-        &native_tool_manifest_yaml(
+        &runtime_tool_manifest_yaml(
             PULL_ARTIFACT_TOOL,
             pull_artifact_description(policy),
             ARTIFACT_INPUT_SCHEMA.to_string(),
@@ -1155,7 +1127,7 @@ pub(super) fn write_artifact_change_tool_manifests(
     write_runtime_provided_tool_manifest(
         runtime_root,
         REMOVE_ARTIFACT_TOOL,
-        &native_tool_manifest_yaml(
+        &runtime_tool_manifest_yaml(
             REMOVE_ARTIFACT_TOOL,
             REMOVE_ARTIFACT_DESCRIPTION.to_string(),
             ARTIFACT_INPUT_SCHEMA.to_string(),
@@ -1198,7 +1170,7 @@ mod tests {
 
     use murmur_artifact::{
         read_lockfile, sha256_hex, ArtifactIndex, ArtifactMeta, IndexedArtifact, IndexedAsset,
-        IndexedVersion, PlatformMatch, ResolvedArtifact, RuntimeType, PACKED_MANIFEST_ENTRY,
+        IndexedVersion, ResolvedArtifact, RuntimeType, PACKED_MANIFEST_ENTRY,
     };
 
     use super::*;
@@ -1684,7 +1656,6 @@ mod tests {
                             interfaces: Vec::new(),
                             assets: vec![IndexedAsset {
                                 file: "tool-editor-0.3.0.mur.zip".to_string(),
-                                platform: None,
                                 sha256: sha256_hex(&payload),
                             }],
                         }],
@@ -1714,7 +1685,6 @@ mod tests {
             &self,
             name: &ArtifactName,
             version: &str,
-            _platform: &str,
             _lock: &MurmurLock,
         ) -> Result<SourcedArtifact, String> {
             self.fetched
@@ -1728,7 +1698,6 @@ mod tests {
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "tool".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -1737,7 +1706,6 @@ mod tests {
                     },
                     sha256: sha256_hex(&self.payload),
                     bytes: self.payload.clone().into(),
-                    platform_match: PlatformMatch::NotApplicable,
                 },
                 source: "github:ana/artifacts".to_string(),
                 owner_id: self.owner_id,
@@ -1838,5 +1806,38 @@ mod tests {
             listing.matches[0].description.as_deref(),
             Some("Edits files")
         );
+    }
+
+    /// A payload whose packed `murmur.yaml` declares `implementation: native` is refused with the
+    /// launch's `E-RUN-061`, naming the artifact and the field: nothing is written under
+    /// `tools/`, and `murmur.lock` gains no entry.
+    #[test]
+    fn artifact_change_a_native_payload_is_refused_and_stages_nothing() {
+        let project = Project::new();
+        let mut native = FakeSupply::new("tool", &echo_tool());
+        native.payload = zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: tool-editor\nversion: 0.3.0\nruntime: tool\nimplementation: native\n",
+            ),
+            ("bin/tool-editor", b"#!/bin/sh\necho hi\n"),
+        ]);
+        native.index.artifacts[0].versions[0].assets[0].sha256 = sha256_hex(&native.payload);
+        let supply = Arc::new(native);
+        let mut state = source_session(&project, &supply, true);
+
+        let err = state.pull_artifact("ana/tool-editor", None).unwrap_err();
+
+        assert!(err.starts_with("E-RUN-061: "), "{err}");
+        assert!(
+            err.contains("'ana/tool-editor'") && err.contains("implementation: native"),
+            "{err}"
+        );
+        assert!(!project.installed("ana/tool-editor").exists());
+        assert!(!state.allowlisted_tools.contains("tool-editor"));
+        assert!(state.pending_artifact_pulls.is_empty());
+        assert!(read_lockfile(&project.lock_path)
+            .map(|lock| lock.artifact_for("ana/tool-editor").is_none())
+            .unwrap_or(true));
     }
 }

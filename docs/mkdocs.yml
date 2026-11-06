@@ -81,6 +81,7 @@ plugins:
         reference/capsule-io.md: reference/workdir.md
         reference/verification.md: reference/containment.md
         reference/nexus-api.md: concepts/registry.md
+        language-guides/python-native.md: language-guides/python.md
 
 hooks:
   # Sets extra.v.murmur_* to the newest version of each default artifact the
@@ -168,7 +169,6 @@ nav:
       - Run Node tests in a capsule: how-to/run-node-tests-in-capsule.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
-      - Python Tool Quickstart (Native): language-guides/python-native.md
   - Reference:
       - CLI Commands: reference/cli.md
       - Manifest Schema: reference/manifest.md

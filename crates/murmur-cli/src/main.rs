@@ -240,10 +240,6 @@ enum Commands {
     Publish {
         /// Artifact path. If omitted, defaults to <name>-<version>.mur.zip in current directory.
         artifact_path: Option<PathBuf>,
-
-        /// Platform tag for native artifacts (e.g. darwin-aarch64). Auto-detected when omitted for native artifacts.
-        #[arg(long)]
-        platform: Option<String>,
     },
     /// Install artifacts into the project store (.murmur/artifacts/) by default, or globally with -g.
     /// With no arguments, installs all manifest deps from murmur.yaml into the project store.
@@ -259,11 +255,6 @@ enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
-        /// Download all platform variants and install into the global store (CI / roost seeding).
-        /// Takes exactly one scope/name@version artifact reference, whose scope has a source.
-        #[arg(long)]
-        all_platforms: bool,
-
         /// Skip the work install does ahead of the first launch: compiling WASM artifacts for this
         /// machine and keeping host facts for the manifest's shell.allow binaries; the first launch
         /// does it instead.
@@ -273,7 +264,7 @@ enum Commands {
         /// Install exactly what murmur.lock pins and never write murmur.lock (for CI). Refuses
         /// with E-REG-005 when there is no murmur.lock, or murmur.yaml declares an artifact the
         /// lock has no entry for or at another version than the lock pins
-        #[arg(long, conflicts_with_all = ["artifact", "global", "all_platforms"])]
+        #[arg(long, conflicts_with_all = ["artifact", "global"])]
         frozen: bool,
     },
     /// Compile WASM artifacts (.mur.zip files) for this machine, so their first launch loads them instead of compiling
@@ -524,12 +515,11 @@ enum Commands {
         #[arg(long, value_name = "CLASS")]
         containment: Option<String>,
 
-        /// Run the capsule on the host as you: its shell commands, plan shell steps, native
-        /// tools and process harness get your HOME, your whole environment, the host filesystem
-        /// and network, and no no_new_privs, so sudo works where your sudoers allows it.
-        /// Refused when the manifest or a config file declares a containment floor. Never
-        /// spreads: a delegated child or plan capsule step runs contained. With --roster, every
-        /// member is passed --unconfined.
+        /// Run the capsule on the host as you: its shell commands, plan shell steps and process
+        /// harness get your HOME, your whole environment, the host filesystem and network, and no
+        /// no_new_privs, so sudo works where your sudoers allows it. Refused when the manifest or a
+        /// config file declares a containment floor. Never spreads: a delegated child or plan
+        /// capsule step runs contained. With --roster, every member is passed --unconfined.
         #[arg(long, conflicts_with = "containment")]
         unconfined: bool,
 
@@ -809,17 +799,13 @@ fn main() {
             version.as_deref(),
             summary.as_deref(),
         ),
-        Commands::Publish {
-            artifact_path,
-            platform,
-        } => run_publish(artifact_path.as_deref(), platform.as_deref()),
+        Commands::Publish { artifact_path } => run_publish(artifact_path.as_deref()),
         Commands::Install {
             artifact,
             global,
-            all_platforms,
             no_precompile,
             frozen,
-        } => run_install(&artifact, global, all_platforms, no_precompile, frozen),
+        } => run_install(&artifact, global, no_precompile, frozen),
         Commands::Precompile {
             files,
             workdir,

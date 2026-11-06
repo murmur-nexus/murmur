@@ -1007,7 +1007,6 @@ pub(crate) mod tests {
             path: path.to_path_buf(),
             list_dir,
             executable: false,
-            pinned: None,
         };
         assert_eq!(
             crate::sandbox::resolve_derived_interpreter_grants(&derived),

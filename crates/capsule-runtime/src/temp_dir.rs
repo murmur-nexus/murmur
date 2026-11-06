@@ -1,6 +1,6 @@
 //! The session's temporary folder: `tmp/` in the session's records directory, which every shell
-//! command, plan shell step and native tool reaches as `$TMPDIR`, `$TMP` and `$TEMP`, and on Linux
-//! as a literal `/tmp` wherever the host can give a command a private mount namespace.
+//! command, plan shell step and `murmur:process` program reaches as `$TMPDIR`, `$TMP` and `$TEMP`,
+//! and on Linux as a literal `/tmp` wherever the host can give a command a private mount namespace.
 //!
 //! ```text
 //! ~/.murmur/records/<workdir root>/<session-id>/

@@ -130,7 +130,7 @@ mur install
 
 --8<-- "includes/mur-pull-info.md"
 
-`murmur/tool-request-input` is a WASM artifact — no platform tag is required. `mur install` resolves the correct variant for every artifact in the manifest automatically.
+`mur install` resolves every artifact in the manifest.
 
 ---
 
@@ -303,7 +303,7 @@ When the deadline passes, the tool call fails and the attempt ends. The task the
 
 | Feature / setting | How it works |
 |---|---|
-| `murmur/tool-request-input` | WASM tool artifact; `runtime: tool`; platform-independent |
+| `murmur/tool-request-input` | WASM tool artifact; `runtime: tool` |
 | `prompt` parameter | The question the model asks the operator; string, required |
 | Task state while waiting | `"TASK_STATE_INPUT_REQUIRED"` |
 | Where to read the question | `result.artifacts[0].parts[0].text` from `GetTask` |

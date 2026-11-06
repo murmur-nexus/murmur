@@ -29,8 +29,8 @@
 //!
 //! After [`refuse_before_lock`] and [`refuse_against_lock`] pass, `remove_artifact` writes
 //! `murmur.lock` without the entry, then updates the session (`tool_components`,
-//! `native_entrypoints`, `native_tool_settings`, `allowlisted_tools`, `installed_artifacts`,
-//! `removed_artifacts`, `installed_generation`), then deletes `<runtime dir>/tools/<name>/`. A lock write that fails
+//! `allowlisted_tools`, `installed_artifacts`, `removed_artifacts`, `installed_generation`), then
+//! deletes `<runtime dir>/tools/<name>/`. A lock write that fails
 //! leaves everything unchanged. A directory that cannot be deleted is reported with
 //! [`undeletable_directory`], and the name is already out of the session and the lock, so
 //! dispatch refuses it. The compiled form under
@@ -50,7 +50,6 @@
 //! - The process-transport tool bridge and plan steps dispatch concurrently on a shared store and
 //!   cannot reach either tool: the shared dispatch answers both names with an error and changes
 //!   nothing, and `plan::validate_plan` refuses them as steps.
-//! - A native tool's process never outlives its call, so no process of a removed tool runs on.
 //!
 //! An instance already built holds its own reference-counted `Component`; removal applies to
 //! calls that start after it.
@@ -58,9 +57,8 @@
 //! # What the model and the guest see
 //!
 //! The removed name is recorded in `removed_artifacts`, and `invoke()` and the agent-loop dispatch
-//! answer a call to it with [`called_after_removal`]. A native tool shadows a same-named
-//! `shell.allow` binary, because the native branch dispatches first; removal hands the name back
-//! to the shell branch, the state before the pull.
+//! answer a call to it with [`called_after_removal`]. A same-named `shell.allow` binary
+//! dispatches ahead of a pulled tool, so a removal leaves it as it was.
 //!
 //! Conversation history is never rewritten. Every earlier `tool_use` and `tool_result`, in the
 //! history, the conversation record and the trace, records what happened, and rewriting them
@@ -177,8 +175,8 @@ mod tests {
     use std::path::PathBuf;
 
     use murmur_artifact::{
-        read_lockfile, write_lockfile_atomic, ArtifactImplementation, ArtifactRuntime, LockOrigin,
-        LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION, PACKED_MANIFEST_ENTRY,
+        read_lockfile, write_lockfile_atomic, ArtifactRuntime, LockOrigin, LockedArtifact,
+        LockedSha256, MurmurLock, LOCK_VERSION, PACKED_MANIFEST_ENTRY,
     };
 
     use murmur_artifact::tool_name_of;
@@ -188,7 +186,6 @@ mod tests {
     use crate::bindings::host::murmur::{
         artifact_manager::manage, tool::run::ToolInput, tool_registry::invoke,
     };
-    use crate::hooks::ResolvedCall;
     use crate::install_grant::{pull, tree, Project, VERSION};
     use crate::runtime::{cwasm_entries, scratch_compiled_dir, CapsuleStoreState};
 
@@ -282,7 +279,6 @@ mod tests {
             name: name.to_string(),
             version: VERSION.to_string(),
             runtime,
-            implementation: Some(ArtifactImplementation::Wasm),
             origin,
         }
     }
@@ -374,8 +370,7 @@ mod tests {
             .unwrap()
             .sha256
             .any
-            .clone()
-            .unwrap();
+            .clone();
 
         assert_eq!(remove(&mut state, "local/wasm-tool"), Ok(true));
 
@@ -388,33 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn a_pulled_native_tool_is_removed_and_its_binary_deleted() {
-        let project = Project::new();
-        project.publish_native_tool("local/native-tool");
-        let mut state = project.session(&[], &["local/native-tool"]);
-        pull(&mut state, "local/native-tool").expect("a granted native tool pulls");
-        let binary = project.installed("local/native-tool").join("native-tool");
-        assert!(binary.is_file());
-
-        assert!(state.allowlisted_tools.contains("native-tool"));
-
-        assert_eq!(remove(&mut state, "local/native-tool"), Ok(true));
-
-        assert!(!binary.exists());
-        assert!(
-            !state.allowlisted_tools.contains("native-tool"),
-            "a removal takes the pulled tool out of the dispatch allowlist"
-        );
-        assert!(!state.native_entrypoints.contains_key("native-tool"));
-        assert_gone(&project, &mut state, "local/native-tool");
-    }
-
-    #[test]
     fn a_scoped_artifact_is_removed_by_its_full_name_and_refused_by_its_bare_one() {
         let project = Project::new();
-        project.publish_native_tool("ana/tool-x");
-        let mut state = project.session(&[], &["ana/tool-*"]);
-        pull(&mut state, "ana/tool-x").expect("a granted scoped tool pulls");
+        project.publish_skill("ana/tool-x", "# x");
+        let mut state = project.session(&["ana/tool-*"], &[]);
+        pull(&mut state, "ana/tool-x").expect("a granted scoped skill pulls");
         let dir = project.workdir.join("tools").join("tool-x");
         assert!(dir.is_dir());
         let before = snapshot(&project, &state);
@@ -496,26 +469,6 @@ mod tests {
 
         assert_eq!(remove(&mut state, SKILL), Ok(true));
         assert_eq!(names(&state), vec!["zzz-existing-tool"]);
-    }
-
-    #[test]
-    fn a_shell_binary_shadowed_by_a_pulled_tool_is_reachable_again_after_removal() {
-        let project = Project::new();
-        project.publish_native_tool("local/shadow-tool");
-        let mut state = project.session(&[], &["local/shadow-tool"]);
-        state.capability_policy.shell_allow = vec!["shadow-tool".to_string()];
-
-        pull(&mut state, "local/shadow-tool").unwrap();
-        assert!(matches!(
-            state.resolve_call("shadow-tool", &input()),
-            ResolvedCall::Tool { .. }
-        ));
-
-        assert_eq!(remove(&mut state, "local/shadow-tool"), Ok(true));
-        match state.resolve_call("shadow-tool", &input()) {
-            ResolvedCall::Shell { argv, .. } => assert_eq!(argv, vec!["--version"]),
-            ResolvedCall::Tool { .. } => panic!("the shell branch is reachable again"),
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

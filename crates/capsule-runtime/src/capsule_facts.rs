@@ -43,7 +43,8 @@ pub(crate) struct CapsuleFacts {
     pub(crate) runtime_dir_tools: Vec<String>,
 }
 
-/// The limits the runtime applies to every shell command and native tool it spawns.
+/// The limits the runtime applies to every shell command and `murmur:process` program it
+/// spawns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DispatchLimits {
     /// `HostResourceLimits::memory_bytes`: `RLIMIT_AS` (`RLIMIT_DATA` on macOS) per command.

@@ -23,9 +23,7 @@ use std::{
 use assert_cmd::Command;
 use common::leaks::{files_containing, hex, sha256_hex};
 use common::recording_upstream::{RecordingUpstream, Reply};
-use murmur_artifact::{
-    tool_name_of, ArtifactMeta, ArtifactName, LocalRegistry, Registry, RuntimeType,
-};
+use murmur_artifact::tool_name_of;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -35,8 +33,6 @@ const TOOL: &str = "local/gateway-probe";
 const TOOL_B: &str = "local/gateway-probe-b";
 const HOOK: &str = "local/gateway-probe-hook";
 const DRIVER: &str = "local/murmur-driver-anthropic";
-/// The native fixture tool, filed under the name its own manifest packs.
-const NATIVE_TOOL: &str = "local/tool-fixture";
 const VERSION: &str = "0.1.0";
 
 /// The key the operator holds. Assembled so no source line carries a credential-shaped literal.
@@ -871,64 +867,6 @@ fn keyless_driver_completes() {
         "{}",
         run.stderr
     );
-}
-
-/// A native tool's requests leave through the egress proxy and never pass the gateway, so a
-/// `gateway:` on one is refused with `E-CAP-017` rather than left silently inert.
-#[test]
-fn gateway_on_native_tool_refuses() {
-    let Some(binary) = common::fixture_native_tool_binary() else {
-        eprintln!("skipping gateway_on_native_tool_refuses: the native fixture did not build");
-        return;
-    };
-    let upstream = RecordingUpstream::replying(UPSTREAM_REPLY);
-    let mut project = Project::new();
-    project.set_credential(CREDENTIAL, MARKER);
-    let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
-    let artifact = common::create_native_tool_zip(
-        project.artifacts.path(),
-        NATIVE_TOOL,
-        VERSION,
-        &manifest_bytes,
-        &binary,
-    );
-    LocalRegistry::new(project.home.path().join(".murmur").join("artifacts"))
-        .publish(
-            ArtifactMeta {
-                name: ArtifactName::parse(NATIVE_TOOL).unwrap(),
-                version: VERSION.to_string(),
-                runtime: RuntimeType::Native,
-                artifact_runtime: "native".to_string(),
-                platforms: Vec::new(),
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-                owner_id: None,
-                built_at_level: None,
-            },
-            &fs::read(&artifact).unwrap(),
-        )
-        .unwrap();
-    project.script_manifest(
-        &format!(
-            "  - name: {NATIVE_TOOL}\n    version: {VERSION}\n    runtime: tool\n    gateway:\n      \
-             endpoint: {}/v1\n      api_key: ${{{CREDENTIAL}}}\n",
-            upstream.endpoint
-        ),
-        "",
-    );
-
-    let run = project.run(&[], &[]);
-    assert!(!run.ok(), "{}", run.context());
-    assert!(run.stderr.contains("E-CAP-017"), "{}", run.context());
-    assert!(
-        run.stderr.contains(&format!("artifact '{NATIVE_TOOL}'")),
-        "{}",
-        run.context()
-    );
-    assert!(run.stderr.contains("egress proxy"), "{}", run.context());
-    assert!(upstream.requests().is_empty());
-    project.assert_key_recorded_nowhere(&run, MARKER);
 }
 
 // ── agent capsules: a metered driver beside an unmetered tool ───────────────

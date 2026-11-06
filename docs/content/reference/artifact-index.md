@@ -11,8 +11,7 @@ The format is schema 2. Its JSON Schema is published beside this page:
 
 ## Example { #example }
 
-An index with a WASM tool at two versions, the older one kept from an earlier release, and a native
-tool with one payload per platform:
+An index with a WASM tool at two versions, the older one kept from an earlier release:
 
 ```json
 {
@@ -55,34 +54,6 @@ tool with one payload per platform:
           ]
         }
       ]
-    },
-    {
-      "name": "tool-git",
-      "runtime": "tool",
-      "description": "Structured git interface.",
-      "tags": [
-        "tool",
-        "git"
-      ],
-      "versions": [
-        {
-          "version": "0.2.0",
-          "release": "v1.1.0",
-          "interfaces": [],
-          "assets": [
-            {
-              "file": "tool-git-0.2.0-darwin-aarch64.mur.zip",
-              "platform": "darwin-aarch64",
-              "sha256": "b197bca09698e8a8ec7658f66208193a309d1675b8756a0dfc6acc368595ec7e"
-            },
-            {
-              "file": "tool-git-0.2.0-linux-x86_64.mur.zip",
-              "platform": "linux-x86_64",
-              "sha256": "e9bbd88e3db8efef0597b0ad135607edca3d811d582586726dd570d2717c5a75"
-            }
-          ]
-        }
-      ]
     }
   ]
 }
@@ -103,10 +74,9 @@ tool with one payload per platform:
 | `versions[].version` | string | yes | The packed `version:`. A semantic version; never `latest`, `stable` or `edge` |
 | `versions[].release` | string | yes | The tag of the release whose assets hold this version's files. No whitespace |
 | `versions[].built_at_level` | integer | no | The [WIT level](wit-levels.md#built-at-level) the version was built at. `mur index` writes the value the version's files pack in `murmur-build.json`, else derives the newest level its `interfaces` fit, and omits the key when they fit none. `--merge` keeps a value an earlier index carries, and derives one for a kept version that has none |
-| `versions[].interfaces` | array of strings | yes | Every `murmur:` interface the version's component exports or imports, across all its files. Sorted and unique; `[]` for a version with no component, such as a native tool or a skill |
-| `versions[].assets` | array | yes | At least one. One entry per payload file, sorted by `file` |
-| `assets[].file` | string | yes | The release asset's file name: `<name>-<version>.mur.zip`, or `<name>-<version>-<platform>.mur.zip` when `platform` is present |
-| `assets[].platform` | string | no | `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`. Present exactly when `file` carries the platform tag |
+| `versions[].interfaces` | array of strings | yes | Every `murmur:` interface the version's component exports or imports, across all its files. Sorted and unique; `[]` for a version with no component, such as a skill |
+| `versions[].assets` | array | yes | Exactly one: the version's payload file |
+| `assets[].file` | string | yes | The release asset's file name: `<name>-<version>.mur.zip` |
 | `assets[].sha256` | string | yes | SHA-256 of the file's bytes as 64 lowercase hexadecimal characters, the same digest `murmur.lock` pins |
 
 A reader ignores keys this table does not list.
@@ -124,8 +94,8 @@ files are published.
 | `runtime` | The packed `runtime:` of the newest version |
 | `description` | The first non-empty line of the newest version's packed `description:`, cut after the first `.`, `!` or `?` that ends the line or is followed by a space |
 | `tags` | The role tags of `runtime`, then each `-`-separated word of the name except `murmur`, without repeats |
-| `interfaces` | The `murmur:` names the version's components export and import. A WASM payload whose component cannot be read is refused rather than given `[]`; a native or static payload has none |
-| `file`, `platform` | The file name |
+| `interfaces` | The `murmur:` names the version's components export and import. A WASM payload whose component cannot be read is refused rather than given `[]`; a static payload has none |
+| `file` | The file name |
 | `sha256` | The file's bytes |
 
 The role tags are:
@@ -147,11 +117,8 @@ files twice gives byte-identical files.
 ## Which version fits { #fit }
 
 `mur search` lists each artifact at the newest version that fits the `mur` running it. A version
-fits when both hold:
-
-1. Every name in `interfaces` is an interface this `mur` serves at exactly that version. The
-   versions a `mur` serves are listed under [WIT interfaces](wit-interfaces.md).
-2. One of its `assets` has no `platform`, or has this host's platform.
+fits when every name in `interfaces` is an interface this `mur` serves at exactly that version.
+The versions a `mur` serves are listed under [WIT interfaces](wit-interfaces.md).
 
 When the newest version does not fit, `mur search` adds a line under its table naming that version
 and the reason.

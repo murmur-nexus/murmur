@@ -40,11 +40,12 @@ pub enum Precompiled {
     Compiled,
     /// A form for the payload under the current engine key was already stored and loads.
     AlreadyStored,
-    /// The payload is not a WASM artifact staged under its own sha256: a native tool, a skill or
-    /// a capsule. No file was touched.
+    /// The payload is not a WASM artifact staged under its own sha256: a skill or a capsule. No
+    /// file was touched.
     NotWasm,
-    /// The payload's manifest does not parse, or its root wasm is missing or does not compile.
-    /// Nothing was stored; a launch staging it fails or compiles exactly as it would have.
+    /// The payload's manifest does not parse, or declares a native tool, which
+    /// [`murmur_artifact::refuse_native_tool`] refuses; or its root wasm is missing or does not
+    /// compile. Nothing was stored; a launch staging it fails or compiles exactly as it would have.
     Failed,
 }
 
@@ -138,8 +139,8 @@ pub struct PrecompileItem<'a> {
 }
 
 /// The outcome of a payload that is not compiled: [`Precompiled::Failed`] when its manifest does
-/// not parse, [`Precompiled::NotWasm`] when it is not staged under its own sha256. `None` for a
-/// payload [`Precompiler::compile_eligible`] takes.
+/// not parse or declares a native tool, [`Precompiled::NotWasm`] when it is not staged under its
+/// own sha256. `None` for a payload [`Precompiler::compile_eligible`] takes.
 fn ineligible(payload: &[u8]) -> Option<Precompiled> {
     let Ok(manifest) = murmur_artifact::load_manifest_from_artifact_bytes(payload) else {
         return Some(Precompiled::Failed);
@@ -326,28 +327,21 @@ mod tests {
     }
 
     #[test]
-    fn a_native_tool_and_a_skill_are_not_compiled() {
+    fn a_skill_and_a_capsule_are_not_wasm_and_a_native_tool_fails() {
         let home = tempfile::tempdir().unwrap();
         crate::murmur_home::run_with_home(
-            "precompile::tests::inner_a_native_tool_and_a_skill_are_not_compiled",
+            "precompile::tests::inner_a_skill_and_a_capsule_are_not_wasm_and_a_native_tool_fails",
             home.path(),
         );
     }
 
     #[test]
-    #[ignore = "run by a_native_tool_and_a_skill_are_not_compiled"]
-    fn inner_a_native_tool_and_a_skill_are_not_compiled() {
+    #[ignore = "run by a_skill_and_a_capsule_are_not_wasm_and_a_native_tool_fails"]
+    fn inner_a_skill_and_a_capsule_are_not_wasm_and_a_native_tool_fails() {
         if !crate::murmur_home::in_scratch_home() {
             return;
         }
         let precompiler = Precompiler::new(None).unwrap();
-        let native = payload(&[
-            (
-                "murmur.yaml",
-                b"name: native-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
-            ),
-            ("native-tool", b"#!/bin/sh\necho hi\n"),
-        ]);
         let skill = payload(&[
             (
                 "murmur.yaml",
@@ -363,17 +357,17 @@ mod tests {
             ("capsule.wasm", &fixture("run/components/echo-tool.wasm")),
         ]);
 
-        for (name, payload) in [
-            ("native-tool", native),
-            ("demo-skill", skill),
-            ("demo-capsule", capsule),
-        ] {
+        for (name, payload) in [("demo-skill", skill), ("demo-capsule", capsule)] {
             assert_eq!(
                 precompiler.precompile(name, "0.1.0", &payload),
                 Precompiled::NotWasm,
                 "{name}"
             );
         }
+        assert_eq!(
+            precompiler.precompile("native-tool", "0.1.0", &native_tool()),
+            Precompiled::Failed
+        );
         assert!(
             !compiled_dir().exists(),
             "{} was created",
@@ -445,13 +439,14 @@ mod tests {
         }
     }
 
+    /// A payload whose packed manifest declares `implementation: native`, beside a dummy binary.
     fn native_tool() -> Vec<u8> {
         payload(&[
             (
                 "murmur.yaml",
                 b"name: native-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
             ),
-            ("native-tool", b"#!/bin/sh\necho hi\n"),
+            ("bin/native-tool", b"#!/bin/sh\necho hi\n"),
         ])
     }
 
@@ -592,7 +587,7 @@ mod tests {
                 Precompiled::Compiled,
                 Precompiled::Failed,
                 Precompiled::Compiled,
-                Precompiled::NotWasm,
+                Precompiled::Failed,
                 Precompiled::Compiled,
             ]
         );
@@ -620,7 +615,7 @@ mod tests {
                 Precompiled::AlreadyStored,
                 Precompiled::Failed,
                 Precompiled::AlreadyStored,
-                Precompiled::NotWasm,
+                Precompiled::Failed,
                 Precompiled::AlreadyStored,
             ]
         );

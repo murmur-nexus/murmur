@@ -21,9 +21,8 @@ use thiserror::Error;
 use crate::{
     artifact::ArtifactError, artifact_name_format_error, build_info_from_artifact_bytes,
     is_reserved_version, load_manifest_from_artifact_bytes, newest_fitting_level,
-    read_component_contracts, sha256_hex, split_platform_suffix, version_fit, FitSubject,
-    RuntimeType, VersionFit, WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE,
-    SUPPORTED_PLATFORMS,
+    read_component_contracts, sha256_hex, version_fit, FitSubject, RuntimeType, VersionFit,
+    WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE,
 };
 
 /// The `schema_version` [`ArtifactIndex::from_json`] reads and [`ArtifactIndex::to_json`] writes.
@@ -81,11 +80,8 @@ pub struct IndexedVersion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexedAsset {
-    /// `<name>-<version>[-<platform>].mur.zip`.
+    /// `<name>-<version>.mur.zip`.
     pub file: String,
-    /// Present exactly when [`Self::file`] carries a platform tag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<String>,
     /// [`sha256_hex`] of the file's bytes.
     pub sha256: String,
 }
@@ -141,7 +137,7 @@ impl ArtifactIndex {
     /// Read an index, checking `schema_version` before anything else, then every constraint of
     /// the schema 2 format: part-rule names and scope, unique sorted artifacts, versions that
     /// parse as semver newest first, `murmur:`-only sorted interfaces, and assets whose file
-    /// names agree with their artifact, version and platform. Keys the format does not define
+    /// names agree with their artifact and version. Keys the format does not define
     /// are ignored.
     pub fn from_json(text: &str) -> Result<Self, ArtifactIndexError> {
         let value: Value = serde_json::from_str(text)
@@ -178,12 +174,12 @@ impl ArtifactIndex {
 }
 
 impl IndexedArtifact {
-    /// The newest version [`version_fit`] accepts for `level` and `platform`.
+    /// The newest version [`version_fit`] accepts for `level`.
     #[must_use]
-    pub fn newest_fitting(&self, level: &WitLevel, platform: &str) -> Option<&IndexedVersion> {
-        self.versions.iter().find(|version| {
-            version_fit(&FitSubject::indexed(version), level, platform) == VersionFit::Fits
-        })
+    pub fn newest_fitting(&self, level: &WitLevel) -> Option<&IndexedVersion> {
+        self.versions
+            .iter()
+            .find(|version| version_fit(&FitSubject::indexed(version), level) == VersionFit::Fits)
     }
 }
 
@@ -229,35 +225,29 @@ pub fn release_tag_error(tag: &str) -> Option<&'static str> {
 }
 
 /// The file name of one payload, as a release asset and in a store's version directory:
-/// `<name>-<version>[-<platform>].mur.zip`, `name` the bare part.
+/// `<name>-<version>.mur.zip`, `name` the bare part.
 #[must_use]
-pub fn asset_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
-    format!(
-        "{}{ARTIFACT_FILE_SUFFIX}",
-        payload_stem(name, version, platform)
-    )
+pub fn asset_file_name(name: &str, version: &str) -> String {
+    format!("{}{ARTIFACT_FILE_SUFFIX}", payload_stem(name, version))
 }
 
 /// The file name of the sha256 a store keeps beside the payload [`asset_file_name`] names:
-/// `<name>-<version>[-<platform>].sha256`.
+/// `<name>-<version>.sha256`.
 #[must_use]
-pub fn sha256_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
-    format!("{}.sha256", payload_stem(name, version, platform))
+pub fn sha256_file_name(name: &str, version: &str) -> String {
+    format!("{}.sha256", payload_stem(name, version))
 }
 
 /// The file name of the metadata sidecar a store keeps beside the payload [`asset_file_name`]
-/// names: `<name>-<version>[-<platform>].meta.json`.
+/// names: `<name>-<version>.meta.json`.
 #[must_use]
-pub fn metadata_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
-    format!("{}.meta.json", payload_stem(name, version, platform))
+pub fn metadata_file_name(name: &str, version: &str) -> String {
+    format!("{}.meta.json", payload_stem(name, version))
 }
 
-/// `<name>-<version>[-<platform>]`, the part of a payload's file name before its extension.
-pub(crate) fn payload_stem(name: &str, version: &str, platform: Option<&str>) -> String {
-    match platform {
-        Some(platform) => format!("{name}-{version}-{platform}"),
-        None => format!("{name}-{version}"),
-    }
+/// `<name>-<version>`, the part of a payload's file name before its extension.
+pub(crate) fn payload_stem(name: &str, version: &str) -> String {
+    format!("{name}-{version}")
 }
 
 /// The first sentence of a manifest `description:`: its first non-empty line, trimmed, cut after
@@ -299,12 +289,9 @@ pub fn derived_tags(runtime: &str, name: &str) -> Vec<String> {
 /// One `.mur.zip` file read for indexing.
 struct ScannedFile {
     file: String,
-    path: String,
     name: String,
     version: String,
     runtime: String,
-    packaging: RuntimeType,
-    platform: Option<&'static str>,
     sha256: String,
     interfaces: Vec<String>,
     description: Option<String>,
@@ -314,15 +301,14 @@ struct ScannedFile {
 /// Index every `.mur.zip` regular file directly inside `dir`, recording `release` on every
 /// version. Every other entry is ignored.
 ///
-/// Each version's `built_at_level` is the label its files pack in `murmur-build.json`; a version
-/// whose files pack none gets the newest of `levels` its `interfaces` fit, and none when they fit
-/// no level.
+/// Each version is one file, `<name>-<version>.mur.zip`. Its `built_at_level` is the label the
+/// file packs in `murmur-build.json`; a file that packs none gets the newest of `levels` its
+/// `interfaces` fit, and none when they fit no level.
 ///
 /// Refuses the whole directory when any one file cannot be indexed (unreadable, no packed
 /// `murmur.yaml`, a malformed packed `murmur-build.json`, a name or version the registry would
-/// refuse, a file name that disagrees with the packed name, version or packaging type), when two
-/// files of one version disagree on their packed `runtime:`, packaging type or built-at level, or
-/// when `dir` holds no such file. The result depends only on the files' names and bytes and on
+/// refuse, a file name that is not `<name>-<version>.mur.zip` for its packed name and version),
+/// or when `dir` holds no such file. The result depends only on the files' names and bytes and on
 /// `levels`, never on directory order or file times.
 pub fn index_directory(
     dir: &Path,
@@ -366,88 +352,44 @@ pub fn index_directory(
     }
     file_names.sort();
 
-    // name → version → files of that version, in file-name order.
-    let mut grouped: BTreeMap<String, BTreeMap<String, Vec<ScannedFile>>> = BTreeMap::new();
+    // name → version → the one file of that version. A file name is `<name>-<version>.mur.zip`
+    // for the name and version it packs, so no two files share a version.
+    let mut grouped: BTreeMap<String, BTreeMap<String, ScannedFile>> = BTreeMap::new();
     for file_name in file_names {
         let scanned = scan_file(dir, file_name)?;
-        let files = grouped
+        grouped
             .entry(scanned.name.clone())
             .or_default()
-            .entry(scanned.version.clone())
-            .or_default();
-        let labelled = files
-            .iter()
-            .find(|file| file.built_at_level.is_some() && scanned.built_at_level.is_some());
-        if let Some(first) = labelled.filter(|file| file.built_at_level != scanned.built_at_level) {
-            return Err(IndexBuildError::File {
-                file: scanned.path,
-                reason: format!(
-                    "its packed {BUILD_INFO_FILE} sets built_at_level {}, and {} of the same \
-                     {}@{} sets built_at_level {}",
-                    scanned.built_at_level.unwrap_or_default(),
-                    first.path,
-                    first.name,
-                    first.version,
-                    first.built_at_level.unwrap_or_default()
-                ),
-            });
-        }
-        if let Some(first) = files.first() {
-            if first.runtime != scanned.runtime || first.packaging != scanned.packaging {
-                return Err(IndexBuildError::File {
-                    file: scanned.path,
-                    reason: format!(
-                        "it packs runtime '{}' ({}), and {} of the same {}@{} packs runtime '{}' \
-                         ({})",
-                        scanned.runtime,
-                        scanned.packaging.as_str(),
-                        first.path,
-                        first.name,
-                        first.version,
-                        first.runtime,
-                        first.packaging.as_str()
-                    ),
-                });
-            }
-        }
-        files.push(scanned);
+            .insert(scanned.version.clone(), scanned);
     }
 
     let artifacts = grouped
         .into_iter()
         .map(|(name, versions)| {
-            let mut versions: Vec<(String, Vec<ScannedFile>)> = versions.into_iter().collect();
+            let mut versions: Vec<(String, ScannedFile)> = versions.into_iter().collect();
             versions.sort_by(|(a, _), (b, _)| compare_versions(b, a));
-            let newest = &versions[0].1[0];
+            let newest = &versions[0].1;
             let runtime = newest.runtime.clone();
             let description = newest.description.as_deref().and_then(description_summary);
             let tags = derived_tags(&runtime, &name);
             let versions = versions
                 .into_iter()
-                .map(|(version, files)| {
-                    let mut interfaces: Vec<String> = files
-                        .iter()
-                        .flat_map(|file| file.interfaces.iter().cloned())
-                        .collect();
+                .map(|(version, file)| {
+                    let mut interfaces = file.interfaces;
                     interfaces.sort();
                     interfaces.dedup();
-                    let built_at_level = files
-                        .iter()
-                        .find_map(|file| file.built_at_level)
+                    let built_at_level = file
+                        .built_at_level
                         .or_else(|| derived_built_at_level(&interfaces, levels));
                     IndexedVersion {
                         version,
                         release: release.to_string(),
                         built_at_level,
                         interfaces,
-                        assets: files
-                            .into_iter()
-                            .map(|file| IndexedAsset {
-                                file: file.file,
-                                platform: file.platform.map(str::to_string),
-                                sha256: file.sha256,
-                            })
-                            .collect(),
+                        assets: vec![IndexedAsset {
+                            file: file.file,
+                            sha256: file.sha256,
+                        }],
                     }
                 })
                 .collect();
@@ -501,38 +443,17 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
         )));
     }
 
-    let stem = format!("{name}-{version}");
-    let platform = match split_platform_suffix(&file) {
-        Some((head, platform)) if head == stem => Some(platform),
-        _ if file == asset_file_name(&name, &version, None) => None,
-        _ => {
-            return Err(refuse(format!(
-                "its file name does not match its packed name '{name}' and version '{version}': \
-                 expected {stem}{ARTIFACT_FILE_SUFFIX}, or {stem}-<platform>{ARTIFACT_FILE_SUFFIX} \
-                 with <platform> one of {}",
-                SUPPORTED_PLATFORMS.join(", ")
-            )))
-        }
-    };
-
-    let packaging = manifest.registry_runtime();
-    match (packaging, platform) {
-        (RuntimeType::Native, None) => {
-            return Err(refuse(format!(
-                "a native payload names its platform: {stem}-<platform>{ARTIFACT_FILE_SUFFIX}"
-            )))
-        }
-        (RuntimeType::Wasm | RuntimeType::Static, Some(_)) => {
-            return Err(refuse(format!(
-                "a {} payload runs on every platform; name it {}",
-                packaging.as_str(),
-                asset_file_name(&name, &version, None)
-            )))
-        }
-        _ => {}
+    let expected = asset_file_name(&name, &version);
+    if file != expected {
+        return Err(refuse(format!(
+            "its file name does not match its packed name '{name}' and version '{version}': \
+             expected {expected}"
+        )));
     }
 
-    // Only a wasm payload carries a component; a native or static one declares no interface.
+    let packaging = manifest.registry_runtime();
+
+    // Only a wasm payload carries a component; a static one declares no interface.
     let interfaces = match packaging {
         RuntimeType::Wasm => read_component_contracts(&bytes)
             .map(|contracts| murmur_interfaces(&contracts))
@@ -541,7 +462,7 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
                     "its wasm payload cannot be read as a component: {error}"
                 ))
             })?,
-        RuntimeType::Native | RuntimeType::Static => Vec::new(),
+        RuntimeType::Static => Vec::new(),
     };
     let built_at_level = build_info_from_artifact_bytes(&bytes)
         .map_err(|error| refuse(format!("its packed {BUILD_INFO_FILE} {error}")))?
@@ -550,12 +471,9 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
     Ok(ScannedFile {
         sha256: sha256_hex(&bytes),
         file,
-        path,
         name,
         version,
         runtime: manifest.runtime,
-        packaging,
-        platform,
         interfaces,
         description: manifest.description,
         built_at_level,
@@ -923,23 +841,20 @@ fn read_asset(
 ) -> Result<IndexedAsset, ArtifactIndexError> {
     let obj = object(value, at)?;
     let file = required_string(obj, at, "file")?;
-    let platform = optional_string(obj, at, "platform")?;
-    if let Some(platform) = &platform {
-        if !SUPPORTED_PLATFORMS.contains(&platform.as_str()) {
-            return Err(invalid(
-                child(at, "platform"),
-                format!(
-                    "'{platform}' is not one of {}",
-                    SUPPORTED_PLATFORMS.join(", ")
-                ),
-            ));
-        }
-    }
-    let expected = asset_file_name(name, version, platform.as_deref());
-    if file != expected {
+    // An index an older `mur index` wrote may carry a `platform` key on a native tool's asset,
+    // whose file name then ends `-<platform>.mur.zip`. Such an asset is read so an install
+    // fetches it and refuses its native payload by name.
+    let tagged = optional_string(obj, at, "platform")?.is_some();
+    let expected = asset_file_name(name, version);
+    let stem = format!("{}-", payload_stem(name, version));
+    let tagged_name = tagged
+        && file
+            .strip_prefix(&stem)
+            .is_some_and(|tail| tail.ends_with(ARTIFACT_FILE_SUFFIX));
+    if file != expected && !tagged_name {
         return Err(invalid(
             child(at, "file"),
-            format!("'{file}' is not '{expected}', the file name of this artifact, version and platform"),
+            format!("'{file}' is not '{expected}', the file name of this artifact and version"),
         ));
     }
     let sha256 = required_string(obj, at, "sha256")?;
@@ -953,11 +868,7 @@ fn read_asset(
             "is not 64 lowercase hexadecimal characters",
         ));
     }
-    Ok(IndexedAsset {
-        file,
-        platform,
-        sha256,
-    })
+    Ok(IndexedAsset { file, sha256 })
 }
 
 #[cfg(test)]
@@ -1025,7 +936,6 @@ mod tests {
                 .iter()
                 .map(|(file, fill)| IndexedAsset {
                     file: (*file).to_string(),
-                    platform: split_platform_suffix(file).map(|(_, p)| p.to_string()),
                     sha256: sha(*fill),
                 })
                 .collect(),
@@ -1123,19 +1033,13 @@ mod tests {
         let written = index(vec![artifact(
             "tool-x",
             vec![
-                version(
-                    "0.2.0",
-                    "v0.2.0",
-                    &[
-                        ("tool-x-0.2.0-darwin-aarch64.mur.zip", 'b'),
-                        ("tool-x-0.2.0-linux-x86_64.mur.zip", 'c'),
-                    ],
-                ),
+                version("0.2.0", "v0.2.0", &[("tool-x-0.2.0.mur.zip", 'b')]),
                 v,
             ],
         )]);
         let text = written.to_json();
         assert!(text.ends_with("}\n") && !text.ends_with("\n\n"));
+        assert!(!text.contains("\"platform\""), "{text}");
         assert_eq!(ArtifactIndex::from_json(&text).unwrap(), written);
     }
 
@@ -1224,6 +1128,36 @@ mod tests {
         }
     }
 
+    /// An index an older `mur index` wrote carries a `platform` key on a native tool's asset,
+    /// whose file name ends with that platform. It still reads, so an install can fetch that
+    /// asset and refuse its payload by name; an untagged asset may not carry a tagged name.
+    #[test]
+    fn an_asset_carrying_a_platform_key_reads_with_its_tagged_file_name() {
+        let mut value: Value = serde_json::from_str(
+            &index(vec![artifact(
+                "tool-x",
+                vec![version("0.1.0", "v1", &[("tool-x-0.1.0.mur.zip", 'a')])],
+            )])
+            .to_json(),
+        )
+        .unwrap();
+        let asset = &mut value["artifacts"][0]["versions"][0]["assets"][0];
+        asset["file"] = "tool-x-0.1.0-linux-x86_64.mur.zip".into();
+        let untagged = ArtifactIndex::from_json(&value.to_string()).unwrap_err();
+        assert!(
+            matches!(&untagged, ArtifactIndexError::Invalid { at, .. } if at.ends_with("file")),
+            "{untagged:?}"
+        );
+
+        value["artifacts"][0]["versions"][0]["assets"][0]["platform"] = "linux-x86_64".into();
+        let read = ArtifactIndex::from_json(&value.to_string()).unwrap();
+        assert_eq!(
+            read.artifacts[0].versions[0].assets[0].file,
+            "tool-x-0.1.0-linux-x86_64.mur.zip"
+        );
+        assert!(!read.to_json().contains("\"platform\""));
+    }
+
     #[test]
     fn unknown_keys_are_ignored() {
         let mut value: Value = serde_json::from_str(
@@ -1240,32 +1174,19 @@ mod tests {
     }
 
     #[test]
-    fn fit_checks_interfaces_then_platform() {
-        let mut v = version(
-            "1.0.0",
-            "v1",
-            &[("tool-x-1.0.0-darwin-aarch64.mur.zip", 'a')],
-        );
+    fn fit_checks_interfaces() {
+        let mut v = version("1.0.0", "v1", &[("tool-x-1.0.0.mur.zip", 'a')]);
         assert_eq!(
-            version_fit(&FitSubject::indexed(&v), &served(), "linux-x86_64"),
-            VersionFit::NoPayloadFor("linux-x86_64".to_string())
-        );
-        assert_eq!(
-            version_fit(&FitSubject::indexed(&v), &served(), "darwin-aarch64"),
+            version_fit(&FitSubject::indexed(&v), &served()),
             VersionFit::Fits
         );
         v.interfaces = vec!["murmur:tool/run@9.9.9".to_string()];
-        match version_fit(&FitSubject::indexed(&v), &served(), "linux-x86_64") {
+        match version_fit(&FitSubject::indexed(&v), &served()) {
             VersionFit::Unserved(unserved) => {
                 assert_eq!(unserved[0].served_version.as_deref(), Some("0.1.0"))
             }
             other => panic!("{other:?}"),
         }
-        let untagged = version("1.0.0", "v1", &[("tool-x-1.0.0.mur.zip", 'a')]);
-        assert_eq!(
-            version_fit(&FitSubject::indexed(&untagged), &served(), "linux-aarch64"),
-            VersionFit::Fits
-        );
     }
 
     #[test]
@@ -1366,18 +1287,8 @@ mod tests {
         };
         fs::write(dir.path().join("tool-echo-0.10.0.mur.zip"), tool("0.10.0")).unwrap();
         fs::write(dir.path().join("tool-echo-0.9.0.mur.zip"), tool("0.9.0")).unwrap();
-        let native = payload(
-            "name: tool-nat\nversion: 1.0.0\nruntime: tool\nimplementation: native\n",
-            None,
-        );
-        for platform in ["linux-x86_64", "darwin-aarch64"] {
-            fs::write(
-                dir.path()
-                    .join(format!("tool-nat-1.0.0-{platform}.mur.zip")),
-                &native,
-            )
-            .unwrap();
-        }
+        let skill = payload("name: zz-skill\nversion: 1.0.0\nruntime: skill\n", None);
+        fs::write(dir.path().join("zz-skill-1.0.0.mur.zip"), &skill).unwrap();
         fs::write(dir.path().join("notes.txt"), "x").unwrap();
         fs::create_dir(dir.path().join("sub.mur.zip")).unwrap();
 
@@ -1394,16 +1305,12 @@ mod tests {
             echo.versions[0].assets[0].sha256,
             sha256_hex(&tool("0.10.0"))
         );
-        let nat = &built.artifacts[1];
-        assert_eq!(nat.versions.len(), 1);
-        let platforms: Vec<_> = nat.versions[0]
-            .assets
-            .iter()
-            .map(|a| a.platform.as_deref())
-            .collect();
-        assert_eq!(platforms, [Some("darwin-aarch64"), Some("linux-x86_64")]);
-        assert!(nat.versions[0].interfaces.is_empty());
-        assert_eq!(nat.versions[0].built_at_level, Some(1));
+        let skill = &built.artifacts[1];
+        assert_eq!(skill.versions.len(), 1);
+        assert_eq!(skill.versions[0].assets.len(), 1);
+        assert!(skill.versions[0].interfaces.is_empty());
+        assert_eq!(skill.versions[0].built_at_level, Some(1));
+        assert!(!built.to_json().contains("\"platform\""));
         assert_eq!(ArtifactIndex::from_json(&built.to_json()).unwrap(), built);
     }
 
@@ -1432,12 +1339,12 @@ mod tests {
                     "name: tool-a\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
                     None,
                 ),
-                "native payload names its platform",
+                "artifact 'tool-a' declares implementation: native",
             ),
             (
                 "tool-a-0.1.0-linux-x86_64.mur.zip",
                 payload("name: tool-a\nversion: 0.1.0\nruntime: tool\n", None),
-                "runs on every platform",
+                "expected tool-a-0.1.0.mur.zip",
             ),
             (
                 "tool-a-0.1.0.mur.zip",
@@ -1515,32 +1422,5 @@ mod tests {
         assert_eq!(versions[0].built_at_level, Some(1));
         assert_eq!(versions[1].built_at_level, None);
         assert!(built.to_json().contains("\"built_at_level\": 1"));
-    }
-
-    #[test]
-    fn index_directory_refuses_files_of_one_version_with_different_labels() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = "name: tool-n\nversion: 1.0.0\nruntime: tool\nimplementation: native\n";
-        for (platform, level) in [("darwin-aarch64", 1), ("linux-x86_64", 2)] {
-            fs::write(
-                dir.path().join(format!("tool-n-1.0.0-{platform}.mur.zip")),
-                labelled(
-                    manifest,
-                    None,
-                    Some(&format!("{{\"built_at_level\":{level}}}")),
-                ),
-            )
-            .unwrap();
-        }
-        let text = index_directory(dir.path(), "ana", "v1", &levels())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            text.contains("tool-n-1.0.0-linux-x86_64.mur.zip")
-                && text.contains("tool-n-1.0.0-darwin-aarch64.mur.zip")
-                && text.contains("sets built_at_level 2")
-                && text.contains("sets built_at_level 1"),
-            "{text}"
-        );
     }
 }

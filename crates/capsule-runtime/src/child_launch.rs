@@ -11,8 +11,8 @@
 //!
 //! * A daemon crash takes no child with it. Nothing the child needs to keep running lives in the
 //!   daemon's address space.
-//! * Each child has its own process environment and working directory, so a native subprocess
-//!   started by one child inherits nothing a sibling shares.
+//! * Each child has its own process environment and working directory, so a subprocess started
+//!   by one child inherits nothing a sibling shares.
 //! * A child that declares the `sealed` containment floor enters a mount namespace of its own,
 //!   because the containment machinery installs per process and the child *is* a process.
 //!

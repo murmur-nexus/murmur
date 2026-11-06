@@ -280,7 +280,6 @@ impl CheckRunner {
         let check_id = format!("{}-check", self.session_id);
         let prepared = crate::runtime::prepare_launch_scope(
             &self.policy,
-            false,
             &check_id,
             self.accessible_root.path(),
         )

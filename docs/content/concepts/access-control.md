@@ -73,7 +73,7 @@ list is recorded on each session as `effective_grants.preopens` in
 
 ### Widening a contained capsule's reach { #host-paths }
 
-A `scoped` or `sealed` capsule's commands, plan shell steps and native tools reach their work
+A `scoped` or `sealed` capsule's commands and plan shell steps reach their work
 folder and the runtime's own folders, and no other host folder. Only the operator widens that, and
 only in one place: the [`host_paths:`](../reference/config.md#host-paths) list in
 `~/.murmur/config.yaml`.
@@ -297,7 +297,7 @@ available, and permanently open elsewhere.
 
     | Content reaching the model | Fenced |
     |---|---|
-    | A tool result — from a WASM tool, a native subprocess tool, a shell binary, or one of the runtime's own peer-handoff tools | Yes |
+    | A tool result — from a WASM tool, a shell binary, or one of the runtime's own peer-handoff tools | Yes |
     | A task whose [trust class](#task-origin-and-trust-class) is `untrusted` | Yes |
     | A skill's `skill.md`, when a running capsule pulled the skill's pin | Yes. See [Artifact origin](#artifact-origin) |
     | An operator-pinned skill's `skill.md` | No. It is the capsule author's own guidance, staged inside the capsule at install; fencing it as data would make the skill inert |

@@ -1,6 +1,6 @@
 <!-- Manifest property tooltips — auto-appended to every page via pymdownx.snippets -->
 
-*[artifacts[].runtime]: wasm: tool visible to model · default | driver: inference driver · hidden | hook: lifecycle observer · hidden | native: binary tool · visible | skill: guidance file · agent reads voluntarily
+*[artifacts[].runtime]: tool: tool visible to model · default | driver: inference driver · hidden | hook: lifecycle observer · hidden | skill: guidance file · agent reads voluntarily
 
 *[artifacts[].source]: local path to skill.md or directory · skill artifacts only · bypasses registry
 

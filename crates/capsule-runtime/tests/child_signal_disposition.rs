@@ -3,7 +3,7 @@
 //! The Rust runtime sets `SIGPIPE` to ignored before `main`, so a write to a closed pipe is an
 //! `EPIPE` the writer handles. A child spawned through `std::process::Command` starts with the
 //! default disposition instead: std resets `SIGPIPE` to `SIG_DFL` between `fork` and `exec`, on the
-//! plain path and on the `pre_exec` path that sandboxed shell commands and native tools take. A
+//! plain path and on the `pre_exec` path that sandboxed shell commands take. A
 //! child that is itself `mur` ignores it again when its own runtime starts.
 //!
 //! Signal numbers are Linux's: `SIGPIPE` is 13, bit `1 << 12` of `SigIgn` in `/proc/<pid>/status`.

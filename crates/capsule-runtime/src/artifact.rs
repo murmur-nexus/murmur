@@ -1,8 +1,6 @@
 use std::io::Cursor;
 
-use murmur_artifact::payload_shape::{
-    native_binary_entry, select_root_wasm_in_archive, SKILL_MD_ENTRY,
-};
+use murmur_artifact::payload_shape::{select_root_wasm_in_archive, SKILL_MD_ENTRY};
 use murmur_artifact::zip_guard;
 use murmur_artifact::{BUILD_INFO_FILE, PACKED_MANIFEST_ENTRY};
 use zip::ZipArchive;
@@ -82,50 +80,6 @@ fn extract_root_wasm_capped(
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
             message: err.to_string(),
-        }
-    })
-}
-
-/// Extract the native binary from `bin/<artifact_name>` inside a `.mur.zip`.
-///
-/// Canonical native artifact layout:
-///   murmur.yaml            — artifact manifest at zip root
-///   bin/<artifact_name>    — compiled binary with executable permissions
-pub fn extract_native_binary(
-    artifact_name: &str,
-    artifact_version: &str,
-    artifact_bytes: &[u8],
-) -> Result<Vec<u8>, RuntimeError> {
-    extract_native_binary_capped(
-        artifact_name,
-        artifact_version,
-        artifact_bytes,
-        zip_guard::max_artifact_decompressed_bytes(),
-    )
-}
-
-fn extract_native_binary_capped(
-    artifact_name: &str,
-    artifact_version: &str,
-    artifact_bytes: &[u8],
-    max_bytes: u64,
-) -> Result<Vec<u8>, RuntimeError> {
-    let cursor = std::io::Cursor::new(artifact_bytes);
-    let mut archive = ZipArchive::new(cursor).map_err(|err| RuntimeError::ArtifactArchive {
-        name: artifact_name.to_string(),
-        version: artifact_version.to_string(),
-        message: err.to_string(),
-    })?;
-
-    let bin_path = native_binary_entry(artifact_name);
-    zip_guard::read_zip_entry_capped(&mut archive, &bin_path, max_bytes).map_err(|err| {
-        RuntimeError::ArtifactArchive {
-            name: artifact_name.to_string(),
-            version: artifact_version.to_string(),
-            message: format!(
-                "failed to read native binary at '{bin_path}' from archive (ensure the binary \
-                 is at {bin_path} inside the .mur.zip): {err}"
-            ),
         }
     })
 }
@@ -638,20 +592,6 @@ mod tests {
         let archive = archive_with_files(&[("capsule.wasm", &big)]);
 
         let err = extract_root_wasm_capped("demo", "0.0.1", &archive, 16).unwrap_err();
-        match err {
-            RuntimeError::ArtifactArchive { message, .. } => {
-                assert!(message.contains("decompression ceiling"));
-            }
-            other => panic!("expected ArtifactArchive error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_native_binary_rejects_entry_past_ceiling() {
-        let big = vec![b'a'; 1024];
-        let archive = archive_with_files(&[("bin/demo", &big)]);
-
-        let err = extract_native_binary_capped("demo", "0.0.1", &archive, 16).unwrap_err();
         match err {
             RuntimeError::ArtifactArchive { message, .. } => {
                 assert!(message.contains("decompression ceiling"));

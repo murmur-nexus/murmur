@@ -944,7 +944,7 @@ fn create_wasm_tool_artifact(dir: &Path) -> PathBuf {
 /// fails: it treats the text it is handed — the call's input JSON — as a path, and returns
 /// `error` when no file has that name.
 ///
-/// It grants no shell and declares no native tool, so it launches on a host that cannot delegate
+/// It grants no shell, so it launches on a host that cannot delegate
 /// a cgroup scope or build an egress namespace — both launch gates apply only to a capsule that
 /// can spawn a subprocess.
 fn stage_skill_and_tool_agent(endpoint: &str) -> capsule_runtime::StagedSession {

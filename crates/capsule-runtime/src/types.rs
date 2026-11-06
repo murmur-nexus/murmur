@@ -5,8 +5,8 @@ use std::{
 };
 
 use murmur_artifact::{
-    ArtifactImplementation, ArtifactRuntime, ContextConfig, HookConfig, InferenceConfig,
-    LifecycleConfig, LifecycleOverride, Registry,
+    ArtifactRuntime, ContextConfig, HookConfig, InferenceConfig, LifecycleConfig,
+    LifecycleOverride, Registry,
 };
 use wasmtime::{component::Component, Engine};
 
@@ -74,7 +74,7 @@ pub(crate) struct DispatchOutcome {
     /// outcome is first handed back inside the notice margin.
     pub runtime_note: Option<String>,
     /// The runtime's own text, unfenced, when it could not run the call: the
-    /// [`crate::shell::ShellExecError`] a native tool or shell dispatch returned, the same text
+    /// [`crate::shell::ShellExecError`] a shell dispatch returned, the same text
     /// `result.data` carries before the fence wraps it. The agent loop records it as the
     /// `tool_call` trace record's `error`.
     ///
@@ -143,7 +143,7 @@ pub struct ArtifactRequest {
     /// Lowered to compact JSON at staging by [`crate::artifact_config::lower_artifact_config`] and
     /// delivered to this artifact alone as [`crate::artifact_config::ARTIFACT_CONFIG_ENV`]. `None`
     /// means the variable is absent from the artifact's environment. Consumed for `runtime: hook`,
-    /// `runtime: tool` (WASM and native) and `runtime: driver`; the manifest parser rejects the
+    /// `runtime: tool` and `runtime: driver`; the manifest parser rejects the
     /// key on `runtime: skill`.
     pub config: Option<serde_norway::Value>,
     /// This artifact's operator-declared `gateway:` block, copied verbatim from its entry in the
@@ -159,9 +159,7 @@ pub struct ArtifactRequest {
 pub struct LockExpectation {
     pub name: String,
     pub resolved_version: String,
-    /// The hash the resolved payload must have. Selected by the caller from the lock entry's
-    /// `sha256` for the platform staging runs on, so it is whichever of `any` or
-    /// `platforms.<platform>` applies to this host.
+    /// The hash the resolved payload must have: the lock entry's `sha256.any`.
     pub sha256: String,
     /// Who wrote the lock entry. A [`murmur_artifact::LockOrigin::Runtime`] pin stages only as a
     /// tool or skill without a `gateway:` block; staging refuses anything else with
@@ -174,11 +172,8 @@ pub struct LockExpectation {
 pub struct ResolvedLockArtifact {
     pub name: String,
     pub resolved_version: String,
-    /// Hash of the payload that was resolved on this host.
+    /// Hash of the payload that was resolved, pinned as the lock entry's `sha256.any`.
     pub sha256: String,
-    /// Which platform the resolved payload is filed under, `None` for a platform-independent
-    /// one. Decides whether the lock entry pins `sha256.any` or `sha256.platforms.<platform>`.
-    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -267,7 +262,7 @@ pub struct CapabilityPolicy {
     /// this host, checked on this host, in config order (see [`crate::host_paths`]). Not a
     /// manifest field: empty from [`capability_policy_from_runtime_manifest`], filled by `mur run`
     /// (and `--explain-scope`) from the global config alone. On `landlock+seccomp` each becomes a
-    /// Landlock rule for commands, plan shell steps and native tools; on `sealed` also a required
+    /// Landlock rule for commands and plan shell steps; on `sealed` also a required
     /// bind at its own path. Never executable. WASM tools' preopens do not include them.
     pub host_paths: Vec<crate::host_paths::HostPath>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
@@ -280,7 +275,7 @@ pub struct CapabilityPolicy {
     /// each field `capabilities.limits` omits, so there is no "unset" state here and a
     /// silent manifest yields [`ExecutionLimits::default`] rather than no limits.
     pub limits: ExecutionLimits,
-    /// OS-level bounds applied to every *native subprocess* the session spawns — rlimits, the
+    /// OS-level bounds applied to every subprocess the session spawns — rlimits, the
     /// Linux cgroup v2 scope, and the workdir-size ceiling. Resolved on exactly the same terms
     /// as `limits` above (each omitted `capabilities.resources` field replaced by its default,
     /// no "unset" state), but a completely different subject: `limits` bounds a WASM guest
@@ -333,7 +328,7 @@ pub struct CapabilityPolicy {
     ///
     /// A pulled skill gains no grant of its own; see `install_grant`.
     pub install_skill: Vec<String>,
-    /// From `capabilities.install.tool`: the entries naming which tool artifacts, WASM or native,
+    /// From `capabilities.install.tool`: the entries naming which tool artifacts
     /// a pull may install, verbatim and in declaration order. Empty by default, which is deny.
     ///
     /// A pulled tool joins the session's dispatch allowlist and dispatches on this policy's own
@@ -368,7 +363,6 @@ pub struct InstalledArtifactSummary {
     pub name: String,
     pub version: String,
     pub runtime: ArtifactRuntime,
-    pub implementation: Option<ArtifactImplementation>,
     /// Who pinned the artifact: its `murmur.lock` entry's origin, both for an artifact staged
     /// from the lock and for one `manage.pull()` installed mid-session. An artifact staged
     /// without a lock, and a `source:` skill, are [`murmur_artifact::LockOrigin::Operator`].
@@ -547,7 +541,7 @@ pub struct StageRequest {
     /// the channel [`crate::formation_credentials::FormationMember::from_env`] names, and refuses
     /// the launch when that cannot be read. The door verifies formation tokens with it, every WASM
     /// guest is handed its callees' names, and the runtime's egress resolves and authorizes calls
-    /// to them. No native process and no delegated child is handed any of it.
+    /// to them. No subprocess and no delegated child is handed any of it.
     pub formation_member: Option<Arc<FormationMember>>,
     /// Where a pull the stores cannot answer is fetched from, for a capsule granted
     /// `capabilities.install.from: [stores, sources]`. `None` fetches from no source: every pull
@@ -591,25 +585,6 @@ pub struct StagedProcessDriver {
     /// Where [`Self::binary`]'s name came from, for diagnostics and the trace: `inference.command`
     /// or the process driver's `describe()`.
     pub(crate) binary_source: String,
-}
-
-/// The per-tool settings a native tool's spawn carries, lowered at staging from the capsule
-/// operator's own entry for that tool, never from the artifact's bundled `murmur.yaml`, so a tool
-/// pulled from a registry cannot configure itself or name a store.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct NativeToolSettings {
-    /// The entry's `config:` block as compact JSON, from
-    /// [`crate::artifact_config::lower_artifact_config`]: the value of
-    /// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`] in this tool's environment. `None` leaves
-    /// the variable unset.
-    pub(crate) config_json: Option<String>,
-    /// The store `capabilities.state` names, created by
-    /// [`crate::state_store::ensure_state_store`]: the value of
-    /// [`crate::state_store::STATE_DIR_ENV`], and on `KernelFull` and `KernelSealed` a
-    /// read-write path granted to this tool's process tree alone
-    /// ([`crate::sandbox::ShellEnforcement::for_native_entrypoint`]). `None` grants nothing and
-    /// leaves the variable unset.
-    pub(crate) state_dir: Option<PathBuf>,
 }
 
 pub struct StagedSession {
@@ -723,13 +698,6 @@ pub struct StagedSession {
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
     pub(crate) tool_components: HashMap<String, Component>,
-    /// What each native tool installed at staging needs to start, keyed by tool name. Derived
-    /// from the image the runtime wrote; see [`crate::sandbox::NativeEntrypoint`].
-    pub(crate) native_entrypoints: HashMap<String, crate::sandbox::NativeEntrypoint>,
-    /// What each native tool's own manifest entry hands it, keyed by tool name. Holds an entry
-    /// only for a tool whose entry declares `config:` or `capabilities.state`; a tool with no
-    /// entry here is spawned with neither variable and no store.
-    pub(crate) native_tool_settings: HashMap<String, NativeToolSettings>,
     /// The process driver, for a `transport: process` session that named one. `None` on every
     /// other transport.
     pub(crate) process_driver: Option<Arc<StagedProcessDriver>>,

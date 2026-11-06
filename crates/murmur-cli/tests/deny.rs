@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-/// The file a denied `bash` call would have created. Its absence is the measurement.
+/// The file a denied `bash` or tool call would have created. Its absence is the measurement.
 const MARKER: &str = "marker.txt";
 
 /// The command the model asks for in every shell scenario: it writes [`MARKER`] into the
@@ -195,15 +195,15 @@ impl Session {
     }
 }
 
-/// Publish the driver, every hook and every native tool, stage the capsule, run it, and
-/// collect what it left.
+/// Publish the driver, every hook and every tool, stage the capsule, run it, and collect what it
+/// left. Each tool is the `runtime-dir-probe` fixture published under the given name.
 fn run_session(
     responses: Vec<String>,
     hooks: &[Hook<'_>],
-    native_tools: &[(&str, &str)],
+    tools: &[&str],
     deadline_seconds: Option<u64>,
 ) -> Session {
-    run_session_with(responses, hooks, native_tools, deadline_seconds, false)
+    run_session_with(responses, hooks, tools, deadline_seconds, false)
 }
 
 /// [`run_session`] for a capsule that also declares `capabilities.plan.submit`, so the model can
@@ -211,14 +211,14 @@ fn run_session(
 fn run_session_with(
     responses: Vec<String>,
     hooks: &[Hook<'_>],
-    native_tools: &[(&str, &str)],
+    tools: &[&str],
     deadline_seconds: Option<u64>,
     plan_submit: bool,
 ) -> Session {
     run_session_at(
         responses,
         hooks,
-        native_tools,
+        tools,
         deadline_seconds,
         plan_submit,
         murmur_artifact::ContainmentClass::Advisory,
@@ -229,7 +229,7 @@ fn run_session_with(
 fn run_session_at(
     responses: Vec<String>,
     hooks: &[Hook<'_>],
-    native_tools: &[(&str, &str)],
+    tools: &[&str],
     deadline_seconds: Option<u64>,
     plan_submit: bool,
     floor: murmur_artifact::ContainmentClass,
@@ -259,14 +259,12 @@ fn run_session_at(
     }
 
     let mut tool_refs = Vec::new();
-    for (name, script) in native_tools {
-        let artifact = common::create_native_artifact(
+    for name in tools {
+        let artifact = common::create_tool_artifact(
             artifact_dir.path(),
             name,
             "0.1.0",
-            script,
-            Some("Fixture tool"),
-            None,
+            &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
         );
         common::publish_local(&home, &artifact).success();
         tool_refs.push((*name, "0.1.0"));
@@ -465,13 +463,14 @@ fn denying_on_tool_call_hook_stops_the_tool() {
     if common::skip_without_host_support("denying_on_tool_call_hook_stops_the_tool") {
         return;
     }
-    let script = format!(
-        "#!/bin/sh\n: > {MARKER}\necho '{}'\n",
-        r#"{"status":"passed","summary":"ok","data":null,"data_path":null,"truncated":false,"metadata":[]}"#
-    );
     let session = run_session(
         vec![
-            tool_call("msg_1", "toolu_spend", "spender", json!({"amount": 10})),
+            tool_call(
+                "msg_1",
+                "toolu_spend",
+                "spender",
+                json!({"op": "write", "path": MARKER}),
+            ),
             end_turn("msg_2", "Understood."),
         ],
         &[hook(
@@ -480,7 +479,7 @@ fn denying_on_tool_call_hook_stops_the_tool() {
             "deny",
             deny_hook_wasm("on-tool-call", "spend-sensitive"),
         )],
-        &[("spender", script.as_str())],
+        &["spender"],
         None,
     );
 

@@ -111,7 +111,7 @@ wire two capsules together by hand, with a pinned port and `curl`, see
 
 - **Members on more than one machine.** Every member runs on the launcher's machine, and every
   door is served on loopback. See [Launching a formation](../reference/roster.md#launch).
-- **Formation calls from native processes.** Shell commands, native tools and a
+- **Formation calls from host processes.** Shell commands and a
   `transport: process` harness are handed no `MURMUR_FORMATION_PEERS` and cannot reach a member's
   virtual address — see
   [What a member's components are handed](../reference/roster.md#formation-peers). A

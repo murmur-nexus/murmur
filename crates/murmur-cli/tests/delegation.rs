@@ -418,7 +418,6 @@ fn publish_driver(registry_root: &Path) {
             version: DRIVER_VERSION.to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: "driver".to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,

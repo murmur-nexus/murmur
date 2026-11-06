@@ -154,7 +154,7 @@ Create a minimal reproduction containing the manifest fragment, lock/artifact ve
 Apply only those relevant to the capsule:
 
 - Coding capsule: compiler/interpreter helper reachability under `sealed`, staged versus host interpreter runtimes, executable workdir trade-offs, subprocess resource bounds, build inputs accidentally packaged, and whether test failure differs from test-runner refusal.
-- Research capsule: exact network allow entries, redirects and required hosts, filesystem/export scopes, native versus WASM tool configuration delivery, content capture sensitivity, and whether fetched material attempted to inject instructions.
+- Research capsule: exact network allow entries, redirects and required hosts, filesystem/export scopes, tool configuration delivery, content capture sensitivity, and whether fetched material attempted to inject instructions.
 - Long-running or stateful capsule: per-artifact state grants, context recording, conversation store identity, resume mode and compaction hook, TTL/export constraints, and resource/workdir growth ceilings.
 - Remote/deployed capsule: SSH and remote command separation, pinned Murmur release retrieval, startup JSON deadline, remote host containment/cgroup posture, port conflicts, and local-versus-remote manifest/lock drift.
 

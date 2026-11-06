@@ -125,8 +125,8 @@ All 36 bursts passed: 810 launches at the required sizes and 600 at the probe.
 | 64 | 5,987.6 (5,688.6–6,340.6) | 5,982.3 (5,645.9–6,324.2) | 5,987.6 (5,688.6–6,340.6) | 0.5290 (0.5054–0.5519) | 2,793.9 (2,793.6–2,794.1) | 2,793.9 (2,793.6–2,794.1) | 2,112.3 (2,105.7–2,233.4) | 1.0 (1.0–1.0) |
 | 100, probe | 9,853.0 (9,038.8–10,332.4) | 9,820.5 (8,938.1–10,315.7) | 9,853.0 (9,038.8–10,332.4) | 0.5456 (0.5165–0.5631) | 4,357.2 (4,357.2–4,357.3) | 4,357.1 (4,356.7–4,357.2) | 4,409.6 (4,399.5–4,423.2) | 1.0 (1.0–1.0) |
 
-At the plateau each capsule's tree is one process: `mur` itself. The shell and the native tool
-start only after the gate opens.
+At the plateau each capsule's tree is one process: `mur` itself. The shell starts only after the
+gate opens.
 
 ### Per capsule at N=40
 

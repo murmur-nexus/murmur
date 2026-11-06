@@ -135,6 +135,8 @@ files.
 
 | Artifact | What it does |
 |---|---|
+| `murmur/tool-browser` | Drives a headless Chrome or Chromium one action per call — open, click, type, snapshot, screenshot — and returns each page as an accessibility tree |
+| `murmur/tool-computer` | Operates the capsule's own 1440×900 virtual display: screenshot, click, drag, type, press keys. A driver may offer it as its provider's own computer tool |
 | `murmur/tool-code-coverage` | Spectrum-based fault localization (Ochiai / Tarantula) over per-test LCOV reports the agent has already captured. Reads a repository indexed by `murmur/tool-code-graph` |
 | `murmur/tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
 | `murmur/tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
@@ -142,9 +144,12 @@ files.
 | `murmur/tool-edit` | Replaces exact text in a file, several edits at once, all or nothing |
 | `murmur/tool-find` | Searches file contents for a regex, optionally narrowed by a glob |
 | `murmur/tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
+| `murmur/tool-github` | Pushes a local commit range to one operator-pinned GitHub repository and opens, lists and merges its pull requests. The token is attached by the entry's `gateway:`, never held by the tool |
 | `murmur/tool-read` | Reads a file, or a range of its lines |
 | `murmur/tool-registry-search` | Searches the artifact index by keyword |
+| `murmur/tool-report` | Writes the session's own conclusion, or a progress note, to `reports/<session_id>.json` in the store `capabilities.state` opens |
 | `murmur/tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
+| `murmur/tool-tavily` | Searches the web with Tavily and returns a bounded text result. The key is attached by the entry's `gateway:`, never held by the tool |
 | `murmur/tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
 | `murmur/tool-write` | Creates or replaces a file, and any missing directories |
 
@@ -172,8 +177,7 @@ is skipped rather than failing the call: the response carries `skipped_lines` an
 ### `murmur/tool-registry-search` { #murmur-tool-registry-search }
 
 Searches an [artifact index](artifact-index.md) by keyword, so a capsule can discover artifacts
-mid-session. It is a native tool with payloads for `linux-x86_64` and `darwin-aarch64`. It takes
-three inputs:
+mid-session. It takes three inputs:
 
 | Input | Required | Notes |
 |---|---:|---|
@@ -189,34 +193,31 @@ It returns:
 | `scope` | The index's `scope` |
 | `count` | The number of results |
 | `results` | One entry per matching artifact: `name` (`<scope>/<name>`), `runtime`, `description`, `tags`, and `versions` |
-| `results[].versions` | Every version the index lists, newest first, each with `version`, `release`, `built_at_level` and `platforms` (`any` for a platform-independent payload) |
+| `results[].versions` | Every version the index lists, newest first, each with `version`, `release` and `built_at_level` |
 
 `mur` decides whether a version fits when it installs it; the tool lists every published version.
 
-As a native tool it runs under the capsule-wide grants, so the capsule lists
+The capsule lists
 `https://github.com` and `https://release-assets.githubusercontent.com` in its top-level
 `capabilities.network.allow`, plus the host of any other `index` URL.
 [`mur new`](cli.md#mur-new-task) declares this tool in the generator capsule it cold-boots, and
 fails with `E-RUN-008` if it is not installed first.
 
-### What each native tool needs { #native-tool-needs }
+### What each tool needs { #tool-needs }
 
-Five of the tools above ship native implementations. Each runs in the capsule's own sandbox, with
-the capsule-wide grants — see [Native tools](containment.md#native-tools) — so what it needs is
-declared in the capsule's top-level `capabilities:` block. Its own artifact entry carries only
-`config:` and `capabilities.state`, which reach that tool alone — see
-[A native tool's own config and store](containment.md#native-tool-settings):
+These tools read and write inside the workdir. A program a tool runs, such as `git`, goes in the
+capsule's `capabilities.shell.allow` and is contained like a shell command — see
+[Programs a WASM tool runs](containment.md#wasm-tool-programs):
 
-| Tool | Capsule grants it needs | `scoped` | `sealed` |
-|---|---|---|---|
-| `murmur/tool-git` | `git` in `capabilities.shell.allow`; the repository inside the workdir. `fetch`, `pull`, `push` and `clone` also need the remote's host in `capabilities.network.allow` and an `interpreter_runtime` grant for `git` naming the directory its remote helpers live in (`/usr/lib/git-core` on Debian and Ubuntu); without it `git` cannot start `git-remote-https` | Works | Works |
-| `murmur/tool-code-graph` | `repo_path` inside the workdir. It writes `<repo_path>/.murmur/code-graph.db` | Works | Works |
-| `murmur/tool-code-coverage` | `repo_path` and `coverage_dir` inside the workdir, and the index `murmur/tool-code-graph` built there | Works | Works |
-| `murmur/tool-test-report` | `input_path` (and `repo_path`, when given) inside the workdir | Works | Works |
-| `murmur/tool-registry-search` | `https://github.com` and `https://release-assets.githubusercontent.com` in `capabilities.network.allow`, plus the host of any other `index` URL; a path `index` inside the workdir | Works | Works |
-
-Without `git` in `capabilities.shell.allow`, every `murmur/tool-git` operation fails with
-`failed to execute git: Permission denied (os error 13)`.
+| Tool | Capsule grants it needs |
+|---|---|
+| `murmur/tool-browser` | One of `chromium`, `chromium-browser`, `google-chrome` or `chrome` in `capabilities.shell.allow`. It writes `.tool-browser/<id>/` in the workdir. Under `sealed` containment a browser launcher that is a shell script, as `google-chrome` is on Debian and Ubuntu, is refused with [`E-CAP-006`](diagnostics.md#e-cap-006) unless its interpreter is granted |
+| `murmur/tool-computer` | `capabilities.containment: sealed` (anything weaker is refused with [`E-CAP-003`](diagnostics.md#e-cap-003)); `Xvfb`, `xkbcomp` and `sh` in `capabilities.shell.allow`, plus any window manager and every program its `config.launch` names |
+| `murmur/tool-git` | `git` in `capabilities.shell.allow`; the repository inside the workdir. `fetch`, `pull`, `push` and `clone` also need the remote's host in `capabilities.network.allow` and an `interpreter_runtime` grant for `git` naming the directory its remote helpers live in (`/usr/lib/git-core` on Debian and Ubuntu); without it `git` cannot start `git-remote-https` |
+| `murmur/tool-code-graph` | `repo_path` inside the workdir. It writes `<repo_path>/.murmur/code-graph.db` |
+| `murmur/tool-code-coverage` | `repo_path` and `coverage_dir` inside the workdir, and the index `murmur/tool-code-graph` built there |
+| `murmur/tool-test-report` | `input_path` (and `repo_path`, when given) inside the workdir |
+| `murmur/tool-registry-search` | `https://github.com` and `https://release-assets.githubusercontent.com` in `capabilities.network.allow`, plus the host of any other `index` URL; a path `index` inside the workdir |
 
 ---
 
@@ -264,23 +265,20 @@ into every tool artifact.
 
 A formation member that may call at least one member also hands every tool, and a
 `transport: http` driver, [`MURMUR_FORMATION_PEERS`](roster.md#formation-peers), whether or not
-`inference:` is configured. Shell commands, native tools and a `transport: process` harness are
-not handed it.
+`inference:` is configured. Shell commands and a `transport: process` harness are not handed it.
 
-Three further variables are injected per artifact rather than per session:
+Two further variables are injected per artifact rather than per session:
 
 | Env var | Injected when | Value |
 |---|---|---|
 | `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
-| `MURMUR_STATE_DIR` | This artifact is a native tool, and its entry declares [`capabilities.state`](manifest.md#tool-capabilities). Native tools only: a WASM artifact reaches its store as the `state` directory | The store's absolute path, `~/.murmur/state/<store>/` |
 | `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint`. Requests sent there reach `gateway.endpoint` with the key attached as the artifact's [`upstream_auth:`](manifest.md#upstream-auth) block declares |
 
 Each reaches the declaring artifact and no other, and the runtime sets it whether or not
 `inference:` is configured. The configured driver receives `MURMUR_GATEWAY_ENDPOINT` on its agent
 turns and a hook's `run-inference`; a driver called by name as a tool receives neither the variable
-nor its gateway. A native tool receives `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR` on every
-containment tier, and none of the per-session variables above; a `gateway:` block on a native tool
-is refused with [`E-CAP-017`](diagnostics.md#e-cap-017). The runtime sets these names, and no
+nor its gateway. An artifact reaches its [store](workdir.md#state-store) as the `state` directory.
+The runtime sets these names, and no
 `capabilities.env.allow` or `capabilities.shell.baseline_env` entry takes them from the host.
 
 Under `transport: process` the driver named by `inference.driver` is a

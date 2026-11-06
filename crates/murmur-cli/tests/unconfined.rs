@@ -2,7 +2,7 @@
 //! commands run as the operator, and only the operator can choose it.
 //!
 //! The model is scripted. What runs is real: `mur` itself, the staged session, the shell command
-//! and native tool it spawns, and the records it writes. Every scratch directory is created under
+//! it spawns, and the records it writes. Every scratch directory is created under
 //! `CARGO_TARGET_TMPDIR`. An unconfined run creates no namespace, so its half never skips; a
 //! contained comparison half that declares `shell.allow` first asks whether this host can give it
 //! one.
@@ -654,57 +654,6 @@ fn the_global_config_chooses_unconfined_and_containment_overrides_it() {
     let start = first(&fixture.trace(), "session_start");
     assert_eq!(start["containment_declared"], "advisory");
     assert_ne!(start["containment_achieved"], "unconfined");
-}
-
-/// A native tool reporting its `HOME`, `MURMUR_TEST_UNCONFINED` and `NoNewPrivs`.
-const NATIVE_PROBE: &str = "#!/bin/bash\n\
-    while read -r _line; do :; done\n\
-    nnp=none\n\
-    while read -r l; do case \"$l\" in NoNewPrivs:*) set -- $l; nnp=$2;; esac; done < /proc/self/status\n\
-    printf '{\"status\":\"passed\",\"data\":\"home=%s var=%s nnp=%s\"}' \"$HOME\" \"$MURMUR_TEST_UNCONFINED\" \"$nnp\"\n";
-
-/// A native tool runs as the operator when unconfined: the real `HOME`, the inherited
-/// variable and this process's `NoNewPrivs`; contained, the session home folder and no variable.
-#[test]
-fn a_native_tool_runs_as_the_operator_when_unconfined() {
-    let fixture = Fixture::new();
-    let tool = common::create_native_artifact(
-        fixture.artifacts.path(),
-        "probe",
-        "0.1.0",
-        NATIVE_PROBE,
-        Some("Reports who it runs as."),
-        None,
-    );
-    common::publish_local(&fixture.home, &tool).success();
-    let artifacts = "  - name: local/probe\n    version: 0.1.0\n    runtime: tool\n";
-    let home = fixture.home.path().display().to_string();
-    let env = [("MURMUR_TEST_UNCONFINED", "present")];
-
-    let call = || common::tool_use_response("toolu_probe", "probe", json!({}));
-    let server = common::ScriptedServer::start(vec![call(), end_turn("Done.")]);
-    fixture.manifest(&server.endpoint, artifacts, "", "");
-    fixture.run(&["--unconfined"], &env);
-    let text = common::tool_result_text(&server.requests(), "toolu_probe").unwrap();
-    assert!(
-        text.contains(&format!(
-            "home={home} var=present nnp={}",
-            own_status("NoNewPrivs")
-        )),
-        "{text}"
-    );
-
-    if capsule_runtime::skip_without_egress_namespace(
-        "a_native_tool_runs_as_the_operator_when_unconfined",
-    ) {
-        return;
-    }
-    let server = common::ScriptedServer::start(vec![call(), end_turn("Done.")]);
-    fixture.manifest(&server.endpoint, artifacts, "", "");
-    fixture.run(&[], &env);
-    let text = common::tool_result_text(&server.requests(), "toolu_probe").unwrap();
-    assert!(!text.contains(&format!("home={home} ")), "{text}");
-    assert!(text.contains("/home var= nnp="), "{text}");
 }
 
 /// `mur run` works inside an unconfined capsule, and the session it starts is a fresh

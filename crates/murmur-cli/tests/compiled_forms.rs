@@ -87,7 +87,6 @@ impl Project {
             .sha256
             .any
             .clone()
-            .unwrap_or_else(|| panic!("lock pins {name}'s sha256"))
     }
 
     /// The payload sha256 the lock pins for `echo-tool`.
@@ -984,10 +983,7 @@ fn a_manifest_install_fills_in_missing_forms_for_cached_artifacts() {
 
     install(&["--no-precompile"]);
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
-    assert_eq!(
-        lock.artifact_for(TOOL_NAME).unwrap().sha256.any.as_deref(),
-        Some(sha256.as_str())
-    );
+    assert_eq!(lock.artifact_for(TOOL_NAME).unwrap().sha256.any, sha256);
     assert!(project
         .path()
         .join(format!(
@@ -1927,20 +1923,6 @@ fn a_reference_that_does_not_parse_refuses_every_reference_before_any_write() {
         assert!(!project.project.path().join(".murmur").exists());
         assert!(!project.compiled().exists());
     }
-
-    let all_platforms = BatchProject::new();
-    let (stdout, stderr) = output(
-        all_platforms
-            .install(&["--all-platforms", "acme/a@1.0.0", "acme/b@1.0.0"])
-            .code(1),
-    );
-    assert_eq!(stdout, "");
-    assert_eq!(
-        stderr,
-        "error[E-IO-003]: --all-platforms takes one artifact reference (scope/name@version)\n"
-    );
-    assert!(!all_platforms.project.path().join(".murmur").exists());
-    assert!(!all_platforms.home.path().join(".murmur").exists());
 }
 
 #[test]
@@ -2053,13 +2035,12 @@ fn a_manifest_install_compiles_each_success_and_reports_failures_in_manifest_ord
 }
 
 #[test]
-fn a_github_release_compiles_each_wasm_payload_and_no_native_one() {
-    use common::github_release::{native_tool_zip, wasm_tool_zip, MockGitHub};
+fn a_github_release_compiles_each_wasm_payload_and_no_skill() {
+    use common::github_release::{wasm_tool_zip, MockGitHub};
 
     let staging = tempfile::tempdir().unwrap();
-    let platform = murmur_artifact::current_platform();
     let alpha = wasm_tool_zip(staging.path(), "alpha", "1.0.0");
-    let gamma = native_tool_zip(staging.path(), "gamma", "1.0.0", platform);
+    let gamma = common::create_skill_artifact(staging.path(), "gamma", "1.0.0", "# gamma\n");
     let beta = wasm_tool_zip(staging.path(), "beta", "1.0.0");
     let release = MockGitHub::start();
     release.repository("acme/artifacts", 4242);
@@ -2105,9 +2086,5 @@ fn a_github_release_compiles_each_wasm_payload_and_no_native_one() {
 
     let compiled = home.path().join(".murmur").join("compiled");
     let tool_forms = checked_forms(&compiled, &[&alpha, &beta]);
-    assert_eq!(
-        forms(&compiled),
-        tool_forms,
-        "the native payload got a form"
-    );
+    assert_eq!(forms(&compiled), tool_forms, "the skill got a form");
 }

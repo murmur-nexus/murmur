@@ -4,17 +4,15 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, is_reserved_version, load_manifest, load_manifest_from_artifact,
-    load_manifest_yaml_from_artifact, parse_tool_implementation_from_yaml, resolve_manifest_path,
-    split_platform_tag, ArtifactImplementation, ArtifactMeta, LocalRegistry, Registry, RuntimeType,
+    is_reserved_version, load_manifest, load_manifest_from_artifact_bytes, resolve_manifest_path,
+    ArtifactMeta, LocalRegistry, Registry, RegistryError, LOCAL_SCOPE,
 };
 
-use crate::error::{CliError, E_IO_001, E_IO_003, E_REG_004};
+use crate::error::{
+    native_payload_refusal, native_tool_install_error, CliError, E_IO_001, E_IO_003, E_REG_004,
+};
 
-pub(crate) fn run_publish(
-    artifact_path_arg: Option<&Path>,
-    platform: Option<&str>,
-) -> Result<(), CliError> {
+pub(crate) fn run_publish(artifact_path_arg: Option<&Path>) -> Result<(), CliError> {
     let artifact_path = resolve_publish_artifact_path(artifact_path_arg)?;
     let bytes = fs::read(&artifact_path).map_err(|source| {
         CliError::new(
@@ -26,14 +24,16 @@ pub(crate) fn run_publish(
         )
     })?;
 
-    let artifact_manifest = load_manifest_from_artifact(&artifact_path).map_err(|error| {
-        CliError::new(
-            E_IO_003,
-            format!(
-                "failed to parse murmur.yaml in {}: {error}",
-                artifact_path.display()
-            ),
-        )
+    let artifact_manifest = load_manifest_from_artifact_bytes(&bytes).map_err(|error| {
+        native_payload_refusal(&error, LOCAL_SCOPE, &bytes).unwrap_or_else(|| {
+            CliError::new(
+                E_IO_003,
+                format!(
+                    "failed to parse murmur.yaml in {}: {error}",
+                    artifact_path.display()
+                ),
+            )
+        })
     })?;
 
     if is_reserved_version(&artifact_manifest.version) {
@@ -47,68 +47,21 @@ pub(crate) fn run_publish(
         ));
     }
 
-    let registry_runtime = artifact_manifest.registry_runtime();
-
-    let (runtime, platforms) = match (platform, registry_runtime) {
-        // Explicit platform flag always takes precedence.
-        (Some(raw), _) => (RuntimeType::Native, vec![parse_platform(raw)?]),
-
-        // Static artifact — doc-only guidance file, no platform tag.
-        (None, RuntimeType::Static) => (RuntimeType::Static, Vec::new()),
-
-        // WASM or native — inspect implementation field to determine platform handling.
-        (None, _) => {
-            let manifest_yaml =
-                load_manifest_yaml_from_artifact(&artifact_path).map_err(|error| {
-                    CliError::new(
-                        E_IO_003,
-                        format!(
-                            "failed to read murmur.yaml from {}: {error}",
-                            artifact_path.display()
-                        ),
-                    )
-                })?;
-            match parse_tool_implementation_from_yaml(&manifest_yaml) {
-                // Native artifact with no explicit platform → auto-detect current build host.
-                ArtifactImplementation::Native => {
-                    if current_platform() == "unknown" {
-                        return Err(CliError::with_hint(
-                            E_IO_003,
-                            "cannot auto-detect platform for native artifact on this host",
-                            "pass an explicit platform with --platform <PLATFORM> (e.g. darwin-aarch64)",
-                        ));
-                    }
-                    capsule_runtime::report_println!(
-                        "Platform: {} (auto-detected)",
-                        current_platform()
-                    );
-                    let platform_parts = parse_platform(current_platform())?;
-                    (RuntimeType::Native, vec![platform_parts])
-                }
-                // WASM or unspecified implementation → no platform tag.
-                ArtifactImplementation::Wasm => (RuntimeType::Wasm, Vec::new()),
-            }
-        }
-    };
-
     // A file names no owner it could be checked against, so what it publishes is `local/`.
-    let name = murmur_artifact::ArtifactName::from_parts(
-        murmur_artifact::LOCAL_SCOPE,
-        &artifact_manifest.name,
-    )
-    .map_err(|error| {
-        CliError::new(
-            E_IO_003,
-            format!("the artifact declares a name that cannot be published: {error}"),
-        )
-    })?;
-    let artifact_id = format!("{name}@{}", artifact_manifest.version);
+    let name = murmur_artifact::ArtifactName::from_parts(LOCAL_SCOPE, &artifact_manifest.name)
+        .map_err(|error| {
+            CliError::new(
+                E_IO_003,
+                format!("the artifact declares a name that cannot be published: {error}"),
+            )
+        })?;
+    let version = artifact_manifest.version.clone();
+    let artifact_id = format!("{name}@{version}");
     let meta = ArtifactMeta {
         name,
+        runtime: artifact_manifest.registry_runtime(),
         version: artifact_manifest.version,
-        runtime,
         artifact_runtime: artifact_manifest.runtime,
-        platforms,
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
@@ -117,7 +70,14 @@ pub(crate) fn run_publish(
     };
 
     let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
-    global_store.publish(meta, &bytes).map_err(CliError::from)?;
+    global_store
+        .publish(meta, &bytes)
+        .map_err(|error| match error {
+            RegistryError::NativeTool { name, field } => {
+                native_tool_install_error(&name, &version, &field)
+            }
+            error => CliError::from(error),
+        })?;
     capsule_runtime::report_println!("Published {artifact_id}");
     Ok(())
 }
@@ -147,16 +107,4 @@ fn resolve_publish_artifact_path(artifact_path_arg: Option<&Path>) -> Result<Pat
     }
 
     Ok(inferred)
-}
-
-/// Parse a platform string in `os-arch` format (e.g. `darwin-aarch64`) into `(os, arch)`.
-pub(crate) fn parse_platform(input: &str) -> Result<(String, String), CliError> {
-    split_platform_tag(input)
-        .map(|(os, arch)| (os.to_string(), arch.to_string()))
-        .ok_or_else(|| {
-            CliError::new(
-                E_IO_003,
-                format!("invalid platform '{input}' (expected os-arch, e.g. darwin-aarch64)"),
-            )
-        })
 }

@@ -85,8 +85,8 @@ pub(crate) enum DeployCommand {
         #[arg(long, value_name = "PATH")]
         env_file: Option<std::path::PathBuf>,
 
-        /// Target platform for artifact resolution (default: linux-x86_64).
-        /// Artifacts are pulled and staged for this platform before deploying.
+        /// Target platform of the VM, which picks the mur binary deploy uploads (default:
+        /// linux-x86_64). Artifacts are the same payload on every platform.
         #[arg(long, default_value = "linux-x86_64")]
         deploy_platform: String,
 
@@ -108,71 +108,54 @@ pub(crate) struct StagedArtifact {
     pub version: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
-    /// The platform a native payload is for, which its file name carries; `None` for a payload
-    /// every platform runs.
-    pub platform: Option<String>,
 }
 
 impl StagedArtifact {
     /// Where `store` files this payload.
     fn payload_path_in(&self, store: &LocalRegistry) -> PathBuf {
-        match &self.platform {
-            Some(platform) => store.artifact_path_for_platform(&self.name, &self.version, platform),
-            None => store.artifact_path_for(&self.name, &self.version),
-        }
+        store.artifact_path_for(&self.name, &self.version)
     }
 
     /// Where `store` files this payload's sha256.
     fn sha256_path_in(&self, store: &LocalRegistry) -> PathBuf {
-        match &self.platform {
-            Some(platform) => store.sha256_path_for_platform(&self.name, &self.version, platform),
-            None => store.sha256_path_for(&self.name, &self.version),
-        }
+        store.sha256_path_for(&self.name, &self.version)
     }
 }
 
-/// Resolve an artifact for `target_platform`, either from the local registry or by fetching it
-/// from its scope's source.
+/// Resolve an artifact, either from the local registry or by fetching it from its scope's source.
 ///
-/// Step A: check local registry for a platform-specific or WASM generic file.
-/// Step B: if Step A misses, resolve it through the scope's index for the target platform, with
-/// the same checks `mur install` makes. Deploy reads no `murmur.lock`, so only the built-in
-/// `murmur` owner is checked. Fetched artifacts are cached at the platform-specific local path.
+/// Step A: check the local registry. Step B: if Step A misses, resolve it through the scope's
+/// index, with the same checks `mur install` makes. Deploy reads no `murmur.lock`, so only the
+/// built-in `murmur` owner is checked. Fetched artifacts are cached in the local registry.
 pub(crate) fn ensure_artifact_for_deploy(
     name: &ArtifactName,
     version: &str,
-    target_platform: &str,
     local_registry: &LocalRegistry,
     sources: &Sources,
 ) -> Result<StagedArtifact, crate::error::CliError> {
     use crate::error::E_REG_001;
-    use murmur_artifact::{current_platform, Registry, RegistryError, RuntimeType};
+    use murmur_artifact::{Registry, RegistryError};
 
-    let platform_specific_path =
-        local_registry.artifact_path_for_platform(name, version, target_platform);
-
-    match local_registry.resolve_with_platform(name, version, Some(target_platform)) {
+    match local_registry.resolve(name, version) {
         Ok(resolved) => {
-            let is_same_platform = target_platform == current_platform();
-            let is_native = resolved.meta.runtime == RuntimeType::Native;
-
-            if is_native && !is_same_platform && !platform_specific_path.exists() {
-                // Different platform native — fall through to Step B to fetch the target variant
-            } else {
-                return Ok(StagedArtifact {
-                    name: name.clone(),
-                    version: version.to_string(),
-                    bytes: resolved.bytes.to_vec(),
-                    sha256: resolved.sha256,
-                    platform: is_native.then(|| target_platform.to_string()),
-                });
-            }
+            return Ok(StagedArtifact {
+                name: name.clone(),
+                version: version.to_string(),
+                bytes: resolved.bytes.to_vec(),
+                sha256: resolved.sha256,
+            });
         }
         Err(RegistryError::NotFound { .. }) => {}
+        Err(RegistryError::NativeTool { field, .. }) => {
+            return Err(crate::error::native_tool_launch_error(
+                name.as_str(),
+                &field,
+            ));
+        }
         Err(e) => return Err(crate::error::CliError::from(e)),
     }
 
-    // Step B — the scope's source, for the target platform. `local/` has none, and is refused
+    // Step B — the scope's source. `local/` has none, and is refused
     // without a request.
     let source = sources.source_for(name, Some(version))?;
     let resolved = match crate::source::resolve(
@@ -180,7 +163,6 @@ pub(crate) fn ensure_artifact_for_deploy(
         name,
         Some(version),
         crate::source::ExplicitVersion::AsAsked,
-        target_platform,
         None,
     ) {
         Ok(resolved) => resolved,
@@ -202,26 +184,15 @@ pub(crate) fn ensure_artifact_for_deploy(
         }
     };
 
-    let runtime = resolved.manifest.registry_runtime();
     // Cached through the registry rather than written by hand, so the cached payload carries the
-    // metadata every other resolve reads — including which platform it is for, which for a
-    // cross-platform deploy is not this host's, and the owner id of the source that served it.
+    // metadata every other resolve reads, including the owner id of the source that served it.
     local_registry
         .store_installed_overwrite(
             murmur_artifact::ArtifactMeta {
                 name: name.clone(),
                 version: version.to_string(),
-                runtime,
+                runtime: resolved.manifest.registry_runtime(),
                 artifact_runtime: resolved.manifest.runtime.clone(),
-                platforms: match (
-                    runtime,
-                    murmur_artifact::split_platform_tag(target_platform),
-                ) {
-                    (RuntimeType::Native, Some((os, arch))) => {
-                        vec![(os.to_string(), arch.to_string())]
-                    }
-                    _ => Vec::new(),
-                },
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
@@ -238,7 +209,6 @@ pub(crate) fn ensure_artifact_for_deploy(
         version: version.to_string(),
         bytes: resolved.bytes.to_vec(),
         sha256: resolved.sha256,
-        platform: (runtime == RuntimeType::Native).then(|| target_platform.to_string()),
     })
 }
 
@@ -1093,12 +1063,7 @@ pub(crate) fn run_deploy(
     // Done before creating spinners so the group header can show accurate counts.
     let cached_flags: Vec<bool> = artifact_refs
         .iter()
-        .map(|(name, version)| {
-            local_registry
-                .artifact_path_for_platform(name, version, target_platform)
-                .exists()
-                || local_registry.artifact_path_for(name, version).exists()
-        })
+        .map(|(name, version)| local_registry.artifact_path_for(name, version).exists())
         .collect();
 
     // ── 0.6. Pre-check mur binary cache ──────────────────────────────────────
@@ -1281,13 +1246,7 @@ pub(crate) fn run_deploy(
                 crate::source::github::push_download_progress(pb.clone());
             }
 
-            let result = ensure_artifact_for_deploy(
-                name,
-                version,
-                target_platform,
-                &local_registry,
-                &sources,
-            );
+            let result = ensure_artifact_for_deploy(name, version, &local_registry, &sources);
 
             if !is_cached {
                 crate::source::github::pop_download_progress();
@@ -2168,44 +2127,35 @@ mod tests {
         assert!(compile.starts_with(&prefix), "{compile}");
     }
 
-    fn staged(name: &str, version: &str, platform: Option<&str>) -> StagedArtifact {
+    fn staged(name: &str, version: &str) -> StagedArtifact {
         StagedArtifact {
             name: ArtifactName::parse(name).unwrap(),
             version: version.to_string(),
             bytes: Vec::new(),
             sha256: String::new(),
-            platform: platform.map(str::to_string),
         }
     }
 
     #[test]
-    fn a_wasm_payload_uploads_under_its_scope_and_bare_name() {
+    fn a_payload_uploads_under_its_scope_and_bare_name() {
         assert_eq!(
-            remote_payload_path(&staged("murmur/tool-git", "0.2.0", None)),
+            remote_payload_path(&staged("murmur/tool-git", "0.2.0")),
             "/root/.murmur/artifacts/murmur/tool-git/0.2.0/tool-git-0.2.0.mur.zip"
-        );
-    }
-
-    #[test]
-    fn a_native_payload_uploads_under_its_scope_with_the_platform_in_its_file_name() {
-        assert_eq!(
-            remote_payload_path(&staged("ana/tool-x", "1.0.0", Some("linux-x86_64"))),
-            "/root/.murmur/artifacts/ana/tool-x/1.0.0/tool-x-1.0.0-linux-x86_64.mur.zip"
         );
     }
 
     #[test]
     fn the_compile_command_names_every_payload_under_the_start_scripts_workdir() {
         let paths = [
-            remote_payload_path(&staged("local/a", "0.1.0", None)),
-            remote_payload_path(&staged("murmur/b", "1.2.3", Some("linux-aarch64"))),
+            remote_payload_path(&staged("local/a", "0.1.0")),
+            remote_payload_path(&staged("murmur/b", "1.2.3")),
         ];
         assert_eq!(
             build_precompile_command("/root/mur-abc123", &paths),
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
              /usr/local/bin/mur precompile --json --workdir /root/mur-abc123 \
              /root/.murmur/artifacts/local/a/0.1.0/a-0.1.0.mur.zip \
-             /root/.murmur/artifacts/murmur/b/1.2.3/b-1.2.3-linux-aarch64.mur.zip"
+             /root/.murmur/artifacts/murmur/b/1.2.3/b-1.2.3.mur.zip"
         );
         let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml", true);
         assert!(start.contains(" --workdir /root/mur-abc123 "), "{start}");
@@ -2241,7 +2191,7 @@ mod tests {
         let stdout = report_line(
             &[
                 (Some("echo-tool@0.1.0"), "compiled"),
-                (Some("native@0.1.0"), "not_wasm"),
+                (Some("skill@0.1.0"), "not_wasm"),
                 (Some("driver@0.1.0"), "already_stored"),
             ],
             524_288_000,
@@ -2555,7 +2505,7 @@ mod tests {
     fn staging_lays_payloads_out_as_a_store_under_the_deployment_dir() {
         let staging_dir = std::path::PathBuf::from("/h/.murmur/deploy_staging/abc123-deployment");
         let store = LocalRegistry::new(&staging_dir);
-        let generic = staged("murmur/driver-openai", "0.9.0", None);
+        let generic = staged("murmur/driver-openai", "0.9.0");
         assert_eq!(
             generic.payload_path_in(&store),
             staging_dir.join("murmur/driver-openai/0.9.0/driver-openai-0.9.0.mur.zip")
@@ -2563,13 +2513,6 @@ mod tests {
         assert_eq!(
             generic.sha256_path_in(&store),
             staging_dir.join("murmur/driver-openai/0.9.0/driver-openai-0.9.0.sha256")
-        );
-        let native = staged("ana/tool-x", "1.0.0", Some("linux-x86_64"));
-        assert_eq!(
-            native.sha256_path_in(&remote_store()),
-            std::path::Path::new(
-                "/root/.murmur/artifacts/ana/tool-x/1.0.0/tool-x-1.0.0-linux-x86_64.sha256"
-            )
         );
     }
 
@@ -2640,7 +2583,6 @@ mod tests {
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -2660,7 +2602,7 @@ mod tests {
             .par_iter()
             .map(|(name, version)| {
                 let name = ArtifactName::parse(name).unwrap();
-                ensure_artifact_for_deploy(&name, version, "linux-x86_64", &registry, &sources)
+                ensure_artifact_for_deploy(&name, version, &registry, &sources)
             })
             .collect();
 
@@ -2856,7 +2798,7 @@ mod tests {
     mod ensure_artifact {
         use std::{io::Write, sync::Arc};
 
-        use murmur_artifact::{current_platform, ArtifactMeta, LocalRegistry, RuntimeType};
+        use murmur_artifact::{ArtifactMeta, LocalRegistry, RuntimeType};
         use tempfile::tempdir;
         use zip::{
             write::{FileOptions, SimpleFileOptions},
@@ -2890,9 +2832,8 @@ mod tests {
             cursor.into_inner()
         }
 
-        /// A `.mur.zip` declaring a native tool. `filler` goes in the binary, so two
-        /// platforms' payloads hash differently.
-        fn make_native_zip(name: &str, version: &str, filler: &[u8]) -> Vec<u8> {
+        /// A `.mur.zip` declaring a native tool, which no `mur build` writes.
+        fn make_native_zip(name: &str, version: &str) -> Vec<u8> {
             let mut cursor = std::io::Cursor::new(Vec::new());
             {
                 let mut zip = ZipWriter::new(&mut cursor);
@@ -2904,16 +2845,10 @@ mod tests {
                 writeln!(zip, "runtime: tool").unwrap();
                 writeln!(zip, "implementation: native").unwrap();
                 zip.start_file(format!("bin/{name}"), opts).unwrap();
-                zip.write_all(filler).unwrap();
+                zip.write_all(b"native-binary").unwrap();
                 zip.finish().unwrap();
             }
             cursor.into_inner()
-        }
-
-        /// No source for any scope: a fetch is refused without a request, so a test can tell
-        /// "resolved locally" from "fell through to the fetch step" unambiguously.
-        fn no_sources() -> Sources {
-            Sources::from_sources(Vec::new())
         }
 
         fn store_wasm(registry: &LocalRegistry, name: &ArtifactName, version: &str, bytes: &[u8]) {
@@ -2925,7 +2860,6 @@ mod tests {
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
-                        platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
@@ -2938,34 +2872,8 @@ mod tests {
                 .unwrap();
         }
 
-        fn store_native_at_platform_path(
-            registry: &LocalRegistry,
-            name: &ArtifactName,
-            version: &str,
-            platform: &str,
-            bytes: &[u8],
-        ) {
-            let artifact_path = registry.artifact_path_for_platform(name, version, platform);
-            std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-            std::fs::write(&artifact_path, bytes).unwrap();
-            let sha256 = sha256_hex(bytes);
-            let sha256_path = artifact_path
-                .parent()
-                .unwrap()
-                .join(format!("{}-{version}-{platform}.sha256", name.name()));
-            std::fs::write(&sha256_path, sha256.as_bytes()).unwrap();
-            let (os, arch) = murmur_artifact::split_platform_tag(platform).unwrap();
-            let meta_path = registry.metadata_path_for(name, version, Some(platform));
-            let meta = serde_json::json!({
-                "meta": {
-                    "name": name.as_str(), "version": version,
-                    "runtime": "native", "artifact_runtime": "tool",
-                    "platforms": [[os, arch]], "description": null, "tags": []
-                }
-            });
-            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-        }
-
+        /// A native payload filed the way an older mur filed one: at the generic path, under a
+        /// sidecar recording `runtime: native`.
         fn store_native_at_generic_path(
             registry: &LocalRegistry,
             name: &ArtifactName,
@@ -2988,7 +2896,7 @@ mod tests {
             let meta = serde_json::json!({
                 "meta": {
                     "name": name.as_str(), "version": version,
-                    "runtime": "native", "artifact_runtime": "native",
+                    "runtime": "native", "artifact_runtime": "tool",
                     "platforms": [], "description": null, "tags": []
                 }
             });
@@ -3014,12 +2922,9 @@ mod tests {
 
             let (sources, source) = ana_sources(|_| {});
 
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
-                    .unwrap();
+            let staged = ensure_artifact_for_deploy(&tool(), "1.0.0", &registry, &sources).unwrap();
 
             assert_eq!(staged.name, tool());
-            assert_eq!(staged.platform, None);
             assert_eq!(staged.version, "1.0.0");
             assert_eq!(staged.bytes, bytes);
             assert!(
@@ -3035,96 +2940,19 @@ mod tests {
             let bytes = make_zip("my-tool", "1.0.0");
 
             let (sources, source) = ana_sources(|source| {
-                source.publish("v1", "my-tool", "1.0.0", None, &[], bytes.clone());
+                source.publish("v1", "my-tool", "1.0.0", &[], bytes.clone());
             });
 
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
-                    .unwrap();
+            let staged = ensure_artifact_for_deploy(&tool(), "1.0.0", &registry, &sources).unwrap();
 
             assert_eq!(staged.bytes, bytes);
             assert_eq!(
                 source.fetched(),
                 [("v1".to_string(), "my-tool-1.0.0.mur.zip".to_string())]
             );
-            let meta = std::fs::read_to_string(registry.metadata_path_for(&tool(), "1.0.0", None))
-                .unwrap();
+            let meta =
+                std::fs::read_to_string(registry.metadata_path_for(&tool(), "1.0.0")).unwrap();
             assert!(meta.contains("\"owner_id\": 1111"), "{meta}");
-        }
-
-        #[test]
-        fn native_artifact_different_platform_linux_variant_pulled() {
-            let dir = tempdir().unwrap();
-            let registry = LocalRegistry::new(dir.path());
-
-            let darwin_bytes = make_native_zip("my-tool", "1.0.0", b"darwin-binary");
-            store_native_at_platform_path(
-                &registry,
-                &tool(),
-                "1.0.0",
-                "darwin-aarch64",
-                &darwin_bytes,
-            );
-
-            let linux_bytes = make_native_zip("my-tool", "1.0.0", b"linux-binary");
-            let (sources, source) = ana_sources(|source| {
-                source
-                    .publish(
-                        "v1",
-                        "my-tool",
-                        "1.0.0",
-                        Some("darwin-aarch64"),
-                        &[],
-                        darwin_bytes.clone(),
-                    )
-                    .publish(
-                        "v1",
-                        "my-tool",
-                        "1.0.0",
-                        Some("linux-x86_64"),
-                        &[],
-                        linux_bytes.clone(),
-                    );
-            });
-
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
-                    .unwrap();
-
-            assert_eq!(staged.bytes, linux_bytes);
-            assert_eq!(staged.platform.as_deref(), Some("linux-x86_64"));
-            assert_eq!(
-                source.fetched(),
-                [(
-                    "v1".to_string(),
-                    "my-tool-1.0.0-linux-x86_64.mur.zip".to_string()
-                )],
-                "the target platform's payload is fetched by its exact file name"
-            );
-
-            let cached = registry.artifact_path_for_platform(&tool(), "1.0.0", "linux-x86_64");
-            assert!(cached.exists(), "linux binary should be cached locally");
-        }
-
-        #[test]
-        fn native_artifact_same_platform_local_generic_used() {
-            let dir = tempdir().unwrap();
-            let registry = LocalRegistry::new(dir.path());
-
-            let bytes = make_native_zip("my-tool", "1.0.0", b"native-binary");
-            store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
-
-            let (sources, source) = ana_sources(|_| {});
-
-            let target = current_platform();
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources).unwrap();
-
-            assert_eq!(staged.bytes, bytes);
-            assert!(
-                source.fetched().is_empty(),
-                "the source must not be asked for a same-platform native payload"
-            );
         }
 
         #[test]
@@ -3137,7 +2965,6 @@ mod tests {
             let err = ensure_artifact_for_deploy(
                 &ArtifactName::parse("ana/missing-tool").unwrap(),
                 "9.9.9",
-                "linux-x86_64",
                 &registry,
                 &sources,
             )
@@ -3164,20 +2991,12 @@ mod tests {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
             let (sources, source) = ana_sources(|source| {
-                source.publish(
-                    "v1",
-                    "my-tool",
-                    "1.0.0",
-                    None,
-                    &[],
-                    make_zip("my-tool", "1.0.0"),
-                );
+                source.publish("v1", "my-tool", "1.0.0", &[], make_zip("my-tool", "1.0.0"));
             });
 
             let err = ensure_artifact_for_deploy(
                 &ArtifactName::parse("local/my-tool").unwrap(),
                 "1.0.0",
-                "linux-x86_64",
                 &registry,
                 &sources,
             )
@@ -3202,138 +3021,32 @@ mod tests {
             );
         }
 
-        /// A store holding one payload per platform stages the target's, not this host's.
+        /// A native payload an older mur stored is refused with `E-RUN-061`, and no source is
+        /// asked for a replacement.
         #[test]
-        fn a_tagged_store_stages_the_target_platforms_payload() {
+        fn a_stored_native_payload_is_refused_without_asking_a_source() {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
-            let host = current_platform();
-            let target = murmur_artifact::SUPPORTED_PLATFORMS
-                .iter()
-                .copied()
-                .find(|platform| *platform != host)
-                .unwrap();
-
-            let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
-            let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
-            store_native_at_platform_path(&registry, &tool(), "1.0.0", host, &host_bytes);
-            store_native_at_platform_path(&registry, &tool(), "1.0.0", target, &target_bytes);
-
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &no_sources())
-                    .unwrap();
-
-            assert_eq!(staged.bytes, target_bytes);
-            assert_eq!(staged.sha256, sha256_hex(&target_bytes));
-            assert_ne!(staged.sha256, sha256_hex(&host_bytes));
-        }
-
-        /// A native payload at the generic path is for an unrecorded platform, so it must not
-        /// be staged for a foreign one. It falls through to the fetch step instead — here, one
-        /// that cannot reach anything.
-        #[test]
-        fn an_untagged_native_payload_is_not_staged_for_a_foreign_platform() {
-            let dir = tempdir().unwrap();
-            let registry = LocalRegistry::new(dir.path());
-            let target = murmur_artifact::SUPPORTED_PLATFORMS
-                .iter()
-                .copied()
-                .find(|platform| *platform != current_platform())
-                .unwrap();
-
-            let bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
-            store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
-
-            let (sources, _) = ana_sources(|_| {});
-            let err = ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources)
-                .unwrap_err();
-            assert!(
-                err.message
-                    .contains("not found locally or in github:ana/artifacts"),
-                "expected a fetch attempt, got: {}",
-                err.message
+            store_native_at_generic_path(
+                &registry,
+                &tool(),
+                "1.0.0",
+                &make_native_zip("my-tool", "1.0.0"),
             );
-        }
-
-        /// A native payload at the generic path under a sidecar that disagrees with it:
-        /// `wasm` and no role, what an install recording a guess rather than the artifact's
-        /// own manifest leaves behind.
-        fn store_native_recorded_as_wasm(
-            registry: &LocalRegistry,
-            name: &ArtifactName,
-            version: &str,
-            bytes: &[u8],
-        ) {
-            let artifact_path = registry.artifact_path_for(name, version);
-            std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-            std::fs::write(&artifact_path, bytes).unwrap();
-            let sha256 = sha256_hex(bytes);
-            std::fs::write(
-                artifact_path
-                    .parent()
-                    .unwrap()
-                    .join(format!("{}-{version}.sha256", name.name())),
-                sha256.as_bytes(),
-            )
-            .unwrap();
-            let meta = serde_json::json!({
-                "meta": {
-                    "name": name.as_str(), "version": version,
-                    "runtime": "wasm", "artifact_runtime": "",
-                    "platforms": [], "description": null, "tags": []
-                }
-            });
-            std::fs::write(
-                registry.metadata_path_for(name, version, None),
-                serde_json::to_string_pretty(&meta).unwrap(),
-            )
-            .unwrap();
-        }
-
-        /// The payload decides, not the sidecar: a native artifact whose recorded packaging
-        /// type says `wasm` still fetches the target platform's binary rather than staging this
-        /// host's.
-        #[test]
-        fn a_native_payload_recorded_as_wasm_still_pulls_the_target_platforms_binary() {
-            let dir = tempdir().unwrap();
-            let registry = LocalRegistry::new(dir.path());
-            let target = murmur_artifact::SUPPORTED_PLATFORMS
-                .iter()
-                .copied()
-                .find(|platform| *platform != current_platform())
-                .unwrap();
-
-            let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
-            store_native_recorded_as_wasm(&registry, &tool(), "1.0.0", &host_bytes);
-
-            let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
             let (sources, source) = ana_sources(|source| {
-                source.publish(
-                    "v1",
-                    "my-tool",
-                    "1.0.0",
-                    Some(target),
-                    &[],
-                    target_bytes.clone(),
-                );
+                source.publish("v1", "my-tool", "1.0.0", &[], make_zip("my-tool", "1.0.0"));
             });
 
-            let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources).unwrap();
+            let err =
+                ensure_artifact_for_deploy(&tool(), "1.0.0", &registry, &sources).unwrap_err();
 
-            assert_eq!(staged.bytes, target_bytes);
-            assert_ne!(staged.bytes, host_bytes);
-            assert_eq!(
-                source.fetched().len(),
-                1,
-                "the source must be asked for the target platform's binary"
-            );
+            assert_eq!(err.code, crate::error::E_RUN_061);
             assert!(
-                registry
-                    .artifact_path_for_platform(&tool(), "1.0.0", target)
-                    .exists(),
-                "the fetched payload must be cached under the target platform"
+                err.message.contains("ana/my-tool") && err.message.contains("implementation"),
+                "{}",
+                err.message
             );
+            assert!(source.fetched().is_empty());
         }
     }
 

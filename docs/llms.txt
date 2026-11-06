@@ -25,9 +25,9 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 
 - [Capsules](/concepts/capsules.md): Murmur's primary execution abstraction — the unit that packages an agent's inference, tools, skills, and configuration together.
 - [Artifacts](/concepts/artifacts.md): Tools, drivers, hooks, and skills — the named, versioned pieces a capsule's manifest declares as dependencies.
-- [Session Loop](/concepts/session-loop.md): The runtime's native execution environment for a capsule: the inference loop and its extension points (tools, hooks, drivers).
+- [Session Loop](/concepts/session-loop.md): The runtime's execution environment for a capsule: the inference loop and its extension points (tools, hooks, drivers).
 - [Hooks](/concepts/hooks.md): An artifact that observes a lifecycle point, receives structured input from the runtime, and can return output the runtime commits.
-- [Tools](/concepts/tools.md): How murmur defines tool artifacts — both WASM and native — and how the runtime invokes them during a session.
+- [Tools](/concepts/tools.md): How murmur defines tool artifacts — WASM components — and how the runtime invokes them during a session.
 - [Access Control](/concepts/access-control.md): The `capabilities` block: what a capsule and its artifacts are allowed to reach — filesystem, network, and subprocesses.
 - [Context](/concepts/context.md): Context compaction — how the runtime condenses message history automatically so a long-running session avoids hitting a hard token limit.
 - [Formations](/concepts/formations.md): A group of capsules on one machine, declared in `roster.yaml` and launched with `mur run --roster` for one task or until it is stopped, whose members hand each other work with `call-member`.
@@ -71,8 +71,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 
 ## Language Guides
 
-- [Python Tool Quickstart (WASM)](/language-guides/python.md): Packaging a Python tool as a WASM artifact for murmur's Rust-centric but language-agnostic ecosystem.
-- [Python Tool Quickstart (Native)](/language-guides/python-native.md): The native compatibility path for tools, for when WASM isn't the right fit.
+- [Python Tool Quickstart (WASM)](/language-guides/python.md): Building a Murmur tool, a WASM component, in Python and packaging it as an artifact.
 
 ## Reference
 

@@ -16,7 +16,7 @@
 ## What is being verified, and what class of problem it is
 
 `capabilities.resources` bounds the operating-system processes the runtime spawns — the
-`capabilities.shell.allow` binaries and native-implementation tool artifacts. A capsule that is
+`capabilities.shell.allow` binaries, whether the model's shell or a WASM tool runs them. A capsule that is
 fully contained can still wedge or starve its host: unbounded forking, unbounded open files,
 unbounded disk writes, unbounded per-process CPU and memory, unbounded workdir growth.
 
@@ -91,9 +91,8 @@ probe at launch and refuses with `E-RUN-012` naming what is missing.
 
 ### What the runtime does with the delegation
 
-At launch, before any WASM is instantiated, if the capsule can spawn a native subprocess
-(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact) the
-runtime:
+At launch, before any WASM is instantiated, if the capsule can spawn a subprocess
+(`capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty) the runtime:
 
 1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
    `Delegate=yes` and moves itself into it — the same mechanism rootless Podman and Docker use —
@@ -209,7 +208,7 @@ inference:
 | `shell.allow` | A command can run only the binaries `shell.allow` lists, so every binary a scenario runs is listed. `git` is there for `murmur/tool-git`, which runs `git` itself ([scenario 8](#scenario-8)). |
 | `interpreter_runtime` | `python3` starts only with its standard library and `lib-dynload` readable ([scenario 3](#scenario-3)). Both paths differ between hosts; replace them with the directory the comment's command prints and its `lib-dynload`. Declaring the grant prints `W-SEC-009` on every run. |
 | `context.max_tokens`, `inference.max_tokens` | `murmur/driver-openai` `0.10.0` declares no limits for `gpt-5.6-luna`. Without an output cap the launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052); without a context window `mur doctor` warns [`W-RUN-009`](diagnostics.md#w-run-009). |
-| `max_open_files: 64` | Far enough below the 1024 default that [scenario 1](#scenario-1)'s probe reaches `EMFILE` within its loop, and the value [scenario 8](#scenario-8) checks on a native tool. |
+| `max_open_files: 64` | Far enough below the 1024 default that [scenario 1](#scenario-1)'s probe reaches `EMFILE` within its loop, and the value [scenario 8](#scenario-8) checks on the `git` that `murmur/tool-git` runs. |
 | `lifecycle.shell_grace_secs: 60` | A command still running after [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) moves to the background, and its trace records neither `exit_code` nor `resource_limit`. At `cgroup_cpu_percent: 50`, scenario 4's 5 CPU-seconds take about 10 seconds, well inside 60. |
 
 Any driver works, but the model must follow the scenario's instructions exactly. Asked plainly to
@@ -236,14 +235,14 @@ Three scenarios use a variant of this manifest. Make them from `murmur.yaml`:
 
 ```bash
 sed '/^  resources:/,/^$/{/^  resources:/d;/^    /d}' murmur.yaml > murmur-defaults.yaml
-sed '/^capabilities:/,/^$/d;/murmur\/tool-git/,/version/d' murmur.yaml > murmur-wasm-only.yaml
+sed '/^capabilities:/,/^$/d' murmur.yaml > murmur-wasm-only.yaml
 sed 's/^    memory_bytes: .*/    memory_bytes: 4294967296/' murmur.yaml > murmur-cgroup-memory.yaml
 ```
 
 | Variant | Change from `murmur.yaml` | Scenario |
 |---|---|---|
 | `murmur-defaults.yaml` | No `resources:` block | [0](#scenario-0) |
-| `murmur-wasm-only.yaml` | No `capabilities:` block and no `murmur/tool-git` entry. A native tool artifact on its own makes a capsule subprocess-capable | [7b](#scenario-7) |
+| `murmur-wasm-only.yaml` | No `capabilities:` block, so no `shell.allow` or `spawn.allow` makes the capsule subprocess-capable | [7b](#scenario-7) |
 | `murmur-cgroup-memory.yaml` | `memory_bytes: 4294967296` (4 GiB), so the cgroup's 256 MiB is the first memory bound a process meets | [3](#scenario-3) |
 
 Before each scenario, in another terminal, keep an eye on the host:
@@ -577,7 +576,7 @@ env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
 spawned:
 
 ```
-error[E-RUN-012]: this capsule can spawn native subprocesses but no cgroup v2 scope could be created to bound them ({reason}); on Linux the runtime refuses to launch rather than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user delegation requirement at https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+error[E-RUN-012]: this capsule can spawn subprocesses but no cgroup v2 scope could be created to bound them ({reason}); on Linux the runtime refuses to launch rather than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user delegation requirement at https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
   hint: the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
 ```
 
@@ -590,8 +589,8 @@ lists is the refused launch, and its [records directory](workdir.md#records-dire
 
 **7b — WASM-only capsule, no delegation → launch proceeds.** Run
 [`murmur-wasm-only.yaml`](#the-test-capsule), keeping delegation removed. It has no
-`capabilities:` block and no `murmur/tool-git` entry, because a native tool artifact on its own
-makes a capsule subprocess-capable and would turn this launch into a refusal:
+`capabilities:` block, so nothing in it can start a subprocess, and `murmur/tool-git` runs inside
+the `mur` process:
 
 ```bash
 env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
@@ -606,25 +605,25 @@ Restore the delegation drop-in afterwards.
 
 ---
 
-## Scenario 8 — native-implementation tool artifacts are bounded too { #scenario-8 }
+## Scenario 8 — programs a WASM tool runs are bounded too { #scenario-8 }
 
-A native-implementation tool artifact is spawned through the same path as a
+A program a WASM tool runs through `murmur:process` is spawned through the same path as a
 `capabilities.shell.allow` subprocess, so it gets the same rlimits and cgroup scope.
 
 The test capsule lists `murmur/tool-git`, and `git` is in its `shell.allow` because the tool runs
-the `git` binary itself. Run a task that calls the tool on a repository large enough for `status`
-to run long enough to catch:
+the `git` binary through `murmur:process`. Run a task that calls the tool on a repository large
+enough for `status` to run long enough to catch:
 
 ```bash
 mur run --manifest murmur.yaml --task 'First, with bash, run exactly: git init -q repo && for i in $(seq 1 20000); do : > repo/f$i; done
 Then use the git tool, not bash, to show the status of ./repo, and report how many untracked files it lists.'
 ```
 
-While the tool runs, confirm it is inside the session's cgroup, with
+While the tool runs, confirm its `git` process is inside the session's cgroup, with
 [`watch_scope`](#what-the-runtime-does-with-the-delegation) started before the run:
 
 ```bash
-watch_scope cgroup.procs                          # the native tool's pid must appear here
+watch_scope cgroup.procs                          # the git process's pid must appear here
 grep -E '^Max (open files|processes)' /proc/<pid>/limits
 ```
 
@@ -633,40 +632,7 @@ hard columns. `Max processes` shows the value `mur` inherited, unchanged: a subp
 gets no `RLIMIT_NPROC`, and `cgroup_pids_max` bounds it instead.
 
 The same spawn also installs the seccomp filter, the Landlock scope and the session's network
-namespace; [Native tools](containment.md#native-tools) describes them, and
-`crates/murmur-cli/tests/native_tool_confinement.rs` checks them.
-
-On a host that reaches `sealed`, also check that a native tool starts under a low ceiling while
-`mur` holds more descriptors than that ceiling:
-
-1. Confirm the host reaches `sealed`: `mur run --explain-scope` on a capsule declaring
-   `capabilities.containment: sealed` prints `achieved:  sealed`, as in
-   [step 2 of the sealed verification](sealed-containment-manual-verification.md#step-2-load-the-profile-and-confirm-the-host-now-reaches-sealed).
-   The test below runs the session inside its own test binary, which no AppArmor profile attaches
-   to, so on a host where `kernel.apparmor_restrict_unprivileged_userns` is `1` it prints
-   `[SKIP-HOST]` instead of running.
-2. From a checkout, run:
-
-    ```bash
-    cargo nextest run -p murmur-cli --test native_tool_confinement \
-      a_native_tool_starts_under_a_low_max_open_files_sealed --no-capture
-    ```
-
-    **Expected:** the test passes, and no `[SKIP-HOST]` line is printed. The capsule declares
-    `max_open_files: 64`; the fixture tool reads `64` soft and hard from its own `RLIMIT_NOFILE`,
-    fails to open a 64th descriptor with `Too many open files`, and `ulimit -Sn; ulimit -Hn` in
-    `bash` prints `64` twice.
-
-3. When it fails, print the runtime's reason for each call it could not run from the session's
-   trace:
-
-    ```bash
-    jq -r 'select(.event_type == "tool_call" and .status == "error") | .error' <trace.jsonl>
-    ```
-
-    The [`tool_call` record's `error`](observability-schemas.md#tool-call) is written under
-    every `trace.capture` mode, so the default `meta` carries it too. The test's own failure
-    message prints the same record.
+namespace; [Programs a WASM tool runs](containment.md#wasm-tool-programs) describes them.
 
 ---
 

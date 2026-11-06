@@ -143,12 +143,12 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 | `--env` | *(none)* | `KEY=VALUE` environment variable for `mur run` on the VM; repeat for multiple |
 | `--env-file` | *(auto-detect)* | Path to a `.env` file; `KEY=VALUE` or `export KEY=VALUE`; `#` comments ignored. If neither `--env` nor `--env-file` is passed, `.env` next to the manifest is loaded automatically |
 | `--workdir` | *(none)* | Local directory to upload as the capsule working directory |
-| `--deploy-platform` | `linux-x86_64` | Target platform for artifact resolution and staging |
+| `--deploy-platform` | `linux-x86_64` | Platform of the VM; picks the `mur` binary uploaded to it |
 | `--no-precompile` | *(off)* | Skip compiling the uploaded WASM artifacts on the VM; the capsule compiles them on its first launch instead |
 
 ### What `mur deploy run` does
 
-1. Parses the manifest and resolves every declared artifact for the target platform — fails immediately if any artifact is unavailable, before touching the network. A native artifact installed for this host is not reused for a different target: the target platform's payload is downloaded and cached beside it
+1. Parses the manifest and resolves every declared artifact — fails immediately if any artifact is unavailable, before touching the network
 2. Checks that every file referenced by the manifest (e.g. `inference.system_prompt_file`) exists locally — fails immediately if any file is missing
 3. Validates every `--env` entry; a missing `=` or empty key causes an immediate exit
 4. Resolves the `mur` binary: uses `deploy.mur_version` from the manifest if set, otherwise the running version; downloads and caches if not already cached

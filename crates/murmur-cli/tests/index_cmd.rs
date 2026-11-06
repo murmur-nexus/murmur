@@ -68,17 +68,8 @@ fn pack_echo_tool(dir: &Path, version: &str) -> PathBuf {
     )
 }
 
-fn pack_native(dir: &Path, name: &str, version: &str, platform: &str) -> PathBuf {
-    pack(
-        dir,
-        &format!("{name}-{version}-{platform}.mur.zip"),
-        &format!("name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"),
-        &[(&format!("bin/{name}"), b"#!/bin/sh\necho native\n")],
-    )
-}
-
 /// A release directory: an echo tool at two versions, a hook exporting an interface no `mur`
-/// serves, a native tool with two platform payloads, a skill, and two entries `mur index` skips.
+/// serves, a skill, and two entries `mur index` skips.
 fn release_dir() -> TempDir {
     let dir = TempDir::new().unwrap();
     pack_echo_tool(dir.path(), "0.1.0");
@@ -89,8 +80,6 @@ fn release_dir() -> TempDir {
         "name: hook-old\nversion: 0.3.0\nruntime: hook\n",
         &[("hook.wasm", &wat::parse_str(UNSERVED_HOOK_WAT).unwrap())],
     );
-    pack_native(dir.path(), "tool-native", "1.0.0", "linux-x86_64");
-    pack_native(dir.path(), "tool-native", "1.0.0", "darwin-aarch64");
     pack(
         dir.path(),
         "skill-notes-0.1.0.mur.zip",
@@ -204,7 +193,7 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
     .success();
     assert_eq!(
         stdout_of(&assert),
-        "Indexed 4 artifacts (5 versions) for scope ana into out.json\n"
+        "Indexed 3 artifacts (4 versions) for scope ana into out.json\n"
     );
 
     let out = out_dir.path().join("out.json");
@@ -223,10 +212,7 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
         .iter()
         .map(|a| a["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        names,
-        ["echo-tool", "hook-old", "skill-notes", "tool-native"]
-    );
+    assert_eq!(names, ["echo-tool", "hook-old", "skill-notes"]);
 
     for a in index["artifacts"].as_array().unwrap() {
         for v in a["versions"].as_array().unwrap() {
@@ -295,14 +281,10 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
         json!([UNSERVED_HOOK_INTERFACE])
     );
 
-    let native = artifact(&index, "tool-native");
-    assert_eq!(native["versions"].as_array().unwrap().len(), 1);
-    assert_eq!(native["versions"][0]["interfaces"], json!([]));
-
     // None of these files packs a label, so each is derived from its interfaces: the newest level
     // they fit, or none for the hook that fits no level.
     let served = capsule_runtime::served_wit_level().level;
-    for name in ["echo-tool", "skill-notes", "tool-native"] {
+    for name in ["echo-tool", "skill-notes"] {
         for v in artifact(&index, name)["versions"].as_array().unwrap() {
             assert_eq!(v["built_at_level"], json!(served), "{name}: {v}");
         }
@@ -311,14 +293,6 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
         hook["versions"][0].get("built_at_level").is_none(),
         "{hook}"
     );
-    let platforms: Vec<&str> = native["versions"][0]["assets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["platform"].as_str().unwrap())
-        .collect();
-    assert_eq!(platforms, ["darwin-aarch64", "linux-x86_64"]);
-
     let skill = artifact(&index, "skill-notes");
     assert_eq!(skill["description"], "Take notes!");
     assert_eq!(skill["tags"], json!(["skill", "notes"]));
@@ -436,7 +410,6 @@ fn assert_refused(dir: &Path, extra: &[&str], code: &str, needles: &[&str]) {
 
 #[test]
 fn a_file_that_cannot_be_indexed_refuses_the_directory() {
-    let native = "runtime: tool\nimplementation: native\n";
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "tool-a-0.2.0.mur.zip",
@@ -450,13 +423,13 @@ fn a_file_that_cannot_be_indexed_refuses_the_directory() {
         ),
         (
             "tool-a-0.1.0.mur.zip",
-            format!("name: tool-a\nversion: 0.1.0\n{native}"),
-            "a native payload names its platform",
+            "name: tool-a\nversion: 0.1.0\nruntime: tool\nimplementation: native\n".into(),
+            "declares implementation: native",
         ),
         (
             "tool-a-0.1.0-linux-x86_64.mur.zip",
             "name: tool-a\nversion: 0.1.0\nruntime: tool\n".into(),
-            "a wasm payload runs on every platform; name it tool-a-0.1.0.mur.zip",
+            "does not match its packed name 'tool-a' and version '0.1.0'",
         ),
         (
             "tool-a-banana.mur.zip",
@@ -496,31 +469,6 @@ fn a_file_that_cannot_be_indexed_refuses_the_directory() {
         &[],
         "E-IDX-001",
         &["tool-a-0.1.0.mur.zip", "holds no packed murmur.yaml"],
-    );
-
-    // Two payloads of one version whose packed runtime differs.
-    let dir = TempDir::new().unwrap();
-    pack(
-        dir.path(),
-        "tool-a-0.1.0-darwin-aarch64.mur.zip",
-        "name: tool-a\nversion: 0.1.0\nruntime: tool\nexecution: native\n",
-        &[],
-    );
-    pack(
-        dir.path(),
-        "tool-a-0.1.0-linux-x86_64.mur.zip",
-        "name: tool-a\nversion: 0.1.0\nruntime: hook\nexecution: native\n",
-        &[],
-    );
-    assert_refused(
-        dir.path(),
-        &[],
-        "E-IDX-001",
-        &[
-            "tool-a-0.1.0-linux-x86_64.mur.zip",
-            "tool-a-0.1.0-darwin-aarch64.mur.zip",
-            "runtime 'hook'",
-        ],
     );
 
     let empty = TempDir::new().unwrap();
@@ -623,10 +571,9 @@ fn a_wasm_payload_over_the_decompression_cap_is_refused() {
     );
 }
 
-/// Only a wasm payload is expected to carry a component: a skill and a native payload index with
-/// no interfaces.
+/// Only a wasm payload is expected to carry a component: a skill indexes with no interfaces.
 #[test]
-fn a_skill_or_native_payload_without_wasm_still_indexes() {
+fn a_skill_payload_without_wasm_still_indexes() {
     let dir = TempDir::new().unwrap();
     pack(
         dir.path(),
@@ -634,7 +581,6 @@ fn a_skill_or_native_payload_without_wasm_still_indexes() {
         "name: skill-notes\nversion: 0.1.0\nruntime: skill\n",
         &[("skill.md", b"# Notes\n")],
     );
-    pack_native(dir.path(), "tool-native", "1.0.0", "linux-x86_64");
     let out = TempDir::new().unwrap();
     mur_index(
         out.path(),
@@ -653,7 +599,7 @@ fn a_skill_or_native_payload_without_wasm_still_indexes() {
         serde_json::from_slice(&fs::read(out.path().join("artifacts-index.json")).unwrap())
             .unwrap();
     let artifacts = index["artifacts"].as_array().unwrap();
-    assert_eq!(artifacts.len(), 2);
+    assert_eq!(artifacts.len(), 1);
     for artifact in artifacts {
         assert_eq!(
             artifact["versions"][0]["interfaces"],
@@ -802,42 +748,6 @@ fn a_packed_label_is_written_and_two_labels_of_one_version_are_refused() {
         artifact(&index, "hook-old")["versions"][0]["built_at_level"],
         json!(1)
     );
-
-    let dir = TempDir::new().unwrap();
-    let manifest = "name: tool-n\nversion: 1.0.0\nruntime: tool\nimplementation: native\n";
-    for (platform, label) in [("darwin-aarch64", "1"), ("linux-x86_64", "2")] {
-        pack(
-            dir.path(),
-            &format!("tool-n-1.0.0-{platform}.mur.zip"),
-            manifest,
-            &[(
-                "murmur-build.json",
-                format!("{{\"built_at_level\":{label}}}").as_bytes(),
-            )],
-        );
-    }
-    let assert = mur_index(
-        out.path(),
-        &[
-            dir.path().to_str().unwrap(),
-            "--repo",
-            "ana/r",
-            "--release",
-            "v1",
-            "-o",
-            "two.json",
-        ],
-    )
-    .failure();
-    let stderr = stderr_of(&assert);
-    assert!(
-        stderr.contains("error[E-IDX-001]")
-            && stderr.contains("tool-n-1.0.0-linux-x86_64.mur.zip")
-            && stderr.contains("tool-n-1.0.0-darwin-aarch64.mur.zip")
-            && stderr.contains("its packed murmur-build.json sets built_at_level 2"),
-        "{stderr}"
-    );
-    assert!(!out.path().join("two.json").exists());
 }
 
 // ── --merge ───────────────────────────────────────────────────────────────────

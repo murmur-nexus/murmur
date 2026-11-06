@@ -1,6 +1,6 @@
 # Session Loop
 
-For an agent capsule, the Session Loop is the native execution environment built into the
+For an agent capsule, the Session Loop is the execution environment built into the
 runtime. It runs the inference loop and manages its extension points — [tools](tools.md),
 [hooks](hooks.md), and the [inference driver](artifacts.md).
 
@@ -118,7 +118,7 @@ session has, each with the name that tool opens the directory by:
 |---|---|---|
 | A command line a shell interpreter runs with `-c` | `$MURMUR_RUNTIME_DIR` | `capabilities.shell.allow` names a shell interpreter, such as `bash` |
 | A WASM `runtime: tool` with no `capabilities.filesystem.scope`, listed by tool name | `murmur-runtime/` | The session has such a tool installed. A pull or removal updates the list |
-| A program run directly, or any other tool given a path, a native tool included | The absolute path | Always |
+| A program run directly, or any other tool given a path | The absolute path | Always |
 
 ```text
 - Runtime directory: /home/ana/.murmur/sessions/ses_01a1…/runtime (read-only). The name to use depends on what opens it:

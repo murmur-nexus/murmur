@@ -27,12 +27,13 @@ use serde_json::Value;
 const DRIVER: &str = "local/fixture-process-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
-/// The native tool every hook scenario calls through the bridge. It writes [`MARKER`] and answers
-/// with [`TOOL_OUTPUT`], so a refusal is measured twice: by the file that is not there and by the
-/// string that appears nowhere in the run.
+/// The tool every hook scenario calls through the bridge: the `image-tool` fixture, which ignores
+/// every input field but `mode` and by default writes [`MARKER`] and answers with [`TOOL_OUTPUT`].
+/// A refusal is measured twice: by the file that is not there and by the string that appears
+/// nowhere in the run.
 const TOOL: &str = "marker-tool";
-const MARKER: &str = "tool-ran.txt";
-const TOOL_OUTPUT: &str = "MARKER-TOOL-RAN";
+const MARKER: &str = "img-1.png";
+const TOOL_OUTPUT: &str = "attached img-1.png";
 
 /// The prebuilt WASM tool the timing case calls, which echoes its input and touches no disk.
 const ECHO_TOOL: &str = "echo-tool";
@@ -44,15 +45,6 @@ const PROCESS_PROBE: &str = "process-probe";
 const PROTECTED_FILE: &str = "tests/api.py";
 const PROTECTED_RULE: &str = "tests";
 const PROTECTED_CONTENTS: &str = "assert compute() == 42\n";
-
-fn marker_tool_script() -> String {
-    format!(
-        "#!/bin/sh\n: > {MARKER}\necho '{}'\n",
-        format_args!(
-            r#"{{"status":"passed","summary":"ok","data":"{TOOL_OUTPUT}","data_path":null,"truncated":false,"metadata":[]}}"#
-        )
-    )
-}
 
 /// Pack the prebuilt echo component as a `runtime: wasm` tool artifact.
 fn create_wasm_tool_artifact(dir: &Path, name: &str, version: &str) -> PathBuf {
@@ -97,11 +89,11 @@ fn hook<'a>(name: &'a str, binding: &'a str, commit_policy: &'a str, wasm: Vec<u
 /// What a scenario's capsule declares, and what its harness is told to ask the bridge for.
 struct Capsule<'a> {
     hooks: Vec<Hook<'a>>,
-    /// `true` for the native [`TOOL`], which is published and declared when it is.
+    /// `true` for the marker [`TOOL`], which is published and declared when it is.
     marker_tool: bool,
-    /// The name the native marker tool is published under, [`TOOL`] unless a scenario names it.
+    /// The name the marker tool is published under, [`TOOL`] unless a scenario names it.
     tool_name: &'a str,
-    /// The native marker tool's `input_schema`, as single-line JSON.
+    /// The marker tool's `input_schema`, as single-line JSON.
     tool_schema: Option<&'a str>,
     /// `true` for the prebuilt [`ECHO_TOOL`].
     echo_tool: bool,
@@ -118,7 +110,7 @@ struct Capsule<'a> {
 }
 
 impl<'a> Capsule<'a> {
-    /// A capsule whose harness makes one bridged call to the native [`TOOL`].
+    /// A capsule whose harness makes one bridged call to the marker [`TOOL`].
     fn calling_the_marker_tool() -> Self {
         Self {
             hooks: Vec::new(),
@@ -341,13 +333,16 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
         common::publish_local(&home, &artifact).success();
     }
     if capsule.marker_tool {
-        let artifact = common::create_native_artifact(
+        let schema = capsule
+            .tool_schema
+            .map(|schema| format!("input_schema: |\n  {schema}\n"))
+            .unwrap_or_default();
+        let artifact = common::create_tool_artifact_with_auth(
             artifact_dir.path(),
             capsule.tool_name,
             "0.1.0",
-            &marker_tool_script(),
-            Some("Fixture marker tool"),
-            capsule.tool_schema,
+            &common::fixture_path("image-tool/tool/image-tool.wasm"),
+            &format!("description: Fixture marker tool\n{schema}"),
         );
         common::publish_local(&home, &artifact).success();
     }

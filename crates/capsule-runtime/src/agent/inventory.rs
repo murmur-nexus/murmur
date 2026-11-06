@@ -29,8 +29,8 @@ pub(crate) const RUNTIME_ORIGIN_MARKER: &str = "[origin: runtime, trust: untrust
 ///
 /// Shared with `CapsuleStoreState::check_required_fields`, so the tools whose calls are checked
 /// against their `input_schema` are exactly the ones this inventory offers that schema for. An
-/// absent or unrecognised value is [`ArtifactRuntime::Tool`], which covers `tool` and the legacy
-/// `wasm` and `native` spellings.
+/// absent or unrecognised value is [`ArtifactRuntime::Tool`], which covers `tool` and the
+/// `wasm` spelling.
 pub(crate) fn staged_manifest_runtime(manifest: &serde_norway::Value) -> ArtifactRuntime {
     match manifest
         .get("runtime")
@@ -491,7 +491,6 @@ mod tests {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             runtime,
-            implementation: None,
             origin,
         }
     }

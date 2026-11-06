@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.murmur.nexus/reference/artifact-index.schema.json",
   "title": "Murmur artifact index, schema 2",
-  "description": "The artifacts-index.json a Murmur artifact source publishes: every version it serves of every artifact. Written by `mur index`; read by `mur search`. Sorting and the agreement between an asset's file name and its artifact, version and platform are checked by mur and are not expressible here.",
+  "description": "The artifacts-index.json a Murmur artifact source publishes: every version it serves of every artifact. Written by `mur index`; read by `mur search`. Sorting and the agreement between an asset's file name and its artifact and version are checked by mur and are not expressible here.",
   "type": "object",
   "required": ["schema_version", "scope", "artifacts"],
   "properties": {
@@ -88,7 +88,7 @@
           "uniqueItems": true
         },
         "assets": {
-          "description": "Sorted by file; one per payload file.",
+          "description": "The version's payload file.",
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/asset" }
@@ -100,12 +100,9 @@
       "required": ["file", "sha256"],
       "properties": {
         "file": {
-          "description": "`<name>-<version>.mur.zip`, or `<name>-<version>-<platform>.mur.zip` when `platform` is present.",
+          "description": "`<name>-<version>.mur.zip`.",
           "type": "string",
           "pattern": "\\.mur\\.zip$"
-        },
-        "platform": {
-          "enum": ["darwin-aarch64", "darwin-x86_64", "linux-aarch64", "linux-x86_64"]
         },
         "sha256": {
           "description": "SHA-256 of the file's bytes, as 64 lowercase hexadecimal characters.",

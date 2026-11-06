@@ -99,8 +99,8 @@ impl HostAccountEnv {
     }
 }
 
-/// What a shell command, plan shell step or native tool is refused with when its enforcement holds
-/// no home folder ([`crate::sandbox::ShellEnforcement::home_root`]).
+/// What a shell command, plan shell step or `murmur:process` program is refused with when its
+/// enforcement holds no home folder ([`crate::sandbox::ShellEnforcement::home_root`]).
 pub(crate) const NO_HOME_FOLDER_REFUSAL: &str =
     "no home folder: this command's enforcement holds no session home folder (home/ in the \
      session's records directory) to be its $HOME, so it is not run";
@@ -248,14 +248,14 @@ impl ShellExecError {
 
 /// What a failed `spawn()` of a `command` that went through
 /// [`crate::sandbox::prepare_enforcement`] means, for every subprocess that does: shell commands,
-/// plan shell steps and native tools.
+/// plan shell steps and `murmur:process` programs.
 ///
 /// A failure inside the `pre_exec` enforcement setup reaches the caller only as a bare errno (std
 /// collapses a `pre_exec` `io::Error` to its `raw_os_error()`, defaulting to EINVAL). `command` is
 /// dropped first so the parent's captured copy of the diagnostic pipe's write end closes, letting
 /// the read see EOF; then the detail the child wrote replaces the undifferentiated
 /// "Invalid argument (os error 22)". `subject` names the spawn in that message (`shell`,
-/// `native tool`), and `spawn_error` is the error returned when the child wrote nothing.
+/// `murmur:process`), and `spawn_error` is the error returned when the child wrote nothing.
 pub(crate) fn enforced_spawn_failure(
     command: Command,
     supervisor: &crate::sandbox::SupervisorHandle,
@@ -318,7 +318,7 @@ pub(crate) fn shell_tool_manifest_yaml(binary: &str) -> String {
     };
 
     format!(
-        "name: {binary}\nversion: 0.0.0\nruntime: tool\nimplementation: native\ndescription: \"{description}\"\ninput_schema: '{{\"type\":\"object\",\"properties\":{{\"command\":{{\"type\":\"string\"}}}},\"required\":[\"command\"]}}'\n"
+        "name: {binary}\nversion: 0.0.0\nruntime: tool\ndescription: \"{description}\"\ninput_schema: '{{\"type\":\"object\",\"properties\":{{\"command\":{{\"type\":\"string\"}}}},\"required\":[\"command\"]}}'\n"
     )
 }
 
@@ -1313,13 +1313,13 @@ pub(crate) fn attribute_resource_limit(
         .map(str::to_string)
 }
 
-/// The environment of one shell command, plan shell step or native tool: [`DEFAULT_ENV_BASELINE`]
+/// The environment of one shell command, plan shell step or `murmur:process` program:
+/// [`DEFAULT_ENV_BASELINE`]
 /// from the host, `env_overrides`, `capabilities.shell.baseline_env`, the credential backstop,
 /// and then the runtime-owned names no entry before them can set — `HOME` and `USERPROFILE` from
 /// `home_dir`, `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and
 /// `records_dir`, and `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
-/// [`ARTIFACT_CONFIG_ENV`] and [`crate::state_store::STATE_DIR_ENV`] are removed whatever an
-/// earlier step supplied; a native tool's dispatch adds its own values to what this returns.
+/// [`ARTIFACT_CONFIG_ENV`] is removed whatever an earlier step supplied.
 ///
 /// `home_dir` is the session's home folder, `home/` in its records directory. `None` refuses the
 /// command: no command runs without it, and none is handed a home anywhere else.
@@ -1344,7 +1344,7 @@ pub(crate) fn build_shell_env(
     }
 
     for key in &policy.shell_baseline_env {
-        // Formation names and the spawner lifeline are never a native process's: a baseline
+        // Formation names and the spawner lifeline are never a subprocess's: a baseline
         // entry naming one supplies nothing from the host.
         if crate::formation::is_member_grant_env(key)
             || key == crate::lifeline::SPAWNER_LIFELINE_ENV
@@ -1358,10 +1358,9 @@ pub(crate) fn build_shell_env(
 
     strip_credential_shaped_vars(&mut env, &policy.shell_strip_env);
 
-    // Set per native tool by its dispatch, from that tool's own entry, and by nothing else: no
-    // override, baseline entry or host value reaches a shell command or an unconfigured tool.
+    // A WASM guest's own entry is the one source of this value: no override, baseline entry or
+    // host value reaches a subprocess with it.
     env.remove(ARTIFACT_CONFIG_ENV);
-    env.remove(crate::state_store::STATE_DIR_ENV);
 
     // Inserted last so neither a guest-supplied `env_overrides` entry nor a
     // manifest-declared `shell_baseline_env` entry can resurrect the real host
@@ -1412,9 +1411,9 @@ pub(crate) const LINEAGE_ENV: &[&str] = &[
     "MURMUR_ROOST_URL",
 ];
 
-/// The environment of one shell command, plan shell step or native tool spawned on
+/// The environment of one shell command, plan shell step or `murmur:process` program spawned on
 /// `enforcement`: [`build_unconfined_env`] on the unconfined tier, [`build_shell_env`] on every
-/// other. A native tool's dispatch adds its own values to what this returns.
+/// other.
 pub(crate) fn subprocess_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
@@ -1442,12 +1441,11 @@ pub(crate) fn subprocess_env(
     .collect())
 }
 
-/// The environment of one unconfined shell command, plan shell step or native tool: `base` (this
-/// process's whole environment, [`std::env::vars_os`], on every production path), then
-/// `env_overrides`, minus the lineage names
-/// ([`LINEAGE_ENV`] and every formation member grant name), [`ARTIFACT_CONFIG_ENV`],
-/// [`crate::state_store::STATE_DIR_ENV`] and whatever `capabilities.shell.strip_env` matches, and
-/// then `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
+/// The environment of one unconfined shell command, plan shell step or `murmur:process` program:
+/// `base` (this process's whole environment, [`std::env::vars_os`], on every production path), then
+/// `env_overrides`, minus the lineage names ([`LINEAGE_ENV`] and every formation member grant
+/// name), [`ARTIFACT_CONFIG_ENV`] and whatever `capabilities.shell.strip_env` matches, and then
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
 ///
 /// The credential backstop ([`CREDENTIAL_ENV_PATTERNS`]) is not applied, and `HOME`,
 /// `USERPROFILE`, `TMPDIR`, `TMP` and `TEMP` are whatever `base` holds: the operator chose to run
@@ -1470,7 +1468,6 @@ pub(crate) fn build_unconfined_env(
         !(LINEAGE_ENV.contains(&key)
             || crate::formation::is_member_grant_env(key)
             || key == ARTIFACT_CONFIG_ENV
-            || key == crate::state_store::STATE_DIR_ENV
             || key == crate::runtime_dir::RUNTIME_DIR_ENV
             || key == crate::records_dir::RECORDS_DIR_ENV
             || policy
@@ -1497,7 +1494,7 @@ pub(crate) fn build_unconfined_env(
 /// `extra_patterns` (a policy's `shell_strip_env`).
 ///
 /// This is the single credential backstop for both environments the runtime builds: the
-/// native subprocess env ([`build_shell_env`]) and the WASI guest env
+/// subprocess env ([`build_shell_env`]) and the WASI guest env
 /// ([`build_declared_env`]). It runs *after* whatever allowlist populated `env`, so a
 /// declared name never bypasses the filter.
 pub(crate) fn strip_credential_shaped_vars(
@@ -1559,11 +1556,11 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// host is simply omitted, not an error.
 ///
 /// This is what every WASM guest observes. A `transport: process` harness starts from it plus the
-/// host's [`HostAccountEnv`], before its driver's `env-set` is applied. Native shell subprocesses
+/// host's [`HostAccountEnv`], before its driver's `env-set` is applied. Shell subprocesses
 /// are the exception: they run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`,
 /// built by [`build_shell_env`].
 ///
-/// [`ARTIFACT_CONFIG_ENV`], [`crate::state_store::STATE_DIR_ENV`], a formation member's names
+/// [`ARTIFACT_CONFIG_ENV`], a formation member's names
 /// ([`crate::formation::is_member_grant_env`]) and [`crate::lifeline::SPAWNER_LIFELINE_ENV`] are
 /// reserved and never resolved from the host, whatever a manifest allowlists: the names are
 /// runtime-owned, and their values come from the declaring artifact's own entry and from the
@@ -1574,7 +1571,6 @@ pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, 
 
     for key in &policy.env_allow {
         if key == ARTIFACT_CONFIG_ENV
-            || key == crate::state_store::STATE_DIR_ENV
             || crate::formation::is_member_grant_env(key)
             || key == crate::lifeline::SPAWNER_LIFELINE_ENV
             || key == crate::runtime_dir::RUNTIME_DIR_ENV
@@ -3623,7 +3619,6 @@ mod tests {
                 crate::formation_credentials::FORMATION_CHANNEL_ENV,
                 crate::lifeline::FORMATION_LIFELINE_ENV,
                 ARTIFACT_CONFIG_ENV,
-                crate::state_store::STATE_DIR_ENV,
             ])
             .collect();
         // A made-up host environment: the test process's own is never changed, so tests running
@@ -3763,14 +3758,14 @@ mod tests {
         assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
     }
 
-    /// `MURMUR_ARTIFACT_CONFIG` and `MURMUR_STATE_DIR` never come from the host: a baseline
-    /// entry, an override and a host value naming either leave neither in a shell command's
-    /// environment, and `env.allow` resolves neither into a guest's.
+    /// `MURMUR_ARTIFACT_CONFIG` never comes from the host: a baseline entry, an override and a
+    /// host value naming it leave it out of a shell command's environment, and `env.allow` does
+    /// not resolve it into a guest's.
     #[test]
-    fn build_shell_env_drops_the_native_tool_settings_names_whatever_else_says() {
+    fn build_shell_env_drops_the_artifact_config_name_whatever_else_says() {
         let workdir = tempfile::tempdir().unwrap();
         let root = WorkdirRoot::open(workdir.path()).unwrap();
-        let names = [ARTIFACT_CONFIG_ENV, crate::state_store::STATE_DIR_ENV];
+        let names = [ARTIFACT_CONFIG_ENV];
         for name in names {
             std::env::set_var(name, "/host/value");
         }

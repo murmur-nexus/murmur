@@ -21,8 +21,7 @@ use common::formation::{assert_no_member_remains, launch_lock};
 use common::github_release::MockGitHub;
 use common::ScriptedServer;
 use murmur_artifact::{
-    current_platform, version_fit, ApiKeyReference, ArtifactIndex, FitSubject, RuntimeManifest,
-    VersionFit,
+    version_fit, ApiKeyReference, ArtifactIndex, FitSubject, RuntimeManifest, VersionFit,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -254,8 +253,7 @@ fn committed_version(name: &str) -> String {
     assert_eq!(
         version_fit(
             &FitSubject::indexed(newest),
-            capsule_runtime::served_wit_level(),
-            current_platform()
+            capsule_runtime::served_wit_level()
         ),
         VersionFit::Fits,
         "{name}@{} fits this mur",
@@ -299,7 +297,6 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
             version: driver_version.to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: "driver".to_string(),
-            platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
             wit_contracts: None,

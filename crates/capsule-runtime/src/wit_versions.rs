@@ -159,9 +159,7 @@ mod tests {
     /// level 4 exactly when it fits level 3, unless it imports the new package.
     #[test]
     fn wit_levels_level_4_only_adds_the_process_package() {
-        use murmur_artifact::{
-            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
-        };
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
         let levels = wit_levels();
         let (three, four) = (&levels[2], &levels[3]);
         let added: Vec<_> = four
@@ -180,8 +178,7 @@ mod tests {
             imports: imports.iter().map(|i| i.to_string()).collect(),
         };
         let fits = |contracts: WitContracts, level| {
-            version_fit(&FitSubject::component(contracts), level, current_platform())
-                == VersionFit::Fits
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
         };
         let tool = || contracts(&["murmur:stream/events@0.1.0", "murmur:task/task@0.1.0"]);
         assert!(fits(tool(), three));
@@ -196,9 +193,7 @@ mod tests {
     /// fit level 3, and a hook, which names neither package, fits both levels unchanged.
     #[test]
     fn wit_levels_level_3_moves_the_tool_packages() {
-        use murmur_artifact::{
-            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
-        };
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
         let levels = wit_levels();
         let (two, three) = (&levels[1], &levels[2]);
         let moved: Vec<_> = two
@@ -227,8 +222,7 @@ mod tests {
             imports: imports.iter().map(|i| i.to_string()).collect(),
         };
         let fits = |contracts: WitContracts, level| {
-            version_fit(&FitSubject::component(contracts), level, current_platform())
-                == VersionFit::Fits
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
         };
         let old_tool = || contracts(&["murmur:tool/run@0.1.0"], &["murmur:stream/events@0.1.0"]);
         assert!(fits(old_tool(), two));
@@ -249,9 +243,7 @@ mod tests {
     /// no `murmur:driver` package fits level 2 unchanged, and a level-1 process driver does not.
     #[test]
     fn wit_levels_level_2_moves_only_the_driver_package() {
-        use murmur_artifact::{
-            current_platform, version_fit, FitSubject, VersionFit, WitContracts,
-        };
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
         let levels = wit_levels();
         let (one, two) = (&levels[0], &levels[1]);
         let moved: Vec<_> = one
@@ -268,8 +260,7 @@ mod tests {
             imports: imports.iter().map(|i| i.to_string()).collect(),
         };
         let fits = |contracts: WitContracts, level| {
-            version_fit(&FitSubject::component(contracts), level, current_platform())
-                == VersionFit::Fits
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
         };
         let hook = || {
             contracts(
