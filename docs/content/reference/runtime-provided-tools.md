@@ -28,9 +28,9 @@ Each one appears only when the declaration in the second column is present.
 | `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
 | `background-command` | An [`inference:`](manifest.md#field-inference) block, a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
 
-Every one of their manifests carries `name`, `version: 0.0.0`, `runtime: tool`, `description` and
-`input_schema`, and no `implementation` key. Nothing was fetched, so nothing is version-pinned, nothing is
-hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
+Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. Nothing was fetched, so
+nothing is version-pinned, nothing is hash-verified, and no entry appears for them in
+`murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 

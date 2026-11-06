@@ -29,8 +29,8 @@
 //! A source pull writes to no store.
 //!
 //! Every refusal leads with one token: [`NOT_GRANTED`], [`NOT_FOUND`], [`DOES_NOT_FIT`],
-//! [`NOT_FETCHED`] or [`NATIVE_TOOL`]. A pinned lock entry that conflicts is refused with its own sentence. A
-//! refusal changes nothing.
+//! [`NOT_FETCHED`] or [`NATIVE_TOOL`]. A pinned lock entry that conflicts is refused with its own
+//! sentence. A refusal changes nothing.
 //!
 //! # The agent path
 //!
@@ -1077,7 +1077,6 @@ fn places_of(candidates: &[Candidate]) -> Vec<String> {
     places
 }
 
-/// The refusal of `name@version` for `fit`, which is not [`VersionFit::Fits`].
 /// The refusal of a pull whose payload declares a native tool, the launch's
 /// [`RuntimeError::NativeTool`] behind [`NATIVE_TOOL`]. Nothing is staged and no lock entry is
 /// written.
@@ -1089,6 +1088,7 @@ fn native_tool_refusal(artifact: &str, field: &str) -> String {
     format!("{NATIVE_TOOL} {error}")
 }
 
+/// The refusal of `name@version` for `fit`, which is not [`VersionFit::Fits`].
 fn fit_refusal(name: &ArtifactName, version: &str, fit: &VersionFit, hint: &str) -> String {
     let level = crate::served_wit_level().level;
     match fit {

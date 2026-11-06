@@ -991,10 +991,10 @@ pub struct ScopeReport {
     /// The tier this session installs, as a stable wire name: the host's tier capped by the
     /// declared floor, from [`ContainmentDecision::enforcement_tier`].
     pub enforcement_tier: &'static str,
-    /// Every route this capsule could run code on, and what holds each: one [`RouteReport`] row
-    /// per [`Route::ALL`] entry, in that order, from [`route_table`]. A route the session's class covers
-    /// names [`Self::enforcement_tier`]; one it does not names [`HOST_PROCESS_MECHANISM`] and says
-    /// what it does run under.
+    /// Every route this capsule could run code on, and what holds each: one [`RouteReport`] row per
+    /// [`Route::ALL`] entry, in that order, from [`route_table`]. A route the session's class
+    /// covers names [`Self::enforcement_tier`]; one it does not names [`HOST_PROCESS_MECHANISM`]
+    /// and says what it does run under.
     ///
     /// Always serialized, every row, on every tier and platform: an absent key identifies a
     /// runtime that predates it. Set again through [`Self::with_routes`] by the caller that knows
@@ -1105,8 +1105,9 @@ pub struct ScopeReport {
     /// It opens no host resource of its own. A pulled skill adds text to what the model reads and
     /// gains no grant.
     pub install_skill: Vec<String>,
-    /// `capabilities.install.tool`, verbatim: which tool artifacts a pull may install. Always serialized, on [`Self::install_skill`]'s terms. A pulled tool joins the
-    /// dispatch allowlist, runs on this capsule's own grants and gains none of its own.
+    /// `capabilities.install.tool`, verbatim: which tool artifacts a pull may install. Always
+    /// serialized, on [`Self::install_skill`]'s terms. A pulled tool joins the dispatch allowlist,
+    /// runs on this capsule's own grants and gains none of its own.
     pub install_tool: Vec<String>,
     /// `capabilities.install.from`: `["stores"]`, or `["stores", "sources"]` when a pull the
     /// stores cannot answer is fetched from the scope's GitHub source. `[]` for a capsule with no
@@ -5304,7 +5305,8 @@ mod tests {
 
     /// The table over every tier, every declared class and every presence input: one row per
     /// [`Route::ALL`] entry in the fixed order; the first two covered by the applied tier's
-    /// mechanism and the rest `host-process` with their note, whatever the tier; presence exactly as each input implies.
+    /// mechanism and the rest `host-process` with their note, whatever the tier; presence exactly
+    /// as each input implies.
     #[test]
     fn the_route_table_holds_its_invariants_on_every_input() {
         for tier in ALL_TIERS {

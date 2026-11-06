@@ -16,9 +16,10 @@ use murmur_artifact::{
     write_lockfile_atomic, AfterTask, ApiKeyReference, ArtifactName, ArtifactRuntime,
     ContextConfig, ConversationMode, DoneCheck, HookBinding, InferenceConfig,
     InterpreterRuntimeGrant, KeepWorking, LifecycleConfig, LockOrigin, LockedSha256, LockfileError,
-    MurmurLock, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008,
-    W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    MurmurLock, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance,
+    LOCK_VERSION, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003,
+    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_016,
+    W_SEC_017, W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -8533,10 +8534,10 @@ fn gateway_for_store(
 ///
 /// For each such artifact the `gateway.api_key` is resolved first, against `credentials_file` and
 /// the environment, so a credential found nowhere refuses with
-/// [`RuntimeError::GatewayCredentialNotFound`]. Then the artifact's own bundled `upstream_auth:` block is read,
-/// refusing with [`RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth`] when it is absent or
-/// malformed. A keyless gateway needs that block too: its header is the one stripped from every
-/// request. A gateway with neither a credential nor `keyless: true` is refused with
+/// [`RuntimeError::GatewayCredentialNotFound`]. Then the artifact's own bundled `upstream_auth:`
+/// block is read, refusing with [`RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth`] when it is
+/// absent or malformed. A keyless gateway needs that block too: its header is the one stripped from
+/// every request. A gateway with neither a credential nor `keyless: true` is refused with
 /// [`RuntimeError::GatewayWithoutCredential`] before anything is resolved.
 ///
 /// The configured `transport: http` driver's gateway is metered against `spend` and becomes the
@@ -9531,9 +9532,9 @@ impl CapsuleStoreState {
     /// Resolve what a tool call is about to run, for the policy decision point.
     ///
     /// Routes exactly as [`Self::dispatch_agent_tool_unfenced`] does, in the same order, so the
-    /// hook is shown the branch that will actually be taken. Everything that is not a shell
-    /// call — a runtime peer-handoff tool, a skill, a WASM tool —
-    /// resolves to [`ResolvedCall::Tool`] carrying the exact input JSON.
+    /// hook is shown the branch that will actually be taken. Everything that is not a shell call —
+    /// a runtime peer-handoff tool, a skill, a WASM tool — resolves to [`ResolvedCall::Tool`]
+    /// carrying the exact input JSON.
     ///
     /// Read-only and side-effect free: it decides nothing and grants nothing, and the capability
     /// checks it routes past are still performed by the dispatch path itself.

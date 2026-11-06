@@ -139,8 +139,8 @@ pub struct PrecompileItem<'a> {
 }
 
 /// The outcome of a payload that is not compiled: [`Precompiled::Failed`] when its manifest does
-/// not parse or declares a native tool, [`Precompiled::NotWasm`] when it is not staged under its own sha256. `None` for a
-/// payload [`Precompiler::compile_eligible`] takes.
+/// not parse or declares a native tool, [`Precompiled::NotWasm`] when it is not staged under its
+/// own sha256. `None` for a payload [`Precompiler::compile_eligible`] takes.
 fn ineligible(payload: &[u8]) -> Option<Precompiled> {
     let Ok(manifest) = murmur_artifact::load_manifest_from_artifact_bytes(payload) else {
         return Some(Precompiled::Failed);

@@ -135,6 +135,8 @@ files.
 
 | Artifact | What it does |
 |---|---|
+| `murmur/tool-browser` | Drives a headless Chrome or Chromium one action per call — open, click, type, snapshot, screenshot — and returns each page as an accessibility tree |
+| `murmur/tool-computer` | Operates the capsule's own 1440×900 virtual display: screenshot, click, drag, type, press keys. A driver may offer it as its provider's own computer tool |
 | `murmur/tool-code-coverage` | Spectrum-based fault localization (Ochiai / Tarantula) over per-test LCOV reports the agent has already captured. Reads a repository indexed by `murmur/tool-code-graph` |
 | `murmur/tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
 | `murmur/tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
@@ -142,9 +144,12 @@ files.
 | `murmur/tool-edit` | Replaces exact text in a file, several edits at once, all or nothing |
 | `murmur/tool-find` | Searches file contents for a regex, optionally narrowed by a glob |
 | `murmur/tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
+| `murmur/tool-github` | Pushes a local commit range to one operator-pinned GitHub repository and opens, lists and merges its pull requests. The token is attached by the entry's `gateway:`, never held by the tool |
 | `murmur/tool-read` | Reads a file, or a range of its lines |
 | `murmur/tool-registry-search` | Searches the artifact index by keyword |
+| `murmur/tool-report` | Writes the session's own conclusion, or a progress note, to `reports/<session_id>.json` in the store `capabilities.state` opens |
 | `murmur/tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
+| `murmur/tool-tavily` | Searches the web with Tavily and returns a bounded text result. The key is attached by the entry's `gateway:`, never held by the tool |
 | `murmur/tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
 | `murmur/tool-write` | Creates or replaces a file, and any missing directories |
 
@@ -206,6 +211,8 @@ capsule's `capabilities.shell.allow` and is contained like a shell command — s
 
 | Tool | Capsule grants it needs |
 |---|---|
+| `murmur/tool-browser` | One of `chromium`, `chromium-browser`, `google-chrome` or `chrome` in `capabilities.shell.allow`. It writes `.tool-browser/<id>/` in the workdir. Under `sealed` containment a browser launcher that is a shell script, as `google-chrome` is on Debian and Ubuntu, is refused with [`E-CAP-006`](diagnostics.md#e-cap-006) unless its interpreter is granted |
+| `murmur/tool-computer` | `capabilities.containment: sealed` (anything weaker is refused with [`E-CAP-003`](diagnostics.md#e-cap-003)); `Xvfb`, `xkbcomp` and `sh` in `capabilities.shell.allow`, plus any window manager and every program its `config.launch` names |
 | `murmur/tool-git` | `git` in `capabilities.shell.allow`; the repository inside the workdir. `fetch`, `pull`, `push` and `clone` also need the remote's host in `capabilities.network.allow` and an `interpreter_runtime` grant for `git` naming the directory its remote helpers live in (`/usr/lib/git-core` on Debian and Ubuntu); without it `git` cannot start `git-remote-https` |
 | `murmur/tool-code-graph` | `repo_path` inside the workdir. It writes `<repo_path>/.murmur/code-graph.db` |
 | `murmur/tool-code-coverage` | `repo_path` and `coverage_dir` inside the workdir, and the index `murmur/tool-code-graph` built there |

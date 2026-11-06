@@ -1562,7 +1562,6 @@ pub(crate) fn resolve_scoped_name_resolution_landlock_grants(
             path: PathBuf::from(path),
             list_dir: false,
             executable: false,
-            pinned: None,
         })
         .collect()
 }
@@ -3350,8 +3349,8 @@ pub(crate) fn prepare_enforcement(
         .map(|home| home.path_fd().map(Arc::new))
         .transpose()
         .map_err(|error| format!("sandbox: failed to open the session's home folder: {error}"))?;
-    // Every host path: opened on both Landlock tiers and on no other, and fail-closed. A configured host path that can no longer be opened fails this spawn naming
-    // it; it is never dropped.
+    // Every host path: opened on both Landlock tiers and on no other, and fail-closed. A configured
+    // host path that can no longer be opened fails this spawn naming it; it is never dropped.
     let host_path_fds: Vec<HostPathFd> = if matches!(
         enforcement.tier,
         EnforcementTier::KernelFull | EnforcementTier::KernelSealed
@@ -3645,11 +3644,11 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// canonical `/tmp`, and every path beneath the host's `/tmp` the command still needs re-exposed
 /// at its own path.
 ///
-/// Those paths are the accessible workdir and the session's home folder, bound read-write, and
-/// the runtime and records directories and every Landlock grant path, which already carries the
-/// `shell.allow` closure and the interpreter and staged runtimes, bound read-only. Landlock adds the folder's rights to everything bound beneath it, which are the
-/// workdir's own; a read-only bind is what keeps them from writing the rest. See
-/// [`crate::temp_dir::reexposed_paths`].
+/// Those paths are the accessible workdir and the session's home folder, bound read-write, and the
+/// runtime and records directories and every Landlock grant path, which already carries the
+/// `shell.allow` closure and the interpreter and staged runtimes, bound read-only. Landlock adds
+/// the folder's rights to everything bound beneath it, which are the workdir's own; a read-only
+/// bind is what keeps them from writing the rest. See [`crate::temp_dir::reexposed_paths`].
 #[cfg(target_os = "linux")]
 fn build_tmp_map_spec(
     enforcement: &ShellEnforcement,
@@ -3795,9 +3794,9 @@ pub(crate) struct SealedSourceFds {
 #[cfg(target_os = "linux")]
 impl SealedSourceFds {
     /// Writes the synthetic `/etc` files and takes every descriptor, with `temp_dir_fd` and
-    /// `home_dir_fd` the descriptors `prepare_enforcement` took on the session's temporary and
-    /// home folders. A sealed root cannot be composed for an enforcement that holds no runtime directory, no temporary folder
-    /// or no home folder.
+    /// `home_dir_fd` the descriptors `prepare_enforcement` took on the session's temporary and home
+    /// folders. A sealed root cannot be composed for an enforcement that holds no runtime
+    /// directory, no temporary folder or no home folder.
     fn open(
         enforcement: &ShellEnforcement,
         temp_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
@@ -13075,7 +13074,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
         assert!(grants
             .iter()
-            .all(|grant| !grant.list_dir && !grant.executable && grant.pinned.is_none()));
+            .all(|grant| !grant.list_dir && !grant.executable));
         for tier in [
             EnforcementTier::KernelSealed,
             EnforcementTier::KernelSeccompOnly,

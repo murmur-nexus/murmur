@@ -608,21 +608,43 @@ fn s3_a_launch_refuses_a_generic_native_install_an_older_mur_left() {
 
 #[test]
 fn s4_a_running_capsule_cannot_pull_a_native_tool() {
-    if capsule_runtime::skip_without_egress_namespace(
-        "s4_a_running_capsule_cannot_pull_a_native_tool",
-    ) {
-        return;
-    }
-    let server = common::ScriptedServer::start(vec![
-        tool_use(
-            "toolu_pull",
-            "pull-artifact",
-            json!({"artifact": format!("local/{NAT}")}),
-        ),
-        end_turn("done"),
-    ]);
     let launch = Launch::new();
     seed_legacy_native(&global_store(launch.home.path()), LegacyLayout::Generic);
+    // The runtime directory is `~/.murmur/sessions/<session-id>/runtime/`, removed when the session
+    // ends, so what the pull staged is read when the second request arrives, while the session is
+    // live.
+    let sessions = launch.home.path().join(".murmur").join("sessions");
+    let staged: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> = Default::default();
+    let seen = std::sync::Arc::clone(&staged);
+    let mut calls = 0;
+    let server = common::ScriptedServer::start_answering(2, move |_| {
+        calls += 1;
+        if calls == 1 {
+            return tool_use(
+                "toolu_pull",
+                "pull-artifact",
+                json!({"artifact": format!("local/{NAT}")}),
+            );
+        }
+        let session_dirs: Vec<PathBuf> = fs::read_dir(&sessions)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.path().join("runtime")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `None` when no live runtime directory was found, which fails the test below.
+        let live: Vec<&PathBuf> = session_dirs
+            .iter()
+            .filter(|dir| dir.join("tools").is_dir())
+            .collect();
+        *seen.lock().unwrap() = (!live.is_empty()).then(|| {
+            live.iter()
+                .flat_map(|dir| files_under(&dir.join("tools").join(NAT)))
+                .collect()
+        });
+        end_turn("done")
+    });
     launch.write_manifest(&capsule_yaml(
         &server.endpoint,
         "",
@@ -632,7 +654,6 @@ fn s4_a_running_capsule_cannot_pull_a_native_tool() {
     let run = launch.run().success();
     let stdout = stdout_of(&run);
     assert!(stdout.contains("status:  ok"), "{stdout}");
-    let workdir = common::parse_workdir_from_stdout(&stdout);
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "{requests:#?}");
@@ -643,7 +664,11 @@ fn s4_a_running_capsule_cannot_pull_a_native_tool() {
         text.contains("E-RUN-061") && text.contains(NAT) && text.contains("implementation"),
         "{text}"
     );
-    assert!(files_under(&workdir.join("tools").join(NAT)).is_empty());
+    assert_eq!(
+        staged.lock().unwrap().as_deref(),
+        Some(&[][..]),
+        "no live runtime directory was found, or the pull staged files for {NAT}"
+    );
     if let Ok(lock) = read_lockfile(&launch.lock_path()) {
         assert!(
             lock.artifact_for(&format!("local/{NAT}")).is_none(),
@@ -734,9 +759,6 @@ fn s6_a_lock_entry_pinning_per_platform_hashes_is_refused() {
 
 #[test]
 fn s6_a_lock_entry_pinning_any_launches() {
-    if capsule_runtime::skip_without_egress_namespace("s6_a_lock_entry_pinning_any_launches") {
-        return;
-    }
     let server = common::ScriptedServer::start(vec![end_turn("ok")]);
     let launch = Launch::new();
     launch.write_manifest(&capsule_yaml(&server.endpoint, "", ""));

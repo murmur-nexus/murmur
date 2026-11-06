@@ -289,11 +289,9 @@ pub fn derived_tags(runtime: &str, name: &str) -> Vec<String> {
 /// One `.mur.zip` file read for indexing.
 struct ScannedFile {
     file: String,
-    path: String,
     name: String,
     version: String,
     runtime: String,
-    packaging: RuntimeType,
     sha256: String,
     interfaces: Vec<String>,
     description: Option<String>,
@@ -303,15 +301,14 @@ struct ScannedFile {
 /// Index every `.mur.zip` regular file directly inside `dir`, recording `release` on every
 /// version. Every other entry is ignored.
 ///
-/// Each version's `built_at_level` is the label its files pack in `murmur-build.json`; a version
-/// whose files pack none gets the newest of `levels` its `interfaces` fit, and none when they fit
-/// no level.
+/// Each version is one file, `<name>-<version>.mur.zip`. Its `built_at_level` is the label the
+/// file packs in `murmur-build.json`; a file that packs none gets the newest of `levels` its
+/// `interfaces` fit, and none when they fit no level.
 ///
 /// Refuses the whole directory when any one file cannot be indexed (unreadable, no packed
 /// `murmur.yaml`, a malformed packed `murmur-build.json`, a name or version the registry would
-/// refuse, a file name that disagrees with the packed name, version or packaging type), when two
-/// files of one version disagree on their packed `runtime:`, packaging type or built-at level, or
-/// when `dir` holds no such file. The result depends only on the files' names and bytes and on
+/// refuse, a file name that is not `<name>-<version>.mur.zip` for its packed name and version),
+/// or when `dir` holds no such file. The result depends only on the files' names and bytes and on
 /// `levels`, never on directory order or file times.
 pub fn index_directory(
     dir: &Path,
@@ -355,87 +352,44 @@ pub fn index_directory(
     }
     file_names.sort();
 
-    // name → version → files of that version, in file-name order.
-    let mut grouped: BTreeMap<String, BTreeMap<String, Vec<ScannedFile>>> = BTreeMap::new();
+    // name → version → the one file of that version. A file name is `<name>-<version>.mur.zip`
+    // for the name and version it packs, so no two files share a version.
+    let mut grouped: BTreeMap<String, BTreeMap<String, ScannedFile>> = BTreeMap::new();
     for file_name in file_names {
         let scanned = scan_file(dir, file_name)?;
-        let files = grouped
+        grouped
             .entry(scanned.name.clone())
             .or_default()
-            .entry(scanned.version.clone())
-            .or_default();
-        let labelled = files
-            .iter()
-            .find(|file| file.built_at_level.is_some() && scanned.built_at_level.is_some());
-        if let Some(first) = labelled.filter(|file| file.built_at_level != scanned.built_at_level) {
-            return Err(IndexBuildError::File {
-                file: scanned.path,
-                reason: format!(
-                    "its packed {BUILD_INFO_FILE} sets built_at_level {}, and {} of the same \
-                     {}@{} sets built_at_level {}",
-                    scanned.built_at_level.unwrap_or_default(),
-                    first.path,
-                    first.name,
-                    first.version,
-                    first.built_at_level.unwrap_or_default()
-                ),
-            });
-        }
-        if let Some(first) = files.first() {
-            if first.runtime != scanned.runtime || first.packaging != scanned.packaging {
-                return Err(IndexBuildError::File {
-                    file: scanned.path,
-                    reason: format!(
-                        "it packs runtime '{}' ({}), and {} of the same {}@{} packs runtime '{}' \
-                         ({})",
-                        scanned.runtime,
-                        scanned.packaging.as_str(),
-                        first.path,
-                        first.name,
-                        first.version,
-                        first.runtime,
-                        first.packaging.as_str()
-                    ),
-                });
-            }
-        }
-        files.push(scanned);
+            .insert(scanned.version.clone(), scanned);
     }
 
     let artifacts = grouped
         .into_iter()
         .map(|(name, versions)| {
-            let mut versions: Vec<(String, Vec<ScannedFile>)> = versions.into_iter().collect();
+            let mut versions: Vec<(String, ScannedFile)> = versions.into_iter().collect();
             versions.sort_by(|(a, _), (b, _)| compare_versions(b, a));
-            let newest = &versions[0].1[0];
+            let newest = &versions[0].1;
             let runtime = newest.runtime.clone();
             let description = newest.description.as_deref().and_then(description_summary);
             let tags = derived_tags(&runtime, &name);
             let versions = versions
                 .into_iter()
-                .map(|(version, files)| {
-                    let mut interfaces: Vec<String> = files
-                        .iter()
-                        .flat_map(|file| file.interfaces.iter().cloned())
-                        .collect();
+                .map(|(version, file)| {
+                    let mut interfaces = file.interfaces;
                     interfaces.sort();
                     interfaces.dedup();
-                    let built_at_level = files
-                        .iter()
-                        .find_map(|file| file.built_at_level)
+                    let built_at_level = file
+                        .built_at_level
                         .or_else(|| derived_built_at_level(&interfaces, levels));
                     IndexedVersion {
                         version,
                         release: release.to_string(),
                         built_at_level,
                         interfaces,
-                        assets: files
-                            .into_iter()
-                            .map(|file| IndexedAsset {
-                                file: file.file,
-                                sha256: file.sha256,
-                            })
-                            .collect(),
+                        assets: vec![IndexedAsset {
+                            file: file.file,
+                            sha256: file.sha256,
+                        }],
                     }
                 })
                 .collect();
@@ -517,11 +471,9 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
     Ok(ScannedFile {
         sha256: sha256_hex(&bytes),
         file,
-        path,
         name,
         version,
         runtime: manifest.runtime,
-        packaging,
         interfaces,
         description: manifest.description,
         built_at_level,

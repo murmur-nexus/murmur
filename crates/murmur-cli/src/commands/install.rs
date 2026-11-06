@@ -1555,14 +1555,9 @@ mod tests {
                  but other-hash was resolved"
             );
             assert_eq!(changed.hint.as_deref(), Some(CHANGED_BYTES_HINT));
-            assert!(check_lock_entry(
-                None,
-                "ana/tool",
-                "2.0.0",
-                &LockedSha256::any("x"),
-                mode
-            )
-            .is_ok());
+            assert!(
+                check_lock_entry(None, "ana/tool", "2.0.0", &LockedSha256::any("x"), mode).is_ok()
+            );
         }
 
         assert!(check("1.1.0", "new-hash", LockCheck::PinOnly).is_none());

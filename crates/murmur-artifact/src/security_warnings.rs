@@ -318,12 +318,13 @@ pub const W_SEC_034: &str = "W-SEC-034";
 /// from `mur run` and from `mur doctor`, naming the entry and the location.
 pub const W_SEC_035: &str = "W-SEC-035";
 
-/// The capsule runs unconfined: its shell commands, plan shell steps, the programs its
-/// tools run through `murmur:process` and its `transport: process` harness run as the operator, with their `HOME`, their whole environment
-/// (credential variables included), the host filesystem and network, and no `no_new_privs`, so
-/// `sudo` works wherever the operator's sudoers allows it. Chosen only by the operator, with
-/// `mur run --unconfined` or `containment: unconfined` in `~/.murmur/config.yaml`. Fires exactly
-/// once per launch, after staging succeeds; `--explain-scope` does not print it.
+/// The capsule runs unconfined: its shell commands, plan shell steps, the programs its tools run
+/// through `murmur:process` and its `transport: process` harness run as the operator, with their
+/// `HOME`, their whole environment (credential variables included), the host filesystem and
+/// network, and no `no_new_privs`, so `sudo` works wherever the operator's sudoers allows it.
+/// Chosen only by the operator, with `mur run --unconfined` or `containment: unconfined` in
+/// `~/.murmur/config.yaml`. Fires exactly once per launch, after staging succeeds;
+/// `--explain-scope` does not print it.
 pub const W_SEC_036: &str = "W-SEC-036";
 
 /// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.

@@ -817,12 +817,10 @@ fn restore_backup(backup: &Path, final_path: &Path, had_backup: bool) -> Result<
 
 /// Describe a payload that has no metadata sidecar, from the payload itself.
 ///
-/// A store seeded by a path that wrote only the
-/// zip and its hash, still has to answer what the artifact is. `runtime` and `artifact_runtime`
-/// come from the `murmur.yaml` packed inside the bytes, so the answer describes these bytes
-/// rather than a default. A payload
-/// that does not parse falls back to `wasm` with nothing else filled in, so an opaque payload
-/// still resolves.
+/// A store seeded by a path that wrote only the zip and its hash, still has to answer what the
+/// artifact is. `runtime` and `artifact_runtime` come from the `murmur.yaml` packed inside the
+/// bytes, so the answer describes these bytes rather than a default. A payload that does not parse
+/// falls back to `wasm` with nothing else filled in, so an opaque payload still resolves.
 fn derived_meta(name: &ArtifactName, version: &str, bytes: &[u8]) -> ArtifactMeta {
     let (runtime, artifact_runtime) = declared_runtime_from_artifact_bytes(bytes).map_or_else(
         || (RuntimeType::Wasm, String::new()),

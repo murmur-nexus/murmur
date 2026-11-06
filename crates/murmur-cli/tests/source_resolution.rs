@@ -1398,7 +1398,6 @@ fn two_fitting_tool_x_versions(stub: &MockGitHub) {
             version,
             vec![served_tool_run()],
             vec![(
-                None,
                 format!("tool-x-{version}.mur.zip"),
                 zip_of(dir, "tool-x", version),
             )],
@@ -1447,10 +1446,7 @@ fn a_source_served_version_change_re_pins_but_new_bytes_for_the_pinned_version_a
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock.artifact_for("ana/tool-x").unwrap();
     assert_eq!(entry.resolved_version, "1.1.0");
-    assert_eq!(
-        entry.sha256.any.as_deref(),
-        Some(sha256_hex(&served).as_str())
-    );
+    assert_eq!(entry.sha256.any, sha256_hex(&served));
     assert_eq!(entry.owner_id, Some(1111));
     assert!(!global_store(home.path()).join("ana/tool-x").exists());
 

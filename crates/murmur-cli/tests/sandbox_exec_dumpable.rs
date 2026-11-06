@@ -157,7 +157,7 @@ fn mur(home: &TempDir, project: &Path) -> Command {
 /// controllers delegated to it.
 ///
 /// Needed because `mur run` refuses to launch a subprocess-capable capsule unless it can create a
-/// child cgroup to bound the process tree (slice `5cd4e8d`, `E-RUN-012`), and a test harness's own
+/// child cgroup to bound the process tree (`E-RUN-012`), and a test harness's own
 /// cgroup is normally undelegated. Wrapping only the `mur` process — rather than asking the
 /// operator to wrap `cargo test` — is what makes this work: cgroup v2's "no internal processes"
 /// rule means controllers cannot be enabled in a cgroup that still holds the test binary itself,
@@ -284,10 +284,10 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
         .clone();
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    // Pre-existing, unrelated launch gate (slice `5cd4e8d`): a capsule that can spawn
-    // subprocesses refuses to launch unless a cgroup v2 scope can bound the process tree, and the
-    // cgroup a test harness runs in is normally undelegated. Retry with `mur` in a delegated scope
-    // of its own; there is nothing to observe about *this* slice until it launches.
+    // A capsule that can spawn subprocesses refuses to launch (`E-RUN-012`) unless a cgroup v2
+    // scope can bound the process tree, and the cgroup a test harness runs in is normally
+    // undelegated. Retry with `mur` in a delegated scope of its own; there is nothing to observe
+    // until it launches.
     if !output.status.success()
         && stderr.contains(CGROUP_REFUSAL)
         && common::cgroup_delegation_available()

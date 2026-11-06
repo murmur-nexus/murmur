@@ -3,8 +3,9 @@
 //! workdir, which the capsule's commands can read and cannot change.
 //!
 //! The model is scripted against the anthropic driver fixture. What runs is real: the staged
-//! session, the kernel tier this host reaches, the WASM probe fixture and the `mur` binary. Every `scoped` and `sealed` case runs on this host or prints a `[SKIP-HOST]`
-//! line saying why it cannot.
+//! session, the kernel tier this host reaches, the WASM probe fixture and the `mur` binary. Every
+//! `scoped` and `sealed` case runs on this host or prints a `[SKIP-HOST]` line saying why it
+//! cannot.
 
 #[path = "common/mod.rs"]
 mod common;

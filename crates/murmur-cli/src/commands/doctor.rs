@@ -553,8 +553,9 @@ fn report_home_unusable(error: &capsule_runtime::HomeUnusable) {
 /// `E-CAP-004` precedent above: doctor launches nothing, so it has nothing to refuse, and aborting
 /// the checklist over one manifest line would hide every artifact problem behind it.
 ///
-/// Each WASM tool's extra roots come from `declared_floor` and the global config's `host_paths` checked for the default
-/// workdir; a refused `host_paths` entry adds none here and is reported under `Host paths`.
+/// Each WASM tool's extra roots come from `declared_floor` and the global config's `host_paths`
+/// checked for the default workdir; a refused `host_paths` entry adds none here and is reported
+/// under `Host paths`.
 fn report_preopens(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
     project_root: &Path,

@@ -886,10 +886,9 @@ impl From<RuntimeError> for CliError {
                     murmur_artifact::diagnostic_link("E-CAP-006")
                 ),
             ),
-            // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
-            // with another: this one is not about the containment ladder at all. A network
-            // namespace is what makes `capabilities.network.allow` mean anything for a
-            // subprocess, and every
+            // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help with
+            // another: this one is not about the containment ladder at all. A network namespace is
+            // what makes `capabilities.network.allow` mean anything for a subprocess, and every
             // Linux capsule that can spawn one needs it at every containment class — so neither
             // raising nor lowering a declared floor changes this answer. The hint therefore names
             // the host mechanism, never the manifest.

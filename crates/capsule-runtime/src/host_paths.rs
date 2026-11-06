@@ -1,12 +1,12 @@
 //! Host folders the operator lends every contained capsule on this host: the `host_paths:` list in
 //! `~/.murmur/config.yaml`.
 //!
-//! Each entry names one host directory and an access, `read` or `read-write`. On
-//! `landlock+seccomp` it becomes one Landlock rule for every command, plan shell step and
-//! `murmur:process` program; on `mountns+pivot_root+landlock+seccomp` it is also bound into the composed root at the
-//! directory's own absolute path. No rule ever carries `Execute`, so `capabilities.shell.allow`
-//! stays the complete list of what a contained capsule can run. Below `landlock+seccomp` nothing
-//! is scoped, and an entry is checked and reported but adds nothing.
+//! Each entry names one host directory and an access, `read` or `read-write`. On `landlock+seccomp`
+//! it becomes one Landlock rule for every command, plan shell step and `murmur:process` program; on
+//! `mountns+pivot_root+landlock+seccomp` it is also bound into the composed root at the directory's
+//! own absolute path. No rule ever carries `Execute`, so `capabilities.shell.allow` stays the
+//! complete list of what a contained capsule can run. Below `landlock+seccomp` nothing is scoped,
+//! and an entry is checked and reported but adds nothing.
 //!
 //! Checking happens in three steps, each refusing with the entry's index and its path as written:
 //!

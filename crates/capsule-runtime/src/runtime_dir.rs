@@ -41,8 +41,8 @@ use crate::workdir_fs::WorkdirRoot;
 pub const SESSION_ID_PLACEHOLDER: &str = "<session-id>";
 
 /// The variable naming the runtime directory in every shell command's, plan shell step's,
-/// `murmur:process` program's and `transport: process` harness's environment. Runtime-owned like `HOME`: no
-/// manifest, override or host value can set it.
+/// `murmur:process` program's and `transport: process` harness's environment. Runtime-owned like
+/// `HOME`: no manifest, override or host value can set it.
 pub const RUNTIME_DIR_ENV: &str = "MURMUR_RUNTIME_DIR";
 
 /// The guest path a `runtime: tool` with no `capabilities.filesystem.scope` finds the runtime

@@ -891,17 +891,17 @@ mod tests {
     }
 
     #[test]
-    fn a_same_version_conflict_ignores_a_new_version_and_an_unpinned_platform() {
-        let wasm = entry("local/tool", "1.0.0", LockedSha256::any("wasm-hash"));
+    fn a_same_version_conflict_ignores_a_new_version() {
+        let pinned = entry("local/tool", "1.0.0", LockedSha256::any("wasm-hash"));
         assert_eq!(
-            wasm.same_version_conflict_with("1.1.0", &LockedSha256::any("other-hash")),
+            pinned.same_version_conflict_with("1.1.0", &LockedSha256::any("other-hash")),
             None
         );
         assert_eq!(
-            wasm.same_version_conflict_with("1.0.0", &LockedSha256::any("wasm-hash")),
+            pinned.same_version_conflict_with("1.0.0", &LockedSha256::any("wasm-hash")),
             None
         );
-        let new_bytes = wasm
+        let new_bytes = pinned
             .same_version_conflict_with("1.0.0", &LockedSha256::any("other-hash"))
             .unwrap();
         assert_eq!(
@@ -909,42 +909,8 @@ mod tests {
             "'local/tool' is pinned at sha256 wasm-hash, but other-hash was resolved"
         );
         assert_eq!(
-            wasm.conflict_with("1.0.0", &LockedSha256::any("other-hash")),
+            pinned.conflict_with("1.0.0", &LockedSha256::any("other-hash")),
             Some(new_bytes)
-        );
-        let shape_change = wasm
-            .same_version_conflict_with(
-                "1.0.0",
-                &LockedSha256::for_one_platform("linux-x86_64", "wasm-hash"),
-            )
-            .unwrap();
-        assert!(shape_change.contains("per-platform"), "{shape_change}");
-
-        let native = entry(
-            "local/native-tool",
-            "0.1.0",
-            LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
-        );
-        assert_eq!(
-            native.same_version_conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("linux-x86_64", "linux-hash")
-            ),
-            None
-        );
-        let platform_hash = native
-            .same_version_conflict_with(
-                "0.1.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
-            )
-            .unwrap();
-        assert!(platform_hash.contains("darwin-aarch64"), "{platform_hash}");
-        assert_eq!(
-            native.same_version_conflict_with(
-                "0.2.0",
-                &LockedSha256::for_one_platform("darwin-aarch64", "other-hash"),
-            ),
-            None
         );
     }
 

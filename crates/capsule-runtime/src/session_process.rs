@@ -414,8 +414,8 @@ struct RefusalRecord<'a> {
 }
 
 impl SessionProcesses {
-    /// One session's registry. `env_overrides` is what every shell command of the session is
-    /// given ([`crate::runtime::subprocess_guest_env`] of the session's environment); `trace` is the
+    /// One session's registry. `env_overrides` is what every shell command of the session is given
+    /// ([`crate::runtime::subprocess_guest_env`] of the session's environment); `trace` is the
     /// session's concurrent trace appender.
     pub(crate) fn new(
         enforcement: ShellEnforcement,

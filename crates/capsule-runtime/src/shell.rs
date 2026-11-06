@@ -1442,11 +1442,10 @@ pub(crate) fn subprocess_env(
 }
 
 /// The environment of one unconfined shell command, plan shell step or `murmur:process` program:
-/// `base` (this
-/// process's whole environment, [`std::env::vars_os`], on every production path), then
-/// `env_overrides`, minus the lineage names
-/// ([`LINEAGE_ENV`] and every formation member grant name), [`ARTIFACT_CONFIG_ENV`] and whatever `capabilities.shell.strip_env` matches, and
-/// then `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
+/// `base` (this process's whole environment, [`std::env::vars_os`], on every production path), then
+/// `env_overrides`, minus the lineage names ([`LINEAGE_ENV`] and every formation member grant
+/// name), [`ARTIFACT_CONFIG_ENV`] and whatever `capabilities.shell.strip_env` matches, and then
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
 ///
 /// The credential backstop ([`CREDENTIAL_ENV_PATTERNS`]) is not applied, and `HOME`,
 /// `USERPROFILE`, `TMPDIR`, `TMP` and `TEMP` are whatever `base` holds: the operator chose to run

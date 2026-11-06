@@ -642,7 +642,8 @@ fn target(name: &ArtifactName, version: Option<&str>) -> String {
 }
 
 /// Fetch `name` from `source`, which must be the source of its scope: `version` exactly, or with
-/// `None` the newest version that fits this mur. Nothing is written: the caller stores what this returns.
+/// `None` the newest version that fits this mur. Nothing is written: the caller stores what this
+/// returns.
 ///
 /// Checked in order, each before anything further is requested: the owner id against `lock` and,
 /// for the [`MURMUR_SCOPE`], against [`MURMUR_OWNER_ID`]; the index's scope against the
