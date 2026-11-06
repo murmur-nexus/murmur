@@ -853,8 +853,6 @@ another version than the manifest declares is replaced by the declared version, 
 entry is left as it was ([Behavior step 4](cli.md#mur-install)). An install fails with `E-REG-005`
 when:
 
-- the version an entry pins resolves to a payload with another SHA-256, or of another shape
-  (platform-independent instead of per-platform, or the reverse)
-- under `mur install --frozen`, there is no `murmur.lock`, a declared artifact has no entry, the
-  manifest declares another version than the entry pins, or a native artifact's entry pins no hash
-  for this platform
+- the version an entry pins resolves to a payload with another SHA-256
+- under `mur install --frozen`, there is no `murmur.lock`, a declared artifact has no entry, or the
+  manifest declares another version than the entry pins

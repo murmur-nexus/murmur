@@ -826,7 +826,7 @@ Behavior:
     | Entry | Change |
     |---|---|
     | Pins the version `murmur.yaml` declares, same bytes | None |
-    | Pins the version `murmur.yaml` declares, other bytes or payload shape | None: the artifact fails with [`E-REG-005`](workdir.md#lockfile-murmurlock) and is not stored |
+    | Pins the version `murmur.yaml` declares, other bytes | None: the artifact fails with [`E-REG-005`](workdir.md#lockfile-murmurlock) and is not stored |
     | Pins another version than `murmur.yaml` declares | Replaced by the declared version and its SHA-256 |
     | Missing for a declared artifact | Added |
     | For an artifact `murmur.yaml` does not declare | None |
