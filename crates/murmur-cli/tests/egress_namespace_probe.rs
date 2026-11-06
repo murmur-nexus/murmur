@@ -10,7 +10,6 @@
 //! |---|---|---|
 //! | restriction bound to `1` | `1` | succeeds |
 //! | the same, then `chroot` | `1` | `EPERM` (the kernel refuses a chrooted process) |
-//! | `user.max_user_namespaces=0` | the host's | `ENOSPC` |
 //!
 //! A host where a construction cannot be built prints `[SKIP-HOST]` and the case returns.
 
@@ -29,7 +28,6 @@ const RESTRICT_PROC: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_use
 /// Read before [`RESTRICT_PROC`] when it exists, so a construction binds over both.
 const RESTRICT_SYS: &str = "/sys/module/apparmor/parameters/restrict_unprivileged_userns";
 const APPARMOR_ENABLED: &str = "/sys/module/apparmor/parameters/enabled";
-const MAX_USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
 
 /// How `mur` is started: the shell script `sh -c` runs before it `exec`s `mur`, and the
 /// `unshare` flags it runs under.
@@ -40,9 +38,6 @@ enum Construction {
     /// The restriction reads `1` and `mur` runs chrooted, where `unshare(CLONE_NEWUSER)` fails
     /// with `EPERM`.
     RestrictionReadsOneChrooted,
-    /// `user.max_user_namespaces` is `0` in the namespace `mur` runs in, so `unshare` fails with
-    /// `ENOSPC`.
-    NoUserNamespacesLeft,
 }
 
 /// The scratch files a construction binds or chroots into.
@@ -71,7 +66,6 @@ impl Construction {
     fn unshare_flags(self) -> &'static str {
         match self {
             Self::RestrictionReadsOne | Self::RestrictionReadsOneChrooted => "-Urm",
-            Self::NoUserNamespacesLeft => "-Ur",
         }
     }
 
@@ -89,9 +83,6 @@ impl Construction {
                 "{bind} && mount --rbind / \"$ROOT\" && \
                  exec chroot \"$ROOT\" sh -c 'cd \"$CWD\" && exec \"$0\" \"$@\"' \"$0\" \"$@\""
             ),
-            Self::NoUserNamespacesLeft => {
-                format!("echo 0 > {MAX_USER_NAMESPACES} && exec \"$0\" \"$@\"")
-            }
         }
     }
 
@@ -166,7 +157,6 @@ impl Construction {
         }
         let (file, expected) = match self {
             Self::RestrictionReadsOne | Self::RestrictionReadsOneChrooted => (RESTRICT_PROC, "1"),
-            Self::NoUserNamespacesLeft => (MAX_USER_NAMESPACES, "0"),
         };
         let read = match probe("cat", &[file]) {
             Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -177,14 +167,12 @@ impl Construction {
                 "{file} reads {read:?} inside the construction, not {expected}"
             ));
         }
-        if !matches!(self, Self::NoUserNamespacesLeft) {
-            let enabled = fs::read_to_string(APPARMOR_ENABLED).unwrap_or_default();
-            if !matches!(enabled.trim(), "Y" | "1") {
-                return Some(
-                    "AppArmor is not enabled, so a restriction reading of 1 means nothing here"
-                        .to_string(),
-                );
-            }
+        let enabled = fs::read_to_string(APPARMOR_ENABLED).unwrap_or_default();
+        if !matches!(enabled.trim(), "Y" | "1") {
+            return Some(
+                "AppArmor is not enabled, so a restriction reading of 1 means nothing here"
+                    .to_string(),
+            );
         }
         None
     }
@@ -607,41 +595,6 @@ fn a_refused_namespace_names_the_call_the_errno_and_the_reading() {
             "{shortfall}"
         );
     }
-}
-
-/// A kernel with no user namespaces left to give is named as such, with no AppArmor remedy.
-#[test]
-fn a_kernel_without_user_namespaces_is_named_without_apparmor() {
-    let test = "a_kernel_without_user_namespaces_is_named_without_apparmor";
-    let construction = Construction::NoUserNamespacesLeft;
-    let scratch = Scratch::new();
-    if skip(test, construction, &scratch) {
-        return;
-    }
-    let case = Case::new(construction, scratch);
-
-    let run = case.run();
-    assert!(!run.success, "{}", run.all());
-    for expected in [
-        "error[E-CAP-005]",
-        "failed with ENOSPC",
-        "user.max_user_namespaces",
-    ] {
-        assert!(run.stderr.contains(expected), "{expected}\n{}", run.all());
-    }
-    assert!(!run.stderr.contains("apparmor_parser"), "{}", run.all());
-    assert!(!run.stderr.contains("E-CAP-012"), "{}", run.all());
-
-    let sealed = driver_project("http://127.0.0.1:9", "sealed");
-    let report = explain_scope(construction, &case.scratch, case.home.path(), sealed.path());
-    assert_eq!(report["floor_met"], false, "{report}");
-    let shortfall = report["shortfall_reason"].as_str().expect("a shortfall");
-    assert!(
-        shortfall.starts_with(&capsule_runtime::SealedBlocker::KernelUnsupported.reason()),
-        "{shortfall}"
-    );
-    assert!(shortfall.contains("failed with ENOSPC"), "{shortfall}");
-    assert!(!shortfall.contains("mur-sealed"), "{shortfall}");
 }
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";

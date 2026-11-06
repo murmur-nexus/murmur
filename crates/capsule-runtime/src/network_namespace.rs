@@ -2633,7 +2633,28 @@ mod tests {
                 let join = netns
                     .establish(&[], policy())
                     .expect("the namespace is created");
-                let holder = host_pid_in_session(std::process::id(), 1)
+                // This session's own PID namespace, not the first one the test process holds:
+                // tests running beside this one hold sessions of their own, whose holders are
+                // pid 1 too and are not under this thread's filter.
+                let pid_ns = std::fs::read_link(format!("/proc/self/fd/{}", join.pid_ns_fd()))
+                    .expect("the session's PID namespace handle is readable");
+                let holder = std::fs::read_dir("/proc")
+                    .expect("/proc is readable")
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                    .find(|pid| {
+                        std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                            .is_ok_and(|namespace| namespace == pid_ns)
+                            && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(
+                                |status| {
+                                    status
+                                        .lines()
+                                        .find_map(|line| line.strip_prefix("NSpid:"))
+                                        .and_then(|fields| fields.split_whitespace().last())
+                                        == Some("1")
+                                },
+                            )
+                    })
                     .expect("the session's holder is pid 1 of its PID namespace");
                 let status = std::fs::read_to_string(format!("/proc/{holder}/status")).unwrap();
                 assert!(
