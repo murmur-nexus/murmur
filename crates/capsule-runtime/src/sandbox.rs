@@ -11382,15 +11382,44 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         // Both servers bound the same port: each is still running, waiting for its one client.
         std::thread::sleep(std::time::Duration::from_millis(300));
         // Each pid file holds a pid in its session's PID namespace, where the two servers may
-        // well share a number: both must be live host processes.
-        let servers: std::collections::HashSet<i32> = [&dir_a, &dir_b]
-            .iter()
-            .flat_map(|dir| {
-                crate::network_namespace::host_pids_in_sessions(
-                    std::process::id(),
-                    pid_in(dir.path(), "server.pid"),
+        // well share a number: both must be live host processes. Each is looked up in its own
+        // session's namespace only, since tests running beside this one hold sessions whose
+        // processes can carry the same number.
+        let server_in = |dir: &tempfile::TempDir, session: &ShellEnforcement| -> Option<i32> {
+            let join = session
+                .session_netns
+                .establish(
+                    &session.egress_tcp_ports,
+                    crate::egress_proxy::EgressPolicy::new(
+                        session.network_allow_rules.clone(),
+                        session.network_allow_ips.clone(),
+                    ),
                 )
-            })
+                .expect("the session's namespace is established");
+            let pid_ns = std::fs::read_link(format!("/proc/self/fd/{}", join.pid_ns_fd()))
+                .expect("the session's PID namespace handle is readable");
+            let namespace_pid = pid_in(dir.path(), "server.pid").to_string();
+            std::fs::read_dir("/proc")
+                .expect("/proc is readable")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                .find(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                        .is_ok_and(|namespace| namespace == pid_ns)
+                        && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(
+                            |status| {
+                                status
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("NSpid:"))
+                                    .and_then(|fields| fields.split_whitespace().last())
+                                    == Some(namespace_pid.as_str())
+                            },
+                        )
+                })
+        };
+        let servers: std::collections::HashSet<i32> = [(&dir_a, &session_a), (&dir_b, &session_b)]
+            .into_iter()
+            .filter_map(|(dir, session)| server_in(dir, session))
             .collect();
         assert_eq!(
             servers.len(),
