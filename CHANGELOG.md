@@ -4,6 +4,7 @@ All notable changes to Murmur are documented here. Each release has a detailed c
 
 ## Releases
 
+- [v0.10.0](./CHANGELOG/v0.10.0.md)
 - [v0.9.0](./CHANGELOG/v0.9.0.md)
 - [v0.8.0](./CHANGELOG/v0.8.0.md)
 - [v0.7.0](./CHANGELOG/v0.7.0.md)
