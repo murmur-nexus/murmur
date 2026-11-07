@@ -119,8 +119,8 @@ impl Fixture {
         self.project.join("murmur.yaml")
     }
 
-    /// The capsule at `containment`, with `extra` lines under `capabilities:`, the second probe
-    /// when `probe_b`, and the deny hook when `hook`.
+    /// The capsule at `containment`, or declaring none when it is empty, with `extra` lines under
+    /// `capabilities:`, the second probe when `probe_b`, and the deny hook when `hook`.
     fn write_manifest(
         &self,
         endpoint: &str,
@@ -144,11 +144,16 @@ impl Fixture {
                 "  - name: local/{HOOK}\n    version: 0.1.0\n    runtime: hook\n"
             ));
         }
+        let containment = if containment.is_empty() {
+            String::new()
+        } else {
+            format!("  containment: {containment}\n")
+        };
         fs::write(
             self.manifest(),
             format!(
                 "name: session-processes-capsule\nversion: 0.0.1\nartifacts:\n{artifacts}\
-                 capabilities:\n  containment: {containment}\n  network:\n    allow:\n      - \
+                 capabilities:\n{containment}  network:\n    allow:\n      - \
                  {endpoint}\n{extra}inference:\n  transport: http\n  model: test-model\n  \
                  driver:\n    artifact: {DRIVER}\n"
             ),
@@ -170,6 +175,19 @@ impl Fixture {
         calls: Vec<Call>,
         probe_b: bool,
         hook: bool,
+    ) -> Run {
+        self.run_with_args(containment, extra, calls, probe_b, hook, &[])
+    }
+
+    /// [`Fixture::run`], with `args` added to `mur run`.
+    fn run_with_args(
+        &self,
+        containment: &str,
+        extra: &str,
+        calls: Vec<Call>,
+        probe_b: bool,
+        hook: bool,
+        args: &[&str],
     ) -> Run {
         let total = calls.len() + 1;
         let mut next = 0usize;
@@ -198,6 +216,7 @@ impl Fixture {
             .mur()
             .args(["run", "--manifest", self.manifest().to_str().unwrap()])
             .args(["--task", "Run each call once.", "--verbose"])
+            .args(args)
             .write_stdin("")
             .timeout(std::time::Duration::from_secs(300))
             .output()
@@ -809,4 +828,462 @@ fn another_tool_cannot_reach_the_first_tools_processes() {
         assert_eq!(tools, [PROBE, PROBE_B], "{tier}");
         run.assert_process_lines_are_attributed();
     }
+}
+
+// ---------------------------------------------------------------- one containment, two routes
+
+/// One capsule shape the routes are compared at: its label, the `containment:` it declares (none
+/// when empty) and its `capabilities:` lines.
+struct Shape {
+    label: &'static str,
+    containment: &'static str,
+    extra: String,
+}
+
+/// What the fingerprint script needs to exec, allowed identically for every route.
+const FINGERPRINT_ALLOW: &[&str] = &["bash", "readlink", "rm"];
+
+/// `scoped`, `sealed` when the host reaches it, and the shape of a capsule that declares no
+/// containment and sets `filesystem.workdir_exec: true`, which runs `advisory` on the Full tier.
+fn fingerprint_shapes(test_name: &str) -> Vec<Shape> {
+    let mut shapes: Vec<Shape> = tiers(test_name)
+        .into_iter()
+        .map(|tier| Shape {
+            label: tier,
+            containment: tier,
+            extra: shell_allow(FINGERPRINT_ALLOW),
+        })
+        .collect();
+    shapes.push(Shape {
+        label: "advisory+workdir_exec",
+        containment: "",
+        extra: format!(
+            "{}  filesystem:\n    workdir_exec: true\n",
+            shell_allow(FINGERPRINT_ALLOW)
+        ),
+    });
+    shapes
+}
+
+/// The five ways one session runs the fingerprint script: a `bash` shell call and a
+/// `murmur:process` `run` of the same `bash -c`, each at depth 1 and depth 2, and a `start`.
+const ROUTES: &[&str] = &["shell-d1", "shell-d2", "run-d1", "run-d2", "start-d1"];
+
+/// One fingerprint per route, keyed by field. Depth-2 keys keep their `d2.` prefix.
+type Fingerprints = std::collections::BTreeMap<&'static str, Fingerprint>;
+type Fingerprint = std::collections::BTreeMap<String, String>;
+
+/// The key families the script prints, the first word of every key it prints.
+const FINGERPRINT_FAMILIES: &[&str] = &[
+    "status",
+    "limit",
+    "cgroup",
+    "lsm",
+    "oom_score_adj",
+    "personality",
+    "ns",
+    "proc",
+    "fd",
+    "env",
+    "dev",
+    "devshm",
+    "mount",
+    "landlock",
+    "end",
+];
+
+/// The `key: value` lines of the script's output; every other line (the shell result's
+/// `$ <command>` head) is skipped.
+fn parse_fingerprint(output: &str) -> Fingerprint {
+    output
+        .lines()
+        .filter_map(|line| line.split_once(": "))
+        .filter(|(key, _)| {
+            let bare = key.strip_prefix("d2.").unwrap_or(key);
+            let family = bare.split(['.', ':']).next().unwrap_or_default();
+            FINGERPRINT_FAMILIES.contains(&family) && !key.contains(' ')
+                || bare.starts_with("limit.")
+        })
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Runs the fingerprint script every way in [`ROUTES`] in one session of `shape`.
+fn fingerprint_routes(fixture: &Fixture, shape: &Shape) -> Fingerprints {
+    let workdir = fixture.project.join(format!("work-{}", shape.label));
+    let _ = fs::remove_dir_all(&workdir);
+    fs::create_dir_all(&workdir).unwrap();
+    fs::copy(
+        common::fixture_path("containment-fingerprint/fingerprint.sh"),
+        workdir.join("fingerprint.sh"),
+    )
+    .unwrap();
+    let shell = |id: &'static str, command: &str| Call {
+        id,
+        tool: "bash",
+        input: json!({"command": command}),
+    };
+    let run_bash = |id: &'static str, command: &str| {
+        call(
+            id,
+            json!({"op": "run", "program": "bash", "args": ["-c", command], "timeout_ms": 120_000}),
+        )
+    };
+    let run = fixture.run_with_args(
+        shape.containment,
+        &shape.extra,
+        vec![
+            shell("shell-d1", "bash fingerprint.sh"),
+            shell("shell-d2", "bash fingerprint.sh --depth2"),
+            run_bash("run-d1", "bash fingerprint.sh"),
+            run_bash("run-d2", "bash fingerprint.sh --depth2"),
+            call(
+                "start-d1",
+                json!({"op": "seq", "steps": [
+                    {"op": "start", "name": "fingerprint", "program": "bash",
+                     "args": ["-c", "bash fingerprint.sh"]},
+                    {"op": "wait_output", "name": "fingerprint", "contains": "end: ok",
+                     "timeout_ms": 120_000},
+                ]}),
+            ),
+        ],
+        false,
+        false,
+        &["--workdir", workdir.to_str().unwrap()],
+    );
+    let label = shape.label;
+    let mut fingerprints = Fingerprints::new();
+    for route in ["shell-d1", "shell-d2"] {
+        let text = common::tool_result_text(&run.requests, route)
+            .unwrap_or_else(|| panic!("{label}: no result for {route}"));
+        fingerprints.insert(route, parse_fingerprint(&text));
+    }
+    for route in ["run-d1", "run-d2"] {
+        let result = run.result(route);
+        assert_eq!(result["exit_code"], 0, "{label}: {route}: {result}");
+        fingerprints.insert(
+            route,
+            parse_fingerprint(result["stdout"].as_str().unwrap_or_default()),
+        );
+    }
+    let started = run.result("start-d1");
+    assert_eq!(started[1]["found"], true, "{label}: start-d1: {started}");
+    fingerprints.insert(
+        "start-d1",
+        parse_fingerprint(started[1]["output"].as_str().unwrap_or_default()),
+    );
+    for probe in ["tmp", "dev/shm"] {
+        for entry in fs::read_dir(format!("/{probe}"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("murmur-fingerprint.")
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    fingerprints
+}
+
+/// The fields compared by name: each must be present on both routes and equal.
+const COMPARED_KEYS: &[&str] = &[
+    "status.Uid",
+    "status.Gid",
+    "status.Groups",
+    "status.CapInh",
+    "status.CapPrm",
+    "status.CapEff",
+    "status.CapBnd",
+    "status.CapAmb",
+    "status.NoNewPrivs",
+    "status.Seccomp",
+    "status.Seccomp_filters",
+    "status.SigBlk",
+    "status.SigIgn",
+    "status.SigCgt",
+    "status.Umask",
+    "status.Cpus_allowed_list",
+    "status.NSpid.depth",
+    "limit.Max cpu time",
+    "limit.Max file size",
+    "limit.Max data size",
+    "limit.Max stack size",
+    "limit.Max core file size",
+    "limit.Max resident set",
+    "limit.Max processes",
+    "limit.Max open files",
+    "limit.Max locked memory",
+    "limit.Max address space",
+    "limit.Max file locks",
+    "limit.Max pending signals",
+    "limit.Max msgqueue size",
+    "limit.Max nice priority",
+    "limit.Max realtime priority",
+    "limit.Max realtime timeout",
+    "cgroup",
+    "lsm.current",
+    "oom_score_adj",
+    "personality",
+    "ns.cgroup",
+    "ns.ipc",
+    "ns.net",
+    "ns.pid",
+    "ns.pid_for_children",
+    "ns.time",
+    "ns.time_for_children",
+    "ns.user",
+    "ns.uts",
+    "proc.ppid",
+    "proc.sid",
+    "proc.pgid_is_pid",
+    "proc.sid_is_pid",
+    "proc.nice",
+    "proc.pdeathsig",
+    "dev.entries",
+    "mount.count",
+    "landlock.read_etc_passwd",
+    "landlock.list_home",
+    "landlock.write_workdir",
+    "landlock.write_tmp",
+    "landlock.write_dev_shm",
+    "landlock.exec_unallowed",
+    "end",
+];
+
+/// The families compared key by key: every key of the family on either route must be on both,
+/// and equal.
+const COMPARED_FAMILIES: &[&str] = &["env.", "fd.", "mount./"];
+
+/// The fields that may differ, each with the rule that allows it. A key is tolerated only on the
+/// comparisons named here; on every other it is compared like the rest.
+///
+/// No `env.` key is tolerated: the tool's own `env` additions are the one environment difference
+/// the containment reference allows, and these calls pass none.
+fn tolerated(key: &str, pair: (&str, &str)) -> Option<&'static str> {
+    let bare = key.strip_prefix("d2.").unwrap_or(key);
+    match bare {
+        "proc.pid" => Some("a pid value: every process has its own"),
+        "proc.ppid" if key.starts_with("d2.") => {
+            Some("a pid value: a depth-2 process's parent is its depth-1 process")
+        }
+        "ns.mnt" => Some(
+            "the per-command mount namespace: every command of a contained session gets its own",
+        ),
+        "fd.0" if pair.1 == "start-d1" => Some(
+            "stdin: `/dev/null` for a shell command and a `run` without stdin, a pipe for `start`",
+        ),
+        _ => None,
+    }
+}
+
+/// The value a key is compared on. `devshm.entries` is compared on whether `/dev/shm` could be
+/// listed, or the refusal: the host's `/dev/shm` is shared with every process on it, so what it
+/// holds changes between two calls, and what `/dev/shm` is, is compared by `mount./dev/shm`.
+fn compared_value<'a>(key: &str, value: &'a str) -> &'a str {
+    let bare = key.strip_prefix("d2.").unwrap_or(key);
+    if bare == "devshm.entries" && !value.starts_with("unreadable:") {
+        return "<listed>";
+    }
+    value
+}
+
+/// A field the script cannot read from a shell on any host, which it prints as such.
+fn not_readable(value: &str) -> bool {
+    value.starts_with("not readable")
+}
+
+/// Every difference between route `a` and route `b` outside [`tolerated`], one line each.
+fn route_differences(fingerprints: &Fingerprints, a: &str, b: &str, depth2: bool) -> Vec<String> {
+    let prefix = if depth2 { "d2." } else { "" };
+    let left = &fingerprints[a];
+    let right = &fingerprints[b];
+    let mut differences = Vec::new();
+    for (route, fingerprint) in [(a, left), (b, right)] {
+        let seccomp = fingerprint.get(&format!("{prefix}status.Seccomp"));
+        assert!(
+            seccomp.is_some_and(|value| !value.starts_with("unreadable")),
+            "{route}: no readable `{prefix}status.Seccomp` line, so nothing is compared: \
+             {fingerprint:#?}"
+        );
+        let limits = fingerprint
+            .keys()
+            .filter(|key| key.starts_with(&format!("{prefix}limit.Max ")))
+            .count();
+        assert!(
+            limits >= 16,
+            "{route}: no limits table at {prefix}, so nothing is compared: {fingerprint:#?}"
+        );
+    }
+    let mut keys: std::collections::BTreeSet<String> = COMPARED_KEYS
+        .iter()
+        .map(|key| format!("{prefix}{key}"))
+        .collect();
+    keys.insert(format!("{prefix}proc.pid"));
+    keys.insert(format!("{prefix}ns.mnt"));
+    keys.insert(format!("{prefix}devshm.entries"));
+    for fingerprint in [left, right] {
+        for key in fingerprint.keys() {
+            let Some(bare) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if prefix.is_empty() && key.starts_with("d2.") {
+                continue;
+            }
+            if COMPARED_FAMILIES
+                .iter()
+                .any(|family| bare.starts_with(family))
+            {
+                keys.insert(key.clone());
+            } else if !keys.contains(key) {
+                differences.push(format!(
+                    "{key}: printed by the script but neither compared nor tolerated"
+                ));
+            }
+        }
+    }
+    for key in keys {
+        if tolerated(&key, (a, b)).is_some() {
+            continue;
+        }
+        match (left.get(&key), right.get(&key)) {
+            // Present on both routes and unreadable on both: the record says so, and two missing
+            // values are never counted as equal.
+            (Some(l), Some(r)) if not_readable(l) && not_readable(r) => {}
+            (Some(l), Some(r)) if compared_value(&key, l) == compared_value(&key, r) => {}
+            (Some(l), Some(r)) => differences.push(format!("{key}: {a} `{l}`, {b} `{r}`")),
+            (l, r) => differences.push(format!(
+                "{key}: on one route only ({a} {:?}, {b} {:?})",
+                l.map(|_| "present"),
+                r.map(|_| "present")
+            )),
+        }
+    }
+    differences
+}
+
+/// The record's markdown table for one shape: a row per field, a column per route, and whether
+/// the routes agree.
+fn fingerprint_table(label: &str, fingerprints: &Fingerprints) -> String {
+    fn cell(value: Option<&String>) -> String {
+        let Some(value) = value else {
+            return "—".to_string();
+        };
+        let value = value.replace('|', "\\|");
+        if value.chars().count() <= 48 {
+            return format!("`{value}`");
+        }
+        // A long value prints its head and a digest, so two cells agree exactly when their
+        // digests do.
+        let digest = value.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let head: String = value.chars().take(32).collect();
+        format!(
+            "`{head}…` ({} chars, fnv {digest:016x})",
+            value.chars().count()
+        )
+    }
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for fingerprint in fingerprints.values() {
+        for key in fingerprint.keys() {
+            keys.insert(key.strip_prefix("d2.").unwrap_or(key).to_string());
+        }
+    }
+    let mut table = format!(
+        "#### {label}\n\n| field | shell d1 | shell d2 | process run d1 | process run d2 | \
+         process start d1 | equal |\n|---|---|---|---|---|---|---|\n"
+    );
+    for key in keys {
+        let d2 = format!("d2.{key}");
+        let shell_d1 = fingerprints["shell-d1"].get(&key);
+        let shell_d2 = fingerprints["shell-d2"].get(&d2);
+        let run_d1 = fingerprints["run-d1"].get(&key);
+        let run_d2 = fingerprints["run-d2"].get(&d2);
+        let start_d1 = fingerprints["start-d1"].get(&key);
+        let same = |left: Option<&String>, right: Option<&String>, k: &str| match (left, right) {
+            (Some(l), Some(r)) => compared_value(k, l) == compared_value(k, r),
+            (None, None) => true,
+            _ => false,
+        };
+        let pairs = [
+            (
+                same(shell_d1, run_d1, &key),
+                tolerated(&key, ("shell-d1", "run-d1")),
+            ),
+            (
+                same(shell_d2, run_d2, &d2),
+                tolerated(&d2, ("shell-d2", "run-d2")),
+            ),
+            (
+                same(shell_d1, start_d1, &key),
+                tolerated(&key, ("shell-d1", "start-d1")),
+            ),
+        ];
+        let equal = if [shell_d1, shell_d2, run_d1, run_d2, start_d1]
+            .iter()
+            .all(|value| value.is_some_and(|value| not_readable(value)))
+        {
+            "not compared: not readable from a shell".to_string()
+        } else if pairs.iter().all(|(same, _)| *same) {
+            "yes".to_string()
+        } else if let Some(rule) = pairs
+            .iter()
+            .filter(|(same, _)| !same)
+            .map(|(_, rule)| *rule)
+            .collect::<Option<Vec<_>>>()
+        {
+            format!("no, allowed: {}", rule[0])
+        } else {
+            "**no**".to_string()
+        };
+        table.push_str(&format!(
+            "| `{key}` | {} | {} | {} | {} | {} | {equal} |\n",
+            cell(shell_d1),
+            cell(shell_d2),
+            cell(run_d1),
+            cell(run_d2),
+            cell(start_d1)
+        ));
+    }
+    table
+}
+
+/// A program started from a `bash` shell call and the same program a WASM tool runs through
+/// `murmur:process` run under the same containment, field by field, at depth 1 and at depth 2:
+/// seccomp, `no_new_privs`, capabilities, rlimits, cgroup, namespaces, environment, open
+/// descriptors, signal mask and dispositions, process group, `/dev` and `/dev/shm`, and the
+/// Landlock outcomes. A `start` is compared with the shell call at depth 1 too.
+#[test]
+#[allow(clippy::print_stdout)]
+fn a_shell_command_and_a_session_process_are_contained_alike() {
+    let name = "a_shell_command_and_a_session_process_are_contained_alike";
+    if common::skip_without_host_support(name) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut failures = Vec::new();
+    for shape in fingerprint_shapes(name) {
+        let fingerprints = fingerprint_routes(&fixture, &shape);
+        assert_eq!(fingerprints.len(), ROUTES.len());
+        println!("{}", fingerprint_table(shape.label, &fingerprints));
+        for (a, b, depth2) in [
+            ("shell-d1", "run-d1", false),
+            ("shell-d2", "run-d2", true),
+            ("shell-d1", "start-d1", false),
+        ] {
+            for difference in route_differences(&fingerprints, a, b, depth2) {
+                failures.push(format!("{}: {difference}", shape.label));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the routes are contained differently:\n{}",
+        failures.join("\n")
+    );
 }
