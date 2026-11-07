@@ -2194,6 +2194,10 @@ pub(crate) struct IncomingTask {
     /// The formation member that called, when the door let this task in on a formation token.
     /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
     pub caller_member: Option<String>,
+    /// The caller's member request id, kept by the door only beside a `caller_member` and only in
+    /// the shape the runtime mints. Recorded as `a2a_task_received.member_request_id`; `None` for
+    /// every other task.
+    pub member_request_id: Option<String>,
     /// Who the door let this task in as, recorded as `a2a_task_received.caller`. `Some` exactly
     /// for a [`SOURCE_A2A`] task; `None` for the launch's own task and every report the runtime
     /// enqueued for itself, none of which crossed the door.

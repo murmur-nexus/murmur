@@ -45,7 +45,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_busy`, `member_call_start`, `member_call` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_busy`, `member_call_start`, `member_call`, `member_request` | The session node |
 | `plan_start` | The session node. Its `event_id` is the plan node |
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
@@ -699,6 +699,7 @@ A script capsule ended by `SIGKILL`, `SIGTERM` or its spawner's lifeline writes 
 | `caller` | string | Who the door let the task in as — see the table below. Always written |
 | `caller_member` | string | The roster name of the formation member that called. Present exactly when `caller` is `"member"` |
 | `caller_credential` | string | The name of the declared credential whose token let the task in. Present exactly when `caller` is `"credential"` |
+| `member_request_id` | string | The `call_id` of the caller's [`member_request`](#member-request): the `x-murmur-member-request-id` header's value. Present only when `caller` is `"member"` and the request carried exactly one value of the form `mrq_` and 32 lowercase hex digits |
 | `message_sha256` | string | `sha256` of the message text, the text written to `task.md`. Written under [`trace.capture`](manifest.md#field-trace) `meta` and `content`, absent under `none`. Under `content` the text is stored at [`<session_id>/blobs/<message_sha256>`](#trace-blobs) |
 
 | `caller` | The request carried |
@@ -1045,6 +1046,49 @@ A call to a member that ended without an answer because its own call timed out:
 ```json
 {"event_type":"member_call","event_id":"evt_01a106502c377c72bcc0f222268e783e","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107282511,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c6","member":"p","member_task_id":"tsk_01a106502a41745381369d93d349d696","status":"no_answer","duration_ms":3088,"output":"q gave no answer","truncated":false,"delivered":true,"no_answer_below":[{"member":"q","status":"timed_out"}]}
 ```
+
+**`member_request`**{ #member-request } — written once per request a member's runtime routed to
+a callee's virtual address (`http://<member>.formation.invalid`), refused requests included. The
+sender is a WASM tool, a hook, a `transport: http` driver, or a script capsule through its own HTTP
+requests or [`murmur:message/send`](wit-interfaces.md#message-send). Written after the request
+is accounted for and before `session_end`. A session in no formation writes none, and a
+[`call-member`](runtime-provided-tools.md#call-member) call writes its own lines instead.
+
+| Field | Type | Notes |
+|---|---|---|
+| `call_id` | string | `mrq_` and 32 lowercase hex digits, minted by the runtime and sent to the member's door as `x-murmur-member-request-id`. The callee's `a2a_task_received.member_request_id` carries the same value |
+| `task_id` | string | The task the request was sent for. Absent for a request sent for no task: a hook's, a hook's `run-inference` driver's, and a script capsule's |
+| `member` | string | The roster name the address names. Absent when its host names no single member, such as `formation.invalid` or `a.coder.formation.invalid` |
+| `component` | string | The artifact's tool name for a tool or driver, the hook's name, or the capsule's `name` |
+| `role` | string | `"tool"` \| `"driver"` \| `"hook"` \| `"capsule"` — as [`call_deadline.role`](#call-deadline) |
+| `via` | string | `"wasi_http"` — the component's own HTTP request \| `"message_send"` — a script capsule's `murmur:message/send` |
+| `outcome` | string | `"sent"` \| `"refused"` \| `"failed"` — see the table below |
+| `reason` | string | Present exactly for `refused` and `failed` — see the table below |
+| `http_status` | u16 | The member door's HTTP status. Present when a response arrived |
+| `member_task_id` | string | The callee's task: the `task.id` of the `SendMessage` answer. Present when the response carried one |
+| `duration_ms` | u64 | From the request reaching the runtime to the line being accounted for: the end of the response for `sent` |
+
+| `outcome` | `reason` | Written when |
+|---|---|---|
+| `"sent"` | — | The member's door answered. A non-2xx status or a JSON-RPC error is `sent`, with its `http_status` |
+| `"refused"` | `"not_a_virtual_address"` | The address is not `http://<name>.formation.invalid`: another scheme, a port, user info, or more or fewer labels |
+| `"refused"` | `"not_a_callee"` | The roster does not let this member call the name, whether or not such a member exists |
+| `"refused"` | `"address_not_arrived"` | The callee's door address did not arrive within 10 seconds — see [formation peers](roster.md#formation-peers) |
+| `"refused"` | `"egress_not_allowed"` | `capabilities.network.allow` does not reach the callee's door |
+| `"refused"` | `"unreadable_address"` | The callee's door address is not a URL a request can be sent to |
+| `"failed"` | `"connection_failed"` | No response arrived: the connection or the write failed |
+| `"failed"` | `"response_interrupted"` | The response could not be read to its end. Keeps `http_status` when the status had arrived |
+
+A refused request opens no connection, and the component sees the same refusal for every reason. No
+field carries a door address, a port, a token, a header value or a request or response body.
+
+```json
+{"event_type":"member_request","event_id":"evt_01a2c4e0b7d17a40b9f3c2d1e0a9b8c7","parent_id":"evt_01a2c4e0a1f07b1c8d2e3f4a5b6c7d8e","session_id":"ses_01a2c4e0a1e57c3d9e8f7a6b5c4d3e2f","timestamp":1793820004120,"call_id":"mrq_01a2c4e0b7c07d5e8f9a0b1c2d3e4f50","task_id":"tsk_01a2c4e0a2017e6f9a0b1c2d3e4f5a6b","member":"coder","component":"formation-probe","role":"tool","via":"wasi_http","outcome":"sent","http_status":200,"member_task_id":"tsk_01a2c4e0b8a27f708192a3b4c5d6e7f8","duration_ms":38}
+```
+
+`mur trace show` lists each as
+`member_request coder  mrq_01a2…  sent  200  38ms  via tool formation-probe`, and a refused one as
+`member_request reviewer  mrq_01a2…  refused not_a_callee  0ms  via tool formation-probe`.
 
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
 terminal `task_end`
@@ -1638,6 +1682,12 @@ list.
 
 A member that wound down because its formation ended carries one
 [`formation_ended`](#formation-ended) line, ahead of its `session_end`.
+
+A request one member's runtime routed to another member's virtual address is recorded once from
+each end and joined by the `mrq_` id: the sender's [`member_request.call_id`](#member-request) and
+the callee's [`a2a_task_received.member_request_id`](#a2a-task-received). A `call-member` call is
+joined by its message id instead: the callee's `message_id` is `msg_` followed by the caller's
+`mcl_` call id.
 
 A session resumed with `mur run --resume` is a member only when its own launch names a formation;
 its `resumed_from` names the member it continues.

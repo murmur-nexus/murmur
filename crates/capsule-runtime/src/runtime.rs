@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+use http_body_util::BodyExt;
 use murmur_artifact::{
     is_credential_shaped_env_name, parse_hook_config_from_yaml, read_lockfile,
     refuse_native_payload, runtime_warning_link, security_warning_link, verify_sha256,
@@ -79,6 +80,10 @@ use crate::{
         ExecutionLimiter, GuestFailure,
     },
     manifest_files::ManifestFiles,
+    member_request::{
+        MemberRequestBody, MemberRequestFailure, MemberRequestOutcome, MemberRequestRecorder,
+        MemberRequestRefusal, MemberRequestScope, MemberRequests,
+    },
     murmur_md,
     network_policy::{
         effective_tool_network_rules, parse_network_allow_rules, resolve_scoped_dir,
@@ -2766,6 +2771,9 @@ pub fn stage_session(
     // Every component this session runs, from the on-stage hooks below on, records a call its
     // wall-clock bound stopped here.
     let call_deadlines = CallDeadlines::default();
+    // Every component this session runs, from the on-stage hooks below on, records a request it
+    // routed to a member's virtual address here.
+    let member_requests = MemberRequests::default();
     // Every report above names artifacts by full name; from here on the session knows each by its
     // tool name, and `full_names` takes it back to the full name for the store, the lock and the
     // identity records.
@@ -3533,6 +3541,7 @@ pub fn stage_session(
         formation_id: request.formation_id.as_ref().map(FormationId::as_str),
         formation_member: request.formation_member.as_ref(),
         call_deadlines: call_deadlines.clone(),
+        member_requests: member_requests.clone(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -3710,6 +3719,7 @@ pub fn stage_session(
         source_supply: request.source_supply,
         _epoch_ticker: epoch_ticker,
         call_deadlines,
+        member_requests,
         // Minted by the daemon at registration, which `launch_session` performs — it names a
         // session id, and staging is what mints one.
         spawn_credential: None,
@@ -4386,6 +4396,7 @@ fn launch(
         let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
         let call_deadlines = staged.call_deadlines.clone();
+        let member_requests = staged.member_requests.clone();
         let capability_policy = staged.capability_policy.clone();
         let protected_paths = staged.protected_paths.clone();
         let tool_annotations = staged.tool_annotations.clone();
@@ -4461,6 +4472,7 @@ fn launch(
                 None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
             })?;
             trace.set_call_deadlines(call_deadlines.clone());
+            trace.set_member_requests(member_requests.clone());
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
             let session_status = Arc::new(crate::session_status::SessionStatus::new(
                 std::time::Instant::now(),
@@ -4684,6 +4696,7 @@ fn launch(
                         // `capability_policy.limits`) that bound this path's guests.
                         limits: capability_policy.limits.limiter(),
                         call_deadlines: call_deadlines.clone(),
+                        member_requests: member_requests.clone(),
                         table: ResourceTable::new(),
                         // The capsule's own store is the ceiling itself, never narrowed:
                         // per-artifact grants apply to staged tools/drivers, not to the
@@ -4713,6 +4726,12 @@ fn launch(
                             gateway: None,
                             formation: formation_member.clone(),
                             task_provenance: None,
+                            // The capsule's own store sends for no task: a task's requests come
+                            // from the tool and driver stores dispatched for it.
+                            member_requests: Some(MemberRequestScope::for_capsule(
+                                &member_requests,
+                                capsule_name.clone(),
+                            )),
                         },
                         network_allow_rules,
                         peer_fetch_rules,
@@ -4754,6 +4773,7 @@ fn launch(
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
+                        current_task_id: None,
                         image_limits: staged
                             .context
                             .as_ref()
@@ -4847,6 +4867,7 @@ fn launch(
                                     retry: inference.retry.into(),
                                     deadline: session_status.deadline(),
                                     call_deadlines: state.call_deadlines.clone(),
+                                    member_requests: state.member_requests.clone(),
                                 })
                             })
                             .ok_or(InferenceUnavailable::NotConfigured)
@@ -4873,6 +4894,7 @@ fn launch(
                             formation_id: formation_id.as_ref().map(FormationId::as_str),
                             formation_member: formation_member.as_ref(),
                             call_deadlines: call_deadlines.clone(),
+                            member_requests: member_requests.clone(),
                         },
                         hook_limits,
                         hook_inference,
@@ -5249,6 +5271,7 @@ fn launch(
                                     incoming.traceparent.as_deref(),
                                     caller,
                                     incoming.caller_member.as_deref(),
+                                    incoming.member_request_id.as_deref(),
                                     &incoming.message_text,
                                 )
                                 .await;
@@ -5293,6 +5316,7 @@ fn launch(
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
+                        state.current_task_id = Some(incoming.task_id.clone());
                         state.current_task_images =
                             incoming.images.iter().map(|(_, image)| image.clone()).collect();
                         state.current_context_id = Some(incoming.context_id.clone());
@@ -5717,6 +5741,7 @@ fn launch(
     trace.set_control(staged.control.as_ref().map(|state| state.session_control()));
     trace.set_tool_refresh(None);
     trace.set_call_deadlines(staged.call_deadlines.clone());
+    trace.set_member_requests(staged.member_requests.clone());
     trace.set_runtime_artifacts(&staged.installed_artifacts);
     trace.set_host_facts(&staged.host_facts);
     trace.set_formation_id(staged.formation_id.as_ref());
@@ -5746,6 +5771,11 @@ fn launch(
             gateway: None,
             formation: staged.formation_member.clone(),
             task_provenance: None,
+            // A script capsule runs no task loop, so its requests are sent for no task.
+            member_requests: Some(MemberRequestScope::for_capsule(
+                &staged.member_requests,
+                staged.capsule_name.clone(),
+            )),
         },
         network_allow_rules,
         // A script capsule has no peer-handoff surface: `share-file` and `fetch-peer-file` are
@@ -5803,6 +5833,7 @@ fn launch(
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent,
         current_task_provenance: None,
+        current_task_id: None,
         image_limits: murmur_artifact::ContextImagesConfig::default(),
         current_task_images: Vec::new(),
         current_context_id: None,
@@ -5833,6 +5864,7 @@ fn launch(
         member_calls: None,
         limits: capsule_limits.limiter(),
         call_deadlines: staged.call_deadlines.clone(),
+        member_requests: staged.member_requests.clone(),
     };
 
     let mut store = Store::new(&staged.engine, state);
@@ -7723,6 +7755,10 @@ pub(crate) struct NetworkPolicyHooks {
     /// The task in scope on this store, whose trust class a formation call is stamped with. `None`
     /// — no task in scope — stamps `untrusted`.
     pub(crate) task_provenance: Option<TaskProvenance>,
+    /// Where each request to a virtual address is accounted for as one `member_request` line, and
+    /// the component, role and calling task it is recorded under. `None` records nothing; a
+    /// session in no formation records nothing either way.
+    pub(crate) member_requests: Option<MemberRequestScope>,
 }
 
 /// Where [`NetworkPolicyHooks::admit`] lets a request go.
@@ -7786,42 +7822,61 @@ impl NetworkPolicyHooks {
 /// grants a credential and a name, never egress.
 ///
 /// The routing rule is [`crate::member_call::resolve_member_call`]'s, the one `call-member` is
-/// routed by; this reads the member's name off the virtual address and renders every refusal as
-/// the one denial a guest is shown.
+/// routed by; this reads the member's name off the virtual address. Every caller renders every
+/// refusal as the one denial a guest is shown; the refusal itself is only recorded.
 pub(crate) fn resolve_formation_call(
     formation: Option<&FormationMember>,
     network_allow_rules: &[NetworkAllowRule],
     uri: &http::Uri,
-) -> Result<(http::Uri, FormationToken), WasiHttpError> {
-    let denied = || WasiHttpError::HttpRequestDenied;
-    if formation.is_none() || uri.scheme_str() != Some("http") {
-        return Err(denied());
+) -> Result<(http::Uri, FormationToken), MemberRequestRefusal> {
+    if formation.is_none() {
+        return Err(MemberRequestRefusal::Member(
+            crate::member_call::MemberCallRefusal::NotACallee,
+        ));
+    }
+    if uri.scheme_str() != Some("http") {
+        return Err(MemberRequestRefusal::NotAVirtualAddress);
     }
     let name = uri
         .authority()
         .and_then(|authority| virtual_member(authority.as_str()))
-        .ok_or_else(denied)?;
+        .ok_or(MemberRequestRefusal::NotAVirtualAddress)?;
     crate::member_call::resolve_member_call(formation, network_allow_rules, name)
-        .map_err(|_| denied())
+        .map_err(MemberRequestRefusal::Member)
+}
+
+/// The member a request to `uri` is recorded against: the one name its host reads as under the
+/// formation domain, or `None` when the host names no single member.
+fn member_named_by(uri: &http::Uri) -> Option<String> {
+    uri.host().and_then(virtual_member).map(str::to_string)
 }
 
 /// `request`, readdressed at the callee's real door `url` and presenting `token`.
 ///
 /// The URI keeps the guest's path and query and takes the door's scheme and authority, and `host`
-/// is set to match. Every `authorization`, origin and trust header the guest set is removed: the
-/// runtime is the one presenting the credential, so it attaches exactly one `Bearer` header of its
-/// own and stamps the provenance itself, from `stamped`.
+/// is set to match. Every `authorization`, origin, trust and member request id header the guest
+/// set is removed: the runtime is the one presenting the credential, so it attaches exactly one
+/// `Bearer` header of its own, stamps the provenance itself, from `stamped`, and names the request
+/// by the `call_id` it minted.
 pub(crate) fn readdress_formation_call(
     request: http::Request<WasiBody>,
     url: &http::Uri,
     token: &FormationToken,
     stamped: TaskProvenance,
+    call_id: &str,
 ) -> Result<http::Request<WasiBody>, WasiHttpError> {
     use http::header::{HeaderValue, AUTHORIZATION};
     let (mut parts, body) = request.into_parts();
     parts.headers.remove(AUTHORIZATION);
     parts.headers.remove(crate::origin::PEER_ORIGIN_HEADER);
     parts.headers.remove(crate::origin::PEER_TRUST_HEADER);
+    parts
+        .headers
+        .remove(crate::member_call::MEMBER_REQUEST_ID_HEADER);
+    parts.headers.insert(
+        crate::member_call::MEMBER_REQUEST_ID_HEADER,
+        HeaderValue::from_str(call_id).map_err(|_| WasiHttpError::InternalError(None))?,
+    );
     let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
         .map_err(|_| WasiHttpError::InternalError(None))?;
     bearer.set_sensitive(true);
@@ -7845,6 +7900,31 @@ pub(crate) fn readdress_formation_call(
     Ok(http::Request::from_parts(parts, body))
 }
 
+impl NetworkPolicyHooks {
+    /// A fresh member request id for a request to `uri` through `via`, and the recorder that
+    /// accounts for it. The recorder records nothing for a session in no formation or a store
+    /// with no [`Self::member_requests`].
+    pub(crate) fn member_request(
+        &self,
+        uri: &http::Uri,
+        via: crate::member_request::MemberRequestVia,
+    ) -> (String, MemberRequestRecorder) {
+        let call_id = crate::member_call::mint_member_request_id();
+        let scope = self
+            .member_requests
+            .as_ref()
+            .filter(|_| self.formation.is_some());
+        let recorder = MemberRequestRecorder::begin(
+            scope,
+            &call_id,
+            member_named_by(uri).as_deref(),
+            via,
+            Instant::now(),
+        );
+        (call_id, recorder)
+    }
+}
+
 impl WasiHttpHooks for NetworkPolicyHooks {
     fn send_request(
         &mut self,
@@ -7857,21 +7937,40 @@ impl WasiHttpHooks for NetworkPolicyHooks {
         // A formation call may wait for its callee's address, so it is resolved off this thread,
         // inside the response future, and still before any connection is opened.
         if request.uri().host().is_some_and(is_formation_host) {
+            let (call_id, mut recorder) = self.member_request(
+                request.uri(),
+                crate::member_request::MemberRequestVia::WasiHttp,
+            );
             let stamped = stamp_for_peer(self.task_provenance);
             let formation = self.formation.clone();
             let rules = self.network_allow_rules.clone();
             let uri = request.uri().clone();
             return Box::new(async move {
-                let (url, token) = tokio::task::spawn_blocking(move || {
+                let resolved = tokio::task::spawn_blocking(move || {
                     resolve_formation_call(formation.as_deref(), &rules, &uri)
                 })
                 .await
-                .map_err(|_| WasiHttpError::HttpRequestDenied)??;
-                send_direct(
-                    readdress_formation_call(request, &url, &token, stamped)?,
-                    options,
-                )
-                .await
+                .map_err(|_| WasiHttpError::HttpRequestDenied)?;
+                let (url, token) = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(refusal) => {
+                        recorder.finish(
+                            MemberRequestOutcome::Refused(refusal.reason()),
+                            None,
+                            None,
+                        );
+                        return Err(WasiHttpError::HttpRequestDenied);
+                    }
+                };
+                let readdressed =
+                    readdress_formation_call(request, &url, &token, stamped, &call_id)?;
+                // An error here leaves the recorder unfinished: dropped, it records
+                // `connection_failed`, since no response head arrived.
+                let (response, io) = send_direct(readdressed, options).await?;
+                let status = response.status().as_u16();
+                let (parts, body) = response.into_parts();
+                let body = MemberRequestBody::new(body, recorder, status).boxed_unsync();
+                Ok((http::Response::from_parts(parts, body), io))
             });
         }
         // A refused request gets a future that has already failed, so no connection is opened
@@ -7919,6 +8018,9 @@ pub(crate) struct CapsuleStoreState {
     /// The session's latch, cloned into every tool and driver store dispatched from here, where
     /// a call the wall-clock bound stops is recorded.
     pub(crate) call_deadlines: CallDeadlines,
+    /// The session's latch, cloned into every tool and driver store dispatched from here, where
+    /// a request routed to a member's virtual address is recorded.
+    pub(crate) member_requests: MemberRequests,
     pub(crate) table: ResourceTable,
     pub(crate) wasi: WasiCtx,
     pub(crate) http: WasiHttpCtx,
@@ -8062,6 +8164,10 @@ pub(crate) struct CapsuleStoreState {
     /// script-capsule path, which runs no task loop and so has no task in scope — that stamps
     /// `untrusted`, the safe class.
     pub(crate) current_task_provenance: Option<TaskProvenance>,
+    /// The id of the task now in scope, set beside `current_task_provenance` at every
+    /// task-activation site. The tool and driver stores dispatched for the task record it on each
+    /// `member_request` they send. `None` on the script-capsule path.
+    pub(crate) current_task_id: Option<String>,
     /// The capsule's `context.images` limits, the defaults when it declares none. Read by the
     /// agent loop for each tool result's attachments and by the process transport's bridge.
     pub(crate) image_limits: murmur_artifact::ContextImagesConfig,
@@ -8320,21 +8426,37 @@ impl send::Host for CapsuleStoreState {
         // A formation callee's virtual address is resolved and authorized exactly as the egress
         // hook does it: the real door must be reachable under `capabilities.network.allow`, and
         // the runtime presents the callee's token. The guest learns neither the door nor the
-        // token, and the trace records the address the guest named.
+        // token, and the trace records the address the guest named. Every such send, refused
+        // included, is one `member_request`.
+        let mut member_request = None;
         let (connect_url, authorization, door) = match formation_send_target(&peer_url) {
             Some(uri) => {
+                let (call_id, mut recorder) = self
+                    .http_hooks
+                    .member_request(&uri, crate::member_request::MemberRequestVia::MessageSend);
                 // The callee's address may still be on its way; wait for it without holding up
                 // the runtime worker this host call runs on.
-                let (url, token) = tokio::task::block_in_place(|| {
+                let resolved = tokio::task::block_in_place(|| {
                     resolve_formation_call(
                         self.http_hooks.formation.as_deref(),
                         &self.network_allow_rules,
                         &uri,
                     )
-                })
-                .map_err(|_| {
-                    format!("network policy: '{peer_url}' not in capabilities.network.allow")
-                })?;
+                });
+                let (url, token) = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(refusal) => {
+                        recorder.finish(
+                            MemberRequestOutcome::Refused(refusal.reason()),
+                            None,
+                            None,
+                        );
+                        return Err(format!(
+                            "network policy: '{peer_url}' not in capabilities.network.allow"
+                        ));
+                    }
+                };
+                member_request = Some((call_id, recorder));
                 let authority = url.authority().map(|a| a.to_string()).unwrap_or_default();
                 let member = uri
                     .authority()
@@ -8370,18 +8492,44 @@ impl send::Host for CapsuleStoreState {
         // it to. `murmur:message/send` is linked only on the script-capsule path, which runs no
         // task loop, so this is `None` there and stamps `untrusted`.
         let sender_task = self.current_task_provenance;
-        let task = tokio::task::block_in_place(|| {
+        let sent = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(outgoing::send_a2a_message(
                 &connect_url,
                 outgoing_msg,
                 traceparent.clone(),
                 sender_task,
                 authorization.as_ref(),
+                member_request.as_ref().map(|(call_id, _)| call_id.as_str()),
             ))
-        })
-        .map_err(|error| match &door {
-            Some((door, member)) => crate::member_call::redact_door(&error, door, member),
-            None => error.replace(&connect_url, &peer_url),
+        });
+        if let Some((_, mut recorder)) = member_request {
+            let (outcome, http_status, member_task_id) = match &sent {
+                Ok(sent) => (
+                    MemberRequestOutcome::Sent,
+                    Some(sent.http_status),
+                    Some(sent.task.id.clone()),
+                ),
+                Err(error) => match error.stage {
+                    outgoing::SendStage::NotSent => (
+                        MemberRequestOutcome::Failed(MemberRequestFailure::ConnectionFailed),
+                        None,
+                        None,
+                    ),
+                    outgoing::SendStage::ResponseUnread => (
+                        MemberRequestOutcome::Failed(MemberRequestFailure::ResponseInterrupted),
+                        None,
+                        None,
+                    ),
+                    outgoing::SendStage::Answered(status) => {
+                        (MemberRequestOutcome::Sent, Some(status), None)
+                    }
+                },
+            };
+            recorder.finish(outcome, http_status, member_task_id);
+        }
+        let task = sent.map(|sent| sent.task).map_err(|error| match &door {
+            Some((door, member)) => crate::member_call::redact_door(&error.message, door, member),
+            None => error.message.replace(&connect_url, &peer_url),
         })?;
 
         if let Some(session) = self.script_session.as_mut() {
@@ -8976,6 +9124,12 @@ pub(crate) struct ToolInvokeEnv<'a> {
     pub(crate) role: ComponentRole,
     /// The session's latch, where a call the wall-clock bound stops is recorded.
     pub(crate) call_deadlines: &'a CallDeadlines,
+    /// The session's latch, where each request the store routes to a member's virtual address is
+    /// recorded.
+    pub(crate) member_requests: &'a MemberRequests,
+    /// The task this dispatch runs for, recorded on each of those requests; `None` for a hook's
+    /// `run-inference` driver call.
+    pub(crate) task_id: Option<String>,
     /// What the store's `murmur:process` import serves: an agent capsule's tool call gets the
     /// session's processes, every other call the reason it gets none.
     pub(crate) process: crate::session_process::ProcessAccess,
@@ -9043,6 +9197,8 @@ pub(crate) async fn invoke_tool_component(
         task_provenance,
         role,
         call_deadlines,
+        member_requests,
+        task_id,
         process,
     } = env;
     let ToolA2aWiring {
@@ -9219,6 +9375,12 @@ pub(crate) async fn invoke_tool_component(
             gateway,
             formation: formation.cloned(),
             task_provenance,
+            member_requests: Some(MemberRequestScope::new(
+                member_requests,
+                name,
+                role,
+                task_id,
+            )),
         },
         process,
     };
@@ -9494,7 +9656,10 @@ impl CapsuleStoreState {
             return Err(format!("tool '{name}' is not available in this session"));
         };
         let extra_roots = self.extra_roots_preopen(name);
-        invoke_tool_component(
+        // Boxed: the invocation's state machine is large, and inlined into every caller's future
+        // it overflows a 2 MiB thread stack on the process transport's bridged path, which
+        // `launch_session` drives on the caller's own thread.
+        Box::pin(invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
@@ -9512,6 +9677,8 @@ impl CapsuleStoreState {
                 task_provenance: self.current_task_provenance,
                 role,
                 call_deadlines: &self.call_deadlines,
+                member_requests: &self.member_requests,
+                task_id: self.current_task_id.clone(),
                 process,
             },
             ToolA2aWiring {
@@ -9525,7 +9692,7 @@ impl CapsuleStoreState {
             name,
             component,
             input,
-        )
+        ))
         .await
     }
 
@@ -13537,6 +13704,7 @@ fn enqueue_launch_task(
         source: crate::a2a::SOURCE_TASK_MD,
         forget_session: std::mem::take(pending_forget_session),
         caller_member: None,
+        member_request_id: None,
         caller: None,
         reference_task_ids: Vec::new(),
         part_kinds: Vec::new(),
@@ -13596,6 +13764,7 @@ async fn enqueue_detached_report(
                 // itself.
                 forget_session: false,
                 caller_member: None,
+                member_request_id: None,
                 caller: None,
                 reference_task_ids: Vec::new(),
                 part_kinds: Vec::new(),
@@ -13619,6 +13788,7 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             forget_session: false,
             caller_member: None,
+            member_request_id: None,
             caller: None,
             reference_task_ids: Vec::new(),
             part_kinds: Vec::new(),
@@ -18113,6 +18283,7 @@ inference:
         CapsuleStoreState {
             limits: crate::limits::ExecutionLimits::default().limiter(),
             call_deadlines: CallDeadlines::default(),
+            member_requests: MemberRequests::default(),
             table: ResourceTable::new(),
             wasi,
             http: WasiHttpCtx::new(),
@@ -18121,6 +18292,7 @@ inference:
                 gateway: None,
                 formation: None,
                 task_provenance: None,
+                member_requests: None,
             },
             network_allow_rules: Vec::new(),
             peer_fetch_rules: Vec::new(),
@@ -18170,6 +18342,7 @@ inference:
                 .with_test_session_dirs(),
             current_traceparent: None,
             current_task_provenance: None,
+            current_task_id: None,
             image_limits: murmur_artifact::ContextImagesConfig::default(),
             provider_tool_terms: crate::provider_tool::ProviderToolTerms::default(),
             current_task_images: Vec::new(),
@@ -21955,6 +22128,7 @@ inference:
             gateway: None,
             formation: None,
             task_provenance: None,
+            member_requests: None,
         };
         hooks.admit(&uri.parse().expect("uri parses")).is_ok()
     }
@@ -22042,6 +22216,7 @@ inference:
             gateway: gateway_for_store(table.for_artifact("other-tool"), "other-tool"),
             formation: None,
             task_provenance: None,
+            member_requests: None,
         };
         let request = http::Request::builder()
             .uri("http://127.0.0.1:9/")
@@ -22389,6 +22564,8 @@ inference:
                     task_provenance: None,
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
+                    member_requests: &MemberRequests::default(),
+                    task_id: None,
                     process: crate::session_process::ProcessAccess::Unavailable(
                         crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
                     ),
@@ -22441,6 +22618,8 @@ inference:
                     task_provenance: None,
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
+                    member_requests: &MemberRequests::default(),
+                    task_id: None,
                     process: crate::session_process::ProcessAccess::Unavailable(
                         crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
                     ),
@@ -24413,6 +24592,7 @@ inference:
             retry: Default::default(),
             deadline: None,
             call_deadlines: CallDeadlines::default(),
+            member_requests: MemberRequests::default(),
         });
         let mut hooks =
             crate::hooks::test_support::inference_calling_hooks(&state.engine, &workdir, ctx).await;
@@ -25864,6 +26044,7 @@ inference:
             gateway: None,
             formation: member,
             task_provenance: task,
+            member_requests: None,
         }
     }
 
@@ -26143,6 +26324,413 @@ inference:
         );
         assert!(!refused_planner.contains("127.0.0.1"), "{refused_planner}");
         assert_eq!(door.requests().len(), 1);
+    }
+
+    /// The `member_request` lines a session's writer drains from `requests`, in order. Each one
+    /// is written ahead of `session_end`.
+    fn drained_member_requests(requests: &MemberRequests) -> Vec<serde_json::Value> {
+        let records = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut session = rt.block_on(script_session_over(records.path()));
+        session.trace.set_member_requests(requests.clone());
+        rt.block_on(session.trace.write_session_end("ok")).unwrap();
+        let lines = script_trace_lines(records.path());
+        assert_eq!(lines[0]["event_type"], "session_start");
+        assert_eq!(lines.last().unwrap()["event_type"], "session_end");
+        let session_event = lines[0]["event_id"].clone();
+        lines
+            .into_iter()
+            .filter(|line| line["event_type"] == "member_request")
+            .inspect(|line| assert_eq!(line["parent_id"], session_event, "{line}"))
+            .collect()
+    }
+
+    /// [`egress_hooks`] whose requests are recorded under a tool `probe` sending for `tsk_a`.
+    fn recorded_egress_hooks(
+        member: Option<Arc<FormationMember>>,
+        allow: &[&str],
+        requests: &MemberRequests,
+    ) -> NetworkPolicyHooks {
+        let mut hooks = egress_hooks(member, allow, None);
+        hooks.member_requests = Some(MemberRequestScope::new(
+            requests,
+            "probe",
+            ComponentRole::Tool,
+            Some("tsk_a".to_string()),
+        ));
+        hooks
+    }
+
+    fn assert_mrq_id(id: &serde_json::Value) {
+        let id = id.as_str().unwrap();
+        let hex = id.strip_prefix("mrq_").unwrap_or_else(|| panic!("{id}"));
+        assert!(
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{id}"
+        );
+    }
+
+    /// Every address shape the runtime cannot route writes exactly one `refused` line naming why,
+    /// and none opens a connection. A session in no formation writes none.
+    #[test]
+    fn member_request_every_unroutable_shape_writes_one_refused_line() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let cases = [
+            (
+                "http://planner.formation.invalid/",
+                Some("planner"),
+                "not_a_callee",
+            ),
+            (
+                "http://nosuch.formation.invalid/",
+                Some("nosuch"),
+                "not_a_callee",
+            ),
+            (
+                "https://reviewer.formation.invalid/",
+                Some("reviewer"),
+                "not_a_virtual_address",
+            ),
+            (
+                "http://reviewer.formation.invalid:80/",
+                Some("reviewer"),
+                "not_a_virtual_address",
+            ),
+            (
+                "http://a.reviewer.formation.invalid/",
+                None,
+                "not_a_virtual_address",
+            ),
+            ("http://formation.invalid/", None, "not_a_virtual_address"),
+        ];
+        for (uri, member_name, reason) in cases {
+            let requests = MemberRequests::default();
+            let mut hooks =
+                recorded_egress_hooks(Some(Arc::clone(&member)), &["127.0.0.1", "*"], &requests);
+            assert!(
+                matches!(
+                    send_through(&mut hooks, guest_request(uri, &[])),
+                    Err(WasiHttpError::HttpRequestDenied)
+                ),
+                "{uri}"
+            );
+            let lines = drained_member_requests(&requests);
+            assert_eq!(lines.len(), 1, "{uri}: {lines:?}");
+            let line = &lines[0];
+            assert_mrq_id(&line["call_id"]);
+            assert_eq!(line["outcome"], "refused", "{uri}");
+            assert_eq!(line["reason"], reason, "{uri}");
+            assert_eq!(line["member"].as_str(), member_name, "{uri}");
+            assert_eq!(line["component"], "probe");
+            assert_eq!(line["role"], "tool");
+            assert_eq!(line["via"], "wasi_http");
+            assert_eq!(line["task_id"], "tsk_a");
+            assert!(line.get("http_status").is_none(), "{line}");
+            assert!(line.get("member_task_id").is_none(), "{line}");
+            assert!(line["duration_ms"].is_u64(), "{line}");
+        }
+        // An address that never arrives, and a door the store's rules do not reach.
+        for (member, allow, reason) in [
+            (
+                coder_member(&authority, &door.url, false),
+                "127.0.0.1",
+                "address_not_arrived",
+            ),
+            (Arc::clone(&member), "api.example.com", "egress_not_allowed"),
+        ] {
+            let requests = MemberRequests::default();
+            let mut hooks = recorded_egress_hooks(Some(member), &[allow], &requests);
+            assert!(send_through(
+                &mut hooks,
+                guest_request("http://reviewer.formation.invalid/", &[])
+            )
+            .is_err());
+            let lines = drained_member_requests(&requests);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["reason"], reason);
+        }
+        // No formation: no line at all.
+        let requests = MemberRequests::default();
+        let mut outside = recorded_egress_hooks(None, &["127.0.0.1"], &requests);
+        assert!(send_through(
+            &mut outside,
+            guest_request("http://reviewer.formation.invalid/", &[])
+        )
+        .is_err());
+        assert!(drained_member_requests(&requests).is_empty());
+        assert!(door.requests().is_empty(), "{:?}", door.requests());
+    }
+
+    /// The runtime removes every member request id the guest set and sends exactly one of its own,
+    /// the id its `member_request` line records; the routed request is `sent` with the door's
+    /// status and the task the door answered.
+    #[test]
+    fn member_request_the_runtime_replaces_the_guests_request_id_header() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let requests = MemberRequests::default();
+        let mut hooks = recorded_egress_hooks(Some(member), &["127.0.0.1"], &requests);
+        let forged_zero = format!("mrq_{}", "0".repeat(32));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent = hooks.send_request(
+            guest_request(
+                "http://reviewer.formation.invalid/",
+                &[
+                    (crate::member_call::MEMBER_REQUEST_ID_HEADER, &forged_zero),
+                    ("X-Murmur-Member-Request-Id", "forged"),
+                ],
+            ),
+            None,
+            Box::new(async { Ok(()) }),
+        );
+        let body = rt.block_on(async {
+            let (response, io) = Box::into_pin(sent).await.expect("the callee is reached");
+            let io = tokio::spawn(Box::into_pin(io));
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let _ = io.await;
+            body
+        });
+        assert!(String::from_utf8_lossy(&body).contains("tsk_1"));
+        let head = door.requests().pop().unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(
+            lower.matches("x-murmur-member-request-id:").count(),
+            1,
+            "{head}"
+        );
+        assert!(
+            !head.contains(&forged_zero) && !lower.contains("forged"),
+            "{head}"
+        );
+        let lines = drained_member_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        let call_id = line["call_id"].as_str().unwrap();
+        assert!(
+            lower.contains(&format!("x-murmur-member-request-id: {call_id}\r\n")),
+            "{head}"
+        );
+        assert_eq!(line["outcome"], "sent");
+        assert!(line.get("reason").is_none(), "{line}");
+        assert_eq!(line["http_status"], 200);
+        assert_eq!(line["member_task_id"], "tsk_1");
+        assert_eq!(line["member"], "reviewer");
+    }
+
+    /// A callee door nothing listens on fails the guest's request as before and writes one
+    /// `failed`/`connection_failed` line that names neither the door's address nor its port.
+    #[test]
+    fn member_request_to_a_door_nothing_listens_on_is_one_connection_failed_line() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &format!("http://127.0.0.1:{port}"), true);
+        let requests = MemberRequests::default();
+        let mut hooks = recorded_egress_hooks(Some(member), &["127.0.0.1"], &requests);
+        let refused = send_through(
+            &mut hooks,
+            guest_request("http://reviewer.formation.invalid/", &[]),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        let lines = drained_member_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "failed");
+        assert_eq!(line["reason"], "connection_failed");
+        assert!(line.get("http_status").is_none(), "{line}");
+        assert!(line.get("member_task_id").is_none(), "{line}");
+        let text = line.to_string();
+        assert!(
+            !text.contains("127.0.0.1") && !text.contains(&port.to_string()),
+            "{text}"
+        );
+    }
+
+    /// Each kind of component records its own role, name and calling task: a tool and a driver
+    /// dispatched through the one invocation body, a hook's store and a capsule's own store.
+    #[test]
+    fn member_request_names_the_component_role_and_task_of_every_kind() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let engine = build_engine().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let component = Component::from_file(
+            &engine,
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../murmur-cli/tests/fixtures/formation-probe/tool/formation-probe.wasm"
+            ),
+        )
+        .unwrap();
+        let rules = parse_network_allow_rules(&["127.0.0.1".to_string()]).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (role, task_id) in [
+            (ComponentRole::Tool, Some("tsk_tool".to_string())),
+            (ComponentRole::Driver, None),
+        ] {
+            let requests = MemberRequests::default();
+            let result = rt.block_on(invoke_tool_component(
+                ToolInvokeEnv {
+                    engine: &engine,
+                    runtime_dir: None,
+                    extra_roots: &[],
+                    accessible_workdir: workdir.path(),
+                    inference_env: &[],
+                    capability_policy: &CapabilityPolicy::default(),
+                    network_allow_rules: &rules,
+                    artifact_grant: None,
+                    gateway: None,
+                    formation: Some(&member),
+                    task_provenance: None,
+                    role,
+                    call_deadlines: &CallDeadlines::default(),
+                    member_requests: &requests,
+                    task_id: task_id.clone(),
+                    process: crate::session_process::ProcessAccess::Unavailable(
+                        crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
+                    ),
+                },
+                ToolA2aWiring::silent(),
+                "formation-probe",
+                &component,
+                murmur::tool::run::ToolInput {
+                    data: Some(r#"{"names":["reviewer"]}"#.to_string()),
+                    log_path: None,
+                },
+            ));
+            assert!(result.is_ok(), "{result:?}");
+            let lines = drained_member_requests(&requests);
+            assert_eq!(lines.len(), 2, "a card fetch and a SendMessage: {lines:?}");
+            for line in &lines {
+                assert_eq!(line["role"], role.wire_name());
+                assert_eq!(line["component"], "formation-probe");
+                assert_eq!(line["task_id"].as_str(), task_id.as_deref(), "{line}");
+                assert_eq!(line["outcome"], "sent");
+            }
+        }
+        for (scope, role, component) in [
+            (
+                MemberRequestScope::for_hook(&MemberRequests::default(), "audit"),
+                "hook",
+                "audit",
+            ),
+            (
+                MemberRequestScope::for_capsule(&MemberRequests::default(), "planner-capsule"),
+                "capsule",
+                "planner-capsule",
+            ),
+        ] {
+            let requests = scope.requests.clone();
+            let mut hooks = egress_hooks(Some(Arc::clone(&member)), &["127.0.0.1"], None);
+            hooks.member_requests = Some(scope);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let sent = hooks.send_request(
+                guest_request("http://planner.formation.invalid/", &[]),
+                None,
+                Box::new(async { Ok(()) }),
+            );
+            assert!(rt.block_on(Box::into_pin(sent)).is_err());
+            let lines = drained_member_requests(&requests);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["role"], role);
+            assert_eq!(lines[0]["component"], component);
+            assert!(lines[0].get("task_id").is_none(), "{}", lines[0]);
+        }
+    }
+
+    /// A script capsule's `murmur:message/send` to a virtual address writes one `member_request`
+    /// ahead of its `a2a_send`, sends the line's id as the one member request id header, and a
+    /// send to a member it may not call is `refused` with no connection.
+    #[test]
+    fn member_request_from_a_script_message_send_precedes_its_a2a_send() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let mut state = continuation_test_state();
+        state.network_allow_rules = parse_network_allow_rules(&["127.0.0.1".to_string()]).unwrap();
+        state.http_hooks.formation = Some(member);
+        let requests = MemberRequests::default();
+        state.http_hooks.member_requests = Some(MemberRequestScope::for_capsule(
+            &requests,
+            "formation-sender",
+        ));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let mut session = rt.block_on(script_session_over(records.path()));
+        session.trace.set_member_requests(requests.clone());
+        state.script_session = Some(session);
+        let message = |id: &str| send::Message {
+            message_id: id.to_string(),
+            context_id: None,
+            text: "review this".to_string(),
+        };
+        let (sent, refused) = rt.block_on(async {
+            (
+                send::Host::send(
+                    &mut state,
+                    "http://reviewer.formation.invalid".to_string(),
+                    message("msg_1"),
+                ),
+                send::Host::send(
+                    &mut state,
+                    "http://planner.formation.invalid".to_string(),
+                    message("msg_2"),
+                ),
+            )
+        });
+        assert_eq!(sent.expect("the callee takes the message").task_id, "tsk_1");
+        assert_eq!(
+            refused.unwrap_err(),
+            "network policy: 'http://planner.formation.invalid' not in capabilities.network.allow"
+        );
+        let session = state.script_session.as_mut().unwrap();
+        rt.block_on(session.trace.write_session_end("ok")).unwrap();
+        let lines = script_trace_lines(records.path());
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| line["event_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "session_start",
+                "member_request",
+                "a2a_send",
+                "member_request",
+                "session_end"
+            ]
+        );
+        let sent_line = &lines[1];
+        assert_mrq_id(&sent_line["call_id"]);
+        assert_eq!(sent_line["outcome"], "sent");
+        assert_eq!(sent_line["via"], "message_send");
+        assert_eq!(sent_line["role"], "capsule");
+        assert_eq!(sent_line["component"], "formation-sender");
+        assert_eq!(sent_line["member"], "reviewer");
+        assert_eq!(sent_line["http_status"], 200);
+        assert_eq!(sent_line["member_task_id"], "tsk_1");
+        assert!(sent_line.get("task_id").is_none(), "{sent_line}");
+        let refused_line = &lines[3];
+        assert_eq!(refused_line["outcome"], "refused");
+        assert_eq!(refused_line["reason"], "not_a_callee");
+        assert_eq!(refused_line["member"], "planner");
+        let heads = door.requests();
+        assert_eq!(heads.len(), 1, "the refused send opened no connection");
+        let lower = heads[0].to_ascii_lowercase();
+        assert_eq!(lower.matches("x-murmur-member-request-id:").count(), 1);
+        assert!(lower.contains(&format!(
+            "x-murmur-member-request-id: {}\r\n",
+            sent_line["call_id"].as_str().unwrap()
+        )));
     }
 
     // ── Links inside the workdir: every runtime path refuses them ─────────────

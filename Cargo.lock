@@ -245,6 +245,7 @@ dependencies = [
  "hickory-resolver",
  "hmac",
  "http",
+ "http-body",
  "http-body-util",
  "landlock",
  "libc",

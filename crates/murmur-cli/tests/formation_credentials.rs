@@ -15,7 +15,7 @@ use capsule_runtime::mac_token::B64;
 use capsule_runtime::{FormationAuthority, FormationId, FormationMember};
 use common::door_capsule::{
     agent_project, bearer, driver_home, end_turn, launch_door, message, request,
-    returning_immediately, rpc, stage_door, trace_events, Response, QUEUE_SLEEP_YAML,
+    returning_immediately, rpc, stage_door, trace_events, Response, A2A_VERSION, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -528,4 +528,94 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         );
         assert_eq!(read.json()["result"], as_submitter["result"], "{read:?}");
     }
+}
+
+/// A callee's door keeps a member request id only on a request a formation token let in, and only
+/// in the shape the runtime mints: `a2a_task_received.member_request_id` carries it then, and every
+/// other task's line has no such key.
+#[test]
+fn the_door_keeps_a_member_request_id_only_beside_a_formation_token() {
+    if common::skip_without_host_support(
+        "the_door_keeps_a_member_request_id_only_beside_a_formation_token",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(
+        (1..=4)
+            .map(|n| end_turn(n, "done"))
+            .collect::<Vec<String>>(),
+    );
+    let home = driver_home();
+    let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();
+    let coder = door(
+        &home,
+        &server.endpoint,
+        "coder",
+        true,
+        Some(member(&authority, "coder", &["reviewer"])),
+    );
+    let planner = bearer(
+        authority.member_bundle("planner", &["coder"]).calls[0]
+            .1
+            .expose(),
+    );
+    let operator = bearer(&coder.operator);
+    let well_formed = "mrq_0193f4a6b2c87d1e9f0a1b2c3d4e5f60";
+    let header = "x-murmur-member-request-id";
+    let cases: [(&str, &str, Option<&str>); 4] = [
+        ("m-a", &planner, Some(well_formed)),
+        (
+            "m-b",
+            &planner,
+            Some("mrq_0193F4A6B2C87D1E9F0A1B2C3D4E5F60"),
+        ),
+        ("m-c", &operator, Some(well_formed)),
+        ("m-d", &planner, None),
+    ];
+    for (message_id, authorization, id) in cases {
+        let mut headers = vec![("Authorization", authorization), A2A_VERSION];
+        headers.extend(id.map(|id| (header, id)));
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+            "params": returning_immediately(message(message_id, "hi"))})
+        .to_string();
+        let sent = request(&coder.addr, "POST", "/", &headers, &body);
+        assert_eq!(sent.status, 200, "{message_id}: {sent:?}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let received = loop {
+        let received: Vec<Value> = trace_events(&coder.records_dir)
+            .into_iter()
+            .filter(|event| event["event_type"] == "a2a_task_received")
+            .collect();
+        if received.len() >= 4 || std::time::Instant::now() >= deadline {
+            break received;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(received.len(), 4, "{received:?}");
+    let by_message = |id: &str| {
+        received
+            .iter()
+            .find(|event| event["message_id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {received:?}"))
+    };
+    assert_eq!(by_message("m-a")["member_request_id"], well_formed);
+    let keys = |event: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = event.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let mut with_id = keys(by_message("m-a"));
+    with_id.retain(|key| key != "member_request_id");
+    for id in ["m-b", "m-c", "m-d"] {
+        let event = by_message(id);
+        assert!(event.get("member_request_id").is_none(), "{id}: {event}");
+    }
+    assert_eq!(
+        keys(by_message("m-b")),
+        with_id,
+        "a member's task, otherwise as before"
+    );
+    assert_eq!(keys(by_message("m-d")), with_id);
+    assert_eq!(by_message("m-c")["caller"], "operator");
 }

@@ -35,6 +35,44 @@ impl From<PeerTask> for crate::bindings::host::murmur::message::send::TaskResult
     }
 }
 
+/// What a [`send_a2a_message`] that got an answer holds: the peer's task and the HTTP status of
+/// the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SentMessage {
+    pub task: PeerTask,
+    pub http_status: u16,
+}
+
+/// How far a [`send_a2a_message`] that did not return a task got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendStage {
+    /// The address did not parse, the connection failed, or writing the request failed: no
+    /// response head arrived.
+    NotSent,
+    /// The request was written, but the response could not be read.
+    ResponseUnread,
+    /// The peer answered with this HTTP status, then the answer was a refusal, a JSON-RPC error,
+    /// or not a task.
+    Answered(u16),
+}
+
+/// Why a [`send_a2a_message`] returned no task: `message` is the text a guest is shown, and
+/// `stage` how far the request got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendError {
+    pub message: String,
+    pub stage: SendStage,
+}
+
+impl SendError {
+    fn not_sent(message: String) -> Self {
+        Self {
+            message,
+            stage: SendStage::NotSent,
+        }
+    }
+}
+
 /// Send an A2A SendMessage JSON-RPC request to a peer capsule.
 ///
 /// `peer_url` is in "localhost:{port}" or "http://localhost:{port}" format.
@@ -50,6 +88,9 @@ impl From<PeerTask> for crate::bindings::host::murmur::message::send::TaskResult
 /// sent as `Authorization: Bearer <token>`. It is read only at the write, and `None` sends no
 /// `Authorization` at all.
 ///
+/// `member_request_id` is the id the runtime minted for a request to a formation callee's virtual
+/// address, sent as [`crate::member_call::MEMBER_REQUEST_ID_HEADER`]; `None` sends no such header.
+///
 /// A peer that answers with a message rather than a task, or with a state that is not a
 /// meaningful A2A v1.0 task state, is an `Err` naming what it sent.
 pub(crate) async fn send_a2a_message(
@@ -58,8 +99,9 @@ pub(crate) async fn send_a2a_message(
     traceparent: Option<String>,
     sender_task: Option<TaskProvenance>,
     authorization: Option<&crate::formation_credentials::FormationToken>,
-) -> Result<PeerTask, String> {
-    let addr = parse_host_port(peer_url)?;
+    member_request_id: Option<&str>,
+) -> Result<SentMessage, SendError> {
+    let addr = parse_host_port(peer_url).map_err(SendError::not_sent)?;
 
     let request_id = format!("req_{}", uuid::Uuid::now_v7().simple());
     let body = serde_json::json!({
@@ -76,7 +118,7 @@ pub(crate) async fn send_a2a_message(
 
     let mut stream = TcpStream::connect(&addr)
         .await
-        .map_err(|e| format!("failed to connect to {peer_url}: {e}"))?;
+        .map_err(|e| SendError::not_sent(format!("failed to connect to {peer_url}: {e}")))?;
 
     let mut request = format!(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{A2A_VERSION_HEADER}: {A2A_PROTOCOL_VERSION}\r\n",
@@ -88,31 +130,51 @@ pub(crate) async fn send_a2a_message(
     for (name, value) in peer_call_headers(sender_task, traceparent.as_deref()) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
+    if let Some(id) = member_request_id {
+        request.push_str(&format!(
+            "{}: {id}\r\n",
+            crate::member_call::MEMBER_REQUEST_ID_HEADER
+        ));
+    }
     request.push_str("\r\n");
     request.push_str(&body);
 
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| format!("failed to write request to {peer_url}: {e}"))?;
+        .map_err(|e| SendError::not_sent(format!("failed to write request to {peer_url}: {e}")))?;
 
-    let raw = read_raw_response(BufReader::new(stream), peer_url).await?;
+    let raw = read_raw_response(BufReader::new(stream), peer_url)
+        .await
+        .map_err(|message| SendError {
+            message,
+            stage: SendStage::ResponseUnread,
+        })?;
+    let answered = |message: String| SendError {
+        message,
+        stage: SendStage::Answered(raw.status),
+    };
     if !(200..300).contains(&raw.status) {
-        return Err(refused_message(peer_url, &raw));
+        return Err(answered(refused_message(peer_url, &raw)));
     }
 
     let response: serde_json::Value = serde_json::from_slice(&raw.body)
-        .map_err(|e| format!("failed to parse response from {peer_url}: {e}"))?;
+        .map_err(|e| answered(format!("failed to parse response from {peer_url}: {e}")))?;
 
     if let Some(error) = response.get("error") {
-        return Err(format!("A2A error from {peer_url}: {error}"));
+        return Err(answered(format!("A2A error from {peer_url}: {error}")));
     }
 
     let result = response
         .get("result")
-        .ok_or_else(|| format!("no result in A2A response from {peer_url}"))?;
+        .ok_or_else(|| answered(format!("no result in A2A response from {peer_url}")))?;
 
-    peer_task(result).map_err(|e| format!("failed to parse A2A task from {peer_url}: {e}"))
+    let task = peer_task(result)
+        .map_err(|e| answered(format!("failed to parse A2A task from {peer_url}: {e}")))?;
+    Ok(SentMessage {
+        task,
+        http_status: raw.status,
+    })
 }
 
 /// The task a peer's `SendMessage` `result` holds, or why it holds none murmur can read.
@@ -414,7 +476,7 @@ mod tests {
             context_id: None,
             text: "hello".to_string(),
         };
-        send_a2a_message(&addr, message, None, sender_task, None)
+        send_a2a_message(&addr, message, None, sender_task, None, None)
             .await
             .expect("peer should answer with a task");
         server.await.expect("capture task should not panic")
@@ -458,11 +520,12 @@ mod tests {
     #[tokio::test]
     async fn a_refused_peer_message_names_the_status_and_the_receivers_reason() {
         let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(false).await;
-        let error = send_a2a_message(&addr, hello(), None, None, None)
+        let error = send_a2a_message(&addr, hello(), None, None, None, None)
             .await
             .expect_err("a door that does not consent refuses the message");
+        assert_eq!(error.stage, SendStage::Answered(403));
         assert_eq!(
-            error,
+            error.message,
             format!(
                 "peer at {addr} refused the message (403 peer_not_accepted): this capsule does \
                  not accept tasks from peers"
@@ -475,9 +538,11 @@ mod tests {
     #[tokio::test]
     async fn a_consenting_door_takes_the_peer_message() {
         let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(true).await;
-        let task = send_a2a_message(&addr, hello(), None, None, None)
+        let sent = send_a2a_message(&addr, hello(), None, None, None, None)
             .await
             .expect("a consenting door takes the message");
+        assert!((200..300).contains(&sent.http_status), "{sent:?}");
+        let task = sent.task;
         assert_eq!(task.state, "submitted");
         assert!(task.id.starts_with("tsk_"), "{task:?}");
         let result = crate::bindings::host::murmur::message::send::TaskResult::from(task);
@@ -536,9 +601,9 @@ mod tests {
         let (addr, sent) = crate::http_client::capture::answer_one(
             serde_json::json!({"jsonrpc": "2.0", "id": "req_1", "result": result}).to_string(),
         );
-        let task = send_a2a_message(&addr, hello(), None, None, None).await;
+        let task = send_a2a_message(&addr, hello(), None, None, None, None).await;
         sent.join().unwrap();
-        task
+        task.map(|sent| sent.task).map_err(|error| error.message)
     }
 
     fn peer_answer(state: &str) -> serde_json::Value {

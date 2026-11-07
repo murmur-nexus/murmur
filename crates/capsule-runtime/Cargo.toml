@@ -32,6 +32,8 @@ hmac = "0.12"
 http = "1"
 # The inference gateway buffers a driver's request body so it can resend it after a 401.
 http-body-util = "0.1"
+# A member request's response body is passed through unchanged while its end is recorded.
+http-body = "1"
 libc = "0.2"
 murmur-artifact.workspace = true
 # Ed25519 for formation tokens: the launcher signs, every member's door verifies.

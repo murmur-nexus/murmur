@@ -454,18 +454,26 @@ MURMUR_FORMATION_PEERS=coder=http://coder.formation.invalid reviewer=http://revi
 A component calls a member at its virtual address. `.invalid` never resolves; the member's runtime
 recognises the address and sends the request on:
 
-1. It resolves the name to the member's real door URL. A door URL that has not arrived on the
+1. It mints the request's id: `mrq_` and 32 lowercase hex digits.
+2. It resolves the name to the member's real door URL. A door URL that has not arrived on the
    channel yet is waited for up to 10 seconds.
-2. It checks the real URL against the sending component's
+3. It checks the real URL against the sending component's
    [`capabilities.network.allow`](manifest.md#field-capabilities), per-artifact narrowing
    included. The roster grants a credential and a name, never network access: a member whose
    components may not reach `localhost` cannot call anyone.
-3. It removes any `Authorization`, `x-murmur-task-origin` and `x-murmur-task-trust` header the
-   component set, attaches `Authorization: Bearer <token>`, and stamps the origin `peer` with the
-   trust class of the task the component is running for (`untrusted` when there is none).
+4. It removes any `Authorization`, `x-murmur-task-origin`, `x-murmur-task-trust` and
+   `x-murmur-member-request-id` header the component set, attaches `Authorization: Bearer <token>`,
+   stamps the origin `peer` with the trust class of the task the component is running for
+   (`untrusted` when there is none), and sets `x-murmur-member-request-id` to the id it minted.
 
 [`murmur:message/send`](wit-interfaces.md#message-send) resolves a virtual `peer-url` the same way, and the
 trace records the virtual address.
+
+Every request to a virtual address, a refused one included, writes one
+[`member_request`](observability-schemas.md#member-request) line in the sender's trace, naming the
+member, the component, the outcome and the id. The callee's door records that id on the task it
+starts, as [`a2a_task_received.member_request_id`](observability-schemas.md#a2a-task-received), and
+[`mur trace show <formation-id>`](cli.md#mur-trace-show-formation) joins the two into one call row.
 
 A request to any other name under `formation.invalid` — a member it may not call, or no member at
 all — is refused before a connection opens, with the same refusal either way.
