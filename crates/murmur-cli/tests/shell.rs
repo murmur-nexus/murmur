@@ -817,11 +817,10 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
                 let host = fs::read_to_string(workdir.join(file))
                     .ok()
                     .and_then(|text| text.trim().parse::<i32>().ok())
+                    // By working directory, not by the test process's sessions: tests beside this
+                    // one run sessions of their own whose processes carry the same numbers.
                     .and_then(|pid| {
-                        capsule_runtime::network_namespace::host_pid_in_session(
-                            std::process::id(),
-                            pid,
-                        )
+                        capsule_runtime::network_namespace::host_pid_in_workdir(&workdir, pid)
                     });
                 host_pids.lock().unwrap().push((file, host));
             }
