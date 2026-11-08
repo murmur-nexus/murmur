@@ -205,7 +205,7 @@ Treat these diagnostics as security-significant:
 - `W-SEC-035`: a `host_paths` entry in `~/.murmur/config.yaml` reaches a credential location (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.murmur`, …), so every contained capsule on the host can read it; lend a narrower folder.
 - `E-CFG-004`: a `host_paths` entry is malformed, sits in a project config, or cannot be honoured on this host (missing, `/`, a system path, read-write over `~/.murmur` or over a folder the session runs binaries from at `scoped`); fix or remove the entry rather than dropping containment.
 - `E-IO-004`: `HOME` is unset, relative, or cannot hold `~/.murmur`; set it to an absolute directory you own.
-- `W-SEC-036`: the capsule runs unconfined (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`): its commands run as the operator with their `HOME`, environment, filesystem, network and `sudo`, so no containment claim holds. Declare `capabilities.containment` to refuse that stance (`E-RUN-059`).
+- `W-SEC-036`: the capsule runs unconfined (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`): its commands run as the operator with their `HOME`, environment, filesystem, network and `sudo`, so no containment claim holds. Declare `capabilities.containment` to refuse that stance (`E-RUN-059`). `mur` running as root refuses it whatever is declared (`E-RUN-063`).
 
 Warnings are the difference between intended and effective policy. Capture them in automation; do not suppress, ignore, or “fix” them by renaming an equally powerful primitive.
 

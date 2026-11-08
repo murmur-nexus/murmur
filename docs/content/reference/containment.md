@@ -486,6 +486,12 @@ A declared floor is never lowered. `--unconfined`, or the global `containment: u
 refused with [`E-RUN-059`](diagnostics.md#e-run-059), naming both. `--unconfined` together with
 `--containment` is a usage error.
 
+**Never as root.** When `mur`'s effective uid is 0, the unconfined stance is refused with
+[`E-RUN-063`](diagnostics.md#e-run-063), whichever of the two chose it and before a declared floor
+is checked: its commands would run as root on the host. No flag, environment variable or config key
+overrides it. On a machine whose only user is root, add a user to run unconfined, or run contained;
+a contained run as root keeps its boundary.
+
 **What it removes.** An unconfined capsule's shell commands, plan shell steps and
 `transport: process` harness run on the Unconfined tier, which installs no network namespace, no
 `/tmp` mapping, no composed root, no capability drop, no `no_new_privs`, no seccomp filter and no
@@ -528,7 +534,8 @@ capsule `mur deploy` starts, and a launch redeeming a roost spawn approval. Such
 first and starts it this way only when it knows how; a `mur` from before the unconfined stance
 always runs contained. A deploy that cannot ask stops with `E-DEPLOY-003`.
 `mur run --roster --unconfined` passes `--unconfined` to every member, and each member resolves it
-against its own manifest.
+against its own manifest. As root, the roster refuses with `E-RUN-063` before any member starts,
+and so does each member.
 
 **Reporting.** `mur run` prints one [`W-SEC-036`](diagnostics.md#w-sec-036) line per launch
 instead of the tier warnings. The stance is recorded and reported everywhere:
@@ -539,7 +546,7 @@ instead of the tier warnings. The stance is recorded and reported everywhere:
 | `mur run --explain-scope` | `achieved:  unconfined`, `mechanism: unconfined`, and an `Unconfined` block with the user, uid, `HOME`, the routes it applies to and the declared resource limits; `--json` carries the block as `unconfined`, `null` on a contained run, and `filesystem_boundary.restriction` as `none` |
 | `mur trace show` | The `containment:` line names the user and `HOME` the commands ran as |
 | `mur ps` | A line below the table per unconfined session; `--json` carries `"unconfined": true` |
-| `mur doctor` | A `Containment stance:` line when the global config chooses it, and an `E-RUN-059` error that makes it exit `1` when a floor is declared too |
+| `mur doctor` | A `Containment stance:` line when the global config chooses it. In its place, an error that makes it exit `1`: `E-RUN-063` when `mur doctor` runs as root, else `E-RUN-059` when a floor is declared too |
 
 See [Run a capsule on the host](../how-to/run-capsule-on-the-host.md).
 

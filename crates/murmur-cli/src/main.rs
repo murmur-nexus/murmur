@@ -517,9 +517,10 @@ enum Commands {
 
         /// Run the capsule on the host as you: its shell commands, plan shell steps and process
         /// harness get your HOME, your whole environment, the host filesystem and network, and no
-        /// no_new_privs, so sudo works where your sudoers allows it. Refused when the manifest or a
-        /// config file declares a containment floor. Never spreads: a delegated child or plan
-        /// capsule step runs contained. With --roster, every member is passed --unconfined.
+        /// no_new_privs, so sudo works where your sudoers allows it. Refused when mur runs as root,
+        /// and when the manifest or a config file declares a containment floor. Never spreads: a
+        /// delegated child or plan capsule step runs contained. With --roster, every member is
+        /// passed --unconfined.
         #[arg(long, conflicts_with = "containment")]
         unconfined: bool,
 

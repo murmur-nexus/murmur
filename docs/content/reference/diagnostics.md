@@ -148,6 +148,7 @@ section that explains it.
 | `E-RUN-060` | `--unconfined` was given to a launch the runtime started contained | [E-RUN-060](#e-run-060) |
 | `E-RUN-061` | An installed artifact's `murmur.yaml` declares `implementation: native` or `execution: native`; refused by a launch, `mur doctor` and a runtime pull | [E-RUN-061](#e-run-061) |
 | `E-RUN-062` | A staged tool's `programs:` block is malformed or names a need by host path; refused by a launch, `mur run --explain-scope` and `mur doctor` | [E-RUN-062](#e-run-062) |
+| `E-RUN-063` | The unconfined stance was chosen while `mur` runs as root | [E-RUN-063](#e-run-063) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1621,6 +1622,36 @@ error[E-RUN-062]: artifact 'local/needs-tool@1.0.0' ships a malformed programs: 
 | [`mur doctor`](cli.md#mur-doctor) | The `Declared needs` check fails |
 
 `mur build` refuses the same block with [`E-BLD-008`](#e-bld-008).
+
+### E-RUN-063 — unconfined as root { #e-run-063 }
+
+The operator chose the [unconfined stance](containment.md#unconfined) while `mur`'s effective uid
+is 0. An unconfined capsule's commands run as the user who launched it, so as root they would run
+as root on the host with no boundary at all. The launch is refused before it creates a workdir, a
+records directory or a formation directory. Nothing overrides it: no flag, environment variable or
+config key.
+
+```text
+error[E-RUN-063]: --unconfined cannot run as root: mur's effective uid is 0, so the capsule's commands would run as root on this host with no boundary at all
+  hint: run mur as a normal user (on a machine whose only user is root, add one), or run without --unconfined to run contained
+```
+
+| Chosen by | Run contained instead with |
+|---|---|
+| `--unconfined` | the same command without `--unconfined` |
+| `containment: unconfined` in `~/.murmur/config.yaml` | `--containment <class>` on this launch |
+
+Either way, the other fix is to run `mur` as a normal user; on a machine whose only user is root,
+add one.
+
+| Where | What happens |
+|---|---|
+| `mur run` | Refused before any staging. A declared floor's [`E-RUN-059`](#e-run-059) is not reached |
+| `mur run --explain-scope` | Refused the same way |
+| [`mur run --roster`](cli.md#mur-run-roster) | Refused before the roster is read or any member starts. Each member is a `mur run --unconfined` and refuses on the same terms |
+| [`mur doctor`](cli.md#mur-doctor) | When the global config chooses the stance, prints the same refusal as an error and exits `1` |
+
+A contained run as root is unaffected.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
