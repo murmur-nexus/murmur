@@ -6314,8 +6314,9 @@ mod linux_enforce {
         /// How many `BPF_RET | BPF_K` instructions of `filter`'s export return `action`.
         fn returns_of(filter: &libseccomp::ScmpFilterContext, action: u32) -> usize {
             let exported = export_to_memfd(|fd| filter.export_bpf(fd)).expect("export the bpf");
-            exported
-                .chunks_exact(SOCK_FILTER_BYTES)
+            let (insns, _) = exported.as_chunks::<SOCK_FILTER_BYTES>();
+            insns
+                .iter()
                 .filter(|insn| {
                     let code = u16::from_ne_bytes([insn[0], insn[1]]);
                     let k = u32::from_ne_bytes([insn[4], insn[5], insn[6], insn[7]]);
