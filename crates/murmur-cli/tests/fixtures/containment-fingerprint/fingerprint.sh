@@ -133,6 +133,11 @@ emit proc.pdeathsig "not readable from a shell"
 
 # ---------------------------------------------------------------- open descriptors
 
+# Two entries are this script's own: fd 255, bash's handle on a script file it runs, and the
+# lowest free fd (3 when nothing was inherited), which the glob below opens to list the folder and
+# the `$(readlink …)` then reads through. A descriptor the process inherited takes a number of its
+# own and pushes those up by one, so it shows as an extra `fd.<n>` key.
+
 fds=("/proc/$$/fd/"*)
 if [[ ${fds[0]} == "/proc/$$/fd/*" ]]; then
     emit fd "unreadable: /proc/$$/fd lists nothing"
@@ -176,8 +181,10 @@ list_dir() {
 list_dir dev.entries /dev
 list_dir devshm.entries /dev/shm
 
-# What `/`, `/dev`, `/tmp`, `/proc` and `/sys` and the mounts beneath `/dev` are, without the
-# mount ids a new mount namespace renumbers, and how many mounts there are in all. The rest of the
+# What `/`, `/dev`, `/tmp`, `/proc` and `/sys` and the mounts beneath `/dev` are, and how many
+# mounts there are in all. The mount ids and the `major:minor` device are left out: a tmpfs, devpts
+# or procfs a command mounts for itself gets a device number from a host-wide pool, so two commands
+# alike differ there whenever anything else on the host mounts one in between. The rest of the
 # table is left out: a shell result holds 16 KiB.
 if error=$({ : </proc/self/mountinfo; } 2>&1); then
     declare -A mount_seen=()
@@ -189,7 +196,7 @@ if error=$({ : </proc/self/mountinfo; } 2>&1); then
         / | /dev | /dev/* | /tmp | /proc | /sys) ;;
         *) continue ;;
         esac
-        rest="${fields[*]:2:2} ${fields[*]:5}"
+        rest="${fields[3]} ${fields[*]:5}"
         count=$((${mount_seen[$point]:-0} + 1))
         mount_seen[$point]=$count
         if ((count == 1)); then emit "mount.$point" "$rest"; else emit "mount.$point.$count" "$rest"; fi

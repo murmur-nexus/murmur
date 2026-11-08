@@ -16,7 +16,6 @@ use std::{
 };
 
 use assert_cmd::Command;
-use murmur_artifact::ContainmentClass;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -89,20 +88,6 @@ fn find_chrome() -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// The tiers a scenario runs at on this host: `scoped` always, `sealed` when reachable.
-fn tiers(test_name: &str) -> Vec<&'static str> {
-    let mut tiers = vec!["scoped"];
-    let achieved = capsule_runtime::detect_containment_decision(ContainmentClass::Sealed)
-        .0
-        .achieved();
-    if achieved >= ContainmentClass::Sealed {
-        tiers.push("sealed");
-    } else {
-        eprintln!("[SKIP-HOST] {test_name} (sealed): this host reaches {achieved}, the variant needs sealed");
-    }
-    tiers
 }
 
 /// One scripted call: the call id, the tool and its input.
@@ -335,7 +320,7 @@ fn chrome_from_a_shell_command_loads_a_page_in_a_capsule() {
         return;
     };
     let fixture = Fixture::new(&chrome);
-    for tier in tiers(name) {
+    for tier in common::tiers(name) {
         let workdir = workdir_with_page(&fixture, tier);
         let run = fixture.run(
             tier,

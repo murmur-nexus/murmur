@@ -53,6 +53,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Configure a long-running capsule](/how-to/long-running-capsule.md): Keeping a capsule alive across multiple tasks instead of the default exit-on-completion.
 - [Run a capsule on the host as yourself](/how-to/run-capsule-on-the-host.md): `mur run --unconfined` — running your own coding agent with your `HOME`, environment and `sudo`, what that gives up, and what stays contained.
 - [Run Node tests in a capsule](/how-to/run-node-tests-in-capsule.md): A `scoped` capsule that runs `npm ci` and vitest with only the grants Node needs — the npm package tree, the library folder native addons load from, OpenSSL's configuration file and an address-space limit V8 can run under.
+- [Run a Playwright suite in a capsule](/how-to/run-playwright-in-capsule.md): A `scoped` capsule that runs a Playwright suite against a headless Chrome on the host — the browser folder, fonts, the system library folder, the PCI device tree Chrome's GPU process reads, and the Playwright config lines that point at the granted browser.
 
 ### Observability & Evaluation
 

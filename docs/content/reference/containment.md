@@ -548,12 +548,12 @@ exactly as a shell command of the same session is, at every tier:
 | The decision point | The `capabilities.filesystem.read_only` check and every `on-shell` deny hook see its argv before it starts; the argv they see is the argv that runs |
 | The work-folder size limit | Checked before it starts |
 | Environment | The sanitized shell environment, plus the tool's additions |
-| [Enforcement tier](#subprocess-enforcement-tiers) | Landlock, seccomp, the sealed composed root and the per-process limits of the session's tier |
+| [Enforcement tier](#subprocess-enforcement-tiers) | The session's; the rows below are what it applies |
 | Privileges | The capsule's user, no capabilities, `no_new_privs` set, and the tier's [syscall filter](#default-deny-syscall-allowlist) |
 | [Landlock ruleset](#library-grant-reach) | The session's one ruleset, built from every grant in the manifest |
 | [Per-process limits](resource-limits.md#host-resource-limits) | The same `capabilities.resources` limits: address space, file size, open files, CPU time, and no core file |
 | [Cgroup scope](#cgroup-scope) and network namespace | The session's own; outbound connections go through its egress proxy |
-| User and PID namespaces | The session's own. The program's parent is outside the PID namespace, and the program is killed when that parent dies |
+| User and PID namespaces | The session's own; on Sealed, a user namespace of its own nested inside the session's. The program's parent is outside the PID namespace, and the program is killed when that parent dies |
 | Mount namespace | Its own: the session's [temporary folder](#temp-folder) over `/tmp` on Full, the [composed root](#composed-root-listability) on Sealed |
 | Devices | The [fixed capsule device set](#capsule-device-set) of the tier; `/dev/shm` is refused on Full and absent on Sealed |
 | Process group and descriptors | Its own process group; stdout and stderr are pipes, stdin is `/dev/null` or, for `start` and a `run` given input, a pipe; no other descriptor is inherited, and the signal mask is empty |

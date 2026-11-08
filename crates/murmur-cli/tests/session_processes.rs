@@ -16,7 +16,6 @@ use std::{
 };
 
 use assert_cmd::Command;
-use murmur_artifact::ContainmentClass;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -26,20 +25,6 @@ const PROBE: &str = "process-probe";
 const PROBE_B: &str = "process-probe-b";
 const VERSION: &str = "0.1.0";
 const HOOK: &str = "no-programs";
-
-/// The tiers a scenario runs at on this host: `scoped` always, `sealed` when reachable.
-fn tiers(test_name: &str) -> Vec<&'static str> {
-    let mut tiers = vec!["scoped"];
-    let achieved = capsule_runtime::detect_containment_decision(ContainmentClass::Sealed)
-        .0
-        .achieved();
-    if achieved >= ContainmentClass::Sealed {
-        tiers.push("sealed");
-    } else {
-        eprintln!("[SKIP-HOST] {test_name} (sealed): this host reaches {achieved}, the variant needs sealed");
-    }
-    tiers
-}
 
 struct Fixture {
     _root: TempDir,
@@ -371,7 +356,7 @@ fn run_obeys_the_shell_rules() {
         return;
     }
     let fixture = Fixture::new();
-    for tier in tiers("run_obeys_the_shell_rules") {
+    for tier in common::tiers("run_obeys_the_shell_rules") {
         let run = fixture.run(
             tier,
             &shell_allow(&["cat", "sleep"]),
@@ -445,7 +430,7 @@ fn an_on_shell_deny_hook_refuses_run_and_start() {
         return;
     }
     let fixture = Fixture::new();
-    for tier in tiers("an_on_shell_deny_hook_refuses_run_and_start") {
+    for tier in common::tiers("an_on_shell_deny_hook_refuses_run_and_start") {
         let run = fixture.run(
             tier,
             &shell_allow(&["cat"]),
@@ -488,7 +473,7 @@ fn a_session_process_lives_across_calls_and_dies_with_the_session() {
         return;
     }
     let fixture = Fixture::new();
-    for tier in tiers(name) {
+    for tier in common::tiers(name) {
         let run = fixture.run(
             tier,
             &shell_allow(&["cat"]),
@@ -564,7 +549,7 @@ fn connect_reaches_only_the_handles_own_listener() {
     let fixture = Fixture::new();
     let (p, q, r): (u16, u16, u16) = (18741, 18742, 18743);
     let server = |port: u16| json!(["-m", "http.server", "--bind", "127.0.0.1", port.to_string()]);
-    for tier in tiers(name) {
+    for tier in common::tiers(name) {
         // A second `network.allow` entry naming one host on port 443, so the session's egress
         // proxy holds a listener there that `connect` must not reach.
         let extra = format!("      - https://example.com\n{}", shell_allow(&["python3"]));
@@ -644,7 +629,7 @@ fn a_session_holds_at_most_eight_processes() {
         return;
     }
     let fixture = Fixture::new();
-    for tier in tiers(name) {
+    for tier in common::tiers(name) {
         let starts: Vec<Value> = (1..=9)
             .map(|index| json!({"op": "start", "name": format!("cat-{index}"), "program": "cat"}))
             .collect();
@@ -716,7 +701,7 @@ fn a_session_process_that_exits_takes_its_group_with_it() {
         return;
     }
     let fixture = Fixture::new();
-    for (tier, sleep_arg) in tiers(name).into_iter().zip(["297.25", "297.75"]) {
+    for (tier, sleep_arg) in common::tiers(name).into_iter().zip(["297.25", "297.75"]) {
         let program = format!("sleep {sleep_arg} & echo started $!");
         let steps: Vec<Value> = (1..=9)
             .flat_map(|index| {
@@ -789,7 +774,7 @@ fn another_tool_cannot_reach_the_first_tools_processes() {
         return;
     }
     let fixture = Fixture::new();
-    for tier in tiers(name) {
+    for tier in common::tiers(name) {
         let run = fixture.run(
             tier,
             &shell_allow(&["cat"]),
@@ -846,7 +831,7 @@ const FINGERPRINT_ALLOW: &[&str] = &["bash", "readlink", "rm"];
 /// `scoped`, `sealed` when the host reaches it, and the shape of a capsule that declares no
 /// containment and sets `filesystem.workdir_exec: true`, which runs `advisory` on the Full tier.
 fn fingerprint_shapes(test_name: &str) -> Vec<Shape> {
-    let mut shapes: Vec<Shape> = tiers(test_name)
+    let mut shapes: Vec<Shape> = common::tiers(test_name)
         .into_iter()
         .map(|tier| Shape {
             label: tier,
@@ -1059,12 +1044,13 @@ const COMPARED_KEYS: &[&str] = &[
 /// and equal.
 const COMPARED_FAMILIES: &[&str] = &["env.", "fd.", "mount./"];
 
-/// The fields that may differ, each with the rule that allows it. A key is tolerated only on the
-/// comparisons named here; on every other it is compared like the rest.
+/// The fields that may differ at the shape labelled `shape`, each with the rule that allows it. A
+/// key is tolerated only on the comparisons and shapes named here; on every other it is compared
+/// like the rest.
 ///
 /// No `env.` key is tolerated: the tool's own `env` additions are the one environment difference
 /// the containment reference allows, and these calls pass none.
-fn tolerated(key: &str, pair: (&str, &str)) -> Option<&'static str> {
+fn tolerated(shape: &str, key: &str, pair: (&str, &str)) -> Option<&'static str> {
     let bare = key.strip_prefix("d2.").unwrap_or(key);
     match bare {
         "proc.pid" => Some("a pid value: every process has its own"),
@@ -1073,6 +1059,10 @@ fn tolerated(key: &str, pair: (&str, &str)) -> Option<&'static str> {
         }
         "ns.mnt" => Some(
             "the per-command mount namespace: every command of a contained session gets its own",
+        ),
+        "ns.user" if shape == "sealed" => Some(
+            "the per-command user namespace: every command of a sealed session gets its own, \
+             nested in the session's",
         ),
         "fd.0" if pair.1 == "start-d1" => Some(
             "stdin: `/dev/null` for a shell command and a `run` without stdin, a pipe for `start`",
@@ -1097,8 +1087,15 @@ fn not_readable(value: &str) -> bool {
     value.starts_with("not readable")
 }
 
-/// Every difference between route `a` and route `b` outside [`tolerated`], one line each.
-fn route_differences(fingerprints: &Fingerprints, a: &str, b: &str, depth2: bool) -> Vec<String> {
+/// Every difference between route `a` and route `b` at the shape labelled `shape` outside
+/// [`tolerated`], one line each.
+fn route_differences(
+    shape: &str,
+    fingerprints: &Fingerprints,
+    a: &str,
+    b: &str,
+    depth2: bool,
+) -> Vec<String> {
     let prefix = if depth2 { "d2." } else { "" };
     let left = &fingerprints[a];
     let right = &fingerprints[b];
@@ -1147,7 +1144,7 @@ fn route_differences(fingerprints: &Fingerprints, a: &str, b: &str, depth2: bool
         }
     }
     for key in keys {
-        if tolerated(&key, (a, b)).is_some() {
+        if tolerated(shape, &key, (a, b)).is_some() {
             continue;
         }
         match (left.get(&key), right.get(&key)) {
@@ -1213,15 +1210,15 @@ fn fingerprint_table(label: &str, fingerprints: &Fingerprints) -> String {
         let pairs = [
             (
                 same(shell_d1, run_d1, &key),
-                tolerated(&key, ("shell-d1", "run-d1")),
+                tolerated(label, &key, ("shell-d1", "run-d1")),
             ),
             (
                 same(shell_d2, run_d2, &d2),
-                tolerated(&d2, ("shell-d2", "run-d2")),
+                tolerated(label, &d2, ("shell-d2", "run-d2")),
             ),
             (
                 same(shell_d1, start_d1, &key),
-                tolerated(&key, ("shell-d1", "start-d1")),
+                tolerated(label, &key, ("shell-d1", "start-d1")),
             ),
         ];
         let equal = if [shell_d1, shell_d2, run_d1, run_d2, start_d1]
@@ -1276,7 +1273,7 @@ fn a_shell_command_and_a_session_process_are_contained_alike() {
             ("shell-d2", "run-d2", true),
             ("shell-d1", "start-d1", false),
         ] {
-            for difference in route_differences(&fingerprints, a, b, depth2) {
+            for difference in route_differences(shape.label, &fingerprints, a, b, depth2) {
                 failures.push(format!("{}: {difference}", shape.label));
             }
         }
