@@ -32,10 +32,12 @@ jobs:
     # The ceiling covers the whole job -- compile, link and run -- and is here so a hung test
     # fails the job rather than burning the runner's own limit.
     #
-    # About twice the job's median with a warm dependency cache, which also leaves room for a run
-    # that misses the cache and rebuilds every dependency at opt-level 2. A single hung test is cut
+    # Sized for a run that misses the cache: rebuilding every dependency at opt-level 2 takes 10-13
+    # minutes and the suite another 8-10, which overruns 20. The ceiling must clear that case, not
+    # only the warm one (~16 minutes): the cache is saved only when the job succeeds, so a ceiling
+    # that cancels the cold run on main leaves every later run cold too. A single hung test is cut
     # off sooner, by the slow-timeout in .config/nextest.toml's `ci` profile.
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       # Each crate with a `tests/` directory is a separate link unit that statically links wasmtime,

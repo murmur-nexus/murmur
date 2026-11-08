@@ -251,6 +251,13 @@ fn assert_cat_needs(needs: &Value) {
 #[test]
 #[allow(clippy::print_stdout)]
 fn declared_needs_reach_a_session_only_through_its_own_declarations() {
+    // Staging a capsule with a shell grant needs the egress namespace; a host that cannot
+    // create one refuses the launch before any declared need is derived.
+    if capsule_runtime::skip_without_egress_namespace(
+        "declared_needs_reach_a_session_only_through_its_own_declarations",
+    ) {
+        return;
+    }
     let store = publish(CAT_NEEDS);
 
     // (a) The program with needs is not granted.
@@ -298,6 +305,13 @@ fn declared_needs_reach_a_session_only_through_its_own_declarations() {
 #[test]
 #[allow(clippy::print_stdout)]
 fn explain_scope_reports_the_declared_needs_staging_grants() {
+    // Staging a capsule with a shell grant needs the egress namespace; a host that cannot
+    // create one refuses the launch before any declared need is derived.
+    if capsule_runtime::skip_without_egress_namespace(
+        "explain_scope_reports_the_declared_needs_staging_grants",
+    ) {
+        return;
+    }
     let store = publish(CAT_NEEDS);
     let project = project(&["cat"], "");
     let explain = |json: bool| {
@@ -494,6 +508,13 @@ fn doctor_names_a_missing_declared_library_and_its_package() {
 #[test]
 #[allow(clippy::print_stdout)]
 fn a_malformed_programs_block_refuses_the_launch() {
+    // Staging a capsule with a shell grant needs the egress namespace; a host that cannot
+    // create one refuses the launch before any declared need is derived.
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_malformed_programs_block_refuses_the_launch",
+    ) {
+        return;
+    }
     let store = publish("programs:\n  cat:\n    needs:\n      - library: /usr/lib/libx.so\n");
     let project = project(&["cat"], "");
     let Err(error) = stage(&store, &project, None) else {
@@ -537,6 +558,13 @@ fn a_malformed_programs_block_refuses_the_launch() {
 #[test]
 #[allow(clippy::print_stdout)]
 fn a_manifest_naming_its_own_paths_keeps_them_beside_the_declared_needs() {
+    // Staging a capsule with a shell grant needs the egress namespace; a host that cannot
+    // create one refuses the launch before any declared need is derived.
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_manifest_naming_its_own_paths_keeps_them_beside_the_declared_needs",
+    ) {
+        return;
+    }
     let store = publish(CAT_NEEDS);
     let scratch = TempDir::new().unwrap();
     let own = fs::canonicalize(scratch.path()).unwrap();

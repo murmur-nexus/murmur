@@ -30,8 +30,11 @@
 //!
 //! Off Linux nothing is derived: commands' file reads are not path-scoped there.
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use murmur_artifact::{DeclaredNeed, LockOrigin, ProgramNeeds};
 #[cfg(target_os = "linux")]
