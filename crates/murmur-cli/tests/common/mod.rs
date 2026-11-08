@@ -323,6 +323,23 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
     capsule_runtime::skip_without_host_support(test_name)
 }
 
+/// The containment tiers a scenario runs at on this host: `scoped` always, `sealed` when the host
+/// reaches it. Prints a `[SKIP-HOST]` line for the `sealed` variant when it does not.
+pub fn tiers(test_name: &str) -> Vec<&'static str> {
+    let mut tiers = vec!["scoped"];
+    let achieved = capsule_runtime::detect_containment_decision(ContainmentClass::Sealed)
+        .0
+        .achieved();
+    if achieved >= ContainmentClass::Sealed {
+        tiers.push("sealed");
+    } else {
+        eprintln!(
+            "[SKIP-HOST] {test_name} (sealed): this host reaches {achieved}, the variant needs sealed"
+        );
+    }
+    tiers
+}
+
 /// The provider-bound `system` text: a plain string, or the concatenated `text` of the block array
 /// the anthropic driver sends when it places cache breakpoints.
 pub fn system_text(system: &serde_json::Value) -> Option<String> {
