@@ -2788,6 +2788,8 @@ pub fn stage_session(
     let mut resolved_lock_artifacts = Vec::with_capacity(request.artifacts.len());
     let mut installed_artifacts = Vec::with_capacity(request.artifacts.len());
     let mut installed_manifests = Vec::with_capacity(request.artifacts.len());
+    // (full name, version, lock origin, manifest) of every staged tool, for its `programs:` block.
+    let mut tool_manifests: Vec<(String, String, LockOrigin, String)> = Vec::new();
     let mut tool_components = HashMap::with_capacity(request.artifacts.len());
     // Only tools/drivers that declare a `capabilities:` block get an entry; everything else
     // stays absent and therefore runs on the unclamped ceiling.
@@ -2912,6 +2914,12 @@ pub fn stage_session(
 
         match artifact.runtime {
             ArtifactRuntime::Tool => {
+                tool_manifests.push((
+                    full_name.clone(),
+                    resolved_version.clone(),
+                    origin.clone(),
+                    manifest_yaml.clone(),
+                ));
                 stage_artifact_grant(
                     artifact,
                     &ceiling_network_allow_rules,
@@ -3119,6 +3127,31 @@ pub fn stage_session(
         containment.declared(),
         containment.host_containment(),
     )?;
+
+    // Every staged tool's `programs:` block is parsed, whatever its pin; only an operator pin's
+    // needs, for a program `shell.allow` grants, are derived. Filled before `launch_session`
+    // resolves the enforcement, and reported below, so `session_start` names what it grants.
+    let declared_tool_needs = tool_manifests
+        .into_iter()
+        .filter(|(.., manifest_yaml)| manifest_yaml.contains(murmur_artifact::PROGRAMS_KEY))
+        .map(|(artifact, version, origin, manifest_yaml)| {
+            murmur_artifact::parse_program_needs(&manifest_yaml)
+                .map(|programs| crate::declared_needs::DeclaredToolNeeds {
+                    artifact: artifact.clone(),
+                    origin,
+                    programs,
+                })
+                .map_err(|error| RuntimeError::ProgramNeedsMalformed {
+                    artifact: format!("{artifact}@{version}"),
+                    reason: error.to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    request.capability_policy.shell_declared_needs = crate::declared_needs::derive_declared_needs(
+        &declared_tool_needs,
+        &request.capability_policy.shell_allow,
+        &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
+    );
 
     let staged_process_driver = match process_driver {
         Some((name, version, component)) => {
@@ -3437,12 +3470,14 @@ pub fn stage_session(
             hook.grant.records_hooks_dir = Some(hooks_dir.clone());
         }
     }
-    let scope_report = scope_report.with_routes(
-        request
-            .inference
-            .as_ref()
-            .map(|inference| inference.transport.as_str()),
-    );
+    let scope_report = scope_report
+        .with_routes(
+            request
+                .inference
+                .as_ref()
+                .map(|inference| inference.transport.as_str()),
+        )
+        .with_declared_needs(&request.capability_policy.shell_declared_needs);
     runtime_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings

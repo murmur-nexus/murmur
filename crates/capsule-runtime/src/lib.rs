@@ -26,6 +26,7 @@ pub mod containment;
 pub(crate) mod control_plane;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
+pub mod declared_needs;
 pub mod delegation;
 pub mod delegation_plane;
 pub mod detached;

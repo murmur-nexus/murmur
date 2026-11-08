@@ -15,6 +15,7 @@ section that explains it.
 | `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
 | `E-BLD-006` | An artifact's `provider_tool:` block is malformed, or declared on a `driver`, `hook` or `skill` artifact | [E-BLD-006](#e-bld-006) |
 | `E-BLD-007` | An artifact's `murmur.yaml` declares `implementation: native` or `execution: native` | [E-BLD-007](#e-bld-007) |
+| `E-BLD-008` | An artifact's `programs:` block names a need by host path, is malformed, or is declared on a `driver`, `hook` or `skill` artifact | [E-BLD-008](#e-bld-008) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host, or a declared provider tool needs `sealed` and the effective floor is below it | [E-CAP-003](#e-cap-003) |
@@ -146,6 +147,7 @@ section that explains it.
 | `E-RUN-059` | The unconfined stance was chosen for a capsule the manifest or a config file declares a containment floor for | [E-RUN-059](#e-run-059) |
 | `E-RUN-060` | `--unconfined` was given to a launch the runtime started contained | [E-RUN-060](#e-run-060) |
 | `E-RUN-061` | An installed artifact's `murmur.yaml` declares `implementation: native` or `execution: native`; refused by a launch, `mur doctor` and a runtime pull | [E-RUN-061](#e-run-061) |
+| `E-RUN-062` | A staged tool's `programs:` block is malformed or names a need by host path; refused by a launch, `mur run --explain-scope` and `mur doctor` | [E-RUN-062](#e-run-062) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -168,6 +170,7 @@ section that explains it.
 | `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
 | `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
 | `W-RUN-010` | `capabilities.shell.allow` names `node` or `nodejs` and the address-space limit its commands run under is below 32 GiB | [W-RUN-010](#w-run-010) |
+| `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host cannot grant it | [W-RUN-011](#w-run-011) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -1598,6 +1601,25 @@ can find it and delete its `<scope>/<name>/<version>/` folder from the store —
 `mur install` and `mur publish` refuse the same payload with [`E-REG-012`](#e-reg-012), and
 `mur build` refuses the manifest with [`E-BLD-007`](#e-bld-007).
 
+### E-RUN-062 — a malformed `programs:` block { #e-run-062 }
+
+A stored tool's [`programs:` block](manifest.md#artifact-programs) does not parse, names a need by
+host path, or sits on an artifact that is not a tool. Every staged tool's block is read, whatever
+its lock origin:
+
+```text
+error[E-RUN-062]: artifact 'local/needs-tool@1.0.0' ships a malformed programs: block: murmur.yaml: field 'programs.cat.needs[0].library' is '/usr/lib/libx.so', an absolute host path; a need names what the program needs, never where a host keeps it
+  hint: a programs: need names a library by soname, a file beside a declared library, a program_folder, a system location or an etc name, never a host path; install a version of the artifact that ships a valid block, or remove it from artifacts: — see https://docs.murmur.nexus/reference/diagnostics/#e-run-062
+```
+
+| Where | What happens |
+|---|---|
+| `mur run`, and every launch that stages artifacts | The launch stops before the session directory exists |
+| `mur run --explain-scope` | Refused the same way |
+| [`mur doctor`](cli.md#mur-doctor) | The `Declared needs` check fails |
+
+`mur build` refuses the same block with [`E-BLD-008`](#e-bld-008).
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -2244,6 +2266,32 @@ and the tool starts it through `murmur:process` — see
 [Programs a WASM tool runs](containment.md#wasm-tool-programs). An already-built payload that
 declares a native implementation is refused by `mur install` and `mur publish` with
 [`E-REG-012`](#e-reg-012), and by a launch with [`E-RUN-061`](#e-run-061).
+
+### E-BLD-008 — a `programs:` need named by host path { #e-bld-008 }
+
+```text
+error[E-BLD-008]: murmur.yaml: field 'programs.chromium.needs[2].program_folder' is '/home/someone/.fonts', an absolute host path; a need names what the program needs, never where a host keeps it
+  hint: programs: goes on a runtime: tool artifact; each need names what the program needs, never where: library (a soname), file with beside (a file name beside a declared library), program_folder (relative to the program's folder), system (fonts or ca_bundle) or etc (a name under /etc) — see https://docs.murmur.nexus/reference/manifest/#artifact-programs
+```
+
+`mur build` refuses before writing the `.mur.zip`. The message names the program, the need's index,
+the value and the reason; the forms are in [`programs:` block](manifest.md#artifact-programs):
+
+| Need | Reason named |
+|---|---|
+| A value under `/proc` | `/proc is the runtime's rule` |
+| Any other absolute path | `an absolute host path` |
+| A value starting with `~` | `a home folder` |
+| A value containing `$` | `an environment expansion` |
+| A `..` component | `a path climbing with '..'` |
+| An `etc` name equal to, beneath or holding an `/etc` credential location | `a credential location` |
+| No form, or two forms | `a need holds exactly one form` |
+| A key other than a form, `beside` and `packages` | the key, in the field name |
+| `beside` naming no `library` of the same program | `names no library: entry` |
+| A `system` other than `fonts` and `ca_bundle` | `not a system location` |
+| The block on a `driver`, `hook` or `skill` artifact | `only valid on an artifact whose runtime is tool` |
+
+A tool packed with such a block some other way is refused at launch with [`E-RUN-062`](#e-run-062).
 
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
@@ -3143,6 +3191,32 @@ Where a warning is written depends on whether the session's records directory ex
 | `W-SEC-034` — from `mur doctor` | stderr |
 | `W-SEC-035` — decided before staging by `mur run`, and by `mur doctor` | stderr |
 | `W-SEC-036` — decided at launch, after staging succeeds | stderr, with `--json` too, and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
+
+### W-RUN-011 — a declared program need this host cannot grant { #w-run-011 }
+
+```text
+  warning[W-RUN-011]: local/browser declares library libsoftokn3.so for chromium, and this host has none; install libnss3 (debian)
+  warning[W-RUN-011]: local/browser declares system fonts for chromium, and this host has none; the artifact names no package for ubuntu, debian
+  warning[W-RUN-011]: local/browser declares program_folder . for chromium, and it is not granted: program not found on PATH
+```
+
+**Fires when** a tool the capsule pins with an `operator` lock origin declares a
+[need](containment.md#declared-program-needs) for a program `capabilities.shell.allow` grants, and
+the need is reported `missing`: it resolves to nothing on this host, its program is not on `PATH`,
+or what it resolves to is a location no need may reach.
+
+[`mur doctor`](cli.md#mur-doctor) prints one line per missing need and counts each among its
+warnings. Nothing is refused: a launch grants the needs this host has and reports the rest under
+`declared_needs`.
+
+| Why the need is missing | The line ends with |
+|---|---|
+| It resolves to nothing on this host | `this host has none; install <package> (<distribution>)`, the need's `packages` entry for this host's os-release `ID`, else for each `ID_LIKE` word in order (read from `/etc/os-release`, else `/usr/lib/os-release`). With no entry for this host: `the artifact names no package for <IDs checked>` |
+| Its program is not on `PATH`, or it resolves to a location no need may reach | `it is not granted: <reason>`, with no package: installing one would not change it |
+
+**What to do:** install the package named, or the one that provides the need on this
+distribution. For a need that is not granted, put the program on `PATH`, or install the library
+or file where the reason shows it is not under the home folder or a folder the capsule can write.
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 

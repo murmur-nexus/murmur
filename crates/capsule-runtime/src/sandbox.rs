@@ -1049,7 +1049,7 @@ fn resolve_landlock_grants_in(
 
 /// The dependencies of the ELF image at `path`, read through [`ElfFile`]. `None` when it cannot
 /// be opened or does not parse.
-fn read_elf_dependencies(path: &Path) -> Option<ElfDependencies> {
+pub(crate) fn read_elf_dependencies(path: &Path) -> Option<ElfDependencies> {
     parse_elf_dependencies(&ElfFile::open_host(path).ok()?)
 }
 
@@ -1252,6 +1252,65 @@ pub(crate) fn resolve_trust_store_grants(
             executable: false,
         })
         .collect()
+}
+
+/// One [`LandlockGrant`] per path a tool's declared program need was granted (see
+/// [`crate::declared_needs`]): a directory readable and listable, a file readable.
+///
+/// `executable: false` on every one (see [`LandlockGrant`]): a need is read, never run, and a
+/// declared library still loads, because `dlopen(3)` needs `ReadFile` alone. Libraries arrive
+/// file by file, never as their folder. The derivation gates on the capsule's own declarations
+/// and never names `/`, `/proc`, `/sys`, `/dev`, the home folder, a capsule-writable tree or an
+/// `/etc` credential location, or a folder holding one.
+///
+/// Consulted only on `KernelFull` and `KernelSealed`, like every grant here.
+pub(crate) fn resolve_declared_need_grants(
+    needs: &[crate::declared_needs::ResolvedProgramNeeds],
+) -> Vec<LandlockGrant> {
+    needs
+        .iter()
+        .flat_map(|program| program.granted.iter())
+        .flat_map(|need| need.paths.iter())
+        .map(|entry| LandlockGrant {
+            path: entry.path.clone(),
+            list_dir: entry.directory,
+            executable: false,
+        })
+        .collect()
+}
+
+/// Each path a declared program need was granted, as an optional composed-root mirror at its own
+/// path: a file mirrored as a file, a directory as a directory, never the folder holding it.
+///
+/// Skipped when the composed root already carries it: under a fixed
+/// [`crate::sealed::SEALED_RUNTIME_PATHS`] tree, at or under a [`crate::sealed::SEALED_ETC_PATHS`]
+/// entry, or under one of `bind_dirs` ([`resolve_sealed_bind_dirs`]). Deduplicated. Pure and
+/// syscall-free.
+pub(crate) fn resolve_sealed_need_mirrors(
+    needs: &[crate::declared_needs::ResolvedProgramNeeds],
+    bind_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut mirrors: Vec<PathBuf> = Vec::new();
+    for path in needs
+        .iter()
+        .flat_map(|program| program.granted.iter())
+        .flat_map(|need| need.paths.iter())
+        .map(|entry| &entry.path)
+    {
+        let carried = crate::sealed::SEALED_RUNTIME_PATHS
+            .iter()
+            .chain(
+                crate::sealed::SEALED_ETC_PATHS
+                    .iter()
+                    .map(|entry| &entry.path),
+            )
+            .any(|root| path.starts_with(root))
+            || bind_dirs.iter().any(|dir| path.starts_with(dir));
+        if path.is_absolute() && !carried && !mirrors.contains(path) {
+            mirrors.push(path.clone());
+        }
+    }
+    mirrors
 }
 
 /// The host directories a composed root must carry *beyond* [`crate::sealed::SEALED_RUNTIME_PATHS`]
@@ -2319,6 +2378,12 @@ pub(crate) struct ShellEnforcement {
     /// every platform for parity, exactly like `landlock_grants` above.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) sealed_bind_dirs: Vec<PathBuf>,
+    /// Each path a declared program need was granted ([`resolve_sealed_need_mirrors`]), mirrored
+    /// read-only into the composed root at its own path, file or directory. Optional, like
+    /// `sealed_bind_dirs`; kept apart from it because a file need's folder (`/etc` for
+    /// `/etc/fonts/fonts.conf`) must never be bound whole. Consumed only on `KernelSealed`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) sealed_need_mirrors: Vec<PathBuf>,
     /// The `source_path` of each declared `capabilities.shell.staged_runtime` grant, bind-mounted
     /// read-only into the composed root at its own absolute path.
     ///
@@ -2449,6 +2514,9 @@ impl ShellEnforcement {
         // network gate lives in the derivation, which leaves the field empty for a capsule whose
         // commands cannot reach the network.
         landlock_grants.extend(resolve_trust_store_grants(&policy.shell_trust_store));
+        // Plus one read-only grant per path a tool's declared program need resolved to. The
+        // gate (an operator pin and the program in `shell.allow`) lives in the derivation.
+        landlock_grants.extend(resolve_declared_need_grants(&policy.shell_declared_needs));
         // Plus one per staged runtime tree. Without this the tree is bind-mounted into the
         // composed root and then denied by the Landlock ruleset installed inside it — see
         // `resolve_staged_runtime_landlock_grants`.
@@ -2468,6 +2536,8 @@ impl ShellEnforcement {
         // `localhost` resolves; `sealed` has them from the line above.
         landlock_grants.extend(resolve_scoped_name_resolution_landlock_grants(tier));
         let sealed_bind_dirs = resolve_sealed_bind_dirs(&exec_allow_paths, policy);
+        let sealed_need_mirrors =
+            resolve_sealed_need_mirrors(&policy.shell_declared_needs, &sealed_bind_dirs);
         let staged_runtime_dirs = resolve_staged_runtime_dirs(policy);
         Ok(Self {
             tier,
@@ -2479,6 +2549,7 @@ impl ShellEnforcement {
             landlock_abi: ruleset_landlock_abi(probe.landlock_kernel_abi(), tier),
             landlock_grants,
             sealed_bind_dirs,
+            sealed_need_mirrors,
             staged_runtime_dirs,
             resource_limits: policy.resources,
             declared_resources: policy.declared_resources,
@@ -2711,6 +2782,7 @@ impl ShellEnforcement {
             landlock_abi: None,
             landlock_grants: Vec::new(),
             sealed_bind_dirs: Vec::new(),
+            sealed_need_mirrors: Vec::new(),
             staged_runtime_dirs: Vec::new(),
             // Defaults, not "no limits": the rlimit ceilings apply unchanged on this tier, so
             // zeroing them out here would misrepresent what a real macOS host does.
@@ -3466,7 +3538,13 @@ pub(crate) fn prepare_enforcement(
         Some(sources) => Some(build_sealed_root(
             accessible_workdir,
             sources,
-            &enforcement.sealed_bind_dirs,
+            // Both optional mirrors at their own paths: the bind directories first, so a need
+            // inside one is already carried.
+            &[
+                enforcement.sealed_bind_dirs.as_slice(),
+                enforcement.sealed_need_mirrors.as_slice(),
+            ]
+            .concat(),
             &enforcement.staged_runtime_dirs,
             &host_path_fds,
             &enforcement.host_path_read_only_binds,
@@ -6894,6 +6972,125 @@ mod tests {
                 assert_eq!(applied_tier(host_tier, declared), host_tier);
             }
         }
+    }
+
+    /// One (artifact, program) of declared needs granting `paths`, each `(path, directory)`, for
+    /// tests that hand the enforcement needs without deriving them.
+    pub(super) fn granted_needs(
+        paths: &[(PathBuf, bool)],
+    ) -> Vec<crate::declared_needs::ResolvedProgramNeeds> {
+        vec![crate::declared_needs::ResolvedProgramNeeds {
+            artifact: "local/needs-tool".to_string(),
+            program: "cat".to_string(),
+            granted: paths
+                .iter()
+                .map(|(path, directory)| crate::declared_needs::ResolvedNeed {
+                    need: murmur_artifact::DeclaredNeed {
+                        form: murmur_artifact::NeedForm::Etc("fixture".to_string()),
+                        packages: Default::default(),
+                    },
+                    paths: vec![crate::declared_needs::NeedPath {
+                        path: path.clone(),
+                        directory: *directory,
+                    }],
+                })
+                .collect(),
+            missing: Vec::new(),
+        }]
+    }
+
+    /// A declared need is mirrored into the composed root at its own path: a file as that file,
+    /// never its folder; nothing the fixed trees, the `/etc` allowlist or a bind directory
+    /// already carry.
+    #[test]
+    fn sealed_need_mirrors_are_each_need_at_its_own_path() {
+        let needs = granted_needs(&[
+            (PathBuf::from("/etc/fonts/fonts.conf"), false),
+            (PathBuf::from("/usr/share/fonts"), true),
+            (PathBuf::from("/lib/x86_64-linux-gnu/libm.so.6"), false),
+            (PathBuf::from("/etc/ssl/certs"), true),
+            (PathBuf::from("/opt/fixture/share"), true),
+            (PathBuf::from("/opt/fixture/share"), true),
+            (PathBuf::from("/var/cache/fontconfig"), true),
+        ]);
+        assert_eq!(
+            resolve_sealed_need_mirrors(&needs, &[]),
+            [
+                PathBuf::from("/etc/fonts/fonts.conf"),
+                PathBuf::from("/opt/fixture/share"),
+                PathBuf::from("/var/cache/fontconfig"),
+            ]
+        );
+        assert!(!resolve_sealed_need_mirrors(&needs, &[]).contains(&PathBuf::from("/etc")));
+        assert_eq!(
+            resolve_sealed_need_mirrors(&needs, &[PathBuf::from("/opt/fixture")]),
+            [
+                PathBuf::from("/etc/fonts/fonts.conf"),
+                PathBuf::from("/var/cache/fontconfig"),
+            ]
+        );
+    }
+
+    /// Every declared-need grant is read-only, and listable only for a directory.
+    #[test]
+    fn resolve_declared_need_grants_reads_and_lists_but_never_executes() {
+        let needs = granted_needs(&[
+            (PathBuf::from("/opt/fixture/lib/libfix.so.1"), false),
+            (PathBuf::from("/opt/fixture/share"), true),
+        ]);
+        assert_eq!(
+            resolve_declared_need_grants(&needs),
+            [
+                LandlockGrant {
+                    path: PathBuf::from("/opt/fixture/lib/libfix.so.1"),
+                    list_dir: false,
+                    executable: false,
+                },
+                LandlockGrant {
+                    path: PathBuf::from("/opt/fixture/share"),
+                    list_dir: true,
+                    executable: false,
+                },
+            ]
+        );
+        let mut policy = CapabilityPolicy {
+            shell_allow: vec!["cat".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        policy.shell_declared_needs = needs;
+        // A manifest's own grant is kept beside the needs: Landlock rules union.
+        policy.shell_interpreter_runtime = vec![murmur_artifact::InterpreterRuntimeGrant {
+            binary: "cat".to_string(),
+            dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                path: "/opt/own-grant".to_string(),
+                list_dir: false,
+            }],
+        }];
+        let enforcement = ShellEnforcement::resolve_declared(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            HostProbe::probe(),
+        )
+        .unwrap();
+        for path in ["/opt/fixture/lib/libfix.so.1", "/opt/fixture/share"] {
+            let grant = enforcement
+                .landlock_grants
+                .iter()
+                .find(|grant| grant.path == Path::new(path))
+                .unwrap_or_else(|| panic!("{path} is granted"));
+            assert!(!grant.executable, "{grant:?}");
+        }
+        assert!(enforcement
+            .landlock_grants
+            .iter()
+            .any(|grant| grant.path == Path::new("/opt/own-grant") && grant.executable));
+        assert_eq!(
+            enforcement.sealed_need_mirrors,
+            [
+                PathBuf::from("/opt/fixture/lib/libfix.so.1"),
+                PathBuf::from("/opt/fixture/share"),
+            ]
+        );
     }
 
     #[test]
@@ -12464,6 +12661,79 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "{}",
             &read.stdout[..read.stdout.len().min(200)]
         );
+    }
+
+    /// A `scoped` command reads a declared need and lists a granted need directory, while a file
+    /// beside them stays denied and the granted file, though executable on disk, never runs.
+    #[test]
+    fn a_scoped_command_reads_a_declared_need_and_nothing_beside_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let test = "a_scoped_command_reads_a_declared_need_and_nothing_beside_it";
+        // Outside `/tmp`, which a scoped command sees as its own private folder.
+        let base = home_tempdir();
+        let need = base.path().join("need");
+        std::fs::create_dir_all(need.join("share")).unwrap();
+        let library = need.join("lib.so.1");
+        std::fs::write(&library, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(need.join("share/font.txt"), "font").unwrap();
+        let secret = need.join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let (_work_base, work, _outside) = work_and_outside();
+        let mut policy = allow_only(&["cat", "sh", "ls"]);
+        policy.shell_declared_needs =
+            super::tests::granted_needs(&[(library.clone(), false), (need.join("share"), true)]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        assert!(enforcement
+            .landlock_grants
+            .iter()
+            .filter(|grant| grant.path.starts_with(&need))
+            .all(|grant| !grant.executable));
+
+        let read = execute(
+            "cat",
+            &[library.to_str().unwrap()],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        let beside = execute(
+            "cat",
+            &[secret.to_str().unwrap()],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        let listed = execute(
+            "ls",
+            &[need.join("share").to_str().unwrap()],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        let ran = execute(
+            "sh",
+            &["-c", library.to_str().unwrap()],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_eq!(read.exit_code, 0, "{}", read.stderr);
+        assert!(read.stdout.contains("echo ran"), "{}", read.stdout);
+        assert_ne!(beside.exit_code, 0);
+        assert!(
+            beside.stderr.contains("Permission denied"),
+            "{}",
+            beside.stderr
+        );
+        assert_eq!(listed.exit_code, 0, "{}", listed.stderr);
+        assert!(listed.stdout.contains("font.txt"), "{}", listed.stdout);
+        assert_eq!(ran.exit_code, 126, "{}", ran.stderr);
+        assert!(ran.stderr.contains("Permission denied"), "{}", ran.stderr);
+        assert!(!ran.stdout.contains("ran"), "{}", ran.stdout);
     }
 
     // ---- the session's PID namespace and its private /proc ----

@@ -73,6 +73,15 @@ pub const W_RUN_009: &str = "W-RUN-009";
 /// same text.
 pub const W_RUN_010: &str = "W-RUN-010";
 
+/// A tool the capsule pins with an `operator` lock origin declares a need (its `programs:` block)
+/// for a program `capabilities.shell.allow` grants, and this host cannot grant it: it resolves to
+/// nothing, its program is not on `PATH`, or it resolves to a location no need may reach.
+///
+/// A missing need never refuses a launch: the program may run without it, or fail for want of it.
+/// Printed by `mur doctor`, once per missing need. A need that resolves to nothing names the
+/// package the tool declares for this host's distribution; any other names its reason.
+pub const W_RUN_011: &str = "W-RUN-011";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -88,6 +97,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
+            W_RUN_011,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

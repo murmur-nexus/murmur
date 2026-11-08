@@ -568,3 +568,140 @@ fn copy_dir_all(src: &Path, dst: &Path) {
         }
     }
 }
+
+/// The reference page's example `programs:` block.
+const PROGRAMS_EXAMPLE: &str = "programs:
+  chromium:
+    needs:
+      - library: libsoftokn3.so
+        packages:
+          debian: libnss3
+          fedora: nss-softokn
+      - file: libsoftokn3.chk
+        beside: libsoftokn3.so
+      - program_folder: .
+      - system: fonts
+      - etc: fonts/fonts.conf
+";
+
+/// A tool manifest packing a copy of the committed `image-tool` component, with `block`.
+fn programs_source(runtime: &str, block: &str) -> (tempfile::TempDir, String) {
+    let dir = tempdir().unwrap();
+    let manifest = format!(
+        "name: needs-tool\nversion: 0.1.0\nruntime: {runtime}\nrequires_files:\n  - tool.wasm\n\
+         {block}"
+    );
+    fs::write(dir.path().join("murmur.yaml"), &manifest).unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/image-tool/tool/image-tool.wasm"),
+        dir.path().join("tool.wasm"),
+    )
+    .unwrap();
+    (dir, manifest)
+}
+
+/// A tool declaring every portable need form builds, and its manifest is packed byte for byte.
+#[test]
+fn programs_the_example_block_builds_and_is_packed_byte_for_byte() {
+    let (dir, manifest) = programs_source("tool", PROGRAMS_EXAMPLE);
+    build_in(dir.path()).success();
+    let mut archive =
+        ZipArchive::new(fs::File::open(dir.path().join("out.mur.zip")).unwrap()).unwrap();
+    let mut packed = String::new();
+    archive
+        .by_name("murmur.yaml")
+        .unwrap()
+        .read_to_string(&mut packed)
+        .unwrap();
+    assert_eq!(packed, manifest);
+    assert!(packed.contains(PROGRAMS_EXAMPLE));
+}
+
+/// A need named by host path, or malformed, or a block off a tool, is refused before anything is
+/// written, naming the program, the need's index, the value and why.
+#[test]
+#[allow(clippy::print_stdout)]
+fn programs_a_non_portable_need_fails_the_build_naming_it() {
+    let one = |need: &str| format!("programs:\n  cat:\n    needs:\n      - {need}\n");
+    for (runtime, block, expected) in [
+        (
+            "tool",
+            one("program_folder: /home/someone/.fonts"),
+            "field 'programs.cat.needs[0].program_folder' is '/home/someone/.fonts', an absolute \
+             host path",
+        ),
+        (
+            "tool",
+            one("library: /proc/self/maps"),
+            "field 'programs.cat.needs[0].library' is '/proc/self/maps', under /proc, and /proc \
+             is the runtime's rule",
+        ),
+        (
+            "tool",
+            one("etc: shadow"),
+            "field 'programs.cat.needs[0].etc' is 'shadow', a credential location",
+        ),
+        (
+            "tool",
+            one("etc: ssl"),
+            "field 'programs.cat.needs[0].etc' is 'ssl', a credential location: /etc/ssl/private",
+        ),
+        (
+            "tool",
+            one("etc: ../proc/cpuinfo"),
+            "field 'programs.cat.needs[0].etc' is '../proc/cpuinfo', a path climbing with '..'",
+        ),
+        (
+            "tool",
+            one("library: ~/lib/libx.so"),
+            "field 'programs.cat.needs[0].library' is '~/lib/libx.so', a home folder",
+        ),
+        (
+            "tool",
+            one("program_folder: $HOME/x"),
+            "field 'programs.cat.needs[0].program_folder' is '$HOME/x', an environment expansion",
+        ),
+        (
+            "tool",
+            one("path: /usr/share/fonts"),
+            "field 'programs.cat.needs[0].path' is not a need key",
+        ),
+        (
+            "tool",
+            one("library: libm.so.6\n        etc: fonts"),
+            "field 'programs.cat.needs[0]' holds library and etc; a need holds exactly one form",
+        ),
+        (
+            "tool",
+            "programs:\n  cat:\n    needs:\n      - library: libm.so.6\n      - file: x.chk\n        \
+             beside: libnone.so\n"
+                .to_string(),
+            "field 'programs.cat.needs[1].beside' is 'libnone.so', which names no library: entry \
+             of program 'cat'",
+        ),
+        (
+            "tool",
+            one("system: everything"),
+            "field 'programs.cat.needs[0].system' is 'everything', which is not a system location",
+        ),
+        (
+            "driver",
+            one("system: fonts"),
+            "field 'programs' is only valid on an artifact whose runtime is tool; this one is \
+             runtime: driver",
+        ),
+    ] {
+        let (dir, _) = programs_source(runtime, &block);
+        let output = build_in(dir.path()).failure().get_output().clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{stderr}");
+        assert!(stderr.contains("error[E-BLD-008]:"), "{stderr}");
+        assert!(stderr.contains(expected), "{block}: {stderr}");
+        assert!(
+            stderr.contains("hint: programs: goes on a runtime: tool artifact"),
+            "{stderr}"
+        );
+        assert!(!dir.path().join("out.mur.zip").exists(), "{block}");
+    }
+}

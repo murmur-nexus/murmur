@@ -129,6 +129,11 @@ pub enum BuildError {
     /// that declares it.
     #[error(transparent)]
     ProviderTool(ManifestError),
+    /// The manifest's `programs:` block is malformed, names a need by host path, or is declared
+    /// on an artifact whose `runtime` is `driver`, `hook` or `skill`. A tool shipped with it would
+    /// refuse every launch that declares it.
+    #[error(transparent)]
+    ProgramNeeds(ManifestError),
 }
 
 /// One file the packer will write into the archive.
@@ -184,6 +189,7 @@ pub fn build_artifact(
     refuse_retired_auth_block(&manifest_yaml).map_err(BuildError::RetiredAuthBlock)?;
     parse_model_limits(&manifest_yaml).map_err(BuildError::ModelLimits)?;
     parse_provider_tool(&manifest_yaml).map_err(BuildError::ProviderTool)?;
+    crate::parse_program_needs(&manifest_yaml).map_err(BuildError::ProgramNeeds)?;
 
     // Everything that decides *what* ships — name validation, per-entry path safety, curation
     // and archive-name collisions — happens here, and is the same computation the build lints
