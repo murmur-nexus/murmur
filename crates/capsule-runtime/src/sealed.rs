@@ -4628,8 +4628,8 @@ mod tests {
         }
     }
 
-    /// The undetermined remedy is the combined advice the refusals gave before the gap was read,
-    /// word for word.
+    /// The undetermined remedy is the combined advice: install the shipped profile, or run the
+    /// checkout script, then the `LAST RESORT` sysctl.
     #[test]
     fn the_undetermined_remedy_is_the_combined_advice() {
         let remedy = profile_gap_remedy(&ProfileGap::Undetermined, "0.10.0");

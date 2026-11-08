@@ -136,7 +136,7 @@ names which case applies and the command that fixes it:
 
 | Install | Binary path | Profile |
 |---|---|---|
-| Per user, without root for the binary | `~/.local/bin/mur` (`install -m 755 mur-${VERSION}-${PLATFORM} ~/.local/bin/mur`) | `mur-sealed-home`. The profile still needs root: run Step 3 and Step 4 |
+| Per user, without root for the binary | `~/.local/bin/mur` (`install -m 755 mur-${VERSION}-${PLATFORM} ~/.local/bin/mur`, and `mur-roost` beside it the same way) | `mur-sealed-home`. The profile still needs root: run Step 3 and Step 4 |
 | `cargo install murmur-cli` | `~/.cargo/bin/mur` | `mur-sealed-home`. Run Step 3 and Step 4 with `VERSION` set to the installed crate's version |
 | A checkout build | `<checkout>/target/debug/mur` or `<checkout>/target/release/mur` | `mur-sealed-dev`: run `sudo scripts/install-dev-apparmor.sh` from the checkout. A build whose target directory is not `<checkout>/target` gets no profile |
 

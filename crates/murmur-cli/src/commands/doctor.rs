@@ -396,11 +396,7 @@ fn profile_advice_lines(gap: &ProfileGap, version: &str) -> Vec<String> {
         }
         ProfileGap::PathNotProfiled { .. } => {
             let mut parts = profile_gap_remedy_parts(gap, version).into_iter();
-            let mut lines = vec![
-                "This path is why the grant below is withheld: AppArmor attaches profiles by the \
-                 executable's resolved path, and no mur-sealed profile names this one."
-                    .to_string(),
-            ];
+            let mut lines = vec!["This path is why the grant below is withheld.".to_string()];
             lines.extend(parts.next());
             lines.extend(attachment_list());
             lines.push(not_the_fix.to_string());
@@ -3245,7 +3241,8 @@ mod tests {
         assert!(!text.contains("This path is why"), "{text}");
     }
 
-    /// Where the loaded profiles cannot be read, the advice is the block doctor always printed.
+    /// Where the loaded profiles cannot be read, the advice is the combined block: the attachment
+    /// list, the checkout script and the not-the-fix sentence.
     #[test]
     fn the_profile_advice_for_an_undetermined_gap_is_the_combined_block() {
         let lines = profile_advice_lines(&ProfileGap::Undetermined, "0.10.0");

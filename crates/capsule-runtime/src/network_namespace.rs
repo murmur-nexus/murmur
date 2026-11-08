@@ -2280,7 +2280,7 @@ mod tests {
     }
 
     /// Every gap's reason opens with the shared cause, carries the build's remedy for that gap and
-    /// ends with the unchanged readings line.
+    /// ends with the readings line.
     #[test]
     fn every_profile_gap_is_worded_with_its_own_remedy_and_the_unchanged_readings() {
         for gap in [
