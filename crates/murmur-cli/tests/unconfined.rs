@@ -1037,7 +1037,7 @@ fn wasm_tool_grants_differ_only_in_extra_roots_when_unconfined() {
 /// The environment a caller might hope lifts the root refusal; none of it does.
 const ROOT_OVERRIDE_ATTEMPT: &[(&str, &str)] = &[
     ("MURMUR_ALLOW_ROOT", "1"),
-    ("SUDO_USER", "agape"),
+    ("SUDO_USER", "operator"),
     ("SUDO_UID", "1000"),
 ];
 

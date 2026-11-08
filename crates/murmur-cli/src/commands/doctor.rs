@@ -2667,9 +2667,9 @@ fn report_host_paths(
 
 /// The containment stance `mur run` with no flags would resolve for this capsule, reported, and
 /// the floor the rest of the checklist reads: `unconfined` when the global config chooses it,
-/// `contained` otherwise. When the global config chooses `unconfined` and a floor is declared too,
-/// `mur run` refuses with `E-RUN-059`, which is an error in `findings`, and the checklist reads
-/// the contained floor a `--containment` launch would run at.
+/// `contained` otherwise. When the global config chooses `unconfined` and `mur` runs as root
+/// (`E-RUN-063`) or a floor is declared too (`E-RUN-059`), `mur run` refuses, which is an error in
+/// `findings`, and the checklist reads the contained floor a `--containment` launch would run at.
 fn doctor_containment_stance(
     config: crate::config::ContainmentConfig,
     manifest: Option<murmur_artifact::ContainmentClass>,
