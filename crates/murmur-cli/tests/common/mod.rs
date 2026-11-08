@@ -1175,6 +1175,36 @@ pub fn publish_to_store(
     .unwrap();
 }
 
+/// The opening of every `E-CAP-003` reason the cargo-built `mur` can give for `sealed` on this
+/// host: one per [`capsule_runtime::sealed::SealedBlocker`], each rendered as
+/// [`capsule_runtime::SealedShortfall::reason`] renders it, before the probe sentence.
+///
+/// A missing AppArmor profile is worded for the profile gap `mur` reads, so the expected text is
+/// derived from the same readings: the kernel's loaded profiles, the cargo-built binary's own
+/// path (it is started by that path, so through no symlink) and the installed profile file.
+pub fn sealed_refusal_reasons() -> Vec<String> {
+    let profile_gap = capsule_runtime::classify_profile_gap(&capsule_runtime::ProfileGapReadings {
+        loaded: capsule_runtime::loaded_apparmor_profiles(),
+        exe: std::fs::canonicalize(assert_cmd::cargo::cargo_bin("mur")).ok(),
+        link: None,
+        installed: capsule_runtime::inspect_installed_profile(),
+    });
+    capsule_runtime::sealed::SealedBlocker::ALL
+        .iter()
+        .map(|blocker| {
+            capsule_runtime::SealedShortfall {
+                blocker: *blocker,
+                failed_call: None,
+                errno: None,
+                userns_grant: capsule_runtime::UsernsGrant::Withheld,
+                attachment: capsule_runtime::ProfileAttachment::Unconfined,
+                profile_gap: profile_gap.clone(),
+            }
+            .reason()
+        })
+        .collect()
+}
+
 /// `mur run --explain-scope --json`, which resolves the capability scope and creates nothing.
 pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
     let stdout = Command::cargo_bin("mur")

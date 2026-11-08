@@ -316,11 +316,11 @@ fn a_sealed_verdict_survives_the_first_subprocess() {
     let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("E-CAP-003"), "stderr was:\n{stderr}");
     // Derived from the enum, never a hand-written list: a blocker added later cannot make this
-    // assertion lie about the host.
+    // assertion lie about the host. A missing profile is worded for this host's profile gap.
     assert!(
-        capsule_runtime::sealed::SealedBlocker::ALL
+        common::sealed_refusal_reasons()
             .iter()
-            .any(|blocker| stderr.contains(&blocker.reason())),
+            .any(|reason| stderr.contains(reason)),
         "the refusal must name one specific mechanism, got:\n{stderr}"
     );
     assert!(

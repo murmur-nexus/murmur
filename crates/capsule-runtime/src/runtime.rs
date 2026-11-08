@@ -21583,6 +21583,7 @@ inference:
             errno: Some(libc::ENOSPC),
             userns_grant: crate::sealed::UsernsGrant::RestrictionDisabledHostWide,
             attachment: crate::sealed::ProfileAttachment::Unconfined,
+            profile_gap: crate::sealed::ProfileGap::Undetermined,
         }
     }
 

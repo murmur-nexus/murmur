@@ -8,17 +8,17 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_landlock_abi, doctor_runtime_dir, find_on_path, has_subprocess_route_at_staging,
     inspect_installed_profile, install_from_places, landlock_doctor_lines, preopen_reports,
-    probe_scope, read_only_advisory_for, render_cgroup_scope, render_install, render_read_only,
-    render_records_dir, render_routes, render_runtime_dir, render_temp_dir, route_table,
-    runtime_dir_inside_warning, served_wit_level, undeclarable_runtime_pin_role,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_uncovered_routes, warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
-    ArtifactRequest, CgroupScopeReport, CgroupScopeStatus, EgressNamespaceFailure, HostProbe,
-    InstalledProfileState, MountAttempt, NamespaceReading, PreopenReport, ProfileAttachment,
-    RouteInputs, UsernsGrant, HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    probe_scope, profile_gap_remedy_parts, read_only_advisory_for, render_cgroup_scope,
+    render_install, render_read_only, render_records_dir, render_routes, render_runtime_dir,
+    render_temp_dir, route_table, runtime_dir_inside_warning, served_wit_level,
+    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_uncovered_routes, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, CgroupScopeReport, CgroupScopeStatus,
+    EgressNamespaceFailure, HostProbe, InstalledProfileState, MountAttempt, NamespaceReading,
+    PreopenReport, ProfileAttachment, ProfileGap, RouteInputs, UsernsGrant, HOME_UNUSABLE_HINT,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     effective_containment_floor, newest_fitting_level, read_runtime_manifest_text,
@@ -312,6 +312,7 @@ fn check_lock_entry(
 fn report_binary_attachment(
     grant: Option<UsernsGrant>,
     attachment: &ProfileAttachment,
+    profile_gap: &ProfileGap,
     attempt_failed: bool,
 ) {
     match std::env::current_exe() {
@@ -366,24 +367,63 @@ fn report_binary_attachment(
              the reading explains a refusal when an attempt fails, and caused none here."
         );
     } else if profile_advice_applies(grant, attachment, attempt_failed) {
-        capsule_runtime::report_println!(
-            "    This path is why the grant below is withheld: AppArmor attaches profiles by \
-             executable path, and no mur-sealed profile attaches to this one."
-        );
-        capsule_runtime::report_println!("    The shipped profile attaches to:");
-        for attachment in SEALED_APPARMOR_ATTACHMENT_PATHS {
-            capsule_runtime::report_println!("      {attachment}");
+        for line in profile_advice_lines(profile_gap, env!("CARGO_PKG_VERSION")) {
+            capsule_runtime::report_println!("    {line}");
         }
-        capsule_runtime::report_println!(
-            "    Running from a checkout build: `scripts/install-dev-apparmor.sh` generates and \
-             loads the same grant for ./target/{{debug,release}}/mur. Running from anywhere else: \
-             install mur to one of the paths above."
-        );
-        capsule_runtime::report_println!(
-            "    Adding this path to the profile is not the fix. Path attachment is the \
-             mechanism's design — a profile that matched everything would grant userns to \
-             everything — so the next unusual location would fail exactly the same way."
-        );
+    }
+}
+
+/// The advice printed under `profile attached: none` when the probe was refused for it, worded
+/// for why no `mur-sealed` profile confines this binary. The commands are
+/// [`profile_gap_remedy_parts`]'s, the ones `E-CAP-005` and `E-CAP-003` name for the same gap;
+/// the `LAST RESORT` sysctl stays in the refusals, not here. Lines are unindented; a list entry
+/// carries two spaces of its own.
+fn profile_advice_lines(gap: &ProfileGap, version: &str) -> Vec<String> {
+    let attachment_list = || {
+        std::iter::once("The shipped profiles attach to:".to_string()).chain(
+            SEALED_APPARMOR_ATTACHMENT_PATHS
+                .iter()
+                .map(|attachment| format!("  {attachment}")),
+        )
+    };
+    let not_the_fix = "Adding this path to the profile is not the fix. Path attachment is the \
+                       mechanism's design — a profile that matched everything would grant userns \
+                       to everything — so the next unusual location would fail exactly the same \
+                       way.";
+    match gap {
+        ProfileGap::NotLoaded { .. } | ProfileGap::NotAttached { .. } => {
+            profile_gap_remedy_parts(gap, version)
+        }
+        ProfileGap::PathNotProfiled { .. } => {
+            let mut parts = profile_gap_remedy_parts(gap, version).into_iter();
+            let mut lines = vec!["This path is why the grant below is withheld.".to_string()];
+            lines.extend(parts.next());
+            lines.extend(attachment_list());
+            lines.push(not_the_fix.to_string());
+            lines.extend(parts);
+            lines
+        }
+        ProfileGap::Undetermined => {
+            let mut lines = vec![
+                "This path is why the grant below is withheld: AppArmor attaches profiles by \
+                 executable path, and no mur-sealed profile attaches to this one."
+                    .to_string(),
+                "The shipped profile attaches to:".to_string(),
+            ];
+            lines.extend(
+                SEALED_APPARMOR_ATTACHMENT_PATHS
+                    .iter()
+                    .map(|attachment| format!("  {attachment}")),
+            );
+            lines.push(
+                "Running from a checkout build: `scripts/install-dev-apparmor.sh` generates and \
+                 loads the same grant for ./target/{debug,release}/mur. Running from anywhere \
+                 else: install mur to one of the paths above."
+                    .to_string(),
+            );
+            lines.push(not_the_fix.to_string());
+            lines
+        }
     }
 }
 
@@ -420,7 +460,12 @@ fn report_userns_grant(probe: &HostProbe) {
     let reading = probe.namespaces();
     let is_linux = cfg!(target_os = "linux");
     capsule_runtime::report_println!("AppArmor / user namespaces");
-    report_binary_attachment(grant, &reading.attachment, an_attempt_failed(reading));
+    report_binary_attachment(
+        grant,
+        &reading.attachment,
+        &reading.profile_gap,
+        an_attempt_failed(reading),
+    );
     match grant {
         Some(grant) => {
             capsule_runtime::report_println!("  userns grant: {}", grant.wire_name());
@@ -2740,6 +2785,7 @@ mod tests {
             errno: Some(libc::ENOSPC),
             userns_grant: UsernsGrant::RestrictionDisabledHostWide,
             attachment: ProfileAttachment::Unconfined,
+            profile_gap: ProfileGap::Undetermined,
         }
     }
 
@@ -2979,6 +3025,7 @@ mod tests {
             private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::Withheld,
             attachment: ProfileAttachment::Unconfined,
+            profile_gap: ProfileGap::Undetermined,
         }
     }
 
@@ -3103,6 +3150,119 @@ mod tests {
             &ProfileAttachment::Unconfined,
             true
         ));
+    }
+
+    fn not_loaded_fixture() -> ProfileGap {
+        ProfileGap::NotLoaded {
+            exe: "/home/u/.local/bin/mur".into(),
+            path: capsule_runtime::ProfiledPath::Home,
+            file: capsule_runtime::ProfileFile::Installed,
+        }
+    }
+
+    fn path_not_profiled_fixture(profile_loaded: bool) -> ProfileGap {
+        ProfileGap::PathNotProfiled {
+            exe: "/space/scratch/mur-0.11.0-dev".into(),
+            link: Some("/home/u/.local/bin/mur".into()),
+            profile_loaded,
+            file: capsule_runtime::ProfileFile::Installed,
+        }
+    }
+
+    /// A profile that is not loaded and a path no profile names get distinct advice, each with
+    /// its own command and not the other's; only the path case says the path is why.
+    #[test]
+    fn the_profile_advice_tells_a_profile_not_loaded_from_a_path_not_profiled() {
+        let load = "`sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`";
+        let mv = "`mv -f /space/scratch/mur-0.11.0-dev /home/u/.local/bin/mur`";
+
+        let not_loaded = profile_advice_lines(&not_loaded_fixture(), "0.10.0").join("\n");
+        assert!(
+            not_loaded
+                .starts_with("No mur-sealed AppArmor profile naming this binary's path is loaded"),
+            "{not_loaded}"
+        );
+        assert!(not_loaded.contains(load), "{not_loaded}");
+        assert!(!not_loaded.contains("mv -f"), "{not_loaded}");
+        assert!(!not_loaded.contains("This path is why"), "{not_loaded}");
+        assert!(!not_loaded.contains("LAST RESORT"), "{not_loaded}");
+
+        let linked = profile_advice_lines(&path_not_profiled_fixture(true), "0.10.0");
+        let path = linked.join("\n");
+        assert!(linked[0].starts_with("This path is why"), "{path}");
+        assert!(
+            path.contains("/home/u/.local/bin/mur is a symlink to /space/scratch/mur-0.11.0-dev"),
+            "{path}"
+        );
+        assert!(path.contains(mv), "{path}");
+        assert!(!path.contains("sudo mv"), "{path}");
+        assert!(!path.contains(load), "{path}");
+        assert!(!path.contains("is loaded either"), "{path}");
+        assert!(
+            path.contains("Adding this path to the profile is not the fix"),
+            "{path}"
+        );
+        for attachment in SEALED_APPARMOR_ATTACHMENT_PATHS {
+            assert!(linked.contains(&format!("  {attachment}")), "{path}");
+        }
+        assert_ne!(not_loaded, path);
+    }
+
+    /// With no profile loaded either, the path advice ends with the load step.
+    #[test]
+    fn the_path_advice_adds_the_load_step_only_when_no_profile_is_loaded() {
+        let lines = profile_advice_lines(&path_not_profiled_fixture(false), "0.10.0");
+        let last = lines.last().expect("advice");
+        assert!(
+            last.starts_with("No mur-sealed AppArmor profile is loaded either"),
+            "{lines:?}"
+        );
+        assert!(
+            last.contains("`sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_profile_advice_for_a_loaded_profile_that_does_not_attach_is_a_reload() {
+        let lines = profile_advice_lines(
+            &ProfileGap::NotAttached {
+                exe: "/usr/local/bin/mur".into(),
+                path: capsule_runtime::ProfiledPath::System,
+            },
+            "0.10.0",
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("out of date"), "{text}");
+        assert!(
+            text.contains("Reload it: `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`"),
+            "{text}"
+        );
+        assert!(!text.contains("This path is why"), "{text}");
+    }
+
+    /// Where the loaded profiles cannot be read, the advice is the combined block: the attachment
+    /// list, the checkout script and the not-the-fix sentence.
+    #[test]
+    fn the_profile_advice_for_an_undetermined_gap_is_the_combined_block() {
+        let lines = profile_advice_lines(&ProfileGap::Undetermined, "0.10.0");
+        assert_eq!(
+            lines[0],
+            "This path is why the grant below is withheld: AppArmor attaches profiles by \
+             executable path, and no mur-sealed profile attaches to this one."
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("scripts/install-dev-apparmor.sh")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.starts_with("Adding this path to the profile is not")),
+            "{lines:?}"
+        );
     }
 
     #[test]

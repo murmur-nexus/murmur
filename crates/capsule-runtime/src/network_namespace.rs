@@ -249,6 +249,9 @@ pub struct EgressNamespaceFailure {
     pub userns_grant: crate::sealed::UsernsGrant,
     /// The profile the kernel reports as confining this process, read at the same moment.
     pub attachment: crate::sealed::ProfileAttachment,
+    /// Why no `mur-sealed` profile confines this process, read at the same moment. Words the
+    /// remedy for an unconfined `mur` under a withheld grant; decides nothing.
+    pub profile_gap: crate::sealed::ProfileGap,
 }
 
 impl EgressNamespaceFailure {
@@ -310,7 +313,7 @@ impl EgressNamespaceFailure {
                 )
             }
             EgressNamespaceBlocker::CapabilityGrantMissing => {
-                let cause = grant_cause(self.userns_grant, &self.attachment);
+                let cause = grant_cause(self.userns_grant, &self.attachment, &self.profile_gap);
                 match self.step().and_then(step_context) {
                     Some(context) => format!("{context} {cause}"),
                     None => cause,
@@ -386,12 +389,17 @@ fn step_context(step: CreationStep) -> Option<&'static str> {
 /// AppArmor absent comes first because `/proc/self/attr/current` then reports another security
 /// module's label, which is no AppArmor profile. A process another profile confines is next: the
 /// host's restriction knob does not govern it, whatever it reads.
+///
+/// An unconfined `mur` under a withheld grant is told the remedy for `profile_gap`; with the
+/// attachment not reported, the gap is not consulted and the combined advice stands.
 fn grant_cause(
     userns_grant: crate::sealed::UsernsGrant,
     attachment: &crate::sealed::ProfileAttachment,
+    profile_gap: &crate::sealed::ProfileGap,
 ) -> String {
     use crate::sealed::{
-        ProfileAttachment, UsernsGrant, SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
+        profile_gap_remedy, ProfileAttachment, ProfileGap, UsernsGrant,
+        SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
     };
     const CONTAINER_REMEDY: &str = "Inside a container, the container runtime's seccomp \
          profile is the usual blocker: it refuses unshare(CLONE_NEWUSER) and setns whatever \
@@ -427,21 +435,18 @@ fn grant_cause(
              — a container runtime's seccomp profile, or another security module's policy. \
              {CONTAINER_REMEDY}"
         ),
-        (UsernsGrant::Withheld, _) => format!(
-            "Likely cause: AppArmor's unprivileged-userns restriction \
-             (kernel.apparmor_restrict_unprivileged_userns=1) applies to this binary, which no \
-             {SEALED_APPARMOR_PROFILE_NAME} profile confines. Install and load the profile shipped \
-             with mur, `sudo install -m 644 packaging/apparmor/{SEALED_APPARMOR_PROFILE_NAME} \
-             {SEALED_APPARMOR_PROFILE_PATH} && sudo apparmor_parser -r \
-             {SEALED_APPARMOR_PROFILE_PATH}` (or re-run the mur installer as root), then re-run. \
-             Building out of a checkout, where the binary sits at ./target/{{debug,release}}/mur \
-             and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which \
-             generates and loads the same grant for those two paths. LAST RESORT, only where a \
-             profile genuinely cannot be loaded: `sudo sysctl -w \
-             kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns \
-             hardening from every program on the machine, not just from mur, and is not the \
-             configuration murmur ships."
-        ),
+        (UsernsGrant::Withheld, attachment) => {
+            let gap = match attachment {
+                ProfileAttachment::Unconfined => profile_gap,
+                _ => &ProfileGap::Undetermined,
+            };
+            format!(
+                "Likely cause: AppArmor's unprivileged-userns restriction \
+                 (kernel.apparmor_restrict_unprivileged_userns=1) applies to this binary, which no \
+                 {SEALED_APPARMOR_PROFILE_NAME} profile confines. {}",
+                profile_gap_remedy(gap, env!("CARGO_PKG_VERSION"))
+            )
+        }
     }
 }
 
@@ -524,6 +529,7 @@ pub(crate) fn egress_namespace_failure(
     attempt: Result<(), NamespaceAttemptError>,
     userns_grant: crate::sealed::UsernsGrant,
     attachment: crate::sealed::ProfileAttachment,
+    profile_gap: crate::sealed::ProfileGap,
 ) -> Option<EgressNamespaceFailure> {
     // Not Linux: there is no network namespace here. A non-Linux host resolves to
     // `EnforcementTier::EnvironmentOnly`, installs no kernel subprocess sandbox at all, and says
@@ -534,7 +540,7 @@ pub(crate) fn egress_namespace_failure(
     }
     attempt
         .err()
-        .map(|error| failure_of(error, userns_grant, attachment))
+        .map(|error| failure_of(error, userns_grant, attachment, profile_gap))
 }
 
 /// The failure a failed attempt is, classified by its step and `errno`.
@@ -542,6 +548,7 @@ fn failure_of(
     error: NamespaceAttemptError,
     userns_grant: crate::sealed::UsernsGrant,
     attachment: crate::sealed::ProfileAttachment,
+    profile_gap: crate::sealed::ProfileGap,
 ) -> EgressNamespaceFailure {
     let (blocker, failed_call, errno) = match error {
         NamespaceAttemptError::Step { step, errno } => {
@@ -567,6 +574,7 @@ fn failure_of(
         errno,
         userns_grant,
         attachment,
+        profile_gap,
     }
 }
 
@@ -745,6 +753,7 @@ fn session_netns_creation_error(
     error: NamespaceAttemptError,
     userns_grant: crate::sealed::UsernsGrant,
     attachment: crate::sealed::ProfileAttachment,
+    profile_gap: crate::sealed::ProfileGap,
 ) -> String {
     match error {
         NamespaceAttemptError::Creator(detail) => {
@@ -752,7 +761,7 @@ fn session_netns_creation_error(
         }
         step => format!(
             "sandbox: E-CAP-005: {}",
-            unavailable(&failure_of(step, userns_grant, attachment))
+            unavailable(&failure_of(step, userns_grant, attachment, profile_gap))
         ),
     }
 }
@@ -941,6 +950,7 @@ impl SessionNetns {
                 error,
                 crate::sealed::userns_grant(),
                 crate::sealed::inspect_profile_attachment(),
+                crate::sealed::inspect_profile_gap(),
             )
         })?;
         let established = created.serve(policy).map_err(|detail| {
@@ -1947,7 +1957,9 @@ const DNS_PORT_BE: u16 = crate::egress_proxy::EGRESS_DNS_PORT.to_be();
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sealed::{ProfileAttachment, UsernsGrant};
+    use crate::sealed::{
+        profile_gap_remedy, ProfileAttachment, ProfileFile, ProfileGap, ProfiledPath, UsernsGrant,
+    };
 
     fn attachments() -> [ProfileAttachment; 4] {
         [
@@ -1971,7 +1983,7 @@ mod tests {
         grant: UsernsGrant,
         attachment: ProfileAttachment,
     ) -> EgressNamespaceFailure {
-        egress_namespace_failure(true, attempt, grant, attachment)
+        egress_namespace_failure(true, attempt, grant, attachment, ProfileGap::Undetermined)
             .expect("a failed attempt is a failure")
     }
 
@@ -1984,7 +1996,13 @@ mod tests {
         for grant in UsernsGrant::ALL {
             for attachment in attachments() {
                 assert_eq!(
-                    egress_namespace_failure(true, Ok(()), *grant, attachment.clone()),
+                    egress_namespace_failure(
+                        true,
+                        Ok(()),
+                        *grant,
+                        attachment.clone(),
+                        ProfileGap::Undetermined
+                    ),
                     None,
                     "{grant:?} / {attachment:?}"
                 );
@@ -2013,11 +2031,14 @@ mod tests {
         for (attempt, blocker) in attempts {
             for grant in UsernsGrant::ALL {
                 for attachment in attachments() {
-                    let failure =
-                        egress_namespace_failure(true, attempt.clone(), *grant, attachment.clone())
-                            .unwrap_or_else(|| {
-                                panic!("{attempt:?} under {grant:?} / {attachment:?}")
-                            });
+                    let failure = egress_namespace_failure(
+                        true,
+                        attempt.clone(),
+                        *grant,
+                        attachment.clone(),
+                        ProfileGap::Undetermined,
+                    )
+                    .unwrap_or_else(|| panic!("{attempt:?} under {grant:?} / {attachment:?}"));
                     assert_eq!(failure.blocker, blocker, "{grant:?} / {attachment:?}");
                 }
             }
@@ -2089,7 +2110,8 @@ mod tests {
                     false,
                     attempt,
                     UsernsGrant::Withheld,
-                    ProfileAttachment::NotReported
+                    ProfileAttachment::NotReported,
+                    ProfileGap::Undetermined
                 ),
                 None
             );
@@ -2212,6 +2234,291 @@ mod tests {
         );
         assert!(reason.contains("stale"), "{reason}");
         assert!(!reason.contains("LAST RESORT"), "{reason}");
+    }
+
+    // ---- the profile gap ------------------------------------------------------------------
+
+    const READINGS_LINE: &str = "Host readings: kernel.apparmor_restrict_unprivileged_userns=1; \
+                                 AppArmor profile confining mur: unconfined.";
+    const LOAD: &str = "sudo apparmor_parser -r /etc/apparmor.d/mur-sealed";
+    const NOT_LOADED: &str = "No mur-sealed AppArmor profile naming this binary's path is loaded";
+    const NOT_LOADED_EITHER: &str = "No mur-sealed AppArmor profile is loaded either";
+
+    /// The `E-CAP-005` reason for an unconfined `mur` under a withheld grant, with `gap`.
+    fn gap_reason(gap: &ProfileGap) -> String {
+        egress_namespace_failure(
+            true,
+            step(CreationStep::IdentityMaps, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+            gap.clone(),
+        )
+        .expect("a failed attempt is a failure")
+        .reason()
+    }
+
+    fn not_loaded(exe: &str, path: ProfiledPath, file: ProfileFile) -> ProfileGap {
+        ProfileGap::NotLoaded {
+            exe: exe.into(),
+            path,
+            file,
+        }
+    }
+
+    fn path_not_profiled(
+        exe: &str,
+        link: Option<&str>,
+        profile_loaded: bool,
+        file: ProfileFile,
+    ) -> ProfileGap {
+        ProfileGap::PathNotProfiled {
+            exe: exe.into(),
+            link: link.map(Into::into),
+            profile_loaded,
+            file,
+        }
+    }
+
+    /// Every gap's reason opens with the shared cause, carries the build's remedy for that gap and
+    /// ends with the readings line.
+    #[test]
+    fn every_profile_gap_is_worded_with_its_own_remedy_and_the_unchanged_readings() {
+        for gap in [
+            not_loaded(
+                "/usr/local/bin/mur",
+                ProfiledPath::System,
+                ProfileFile::Installed,
+            ),
+            path_not_profiled(
+                "/usr/local/bin/mur-0.10.0",
+                Some("/usr/local/bin/mur"),
+                true,
+                ProfileFile::Installed,
+            ),
+            ProfileGap::NotAttached {
+                exe: "/root/.cargo/bin/mur".into(),
+                path: ProfiledPath::Home,
+            },
+            ProfileGap::Undetermined,
+        ] {
+            let reason = gap_reason(&gap);
+            assert!(
+                reason.contains(&format!(
+                    "Likely cause: AppArmor's unprivileged-userns restriction \
+                     (kernel.apparmor_restrict_unprivileged_userns=1) applies to this binary, \
+                     which no mur-sealed profile confines. {} {READINGS_LINE}",
+                    profile_gap_remedy(&gap, env!("CARGO_PKG_VERSION"))
+                )),
+                "{reason}"
+            );
+            assert!(reason.ends_with(READINGS_LINE), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_profile_not_loaded_is_told_to_load_it_and_nothing_about_the_path() {
+        let reason = gap_reason(&not_loaded(
+            "/home/u/.local/bin/mur",
+            ProfiledPath::Home,
+            ProfileFile::Installed,
+        ));
+        assert!(reason.contains(NOT_LOADED), "{reason}");
+        assert!(reason.contains("`mur-sealed-home`"), "{reason}");
+        assert!(reason.contains(&format!("`{LOAD}`")), "{reason}");
+        assert!(!reason.contains("mv -f"), "{reason}");
+        assert!(!reason.contains("install-dev-apparmor.sh"), "{reason}");
+        assert!(!reason.contains("This path is why"), "{reason}");
+        assert!(reason.contains("LAST RESORT"), "{reason}");
+        assert!(reason.ends_with(READINGS_LINE), "{reason}");
+    }
+
+    #[test]
+    fn a_checkout_build_with_no_profile_loaded_is_told_to_run_the_dev_script() {
+        let reason = gap_reason(&not_loaded(
+            "/repo/target/debug/mur",
+            ProfiledPath::Checkout,
+            ProfileFile::Installed,
+        ));
+        assert!(reason.contains(NOT_LOADED), "{reason}");
+        assert!(
+            reason.contains("`sudo scripts/install-dev-apparmor.sh`"),
+            "{reason}"
+        );
+        assert!(!reason.contains(LOAD), "{reason}");
+        assert!(!reason.contains("mv -f"), "{reason}");
+        assert!(reason.contains("LAST RESORT"), "{reason}");
+    }
+
+    /// A missing profile file is downloaded from the release tag of a released build, and
+    /// installed from a checkout by a pre-release build, which has no tag.
+    #[test]
+    fn a_missing_profile_file_is_fetched_from_the_release_tag_or_a_checkout() {
+        let gap = not_loaded(
+            "/usr/local/bin/mur",
+            ProfiledPath::System,
+            ProfileFile::Absent,
+        );
+        let released = profile_gap_remedy(&gap, "0.10.0");
+        assert!(
+            released.contains(
+                "`curl -fsSL https://raw.githubusercontent.com/murmur-nexus/murmur/v0.10.0/\
+                 packaging/apparmor/mur-sealed -o mur-sealed && sudo install -m 644 mur-sealed \
+                 /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r \
+                 /etc/apparmor.d/mur-sealed`"
+            ),
+            "{released}"
+        );
+        let pre_release = profile_gap_remedy(&gap, "0.11.0-dev");
+        assert!(
+            pre_release.contains(
+                "`sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed \
+                 && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`"
+            ),
+            "{pre_release}"
+        );
+        assert!(pre_release.contains("0.11.0-dev"), "{pre_release}");
+        assert!(!pre_release.contains("https://"), "{pre_release}");
+        assert!(
+            gap_reason(&gap).contains(&profile_gap_remedy(&gap, env!("CARGO_PKG_VERSION"))),
+            "the reason renders this build's version"
+        );
+    }
+
+    #[test]
+    fn a_symlink_at_a_system_path_is_told_to_move_the_file_over_it_with_sudo() {
+        let reason = gap_reason(&path_not_profiled(
+            "/usr/local/bin/mur-0.10.0",
+            Some("/usr/local/bin/mur"),
+            true,
+            ProfileFile::Installed,
+        ));
+        assert!(
+            reason.contains("/usr/local/bin/mur is a symlink to /usr/local/bin/mur-0.10.0"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("`sudo mv -f /usr/local/bin/mur-0.10.0 /usr/local/bin/mur`"),
+            "{reason}"
+        );
+        assert!(!reason.contains(NOT_LOADED), "{reason}");
+        assert!(!reason.contains(NOT_LOADED_EITHER), "{reason}");
+        assert!(!reason.contains(LOAD), "{reason}");
+        assert!(!reason.contains("install -m 755"), "{reason}");
+        assert!(reason.contains("LAST RESORT"), "{reason}");
+        assert!(reason.ends_with(READINGS_LINE), "{reason}");
+    }
+
+    #[test]
+    fn a_symlink_at_a_home_path_is_told_to_move_the_file_over_it_without_sudo() {
+        let reason = gap_reason(&path_not_profiled(
+            "/space/scratch/mur-0.11.0-dev",
+            Some("/home/u/.local/bin/mur"),
+            true,
+            ProfileFile::Installed,
+        ));
+        assert!(
+            reason.contains("`mv -f /space/scratch/mur-0.11.0-dev /home/u/.local/bin/mur`"),
+            "{reason}"
+        );
+        assert!(!reason.contains("sudo mv"), "{reason}");
+        assert!(!reason.contains(NOT_LOADED_EITHER), "{reason}");
+    }
+
+    /// With no profile loaded either, the path fix comes first and the load step after it.
+    #[test]
+    fn an_unprofiled_path_with_no_profile_loaded_names_both_fixes_path_first() {
+        let reason = gap_reason(&path_not_profiled(
+            "/usr/local/bin/mur-0.10.0",
+            Some("/usr/local/bin/mur"),
+            false,
+            ProfileFile::Absent,
+        ));
+        let path = reason
+            .find("sudo mv -f /usr/local/bin/mur-0.10.0 /usr/local/bin/mur")
+            .expect("the path fix");
+        let loaded = reason.find(NOT_LOADED_EITHER).expect("the load step");
+        let load = reason.find(LOAD).expect("the load command");
+        assert!(path < loaded && loaded < load, "{reason}");
+        assert!(reason.ends_with(READINGS_LINE), "{reason}");
+    }
+
+    #[test]
+    fn an_unprofiled_path_with_no_profiled_link_is_told_to_install_a_real_file() {
+        let reason = gap_reason(&path_not_profiled(
+            "/space/home/u/.local/bin/mur",
+            None,
+            true,
+            ProfileFile::Installed,
+        ));
+        assert!(
+            reason.contains(
+                "`sudo rm -f /usr/local/bin/mur && sudo install -m 755 \
+                 /space/home/u/.local/bin/mur /usr/local/bin/mur`"
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("mv -f"), "{reason}");
+        assert!(!reason.contains("install-dev-apparmor.sh"), "{reason}");
+
+        let elsewhere = gap_reason(&path_not_profiled(
+            "/cache/targets/card/debug/mur",
+            None,
+            true,
+            ProfileFile::Installed,
+        ));
+        assert!(
+            elsewhere.contains("sudo scripts/install-dev-apparmor.sh"),
+            "a build outside <checkout>/target is pointed at the dev script: {elsewhere}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_profile_that_does_not_attach_is_told_to_reload_it_without_the_sysctl() {
+        let reason = gap_reason(&ProfileGap::NotAttached {
+            exe: "/root/.cargo/bin/mur".into(),
+            path: ProfiledPath::Home,
+        });
+        assert!(reason.contains("out of date"), "{reason}");
+        assert!(reason.contains(&format!("`{LOAD}`")), "{reason}");
+        assert!(!reason.contains("LAST RESORT"), "{reason}");
+        assert!(!reason.contains("mv -f"), "{reason}");
+        assert!(!reason.contains(NOT_LOADED), "{reason}");
+        assert!(reason.ends_with(READINGS_LINE), "{reason}");
+    }
+
+    /// The gap words only the unconfined case: a binary another profile confines, or one whose
+    /// attachment is not reported, renders what it renders without one.
+    #[test]
+    fn the_gap_changes_nothing_but_the_unconfined_withheld_remedy() {
+        let gap = not_loaded(
+            "/usr/local/bin/mur",
+            ProfiledPath::System,
+            ProfileFile::Installed,
+        );
+        for grant in UsernsGrant::ALL {
+            for attachment in attachments() {
+                let with = egress_namespace_failure(
+                    true,
+                    step(CreationStep::Unshare, libc::EPERM),
+                    *grant,
+                    attachment.clone(),
+                    gap.clone(),
+                )
+                .unwrap()
+                .reason();
+                let without = failure(
+                    step(CreationStep::Unshare, libc::EPERM),
+                    *grant,
+                    attachment.clone(),
+                )
+                .reason();
+                if *grant == UsernsGrant::Withheld && attachment == ProfileAttachment::Unconfined {
+                    assert_ne!(with, without);
+                } else {
+                    assert_eq!(with, without, "{grant:?} / {attachment:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2391,8 +2698,13 @@ mod tests {
                 ProfileAttachment::Unconfined,
             ),
         ] {
-            let staging =
-                egress_namespace_failure(true, step(failed, errno), grant, attachment.clone());
+            let staging = egress_namespace_failure(
+                true,
+                step(failed, errno),
+                grant,
+                attachment.clone(),
+                ProfileGap::Undetermined,
+            );
             let staging_refusal = check_egress_namespace(true, staging.as_ref())
                 .expect_err("staging refuses")
                 .to_string();
@@ -2403,6 +2715,7 @@ mod tests {
                 },
                 grant,
                 attachment,
+                ProfileGap::Undetermined,
             );
             assert_eq!(establish, format!("sandbox: E-CAP-005: {staging_refusal}"));
             assert!(
@@ -2418,6 +2731,7 @@ mod tests {
             NamespaceAttemptError::Creator("fork() for the namespace creator failed".to_string()),
             UsernsGrant::Withheld,
             ProfileAttachment::Unconfined,
+            ProfileGap::Undetermined,
         );
         assert_eq!(
             error,

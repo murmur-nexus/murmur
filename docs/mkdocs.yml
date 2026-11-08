@@ -131,6 +131,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started:
+      - Install mur: getting-started/install.md
       - Overview: getting-started/overview.md
       - Quickstart: getting-started/quickstart.md
   - Concepts:

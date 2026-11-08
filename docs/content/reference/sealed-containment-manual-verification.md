@@ -242,18 +242,17 @@ Containment
   floor met: no
   reason:    sealed requires an unprivileged user+mount namespace, and AppArmor's
              unprivileged-userns restriction is active on this host while the 'mur-sealed'
-             profile is not confining this binary. Install and load the profile shipped with
-             mur: `sudo install -m 644 packaging/apparmor/mur-sealed
-             /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r
-             /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run.
-             Building out of a checkout, where the binary sits at
-             ./target/{debug,release}/mur and no shipped profile attaches to it: run
-             `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for
-             those two paths. LAST RESORT, only where a profile genuinely cannot be loaded:
-             `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes
-             unprivileged-userns hardening from every program on the machine, not just from
-             mur, and is not the configuration murmur ships. The probe's writing
-             uid_map/gid_map failed with EPERM (Operation not permitted). Host readings:
+             profile is not confining this binary. No mur-sealed AppArmor profile naming this
+             binary's path is loaded: /usr/local/bin/mur is a path the `mur-sealed` profile
+             names, and the kernel lists no `mur-sealed`. Install and load it: `curl -fsSL
+             https://raw.githubusercontent.com/murmur-nexus/murmur/v<version>/packaging/apparmor/mur-sealed
+             -o mur-sealed && sudo install -m 644 mur-sealed /etc/apparmor.d/mur-sealed && sudo
+             apparmor_parser -r /etc/apparmor.d/mur-sealed`, then re-run. LAST RESORT, only
+             where a profile genuinely cannot be loaded: `sudo sysctl -w
+             kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns
+             hardening from every program on the machine, not just from mur, and is not the
+             configuration murmur ships. The probe's writing uid_map/gid_map failed with EPERM
+             (Operation not permitted). Host readings:
              kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur:
              unconfined.
   mechanism: landlock+seccomp
@@ -269,10 +268,15 @@ mur run; echo "exit=$?"
 Expected:
 
 ```text
-error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. Building out of a checkout, where the binary sits at ./target/{debug,release}/mur and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for those two paths. LAST RESORT, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns hardening from every program on the machine, not just from mur, and is not the configuration murmur ships. The probe's writing uid_map/gid_map failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur: unconfined.
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. No mur-sealed AppArmor profile naming this binary's path is loaded: /usr/local/bin/mur is a path the `mur-sealed` profile names, and the kernel lists no `mur-sealed`. Install and load it: `curl -fsSL https://raw.githubusercontent.com/murmur-nexus/murmur/v<version>/packaging/apparmor/mur-sealed -o mur-sealed && sudo install -m 644 mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, then re-run. LAST RESORT, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns hardening from every program on the machine, not just from mur, and is not the configuration murmur ships. The probe's writing uid_map/gid_map failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur: unconfined.
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 exit=1
 ```
+
+The quoted reason is for a released `mur` at `/usr/local/bin/mur`, with `<version>` its version.
+A `mur` at `~/.local/bin/mur` names the `mur-sealed-home` profile instead; a pre-release build,
+which no release tag carries a profile for, names the `sudo install` command run from a murmur
+checkout in place of the `curl` line.
 
 The refusal must be `achieved: 'scoped'`, **not** a session that ran. A run that succeeded here is
 the single most important failure this page can catch.

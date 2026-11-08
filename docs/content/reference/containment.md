@@ -227,6 +227,12 @@ The line is `n/a` off Linux, where AppArmor does not exist. The same value is wr
 distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
 whose unprivileged-userns hardening was switched off.
 
+Under `withheld` with `mur` unconfined, `mur doctor`, `E-CAP-005` and `E-CAP-003` read the
+profiles the kernel has loaded and the path `mur` runs from, and name one case: no profile loaded,
+binary path not profiled (including a symlink that resolves to an unprofiled file), or a loaded
+profile that does not attach. Each case names its own command; [Install mur](../getting-started/install.md)
+lists the paths the shipped profiles name.
+
 A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
 attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
 two paths, so building from source needs no host-wide sysctl.

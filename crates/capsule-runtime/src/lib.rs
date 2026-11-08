@@ -189,10 +189,12 @@ pub use network_policy::preopen_reports;
 // invoked-binary report already resolve one, rather than open-coding the `PATH` walk again.
 pub use sandbox::{detect_landlock_abi, find_on_path, landlock_doctor_lines, HostProbe};
 pub use sealed::{
-    classify_installed_profile, classify_profile_attachment, inspect_installed_profile,
-    inspect_profile_attachment, InstalledProfileState, ProfileAttachment, SealedBlocker,
-    SealedShortfall, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
-    SEALED_APPARMOR_PROFILE_SHA256,
+    classify_installed_profile, classify_profile_attachment, classify_profile_gap,
+    inspect_installed_profile, inspect_profile_attachment, inspect_profile_gap,
+    loaded_apparmor_profiles, profile_gap_remedy, profile_gap_remedy_parts, profiled_path_for,
+    InstalledProfileState, ProfileAttachment, ProfileFile, ProfileGap, ProfileGapReadings,
+    ProfiledPath, SealedBlocker, SealedShortfall, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 pub use streaming::STREAM_EXTENSION_URI;
 // `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the

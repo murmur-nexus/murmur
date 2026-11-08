@@ -18,6 +18,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 ## Start Here
 
 - [Home](/index.md): What murmur is: agents packaged as a single capsule — inference, tools, skills, and configuration in one manifest — run on your own infrastructure, fully isolated.
+- [Install mur](/getting-started/install.md): The installer, and the manual install that keeps the `mur-sealed` AppArmor profile: the binary as a real file at a profiled path, the profile file, `apparmor_parser -r`, and `mur doctor` to confirm.
 - [Overview](/getting-started/overview.md): The mental model: a capsule as the unit of packaging, the manifest as the whole contract, and what "fully isolated" means in practice.
 - [Quickstart](/getting-started/quickstart.md): From an empty directory to a running, inspectable agent capsule using nothing but a manifest.
 

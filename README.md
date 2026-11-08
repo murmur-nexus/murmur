@@ -32,6 +32,10 @@ On an older distribution, or on any platform without a published binary, build f
 cargo install murmur-cli
 ```
 
+To install by hand on a Linux host with AppArmor (Ubuntu 23.10 and later), put `mur` at a path the
+`mur-sealed` profile names and load the profile: [Install mur](https://docs.murmur.nexus/getting-started/install/)
+gives the steps.
+
 ## How it works
 
 ![](https://murmur-static.s3.eu-north-1.amazonaws.com/assets/mur-how-it-works-github.png)

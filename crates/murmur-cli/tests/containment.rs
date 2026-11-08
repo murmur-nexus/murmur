@@ -22,6 +22,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+mod common;
+
 /// A script capsule: no `inference:` block, so `mur run` looks for a root `*.wasm`. The bytes are
 /// a bare module header — enough to be discovered and read, and deliberately not a valid
 /// component, so a run that gets *past* the containment gate fails loudly at compile time. That
@@ -93,15 +95,14 @@ fn sealed_refuses_with_an_actionable_reason_unless_the_host_can_back_it() {
 
     // Exactly one of the mechanism-specific reasons, never a generic "not supported".
     //
-    // Compared against `SealedBlocker::ALL` rather than a hand-written list of substrings. The
-    // hand-written version was wrong the moment a variant was added: the refusal was correct and
-    // specific, the list had not heard of it, and the failure read as "this host cannot do sealed"
-    // when the real defect was in the test. Deriving the expected set from the enum means a new
-    // blocker can never make this assert lie again.
+    // Derived from `SealedBlocker::ALL`, never a hand-written list of substrings: a list goes
+    // stale the moment a variant is added, and the failure then reads as "this host cannot do
+    // sealed" when the defect is in the test. A missing profile is worded for the profile gap this
+    // host gives the cargo-built `mur`, so the expected text is rendered from the same readings.
     let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
-    let matched = capsule_runtime::sealed::SealedBlocker::ALL
-        .iter()
-        .find(|blocker| stderr.contains(&blocker.reason()));
+    let matched = common::sealed_refusal_reasons()
+        .into_iter()
+        .find(|reason| stderr.contains(reason));
     assert!(
         matched.is_some(),
         "the sealed refusal must be one of SealedBlocker's mechanism-specific reasons, got: \
