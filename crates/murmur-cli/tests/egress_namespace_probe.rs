@@ -23,6 +23,9 @@ use std::{
     process::{Command, Output},
 };
 
+use capsule_runtime::{
+    ProfileAttachment, ProfileGap, ProfileGapReadings, SealedBlocker, SealedShortfall, UsernsGrant,
+};
 use serde_json::{json, Value};
 
 const RESTRICT_PROC: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
@@ -612,10 +615,36 @@ fn a_refused_namespace_names_the_call_the_errno_and_the_reading() {
         "{shortfall}"
     );
     if doctor.stdout.contains("profile attached: none") {
+        // The construction runs the cargo-built `mur` by its own path on this kernel, so the gap
+        // it reads is the one these readings give.
+        let profile_gap = capsule_runtime::classify_profile_gap(&ProfileGapReadings {
+            loaded: capsule_runtime::loaded_apparmor_profiles(),
+            exe: std::fs::canonicalize(mur_path()).ok(),
+            link: None,
+            installed: capsule_runtime::inspect_installed_profile(),
+        });
+        let opening = SealedShortfall {
+            blocker: SealedBlocker::AppArmorProfileMissing,
+            failed_call: None,
+            errno: None,
+            userns_grant: UsernsGrant::Withheld,
+            attachment: ProfileAttachment::Unconfined,
+            profile_gap: profile_gap.clone(),
+        }
+        .reason();
         assert!(
-            shortfall.starts_with(&capsule_runtime::SealedBlocker::AppArmorProfileMissing.reason()),
-            "{shortfall}"
+            shortfall.starts_with(&opening),
+            "{profile_gap:?}\n{opening}\n{shortfall}"
         );
+        if profile_gap != ProfileGap::Undetermined {
+            assert!(
+                shortfall.contains(&capsule_runtime::profile_gap_remedy(
+                    &profile_gap,
+                    env!("CARGO_PKG_VERSION")
+                )),
+                "{shortfall}"
+            );
+        }
         assert!(
             shortfall.ends_with(
                 "Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile \

@@ -2714,6 +2714,7 @@ mod tests {
             errno: None,
             userns_grant: UsernsGrant::Withheld,
             attachment: crate::sealed::ProfileAttachment::NotReported,
+            profile_gap: crate::sealed::ProfileGap::Undetermined,
         }
     }
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant, StagedRuntimeGrant};

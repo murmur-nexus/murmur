@@ -6396,6 +6396,7 @@ mod tests {
             private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
             userns_grant: crate::sealed::UsernsGrant::Withheld,
             attachment: crate::sealed::ProfileAttachment::Unconfined,
+            profile_gap: crate::sealed::ProfileGap::Undetermined,
         }
     }
 
@@ -6410,6 +6411,7 @@ mod tests {
             private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
             userns_grant: crate::sealed::UsernsGrant::Withheld,
             attachment: crate::sealed::ProfileAttachment::NotReported,
+            profile_gap: crate::sealed::ProfileGap::Undetermined,
         }
     }
 
@@ -13904,6 +13906,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
                 userns_grant: crate::sealed::UsernsGrant::Withheld,
                 attachment: crate::sealed::ProfileAttachment::NotReported,
+                profile_gap: crate::sealed::ProfileGap::Undetermined,
             },
         );
         ShellEnforcement::resolve(policy, &decision, probe)

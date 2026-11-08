@@ -1165,6 +1165,12 @@ mod tests {
             "read_trimmed",
             "Host settings under `/sys` and `/proc`.",
         ),
+        (
+            "sealed.rs",
+            "loaded_apparmor_profiles",
+            "The names of the kernel's loaded AppArmor profiles under \
+             `/sys/kernel/security/apparmor`.",
+        ),
     ];
 
     /// `std::fs` / `tokio::fs` functions that touch a path, matched only straight after `fs::`

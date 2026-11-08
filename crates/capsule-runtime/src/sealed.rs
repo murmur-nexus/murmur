@@ -364,6 +364,409 @@ pub fn inspect_profile_attachment() -> ProfileAttachment {
     )
 }
 
+/// Which shipped profile names a binary path: the three kinds of path a `mur-sealed` profile
+/// attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfiledPath {
+    /// `/usr/local/bin/mur`, `/usr/bin/mur` or `/opt/mur/bin/mur`, named by `mur-sealed`.
+    System,
+    /// `~/.local/bin/mur` or `~/.cargo/bin/mur` under `/home/<user>` or `/root`, named by
+    /// `mur-sealed-home`.
+    Home,
+    /// `<checkout>/target/{debug,release}/mur`, named by the `mur-sealed-dev` profile
+    /// `scripts/install-dev-apparmor.sh` generates for one checkout.
+    Checkout,
+}
+
+impl ProfiledPath {
+    /// The name of the profile that names this kind of path, as the kernel lists it.
+    #[must_use]
+    pub fn profile_name(self) -> &'static str {
+        match self {
+            ProfiledPath::System => "mur-sealed",
+            ProfiledPath::Home => "mur-sealed-home",
+            ProfiledPath::Checkout => "mur-sealed-dev",
+        }
+    }
+}
+
+/// Which kind of path a shipped profile names `path` as, or `None` when no shipped profile names
+/// it.
+///
+/// **Remediation text only**, on the same terms as [`SEALED_APPARMOR_ATTACHMENT_PATHS`]: whether
+/// a profile attaches is what `/proc/self/attr/current` reports, and this only chooses which
+/// command a refusal names. It follows the stock `tunables/home` (`@{HOME}` is `/home/*/` and
+/// `/root/`); a host that extends `@{HOMEDIRS}` through `tunables/home.d` has home paths this
+/// reads as unprofiled. A `Checkout` path is any `target/{debug,release}/mur`, whichever checkout
+/// the loaded `mur-sealed-dev` was generated from.
+#[must_use]
+pub fn profiled_path_for(path: &Path) -> Option<ProfiledPath> {
+    let path = path.to_str()?;
+    if matches!(
+        path,
+        "/usr/local/bin/mur" | "/usr/bin/mur" | "/opt/mur/bin/mur"
+    ) {
+        return Some(ProfiledPath::System);
+    }
+    for suffix in ["/.local/bin/mur", "/.cargo/bin/mur"] {
+        let Some(home) = path.strip_suffix(suffix) else {
+            continue;
+        };
+        let user = home.strip_prefix("/home/");
+        if home == "/root" || user.is_some_and(|user| !user.is_empty() && !user.contains('/')) {
+            return Some(ProfiledPath::Home);
+        }
+    }
+    if path.ends_with("/target/debug/mur") || path.ends_with("/target/release/mur") {
+        return Some(ProfiledPath::Checkout);
+    }
+    None
+}
+
+/// Whether [`SEALED_APPARMOR_PROFILE_PATH`] is on disk, which decides whether a remedy can load
+/// it or has to install it first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileFile {
+    /// A file is there: matching, drifted, or present and unreadable.
+    Installed,
+    /// No file at [`SEALED_APPARMOR_PROFILE_PATH`].
+    Absent,
+}
+
+impl ProfileFile {
+    /// [`InstalledProfileState::Absent`] is `Absent`; every other state is a file on disk.
+    #[must_use]
+    pub fn from_installed(state: &InstalledProfileState) -> Self {
+        match state {
+            InstalledProfileState::Absent => ProfileFile::Absent,
+            InstalledProfileState::Matches
+            | InstalledProfileState::Drifted { .. }
+            | InstalledProfileState::Unreadable { .. } => ProfileFile::Installed,
+        }
+    }
+}
+
+/// Why no `mur-sealed` profile confines an unconfined `mur`: the case a refusal's remedy is worded
+/// for.
+///
+/// Read with [`UsernsGrant`] and [`ProfileAttachment`] and, like them, decides nothing: it is
+/// rendered only under a withheld grant with `mur` unconfined, and only chooses the command
+/// [`profile_gap_remedy`] names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProfileGap {
+    /// `exe` is a path a shipped profile names, and the kernel lists no profile of that name.
+    NotLoaded {
+        /// This binary's resolved path.
+        exe: PathBuf,
+        /// The kind of path `exe` is.
+        path: ProfiledPath,
+        /// Whether the profile file is on disk to load.
+        file: ProfileFile,
+    },
+    /// No shipped profile names `exe`.
+    PathNotProfiled {
+        /// This binary's resolved path.
+        exe: PathBuf,
+        /// The symlink `mur` was started through, when one resolves to `exe`.
+        link: Option<PathBuf>,
+        /// Whether the kernel lists any profile whose name begins with
+        /// [`SEALED_APPARMOR_PROFILE_NAME`].
+        profile_loaded: bool,
+        /// Whether the profile file is on disk to load.
+        file: ProfileFile,
+    },
+    /// The profile that names `exe` is loaded, and the kernel still reports `mur` unconfined.
+    NotAttached {
+        /// This binary's resolved path.
+        exe: PathBuf,
+        /// The kind of path `exe` is.
+        path: ProfiledPath,
+    },
+    /// The loaded profiles or this binary's path could not be read.
+    #[default]
+    Undetermined,
+}
+
+/// The host readings [`classify_profile_gap`] decides on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileGapReadings {
+    /// The names of the profiles the kernel has loaded, or `None` when the list cannot be read.
+    pub loaded: Option<Vec<String>>,
+    /// This binary's resolved path, or `None` when the platform does not report it.
+    pub exe: Option<PathBuf>,
+    /// The symlink `mur` was started through, kept only when it resolves to `exe`.
+    pub link: Option<PathBuf>,
+    /// The state of [`SEALED_APPARMOR_PROFILE_PATH`].
+    pub installed: InstalledProfileState,
+}
+
+/// The [`ProfileGap`] the readings describe. Pure, so every case is unit-testable on any OS;
+/// [`inspect_profile_gap`] is the reader.
+#[must_use]
+pub fn classify_profile_gap(readings: &ProfileGapReadings) -> ProfileGap {
+    let (Some(loaded), Some(exe)) = (&readings.loaded, &readings.exe) else {
+        return ProfileGap::Undetermined;
+    };
+    let file = ProfileFile::from_installed(&readings.installed);
+    let Some(path) = profiled_path_for(exe) else {
+        return ProfileGap::PathNotProfiled {
+            exe: exe.clone(),
+            link: readings.link.clone(),
+            profile_loaded: loaded
+                .iter()
+                .any(|name| name.starts_with(SEALED_APPARMOR_PROFILE_NAME)),
+            file,
+        };
+    };
+    if loaded.iter().any(|name| name == path.profile_name()) {
+        ProfileGap::NotAttached {
+            exe: exe.clone(),
+            path,
+        }
+    } else {
+        ProfileGap::NotLoaded {
+            exe: exe.clone(),
+            path,
+            file,
+        }
+    }
+}
+
+/// [`classify_profile_gap`] over this host and this process. Holds no logic of its own; off Linux
+/// it is [`ProfileGap::Undetermined`].
+#[must_use]
+pub fn inspect_profile_gap() -> ProfileGap {
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+        let link = exe.as_deref().and_then(invoked_through_symlink);
+        classify_profile_gap(&ProfileGapReadings {
+            loaded: loaded_apparmor_profiles(),
+            exe,
+            link,
+            installed: inspect_installed_profile(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ProfileGap::Undetermined
+    }
+}
+
+/// The names of the profiles the kernel has loaded, from the world-readable
+/// `/sys/kernel/security/apparmor/policy/profiles/<entry>/name`, or `None` when that directory
+/// cannot be read. An entry whose `name` cannot be read is left out.
+///
+/// The root-only `/sys/kernel/security/apparmor/profiles` would give the same names in one read.
+/// Neither gives a profile's attachment back: a glob attachment reads `<unknown>`.
+#[must_use]
+pub fn loaded_apparmor_profiles() -> Option<Vec<String>> {
+    let entries = std::fs::read_dir("/sys/kernel/security/apparmor/policy/profiles").ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path().join("name")).ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect(),
+    )
+}
+
+/// The path this process was started through, when it is a symlink that resolves to `exe`:
+/// `argv[0]` made absolute when it contains a `/`, otherwise the first `mur` on `PATH`, which is
+/// the one a shell ran.
+#[cfg(target_os = "linux")]
+fn invoked_through_symlink(exe: &Path) -> Option<PathBuf> {
+    let argv0 = PathBuf::from(std::env::args_os().next()?);
+    let invoked = if argv0.as_os_str().as_encoded_bytes().contains(&b'/') {
+        std::env::current_dir().ok()?.join(argv0)
+    } else {
+        crate::sandbox::find_on_path(argv0.to_str()?)?
+    };
+    let is_link = std::fs::symlink_metadata(&invoked)
+        .ok()?
+        .file_type()
+        .is_symlink();
+    (is_link && std::fs::canonicalize(&invoked).ok()? == exe).then_some(invoked)
+}
+
+const RAW_PROFILE_URL_BASE: &str = "https://raw.githubusercontent.com/murmur-nexus/murmur";
+
+const PROFILE_LAST_RESORT: &str = "LAST RESORT, only where a profile genuinely cannot be loaded: \
+     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes \
+     unprivileged-userns hardening from every program on the machine, not just from mur, and is \
+     not the configuration murmur ships.";
+
+/// The remedy an unconfined `mur` under a withheld grant is told: the one text `E-CAP-005`,
+/// `E-CAP-003` for `sealed` and `mur doctor` name a [`ProfileGap`] with. `version` is the
+/// running build's version, which picks the release tag the profile is downloaded from; a
+/// pre-release version (one with a `-`) has no tag and is told to install from a checkout.
+///
+/// [`profile_gap_remedy_parts`] joined, then the `LAST RESORT` sysctl sentence, except for
+/// [`ProfileGap::NotAttached`], where the profile is loaded and reloading it is the fix.
+#[must_use]
+pub fn profile_gap_remedy(gap: &ProfileGap, version: &str) -> String {
+    let mut remedy = profile_gap_remedy_parts(gap, version).join(" ");
+    if !matches!(gap, ProfileGap::NotAttached { .. }) {
+        remedy.push(' ');
+        remedy.push_str(PROFILE_LAST_RESORT);
+    }
+    remedy
+}
+
+/// [`profile_gap_remedy`]'s parts, without the `LAST RESORT` sentence: the fix for the gap's own
+/// case first and, for a [`ProfileGap::PathNotProfiled`] with no profile loaded, the load step
+/// second. `mur doctor` prints them as separate lines.
+#[must_use]
+pub fn profile_gap_remedy_parts(gap: &ProfileGap, version: &str) -> Vec<String> {
+    match gap {
+        ProfileGap::NotLoaded { exe, path, file } => {
+            let named_by = match path {
+                ProfiledPath::Checkout => format!(
+                    "{} is a checkout build, which only the `mur-sealed-dev` profile generated \
+                     from its checkout names",
+                    exe.display()
+                ),
+                ProfiledPath::System | ProfiledPath::Home => format!(
+                    "{} is a path the `{}` profile names",
+                    exe.display(),
+                    path.profile_name()
+                ),
+            };
+            vec![format!(
+                "No mur-sealed AppArmor profile naming this binary's path is loaded: {named_by}, \
+                 and the kernel lists no `{}`. {}",
+                path.profile_name(),
+                load_step(*path, *file, version)
+            )]
+        }
+        ProfileGap::PathNotProfiled {
+            exe,
+            link,
+            profile_loaded,
+            file,
+        } => {
+            let profiled_link = link
+                .as_deref()
+                .and_then(|link| Some((link, profiled_path_for(link)?)))
+                .filter(|(_, path)| *path != ProfiledPath::Checkout);
+            let mut fix = match profiled_link {
+                Some((link, path)) => format!(
+                    "AppArmor attaches profiles by the executable's resolved path, not by the path \
+                     it was started through: {link} is a symlink to {exe}, and no mur-sealed \
+                     profile names {exe}. Replace the link with the file: `{sudo}mv -f {exe_word} \
+                     {link_word}`, then run {link} again.",
+                    link = link.display(),
+                    exe = exe.display(),
+                    sudo = if path == ProfiledPath::System {
+                        "sudo "
+                    } else {
+                        ""
+                    },
+                    exe_word = shell_word(exe),
+                    link_word = shell_word(link),
+                ),
+                None => format!(
+                    "AppArmor attaches profiles by the executable's resolved path, and no \
+                     mur-sealed profile names {exe}. Install it as a real file at a path the \
+                     shipped profile names: `sudo rm -f /usr/local/bin/mur && sudo install -m 755 \
+                     {exe_word} /usr/local/bin/mur`, then run /usr/local/bin/mur.",
+                    exe = exe.display(),
+                    exe_word = shell_word(exe),
+                ),
+            };
+            if profiled_link.is_none() && is_cargo_build_output(exe) {
+                fix.push_str(
+                    " A checkout build outside <checkout>/target gets no profile either: \
+                     `sudo scripts/install-dev-apparmor.sh` names only that checkout's \
+                     target/{debug,release}/mur, so build into it and run the script from the \
+                     checkout instead.",
+                );
+            }
+            let mut parts = vec![fix];
+            if !profile_loaded {
+                parts.push(format!(
+                    "No mur-sealed AppArmor profile is loaded either. {}",
+                    load_step(ProfiledPath::System, *file, version)
+                ));
+            }
+            parts
+        }
+        ProfileGap::NotAttached { exe, path } => vec![match path {
+            ProfiledPath::Checkout => format!(
+                "The `mur-sealed-dev` profile is loaded and the kernel still reports mur \
+                 unconfined, so the loaded profile may be out of date or generated from another \
+                 checkout than {}. Re-run `sudo scripts/install-dev-apparmor.sh` from this \
+                 checkout, then re-run.",
+                exe.display()
+            ),
+            ProfiledPath::System | ProfiledPath::Home => format!(
+                "The `{}` profile, which names {}, is loaded and the kernel still reports mur \
+                 unconfined, so the loaded profile may be out of date. Reload it: `sudo \
+                 apparmor_parser -r {SEALED_APPARMOR_PROFILE_PATH}`, then re-run.",
+                path.profile_name(),
+                exe.display()
+            ),
+        }],
+        ProfileGap::Undetermined => vec![format!(
+            "Install and load the profile shipped with mur, `sudo install -m 644 \
+             packaging/apparmor/{SEALED_APPARMOR_PROFILE_NAME} {SEALED_APPARMOR_PROFILE_PATH} && \
+             sudo apparmor_parser -r {SEALED_APPARMOR_PROFILE_PATH}` (or re-run the mur installer \
+             as root), then re-run. Building out of a checkout, where the binary sits at \
+             ./target/{{debug,release}}/mur and no shipped profile attaches to it: run \
+             `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for \
+             those two paths."
+        )],
+    }
+}
+
+/// The command that loads the profile naming `path`, installing the file first when it is absent.
+fn load_step(path: ProfiledPath, file: ProfileFile, version: &str) -> String {
+    let install = format!(
+        "sudo install -m 644 {SEALED_APPARMOR_PROFILE_NAME} {SEALED_APPARMOR_PROFILE_PATH}"
+    );
+    let reload = format!("sudo apparmor_parser -r {SEALED_APPARMOR_PROFILE_PATH}");
+    match (path, file) {
+        (ProfiledPath::Checkout, _) => "Run `sudo scripts/install-dev-apparmor.sh` from the \
+             checkout this binary was built in, which generates and loads `mur-sealed-dev` for \
+             that checkout's target/{debug,release}/mur, then re-run."
+            .to_string(),
+        (_, ProfileFile::Installed) => format!("Load it: `{reload}`, then re-run."),
+        (_, ProfileFile::Absent) if version.contains('-') => format!(
+            "No release publishes the profile for this pre-release build ({version}); from a \
+             murmur checkout, install and load the one it ships: `sudo install -m 644 \
+             packaging/apparmor/{SEALED_APPARMOR_PROFILE_NAME} {SEALED_APPARMOR_PROFILE_PATH} && \
+             {reload}`, then re-run."
+        ),
+        (_, ProfileFile::Absent) => format!(
+            "Install and load it: `curl -fsSL \
+             {RAW_PROFILE_URL_BASE}/v{version}/packaging/apparmor/{SEALED_APPARMOR_PROFILE_NAME} \
+             -o {SEALED_APPARMOR_PROFILE_NAME} && {install} && {reload}`, then re-run."
+        ),
+    }
+}
+
+/// Whether `exe` sits where cargo writes a binary (`…/debug/mur`, `…/release/mur`).
+fn is_cargo_build_output(exe: &Path) -> bool {
+    exe.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "debug" || dir == "release")
+}
+
+/// `path` as one shell word: as it is when every character is safe unquoted, single-quoted
+/// otherwise.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = text
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "/._+-@%:,=".contains(character));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
 // ---------------------------------------------------------------- blockers
 
 /// The one mechanism that stands between this host and `sealed`, named specifically enough that
@@ -556,15 +959,33 @@ pub struct SealedShortfall {
     pub userns_grant: UsernsGrant,
     /// The profile the kernel reports as confining this process, read with the attempts.
     pub attachment: ProfileAttachment,
+    /// Why no `mur-sealed` profile confines this process, read with the attempts. Words the
+    /// remedy of [`SealedBlocker::AppArmorProfileMissing`]; decides nothing.
+    pub profile_gap: ProfileGap,
 }
 
 impl SealedShortfall {
     /// [`SealedBlocker::reason`]; then, when an attempt failed, `The probe's <call> failed with
     /// <ERRNO> (<words>).` (or `The probe could not run: <account>.`); then, last, the same `Host
     /// readings: …` line `E-CAP-005` ends with.
+    ///
+    /// For [`SealedBlocker::AppArmorProfileMissing`] with a [`ProfileGap`] other than
+    /// [`ProfileGap::Undetermined`], the blocker's generic remedy is replaced by
+    /// [`profile_gap_remedy`] for that gap, the text `E-CAP-005` names it with.
     #[must_use]
     pub fn reason(&self) -> String {
-        let mut reason = self.blocker.reason();
+        let mut reason = match (&self.blocker, &self.profile_gap) {
+            (SealedBlocker::AppArmorProfileMissing, gap) if *gap != ProfileGap::Undetermined => {
+                format!(
+                    "sealed requires an unprivileged user+mount namespace, and AppArmor's \
+                     unprivileged-userns restriction is active on this host while the '{}' \
+                     profile is not confining this binary. {}",
+                    SEALED_APPARMOR_PROFILE_NAME,
+                    profile_gap_remedy(gap, env!("CARGO_PKG_VERSION"))
+                )
+            }
+            _ => self.blocker.reason(),
+        };
         let Some(call) = &self.failed_call else {
             return reason;
         };
@@ -605,6 +1026,7 @@ pub(crate) fn sealed_shortfall(
         errno,
         userns_grant: reading.userns_grant,
         attachment: reading.attachment.clone(),
+        profile_gap: reading.profile_gap.clone(),
     };
     if !is_linux {
         return Some(shortfall(SealedBlocker::NotLinux, None, None));
@@ -4015,6 +4437,236 @@ mod tests {
         );
     }
 
+    fn gap_readings(loaded: Option<&[&str]>, exe: Option<&str>) -> ProfileGapReadings {
+        ProfileGapReadings {
+            loaded: loaded.map(|names| names.iter().map(ToString::to_string).collect()),
+            exe: exe.map(PathBuf::from),
+            link: None,
+            installed: InstalledProfileState::Matches,
+        }
+    }
+
+    #[test]
+    fn profiled_paths_are_the_ones_the_shipped_profiles_name() {
+        for (path, expected) in [
+            ("/usr/local/bin/mur", Some(ProfiledPath::System)),
+            ("/usr/bin/mur", Some(ProfiledPath::System)),
+            ("/opt/mur/bin/mur", Some(ProfiledPath::System)),
+            ("/home/u/.local/bin/mur", Some(ProfiledPath::Home)),
+            ("/home/u/.cargo/bin/mur", Some(ProfiledPath::Home)),
+            ("/root/.local/bin/mur", Some(ProfiledPath::Home)),
+            ("/root/.cargo/bin/mur", Some(ProfiledPath::Home)),
+            ("/repo/target/debug/mur", Some(ProfiledPath::Checkout)),
+            (
+                "/home/u/src/murmur/target/release/mur",
+                Some(ProfiledPath::Checkout),
+            ),
+            ("/home/a/b/.local/bin/mur", None),
+            ("/home//.local/bin/mur", None),
+            ("/space/home/u/.local/bin/mur", None),
+            ("/usr/local/bin/mur-0.10.0", None),
+            ("/usr/local/bin/mur/", None),
+            ("/usr/sbin/mur", None),
+            ("/repo/target/debug/mur-roost", None),
+            ("/cache/targets/card/debug/mur", None),
+        ] {
+            assert_eq!(profiled_path_for(Path::new(path)), expected, "{path}");
+        }
+        assert_eq!(ProfiledPath::System.profile_name(), "mur-sealed");
+        assert_eq!(ProfiledPath::Home.profile_name(), "mur-sealed-home");
+        assert_eq!(ProfiledPath::Checkout.profile_name(), "mur-sealed-dev");
+    }
+
+    #[test]
+    fn a_profiled_path_whose_profile_is_not_loaded_is_not_loaded() {
+        let system = gap_readings(Some(&[]), Some("/usr/local/bin/mur"));
+        assert_eq!(
+            classify_profile_gap(&system),
+            ProfileGap::NotLoaded {
+                exe: "/usr/local/bin/mur".into(),
+                path: ProfiledPath::System,
+                file: ProfileFile::Installed,
+            }
+        );
+        let absent = ProfileGapReadings {
+            installed: InstalledProfileState::Absent,
+            ..system
+        };
+        assert_eq!(
+            classify_profile_gap(&absent),
+            ProfileGap::NotLoaded {
+                exe: "/usr/local/bin/mur".into(),
+                path: ProfiledPath::System,
+                file: ProfileFile::Absent,
+            }
+        );
+        assert_eq!(
+            classify_profile_gap(&gap_readings(
+                Some(&["mur-sealed"]),
+                Some("/home/u/.local/bin/mur")
+            )),
+            ProfileGap::NotLoaded {
+                exe: "/home/u/.local/bin/mur".into(),
+                path: ProfiledPath::Home,
+                file: ProfileFile::Installed,
+            }
+        );
+        assert_eq!(
+            classify_profile_gap(&gap_readings(
+                Some(&["mur-sealed", "mur-sealed-home"]),
+                Some("/repo/target/debug/mur")
+            )),
+            ProfileGap::NotLoaded {
+                exe: "/repo/target/debug/mur".into(),
+                path: ProfiledPath::Checkout,
+                file: ProfileFile::Installed,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unprofiled_path_is_path_not_profiled_with_its_link_and_whether_any_profile_is_loaded() {
+        let linked = ProfileGapReadings {
+            link: Some("/usr/local/bin/mur".into()),
+            ..gap_readings(
+                Some(&["mur-sealed", "mur-sealed-home"]),
+                Some("/usr/local/bin/mur-0.10.0"),
+            )
+        };
+        assert_eq!(
+            classify_profile_gap(&linked),
+            ProfileGap::PathNotProfiled {
+                exe: "/usr/local/bin/mur-0.10.0".into(),
+                link: Some("/usr/local/bin/mur".into()),
+                profile_loaded: true,
+                file: ProfileFile::Installed,
+            }
+        );
+        let nothing_loaded = ProfileGapReadings {
+            loaded: Some(Vec::new()),
+            installed: InstalledProfileState::Absent,
+            ..linked
+        };
+        assert_eq!(
+            classify_profile_gap(&nothing_loaded),
+            ProfileGap::PathNotProfiled {
+                exe: "/usr/local/bin/mur-0.10.0".into(),
+                link: Some("/usr/local/bin/mur".into()),
+                profile_loaded: false,
+                file: ProfileFile::Absent,
+            }
+        );
+        assert_eq!(
+            classify_profile_gap(&gap_readings(
+                Some(&["mur-sealed", "mur-sealed-home"]),
+                Some("/space/home/u/.local/bin/mur")
+            )),
+            ProfileGap::PathNotProfiled {
+                exe: "/space/home/u/.local/bin/mur".into(),
+                link: None,
+                profile_loaded: true,
+                file: ProfileFile::Installed,
+            }
+        );
+        // Another product's profile is not a mur-sealed one.
+        assert_eq!(
+            classify_profile_gap(&gap_readings(
+                Some(&["firefox", "docker-default"]),
+                Some("/opt/bin/mur")
+            )),
+            ProfileGap::PathNotProfiled {
+                exe: "/opt/bin/mur".into(),
+                link: None,
+                profile_loaded: false,
+                file: ProfileFile::Installed,
+            }
+        );
+    }
+
+    #[test]
+    fn a_profiled_path_whose_profile_is_loaded_is_not_attached() {
+        assert_eq!(
+            classify_profile_gap(&gap_readings(
+                Some(&["mur-sealed", "mur-sealed-home"]),
+                Some("/root/.cargo/bin/mur")
+            )),
+            ProfileGap::NotAttached {
+                exe: "/root/.cargo/bin/mur".into(),
+                path: ProfiledPath::Home,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_profile_list_or_binary_path_is_undetermined() {
+        assert_eq!(
+            classify_profile_gap(&gap_readings(None, Some("/usr/local/bin/mur"))),
+            ProfileGap::Undetermined
+        );
+        assert_eq!(
+            classify_profile_gap(&gap_readings(Some(&["mur-sealed"]), None)),
+            ProfileGap::Undetermined
+        );
+    }
+
+    #[test]
+    fn only_an_absent_profile_file_is_absent() {
+        assert_eq!(
+            ProfileFile::from_installed(&InstalledProfileState::Absent),
+            ProfileFile::Absent
+        );
+        for state in [
+            InstalledProfileState::Matches,
+            InstalledProfileState::Drifted {
+                installed_sha256: "ab".to_string(),
+            },
+            InstalledProfileState::Unreadable {
+                error: "permission denied".to_string(),
+            },
+        ] {
+            assert_eq!(ProfileFile::from_installed(&state), ProfileFile::Installed);
+        }
+    }
+
+    /// The undetermined remedy is the combined advice the refusals gave before the gap was read,
+    /// word for word.
+    #[test]
+    fn the_undetermined_remedy_is_the_combined_advice() {
+        let remedy = profile_gap_remedy(&ProfileGap::Undetermined, "0.10.0");
+        assert!(
+            remedy.starts_with(
+                "Install and load the profile shipped with mur, `sudo install -m 644 \
+                 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo \
+                 apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as \
+                 root), then re-run. Building out of a checkout, where the binary sits at \
+                 ./target/{debug,release}/mur"
+            ),
+            "{remedy}"
+        );
+        assert!(
+            remedy.ends_with("is not the configuration murmur ships."),
+            "{remedy}"
+        );
+        assert!(remedy.contains("LAST RESORT"), "{remedy}");
+    }
+
+    #[test]
+    fn a_path_needing_quotes_is_quoted_in_the_command() {
+        let remedy = profile_gap_remedy(
+            &ProfileGap::PathNotProfiled {
+                exe: "/space/my builds/mur".into(),
+                link: Some("/home/u/.local/bin/mur".into()),
+                profile_loaded: true,
+                file: ProfileFile::Installed,
+            },
+            "0.10.0",
+        );
+        assert!(
+            remedy.contains("`mv -f '/space/my builds/mur' /home/u/.local/bin/mur`"),
+            "{remedy}"
+        );
+    }
+
     /// The profile is the fix and the sysctl is a fallback that costs the whole host its
     /// unprivileged-userns hardening. Both must be in the text — on a host where no profile can be
     /// loaded the sysctl is the right answer — but their order and the stated cost are what stop a
@@ -4141,6 +4793,7 @@ mod tests {
                 private_proc: crate::namespace_probe::MountAttempt::NotAttempted,
                 userns_grant: grant,
                 attachment,
+                profile_gap: crate::sealed::ProfileGap::Undetermined,
             }
         }
 
@@ -4499,6 +5152,112 @@ mod tests {
             assert!(network.contains("E-CAP-005"), "{network}");
             let apparmor = SealedBlocker::AppArmorProfileMissing.reason();
             assert!(apparmor.contains("mur-sealed") && apparmor.contains("apparmor_parser -r"));
+        }
+
+        /// The `E-CAP-003` reason for `sealed` names each profile gap with the remedy `E-CAP-005`
+        /// names it with, in place of the blocker's generic one; an undetermined gap keeps the
+        /// generic text.
+        #[test]
+        fn a_missing_profile_is_remedied_as_e_cap_005_remedies_the_same_gap() {
+            let opening = "sealed requires an unprivileged user+mount namespace, and AppArmor's \
+                           unprivileged-userns restriction is active on this host while the \
+                           'mur-sealed' profile is not confining this binary. ";
+            let version = env!("CARGO_PKG_VERSION");
+            for (gap, command) in [
+                (
+                    ProfileGap::NotLoaded {
+                        exe: "/home/u/.local/bin/mur".into(),
+                        path: ProfiledPath::Home,
+                        file: ProfileFile::Installed,
+                    },
+                    "`sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`",
+                ),
+                (
+                    ProfileGap::NotLoaded {
+                        exe: "/repo/target/debug/mur".into(),
+                        path: ProfiledPath::Checkout,
+                        file: ProfileFile::Installed,
+                    },
+                    "`sudo scripts/install-dev-apparmor.sh`",
+                ),
+                (
+                    ProfileGap::PathNotProfiled {
+                        exe: "/usr/local/bin/mur-0.10.0".into(),
+                        link: Some("/usr/local/bin/mur".into()),
+                        profile_loaded: true,
+                        file: ProfileFile::Installed,
+                    },
+                    "`sudo mv -f /usr/local/bin/mur-0.10.0 /usr/local/bin/mur`",
+                ),
+                (
+                    ProfileGap::NotAttached {
+                        exe: "/usr/bin/mur".into(),
+                        path: ProfiledPath::System,
+                    },
+                    "Reload it: `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`",
+                ),
+            ] {
+                let reading = NamespaceReading {
+                    profile_gap: gap.clone(),
+                    ..network_failed(CreationStep::IdentityMaps, libc::EPERM)
+                };
+                let shortfall = sealed_shortfall(true, true, &reading).unwrap();
+                assert_eq!(shortfall.blocker, SealedBlocker::AppArmorProfileMissing);
+                let sealed = shortfall.reason();
+                let egress = reading.egress_namespace_failure().unwrap().reason();
+                let remedy = profile_gap_remedy(&gap, version);
+                assert!(sealed.contains(command), "{sealed}");
+                assert!(egress.contains(command), "{egress}");
+                assert!(
+                    sealed.starts_with(&format!("{opening}{remedy} The probe's ")),
+                    "{sealed}"
+                );
+                assert!(egress.contains(&remedy), "{egress}");
+                assert!(
+                    sealed.ends_with(
+                        "Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor \
+                         profile confining mur: unconfined."
+                    ),
+                    "{sealed}"
+                );
+            }
+
+            let undetermined = sealed_shortfall(
+                true,
+                true,
+                &network_failed(CreationStep::IdentityMaps, libc::EPERM),
+            )
+            .unwrap()
+            .reason();
+            assert!(
+                undetermined.starts_with(&SealedBlocker::AppArmorProfileMissing.reason()),
+                "{undetermined}"
+            );
+        }
+
+        /// A gap read beside another blocker changes nothing: only a missing profile is worded
+        /// with it.
+        #[test]
+        fn a_gap_beside_another_blocker_changes_nothing() {
+            let gap = ProfileGap::NotLoaded {
+                exe: "/usr/local/bin/mur".into(),
+                path: ProfiledPath::System,
+                file: ProfileFile::Installed,
+            };
+            for reading in [
+                network_failed(CreationStep::Unshare, libc::ENOSPC),
+                root_failed(MountStep::PivotRoot, libc::EPERM),
+                root_failed(MountStep::Tmpfs, libc::EPERM),
+            ] {
+                let with = NamespaceReading {
+                    profile_gap: gap.clone(),
+                    ..reading.clone()
+                };
+                assert_eq!(
+                    sealed_shortfall(true, true, &with).map(|s| s.reason()),
+                    sealed_shortfall(true, true, &reading).map(|s| s.reason()),
+                );
+            }
         }
     }
 }

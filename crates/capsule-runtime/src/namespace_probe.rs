@@ -37,7 +37,7 @@ use crate::network_namespace::{decode_step_record, STEP_RECORD_LEN};
 use crate::network_namespace::{
     errno_label, errno_words, EgressNamespaceFailure, NamespaceAttemptError,
 };
-use crate::sealed::{ProfileAttachment, UsernsGrant};
+use crate::sealed::{ProfileAttachment, ProfileGap, UsernsGrant};
 
 /// One step of a mount rehearsal, as the child reports it when that step fails.
 ///
@@ -180,6 +180,9 @@ pub struct NamespaceReading {
     /// The profile the kernel reports as confining this process, read with the attempts. Words a
     /// refusal; decides nothing.
     pub attachment: ProfileAttachment,
+    /// Why no `mur-sealed` profile confines this process, read with the attempts. Words a
+    /// refusal's remedy; decides nothing.
+    pub profile_gap: ProfileGap,
 }
 
 impl NamespaceReading {
@@ -193,6 +196,7 @@ impl NamespaceReading {
             private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::default(),
             attachment: ProfileAttachment::NotReported,
+            profile_gap: ProfileGap::Undetermined,
         }
     }
 
@@ -205,6 +209,7 @@ impl NamespaceReading {
             self.network.clone(),
             self.userns_grant,
             self.attachment.clone(),
+            self.profile_gap.clone(),
         )
     }
 
@@ -312,6 +317,7 @@ pub(crate) fn probe_namespaces() -> NamespaceReading {
         private_proc,
         userns_grant: crate::sealed::userns_grant(),
         attachment: crate::sealed::inspect_profile_attachment(),
+        profile_gap: crate::sealed::inspect_profile_gap(),
     }
 }
 
@@ -694,6 +700,7 @@ mod tests {
             private_proc: MountAttempt::NotAttempted,
             userns_grant: UsernsGrant::Withheld,
             attachment: ProfileAttachment::Unconfined,
+            profile_gap: crate::sealed::ProfileGap::Undetermined,
         }
     }
 
