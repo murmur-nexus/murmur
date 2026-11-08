@@ -2304,6 +2304,15 @@ pub(crate) struct ShellEnforcement {
     /// consulted — the strongest form the refusal can take.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) egress_tcp_ports: Vec<u16>,
+    /// The held-port map ([`crate::held_ports::HeldPorts`] over [`Self::egress_tcp_ports`]) when
+    /// this session's commands are observed for a bind on a held port, `None` when they are not.
+    ///
+    /// Decided once, in [`Self::resolve`]: `Some` exactly when the tier is `KernelFull` or
+    /// `KernelSealed`, the allowlist holds at least one TCP port, and this runtime's libseccomp
+    /// supports user notification. Read through [`Self::observed_held_ports`], which keys it on
+    /// [`Self::tier`] again.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) bind_observation: Option<crate::held_ports::HeldPorts>,
     /// `capabilities.network.unix_sockets`, threaded through to the seccomp `socket()` rule.
     /// `false` (the default) means the forked child cannot create an `AF_UNIX` socket at all, so
     /// a local daemon socket — `/var/run/docker.sock` above all — is unreachable regardless of
@@ -2486,6 +2495,14 @@ impl ShellEnforcement {
             crate::network_policy::parse_network_allow_rules(&policy.network_allow)
                 .map_err(|error| error.to_string())?;
         let egress_tcp_ports = crate::egress_proxy::egress_listen_ports(&network_allow_rules);
+        let bind_observation = (observes_binds_on(tier) && bind_notification_supported())
+            .then(|| {
+                crate::held_ports::HeldPorts::from_allowlist(
+                    &policy.network_allow,
+                    &egress_tcp_ports,
+                )
+            })
+            .filter(|held| !held.is_empty());
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
         // The `DT_NEEDED`-closure files (individual files → non-listable), one grant per
         // author-declared `interpreter_runtime` directory (each with its own `list_dir`), and one
@@ -2544,6 +2561,7 @@ impl ShellEnforcement {
             network_allow_ips,
             network_allow_rules,
             egress_tcp_ports,
+            bind_observation,
             unix_sockets_allowed: policy.unix_sockets_allowed,
             workdir_exec: policy.workdir_exec_allowed,
             landlock_abi: ruleset_landlock_abi(probe.landlock_kernel_abi(), tier),
@@ -2771,6 +2789,7 @@ impl ShellEnforcement {
             network_allow_ips: Vec::new(),
             network_allow_rules: Vec::new(),
             egress_tcp_ports: Vec::new(),
+            bind_observation: None,
             // Denied, matching every other grant this constructor zeroes out. Inert on this tier
             // (no seccomp filter is installed at all), but it must not read as "allowed".
             unix_sockets_allowed: false,
@@ -2821,6 +2840,23 @@ impl ShellEnforcement {
         self
     }
 
+    /// The held-port map this enforcement's commands are observed against, or `None` when they
+    /// get today's filter with `bind` allowed: always on a tier other than `KernelFull` and
+    /// `KernelSealed`, whatever [`Self::bind_observation`] holds.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn observed_held_ports(&self) -> Option<&crate::held_ports::HeldPorts> {
+        self.bind_observation
+            .as_ref()
+            .filter(|_| observes_binds_on(self.tier))
+    }
+
+    /// One [`crate::held_ports::held_port_line`] per held port a process of this session tried to
+    /// bind since the last call, ascending, draining the session's pending records. Shared by
+    /// every enforcement of the session through its [`crate::network_namespace::SessionNetns`].
+    pub(crate) fn take_held_port_lines(&self) -> Vec<String> {
+        self.session_netns.take_held_port_lines()
+    }
+
     /// End the session: kill every process it started, then release its network namespace.
     ///
     /// Killing goes through the cgroup scope, which every spawn joins before `execve` and no fork
@@ -2858,6 +2894,31 @@ impl ShellEnforcement {
             );
         }
     }
+}
+
+/// Whether `tier` routes `bind(2)` to the session's observer when the allowlist holds a port.
+///
+/// The Landlock tiers only: Landlock needs Linux 5.13, which has seccomp user notification (5.0),
+/// its continue flag (5.5) and `POLLHUP` on a listener whose tasks have all exited (5.8), so no
+/// kernel version is read. `KernelSeccompOnly` reaches kernels older than that.
+fn observes_binds_on(tier: EnforcementTier) -> bool {
+    matches!(
+        tier,
+        EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+    )
+}
+
+/// Whether this runtime's libseccomp can build a filter that notifies and hand back its listener:
+/// API level 6 of libseccomp 2.5.0 or later, the level the `libseccomp` crate's notification calls
+/// require.
+#[cfg(target_os = "linux")]
+fn bind_notification_supported() -> bool {
+    libseccomp::check_api(6, libseccomp::ScmpVersion::from((2, 5, 0))).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_notification_supported() -> bool {
+    false
 }
 
 /// How long [`ShellEnforcement::end_session`] waits for a killed scope's `cgroup.procs` to empty.
@@ -3074,6 +3135,11 @@ pub(crate) enum SupervisorHandle {
         /// letting `execute_shell` fold that legible detail into the error it returns instead of
         /// the bare, undifferentiated `EINVAL` that `Command::spawn()` surfaces.
         diag_read: std::os::fd::OwnedFd,
+        /// The parent's end of the `SOCK_SEQPACKET` socketpair the child sends its seccomp
+        /// listener over, when the session's commands are observed for a bind on a held port
+        /// ([`ShellEnforcement::observed_held_ports`]); `None` otherwise. Read once, by
+        /// [`SupervisorHandle::hand_off_bind_listener`] after a successful spawn.
+        bind_listener: Option<std::os::fd::OwnedFd>,
     },
 }
 
@@ -3099,6 +3165,32 @@ impl SupervisorHandle {
                 linux_enforce::read_diagnostic_pipe(diag_read.as_raw_fd())
             }
         }
+    }
+
+    /// After a successful `spawn()`: receives the seccomp listener the child sent before its
+    /// `execve` and hands it to `enforcement`'s session observer. Does nothing for a spawn that
+    /// is not observed.
+    ///
+    /// `spawn()` returns only once the command has called `execve`, and the child sends the
+    /// listener before that, so the receive never waits. A listener that cannot be received is
+    /// reported as a warning: a bind in that command then fails with `ENOSYS`.
+    pub(crate) fn hand_off_bind_listener(&self, enforcement: &ShellEnforcement) {
+        #[cfg(target_os = "linux")]
+        if let SupervisorHandle::Linux {
+            bind_listener: Some(socket),
+            ..
+        } = self
+        {
+            match linux_enforce::receive_bind_listener(socket) {
+                Ok(listener) => enforcement.session_netns.observe_bind_listener(listener),
+                Err(error) => crate::runtime_err!(
+                    "[capsule-runtime] warning: could not receive a command's bind listener: \
+                     {error}; a bind in that command fails with ENOSYS"
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (self, enforcement);
     }
 }
 
@@ -3582,13 +3674,26 @@ pub(crate) fn prepare_enforcement(
     // and so a namespace that cannot be created fails this spawn with a legible error instead of
     // running the command anywhere else. The join handle moves into the closure, which keeps both
     // descriptors open until the `Command` is dropped.
+    let observed_held_ports = enforcement.observed_held_ports();
     let netns = enforcement.session_netns.establish(
         &enforcement.egress_tcp_ports,
         crate::egress_proxy::EgressPolicy::new(
             enforcement.network_allow_rules.clone(),
             enforcement.network_allow_ips.clone(),
         ),
+        observed_held_ports,
     )?;
+
+    // On an observed spawn, the socketpair the child sends its seccomp listener over. Both ends
+    // are `CLOEXEC`: the child's end closes at `execve`, and the child closes the listener itself
+    // before that.
+    let (bind_listener_socket, bind_listener_handoff) = match observed_held_ports {
+        Some(_) => {
+            let (parent, handoff) = linux_enforce::bind_listener_socketpair()?;
+            (Some(parent), Some(handoff))
+        }
+        None => (None, None),
+    };
 
     let tier = enforcement.tier;
     // Whether this spawn mounts the session's private `/proc`, and whether the `/tmp` mapping
@@ -3628,14 +3733,15 @@ pub(crate) fn prepare_enforcement(
     // `close_range` fd-hygiene call; the capability-dropping `prctl`/`capset` sequence
     // (bounding-set drop, capset clear, and the explicit `no_new_privs` `prctl`) plus one
     // allocation-free `open`/`read`/`close` of `/proc/sys/kernel/cap_last_cap`; libseccomp filter
-    // construction/load (kernel syscalls); on `KernelFull`/`KernelSealed` Landlock ruleset
+    // construction/load (kernel syscalls), and on an observed spawn one `sendmsg` of the filter's
+    // listener over the socketpair end, from stack buffers, then one `close` of the listener; on `KernelFull`/`KernelSealed` Landlock ruleset
     // construction/`restrict_self` against already-open fds (also kernel syscalls); and last, the
     // `getrlimit`/`setrlimit` pairs of `resources::apply_per_process_rlimits`. No `canonicalize()`, no
     // path lookup beyond those prepared paths and `cap_last_cap`, no locks beyond what those
     // syscalls need. On any failure it writes the real error message to the CLOEXEC diagnostic
     // pipe (best-effort, bounded, raw `write` loop) before returning `Err`. `diag_write`, the
-    // namespace join handle and the Landlock fds are moved in, and are `CLOEXEC`, so none of them
-    // reaches the exec'd program.
+    // namespace join handle, the Landlock fds and the bind-listener socketpair end are moved in,
+    // and are `CLOEXEC`, so none of them reaches the exec'd program.
     unsafe {
         command.pre_exec(move || {
             // `RLIMIT_NPROC` first: the composed root's `unshare(CLONE_NEWUSER)` below fixes the
@@ -3666,6 +3772,7 @@ pub(crate) fn prepare_enforcement(
                 sealed_spec.as_ref(),
                 landlock_fds.as_ref(),
                 unix_sockets_allowed,
+                bind_listener_handoff.as_ref(),
             ) {
                 linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
                 return Err(error);
@@ -3690,7 +3797,10 @@ pub(crate) fn prepare_enforcement(
         });
     }
 
-    Ok(SupervisorHandle::Linux { diag_read })
+    Ok(SupervisorHandle::Linux {
+        diag_read,
+        bind_listener: bind_listener_socket,
+    })
 }
 
 /// Which fixed device set Landlock grants, keyed on the tier.
@@ -4036,10 +4146,16 @@ fn build_sealed_root(
 /// Linux-only mechanics: the `pre_exec` enforcement sequence, seccomp filter construction and
 /// Landlock application.
 ///
-/// Nothing here uses `libseccomp`'s notify facility. `connect`/`sendto` are enforced by the
-/// network namespace and `execve`/`execveat` by Landlock `Execute` rights, both of which decide
-/// from kernel-held state. A `Notify` rule would reintroduce a `/proc/<pid>/mem` read on the hot
-/// path, where the value read can change between the decision and the kernel's own dereference.
+/// No decision here rests on `libseccomp`'s notify facility. `connect`/`sendto` are enforced by
+/// the network namespace and `execve`/`execveat` by Landlock `Execute` rights, both of which
+/// decide from kernel-held state. A `Notify` rule that decided would reintroduce a read of the
+/// calling task's memory on the hot path, where the value read can change between the decision
+/// and the kernel's own dereference.
+///
+/// The one `Notify` rule is `bind`'s on an observed spawn, and it decides nothing: the session's
+/// [`crate::held_ports::BindObserver`] records the port and answers every notification with
+/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, so the kernel performs the bind exactly as it would under
+/// `Allow`, and what the observer read can only change which line a later shell result carries.
 #[cfg_attr(target_os = "linux", allow(unsafe_code))]
 #[cfg(target_os = "linux")]
 mod linux_enforce {
@@ -4390,6 +4506,7 @@ mod linux_enforce {
     /// which is also what enforces `capabilities.shell.allow`. Returning `Err` here aborts the
     /// exec (std's `Command` machinery propagates it back to the parent's `.spawn()` call as an
     /// `io::Error`) — the fail-closed path for setup failures that happen after fork.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         namespaces: SessionNamespaces,
@@ -4398,6 +4515,7 @@ mod linux_enforce {
         sealed_spec: Option<&crate::sealed::SealedRootSpec>,
         landlock_fds: Option<&LandlockChildFds>,
         unix_sockets_allowed: bool,
+        bind_listener: Option<&BindListenerHandoff>,
     ) -> io::Result<()> {
         // FIRST, on every kernel tier: join the session's network namespace. It has to precede
         // everything below it for three separate reasons:
@@ -4544,11 +4662,16 @@ mod linux_enforce {
         drop_all_capabilities()?;
 
         // The child stays *non-dumpable*, inherited from the runtime process
-        // (`security::harden_process_dumpable`). Nothing reads the child's memory, so nothing
-        // needs it dumpable. Marking it dumpable opens same-uid `ptrace`, `environ` and core-dump
-        // access for the whole life of every shell subprocess: do not do so without a reader that
-        // requires it.
-        install_seccomp_filter(unix_sockets_allowed)?;
+        // (`security::harden_process_dumpable`). The one reader of its memory, the bind observer's
+        // `process_vm_readv` of a `bind` `sockaddr`, does not need it dumpable: the runtime's euid
+        // owns the session's user namespace and so holds `CAP_SYS_PTRACE` in it and in every user
+        // namespace nested below it. Marking the child dumpable opens same-uid `ptrace`, `environ`
+        // and core-dump access for the whole life of every shell subprocess: do not do so without
+        // a reader that requires it.
+        //
+        // On an observed spawn the filter routes `bind` to a user notification, and its listener
+        // goes to the parent over `bind_listener` and is closed here, before `execve`.
+        install_seccomp_filter(unix_sockets_allowed, bind_listener)?;
 
         if matches!(
             tier,
@@ -4965,10 +5088,12 @@ mod linux_enforce {
     /// held against and the headroom between them are recorded in
     /// `docs/content/reference/seccomp-filter-instruction-budget.md`.
     ///
-    /// **This filter raises no notifications and needs no supervisor.** Network enforcement lives
-    /// in [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec enforcement in the
+    /// **No rule of this filter decides through a notification.** Network enforcement lives in
+    /// [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec enforcement in the
     /// Landlock domain `apply_landlock_scope` installs — see this module's own header for why no
-    /// `Notify` rule may come back.
+    /// deciding `Notify` rule may come back. With `observe_binds`, `bind` is routed to a user
+    /// notification the session's bind observer always answers with continue, in place of its
+    /// `Allow`; without it the filter carries no `Notify` rule at all.
     ///
     /// One mechanism plus a default:
     ///
@@ -4984,6 +5109,7 @@ mod linux_enforce {
     ///     unreachable — they are simply absent, not argument-matched.
     fn build_seccomp_filter(
         unix_sockets_allowed: bool,
+        observe_binds: bool,
     ) -> io::Result<libseccomp::ScmpFilterContext> {
         // Default-deny. `EPERM` matches what the OCI/Docker default profile returns for a syscall
         // outside its allowlist, and is deliberately a *different* errno from the `EACCES` that the
@@ -5088,10 +5214,27 @@ mod linux_enforce {
         // so the filter can only ever come out *narrower* than intended, never wider. Propagating
         // instead would abort every single spawn on the first arch-specific name, which is why
         // this is the deliberate exception to the module's otherwise-strict error handling.
+        //
+        // `bind` is skipped when observed: two unconditional rules with different actions for one
+        // syscall do not coexist in libseccomp, so its `Notify` rule below replaces the `Allow`.
         for name in super::SECCOMP_SYSCALL_ALLOWLIST {
+            if observe_binds && *name == "bind" {
+                continue;
+            }
             if let Ok(syscall) = libseccomp::ScmpSyscall::from_name(name) {
                 let _ = filter.add_rule(libseccomp::ScmpAction::Allow, syscall);
             }
+        }
+
+        // The observed `bind`: one unconditional `Notify`, never an argument-conditional one,
+        // because libseccomp cannot express "notify on some lengths, allow the rest" without
+        // overlapping rules for one syscall. Fail-closed like the Landlock rules below: an
+        // observed spawn whose filter cannot carry it does not run.
+        if observe_binds {
+            let bind = libseccomp::ScmpSyscall::from_name("bind").map_err(to_io_err)?;
+            filter
+                .add_rule(libseccomp::ScmpAction::Notify, bind)
+                .map_err(to_io_err)?;
         }
 
         // Landlock's three syscalls, which `child_install_enforcement` calls *after* this filter
@@ -5120,13 +5263,126 @@ mod linux_enforce {
     /// Loads the filter [`build_seccomp_filter`] produces into the calling task. Irreversible:
     /// the filter stays in force for the rest of this task's life and is inherited across the
     /// `execve` that follows, which is why nothing outside a forked child ever calls this.
-    fn install_seccomp_filter(unix_sockets_allowed: bool) -> io::Result<()> {
+    ///
+    /// With `bind_listener`, the filter is the observed one, and the listener `load()` creates
+    /// (`SECCOMP_FILTER_FLAG_NEW_LISTENER`, which libseccomp sets for a filter with a `Notify`
+    /// rule) is sent to the parent and then closed here, so the exec'd program never holds it.
+    /// A listener that cannot be sent fails the spawn: without its reader every `bind` in the
+    /// command would fail with `ENOSYS`.
+    fn install_seccomp_filter(
+        unix_sockets_allowed: bool,
+        bind_listener: Option<&BindListenerHandoff>,
+    ) -> io::Result<()> {
         // Dropping the context after `load()` is safe: libseccomp's `seccomp_release()` (invoked
         // on Drop) only frees the userspace filter-building context, while the filter itself is
         // already installed in the kernel and is inherited across the `execve` that follows.
-        build_seccomp_filter(unix_sockets_allowed)?
-            .load()
-            .map_err(to_io_err)
+        let filter = build_seccomp_filter(unix_sockets_allowed, bind_listener.is_some())?;
+        filter.load().map_err(to_io_err)?;
+        let Some(handoff) = bind_listener else {
+            return Ok(());
+        };
+        let listener = filter.get_notify_fd().map_err(|error| {
+            io::Error::other(format!(
+                "sandbox: the seccomp filter observing bind left no listener: {error}"
+            ))
+        })?;
+        let sent = handoff.send(listener);
+        // SAFETY: `listener` is the descriptor `load()` created for this process and nothing else
+        // in it owns; `close` takes one integer.
+        unsafe { libc::close(listener) };
+        sent.map_err(|error| {
+            io::Error::other(format!(
+                "sandbox: sending the seccomp listener observing bind failed: {error}"
+            ))
+        })
+    }
+
+    /// The child's end of an observed spawn's socketpair, which its seccomp listener is sent
+    /// over.
+    pub(super) struct BindListenerHandoff {
+        socket: OwnedFd,
+    }
+
+    impl BindListenerHandoff {
+        /// Sends `listener` in one `SCM_RIGHTS` message. Runs in the `pre_exec` window, so it goes
+        /// through [`crate::network_namespace::send_fds`], which uses stack buffers only.
+        fn send(&self, listener: RawFd) -> io::Result<()> {
+            use std::os::fd::AsRawFd;
+            // SAFETY: called only from the forked child's `pre_exec` window, which is the context
+            // `send_fds` requires; the socket is the end this struct owns.
+            unsafe { crate::network_namespace::send_fds(self.socket.as_raw_fd(), &[listener]) }
+                .map_err(|()| io::Error::last_os_error())
+        }
+    }
+
+    /// A `SOCK_SEQPACKET | SOCK_CLOEXEC` socketpair for one observed spawn: the parent's end, and
+    /// the child's.
+    pub(super) fn bind_listener_socketpair() -> Result<(OwnedFd, BindListenerHandoff), String> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a 2-element array, exactly what `socketpair` writes into.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "sandbox: socketpair() for the bind listener failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: both descriptors were just returned by `socketpair` and nothing else owns them.
+        let (parent, child) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok((parent, BindListenerHandoff { socket: child }))
+    }
+
+    /// The parent's receive of the listener [`BindListenerHandoff::send`] sent, without waiting
+    /// (`MSG_DONTWAIT`) and close-on-exec (`MSG_CMSG_CLOEXEC`).
+    pub(super) fn receive_bind_listener(socket: &OwnedFd) -> io::Result<OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let mut payload = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: payload.len(),
+        };
+        /// Room for `CMSG_SPACE(sizeof(int))`, aligned for `struct cmsghdr`.
+        #[repr(C, align(8))]
+        struct Control([u8; 64]);
+        let mut cmsg = Control([0; 64]);
+        // SAFETY: `msghdr` is a plain C struct for which all-zero is valid; every pointer set in
+        // it names a local that outlives the `recvmsg` call, and `CMSG_FIRSTHDR`/`CMSG_DATA` read
+        // only inside `cmsg`, whose length the kernel wrote back into `msg_controllen`.
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = cmsg.0.as_mut_ptr().cast();
+            message.msg_controllen = cmsg.0.len() as _;
+            let received = libc::recvmsg(
+                socket.as_raw_fd(),
+                &mut message,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            );
+            if received < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let header = libc::CMSG_FIRSTHDR(&message);
+            if header.is_null()
+                || (*header).cmsg_level != libc::SOL_SOCKET
+                || (*header).cmsg_type != libc::SCM_RIGHTS
+            {
+                return Err(io::Error::other(
+                    "the message carried no SCM_RIGHTS descriptor",
+                ));
+            }
+            let fd = std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>());
+            Ok(OwnedFd::from_raw_fd(fd))
+        }
     }
 
     fn to_io_err<E: std::fmt::Display>(error: E) -> io::Error {
@@ -5187,7 +5443,7 @@ mod linux_enforce {
     /// first appeared in libseccomp 2.6.0, and a host on 2.5.x would fail to resolve the symbol.
     #[cfg(test)]
     fn seccomp_filter_instruction_count(unix_sockets_allowed: bool) -> io::Result<usize> {
-        let filter = build_seccomp_filter(unix_sockets_allowed)?;
+        let filter = build_seccomp_filter(unix_sockets_allowed, false)?;
         let exported = export_to_memfd(|fd| filter.export_bpf(fd))?;
         Ok(exported.len() / SOCK_FILTER_BYTES)
     }
@@ -5196,9 +5452,11 @@ mod linux_enforce {
     /// one block per syscall carrying a rule, each block naming the argument comparisons and the
     /// action. It is the only view of a built context that shows the rule *shape* rather than the
     /// compiled program's size, which is what a test pinning the rule sequence needs.
+    ///
+    /// `observe_binds` builds the observed filter, whose `bind` notifies instead of allowing.
     #[cfg(test)]
-    fn seccomp_filter_pfc(unix_sockets_allowed: bool) -> io::Result<String> {
-        let filter = build_seccomp_filter(unix_sockets_allowed)?;
+    fn seccomp_filter_pfc(unix_sockets_allowed: bool, observe_binds: bool) -> io::Result<String> {
+        let filter = build_seccomp_filter(unix_sockets_allowed, observe_binds)?;
         let exported = export_to_memfd(|fd| filter.export_pfc(fd))?;
         String::from_utf8(exported).map_err(to_io_err)
     }
@@ -5973,8 +6231,8 @@ mod linux_enforce {
             );
 
             for unix_sockets_allowed in [false, true] {
-                let filter =
-                    build_seccomp_filter(unix_sockets_allowed).expect("build the seccomp filter");
+                let filter = build_seccomp_filter(unix_sockets_allowed, false)
+                    .expect("build the seccomp filter");
                 assert_eq!(
                     filter.get_act_default().expect("read the default action"),
                     libseccomp::ScmpAction::Errno(libc::EPERM),
@@ -5982,8 +6240,8 @@ mod linux_enforce {
                      makes every syscall outside the allowlist unreachable"
                 );
 
-                let pfc =
-                    seccomp_filter_pfc(unix_sockets_allowed).expect("export the filter's pfc");
+                let pfc = seccomp_filter_pfc(unix_sockets_allowed, false)
+                    .expect("export the filter's pfc");
                 let denied = denied_socket_domains(unix_sockets_allowed);
                 let allowed = allowed_socket_domains(unix_sockets_allowed);
 
@@ -6038,6 +6296,153 @@ mod linux_enforce {
                     LANDLOCK_SYSCALLS.len(),
                 );
             }
+        }
+
+        /// The `bind` block of a pfc export: from its `# filter for syscall "bind"` header to the
+        /// next block.
+        fn bind_block(pfc: &str) -> &str {
+            let start = pfc
+                .find("# filter for syscall \"bind\"")
+                .unwrap_or_else(|| panic!("no bind block in:\n{pfc}"));
+            let rest = &pfc[start + 1..];
+            let end = rest
+                .find("# filter for syscall ")
+                .map_or(pfc.len(), |at| start + 1 + at);
+            &pfc[start..end]
+        }
+
+        /// How many `BPF_RET | BPF_K` instructions of `filter`'s export return `action`.
+        fn returns_of(filter: &libseccomp::ScmpFilterContext, action: u32) -> usize {
+            let exported = export_to_memfd(|fd| filter.export_bpf(fd)).expect("export the bpf");
+            let (insns, _) = exported.as_chunks::<SOCK_FILTER_BYTES>();
+            insns
+                .iter()
+                .filter(|insn| {
+                    let code = u16::from_ne_bytes([insn[0], insn[1]]);
+                    let k = u32::from_ne_bytes([insn[4], insn[5], insn[6], insn[7]]);
+                    code == (libc::BPF_RET | libc::BPF_K) as u16 && k == action
+                })
+                .count()
+        }
+
+        /// The observed filter routes `bind` to the notify action (`SECCOMP_RET_USER_NOTIF`,
+        /// `0x7fc00000`) in place of its `Allow`, and nothing else; the filter without
+        /// observation allows `bind` and notifies on nothing.
+        #[test]
+        fn seccomp_observed_filter_notifies_on_bind_instead_of_allowing_it() {
+            const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
+            for unix_sockets_allowed in [false, true] {
+                let plain = seccomp_filter_pfc(unix_sockets_allowed, false).expect("plain pfc");
+                let observed =
+                    seccomp_filter_pfc(unix_sockets_allowed, true).expect("observed pfc");
+                eprintln!(
+                    "unix_sockets_allowed={unix_sockets_allowed}\nplain bind block:\n{}\
+                     observed bind block:\n{}",
+                    bind_block(&plain),
+                    bind_block(&observed)
+                );
+
+                // libseccomp's pfc writes the notify action as its raw value.
+                let notify = format!("action {SECCOMP_RET_USER_NOTIF:#x};");
+                assert!(bind_block(&plain).contains("action ALLOW;"));
+                assert!(!plain.contains(&notify), "{plain}");
+                assert!(bind_block(&observed).contains(&notify));
+                assert!(!bind_block(&observed).contains("ALLOW"));
+                assert_eq!(observed.matches(&notify).count(), 1, "{observed}");
+                assert_eq!(
+                    observed.matches("action ALLOW;").count() + 1,
+                    plain.matches("action ALLOW;").count()
+                );
+                assert_eq!(
+                    observed.matches("# filter for syscall ").count(),
+                    plain.matches("# filter for syscall ").count()
+                );
+
+                let plain = build_seccomp_filter(unix_sockets_allowed, false).unwrap();
+                let observed = build_seccomp_filter(unix_sockets_allowed, true).unwrap();
+                assert_eq!(returns_of(&plain, SECCOMP_RET_USER_NOTIF), 0);
+                assert!(returns_of(&observed, SECCOMP_RET_USER_NOTIF) >= 1);
+            }
+        }
+
+        /// The errno a forked child gets when, after loading `first`, it asks for a second
+        /// seccomp filter with a listener of its own (`SECCOMP_FILTER_FLAG_NEW_LISTENER`): `0` if
+        /// the kernel took it.
+        fn second_listener_errno(first: &libseccomp::ScmpFilterContext) -> i32 {
+            let allow = [libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            }];
+            let program = libc::sock_fprog {
+                len: allow.len() as u16,
+                filter: allow.as_ptr().cast_mut(),
+            };
+            // SAFETY: as `load_in_child`: the child calls `load()`, one raw `seccomp(2)` over the
+            // program built above, reads `errno` and `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                let code = match first.load() {
+                    Err(_) => PROBE_ERRNO_UNKNOWN,
+                    // SAFETY: `program` points at `allow`, both alive in this child; `errno` is
+                    // read right after the call that set it.
+                    Ok(()) => unsafe {
+                        if libc::syscall(
+                            libc::SYS_seccomp,
+                            libc::SECCOMP_SET_MODE_FILTER,
+                            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                            std::ptr::addr_of!(program),
+                        ) >= 0
+                        {
+                            0
+                        } else {
+                            *libc::__errno_location()
+                        }
+                    },
+                };
+                // SAFETY: forked-child context; `_exit` runs no destructor.
+                unsafe { libc::_exit(code) }
+            }
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` is the child just forked; `status` is a live local.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(waited == pid, "waitpid: {}", io::Error::last_os_error());
+            assert!(libc::WIFEXITED(status), "status {status}");
+            libc::WEXITSTATUS(status)
+        }
+
+        /// A program inside an observed command that installs a seccomp user-notification
+        /// listener of its own is refused. Under the shipped filter the refusal is `EPERM`, the
+        /// default action for `seccomp(2)`, which is outside the allowlist with or without
+        /// observation; behind it, the kernel's one-listener-per-chain rule refuses a second
+        /// listener with `EBUSY`, measured here under a filter that permits `seccomp(2)`.
+        #[test]
+        fn a_second_listener_under_the_observed_filter_is_refused() {
+            if skip_without_seccomp("a second seccomp listener under the observed filter") {
+                return;
+            }
+            let observed = build_seccomp_filter(false, true).expect("build the observed filter");
+            let mut permissive =
+                libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Allow).unwrap();
+            permissive
+                .add_rule(
+                    libseccomp::ScmpAction::Notify,
+                    libseccomp::ScmpSyscall::from_name("bind").unwrap(),
+                )
+                .unwrap();
+
+            let shipped = second_listener_errno(&observed);
+            let kernel = second_listener_errno(&permissive);
+            eprintln!(
+                "second listener under the observed filter: errno {shipped} ({}); under a \
+                 filter permitting seccomp(2): errno {kernel} ({})",
+                io::Error::from_raw_os_error(shipped),
+                io::Error::from_raw_os_error(kernel)
+            );
+            assert_eq!(shipped, libc::EPERM);
+            assert_eq!(kernel, libc::EBUSY);
         }
 
         /// Brackets `BPF_MAXINSNS`, the kernel's limit on a *single* filter's length, by loading
@@ -11331,6 +11736,240 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         true
     }
 
+    /// [`server_policy`] with `capabilities.network.allow: ["127.0.0.1:8091"]`, which makes the
+    /// session's egress proxy hold port 8091.
+    fn held_port_policy() -> CapabilityPolicy {
+        CapabilityPolicy {
+            network_allow: vec!["127.0.0.1:8091".to_string()],
+            ..server_policy(&[])
+        }
+    }
+
+    /// The line a bind on 8091 under [`held_port_policy`] produces.
+    fn held_8091_line() -> String {
+        crate::held_ports::held_port_line(8091, &["127.0.0.1:8091"])
+    }
+
+    /// A server on a held port still fails with the kernel's `EADDRINUSE`, and the session's
+    /// observer records the bind, so the next drain names the port and the allow entry once.
+    fn assert_a_held_bind_is_named(enforcement: &ShellEnforcement, policy: &CapabilityPolicy) {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            enforcement.observed_held_ports().is_some(),
+            "{:?} with a held port observes binds",
+            enforcement.tier
+        );
+
+        let server = bash("nc -l 127.0.0.1 8091", temp.path(), policy, enforcement)
+            .expect("the server command runs");
+        eprintln!(
+            "tier {:?}; nc exit {}; stderr {:?}",
+            enforcement.tier,
+            server.exit_code,
+            server.stderr.trim()
+        );
+        assert_ne!(server.exit_code, 0, "stdout: {}", server.stdout);
+        assert!(
+            server.stderr.contains("Address already in use"),
+            "the kernel's EADDRINUSE is unchanged: {}",
+            server.stderr
+        );
+        assert_eq!(enforcement.take_held_port_lines(), vec![held_8091_line()]);
+        assert!(enforcement.take_held_port_lines().is_empty());
+    }
+
+    /// `nc -l` on the port an allow entry holds fails with `EADDRINUSE`, and the session's drain
+    /// names the port and the allow entry exactly once.
+    #[test]
+    fn a_bind_on_a_held_port_names_the_allow_entry() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_bind_on_a_held_port_names_the_allow_entry",
+        ) {
+            return;
+        }
+        let policy = held_port_policy();
+        let enforcement = session_enforcement(&policy);
+        assert_a_held_bind_is_named(&enforcement, &policy);
+        enforcement.end_session();
+    }
+
+    /// [`a_bind_on_a_held_port_names_the_allow_entry`] inside a composed root, where the bind is
+    /// made from a user namespace nested below the session's.
+    #[test]
+    fn a_bind_on_a_held_port_names_the_allow_entry_on_a_sealed_root() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_bind_on_a_held_port_names_the_allow_entry_on_a_sealed_root",
+        ) {
+            return;
+        }
+        let probe = HostProbe::probe();
+        if probe.tier() != EnforcementTier::KernelSealed {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE SEALED ROOT ON THIS HOST: \
+                 a_bind_on_a_held_port_names_the_allow_entry_on_a_sealed_root needs a host that \
+                 reaches KernelSealed (unprivileged user namespaces plus a usable Landlock ABI); \
+                 detected {:?}. No composed root is built in this run.",
+                probe.tier()
+            );
+            return;
+        }
+        let policy = held_port_policy();
+        let enforcement = ShellEnforcement::resolve_declared(
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            probe,
+        )
+        .expect("a sealed-capable host resolves sealed enforcement")
+        .with_test_session_dirs();
+        assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
+        assert_a_held_bind_is_named(&enforcement, &policy);
+        enforcement.end_session();
+    }
+
+    /// A server on a port no allow entry names binds, answers a later command of the session, and
+    /// produces no line.
+    #[test]
+    fn a_server_on_a_port_no_entry_names_is_reachable_and_unreported() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_server_on_a_port_no_entry_names_is_reachable_and_unreported",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = held_port_policy();
+        let enforcement = session_enforcement(&policy);
+        assert!(enforcement.observed_held_ports().is_some());
+
+        let server = bash(
+            &one_shot_server("pong", 8092),
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the server command runs");
+        assert_eq!(server.exit_code, 0, "stderr: {}", server.stderr);
+        let client = bash(&retrying_client(8092), temp.path(), &policy, &enforcement)
+            .expect("the client command runs");
+        assert_eq!(client.exit_code, 0, "stderr: {}", client.stderr);
+        assert_eq!(client.stdout.trim(), "pong");
+        assert!(enforcement.take_held_port_lines().is_empty());
+        assert_eq!(enforcement.session_netns.creations(), 1);
+
+        enforcement.end_session();
+    }
+
+    /// A server backgrounded by a command that returns at once binds after the command finished;
+    /// its listener stays observed, and the record waits for the session's next drain.
+    #[test]
+    fn a_held_bind_from_a_backgrounded_server_is_reported_after_its_command_returns() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_held_bind_from_a_backgrounded_server_is_reported_after_its_command_returns",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = held_port_policy();
+        let enforcement = session_enforcement(&policy);
+
+        let started = std::time::Instant::now();
+        let command = bash(
+            "nc -l 127.0.0.1 8091 >/dev/null 2>&1 & echo started",
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the command runs");
+        assert_eq!(command.exit_code, 0, "stderr: {}", command.stderr);
+        assert_eq!(command.stdout.trim(), "started");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let mut lines = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lines.is_empty() && std::time::Instant::now() < deadline {
+            lines.extend(enforcement.take_held_port_lines());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        lines.extend(enforcement.take_held_port_lines());
+        assert_eq!(lines, vec![held_8091_line()]);
+
+        enforcement.end_session();
+    }
+
+    /// The observer is decided per tier and allowlist: an empty allowlist and every tier without
+    /// a Landlock domain get no held-port map, no listener socket, and today's filter.
+    #[test]
+    fn no_bind_observer_without_a_held_port_or_on_a_tier_without_landlock() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "no_bind_observer_without_a_held_port_or_on_a_tier_without_landlock",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let empty = session_enforcement(&server_policy(&[]));
+        assert!(empty.bind_observation.is_none());
+        assert!(empty.observed_held_ports().is_none());
+        let mut command = std::process::Command::new("true");
+        let handle = prepare_enforcement(&mut command, &empty, temp.path())
+            .expect("the enforcement prepares");
+        assert!(
+            matches!(
+                handle,
+                SupervisorHandle::Linux {
+                    bind_listener: None,
+                    ..
+                }
+            ),
+            "{handle:?}"
+        );
+        drop(command);
+        empty.end_session();
+
+        let held = session_enforcement(&held_port_policy());
+        assert_eq!(
+            held.observed_held_ports()
+                .map(crate::held_ports::HeldPorts::ports),
+            Some(vec![8091])
+        );
+        for tier in [
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+            EnforcementTier::Unconfined,
+        ] {
+            let other = ShellEnforcement {
+                tier,
+                ..held.clone()
+            };
+            assert!(other.observed_held_ports().is_none(), "{tier:?}");
+            assert!(!observes_binds_on(tier), "{tier:?}");
+        }
+        assert!(ShellEnforcement::environment_only()
+            .observed_held_ports()
+            .is_none());
+        held.end_session();
+    }
+
+    /// Ending the session stops the observer thread and drops what was still pending.
+    #[test]
+    fn ending_the_session_stops_the_bind_observer_and_drops_pending_records() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "ending_the_session_stops_the_bind_observer_and_drops_pending_records",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = held_port_policy();
+        let enforcement = session_enforcement(&policy);
+        let server = bash("nc -l 127.0.0.1 8091", temp.path(), &policy, &enforcement)
+            .expect("the server command runs");
+        assert_ne!(server.exit_code, 0);
+        assert!(enforcement.session_netns.bind_observer_running());
+
+        enforcement.end_session();
+        assert!(!enforcement.session_netns.bind_observer_running());
+        assert!(enforcement.take_held_port_lines().is_empty());
+    }
+
     /// A server one command backgrounds answers a later, separate command of the same session.
     #[test]
     #[allow(clippy::print_stdout)]
@@ -11593,6 +12232,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                         session.network_allow_rules.clone(),
                         session.network_allow_ips.clone(),
                     ),
+                    session.observed_held_ports(),
                 )
                 .expect("the session's namespace is established");
             let pid_ns = std::fs::read_link(format!("/proc/self/fd/{}", join.pid_ns_fd()))

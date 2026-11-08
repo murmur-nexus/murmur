@@ -12919,13 +12919,16 @@ fn dispatch_shell_tool(
                 resource_limit: result.resource_limit_hit.clone(),
             };
             // A note rather than part of `data`: inside the fence it would read exactly like
-            // output the command could have printed itself. One line per thing to report.
+            // output the command could have printed itself. One line per thing to report. The
+            // held-port lines drain the session's pending records, so a bind a backgrounded
+            // server, a plan step or a `murmur:process` program made shows on this result.
             let notes: Vec<String> = result
                 .resource_limit_hit
                 .as_deref()
                 .map(crate::resources::resource_limit_line)
                 .into_iter()
                 .chain(result.output_holders.note())
+                .chain(enforcement.take_held_port_lines())
                 .collect();
             let runtime_note = (!notes.is_empty()).then(|| notes.join("\n"));
             DispatchOutcome {
@@ -21180,6 +21183,193 @@ inference:
         let data = outcome.result.data.expect("a finished call renders text");
         let printed = data
             .rfind(forged)
+            .unwrap_or_else(|| panic!("the printed text is missing from:\n{data}"));
+        let close = data
+            .rfind(crate::fence::FENCE_CLOSE)
+            .expect("the result is fenced");
+        assert!(
+            printed < close,
+            "the forged line escaped the fence:\n{data}"
+        );
+        assert!(data.ends_with(crate::fence::FENCE_CLOSE));
+    }
+
+    fn held_port_policy() -> CapabilityPolicy {
+        CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            network_allow: vec!["127.0.0.1:8091".to_string()],
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    fn dispatch_bash(
+        command: &str,
+        workdir: &std::path::Path,
+        policy: &CapabilityPolicy,
+        enforcement: &sandbox::ShellEnforcement,
+    ) -> DispatchOutcome {
+        dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(serde_json::json!({ "command": command }).to_string()),
+                log_path: None,
+            },
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &[],
+            policy,
+            enforcement,
+            None,
+        )
+    }
+
+    /// A pending held-port record surfaces on the next finished shell result as a runtime note
+    /// after the existing notes, outside the fence, with the call's status untouched; the next
+    /// result carries none.
+    #[test]
+    fn a_finished_shell_result_carries_the_held_port_line_after_the_fence() {
+        let tmp = TempDir::new().unwrap();
+        let policy = held_port_policy();
+        let enforcement = sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
+        let held = crate::held_ports::HeldPorts::from_allowlist(&policy.network_allow, &[8091]);
+        let line = crate::held_ports::held_port_line(8091, &["127.0.0.1:8091"]);
+
+        assert!(enforcement
+            .session_netns
+            .record_held_port_for_test(&held, 8091));
+        let mut outcome = dispatch_bash("echo hi", tmp.path(), &policy, &enforcement);
+        assert_eq!(outcome.runtime_note.as_deref(), Some(line.as_str()));
+        assert_eq!(outcome.result.status, murmur::tool::run::Status::Passed);
+        assert_eq!(
+            outcome.result.data.as_deref(),
+            Some("Exit code: 0\nStdout:\nhi\n")
+        );
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        let data = outcome.result.data.expect("a finished call renders text");
+        assert!(
+            data.ends_with(&format!("{}\n{line}", crate::fence::FENCE_CLOSE)),
+            "the held-port line must follow the fence:\n{data}"
+        );
+
+        let next = dispatch_bash("echo hi", tmp.path(), &policy, &enforcement);
+        assert!(next.runtime_note.is_none(), "{:?}", next.runtime_note);
+
+        // After the output-holder note: a background `sleep` holding the call's output is killed
+        // and named first, the held port second.
+        assert!(enforcement
+            .session_netns
+            .record_held_port_for_test(&held, 8091));
+        let both = dispatch_bash("sleep 30 & echo hi", tmp.path(), &policy, &enforcement);
+        let holders = crate::shell::OutputHolders::Killed
+            .note()
+            .expect("killed holders have a note");
+        assert_eq!(
+            both.runtime_note.as_deref(),
+            Some(format!("{holders}\n{line}").as_str())
+        );
+    }
+
+    /// A real bind on a held port, in a `scoped` session's namespace, reaches the model as the
+    /// last line of the fenced result; a server on a port no entry names leaves no line. Prints
+    /// both results as the model reads them.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_real_bind_on_a_held_port_ends_the_shell_result_with_the_line() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_real_bind_on_a_held_port_ends_the_shell_result_with_the_line",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "nc".to_string(), "timeout".to_string()],
+            network_allow: vec![
+                "127.0.0.1:8091".to_string(),
+                "https://127.0.0.1".to_string(),
+            ],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = sandbox::ShellEnforcement::resolve_declared(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            sandbox::HostProbe::probe(),
+        )
+        .expect("the policy resolves")
+        .with_test_session_dirs();
+        assert_eq!(enforcement.tier, sandbox::EnforcementTier::KernelFull);
+        let line = crate::held_ports::held_port_line(8091, &["127.0.0.1:8091"]);
+
+        let mut held = dispatch_bash("nc -l 127.0.0.1 8091", tmp.path(), &policy, &enforcement);
+        assert_eq!(held.result.status, murmur::tool::run::Status::Passed);
+        fence_and_label("bash", &LockOrigin::Operator, &mut held);
+        let held = held.result.data.expect("a finished call renders text");
+        println!("--- nc -l 127.0.0.1 8091 ---\n{held}\n--- end ---");
+        assert!(
+            held.lines()
+                .any(|text| text == "nc: Address already in use"),
+            "{held}"
+        );
+        assert_eq!(held.lines().last(), Some(line.as_str()));
+        assert!(held.ends_with(&format!("{}\n{line}", crate::fence::FENCE_CLOSE)));
+
+        let mut free = dispatch_bash(
+            "timeout 1 nc -l 127.0.0.1 8092; echo exit $?",
+            tmp.path(),
+            &policy,
+            &enforcement,
+        );
+        assert!(free.runtime_note.is_none(), "{:?}", free.runtime_note);
+        fence_and_label("bash", &LockOrigin::Operator, &mut free);
+        let free = free.result.data.expect("a finished call renders text");
+        println!("--- timeout 1 nc -l 127.0.0.1 8092 ---\n{free}\n--- end ---");
+        assert!(free.lines().any(|text| text == "exit 124"), "{free}");
+        assert!(free.ends_with(crate::fence::FENCE_CLOSE));
+        assert!(!free.contains("held_port:"));
+
+        // Below 1024 the kernel refuses the bind for the privileged port, and the attempt on a
+        // held port is still reported.
+        let mut privileged =
+            dispatch_bash("nc -l 127.0.0.1 443", tmp.path(), &policy, &enforcement);
+        fence_and_label("bash", &LockOrigin::Operator, &mut privileged);
+        let privileged = privileged
+            .result
+            .data
+            .expect("a finished call renders text");
+        println!("--- nc -l 127.0.0.1 443 ---\n{privileged}\n--- end ---");
+        assert!(
+            privileged
+                .lines()
+                .any(|text| text == "nc: Permission denied"),
+            "{privileged}"
+        );
+        assert_eq!(
+            privileged.lines().last(),
+            Some(crate::held_ports::held_port_line(443, &["https://127.0.0.1"]).as_str())
+        );
+
+        enforcement.end_session();
+    }
+
+    /// Text a command prints stays inside the fence however much it looks like the held-port
+    /// line; with nothing pending there is no note.
+    #[test]
+    fn a_command_printing_the_held_port_line_cannot_forge_it() {
+        let tmp = TempDir::new().unwrap();
+        let policy = held_port_policy();
+        let enforcement = sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
+        let forged = crate::held_ports::held_port_line(8091, &["127.0.0.1:8091"]);
+
+        let mut outcome = dispatch_bash(
+            &format!("printf '%s\\n' '{}'", forged.replace('\'', "'\\''")),
+            tmp.path(),
+            &policy,
+            &enforcement,
+        );
+        assert!(outcome.runtime_note.is_none());
+
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        let data = outcome.result.data.expect("a finished call renders text");
+        let printed = data
+            .rfind(&forged)
             .unwrap_or_else(|| panic!("the printed text is missing from:\n{data}"));
         let close = data
             .rfind(crate::fence::FENCE_CLOSE)

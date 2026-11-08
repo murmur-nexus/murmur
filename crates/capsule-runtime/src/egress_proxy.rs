@@ -124,14 +124,7 @@ const MAX_DNS_MESSAGE_BYTES: usize = 4096;
 pub(crate) fn egress_listen_ports(rules: &[NetworkAllowRule]) -> Vec<u16> {
     let mut ports: Vec<u16> = Vec::new();
     for rule in rules {
-        let implied: [Option<u16>; 2] = match rule.port {
-            Some(port) => [Some(port), None],
-            // A bare `example.com` entry spans both schemes and every port. The two scheme
-            // defaults are what a client actually dials; opening every port would be a listener
-            // population no allowlist asked for.
-            None => [Some(80), Some(443)],
-        };
-        for port in implied.into_iter().flatten() {
+        for port in implied_tcp_ports(rule) {
             if !ports.contains(&port) {
                 ports.push(port);
             }
@@ -140,6 +133,21 @@ pub(crate) fn egress_listen_ports(rules: &[NetworkAllowRule]) -> Vec<u16> {
     ports.sort_unstable();
     ports.truncate(MAX_EGRESS_TCP_PORTS);
     ports
+}
+
+/// The TCP ports one allow rule implies a listener for: its explicit port, or both scheme
+/// defaults, 80 and 443, for a bare host (see [`egress_listen_ports`] for why only `rule.port` is
+/// read). The one statement of that mapping: the held-port line attributes a port to the entries
+/// this returns it for, so a second copy would let the two disagree.
+pub(crate) fn implied_tcp_ports(rule: &NetworkAllowRule) -> impl Iterator<Item = u16> {
+    let implied: [Option<u16>; 2] = match rule.port {
+        Some(port) => [Some(port), None],
+        // A bare `example.com` entry spans both schemes and every port. The two scheme defaults
+        // are what a client actually dials; opening every port would be a listener population no
+        // allowlist asked for.
+        None => [Some(80), Some(443)],
+    };
+    implied.into_iter().flatten()
 }
 
 // ---------------------------------------------------------------- the policy

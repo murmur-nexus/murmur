@@ -965,7 +965,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `capabilities.network.allow` | list<string> | no | Host/URL entries the capsule may reach — see [Network allow entries](#network-allow-entries) for the accepted forms. Governs IP destinations only, TCP and UDP alike. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent list means no IP destination is reachable. A non-empty list also grants the `capabilities.shell.allow` binaries read access to the host's [TLS trust store](containment.md#trust-store). |
+| `capabilities.network.allow` | list<string> | no | Host/URL entries the capsule may reach — see [Network allow entries](#network-allow-entries) for the accepted forms. Governs IP destinations only, TCP and UDP alike. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent list means no IP destination is reachable. A non-empty list also grants the `capabilities.shell.allow` binaries read access to the host's [TLS trust store](containment.md#trust-store). Every port an entry implies is held by the session's egress proxy, so a server inside the capsule cannot listen on it — see [Held ports](containment.md#held-ports). |
 | `capabilities.network.unix_sockets` | bool | no | Default: `false`. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`. Set `true` only if a shell tool genuinely needs a local daemon socket — the grant is capsule-wide, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. No effect on non-Linux hosts, which have no kernel enforcement — see [`W-SEC-001`](diagnostics.md#w-sec-001). |
 | `capabilities.peer_fetch.allow` | list<string> | see notes | Peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against — see [`capabilities.peer_fetch`](#field-peer-fetch). Required and non-empty when the `peer_fetch:` block is present. Absent block means no fetching is possible and the `fetch-peer-file` tool does not exist. |
 | `capabilities.filesystem.scope` | string | no | Relative scope under the workdir; see [Filesystem scope](#filesystem-scope). Omitted, the capsule sees the whole workdir. |
@@ -2352,6 +2352,46 @@ Accepted forms:
 
 A URL entry must carry no path, query or fragment, and its scheme must be `http` or `https`.
 Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
+
+An entry is for connecting out. Every port it implies is
+[held by the session's egress proxy](containment.md#held-ports) for the whole session, so a server
+inside the capsule serves on a port no entry names.
+
+**Reaching a server on the host.** A server the host runs on `127.0.0.1:8091` is reachable from
+the capsule's commands through an entry naming that address and port:
+
+```yaml
+capabilities:
+  shell:
+    allow: [curl]
+  network:
+    allow: ["127.0.0.1:8091"]
+```
+
+```bash
+curl http://127.0.0.1:8091/
+```
+
+**Serving inside the capsule.** A server a command starts listens on a port no entry names, and
+later shell calls of the same session reach it on loopback. Nothing outside the session reaches it.
+
+```yaml
+capabilities:
+  shell:
+    allow: [bash, python3, curl]
+  network:
+    allow: ["127.0.0.1:8091"]
+```
+
+```bash
+# one shell call
+python3 -m http.server 8092 >server.log 2>&1 &
+# a later shell call
+curl http://127.0.0.1:8092/
+```
+
+The same server on `8091` fails with `EADDRINUSE`, and the shell result names the entry holding
+the port.
 
 A request an artifact sends through its [credential gateway](#artifact-gateway) does not consult
 this list, so a gateway's upstream need not appear in it.
