@@ -208,6 +208,9 @@ enum Commands {
         /// (default: 127.0.0.1, as for `mur run`).
         #[arg(long, default_value = "127.0.0.1", value_name = "ADDR")]
         bind: String,
+        /// Print one JSON document: the verdict, the exit code, the tally and every finding
+        #[arg(long)]
+        json: bool,
     },
     /// Build a .mur.zip artifact from a source directory
     Build {
@@ -786,7 +789,7 @@ fn main() {
             run_version(json);
             Ok(())
         }
-        Commands::Doctor { bind } => run_doctor(&bind),
+        Commands::Doctor { bind, json } => run_doctor(&bind, json),
         Commands::Build {
             source,
             output,

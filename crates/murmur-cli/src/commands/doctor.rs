@@ -26,7 +26,8 @@ use murmur_artifact::{
     warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactRuntime,
     ContractDirection, FitSubject, LocalRegistry, LockOrigin, MurmurLock, Registry,
     ResolvedArtifact, RosterReachability, RuntimeManifest, UnservedInterface, VersionFit,
-    WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME, W_REG_002, W_REG_003,
+    WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME, W_REG_002, W_REG_003, W_REG_004, W_ROS_001,
+    W_RUN_002, W_RUN_009, W_RUN_013,
 };
 
 use crate::commands::install::find_project_root;
@@ -39,58 +40,168 @@ use crate::env_requirements::{
 };
 use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
-    E_IO_003, E_RUN_012, E_RUN_019,
+    E_IO_003, E_REG_002, E_RUN_003, E_RUN_008, E_RUN_012, E_RUN_019, E_RUN_043, E_RUN_064,
+    E_WIT_LEVEL_001,
 };
 use crate::stores::{installed_contracts, interface_label, served_phrase, FallbackRegistry};
 
-/// A finding that makes `mur doctor` exit `1`.
+/// The doctor block a finding comes from: the `block` key of `mur doctor --json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorBlock {
+    /// The project itself: no `murmur.yaml` found, or one that cannot be read.
+    Project,
+    /// What the manifest's `capabilities` declare.
+    Capabilities,
+    /// The containment stance `mur run` resolves.
+    Containment,
+    /// What this host can do, whatever the manifest says.
+    Host,
+    /// The `mur-roost` daemon a delegating capsule registers with.
+    Roost,
+    /// The `Environment requirements` block.
+    Environment,
+    /// The `Roster` block.
+    Roster,
+    /// The `Filesystem preopens` block.
+    Preopens,
+    /// The artifact checklist, and each pinned tool's declared needs.
+    Artifacts,
+    /// The `Model limits` block.
+    ModelLimits,
+    /// The `Process harness` block.
+    Harness,
+    /// The `capabilities.resources` bounds.
+    Resources,
+    /// The `WIT level` block.
+    WitLevel,
+    /// The `Cgroup scope` block.
+    CgroupScope,
+    /// The `Runtime directory` block.
+    RuntimeDirectory,
+    /// The `Host paths` block.
+    HostPaths,
+}
+
+/// One counted finding: an error, which makes `mur doctor` exit `1`, or a warning, which does not.
+/// Each ends in a `Fix:` line and is one entry of `mur doctor --json`'s `findings`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorError {
-    /// One line naming the finding, printed after the tally as `First refusal: <headline>` when
-    /// this is the first error doctor printed: `error[<CODE>]: <first line of the message>` for a
-    /// coded finding, `<name@version> — <reason>` for an uncoded checklist line.
-    headline: String,
+struct Finding {
+    /// The `E-`/`W-` code `mur run` gives the same thing, or doctor's own code for it.
+    code: &'static str,
+    block: DoctorBlock,
+    /// What the finding concerns — an artifact `name@version`, a member, a capsule, a variable, a
+    /// path, a binary or a manifest field — or `None` for a host-wide finding.
+    subject: Option<String>,
+    /// The finding's one-line headline, without an `error[<CODE>]: ` prefix.
+    message: String,
+    /// Whether the text form heads the finding `error[<code>]: `. A checklist line is headed by
+    /// its `name@version` instead.
+    headed_by_code: bool,
     /// The `Fix:` line's text.
     fix: String,
 }
 
+impl Finding {
+    /// The line printed after the tally as `First refusal: <headline>` when this is the first
+    /// error doctor printed.
+    fn headline(&self) -> String {
+        if self.headed_by_code {
+            format!("error[{}]: {}", self.code, self.message)
+        } else {
+            self.message.clone()
+        }
+    }
+}
+
+/// `line` without a leading `warning[<code>]: ` or `error[<code>]: `, for a message printed with
+/// its code that a [`Finding`] carries separately.
+fn without_code(line: &str, code: &str) -> String {
+    line.strip_prefix(&format!("warning[{code}]: "))
+        .or_else(|| line.strip_prefix(&format!("error[{code}]: ")))
+        .unwrap_or(line)
+        .to_string()
+}
+
 /// Every finding that ends in a `Fix:` line, each list in the order doctor printed its findings.
 ///
-/// Created at the start of [`run_doctor`] and [`run_formation_doctor`], so every block, the
+/// Created at the start of [`check_project`] and [`check_formation`], so every block, the
 /// manifest-only prologue included, records into the same tally. Adding a finding that predicts a
 /// `mur run` refusal is one [`Findings::predict`] call; any error recorded fails the exit code.
+/// Every finding carries a code, a block and a subject, which is what puts it in
+/// `mur doctor --json`.
 #[derive(Debug, Default)]
 struct Findings {
     /// Findings that make doctor exit `1`.
-    errors: Vec<DoctorError>,
-    /// The `Fix:` text of findings that leave the exit code at `0`.
-    warnings: Vec<String>,
+    errors: Vec<Finding>,
+    /// Findings that leave the exit code at `0`.
+    warnings: Vec<Finding>,
 }
 
 impl Findings {
-    /// Records an error under a headline the caller composed.
-    fn error(&mut self, headline: impl Into<String>, fix: impl Into<String>) {
-        self.errors.push(DoctorError {
-            headline: headline.into(),
+    /// Records an error headed by `line` itself, such as a checklist line's
+    /// `<name@version> — <reason>`.
+    fn error(
+        &mut self,
+        code: &'static str,
+        block: DoctorBlock,
+        subject: Option<String>,
+        line: impl Into<String>,
+        fix: impl Into<String>,
+    ) {
+        self.errors.push(Finding {
+            code,
+            block,
+            subject,
+            message: line.into(),
+            headed_by_code: false,
             fix: fix.into(),
         });
     }
 
-    /// Records an error carrying `code`, headed `error[<code>]: <first line of message>`.
-    fn coded(&mut self, code: &str, message: &str, fix: impl Into<String>) {
-        let first_line = message.lines().next().unwrap_or_default();
-        self.error(format!("error[{code}]: {first_line}"), fix);
+    /// Records an error headed `error[<code>]: <first line of message>`.
+    fn coded(
+        &mut self,
+        code: &'static str,
+        block: DoctorBlock,
+        subject: Option<String>,
+        message: &str,
+        fix: impl Into<String>,
+    ) {
+        self.errors.push(Finding {
+            code,
+            block,
+            subject,
+            message: message.lines().next().unwrap_or_default().to_string(),
+            headed_by_code: true,
+            fix: fix.into(),
+        });
     }
 
     /// Prints `refusal` on stderr and records it as an error.
-    fn predict(&mut self, refusal: PredictedRefusal) {
+    fn predict(&mut self, block: DoctorBlock, subject: Option<String>, refusal: PredictedRefusal) {
         capsule_runtime::report_eprintln!("{}", refusal.stderr_text());
-        self.coded(refusal.code, &refusal.message, refusal.fix);
+        self.coded(refusal.code, block, subject, &refusal.message, refusal.fix);
     }
 
-    /// Records a warning's `Fix:` text.
-    fn warning(&mut self, fix: impl Into<String>) {
-        self.warnings.push(fix.into());
+    /// Records a warning: `message` is its one-line headline.
+    fn warning(
+        &mut self,
+        code: &'static str,
+        block: DoctorBlock,
+        subject: Option<String>,
+        message: impl Into<String>,
+        fix: impl Into<String>,
+    ) {
+        let message = message.into();
+        self.warnings.push(Finding {
+            code,
+            block,
+            subject,
+            message: message.lines().next().unwrap_or_default().to_string(),
+            headed_by_code: false,
+            fix: fix.into(),
+        });
     }
 }
 
@@ -731,16 +842,20 @@ fn report_preopens(
                     .is_err()
                 })
                 .map_or("the refused entry", |artifact| artifact.name.as_str());
-            findings.predict(PredictedRefusal {
-                code: E_CAP_002,
-                message: error.to_string(),
-                consequence: "`mur run` will refuse this capsule until that entry's \
+            findings.predict(
+                DoctorBlock::Preopens,
+                Some(refused.to_string()),
+                PredictedRefusal {
+                    code: E_CAP_002,
+                    message: error.to_string(),
+                    consequence: "`mur run` will refuse this capsule until that entry's \
                               capabilities.filesystem.scope names a path inside the workdir."
-                    .to_string(),
-                fix: format!(
-                    "{refused}: give it a capabilities.filesystem.scope inside the workdir"
-                ),
-            });
+                        .to_string(),
+                    fix: format!(
+                        "{refused}: give it a capabilities.filesystem.scope inside the workdir"
+                    ),
+                },
+            );
         }
     }
 
@@ -991,7 +1106,11 @@ fn report_roost_daemon(findings: &mut Findings) {
     if let Some(refusal) =
         roost_daemon_refusal(roost_url.as_deref(), binary.as_deref(), check_roost_health)
     {
-        findings.predict(refusal);
+        findings.predict(
+            DoctorBlock::Roost,
+            Some("MURMUR_ROOST_URL".to_string()),
+            refusal,
+        );
     }
 }
 
@@ -1046,6 +1165,9 @@ fn report_env_requirements(
             project_root.display()
         );
         findings.error(
+            E_IO_003,
+            DoctorBlock::Environment,
+            Some(format!("{}/.env", project_root.display())),
             format!(
                 "{}/.env could not be read \u{2014} {error}",
                 project_root.display()
@@ -1326,6 +1448,22 @@ fn release_requirement(unserved: &[UnservedInterface]) -> String {
     format!("a release built {}", clauses.join(", "))
 }
 
+/// `built against <interface>, <what this mur serves>` for the first of `unserved`, then
+/// `(+N more)` when there are others. `unserved` is never empty.
+fn unserved_reason(unserved: &[UnservedInterface]) -> String {
+    let first = &unserved[0];
+    let more = if unserved.len() > 1 {
+        format!(" (+{} more)", unserved.len() - 1)
+    } else {
+        String::new()
+    };
+    format!(
+        "built against {}, {}{more}",
+        interface_label(first),
+        served_phrase(first)
+    )
+}
+
 /// The warning-tier `Fix:` text for a stale installed artifact. It names a release by what it is
 /// built against, never the installed version: reinstalling that fetches the same build.
 fn stale_install_fix(artifact: &StaleArtifact) -> String {
@@ -1409,6 +1547,8 @@ fn print_variables(report: &EnvRequirementsReport, findings: &mut Findings) {
     for variable in &unset {
         findings.coded(
             E_CAP_014,
+            DoctorBlock::Environment,
+            Some(variable.name.clone()),
             &message,
             format!(
                 "export {} — declared by {}",
@@ -1451,6 +1591,8 @@ fn print_refusals(report: &EnvRequirementsReport, findings: &mut Findings) {
     for refusal in &report.refusals {
         findings.coded(
             E_CAP_015,
+            DoctorBlock::Environment,
+            Some(refusal.child.to_string()),
             &message,
             format!(
                 "{parent}: add '{variable}' to its {axis}, or drop it from {child}",
@@ -1497,10 +1639,20 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut Findings) 
             name = capsule.name,
             declared_by = capsule.declared_by
         );
-        findings.warning(format!(
-            "{name}: {reason} — what it declares is missing from the list above",
-            name = capsule.name
-        ));
+        findings.warning(
+            W_REG_002,
+            DoctorBlock::Environment,
+            Some(capsule.name.to_string()),
+            format!(
+                "{name} (declared by {declared_by}): {reason}",
+                name = capsule.name,
+                declared_by = capsule.declared_by
+            ),
+            format!(
+                "{name}: {reason} — what it declares is missing from the list above",
+                name = capsule.name
+            ),
+        );
     }
 
     capsule_runtime::report_eprintln!(
@@ -1562,7 +1714,7 @@ fn report_roster(
                 code = error.code,
                 message = error.message
             );
-            findings.coded(error.code, &error.message, hint);
+            findings.coded(error.code, DoctorBlock::Roster, None, &error.message, hint);
             return;
         }
     };
@@ -1611,8 +1763,15 @@ fn report_roster(
         _ => capsule_runtime::report_println!("  reachability: {edges}"),
     }
     for overflow in admitted.caller_overflows() {
-        capsule_runtime::report_println!("  {}", caller_overflow_warning(&overflow));
-        findings.warning(caller_overflow_fix(&overflow));
+        let line = caller_overflow_warning(&overflow);
+        capsule_runtime::report_println!("  {line}");
+        findings.warning(
+            W_ROS_001,
+            DoctorBlock::Roster,
+            Some(overflow.member.clone()),
+            without_code(&line, W_ROS_001),
+            caller_overflow_fix(&overflow),
+        );
     }
     capsule_runtime::report_println!();
 }
@@ -1628,9 +1787,10 @@ fn report_door(runtime_manifest: &RuntimeManifest, bind_addr: &str) {
 }
 
 /// Check a formation directory, one holding `roster.yaml` and no `murmur.yaml`: admit its roster
-/// from the stores, and against the lock, that `mur run --roster <dir>` uses, and close with
-/// doctor's tally. A formation directory has no artifacts of its own, so nothing else is checked.
-fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
+/// from the stores, and against the lock, that `mur run --roster <dir>` uses, and return the
+/// findings for doctor's tally. A formation directory has no artifacts of its own, so nothing else
+/// is checked.
+fn check_formation(formation_dir: &Path) -> Result<(u32, Findings), CliError> {
     let mut findings = Findings::default();
     capsule_runtime::report_println!(
         "No {MANIFEST_FILENAME} in {}: checking its {ROSTER_FILENAME}. Run mur doctor in a member's source directory to check that member's artifacts.",
@@ -1647,8 +1807,7 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
         lock.as_ref(),
         &mut findings,
     );
-    print_tally(0, &findings);
-    Ok(())
+    Ok((0, findings))
 }
 
 /// Each driver choice's output cap, context window, input ceiling and input budget under
@@ -1732,15 +1891,19 @@ fn report_model_limits(
                 let Some(warning) = choice.warning.as_deref() else {
                     continue;
                 };
-                capsule_runtime::report_eprintln!(
-                    "[mur doctor] {}",
-                    capsule_runtime::model_limits::model_limits_warning_line(warning)
+                let line = capsule_runtime::model_limits::model_limits_warning_line(warning);
+                capsule_runtime::report_eprintln!("[mur doctor] {line}");
+                findings.warning(
+                    W_RUN_009,
+                    DoctorBlock::ModelLimits,
+                    Some(choice.driver.to_string()),
+                    without_code(&line, W_RUN_009),
+                    format!(
+                        "set context.max_tokens for model '{}' (driver choice '{}'), or use a \
+                         release of {} whose murmur.yaml lists the model under models:",
+                        choice.model, choice.choice, choice.driver
+                    ),
                 );
-                findings.warning(format!(
-                    "set context.max_tokens for model '{}' (driver choice '{}'), or use a release \
-                     of {} whose murmur.yaml lists the model under models:",
-                    choice.model, choice.choice, choice.driver
-                ));
             }
         }
         Err(error) => {
@@ -1752,10 +1915,186 @@ fn report_model_limits(
             );
             findings.coded(
                 refusal.code,
+                DoctorBlock::ModelLimits,
+                None,
                 &refusal.message,
                 refusal.hint.unwrap_or_default(),
             );
         }
+    }
+    capsule_runtime::report_println!();
+}
+
+/// A `transport: process` driver the artifact checklist passed: installed, locked as declared,
+/// and built against interfaces this `mur` serves.
+struct InstalledDriver {
+    /// `name@version`, as the checklist names it.
+    reference: String,
+    name: String,
+    version: String,
+    /// The artifact's `.mur.zip` bytes.
+    bytes: Vec<u8>,
+}
+
+/// The `Fix:` of an untested or unreadable harness version.
+const HARNESS_VERSION_FIX: &str =
+    "install a harness version the driver was tested against, or a driver release tested against \
+     this one";
+
+/// The `Fix:` of a harness the driver reads as logged out.
+const HARNESS_LOGGED_OUT_FIX: &str =
+    "log the harness in as this user on this host \u{2014} the process driver's reason above says how";
+
+/// The `Fix:` of a harness whose login could not be checked.
+const HARNESS_LOGIN_UNCHECKED_FIX: &str =
+    "check by hand that the harness is logged in as this user on this host";
+
+/// The `Process harness` block of a `transport: process` capsule: where the harness binary
+/// resolves, whether its version is one the driver was tested against, and whether the driver
+/// reads it as logged in, all asked through [`capsule_runtime::check_process_harness`] from the
+/// driver, binary, environment and probes `mur run` uses.
+///
+/// `driver` is the inference driver when the checklist passed it. When it did not, the checklist
+/// already counted why, so the block is one line and no finding; so is a driver declared with
+/// `source:` (`local_source`), whose bytes doctor does not hold. A refusal staging would make
+/// before resolving the binary is an error under that refusal's code; a binary that does not
+/// resolve is `E-RUN-006` and gets no version or login line; a logged-out harness is `E-RUN-064`;
+/// an untested version is `W-RUN-002` and a login doctor could not check is `W-RUN-013`. Only the
+/// driver's reason is printed, never what the harness's login command printed.
+fn report_process_harness(
+    runtime_manifest: &RuntimeManifest,
+    driver: Option<&InstalledDriver>,
+    local_source: bool,
+    policy: &capsule_runtime::CapabilityPolicy,
+    project_root: &Path,
+    findings: &mut Findings,
+) {
+    use capsule_runtime::{HarnessBinary, HarnessLogin, HarnessVersion};
+
+    let Some(inference) = runtime_manifest
+        .inference
+        .as_ref()
+        .filter(|inference| inference.transport == "process")
+    else {
+        return;
+    };
+    let Some(driver) = driver else {
+        let name = inference
+            .driver
+            .as_ref()
+            .map(|driver| driver.artifact.as_str())
+            .unwrap_or_default();
+        let why = if local_source {
+            "is a local source"
+        } else {
+            "did not pass the checklist"
+        };
+        capsule_runtime::report_println!("Process harness: not checked, driver {name} {why}");
+        return;
+    };
+    let reference = &driver.reference;
+    let check = match capsule_runtime::check_process_harness(
+        &driver.bytes,
+        &driver.name,
+        &driver.version,
+        inference.command.as_deref(),
+        policy,
+        project_root,
+    ) {
+        Ok(check) => check,
+        Err(error) => {
+            let error = CliError::from(error);
+            capsule_runtime::report_println!("Process harness ({reference}):");
+            capsule_runtime::report_println!(
+                "  \u{2717}  error[{}]: {}",
+                error.code,
+                error.message
+            );
+            findings.coded(
+                error.code,
+                DoctorBlock::Harness,
+                Some(reference.clone()),
+                &error.message,
+                error.hint.unwrap_or_default(),
+            );
+            capsule_runtime::report_println!();
+            return;
+        }
+    };
+    let harness = check.harness;
+    capsule_runtime::report_println!("Process harness ({reference}, harness {harness}):");
+    match check.binary {
+        HarnessBinary::Resolved { path, source } => {
+            capsule_runtime::report_println!(
+                "  \u{2713}  binary   {} (named by {source})",
+                path.display()
+            );
+        }
+        HarnessBinary::NotFound(error) => {
+            let binary = match &error {
+                capsule_runtime::RuntimeError::HarnessBinaryNotFound { binary, .. } => {
+                    Some(binary.clone())
+                }
+                _ => None,
+            };
+            let error = CliError::from(error);
+            capsule_runtime::report_println!(
+                "  \u{2717}  error[{}]: {}",
+                error.code,
+                error.message
+            );
+            findings.coded(
+                error.code,
+                DoctorBlock::Harness,
+                binary,
+                &error.message,
+                error.hint.unwrap_or_default(),
+            );
+        }
+    }
+    match check.version {
+        Some(HarnessVersion::Tested { line }) => {
+            capsule_runtime::report_println!("  \u{2713}  version  {line}, tested");
+        }
+        Some(HarnessVersion::Untested { message }) => {
+            capsule_runtime::report_println!("  \u{26A0}  warning[{W_RUN_002}]: {message}");
+            findings.warning(
+                W_RUN_002,
+                DoctorBlock::Harness,
+                Some(harness.clone()),
+                message,
+                HARNESS_VERSION_FIX,
+            );
+        }
+        None => {}
+    }
+    match check.login {
+        Some(HarnessLogin::LoggedIn) => {
+            capsule_runtime::report_println!("  \u{2713}  login    logged in");
+        }
+        Some(HarnessLogin::LoggedOut { reason }) => {
+            let message = format!("{harness} is not logged in for this user: {reason}");
+            capsule_runtime::report_println!("  \u{2717}  error[{E_RUN_064}]: {message}");
+            findings.coded(
+                E_RUN_064,
+                DoctorBlock::Harness,
+                Some(harness.clone()),
+                &message,
+                HARNESS_LOGGED_OUT_FIX,
+            );
+        }
+        Some(HarnessLogin::NotChecked { reason }) => {
+            let message = format!("login not checked \u{2014} {reason}");
+            capsule_runtime::report_println!("  \u{26A0}  warning[{W_RUN_013}]: {message}");
+            findings.warning(
+                W_RUN_013,
+                DoctorBlock::Harness,
+                Some(harness.clone()),
+                message,
+                HARNESS_LOGIN_UNCHECKED_FIX,
+            );
+        }
+        None => {}
     }
     capsule_runtime::report_println!();
 }
@@ -1795,6 +2134,8 @@ fn report_declared_needs(
             );
             findings.coded(
                 refusal.code,
+                DoctorBlock::Artifacts,
+                None,
                 &refusal.message,
                 refusal.hint.unwrap_or_default(),
             );
@@ -1826,7 +2167,13 @@ fn report_declared_needs(
             let (line, fix) =
                 declared_need_warning(&program.artifact, &program.program, missing, &distributions);
             capsule_runtime::report_println!("  {line}");
-            findings.warning(fix);
+            findings.warning(
+                murmur_artifact::W_RUN_011,
+                DoctorBlock::Artifacts,
+                Some(program.artifact.clone()),
+                without_code(&line, murmur_artifact::W_RUN_011),
+                fix,
+            );
         }
     }
     capsule_runtime::report_println!();
@@ -1926,10 +2273,10 @@ fn render_tally(total_pass: u32, findings: &Findings) -> Tally {
     let mut text =
         format!("{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}.\n");
     if let Some(first) = errors.first() {
-        let _ = writeln!(text, "First refusal: {}", first.headline);
+        let _ = writeln!(text, "First refusal: {}", first.headline());
     }
     text.push('\n');
-    for fix in errors.iter().map(|error| &error.fix).chain(warnings) {
+    for fix in errors.iter().chain(warnings).map(|finding| &finding.fix) {
         let _ = writeln!(text, "Fix: {fix}");
     }
     Tally {
@@ -1949,23 +2296,174 @@ fn print_tally(total_pass: u32, findings: &Findings) {
     }
 }
 
-/// Check every artifact the current project declares against the stores a session
-/// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
-/// is checked, with no change here.
+/// `mur doctor --json`'s verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Verdict {
+    /// No error was found; warnings may have been.
+    Ready,
+    /// At least one error was found.
+    Refused,
+}
+
+/// A finding's severity in `mur doctor --json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Severity {
+    Error,
+    Warning,
+}
+
+/// The one document `mur doctor --json` prints. Serialized keys keep the field order.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct DoctorReport {
+    verdict: Verdict,
+    /// What the process exits with: `0` for [`Verdict::Ready`], `1` for [`Verdict::Refused`].
+    exit_code: i32,
+    /// The tally line's three numbers.
+    checks_passed: u32,
+    errors: usize,
+    warnings: usize,
+    /// Every counted finding, in the order the text form prints its `Fix:` lines: errors, then
+    /// warnings, each in print order.
+    findings: Vec<DoctorFinding>,
+}
+
+/// One entry of [`DoctorReport::findings`]. Serialized keys keep the field order.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct DoctorFinding {
+    severity: Severity,
+    code: &'static str,
+    block: DoctorBlock,
+    /// `null` for a host-wide finding.
+    subject: Option<String>,
+    message: String,
+    fix: String,
+}
+
+impl DoctorFinding {
+    fn new(severity: Severity, finding: &Finding) -> Self {
+        Self {
+            severity,
+            code: finding.code,
+            block: finding.block,
+            subject: finding.subject.clone(),
+            message: finding.message.clone(),
+            fix: finding.fix.clone(),
+        }
+    }
+}
+
+impl DoctorReport {
+    /// The document for a doctor run that reached its tally.
+    fn from_findings(total_pass: u32, findings: &Findings) -> Self {
+        let refused = !findings.errors.is_empty();
+        Self {
+            verdict: if refused {
+                Verdict::Refused
+            } else {
+                Verdict::Ready
+            },
+            exit_code: i32::from(refused),
+            checks_passed: total_pass,
+            errors: findings.errors.len(),
+            warnings: findings.warnings.len(),
+            findings: findings
+                .errors
+                .iter()
+                .map(|finding| DoctorFinding::new(Severity::Error, finding))
+                .chain(
+                    findings
+                        .warnings
+                        .iter()
+                        .map(|finding| DoctorFinding::new(Severity::Warning, finding)),
+                )
+                .collect(),
+        }
+    }
+
+    /// The document for a doctor run `error` stopped before its tally: refused, with `error` as
+    /// its one finding, its hint as the fix.
+    fn early(error: &CliError, block: DoctorBlock) -> Self {
+        Self {
+            verdict: Verdict::Refused,
+            exit_code: 1,
+            checks_passed: 0,
+            errors: 1,
+            warnings: 0,
+            findings: vec![DoctorFinding {
+                severity: Severity::Error,
+                code: error.code,
+                block,
+                subject: None,
+                message: error.message.lines().next().unwrap_or_default().to_string(),
+                fix: error.hint.clone().unwrap_or_default(),
+            }],
+        }
+    }
+
+    /// The pretty-printed document and its closing newline.
+    fn render(&self) -> String {
+        let text = serde_json::to_string_pretty(self)
+            .unwrap_or_else(|error| unreachable!("the doctor report always serializes: {error}"));
+        format!("{text}\n")
+    }
+}
+
+/// `mur doctor [--json]`.
 ///
 /// A current directory holding `roster.yaml` and no `murmur.yaml` is a formation directory, and
-/// is checked as one by [`run_formation_doctor`] without walking up; `bind_addr` has nothing to
-/// check there.
-pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
-    let cwd = std::env::current_dir().map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to determine current directory: {e}"),
-        )
-    })?;
-    if resolve_roster_path(&cwd).exists() && !resolve_manifest_path(&cwd).exists() {
-        return run_formation_doctor(&cwd);
+/// is checked as one by [`check_formation`] without walking up; `bind_addr` has nothing to check
+/// there. Anywhere else [`check_project`] checks the project.
+///
+/// The text form prints the report and its tally on stdout, and exits `1` when an error was found.
+/// With `json`, every line of that text form goes to stderr unchanged, and stdout holds one JSON
+/// document, [`DoctorReport`], whose `exit_code` the process exits with. An error that stops doctor
+/// before its tally is printed as the text form prints it and becomes a `refused` document with
+/// that error as its one finding.
+pub(crate) fn run_doctor(bind_addr: &str, json: bool) -> Result<(), CliError> {
+    if json {
+        capsule_runtime::diagnostic::send_stdout_to_stderr();
     }
+    let (checked, block) = match std::env::current_dir() {
+        Err(e) => (
+            Err(CliError::new(
+                E_IO_003,
+                format!("failed to determine current directory: {e}"),
+            )),
+            DoctorBlock::Project,
+        ),
+        Ok(cwd) if resolve_roster_path(&cwd).exists() && !resolve_manifest_path(&cwd).exists() => {
+            (check_formation(&cwd), DoctorBlock::Roster)
+        }
+        Ok(_) => (check_project(bind_addr), DoctorBlock::Project),
+    };
+    if !json {
+        let (total_pass, findings) = checked?;
+        print_tally(total_pass, &findings);
+        return Ok(());
+    }
+    let report = match checked {
+        Ok((total_pass, findings)) => {
+            capsule_runtime::report_print!("{}", render_tally(total_pass, &findings).text);
+            DoctorReport::from_findings(total_pass, &findings)
+        }
+        Err(error) => {
+            capsule_runtime::runtime_err!("{error}");
+            DoctorReport::early(&error, block)
+        }
+    };
+    capsule_runtime::diagnostic::document_to_stdout(&report.render());
+    if report.exit_code != 0 {
+        std::process::exit(report.exit_code);
+    }
+    Ok(())
+}
+
+/// Check every artifact the current project declares against the stores a session
+/// resolves from, and return the passed-check count and the findings for the tally. The checklist
+/// is the manifest — editing `murmur.yaml` changes what is checked, with no change here.
+fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
     let mut findings = Findings::default();
     let project_root = find_project_root().map_err(|mut error| {
         error.hint = Some(
@@ -2038,17 +2536,21 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 .join(", "),
             _ => "the stripped names".to_string(),
         };
-        findings.predict(PredictedRefusal {
-            code: E_CAP_016,
-            message: error.to_string(),
-            consequence: "`mur run` will refuse this capsule — remove the entries above; no \
+        findings.predict(
+            DoctorBlock::Capabilities,
+            Some(names.clone()),
+            PredictedRefusal {
+                code: E_CAP_016,
+                message: error.to_string(),
+                consequence: "`mur run` will refuse this capsule — remove the entries above; no \
                           manifest setting exempts a name from the credential backstop."
-                .to_string(),
-            fix: format!(
+                    .to_string(),
+                fix: format!(
                 "remove {names} from capabilities.env.allow; the credential backstop strips them \
                  whatever the manifest says"
             ),
-        });
+            },
+        );
     }
 
     // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming a
@@ -2116,14 +2618,18 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             const RAISE: &str = "set `capabilities.containment: sealed` in murmur.yaml, set \
                                  `containment: sealed` in .murmur/config.yaml, or pass \
                                  `--containment sealed`";
-            findings.predict(PredictedRefusal {
-                code: E_CAP_004,
-                message: error.to_string(),
-                consequence: format!(
-                    "`mur run` will refuse this capsule unless the floor is raised — {RAISE}."
-                ),
-                fix: RAISE.to_string(),
-            });
+            findings.predict(
+                DoctorBlock::Capabilities,
+                Some("capabilities.shell.staged_runtime".to_string()),
+                PredictedRefusal {
+                    code: E_CAP_004,
+                    message: error.to_string(),
+                    consequence: format!(
+                        "`mur run` will refuse this capsule unless the floor is raised — {RAISE}."
+                    ),
+                    fix: RAISE.to_string(),
+                },
+            );
         }
     }
 
@@ -2150,7 +2656,10 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             }
             _ => "the interpreter".to_string(),
         };
-        findings.predict(PredictedRefusal {
+        findings.predict(
+            DoctorBlock::Capabilities,
+            Some(interpreters.clone()),
+            PredictedRefusal {
             code: E_CAP_006,
             message: error.to_string(),
             consequence: "`mur run` will refuse this capsule at the declared floor — declare the \
@@ -2161,7 +2670,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 "declare capabilities.shell.interpreter_runtime or capabilities.shell.staged_runtime \
                  for {interpreters}, or lower capabilities.containment"
             ),
-        });
+        },
+        );
     }
     // The second already prints its own `W-SEC-012` and `W-SEC-029` lines, in the same words
     // `mur run` uses, so there is nothing to reformat here — the returned report is only for
@@ -2185,7 +2695,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let host_probe = HostProbe::probe();
     let egress_failure = host_probe.egress_namespace_failure();
     if let Some(refusal) = egress_namespace_refusal(can_spawn_subprocess, egress_failure.as_ref()) {
-        findings.predict(refusal);
+        findings.predict(DoctorBlock::Host, None, refusal);
     }
 
     // The daemon that capsule registers with at launch, gated on `spawn_allows` alone: a capsule
@@ -2308,6 +2818,15 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // Each installed artifact's declared name, `name@version`, and bundled `murmur.yaml`, for the
     // model limits each driver choice resolves to.
     let mut installed_manifests: Vec<(String, String, String)> = Vec::new();
+    // The `transport: process` driver the checklist passed, for the `Process harness` block.
+    let process_driver_name = runtime_manifest
+        .inference
+        .as_ref()
+        .filter(|inference| inference.transport == "process")
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.as_str());
+    let mut process_driver: Option<InstalledDriver> = None;
+    let mut process_driver_local_source = false;
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {
@@ -2331,6 +2850,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 capsule_runtime::report_println!(
                     "  \u{2713}  {ref_str:<col_width$}   local source"
                 );
+                process_driver_local_source |= process_driver_name == Some(name.as_str());
                 total_pass += 1;
             }
             ArtifactPresence::Installed(resolved) => {
@@ -2360,26 +2880,27 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 match verdict {
                     LockVerdict::Ok { pulled_by } => {
                         let unserved = resolved_unserved(&resolved);
+                        if unserved.is_empty() && process_driver_name == Some(name.as_str()) {
+                            process_driver = Some(InstalledDriver {
+                                reference: ref_str.clone(),
+                                name: name.clone(),
+                                version: version.clone(),
+                                bytes: resolved.bytes.to_vec(),
+                            });
+                        }
                         match pulled_by {
                             // The bytes `stage_session` instantiates on the next `mur run`, and the
                             // host resolves one instance name per interface with no fallback, so
                             // a green line here would be one the launch contradicts.
                             _ if !unserved.is_empty() => {
-                                let first = &unserved[0];
-                                let more = if unserved.len() > 1 {
-                                    format!(" (+{} more)", unserved.len() - 1)
-                                } else {
-                                    String::new()
-                                };
-                                let reason = format!(
-                                    "built against {}, {}{more}",
-                                    interface_label(first),
-                                    served_phrase(first)
-                                );
+                                let reason = unserved_reason(&unserved);
                                 capsule_runtime::report_println!(
                                     "  \u{2717}  {ref_str:<col_width$}   \u{2014} {reason}"
                                 );
                                 findings.error(
+                                    E_WIT_LEVEL_001,
+                                    DoctorBlock::Artifacts,
+                                    Some(ref_str.clone()),
                                     format!("{ref_str} \u{2014} {reason}"),
                                     format!(
                                         "{name}: pin {} in murmur.yaml, then run mur install",
@@ -2392,7 +2913,15 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                                 capsule_runtime::report_println!(
                                     "  \u{26A0}  {ref_str:<col_width$}   \u{2014} pulled at runtime by session {session}"
                                 );
-                                findings.warning(format!("mur install {ref_str}"));
+                                findings.warning(
+                                    W_REG_004,
+                                    DoctorBlock::Artifacts,
+                                    Some(ref_str.clone()),
+                                    format!(
+                                        "{ref_str} \u{2014} pulled at runtime by session {session}"
+                                    ),
+                                    format!("mur install {ref_str}"),
+                                );
                                 total_pass += 1;
                             }
                             None => {
@@ -2414,6 +2943,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             "  \u{2717}  {ref_str:<col_width$}   \u{2014} {reason}"
                         );
                         findings.error(
+                            E_RUN_043,
+                            DoctorBlock::Artifacts,
+                            Some(ref_str.clone()),
                             format!("{ref_str} \u{2014} {reason}"),
                             format!("mur install {ref_str}"),
                         );
@@ -2424,6 +2956,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             "  \u{2717}  {ref_str:<col_width$}   \u{2014} {reason}"
                         );
                         findings.error(
+                            E_RUN_003,
+                            DoctorBlock::Artifacts,
+                            Some(ref_str.clone()),
                             format!("{ref_str} \u{2014} {reason}"),
                             format!("mur install {ref_str}"),
                         );
@@ -2436,6 +2971,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             "  \u{2717}  {ref_str:<col_width$}   \u{2014} {reason}"
                         );
                         findings.error(
+                            E_RUN_003,
+                            DoctorBlock::Artifacts,
+                            Some(ref_str.clone()),
                             format!("{ref_str} \u{2014} {reason}"),
                             format!(
                                 "{name}: run mur install, which moves its murmur.lock entry to {version}"
@@ -2454,6 +2992,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             "        actual sha256 (on disk):       {actual}"
                         );
                         findings.error(
+                            E_REG_002,
+                            DoctorBlock::Artifacts,
+                            Some(ref_str.clone()),
                             format!("{ref_str} \u{2014} {reason}"),
                             format!(
                                 "{name}: artifact on disk does not match murmur.lock \u{2014} re-publish or delete the lock"
@@ -2473,6 +3014,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 );
                 findings.coded(
                     refusal.code,
+                    DoctorBlock::Artifacts,
+                    Some(ref_str.clone()),
                     &refusal.message,
                     refusal.hint.unwrap_or_default(),
                 );
@@ -2484,6 +3027,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                     "  \u{2717}  {ref_str:<col_width$}   \u{2014} missing"
                 );
                 findings.error(
+                    E_RUN_008,
+                    DoctorBlock::Artifacts,
+                    Some(ref_str.clone()),
                     format!("{ref_str} \u{2014} missing"),
                     format!("mur install {ref_str}"),
                 );
@@ -2492,6 +3038,14 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     }
 
     report_model_limits(&runtime_manifest, &installed_manifests, &mut findings);
+    report_process_harness(
+        &runtime_manifest,
+        process_driver.as_ref(),
+        process_driver_local_source,
+        &capability_policy,
+        &project_root,
+        &mut findings,
+    );
 
     // `W-RUN-010` in the words a launch prints at staging, counted as a warning.
     if let Some(line) = capsule_runtime::resources::v8_address_space_warning(
@@ -2501,9 +3055,12 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     ) {
         capsule_runtime::report_eprintln!("[mur doctor] {line}");
         findings.warning(
+            murmur_artifact::W_RUN_010,
+            DoctorBlock::Resources,
+            Some("capabilities.resources.memory_bytes".to_string()),
+            without_code(&line, murmur_artifact::W_RUN_010),
             "set capabilities.resources.memory_bytes to 68719476736 (64 GiB) for node, and cap \
-             RAM with capabilities.resources.cgroup_memory_bytes"
-                .to_string(),
+             RAM with capabilities.resources.cgroup_memory_bytes",
         );
     }
 
@@ -2537,8 +3094,18 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     }
 
     for artifact in &interface_findings.stale {
-        if !interface_failed.contains(&format!("{}@{}", artifact.name, artifact.version)) {
-            findings.warning(stale_install_fix(artifact));
+        let reference = format!("{}@{}", artifact.name, artifact.version);
+        if !interface_failed.contains(&reference) {
+            findings.warning(
+                W_REG_003,
+                DoctorBlock::WitLevel,
+                Some(reference.clone()),
+                format!(
+                    "{reference} \u{2014} {}",
+                    unserved_reason(&artifact.unserved)
+                ),
+                stale_install_fix(artifact),
+            );
         }
     }
 
@@ -2554,6 +3121,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     if let Some(fix) = report_cgroup_scope(&cgroup_probe.cgroup_scope, can_spawn_subprocess) {
         findings.coded(
             E_RUN_012,
+            DoctorBlock::CgroupScope,
+            None,
             "no cgroup scope can be created to bound this capsule's subprocesses",
             fix,
         );
@@ -2586,7 +3155,13 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         Err(error) => {
             report_home_unusable(&error);
             let refusal = CliError::from(error);
-            findings.coded(refusal.code, &refusal.message, HOME_UNUSABLE_HINT);
+            findings.coded(
+                refusal.code,
+                DoctorBlock::RuntimeDirectory,
+                None,
+                &refusal.message,
+                HOME_UNUSABLE_HINT,
+            );
         }
     }
 
@@ -2603,8 +3178,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     capsule_runtime::report_println!();
 
-    print_tally(total_pass, &findings);
-    Ok(())
+    Ok((total_pass, findings))
 }
 
 /// The `Host paths` section: each `host_paths` entry of the global config resolved, its access and
@@ -2623,14 +3197,19 @@ fn report_host_paths(
     let mechanism = HostPathMechanism::for_enforcement_tier(enforcement_tier);
     capsule_runtime::report_println!("Host paths");
     let mut refuse = |error: CliError| {
-        findings.predict(PredictedRefusal {
-            code: error.code,
-            message: error.message,
-            consequence: "`mur run` will refuse to launch until that entry is fixed or removed \
+        findings.predict(
+            DoctorBlock::HostPaths,
+            None,
+            PredictedRefusal {
+                code: error.code,
+                message: error.message,
+                consequence:
+                    "`mur run` will refuse to launch until that entry is fixed or removed \
                           from ~/.murmur/config.yaml."
-                .to_string(),
-            fix: "fix or remove that host_paths entry in ~/.murmur/config.yaml".to_string(),
-        });
+                        .to_string(),
+                fix: "fix or remove that host_paths entry in ~/.murmur/config.yaml".to_string(),
+            },
+        );
     };
     let host_paths = match crate::config::launch_host_paths(config, workdir) {
         Ok(host_paths) => host_paths,
@@ -2690,12 +3269,16 @@ fn doctor_containment_stance(
         Ok(crate::stance::Stance::Contained(floor)) => floor,
         Err(error) => {
             let hint = error.hint.unwrap_or_default();
-            findings.predict(PredictedRefusal {
-                code: error.code,
-                message: error.message,
-                consequence: format!("`mur run` will refuse this capsule; {hint}"),
-                fix: hint,
-            });
+            findings.predict(
+                DoctorBlock::Containment,
+                Some("capabilities.containment".to_string()),
+                PredictedRefusal {
+                    code: error.code,
+                    message: error.message,
+                    consequence: format!("`mur run` will refuse this capsule; {hint}"),
+                    fix: hint,
+                },
+            );
             contained_floor
         }
     }
@@ -2812,11 +3395,11 @@ mod tests {
         );
 
         let mut findings = Findings::default();
-        findings.predict(refusal);
+        findings.predict(DoctorBlock::Host, None, refusal);
         assert_eq!(findings.errors.len(), 1);
         assert!(
             findings.errors[0]
-                .headline
+                .headline()
                 .starts_with(&format!("error[{E_CAP_005}]: ")),
             "{:?}",
             findings.errors
@@ -2853,6 +3436,139 @@ mod tests {
         );
     }
 
+    /// Records the checklist's runtime-pulled warning for `reference`, with `fix` as its `Fix:`.
+    fn warn(findings: &mut Findings, fix: &str) {
+        findings.warning(
+            W_REG_004,
+            DoctorBlock::Artifacts,
+            Some("local/pulled@1.0.0".to_string()),
+            "local/pulled@1.0.0 \u{2014} pulled at runtime by session ses_1",
+            fix,
+        );
+    }
+
+    /// Records the checklist's missing line for `reference`.
+    fn missing(findings: &mut Findings, reference: &str) {
+        findings.error(
+            E_RUN_008,
+            DoctorBlock::Artifacts,
+            Some(reference.to_string()),
+            format!("{reference} \u{2014} missing"),
+            format!("mur install {reference}"),
+        );
+    }
+
+    /// The document carries the tally's numbers and every finding in `Fix:` order, each message
+    /// without the `error[<CODE>]: ` prefix the text form heads it with, and keys in the
+    /// documented order.
+    #[test]
+    fn the_json_report_is_the_tally_and_the_findings_in_fix_order() {
+        let mut findings = Findings::default();
+        warn(&mut findings, "mur install local/pulled@1.0.0");
+        findings.coded(
+            E_CAP_005,
+            DoctorBlock::Host,
+            None,
+            "creating a network namespace failed\nsecond line",
+            "make this host able to create the capsule's network namespace",
+        );
+        missing(&mut findings, "local/a@1.0.0");
+        let report = DoctorReport::from_findings(2, &findings);
+        assert_eq!(report.verdict, Verdict::Refused);
+        assert_eq!(report.exit_code, 1);
+        assert_eq!(
+            (report.checks_passed, report.errors, report.warnings),
+            (2, 2, 1)
+        );
+        let fixes: Vec<&str> = report.findings.iter().map(|f| f.fix.as_str()).collect();
+        let tally = render_tally(2, &findings).text;
+        let tally_fixes: Vec<&str> = tally
+            .lines()
+            .filter_map(|line| line.strip_prefix("Fix: "))
+            .collect();
+        assert_eq!(fixes, tally_fixes);
+        assert_eq!(
+            report.findings[0].message,
+            "creating a network namespace failed"
+        );
+        assert_eq!(report.findings[0].subject, None);
+        assert_eq!(report.findings[2].severity, Severity::Warning);
+
+        let rendered = report.render();
+        assert!(rendered.ends_with("}\n"), "{rendered}");
+        let keys: Vec<&str> = [
+            "\"verdict\"",
+            "\"exit_code\"",
+            "\"checks_passed\"",
+            "\"errors\"",
+            "\"warnings\"",
+            "\"findings\"",
+            "\"severity\"",
+            "\"code\"",
+            "\"block\"",
+            "\"subject\"",
+            "\"message\"",
+            "\"fix\"",
+        ]
+        .into_iter()
+        .collect();
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| rendered.find(key).expect(key))
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"block\": \"host\""), "{rendered}");
+        assert!(rendered.contains("\"subject\": null"), "{rendered}");
+    }
+
+    /// Warnings alone are `ready` and exit `0`.
+    #[test]
+    fn the_json_report_with_warnings_only_is_ready() {
+        let mut findings = Findings::default();
+        warn(&mut findings, "mur install local/pulled@1.0.0");
+        let report = DoctorReport::from_findings(1, &findings);
+        assert_eq!(report.verdict, Verdict::Ready);
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.findings.len(), 1);
+    }
+
+    /// An error before the tally is one `refused` finding carrying its code and hint.
+    #[test]
+    fn the_json_report_for_an_early_error_is_one_refused_finding() {
+        let error = CliError::with_hint(E_IO_003, "no murmur.yaml\nmore", "run it in a project");
+        let report = DoctorReport::early(&error, DoctorBlock::Project);
+        assert_eq!(report.verdict, Verdict::Refused);
+        assert_eq!(report.exit_code, 1);
+        assert_eq!(
+            (report.checks_passed, report.errors, report.warnings),
+            (0, 1, 0)
+        );
+        assert_eq!(report.findings[0].code, E_IO_003);
+        assert_eq!(report.findings[0].block, DoctorBlock::Project);
+        assert_eq!(report.findings[0].message, "no murmur.yaml");
+        assert_eq!(report.findings[0].fix, "run it in a project");
+        let bare = DoctorReport::early(&CliError::new(E_IO_003, "x"), DoctorBlock::Roster);
+        assert_eq!(bare.findings[0].fix, "");
+    }
+
+    /// Every block serializes to its kebab-case name.
+    #[test]
+    fn doctor_blocks_serialize_kebab_case() {
+        for (block, name) in [
+            (DoctorBlock::Project, "project"),
+            (DoctorBlock::ModelLimits, "model-limits"),
+            (DoctorBlock::WitLevel, "wit-level"),
+            (DoctorBlock::CgroupScope, "cgroup-scope"),
+            (DoctorBlock::RuntimeDirectory, "runtime-directory"),
+            (DoctorBlock::HostPaths, "host-paths"),
+        ] {
+            assert_eq!(serde_json::to_value(block).unwrap(), name);
+        }
+    }
+
     /// Nothing found closes with `All checks passed.` and does not fail.
     #[test]
     fn the_tally_with_nothing_found_passes() {
@@ -2871,7 +3587,7 @@ mod tests {
     #[test]
     fn the_tally_with_warnings_only_names_no_refusal() {
         let mut findings = Findings::default();
-        findings.warning("mur install local/a@1.0.0");
+        warn(&mut findings, "mur install local/a@1.0.0");
         let tally = render_tally(0, &findings);
         assert_eq!(
             tally.text,
@@ -2879,7 +3595,7 @@ mod tests {
         );
         assert!(!tally.fails);
 
-        findings.warning("second");
+        warn(&mut findings, "second");
         let tally = render_tally(1, &findings);
         assert_eq!(
             tally.text,
@@ -2896,14 +3612,13 @@ mod tests {
         let mut findings = Findings::default();
         findings.coded(
             E_CAP_005,
+            DoctorBlock::Host,
+            None,
             "creating a network namespace failed\nsecond line",
             "make this host able to create the capsule's network namespace",
         );
-        findings.warning("mur install local/pulled@1.0.0");
-        findings.error(
-            "local/a@1.0.0 \u{2014} missing",
-            "mur install local/a@1.0.0",
-        );
+        warn(&mut findings, "mur install local/pulled@1.0.0");
+        missing(&mut findings, "local/a@1.0.0");
         let tally = render_tally(2, &findings);
         assert_eq!(
             tally.text,
@@ -2921,10 +3636,7 @@ mod tests {
     #[test]
     fn the_tally_with_one_error_has_no_warning_count() {
         let mut findings = Findings::default();
-        findings.error(
-            "local/a@1.0.0 \u{2014} missing",
-            "mur install local/a@1.0.0",
-        );
+        missing(&mut findings, "local/a@1.0.0");
         let tally = render_tally(0, &findings);
         assert_eq!(
             tally.text,

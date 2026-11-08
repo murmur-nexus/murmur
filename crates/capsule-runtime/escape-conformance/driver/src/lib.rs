@@ -15,8 +15,8 @@ wit_bindgen::generate!({
 });
 
 use exports::murmur::driver::process::{
-    Description, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
-    LaunchRequest, ToolCallInfo, ToolResultInfo, TurnFailure, Usage,
+    Description, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan, LaunchRequest,
+    LoginCheck, LoginOutput, LoginState, ToolCallInfo, ToolResultInfo, TurnFailure, Usage,
 };
 
 /// The `probe-driver` version this driver reads. `probe-driver --version` prints it as
@@ -45,12 +45,15 @@ impl Guest for ProbeDriver {
             // `probe-driver` spends no tokens and says so with `usage in=0 out=0`. A driver that
             // reported nothing would be refused at staging on any host with a token ceiling.
             reports_usage: true,
+            login_check: LoginCheck::Unavailable(NO_LOGIN.to_string()),
         }
     }
 
     fn launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
         let Some(bridge) = request.bridge else {
-            return Err("the capsule exposes no tools, so the probe has nothing to call".to_string());
+            return Err(
+                "the capsule exposes no tools, so the probe has nothing to call".to_string(),
+            );
         };
         let Some(config) = request.config else {
             return Err("inference.driver.config is required: it names the case".to_string());
@@ -85,7 +88,15 @@ impl Guest for ProbeDriver {
             failed(FailureKind::HarnessError, &exit.stderr_tail)
         }
     }
+
+    /// Never called: `describe` names no login command.
+    fn read_login(_output: LoginOutput) -> LoginState {
+        LoginState::Unknown(NO_LOGIN.to_string())
+    }
 }
+
+/// Why the probe harness has no login to check.
+const NO_LOGIN: &str = "the escape-conformance harness is a test double with no login";
 
 fn failed(kind: FailureKind, message: &str) -> Event {
     Event::TurnFailed(TurnFailure {
@@ -259,7 +270,10 @@ mod tests {
         };
         assert!(matches!(
             ProbeDriver::classify_exit(exit(Some(0), true)),
-            Event::TurnFailed(TurnFailure { kind: FailureKind::Canceled, .. })
+            Event::TurnFailed(TurnFailure {
+                kind: FailureKind::Canceled,
+                ..
+            })
         ));
         assert!(matches!(
             ProbeDriver::classify_exit(exit(Some(0), false)),

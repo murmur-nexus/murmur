@@ -113,6 +113,7 @@ pub const E_RUN_060: &str = "E-RUN-060"; // --unconfined was given to a launch t
 pub const E_RUN_061: &str = "E-RUN-061"; // an installed artifact's murmur.yaml declares implementation: native or execution: native
 pub const E_RUN_062: &str = "E-RUN-062"; // a staged tool ships a malformed programs: block
 pub const E_RUN_063: &str = "E-RUN-063"; // the unconfined stance was chosen while mur's effective uid is 0
+pub const E_RUN_064: &str = "E-RUN-064"; // mur doctor: a transport: process capsule's harness is not logged in for this user, as its process driver reads its login check
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

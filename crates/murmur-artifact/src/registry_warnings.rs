@@ -24,6 +24,13 @@ pub const W_REG_002: &str = "W-REG-002";
 /// fails no run; a declared one fails the checklist instead.
 pub const W_REG_003: &str = "W-REG-003";
 
+/// A declared artifact whose `murmur.lock` pin came from a capsule's runtime pull rather than from
+/// `mur install`.
+///
+/// `mur run` stages it, so nothing is refused, but the pin records a session's choice rather than
+/// the operator's. `mur doctor` names it with the `mur install` that makes the pin the operator's.
+pub const W_REG_004: &str = "W-REG-004";
+
 /// Builds the doc link for a `W-REG-*` code, e.g. `.../diagnostics/#w-reg-001`.
 pub fn registry_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -37,7 +44,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_REG_002, W_REG_003];
+        let codes = [W_REG_002, W_REG_003, W_REG_004];
         for code in codes {
             assert!(code.starts_with("W-REG-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

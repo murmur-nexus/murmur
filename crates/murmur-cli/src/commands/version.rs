@@ -20,6 +20,7 @@ pub(crate) const MACHINE_COMMANDS: &[(&str, u32)] = &[
     ("control show --json", 1),
     ("conversation ls --json", 1),
     ("conversation show --json", 1),
+    ("doctor --json", 1),
     ("eval diff --run --json", 1),
     ("eval show --json", 1),
     ("precompile --json", 1),

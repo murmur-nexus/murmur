@@ -2295,7 +2295,7 @@ fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabili
 /// is looked up on the runtime's own `PATH`. Either way the result must be an executable file, or
 /// the launch is refused here rather than at the first spawn. Returns the absolute path and the
 /// name of the field it came from.
-fn resolve_harness_binary(
+pub(crate) fn resolve_harness_binary(
     command: Option<&str>,
     described_binary: &str,
 ) -> Result<(PathBuf, String), RuntimeError> {
@@ -23281,6 +23281,10 @@ inference:
                 required_env: Vec::new(),
                 streams_text: true,
                 reports_usage: true,
+                login_check: crate::process_driver::LoginCheck::Command(vec![
+                    "auth".to_string(),
+                    "status".to_string(),
+                ]),
             },
             binary: binary.to_path_buf(),
             binary_source: "inference.command".to_string(),

@@ -7,6 +7,18 @@
 
 set -u
 
+# The login check the driver's `describe()` names: one JSON line, and exit 0 whatever the answer,
+# so only what it printed says whether it is logged in. The `token` field stands in for the account
+# details a real harness prints, so a test can prove doctor never shows this output.
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+  case "${FIXTURE_HARNESS_PROFILE:-}" in
+    logged-out) echo '{"loggedIn": false, "token": "fixture-secret-0d1e2f"}' ;;
+    login-unreadable) echo 'not json' ;;
+    *) echo '{"loggedIn": true}' ;;
+  esac
+  exit 0
+fi
+
 if [ "${1:-}" = "--version" ]; then
   if [ "${FIXTURE_HARNESS_PROFILE:-}" = "old-version" ]; then
     echo "fixture-harness 0.9.0"

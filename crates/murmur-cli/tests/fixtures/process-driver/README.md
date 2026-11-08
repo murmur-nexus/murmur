@@ -2,13 +2,14 @@
 
 A test-only process driver, and a fake harness for it to drive, for `tests/process_driver.rs`,
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
-`murmur:driver/process@0.4.0` from the `process-driver` world and imports nothing but WASI.
+`murmur:driver/process@0.5.0` from the `process-driver` world and imports nothing but WASI.
 
-Drivers built against the retired `@0.1.0`, `@0.2.0` and `@0.3.0` live next door, in
-`../process-driver-v1/`, `../process-driver-v2/` and `../process-driver-v3/`, each with the frozen
-`.wit` it was built from; they exist only to be refused.
+Drivers built against the retired `@0.1.0`, `@0.2.0`, `@0.3.0` and `@0.4.0` live next door, in
+`../process-driver-v1/`, `../process-driver-v2/`, `../process-driver-v3/` and
+`../process-driver-v4/`, each with the frozen `.wit` it was built from; they exist only to be
+refused.
 
-Four components are committed under `tool/`, all built from `src/process-driver`:
+Five components are committed under `tool/`, all built from `src/process-driver`:
 
 | Component | Cargo feature | Differs in |
 | --- | --- | --- |
@@ -16,6 +17,7 @@ Four components are committed under `tool/`, all built from `src/process-driver`
 | `tool/process-driver-signal.wasm` | `signal-int` | `describe().interrupt` is `signal-int` |
 | `tool/process-driver-unsupported.wasm` | `unsupported` | `describe().interrupt` is `unsupported`, and the plan names no `interrupt-stdin` |
 | `tool/process-driver-no-usage.wasm` | `no-usage` | `describe().reports-usage` is `false`, and `parse` reads no `usage` line |
+| `tool/process-driver-no-login-check.wasm` | `no-login-check` | `describe().login-check` is `unavailable("fixture-harness has no way to report its login without a turn")` |
 
 Every test but the cancel cases and the unreported-usage cases uses the default build.
 `fake-harness` is a committed executable bash script; a test copies it and `chmod 755`es its copy.
@@ -34,6 +36,7 @@ Every test but the cancel cases and the unreported-usage cases uses the default 
 | `required-env` | `["HOME", "FIXTURE_HARNESS_PROFILE"]` |
 | `streams-text` | `true` |
 | `reports-usage` | `true`, and `false` in the `no-usage` build |
+| `login-check` | `command(["auth", "status"])`, and `unavailable("fixture-harness has no way to report its login without a turn")` in the `no-login-check` build |
 
 ### `launch(request)`
 
@@ -125,10 +128,26 @@ a member that does not parse, an unknown member word or an unknown state makes t
 | otherwise, `code` is `0` | `turn-end("")` |
 | otherwise | `turn-failed { kind: harness-error, message: <stderr-tail> }` |
 
+### `read-login(output)`
+
+| `output.stdout` | `login-state` |
+| --- | --- |
+| A JSON object with `"loggedIn": true` | `logged-in` |
+| A JSON object with `"loggedIn": false` | `logged-out("fixture-harness is not logged in for this user; run fixture-cli auth login")` |
+| Anything else | `unknown("fixture-harness printed no loggedIn field")` |
+
 ## The fake harness
 
-`fake-harness` answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` under
-the `old-version` profile) and exits. Otherwise it reads one task line from stdin and then follows
+`fake-harness` answers `auth status` before anything else, with one line and exit `0`:
+
+| Profile | `auth status` prints |
+| --- | --- |
+| `logged-out` | `{"loggedIn": false, "token": "fixture-secret-0d1e2f"}`. The `token` lets a test prove doctor prints none of the harness's output |
+| `login-unreadable` | `not json` |
+| any other | `{"loggedIn": true}` |
+
+It answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` under the
+`old-version` profile) and exits. Otherwise it reads one task line from stdin and then follows
 `$FIXTURE_HARNESS_PROFILE`:
 
 | Profile | What it does |

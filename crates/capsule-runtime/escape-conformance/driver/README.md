@@ -1,7 +1,7 @@
 # escape-conformance-driver
 
 The process driver the escape-conformance gate runs every case through. It exports
-`murmur:driver/process@0.4.0` from the `process-driver` world, imports nothing but WASI, and
+`murmur:driver/process@0.5.0` from the `process-driver` world, imports nothing but WASI, and
 drives one harness: the gate's own `probe-driver` binary
 (`../src/probe_driver.rs`), which makes predetermined tool calls over the capsule's tool bridge.
 
@@ -23,6 +23,7 @@ with `mur build` at startup, and installs the artifact into each case's project 
 | `required-env` | `[]` |
 | `streams-text` | `false` |
 | `reports-usage` | `true` |
+| `login-check` | `unavailable("the escape-conformance harness is a test double with no login")`; `read-login` answers `unknown` with the same reason |
 
 ### `launch(request)`
 

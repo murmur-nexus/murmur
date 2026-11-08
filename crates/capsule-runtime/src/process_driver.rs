@@ -20,8 +20,9 @@ use crate::ExecutionLimits;
 
 pub use crate::bindings::process_driver::exports::murmur::driver::process::{
     Bridge, Description, DriverFile, Event, ExitStatus, FailureKind, InterruptMethod, LaunchPlan,
-    LaunchRequest, QuotaState, QuotaWindow, RetryInfo, Session, SessionInfo, SessionMode,
-    ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo, TurnFailure, Usage,
+    LaunchRequest, LoginCheck, LoginOutput, LoginState, QuotaState, QuotaWindow, RetryInfo,
+    Session, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress, ToolCallStart,
+    ToolResultInfo, TurnFailure, Usage,
 };
 
 impl QuotaState {
@@ -36,7 +37,7 @@ impl QuotaState {
 }
 
 /// The instance name every process driver exports.
-pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.4.0";
+pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.5.0";
 
 /// Every version of the process interface starts with this, so an export built against another
 /// version is still recognised as a process driver.
@@ -354,8 +355,10 @@ impl ProcessDriver {
 
     /// Calls the driver's `describe`.
     ///
-    /// A trap, an exceeded deadline, or a `required-env` entry that is not a usable variable
-    /// name (empty, or containing `=` or NUL) is [`RuntimeError::ProcessDriverLoad`].
+    /// A trap, an exceeded deadline, a `required-env` entry that is not a usable variable name
+    /// (empty, or containing `=` or NUL), or a `login-check` command naming no arguments is
+    /// [`RuntimeError::ProcessDriverLoad`]. The bare harness binary may start a session, so the
+    /// login check must never run it with nothing after it.
     pub async fn describe(&mut self) -> Result<Description, RuntimeError> {
         self.enter("describe")
             .map_err(|message| self.load_error(message))?;
@@ -387,11 +390,7 @@ impl ProcessDriver {
                 };
                 self.load_error(message)
             })?;
-        if let Some(bad) = unusable_env_name(&description) {
-            return Err(self.load_error(format!(
-                "describe() names {bad:?} in required-env, which is not a usable variable name"
-            )));
-        }
+        validate_description(&self.name, &self.version, &description)?;
         Ok(description)
     }
 
@@ -464,6 +463,28 @@ impl ProcessDriver {
         self.settle("classify-exit", &limits, called)
             .map_err(|message| self.failed_in("classify-exit", message))?
             .map_err(|e| self.call_error("classify-exit", &e))
+    }
+
+    /// Asks the driver to read what its `login-check` command printed.
+    pub async fn read_login(&mut self, output: LoginOutput) -> Result<LoginState, RuntimeError> {
+        self.enter("read-login")
+            .map_err(|message| self.failed_in("read-login", message))?;
+        let limits = self.reset_deadline();
+        let called = self
+            .call_deadlines
+            .bound(
+                &self.name,
+                ComponentRole::ProcessDriver,
+                "read-login",
+                &limits,
+                self.bindings
+                    .murmur_driver_process()
+                    .call_read_login(&mut self.store, &output),
+            )
+            .await;
+        self.settle("read-login", &limits, called)
+            .map_err(|message| self.failed_in("read-login", message))?
+            .map_err(|e| self.call_error("read-login", &e))
     }
 
     /// Gives the next call its own deadline, and returns the limits it runs under. Without this
@@ -561,6 +582,35 @@ fn unusable_env_name(description: &Description) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Refuses a description the runtime cannot act on, as [`RuntimeError::ProcessDriverLoad`]: a
+/// `required-env` name that is not a usable variable name, or a `login-check` command with no
+/// arguments.
+fn validate_description(
+    name: &str,
+    version: &str,
+    description: &Description,
+) -> Result<(), RuntimeError> {
+    let load_error = |message: String| RuntimeError::ProcessDriverLoad {
+        name: name.to_string(),
+        version: version.to_string(),
+        message,
+    };
+    if let Some(bad) = unusable_env_name(description) {
+        return Err(load_error(format!(
+            "describe() names {bad:?} in required-env, which is not a usable variable name"
+        )));
+    }
+    if matches!(&description.login_check, LoginCheck::Command(args) if args.is_empty()) {
+        return Err(load_error(
+            "describe() names a login-check command with no arguments; the bare harness binary \
+             may start a session, so the login check must name the arguments that make it report \
+             its login"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The name and version the `*_process_driver_wasm` helpers give a driver in errors, since bare
 /// bytes carry no artifact name.
 const STANDALONE_NAME: &str = "<wasm>";
@@ -568,21 +618,32 @@ const STANDALONE_VERSION: &str = "";
 
 /// `wasm` compiled on a fresh engine with its own epoch ticker, and a current-thread runtime to
 /// drive one instance of it on: everything the `*_process_driver_wasm` helpers share.
-struct StandaloneDriver {
+pub(crate) struct StandaloneDriver {
     engine: Engine,
     component: Component,
-    rt: tokio::runtime::Runtime,
+    pub(crate) rt: tokio::runtime::Runtime,
     _ticker: EpochTicker,
+    name: String,
+    version: String,
 }
 
 impl StandaloneDriver {
     fn compile(wasm: &[u8]) -> Result<Self, RuntimeError> {
+        Self::compile_named(wasm, STANDALONE_NAME, STANDALONE_VERSION)
+    }
+
+    /// Compiles `wasm`, naming the driver `name` and `version` in every error.
+    pub(crate) fn compile_named(
+        wasm: &[u8],
+        name: &str,
+        version: &str,
+    ) -> Result<Self, RuntimeError> {
         let engine = crate::runtime::build_engine()?;
         let ticker = EpochTicker::spawn(&engine);
         let component =
             Component::new(&engine, wasm).map_err(|e| RuntimeError::ToolComponentCompile {
-                name: STANDALONE_NAME.to_string(),
-                version: STANDALONE_VERSION.to_string(),
+                name: name.to_string(),
+                version: version.to_string(),
                 message: e.to_string(),
             })?;
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -596,15 +657,17 @@ impl StandaloneDriver {
             component,
             rt,
             _ticker: ticker,
+            name: name.to_string(),
+            version: version.to_string(),
         })
     }
 
-    async fn instantiate(&self) -> Result<ProcessDriver, RuntimeError> {
+    pub(crate) async fn instantiate(&self) -> Result<ProcessDriver, RuntimeError> {
         ProcessDriver::instantiate(
             &self.engine,
             &self.component,
-            STANDALONE_NAME,
-            STANDALONE_VERSION,
+            &self.name,
+            &self.version,
             // No session trace exists to drain a firing into.
             CallDeadlines::default(),
         )
@@ -718,7 +781,7 @@ mod tests {
 
     #[test]
     fn process_driver_interface_follows_the_level_it_is_given() {
-        let c = contracts(&["murmur:driver/process@0.4.0"]);
+        let c = contracts(&[PROCESS_DRIVER_IFACE]);
         assert!(check_driver_interface("process", "d", "1.0.0", Some(&c), served()).is_ok());
         match check_driver_interface("process", "d", "1.0.0", Some(&c), level_1()).unwrap_err() {
             RuntimeError::WitLevelMismatch {
@@ -798,7 +861,7 @@ mod tests {
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(
             message.contains(
-                "it imports murmur:text/chunks@0.1.0, and level 4 has no version of murmur:text"
+                "it imports murmur:text/chunks@0.1.0, and level 5 has no version of murmur:text"
             ),
             "{message}"
         );
@@ -921,6 +984,33 @@ mod tests {
             required_env: required_env.iter().map(|v| v.to_string()).collect(),
             streams_text: false,
             reports_usage: false,
+            login_check: LoginCheck::Unavailable("no login".to_string()),
+        }
+    }
+
+    #[test]
+    fn login_check_command_with_arguments_passes() {
+        let mut described = description(&[]);
+        described.login_check = LoginCheck::Command(vec!["auth".to_string(), "status".to_string()]);
+        assert!(validate_description("d", "1.0.0", &described).is_ok());
+        assert!(validate_description("d", "1.0.0", &description(&[])).is_ok());
+    }
+
+    /// A bare harness binary may start a session, so a login check naming no arguments is a
+    /// driver that cannot load.
+    #[test]
+    fn login_check_command_with_no_arguments_is_refused_at_load() {
+        let mut described = description(&[]);
+        described.login_check = LoginCheck::Command(Vec::new());
+        let err = validate_description("d", "1.0.0", &described).unwrap_err();
+        match &err {
+            RuntimeError::ProcessDriverLoad { message, .. } => {
+                assert!(
+                    message.contains("login-check command with no arguments"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 

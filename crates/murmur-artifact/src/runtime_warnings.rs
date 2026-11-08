@@ -82,6 +82,14 @@ pub const W_RUN_010: &str = "W-RUN-010";
 /// package the tool declares for this host's distribution; any other names its reason.
 pub const W_RUN_011: &str = "W-RUN-011";
 
+/// `mur doctor` could not tell whether a `transport: process` capsule's harness is logged in for
+/// this user: its process driver names no way to ask without a turn, the login command could not
+/// be run or did not answer, or the driver could not read what it printed.
+///
+/// Nothing is refused, and `mur run` never asks: a harness that is logged out fails its first turn
+/// with `E-RUN-033`.
+pub const W_RUN_013: &str = "W-RUN-013";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -97,7 +105,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
-            W_RUN_011,
+            W_RUN_011, W_RUN_013,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

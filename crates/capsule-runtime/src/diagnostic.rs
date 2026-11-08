@@ -77,8 +77,44 @@ fn fallback_root() -> Option<WorkdirRoot> {
         .clone()
 }
 
+/// Set by [`send_stdout_to_stderr`]: every line this module would write to standard output goes to
+/// standard error instead, so a command printing one machine-readable document keeps standard
+/// output for it alone.
+static STDOUT_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// From now on, for the rest of the process, send every line this module writes to standard output
+/// — [`to_stdout`], [`credential_to_stdout`], [`raw_to_stdout`], [`report_to_stdout`] and the
+/// macros over them — to standard error instead.
+///
+/// For a command whose `--json` form prints one document on standard output while its text report
+/// still runs: the document goes out through [`document_to_stdout`], which ignores this switch.
+pub fn send_stdout_to_stderr() {
+    STDOUT_TO_STDERR.store(true, Ordering::Release);
+}
+
+fn stdout_goes_to_stderr() -> bool {
+    STDOUT_TO_STDERR.load(Ordering::Acquire)
+}
+
+/// Write `document` verbatim to the real standard output, whatever [`send_stdout_to_stderr`] set,
+/// with the same refusal handling as [`report_to_stdout`].
+pub fn document_to_stdout(document: &str) -> Emitted {
+    if STDOUT_CLOSED.load(Ordering::Acquire) {
+        return Emitted::Dropped;
+    }
+    report_to(
+        &mut std::io::stdout().lock(),
+        document.as_bytes(),
+        &STDOUT_CLOSED,
+        Some(&STDOUT_FAILURE),
+    )
+}
+
 /// Write `line` and a newline to standard output.
 pub fn to_stdout(line: &str) -> Emitted {
+    if stdout_goes_to_stderr() {
+        return to_stderr(line);
+    }
     let fallback = fallback_root();
     emit_to(&mut std::io::stdout().lock(), line, fallback.as_ref())
 }
@@ -87,6 +123,9 @@ pub fn to_stdout(line: &str) -> Emitted {
 /// refuses is [`Emitted::Dropped`], never appended to `logs/bootstrap.log`: a credential written
 /// into the session directory would outlive the one reader it was printed for.
 pub fn credential_to_stdout(line: &str) -> Emitted {
+    if stdout_goes_to_stderr() {
+        return emit_to(&mut std::io::stderr().lock(), line, None);
+    }
     emit_to(&mut std::io::stdout().lock(), line, None)
 }
 
@@ -102,6 +141,9 @@ pub fn to_stderr(line: &str) -> Emitted {
 /// stdout, a rendered report.
 pub fn raw_to_stdout(chunk: &str) -> Emitted {
     let fallback = fallback_root();
+    if stdout_goes_to_stderr() {
+        return emit_raw_to(&mut std::io::stderr().lock(), chunk, fallback.as_ref());
+    }
     emit_raw_to(&mut std::io::stdout().lock(), chunk, fallback.as_ref())
 }
 
@@ -181,6 +223,9 @@ static STDOUT_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 /// output closed and returns [`Emitted::Dropped`]; so does every call after it, without touching
 /// the stream. A refusal other than `BrokenPipe` is also kept for [`stdout_failure`].
 pub fn report_to_stdout(bytes: &[u8]) -> Emitted {
+    if stdout_goes_to_stderr() {
+        return report_to_stderr(bytes);
+    }
     if STDOUT_CLOSED.load(Ordering::Acquire) {
         return Emitted::Dropped;
     }

@@ -96,7 +96,7 @@ pub use registry::{
     LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
     RESERVED_VERSIONS,
 };
-pub use registry_warnings::{registry_warning_link, W_REG_002, W_REG_003};
+pub use registry_warnings::{registry_warning_link, W_REG_002, W_REG_003, W_REG_004};
 pub use roster::{
     load_roster, member_name_format_error, resolve_roster_path, ReachabilityRule, Roster,
     RosterError, RosterMember, RosterReachability, MAX_MEMBER_NAME_LEN, REACHABILITY_ALL,
@@ -128,7 +128,7 @@ pub use runtime_manifest::{
 };
 pub use runtime_warnings::{
     runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008,
-    W_RUN_009, W_RUN_010, W_RUN_011,
+    W_RUN_009, W_RUN_010, W_RUN_011, W_RUN_013,
 };
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,

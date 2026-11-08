@@ -13,8 +13,9 @@ use std::cell::RefCell;
 
 use exports::murmur::driver::process::{
     Description, DriverFile, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
-    LaunchRequest, QuotaState, QuotaWindow, RetryInfo, SessionInfo, SessionMode, ToolCallInfo,
-    ToolCallProgress, ToolCallStart, ToolResultInfo, TurnFailure, Usage,
+    LaunchRequest, LoginCheck, LoginOutput, LoginState, QuotaState, QuotaWindow, RetryInfo,
+    SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo,
+    TurnFailure, Usage,
 };
 
 thread_local! {
@@ -37,6 +38,7 @@ impl Guest for Fixture {
             required_env: vec!["HOME".to_string(), "FIXTURE_HARNESS_PROFILE".to_string()],
             streams_text: true,
             reports_usage: reports_usage(),
+            login_check: login_check(),
         }
     }
 
@@ -111,6 +113,48 @@ impl Guest for Fixture {
                 message: exit.stderr_tail,
             })
         }
+    }
+
+    fn read_login(output: LoginOutput) -> LoginState {
+        match logged_in_field(&output.stdout) {
+            Some(true) => LoginState::LoggedIn,
+            Some(false) => LoginState::LoggedOut(
+                "fixture-harness is not logged in for this user; run fixture-cli auth login"
+                    .to_string(),
+            ),
+            None => LoginState::Unknown("fixture-harness printed no loggedIn field".to_string()),
+        }
+    }
+}
+
+/// How this build asks its harness for its login. The `no-login-check` build says it cannot, which
+/// is what a harness with no way to report its login without a turn looks like to the runtime.
+fn login_check() -> LoginCheck {
+    if cfg!(feature = "no-login-check") {
+        LoginCheck::Unavailable(
+            "fixture-harness has no way to report its login without a turn".to_string(),
+        )
+    } else {
+        LoginCheck::Command(vec!["auth".to_string(), "status".to_string()])
+    }
+}
+
+/// The boolean value of the `loggedIn` key of the JSON object `stdout` holds, or `None` when
+/// `stdout` is not an object or has no boolean `loggedIn`. Enough of JSON for the fake harness's
+/// one-line answer, so the fixture needs no JSON dependency.
+fn logged_in_field(stdout: &str) -> Option<bool> {
+    let text = stdout.trim();
+    if !text.starts_with('{') || !text.ends_with('}') {
+        return None;
+    }
+    let (_, after_key) = text.split_once("\"loggedIn\"")?;
+    let value = after_key.trim_start().strip_prefix(':')?.trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
