@@ -862,7 +862,7 @@ fn mur_ps_names_an_unconfined_capsule() {
 }
 
 /// `mur doctor` with the global config's `unconfined` states the stance and where it came
-/// from; with a manifest floor too, it warns that `mur run` will refuse with `E-RUN-059`.
+/// from; with a manifest floor too, it fails with the `E-RUN-059` refusal `mur run` will make.
 #[test]
 fn mur_doctor_states_the_unconfined_stance() {
     let fixture = Fixture::new();
@@ -892,8 +892,12 @@ fn mur_doctor_states_the_unconfined_stance() {
     fixture.manifest("http://127.0.0.1:9", "", "  containment: scoped\n", "");
     let output = doctor();
     let err = stderr(&output);
-    assert!(err.contains("warning[E-RUN-059]"), "{err}");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(err.contains("[mur doctor] error[E-RUN-059]:"), "{err}");
+    assert!(!err.contains("warning[E-RUN-059]"), "{err}");
     assert!(err.contains("`mur run` will refuse this capsule"), "{err}");
+    assert_eq!(output.status.code(), Some(1), "{out}{err}");
+    assert!(out.contains("\nFirst refusal: error[E-RUN-059]: "), "{out}");
 }
 
 /// A WASM tool's environment, network allowlist and state stores are the same with and without

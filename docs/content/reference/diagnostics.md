@@ -336,7 +336,8 @@ error[E-CAP-002]: invalid filesystem scope '<scope>': scope cannot escape the wo
 The same two rules apply wherever a scope is declared: the capsule-wide
 `capabilities.filesystem.scope`, a per-hook grant, and a per-tool or per-driver narrowing. Like
 `E-CAP-001`, the check runs before any registry pull, artifact compile or workdir creation.
-`scope: "."` is the explicit "whole workdir" grant. See
+`scope: "."` is the explicit "whole workdir" grant. `mur doctor` prints the same error for a
+per-artifact scope, under `<unresolved>` in its `Filesystem preopens` block, and exits `1`. See
 [Filesystem scope](manifest.md#filesystem-scope).
 
 ### E-CAP-003 — declared floor not achievable on this host { #e-cap-003 }
@@ -567,9 +568,9 @@ error[E-RUN-019]: failed to register this session with mur-roost at http://127.0
 `MURMUR_ROOST_URL` unset or blank reports the same code with `MURMUR_ROOST_URL is not set` as the
 reason. The message names the daemon and the reason, never a token.
 
-`mur doctor` reports the same three states — `mur-roost` not installed, `MURMUR_ROOST_URL` not set,
-and nothing answering at the URL it names — for a capsule declaring `capabilities.spawn.allow`, so
-the refusal is visible before a run meets it. See
+`mur doctor` reports the same two states — `MURMUR_ROOST_URL` not set, and nothing answering at
+the URL it names — as this error for a capsule declaring `capabilities.spawn.allow`, and exits `1`.
+When `mur-roost` is not on `PATH`, the error also gives the install command. See
 [Start the daemon](roost-api.md#start-the-daemon) for how to obtain `mur-roost` and start it.
 
 A capsule that declares no spawn capability never reaches this — it opens no connection to the
@@ -1563,7 +1564,8 @@ error[E-RUN-059]: --unconfined cannot run this capsule unconfined: a containment
 | `--unconfined` | `capabilities.containment` in the manifest, `containment` in `.murmur/config.yaml`, a declarable `containment` in `~/.murmur/config.yaml` |
 | `containment: unconfined` in `~/.murmur/config.yaml` | `capabilities.containment` in the manifest, `containment` in `.murmur/config.yaml`. Pass `--containment <class>` to run this launch contained instead |
 
-Every declared floor is named with its source. `mur doctor` prints the same refusal as a warning.
+Every declared floor is named with its source. `mur doctor` prints the same refusal as an error
+and exits `1`.
 
 ### E-RUN-060 — unconfined on a contained launch { #e-run-060 }
 
@@ -1641,7 +1643,7 @@ The check reads the declared floor alone, so it fires identically on a host that
 | What went wrong | the host is too weak for what the capsule declared | the capsule declared too little for what it asked for |
 | Remedy | lower the floor, or move hosts | raise the floor, or drop the grant |
 
-`mur doctor` surfaces the same condition as a warning ahead of a run.
+`mur doctor` reports the same condition as an error ahead of a run, and exits `1`.
 
 ### E-CAP-005 — no network namespace for the subprocess tree { #e-cap-005 }
 
@@ -1683,7 +1685,8 @@ A capsule can spawn a subprocess when `capabilities.shell.allow` or `capabilitie
 non-empty; a WASM tool runs programs through `murmur:process` only from `capabilities.shell.allow`.
 `mur run` checks at staging, before any artifact is pulled.
 
-`mur run` and `mur doctor` print the same reason. `mur doctor` reports the answer as the
+`mur run` and `mur doctor` print the same reason; for a capsule that can spawn a subprocess,
+`mur doctor` prints it as this error and exits `1`. `mur doctor` reports the answer as the
 `network namespace:` line of its `AppArmor / user namespaces` block, for every project, beside the
 `mount namespace:` and `sealed root:` lines. How the three lines and the readings tell host
 conditions apart: [Telling host conditions apart](containment.md#telling-host-conditions-apart).
@@ -1731,7 +1734,7 @@ Measuring it is still yours to do, which is why the hint names the `strace` invo
 
 The check reads only the *declared* floor, never a host probe, and is inert at `scoped` and
 `advisory`: below `sealed` there is no composed root, and the host filesystem is simply the host
-filesystem. `mur doctor` surfaces the same condition ahead of a run, as a warning.
+filesystem. `mur doctor` reports the same condition as an error ahead of a run, and exits `1`.
 
 Two neighbouring codes are easy to confuse with this one:
 
@@ -1979,7 +1982,7 @@ get the same result, and no value ever appears in the message. It is reported by
 |---|---|
 | `mur run`, `mur new`, `mur eval`, and every capsule `mur-roost` launches | Refused at staging, before any artifact is resolved or pulled and before a session directory is created |
 | `mur run --explain-scope` | Refused, by the same code |
-| [`mur doctor`](cli.md#mur-doctor) | `warning[E-CAP-016]`, followed by `` `mur run` will refuse this capsule ``; the rest of the checklist still runs |
+| [`mur doctor`](cli.md#mur-doctor) | `error[E-CAP-016]`, followed by `` `mur run` will refuse this capsule ``; the rest of the checklist still runs, and `mur doctor` exits `1` |
 
 **Why it is a refusal:** the backstop removes these names whatever the manifest declares, so the
 grant would deliver nothing, and a capsule that launched with it would look granted and hold
@@ -2396,8 +2399,8 @@ error[E-CFG-003]: /home/ana/.murmur/config.yaml sets registry.default, which thi
 [`host_paths:`](config.md#host-paths) is read from `~/.murmur/config.yaml` only, and `mur run`
 refuses an entry it cannot honour rather than launch without it. The refusal names the entry's
 index, its path as written, the directory it resolves to when it has one, and the reason. Nothing
-is staged. `mur run --explain-scope` refuses the same entries, and `mur doctor` prints each as a
-warning and continues.
+is staged. `mur run --explain-scope` refuses the same entries, and `mur doctor` prints each as an
+error, continues, and exits `1`.
 
 ```text
 error[E-CFG-004]: ~/.murmur/config.yaml: host_paths[1] (~/tools, resolved to /home/ana/tools): is read-write over /home/ana/tools/bin, a folder this session may run /home/ana/tools/bin/fmt from, so the capsule could rewrite what it runs; at scoped nothing prevents that. Name a folder that does not contain it, make the entry `access: read`, or declare containment: sealed, which binds it read-only
