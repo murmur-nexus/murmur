@@ -70,7 +70,7 @@ Keep `the tool returned failure` separate from `the tool could not run`. A subpr
 2. Extract: when it fires, lifecycle phase, whether evidence is categorical or heuristic, what side effects were prevented, and the documented remedies.
 3. Match the diagnostic's named sub-reason. Codes such as containment failures can have unrelated host, kernel, container, or manifest causes.
 4. Choose the narrowest remedy compatible with the use case and security posture.
-5. Re-run the smallest relevant check. Use `mur doctor` when the reference says it reports the condition without launching; use `mur run --explain-scope` or its JSON form to inspect effective scope when relevant.
+5. Re-run the smallest relevant check. Use `mur doctor` when the reference says it reports the condition without launching (`mur doctor --json` prints its verdict and every finding's code, block and `Fix:` text as one JSON document on stdout; see [`mur doctor --json`](https://docs.murmur.nexus/reference/cli/#mur-doctor-json)); use `mur run --explain-scope` or its JSON form to inspect effective scope when relevant.
 
 Do not generalize across neighboring codes. Similar conditions may have different codes precisely because the operator action differs.
 

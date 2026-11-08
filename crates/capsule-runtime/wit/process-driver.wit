@@ -1,4 +1,4 @@
-package murmur:driver@0.4.0;
+package murmur:driver@0.5.0;
 
 /// The contract between the runtime and a process driver: an artifact that knows how to drive
 /// one harness CLI. Pure translation; the runtime grants it nothing.
@@ -40,6 +40,42 @@ interface process {
     /// a machine ceiling in effect, against such a driver is refused at load: a ceiling that can
     /// never be reached is not a ceiling.
     reports-usage: bool,
+    /// How the runtime asks the harness whether it is signed in for this user, without
+    /// spending a turn.
+    login-check: login-check,
+  }
+
+  /// How the runtime asks the harness whether it is signed in for this user, without spending
+  /// a turn.
+  variant login-check {
+    /// Run `description.binary` with these arguments, the way the version check runs it, and
+    /// hand what it printed to `read-login`. Never empty: a driver naming no arguments is
+    /// refused at load, since the bare binary may start a session.
+    command(list<string>),
+    /// The harness offers no way to ask without a turn; the reason, shown to the person cut to
+    /// its first line and 200 characters.
+    unavailable(string),
+  }
+
+  /// What the login command printed.
+  record login-output {
+    /// The exit code; `none` when a signal ended the command.
+    exit-code: option<s32>,
+    /// Everything the command wrote to stdout.
+    stdout: string,
+    /// Everything the command wrote to stderr.
+    stderr: string,
+  }
+
+  /// Whether the harness is signed in, as the driver reads `login-output`.
+  variant login-state {
+    /// Signed in for this user.
+    logged-in,
+    /// Not signed in for this user; the reason, which names how to sign in and carries no
+    /// credential.
+    logged-out(string),
+    /// The output could not be read; the reason.
+    unknown(string),
   }
 
   /// The endpoint through which the harness calls the capsule's tools.
@@ -346,6 +382,12 @@ interface process {
   /// `turn-end` or `turn-failed`; when `exit.interrupted` is true and no terminal event was
   /// seen it must return `turn-failed` with kind `canceled`, whatever the exit code says.
   classify-exit: func(exit: exit-status) -> event;
+
+  /// Reads what the `login-check.command` printed into whether the harness is signed in.
+  /// Called only for a driver whose `describe` names a `command`, and only when the command
+  /// finished within the bound. The reasons it returns are shown to the person, cut to their
+  /// first line and 200 characters, so they must carry no credential.
+  read-login: func(output: login-output) -> login-state;
 }
 
 /// A process driver exports the `process` interface and imports nothing of Murmur's: it is

@@ -448,7 +448,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-edit@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 3, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 3` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 5, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 5` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-edit@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
@@ -1130,10 +1130,11 @@ the driver with an empty WASI context and grants it nothing.
 
 | Function | Called | Returns |
 |---|---|---|
-| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, and whether it reports token usage |
+| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, whether it reports token usage, and how to ask whether it is logged in (`login-check`) |
 | `launch` | Once per run | The arguments, environment, files and stdin to run the harness with, or an error |
 | `parse` | For each batch of complete stdout lines, including those printed [after the terminal event](#process-after-terminal) | The events those lines describe |
 | `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
+| `read-login` | By `mur doctor`, after running the `login-check` command | Whether the harness is logged in, as a `login-state` |
 
 One driver instance serves a whole run, so `parse` may answer from what `launch` was given. A call
 that refuses, crashes or runs out of time ends the run with
@@ -1261,6 +1262,41 @@ streaming the task as a [`suggested-prompt`](streaming-protocol.md#event-suggest
 task the person cancelled forwards no suggestion, as it forwards no answer; the record is still
 written. The event opens no inference turn.
 
+### Whether the harness is logged in { #process-login }
+
+`mur doctor` asks a process capsule's harness whether it is logged in for this user, without
+spending a turn. Only the driver knows how its harness reports a login, so `description` names how
+to ask, and `read-login` reads the answer. `mur run` never asks.
+
+`description.login-check` is a `login-check` variant:
+
+| Case | Meaning |
+|---|---|
+| `command(list<string>)` | The arguments after `description.binary` that make the harness report its login without a turn, such as `["auth", "status", "--json"]`. Never empty: a driver naming no arguments is refused at load with [`E-RUN-032`](diagnostics.md#e-run-032), since a bare harness binary may start a session |
+| `unavailable(string)` | The harness has no way to ask without a turn; the reason is shown in a [`W-RUN-013`](diagnostics.md#w-run-013) warning |
+
+For a `command`, the runtime runs the binary the way it runs the version check: the resolved binary,
+the host values of the `capabilities.env.allow` names plus the host's `USER` and `LOGNAME`, empty
+stdin, and a 10-second bound. It hands what the command printed to `read-login` as a
+`login-output` record:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `exit-code` | `option<s32>` | The exit code; `none` when a signal ended the command |
+| `stdout` | `string` | Everything it wrote to stdout |
+| `stderr` | `string` | Everything it wrote to stderr |
+
+`read-login` returns a `login-state`:
+
+| Case | `mur doctor` reports |
+|---|---|
+| `logged-in` | `✓  login    logged in` |
+| `logged-out(string)` | [`E-RUN-064`](diagnostics.md#e-run-064) with the reason. The reason names how to sign in and carries no credential |
+| `unknown(string)` | [`W-RUN-013`](diagnostics.md#w-run-013) with the reason: the output could not be read |
+
+The person sees only the driver's reason, cut to its first line and 200 characters, never what the
+command printed. See [Process harness](cli.md#doctor-process-harness).
+
 ### Events after the terminal event { #process-after-terminal }
 
 Once the driver has returned `turn-end` or `turn-failed`, the runtime closes the harness's stdin and
@@ -1307,7 +1343,7 @@ serve it.
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
-| `murmur:driver` | `0.4.0` |
+| `murmur:driver` | `0.5.0` |
 
 | Tier | When |
 |---|---|

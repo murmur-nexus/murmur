@@ -21,7 +21,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
     ("murmur:conversation", "0.2.0"),
-    ("murmur:driver", "0.4.0"),
+    ("murmur:driver", "0.5.0"),
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),
@@ -151,8 +151,48 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_4() {
-        assert_eq!(served_wit_level().level, 4);
+    fn wit_levels_served_level_is_level_5() {
+        assert_eq!(served_wit_level().level, 5);
+    }
+
+    /// Level 5 moved `murmur:driver` alone, for the login check, so an artifact built at level 4
+    /// whose interfaces name no `murmur:driver` package fits level 5 unchanged, and a level-4
+    /// process driver does not.
+    #[test]
+    fn wit_levels_level_5_moves_only_the_driver_package() {
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
+        let levels = wit_levels();
+        let (four, five) = (&levels[3], &levels[4]);
+        assert_eq!(four.packages.len(), five.packages.len());
+        let moved: Vec<_> = four
+            .packages
+            .iter()
+            .zip(&five.packages)
+            .filter(|(before, after)| before != after)
+            .collect();
+        let driver = |version: &str| ("murmur:driver".to_string(), version.to_string());
+        assert_eq!(moved, [(&driver("0.4.0"), &driver("0.5.0"))]);
+
+        let contracts = |exports: &[&str], imports: &[&str]| WitContracts {
+            exports: exports.iter().map(|e| e.to_string()).collect(),
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
+        };
+        let tool = || {
+            contracts(
+                &["murmur:tool/run@0.2.0"],
+                &["murmur:stream/events@0.1.0", "murmur:process/process@0.1.0"],
+            )
+        };
+        assert!(fits(tool(), four));
+        assert!(fits(tool(), five));
+        let driver_at =
+            |version: &str| contracts(&[&format!("murmur:driver/process@{version}")], &[]);
+        assert!(fits(driver_at("0.4.0"), four));
+        assert!(!fits(driver_at("0.4.0"), five));
+        assert!(fits(driver_at("0.5.0"), five));
     }
 
     /// Level 4 adds `murmur:process` as a new package and moves nothing else, so an artifact fits

@@ -25,14 +25,14 @@ use tempfile::TempDir;
 const REPO: &str = "ana/drivers";
 const CONFIG: &str = "registry:\n  sources:\n    - repo: ana/drivers\n";
 
-/// The process driver this mur serves, and the one built against `murmur:driver@0.3.0`, the
+/// The process driver this mur serves, and the one built against `murmur:driver@0.4.0`, the
 /// version before it.
 fn current_wasm() -> PathBuf {
     common::fixture_path("process-driver/tool/process-driver.wasm")
 }
 
 fn previous_wasm() -> PathBuf {
-    common::fixture_path("process-driver-v3/tool/process-driver-v3.wasm")
+    common::fixture_path("process-driver-v4/tool/process-driver-v4.wasm")
 }
 
 /// `mur` under `home`, run from `cwd`, against the GitHub API at `api_base`.
@@ -137,7 +137,7 @@ fn run_refused(home: &Path, project: &Path, api_base: &str, driver: &str) -> Str
         format!("'{driver}@1.0.0'"),
         format!("does not fit WIT level {}", level.level),
         format!(
-            "it exports murmur:driver/process@0.3.0, and level {} has murmur:driver@{driver_version}",
+            "it exports murmur:driver/process@0.4.0, and level {} has murmur:driver@{driver_version}",
             level.level
         ),
     ] {
@@ -173,12 +173,12 @@ fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
     let index = publish(&stub, "v2", staging.path());
 
     // The built artifact's label is in the index as written; the hand-packed one is given the
-    // newest level its interfaces fit: level 1, the last to have `murmur:driver@0.3.0`.
+    // newest level its interfaces fit: level 4, the last to have `murmur:driver@0.4.0`.
     let versions = &index["artifacts"][0]["versions"];
     assert_eq!(versions[0]["version"], "1.1.0");
     assert_eq!(versions[0]["built_at_level"], served_wit_level().level);
     assert_eq!(versions[1]["version"], "1.0.0");
-    assert_eq!(versions[1]["built_at_level"], 1, "{versions}");
+    assert_eq!(versions[1]["built_at_level"], 4, "{versions}");
 
     let (home, project) = fixture("ana/process-driver");
     seed_global(home.path(), &previous);

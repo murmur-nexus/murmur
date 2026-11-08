@@ -25,7 +25,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
-| `murmur:driver`          | `0.4.0`  |
+| `murmur:driver`          | `0.5.0`  |
 
 `SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
@@ -432,6 +432,37 @@ source calls, so a tool built against the extended `tool` world that does not
 call `murmur:process` names exactly what it named before. An artifact therefore
 fits level 4 exactly when it fits level 3, unless it imports the new package,
 which fits level 4 only.
+
+`murmur:driver` then went to `0.5.0`, WIT level 5, so that `mur doctor` can ask
+whether a process capsule's harness is logged in for this user without spending
+a turn. Only the driver knows how its harness reports a login, so the question
+goes through the driver: `description` gained a last field, `login-check`, a new
+variant that is either `command(list<string>)`, the arguments after the harness
+binary that make it report its login, or `unavailable(string)`, the reason it
+cannot; and the interface gained a function, `read-login`, which turns a new
+`login-output` record (`exit-code`, `stdout`, `stderr`) into a new `login-state`
+variant (`logged-in`, `logged-out(string)`, `unknown(string)`). The runtime runs
+the command exactly as it runs the version check, hands what it printed to the
+driver, and prints only the driver's reason. A field appended to a record and a
+function added to an interface are both breaking under the rule below, so the
+minor moved. Its instance name is now `murmur:driver/process@0.5.0`.
+
+An optional extra export, which a driver could leave out, was declined: the
+host would have to ask whether a driver exports it before calling it, which is
+the feature detection the next section rules out. A `command` naming no
+arguments is refused when the driver loads, since a bare harness binary may
+start a session. `mur run` asks nothing new at launch: a logged-out harness
+still fails its first turn.
+
+The cost was paid knowingly. Every installed `@0.4.0` driver is refused at
+launch with `E-WIT-LEVEL-001` the moment `mur` upgrades: it does not fit WIT
+level 5, it exports `murmur:driver/process@0.4.0`, and level 5 has
+`murmur:driver@0.5.0`. Every published process driver, `driver-claude-code`
+among them, must be rebuilt against `0.5.0`. One `@0.4.0` component stays
+committed under `crates/murmur-cli/tests/fixtures/process-driver-v4/`, beside
+the older ones and with its own frozen `.wit`, so that refusal stays testable.
+No other package moved, so an artifact whose interfaces are all outside
+`murmur:driver` fits level 5 exactly when it fits level 4.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

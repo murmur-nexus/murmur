@@ -89,6 +89,7 @@ loses its key.
 | `control show --json` | 1 | [`mur control`](#mur-control) |
 | `conversation ls --json` | 1 | [`mur conversation ls`](#mur-conversation-ls) |
 | `conversation show --json` | 1 | [`mur conversation show`](#mur-conversation-show) |
+| `doctor --json` | 1 | [`mur doctor --json`](#mur-doctor-json) |
 | `eval diff --run --json` | 1 | [`mur eval diff --run`](#mur-eval-diff-run) |
 | `eval show --json` | 1 | [`mur eval show`](#mur-eval-show) |
 | `precompile --json` | 1 | [`mur precompile`](#mur-precompile) |
@@ -614,7 +615,7 @@ mur build [source] [--output <path-or-dir>]
 
 ```bash
 mur build .
-# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 3)
+# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 5)
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
@@ -1000,12 +1001,13 @@ murmur/tool-git          {{ v.murmur_tool_git }}    tool     murmur:tool/run@0.2
 Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store resolution `mur run` performs before staging. In a formation directory, check that its `roster.yaml` is admitted.
 
 ```bash
-mur doctor [--bind <ADDR>]
+mur doctor [--bind <ADDR>] [--json]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--bind` | `127.0.0.1` | The address `mur run --bind` would bind the capsule's door on. With an address off loopback and no [`network.authentication`](manifest.md#field-network-authentication), prints [`W-SEC-032`](diagnostics.md#w-sec-032) |
+| `--json` | off | Print one JSON document on stdout: the verdict, the exit code, the tally and every finding. The text report goes to stderr. See [`mur doctor --json`](#mur-doctor-json) |
 
 What it checks depends on the current directory:
 
@@ -1037,6 +1039,8 @@ For a `transport: http` capsule whose drivers are installed, a `Model limits:` b
 | `✗ error[E-RUN-052]: …` | A choice with no output cap, or a driver with a malformed `models:` table. Adds a `Fix:` line and makes `mur doctor` exit `1` |
 | `✗ error[E-RUN-055]: …` | A choice, or the compaction call, left no input budget: [`E-RUN-055`](diagnostics.md#e-run-055). Adds a `Fix:` line and makes `mur doctor` exit `1` |
 | `Model limits: not checked, driver <name> is not installed` | A choice's driver is missing; the checklist already names it |
+
+For a `transport: process` capsule, a `Process harness` block follows the model limits: whether the harness binary resolves, whether its version is one the process driver was tested against, and whether the driver reads it as logged in. See [Process harness](#doctor-process-harness).
 
 For a capsule whose installed tools declare [needs](containment.md#declared-program-needs) for a program its `capabilities.shell.allow` grants, a `Declared needs:` block follows:
 
@@ -1183,7 +1187,8 @@ or [`E-RUN-043`](diagnostics.md#e-run-043) pin, a `Model limits` refusal, a malf
 `programs:` block in `Declared needs` ([`E-RUN-062`](diagnostics.md#e-run-062)), the `Environment
 requirements` errors ([`E-CAP-014`](diagnostics.md#e-cap-014),
 [`E-CAP-015`](diagnostics.md#e-cap-015)), a refused [roster](#doctor-roster), a refused
-[cgroup scope](#doctor-cgroup-scope) and a `HOME` that cannot hold `~/.murmur`.
+[cgroup scope](#doctor-cgroup-scope), a `HOME` that cannot hold `~/.murmur`, and the
+[`Process harness`](#doctor-process-harness) errors.
 
 With an error, the line after the tally is `First refusal: <headline>`, naming the first error in
 the order `mur doctor` printed them:
@@ -1204,6 +1209,131 @@ First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess 
 Fix: make this host able to create the capsule's network namespace — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-005
 Fix: give `mur` a delegated cgroup v2 scope: …
 ```
+
+### `mur doctor --json` { #mur-doctor-json }
+
+```bash
+mur doctor --json
+```
+
+Standard output holds one JSON document and nothing else. Every line the text form prints, the
+tally and `First refusal:` included, goes to stderr unchanged. The process exits with the
+document's `exit_code`.
+
+```json
+{
+  "verdict": "refused",
+  "exit_code": 1,
+  "checks_passed": 1,
+  "errors": 1,
+  "warnings": 1,
+  "findings": [
+    {
+      "severity": "error",
+      "code": "E-RUN-008",
+      "block": "artifacts",
+      "subject": "murmur/tool-git@1.0.0",
+      "message": "murmur/tool-git@1.0.0 — missing",
+      "fix": "mur install murmur/tool-git@1.0.0"
+    },
+    {
+      "severity": "warning",
+      "code": "W-REG-004",
+      "block": "artifacts",
+      "subject": "murmur/skill-review@1.0.0",
+      "message": "murmur/skill-review@1.0.0 — pulled at runtime by session ses_0190a1b2c3d4",
+      "fix": "mur install murmur/skill-review@1.0.0"
+    }
+  ]
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `verdict` | string | `ready` when no error was found (warnings allowed), `refused` otherwise |
+| `exit_code` | integer | `0` for `ready`, `1` for `refused`: what the process exits with |
+| `checks_passed` | integer | The tally line's passed checks |
+| `errors` | integer | The tally line's errors: the number of `findings` with `severity: error` |
+| `warnings` | integer | The tally line's warnings: the number of `findings` with `severity: warning` |
+| `findings[].severity` | string | `error` or `warning` |
+| `findings[].code` | string | The `E-`/`W-` code; see [Diagnostics](diagnostics.md). Every finding has one |
+| `findings[].block` | string | The block the finding came from; see the table below |
+| `findings[].subject` | string or `null` | The artifact (`name@version`), member, capsule, variable, path, binary or manifest field the finding concerns; `null` for a host-wide finding |
+| `findings[].message` | string | The finding's one-line headline, without an `error[<CODE>]: ` prefix |
+| `findings[].fix` | string | Its `Fix:` line's text, verbatim |
+
+`findings` are the findings the tally counts, in the order the text form prints their `Fix:`
+lines: errors in print order, then warnings in print order. When `verdict` is `refused`,
+`findings[0]` is the first refusal. The stderr posture lines that are not counted, such as the
+`W-SEC-*` warnings, are not findings.
+
+| `block` | Findings from |
+|---|---|
+| `project` | Finding the project and reading `murmur.yaml` |
+| `capabilities` | The manifest's `capabilities`: [`E-CAP-016`](diagnostics.md#e-cap-016), [`E-CAP-004`](diagnostics.md#e-cap-004), [`E-CAP-006`](diagnostics.md#e-cap-006) |
+| `containment` | The containment stance: [`E-RUN-059`](diagnostics.md#e-run-059) |
+| `host` | The host's network namespace: [`E-CAP-005`](diagnostics.md#e-cap-005) |
+| `roost` | The `mur-roost` daemon: [`E-RUN-019`](diagnostics.md#e-run-019) |
+| `environment` | `Environment requirements`: [`E-CAP-014`](diagnostics.md#e-cap-014), [`E-CAP-015`](diagnostics.md#e-cap-015), [`W-REG-002`](diagnostics.md#w-reg-002), and an unreadable `.env` as `E-IO-003` |
+| `roster` | [`Roster`](#doctor-roster): its `E-ROS-*` refusal and [`W-ROS-001`](diagnostics.md#w-ros-001) |
+| `preopens` | `Filesystem preopens`: [`E-CAP-002`](diagnostics.md#e-cap-002) |
+| `artifacts` | The checklist (`E-RUN-008`, `E-RUN-003`, [`E-REG-002`](diagnostics.md#e-reg-002), [`E-RUN-043`](diagnostics.md#e-run-043), [`E-RUN-061`](diagnostics.md#e-run-061), [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), [`W-REG-004`](diagnostics.md#w-reg-004)) and `Declared needs` ([`E-RUN-062`](diagnostics.md#e-run-062), [`W-RUN-011`](diagnostics.md#w-run-011)) |
+| `model-limits` | `Model limits`: [`E-RUN-052`](diagnostics.md#e-run-052), [`E-RUN-054`](diagnostics.md#e-run-054), [`E-RUN-055`](diagnostics.md#e-run-055), [`W-RUN-009`](diagnostics.md#w-run-009) |
+| `harness` | [`Process harness`](#doctor-process-harness) |
+| `resources` | [`W-RUN-010`](diagnostics.md#w-run-010) |
+| `wit-level` | [`WIT level`](#doctor-interface-versions): [`W-REG-003`](diagnostics.md#w-reg-003) |
+| `cgroup-scope` | [`Cgroup scope`](#doctor-cgroup-scope): `E-RUN-012` |
+| `runtime-directory` | [`Runtime directory`](#doctor-runtime-directory): [`E-IO-004`](diagnostics.md#e-io-004) |
+| `host-paths` | [`Host paths`](#doctor-host-paths): [`E-CFG-004`](diagnostics.md#e-cfg-004) |
+
+An error that stops `mur doctor` before its tally (no project, an unreadable `murmur.yaml`, a `HOME`
+that cannot hold `~/.murmur`) is printed on stderr as the text form prints it, and the document is
+`refused`, `exit_code: 1`, with that error as its one finding: its code, block `project` (`roster`
+in a formation directory), `subject: null`, the error's message, and its hint as `fix` (`""` when
+it has none).
+
+```bash
+mur doctor --json 2>/dev/null | jq -r .verdict
+```
+
+### Process harness { #doctor-process-harness }
+
+For a capsule with `inference.transport: process`, `mur doctor` prints a `Process harness` block
+after the model limits. It asks the same process driver, resolves the same binary and runs the same
+probes, with the same environment, that `mur run` uses:
+
+```text
+Process harness (murmur/driver-claude-code@1.0.0, harness claude-code):
+  ✓  binary   /home/me/.local/bin/claude (named by the process driver's describe())
+  ✓  version  2.1.319 (Claude Code), tested
+  ✓  login    logged in
+```
+
+| Line | Severity | Meaning |
+|---|---|---|
+| `✓  binary   <path> (named by <source>)` | — | The harness binary resolved, from `inference.command` or the driver's `describe()` |
+| `✗  error[E-RUN-006]: …` | error | The binary does not resolve: [`E-RUN-006`](diagnostics.md#e-run-006). No version or login line follows |
+| `✗  error[E-RUN-032]: …` | error | The driver cannot be loaded or describes itself unusably: [`E-RUN-032`](diagnostics.md#e-run-032). Printed under the heading `Process harness (<driver>@<version>):` |
+| `✗  error[E-CAP-019]: …` | error | A variable the driver requires is not in `capabilities.env.allow`: [`E-CAP-019`](diagnostics.md#e-cap-019) |
+| `✓  version  <line>, tested` | — | The harness printed a version the driver was tested against |
+| `⚠  warning[W-RUN-002]: …` | warning | The version is untested or could not be read, in the words `mur run` prints: [`W-RUN-002`](diagnostics.md#w-run-002) |
+| `✓  login    logged in` | — | The driver reads the harness's login answer as logged in |
+| `✗  error[E-RUN-064]: <harness> is not logged in for this user: <reason>` | error | The driver reads it as logged out: [`E-RUN-064`](diagnostics.md#e-run-064) |
+| `⚠  warning[W-RUN-013]: login not checked — <reason>` | warning | The driver has no way to ask without a turn, the login command did not answer, or the driver could not read its answer: [`W-RUN-013`](diagnostics.md#w-run-013) |
+
+The `<reason>` is the process driver's own, cut to its first line and 200 characters. What the
+harness's login command printed is never shown: it can carry account details.
+
+The login command is the driver's [`login-check`](wit-interfaces.md#process-login), run as the
+version check is run: the resolved binary, the host values of the `capabilities.env.allow` names
+plus the host's `USER` and `LOGNAME`, empty stdin, and a 10-second bound.
+
+When `mur doctor` has no installed driver it can load, the block is one line and adds no finding:
+
+| Line | When |
+|---|---|
+| `Process harness: not checked, driver <name> did not pass the checklist` | The driver is missing, its `murmur.lock` entry does not match, or it is built against a `murmur:driver` version this `mur` does not serve. The checklist line above it is the counted error |
+| `Process harness: not checked, driver <name> is a local source` | The driver is declared with `source:`, which `mur doctor` does not load |
 
 ### Memory bound { #doctor-memory-bound }
 
@@ -1244,7 +1374,7 @@ one of three lines:
 
 | Line | Meaning | Effect |
 |---|---|---|
-| `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it, [marked untrusted](../concepts/access-control.md#artifact-origin) | Warning: `Fix: mur install name@version`. Exit code unchanged |
+| `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it, [marked untrusted](../concepts/access-control.md#artifact-origin) | Warning [`W-REG-004`](diagnostics.md#w-reg-004): `Fix: mur install name@version`. Exit code unchanged |
 | `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver`, `gateway:` or `inference.system_prompt_artifact`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
 | `· name@version   pulled at runtime by session <session> — not declared in murmur.yaml, so mur run does not stage it` | A pulled entry `murmur.yaml` does not declare, printed after the checklist | None |
 
@@ -1436,7 +1566,7 @@ payload. The check never writes to either store.
 
 ```text
 WIT level
-  this mur serves WIT level 3:
+  this mur serves WIT level 5:
     PACKAGE                  VERSION
     murmur:artifact-manager  0.1.0
     murmur:capsule           0.1.0
@@ -1444,9 +1574,9 @@ WIT level
     murmur:tool-registry     0.2.0
 
   installed:
-    local/built-tool@0.1.0   global    built at 3                fits level 3
-    local/notes@0.1.0        global    built at 3 (derived)      fits level 3
-    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 3
+    local/built-tool@0.1.0   global    built at 5                fits level 5
+    local/notes@0.1.0        global    built at 3 (derived)      fits level 5
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 5
   ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
@@ -4292,7 +4422,7 @@ mur version [--json]
 ```text
 mur 1.1.0-dev
 commit 0123456789abcdef0123456789abcdef01234567
-WIT level 3
+WIT level 5
 
 PACKAGE                  VERSION
 murmur:artifact-manager  0.1.0
@@ -4311,7 +4441,7 @@ padded to its widest cell plus two spaces.
 {
   "mur_version": "1.1.0-dev",
   "commit": "0123456789abcdef0123456789abcdef01234567",
-  "wit_level": 3,
+  "wit_level": 5,
   "packages": [
     {
       "package": "murmur:artifact-manager",

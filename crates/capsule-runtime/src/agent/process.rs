@@ -88,7 +88,8 @@ const BRIDGE_BIND_ADDR: &str = "127.0.0.1";
 /// working resets it every time it says anything.
 const PROCESS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// How long the version probe may take before the version counts as unreadable.
+/// How long a probe of the harness (its version, its login) may take before its answer counts as
+/// unreadable.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a harness that has produced its terminal event is given to exit on its own after its
@@ -401,10 +402,10 @@ fn substitute_files_dir(value: &str, files_dir: &str) -> String {
     value.replace(FILES_DIR_TOKEN, files_dir)
 }
 
-/// The environment the version probe runs with, and the one the harness's own is built on: the
-/// host values of the names `capabilities.env.allow` declares, then the host's `USER` and
+/// The environment the version and login probes run with, and the one the harness's own is built
+/// on: the host values of the names `capabilities.env.allow` declares, then the host's `USER` and
 /// `LOGNAME` as `account` holds them.
-pub(super) fn harness_base_env(
+pub(crate) fn harness_base_env(
     policy: &CapabilityPolicy,
     account: &HostAccountEnv,
 ) -> BTreeMap<String, String> {
@@ -520,33 +521,41 @@ fn check_driver_file_name(name: &str) -> Result<(), String> {
 /// The line is whatever the harness printed, which is usually its own name and then a version, so
 /// every whitespace-separated token is a candidate. One leading `v` is dropped, because a harness
 /// that prints `v1.2.3` and a driver that lists `1.2.3` mean the same release.
-fn version_is_tested(line: &str, tested_versions: &[String]) -> bool {
+pub(crate) fn version_is_tested(line: &str, tested_versions: &[String]) -> bool {
     line.split_whitespace()
         .map(|token| token.strip_prefix('v').unwrap_or(token))
         .any(|token| tested_versions.iter().any(|tested| tested == token))
 }
 
 /// What the version probe found.
-enum VersionProbe {
+pub(crate) enum VersionProbe {
     /// The first non-empty line the harness printed, trimmed.
     Read(String),
     /// No version could be read, and why.
     Unavailable(String),
 }
 
-/// Run the harness with the driver's `version-args` and read back what it printed.
-///
-/// Empty stdin, the same base environment and working directory as the run itself, and a short
-/// bound of its own: a harness that hangs on `--version` must not hold up the run.
-async fn probe_harness_version(
+/// What one probe of the harness printed.
+pub(crate) struct ProbeOutput {
+    /// The exit code; `None` when a signal ended the harness.
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Runs `binary` with `args` the way every probe of the harness runs it: empty stdin, `env` and
+/// nothing else, `cwd`, and a bound of [`VERSION_PROBE_TIMEOUT`], so a harness that hangs cannot
+/// hold up what asked. `Err` is why nothing could be read: `it could not be run: …` or `it did not
+/// answer within 10s`.
+pub(crate) async fn run_harness_probe(
     binary: &Path,
-    version_args: &[String],
+    args: &[String],
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> VersionProbe {
+) -> Result<ProbeOutput, String> {
     let mut command = Command::new(binary);
     command
-        .args(version_args)
+        .args(args)
         .env_clear()
         .envs(env)
         .current_dir(cwd)
@@ -554,23 +563,38 @@ async fn probe_harness_version(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return VersionProbe::Unavailable(format!("it could not be run: {error}")),
+    let child = command
+        .spawn()
+        .map_err(|error| format!("it could not be run: {error}"))?;
+    match tokio::time::timeout(VERSION_PROBE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(ProbeOutput {
+            exit_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }),
+        Ok(Err(error)) => Err(format!("it could not be run: {error}")),
+        Err(_) => Err(format!(
+            "it did not answer within {}s",
+            VERSION_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Run the harness with the driver's `version-args` and read back what it printed.
+///
+/// Empty stdin, the same base environment and working directory as the run itself, and a short
+/// bound of its own: a harness that hangs on `--version` must not hold up the run.
+pub(crate) async fn probe_harness_version(
+    binary: &Path,
+    version_args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> VersionProbe {
+    let output = match run_harness_probe(binary, version_args, env, cwd).await {
+        Ok(output) => output,
+        Err(reason) => return VersionProbe::Unavailable(reason),
     };
-    let output = match tokio::time::timeout(VERSION_PROBE_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return VersionProbe::Unavailable(format!("it could not be run: {error}"))
-        }
-        Err(_) => {
-            return VersionProbe::Unavailable(format!(
-                "it did not answer within {}s",
-                VERSION_PROBE_TIMEOUT.as_secs()
-            ))
-        }
-    };
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return VersionProbe::Unavailable("it exited non-zero".to_string());
     }
     match first_non_empty_line(&output.stdout).or_else(|| first_non_empty_line(&output.stderr)) {
@@ -588,7 +612,7 @@ fn first_non_empty_line(bytes: &[u8]) -> Option<String> {
 }
 
 /// The `W-RUN-002` body: what was read, or why nothing was, and what the driver was tested against.
-fn untested_version_message(probe: &VersionProbe, tested_versions: &[String]) -> String {
+pub(crate) fn untested_version_message(probe: &VersionProbe, tested_versions: &[String]) -> String {
     let tested = if tested_versions.is_empty() {
         "the driver names no tested versions".to_string()
     } else {

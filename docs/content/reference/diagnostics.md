@@ -149,6 +149,7 @@ section that explains it.
 | `E-RUN-061` | An installed artifact's `murmur.yaml` declares `implementation: native` or `execution: native`; refused by a launch, `mur doctor` and a runtime pull | [E-RUN-061](#e-run-061) |
 | `E-RUN-062` | A staged tool's `programs:` block is malformed or names a need by host path; refused by a launch, `mur run --explain-scope` and `mur doctor` | [E-RUN-062](#e-run-062) |
 | `E-RUN-063` | The unconfined stance was chosen while `mur` runs as root | [E-RUN-063](#e-run-063) |
+| `E-RUN-064` | `mur doctor`: a `transport: process` harness is not logged in for this user, as its process driver reads its login check | [E-RUN-064](#e-run-064) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -162,6 +163,7 @@ section that explains it.
 | `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
 | `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-REG-003` | An installed artifact does not fit the WIT level this `mur` serves | [W-REG-003](#w-reg-003) |
+| `W-REG-004` | A declared artifact's `murmur.lock` pin came from a capsule's runtime pull | [W-REG-004](#w-reg-004) |
 | `W-ROS-001` | A roster lets more members call a member than its `lifecycle` holds at once | [W-ROS-001](#w-ros-001) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
@@ -172,6 +174,7 @@ section that explains it.
 | `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
 | `W-RUN-010` | `capabilities.shell.allow` names `node` or `nodejs` and the address-space limit its commands run under is below 32 GiB | [W-RUN-010](#w-run-010) |
 | `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host cannot grant it | [W-RUN-011](#w-run-011) |
+| `W-RUN-013` | `mur doctor` could not tell whether a `transport: process` harness is logged in | [W-RUN-013](#w-run-013) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -487,6 +490,27 @@ The name comes from one of two places, and the message says which:
 
 The same code covers a `transport: http` inference driver artifact that is not installed in the
 local artifact store.
+
+[`mur doctor`](cli.md#doctor-process-harness) reports it for a process capsule, as an error in its
+`Process harness` block.
+
+### E-RUN-064 — the process harness is not logged in { #e-run-064 }
+
+`mur doctor` ran a `transport: process` capsule's harness with its process driver's
+[`login-check`](wit-interfaces.md#process-login) command, and the driver read the answer as logged
+out for this user. The first turn of `mur run` would fail on authentication with
+[`E-RUN-033`](#e-run-033).
+
+```text
+  ✗  error[E-RUN-064]: claude-code is not logged in for this user: not logged in; run claude auth login
+```
+
+The reason after the colon is the process driver's, cut to one line of at most 200 characters.
+What the harness printed is never shown.
+
+**What to do:** log the harness in as the user who runs `mur`, on this host, the way the driver's
+reason says. `mur run` checks nothing at launch: the code comes only from `mur doctor`, in its
+[`Process harness`](cli.md#doctor-process-harness) block.
 
 ### E-RUN-015 — `--resume` and `--context` together { #e-run-015 }
 
@@ -860,7 +884,7 @@ tool — refuses a version that does not fit before anything is written, as a to
 places the pull may use, or says none does:
 
 ```text
-does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 3, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 3 has murmur:tool-registry@0.2.0; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 3
+does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 5, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 5 has murmur:tool-registry@0.2.0; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 5
 ```
 
 | Situation | Hint |
@@ -878,12 +902,12 @@ At staging:
 The message names the artifact, the served level, and one clause per interface that does not fit:
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 3, the level this mur serves: it names murmur:tool/run@9.9.9, and level 3 has murmur:tool@0.2.0
-  hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 3; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
+error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 5, the level this mur serves: it names murmur:tool/run@9.9.9, and level 5 has murmur:tool@0.2.0
+  hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 5; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
 ```
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 3, the level this mur serves: it exports murmur:driver/process@0.3.0, and level 3 has murmur:driver@0.4.0
+error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 5, the level this mur serves: it exports murmur:driver/process@0.4.0, and level 5 has murmur:driver@0.5.0
 ```
 
 A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
@@ -904,11 +928,11 @@ served level. Finding it downloads no payload:
 | The artifact was installed from a file (`local/`) | `` local/<name> was installed from a file, so no source's index can name a version of it that fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file `` |
 
 ```text
-  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 3; pin it in murmur.yaml and run `mur install`, or run `mur install ana/process-driver@1.1.0`
-  hint: no version of ana/process-driver in github:ana/drivers's index fits level 3; rebuild it against level 3's packages (`mur version` lists them)
-  hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 3's packages (`mur version` lists them)
-  hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 3; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 3's packages (`mur version` lists them)
-  hint: local/process-driver was installed from a file, so no source's index can name a version of it that fits level 3; rebuild it against level 3's packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file
+  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 5; pin it in murmur.yaml and run `mur install`, or run `mur install ana/process-driver@1.1.0`
+  hint: no version of ana/process-driver in github:ana/drivers's index fits level 5; rebuild it against level 5's packages (`mur version` lists them)
+  hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 5's packages (`mur version` lists them)
+  hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 5; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 5's packages (`mur version` lists them)
+  hint: local/process-driver was installed from a file, so no source's index can name a version of it that fits level 5; rebuild it against level 5's packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file
 ```
 
 `mur doctor` lists every installed artifact that does not fit, under its
@@ -921,12 +945,12 @@ be served by at any level:
 
 | Driver | Refused when | Hint |
 |---|---|---|
-| The `inference.driver` artifact of a `transport: process` capsule | It exports no version of `murmur:driver/process`, so it is not a process driver | `rebuild the driver against murmur:driver/process@0.4.0, or name a process driver` |
+| The `inference.driver` artifact of a `transport: process` capsule | It exports no version of `murmur:driver/process`, so it is not a process driver | `rebuild the driver against murmur:driver/process@0.5.0, or name a process driver` |
 | Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports a `murmur:stream` interface at the served package version under a name the package does not define, such as `murmur:stream/other@0.1.0` | `` rebuild <name> against murmur:stream/events@0.1.0, the stream interface this mur serves; pin a release built against it in murmur.yaml and run `mur install` `` |
 
 ```text
-error[E-RUN-029]: artifact 'my-process-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.4.0; a process driver must be built against the process-driver world
-  hint: rebuild the driver against murmur:driver/process@0.4.0, or name a process driver
+error[E-RUN-029]: artifact 'my-process-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.5.0; a process driver must be built against the process-driver world
+  hint: rebuild the driver against murmur:driver/process@0.5.0, or name a process driver
 ```
 
 A driver at another version of either interface is
@@ -938,7 +962,7 @@ A `transport: http` manifest names an artifact under `inference.driver` that exp
 driver interface. `mur run` refuses at staging, before the driver runs.
 
 ```text
-error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.4.0, the process driver interface; name it under transport: process, or name an http driver
+error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.5.0, the process driver interface; name it under transport: process, or name an http driver
   hint: set inference.transport: process to use this driver, or name an http driver
 ```
 
@@ -955,7 +979,7 @@ The message ends with the reason; for an import, it names the interface.
 
 ```text
 error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:stream/events@0.1.0`, but a matching implementation was not found in the linker
-  hint: the driver must export murmur:driver/process@0.4.0 and import nothing but WASI
+  hint: the driver must export murmur:driver/process@0.5.0 and import nothing but WASI
 ```
 
 ### E-RUN-033 — a harness turn failed { #e-run-033 }
@@ -2509,7 +2533,7 @@ or lists only versions that do not fit this `mur`. The message names the artifac
 and for versions that do not fit, the newest one and why:
 
 ```text
-error[E-NEW-007]: the artifact index github:murmur-nexus/default-artifacts v1.0.0 lists no version of murmur/driver-anthropic that fits this mur; the newest it lists, 1.1.0, needs murmur:driver/process@9.9.9, this mur serves murmur:driver@0.4.0
+error[E-NEW-007]: the artifact index github:murmur-nexus/default-artifacts v1.0.0 lists no version of murmur/driver-anthropic that fits this mur; the newest it lists, 1.1.0, needs murmur:driver/process@9.9.9, this mur serves murmur:driver@0.5.0
   hint: upgrade mur, or pass --index <PATH|URL> naming an artifact index that lists a version of murmur/driver-anthropic this mur fits
 ```
 
@@ -2852,7 +2876,7 @@ into the report.
 
 ```text
   installed:
-    ana/stale-hook@0.3.0   global    built at none (derived)   does not fit level 3
+    ana/stale-hook@0.3.0   global    built at none (derived)   does not fit level 5
   ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 ```
@@ -2868,6 +2892,19 @@ against the version this `mur` serves, and pin it in `murmur.yaml` if the projec
 [`mur doctor`](cli.md#doctor-interface-versions) prints this warning for every stale artifact in
 the project and global stores that this project does not declare. A stale artifact the project
 does declare fails the checklist instead, because the next `mur run` refuses it.
+
+### W-REG-004 — a declared artifact is pinned from a runtime pull { #w-reg-004 }
+
+```text
+  ⚠  ana/demo-skill@0.1.0   — pulled at runtime by session ses_0190a1b2c3d4
+```
+
+**Fires when** `murmur.yaml` declares a tool or skill whose `murmur.lock` entry a capsule wrote
+when it pulled the artifact at runtime, rather than `mur install`. `mur run` stages it,
+[marked untrusted](../concepts/access-control.md#artifact-origin). Nothing is refused, and
+[`mur doctor`](cli.md#lock-integrity) counts it among its warnings.
+
+**What to do:** run `mur install <name>@<version>`, which makes the pin the operator's.
 
 ---
 
@@ -3265,6 +3302,26 @@ warnings. Nothing is refused: a launch grants the needs this host has and report
 **What to do:** install the package named, or the one that provides the need on this
 distribution. For a need that is not granted, put the program on `PATH`, or install the library
 or file where the reason shows it is not under the home folder or a folder the capsule can write.
+
+### W-RUN-013 — a process harness's login was not checked { #w-run-013 }
+
+```text
+  ⚠  warning[W-RUN-013]: login not checked — the harness has no way to report its login without a turn
+```
+
+**Fires when** [`mur doctor`](cli.md#doctor-process-harness) cannot tell whether a
+`transport: process` capsule's harness is logged in for this user:
+
+| Cause | The reason after `—` |
+|---|---|
+| The process driver's [`login-check`](wit-interfaces.md#process-login) is `unavailable` | The driver's reason |
+| The login command could not be run, or did not answer within 10 seconds | `it could not be run: …` or `it did not answer within 10s` |
+| The driver could not read what the command printed (`read-login` returned `unknown`, or failed) | The driver's reason, or its failure |
+
+Nothing is refused, and `mur run` never asks: a harness that is logged out fails its first turn
+with [`E-RUN-033`](#e-run-033).
+
+**What to do:** check by hand that the harness is logged in as this user on this host.
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
