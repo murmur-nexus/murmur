@@ -10,6 +10,7 @@
 //! |---|---|---|
 //! | restriction bound to `1` | `1` | succeeds |
 //! | the same, then `chroot` | `1` | `EPERM` (the kernel refuses a chrooted process) |
+//! | `user.max_user_namespaces` written to `0` | the host's | `ENOSPC` (no user namespace left) |
 //!
 //! A host where a construction cannot be built prints `[SKIP-HOST]` and the case returns.
 
@@ -38,6 +39,9 @@ enum Construction {
     /// The restriction reads `1` and `mur` runs chrooted, where `unshare(CLONE_NEWUSER)` fails
     /// with `EPERM`.
     RestrictionReadsOneChrooted,
+    /// `mur` runs in a user namespace whose `user.max_user_namespaces` is `0`, where
+    /// `unshare(CLONE_NEWUSER)` fails with `ENOSPC` whatever AppArmor says.
+    UserNamespacesExhausted,
 }
 
 /// The scratch files a construction binds or chroots into.
@@ -66,12 +70,15 @@ impl Construction {
     fn unshare_flags(self) -> &'static str {
         match self {
             Self::RestrictionReadsOne | Self::RestrictionReadsOneChrooted => "-Urm",
+            Self::UserNamespacesExhausted => "-Ur",
         }
     }
 
     /// The setup, ending in `exec "$0" "$@"` (or its `chroot` form) so the program runs as the
     /// construction's own process. `$RESTRICT` and `$ROOT` come from [`Scratch`]; `chroot` starts
-    /// in `/`, so the chrooted form changes back to `$CWD`, the command's working directory.
+    /// in `/`, so the chrooted form changes back to `$CWD`, the command's working directory. The
+    /// `max_user_namespaces` write limits the user namespace `unshare -Ur` created, never the
+    /// host's.
     fn script(self) -> String {
         let bind = format!(
             "mount --bind \"$RESTRICT\" {RESTRICT_PROC} && \
@@ -83,6 +90,9 @@ impl Construction {
                 "{bind} && mount --rbind / \"$ROOT\" && \
                  exec chroot \"$ROOT\" sh -c 'cd \"$CWD\" && exec \"$0\" \"$@\"' \"$0\" \"$@\""
             ),
+            Self::UserNamespacesExhausted => {
+                "echo 0 > /proc/sys/user/max_user_namespaces && exec \"$0\" \"$@\"".to_string()
+            }
         }
     }
 
@@ -136,8 +146,9 @@ impl Construction {
     }
 
     /// `None` when the construction works here, else why it does not. Checks what the case
-    /// relies on: the setup succeeds, the reading is what the case expects, and AppArmor is
-    /// enabled where the case needs a reading of `1` to mean the restriction is on.
+    /// relies on: the setup succeeds, and then either the reading is what the case expects with
+    /// AppArmor enabled, where the case needs a reading of `1` to mean the restriction is on, or a
+    /// user namespace cannot be created, where the case needs exactly that.
     fn unavailable(self, scratch: &Scratch) -> Option<String> {
         let probe = |program: &str, args: &[&str]| {
             self.command(scratch, Path::new("/"), Path::new(program), args)
@@ -155,9 +166,18 @@ impl Construction {
             }
             Err(error) => return Some(error),
         }
-        let (file, expected) = match self {
-            Self::RestrictionReadsOne | Self::RestrictionReadsOneChrooted => (RESTRICT_PROC, "1"),
-        };
+        if let Self::UserNamespacesExhausted = self {
+            return match probe("unshare", &["-U", "true"]) {
+                Ok(output) if output.status.success() => Some(
+                    "`unshare -U true` still creates a user namespace with max_user_namespaces \
+                     at 0"
+                        .to_string(),
+                ),
+                Ok(_) => None,
+                Err(error) => Some(error),
+            };
+        }
+        let (file, expected) = (RESTRICT_PROC, "1");
         let read = match probe("cat", &[file]) {
             Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
             Err(error) => return Some(error),
@@ -228,9 +248,10 @@ fn staging_project(read_only: &[&str], shell_allow: &[&str]) -> tempfile::TempDi
     project
 }
 
-/// What one `mur` invocation printed.
+/// What one `mur` invocation printed, and how it exited.
 struct Run {
     success: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -239,6 +260,7 @@ impl Run {
     fn of(output: Output) -> Self {
         Self {
             success: output.status.success(),
+            code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
@@ -517,7 +539,8 @@ fn a_session_under_the_reading(test: &str, class: &str, mapped_by: &str) {
 
 /// Where the namespace really cannot be created and the restriction reads `1`, `mur run` refuses
 /// with `E-CAP-005` naming the failed call, its `errno` and the reading, before any session
-/// exists; `mur doctor` gives the same reason and reports the namespace as refused.
+/// exists; `mur doctor` gives the same reason as an error, fails, and reports the namespace as
+/// refused.
 #[test]
 fn a_refused_namespace_names_the_call_the_errno_and_the_reading() {
     let test = "a_refused_namespace_names_the_call_the_errno_and_the_reading";
@@ -553,10 +576,16 @@ fn a_refused_namespace_names_the_call_the_errno_and_the_reading() {
         doctor.all()
     );
     assert!(
-        doctor.stderr.contains("warning[E-CAP-005]"),
+        doctor.stderr.contains("[mur doctor] error[E-CAP-005]:"),
         "{}",
         doctor.all()
     );
+    assert!(
+        !doctor.stderr.contains("warning[E-CAP-005]"),
+        "{}",
+        doctor.all()
+    );
+    assert_eq!(doctor.code, Some(1), "{}", doctor.all());
     let reason = reason_of(&run.stderr);
     assert!(
         doctor.stderr.contains(&reason),
@@ -595,6 +624,75 @@ fn a_refused_namespace_names_the_call_the_errno_and_the_reading() {
             "{shortfall}"
         );
     }
+}
+
+/// Where no user namespace can be created — the kernel has none left to give, no AppArmor
+/// involved — a capsule that can run a subprocess is one `mur run` refuses with `E-CAP-005`, so
+/// `mur doctor` fails: the refusal is an error on stderr, the tally counts it, and the line after
+/// the tally names it as the first refusal.
+#[test]
+fn a_host_without_a_network_namespace_fails_doctor() {
+    let test = "a_host_without_a_network_namespace_fails_doctor";
+    let construction = Construction::UserNamespacesExhausted;
+    let scratch = Scratch::new();
+    if skip(test, construction, &scratch) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: namespace-probe-capsule\nversion: 0.1.0\nartifacts: []\n\
+         capabilities:\n  shell:\n    allow: [ls]\n",
+    )
+    .unwrap();
+
+    let doctor = Run::of(
+        construction
+            .command(&scratch, project.path(), &mur_path(), &["doctor"])
+            .env("HOME", home.path())
+            .output()
+            .unwrap(),
+    );
+
+    assert_eq!(doctor.code, Some(1), "{}", doctor.all());
+    assert!(
+        doctor.stderr.contains("[mur doctor] error[E-CAP-005]:"),
+        "{}",
+        doctor.all()
+    );
+    assert!(
+        !doctor.stderr.contains("warning[E-CAP-005]"),
+        "{}",
+        doctor.all()
+    );
+    assert!(
+        !doctor.stdout.contains("All checks passed."),
+        "{}",
+        doctor.all()
+    );
+    let lines: Vec<&str> = doctor.stdout.lines().collect();
+    let tally = lines
+        .iter()
+        .position(|line| line.starts_with("0 checks passed, ") && line.contains(" found"))
+        .unwrap_or_else(|| panic!("doctor never reached its tally\n{}", doctor.all()));
+    assert!(
+        !lines[tally].contains(" 0 errors found"),
+        "{}",
+        doctor.all()
+    );
+    assert!(
+        lines[tally + 1].starts_with("First refusal: error[E-CAP-005]: "),
+        "{}",
+        doctor.all()
+    );
+    assert_eq!(lines[tally + 2], "", "{}", doctor.all());
+    assert!(
+        lines[tally + 3..].iter().any(|line| line
+            .starts_with("Fix: make this host able to create the capsule's network namespace")),
+        "{}",
+        doctor.all()
+    );
 }
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";

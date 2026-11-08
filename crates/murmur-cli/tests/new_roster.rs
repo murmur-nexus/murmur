@@ -984,7 +984,7 @@ fn error_line(stderr: &str) -> &str {
 }
 
 /// `mur doctor` in `crew/` checks the formation: before the members are installed it refuses with
-/// the error `mur run --roster crew` gives, and once the printed steps have run it prints the
+/// the error `mur run --roster crew` gives, named again after the tally, and once the printed steps have run it prints the
 /// admitted roster and passes.
 #[test]
 fn doctor_in_the_scaffolded_formation_checks_its_roster() {
@@ -1015,9 +1015,15 @@ fn doctor_in_the_scaffolded_formation_checks_its_roster() {
         .iter()
         .position(|line| *line == "0 checks passed, 1 error found.");
     let tally = tally.unwrap_or_else(|| panic!("no tally in\n{}", refused.stdout));
-    assert_eq!(lines[tally + 1], "");
-    assert!(lines[tally + 2].starts_with("Fix: "), "{}", refused.stdout);
-    assert_eq!(lines.len(), tally + 3, "{}", refused.stdout);
+    assert_eq!(
+        lines[tally + 1],
+        format!("First refusal: {refusal}"),
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(lines[tally + 2], "");
+    assert!(lines[tally + 3].starts_with("Fix: "), "{}", refused.stdout);
+    assert_eq!(lines.len(), tally + 4, "{}", refused.stdout);
     assert!(!refused.stderr.contains("E-IO-001"), "{}", refused.stderr);
 
     // The printed steps run: the formation is admitted.

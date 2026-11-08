@@ -6,7 +6,7 @@
 //! whether the three surfaces are distinguishable in the output a person actually sees.
 //!
 //! `--explain-scope` returns ahead of every side effect, so most of these need only a
-//! `murmur.yaml` and no installed artifact at all. The two that need one say so.
+//! `murmur.yaml` and no installed artifact at all. The ones that need one say so.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -385,4 +385,56 @@ fn doctor_reports_the_same_preopens_without_changing_its_verdict() {
     // The verdict is the artifact checklist's alone: two present artifacts, no fix lines.
     assert!(stdout.contains("All checks passed."), "got:\n{stdout}");
     assert!(!stdout.contains("Fix:"), "got:\n{stdout}");
+}
+
+/// A scope outside the workdir is the `E-CAP-002` refusal `mur run` makes, so doctor fails with
+/// it: the entry's preopens read `<unresolved>`, the refusal is an error, and the checklist still
+/// reaches its tally.
+#[test]
+fn doctor_fails_on_a_scope_outside_the_workdir() {
+    let home = TempDir::new().unwrap();
+    let fixture = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "",
+        &[artifact_entry(
+            "notes-tool",
+            "tool",
+            Some("\n      filesystem:\n        scope: ../outside"),
+        )],
+    );
+    install_wasm_artifact(fixture.path(), dir.path(), "notes-tool", "wasm");
+
+    let assertion = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(dir.path())
+        .arg("doctor")
+        .assert()
+        .code(1);
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stdout.contains("Filesystem preopens\n  <unresolved>\n"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("[mur doctor] error[E-CAP-002]:"),
+        "got:\n{stderr}"
+    );
+    assert!(stderr.contains("../outside"), "got:\n{stderr}");
+    assert!(!stderr.contains("warning[E-CAP-002]"), "got:\n{stderr}");
+    assert!(
+        stdout.contains("\nFirst refusal: error[E-CAP-002]: "),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Fix: local/notes-tool: give it a capabilities.filesystem.scope inside the workdir"
+        ),
+        "got:\n{stdout}"
+    );
+    assert!(!stdout.contains("All checks passed."), "got:\n{stdout}");
 }

@@ -24,7 +24,7 @@ use tempfile::TempDir;
 /// dependency of the run and doctor's roost report fire.
 ///
 /// The capsule it names is installed, and declares nothing, so the `Environment requirements`
-/// block that fires on the same declaration finds nothing to report and the roost warning is the
+/// block that fires on the same declaration finds nothing to report and the roost refusal is the
 /// only finding.
 fn create_delegating_project(home: &TempDir, project_dir: &Path) {
     install_capsule(
@@ -209,14 +209,19 @@ fn global_store(home: &TempDir) -> PathBuf {
 /// `mur doctor` with every variable a case cares about named explicitly — each either exported or
 /// removed — so its set/unset expectations do not depend on what the machine running the suite
 /// happens to have in its shell.
+///
+/// `MURMUR_ROOST_URL` names a daemon that answers, so a spawn closure's findings are the
+/// `Environment requirements` block's alone and no `E-RUN-019` joins them.
 fn mur_doctor_with_env(
     home: &TempDir,
     project_dir: &Path,
     variables: &[(&str, Option<&str>)],
 ) -> assert_cmd::assert::Assert {
+    let (roost_url, _registry) = start_roost();
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
+        .env("MURMUR_ROOST_URL", &roost_url)
         .current_dir(project_dir)
         // A cyclic spawn.allow must terminate. Bounded so a walk that recursed forever fails the
         // case rather than hanging the suite.
@@ -1106,38 +1111,45 @@ fn doctor_prints_the_landlock_block_and_never_changes_the_exit_code() {
 
 // ── The daemon a delegating capsule registers with ────────────────────────────
 
-/// A capsule that can delegate, on a host where the daemon cannot be obtained at all: the state
-/// an operator would otherwise meet as an `E-RUN-019` mid-run. Doctor names the code, says the
-/// binary is missing, and says where it comes from — and changes neither the checklist nor the
-/// exit status.
+/// A capsule that can delegate, with no daemon named and none installed: `mur run` refuses it
+/// with `E-RUN-019` for the unset `MURMUR_ROOST_URL`, so doctor fails with that error, and the
+/// missing binary is advice inside it, naming where `mur-roost` comes from.
 #[test]
-fn doctor_warns_when_a_delegating_capsule_has_no_mur_roost_on_path() {
+fn doctor_fails_on_an_unset_roost_url_and_says_how_to_install_mur_roost() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let empty_path = TempDir::new().unwrap();
     create_delegating_project(&home, project.path());
 
-    let assert =
-        mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).success();
+    let assert = mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).code(1);
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
-    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(
+        stderr.contains("[mur doctor] error[E-RUN-019]:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(stderr.contains("is not set"), "{stderr}");
     assert!(
         stderr.contains("mur-roost was not found on PATH"),
         "{stderr}"
     );
     assert!(stderr.contains("install.murmur.rs"), "{stderr}");
+    assert!(!stdout.contains("All checks passed."), "{stdout}");
     assert!(
-        stdout.contains("All checks passed."),
-        "the report must not touch the tally, got:\n{stdout}"
+        stdout.contains("0 checks passed, 1 error found.\nFirst refusal: error[E-RUN-019]: "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Fix: set MURMUR_ROOST_URL to a running mur-roost daemon"),
+        "{stdout}"
     );
 }
 
-/// The daemon is installed and nothing names it. Distinct wording from the missing-binary arm:
-/// the fix is an environment variable, not an install.
+/// The daemon is installed and nothing names it: the same refusal, with no install advice.
 #[test]
-fn doctor_names_the_unset_roost_url_when_the_daemon_is_installed() {
+fn doctor_fails_on_an_unset_roost_url_when_mur_roost_is_installed() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
@@ -1145,19 +1157,27 @@ fn doctor_names_the_unset_roost_url_when_the_daemon_is_installed() {
 
     let assert =
         mur_doctor_with_roost_env(&home, project.path(), &path_with_roost(bin.path()), None)
-            .success();
+            .code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
-    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(
+        stderr.contains("[mur doctor] error[E-RUN-019]:"),
+        "{stderr}"
+    );
     assert!(stderr.contains("MURMUR_ROOST_URL"), "{stderr}");
     assert!(stderr.contains("is not set"), "{stderr}");
     assert!(!stderr.contains("was not found on PATH"), "{stderr}");
+    assert!(
+        stdout.contains("First refusal: error[E-RUN-019]: "),
+        "{stdout}"
+    );
 }
 
 /// The daemon is installed, a URL names it, and nothing answers there. Port 1 is reserved and
 /// nothing listens on it.
 #[test]
-fn doctor_reports_an_unreachable_daemon_separately_from_a_missing_one() {
+fn doctor_fails_when_no_roost_daemon_answers() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
@@ -1169,10 +1189,13 @@ fn doctor_reports_an_unreachable_daemon_separately_from_a_missing_one() {
         &path_with_roost(bin.path()),
         Some("http://127.0.0.1:1"),
     )
-    .success();
+    .code(1);
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
-    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(
+        stderr.contains("[mur doctor] error[E-RUN-019]:"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("no daemon answered at http://127.0.0.1:1"),
         "{stderr}"
@@ -1182,6 +1205,25 @@ fn doctor_reports_an_unreachable_daemon_separately_from_a_missing_one() {
         !stderr.contains("MURMUR_ROOST_URL — the variable"),
         "{stderr}"
     );
+}
+
+/// The launch registers on `MURMUR_ROOST_URL` alone and never looks for a binary, so a URL that
+/// answers passes with no `mur-roost` on this machine's `PATH`.
+#[test]
+fn doctor_passes_a_roost_url_that_answers_without_mur_roost_on_path() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let empty_path = TempDir::new().unwrap();
+    create_delegating_project(&home, project.path());
+    let (url, _registry) = start_roost();
+
+    let assert =
+        mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), Some(&url)).code(0);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(!stderr.contains("E-RUN-019"), "{stderr}");
+    assert!(stdout.contains("All checks passed."), "{stdout}");
 }
 
 /// A daemon that answers is the state doctor has nothing to say about.
@@ -1225,6 +1267,113 @@ fn doctor_says_nothing_about_roost_for_a_capsule_that_cannot_delegate() {
     assert!(!stderr.contains("E-RUN-019"), "{stderr}");
     assert!(!stderr.contains("mur-roost"), "{stderr}");
     assert!(!stdout.contains("mur-roost"), "{stdout}");
+}
+
+// ── Refusals of the manifest's containment ───────────────────────────────────
+
+/// The stdout line after the tally, which names the first error doctor printed.
+fn first_refusal(stdout: &str) -> &str {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let tally = lines
+        .iter()
+        .position(|line| line.contains(" passed, ") && line.contains(" found"))
+        .unwrap_or_else(|| panic!("no tally line in:\n{stdout}"));
+    stdout
+        .lines()
+        .nth(tally + 1)
+        .unwrap_or_else(|| panic!("nothing after the tally in:\n{stdout}"))
+}
+
+/// A `staged_runtime` grant with no effective `sealed` floor is an `E-CAP-004` refusal at
+/// `mur run`, so doctor fails with it, and still reaches its tally.
+#[test]
+fn doctor_fails_on_a_staged_runtime_without_a_sealed_floor() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: doctor-fixture\nversion: 0.0.1\nartifacts: []\n\
+         capabilities:\n  shell:\n    allow: [python3]\n    staged_runtime:\n      \
+         - binary: python3\n        source_path: /opt/doctor-fixture/python\n        \
+         pin: cpython-3.12.4\n",
+    )
+    .unwrap();
+
+    let assert = mur_doctor(&home, project.path()).code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stderr.contains("[mur doctor] error[E-CAP-004]:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning[E-CAP-004]"), "{stderr}");
+    assert!(
+        stderr.contains("`mur run` will refuse this capsule unless the floor is raised"),
+        "{stderr}"
+    );
+    assert!(
+        first_refusal(&stdout).starts_with("First refusal: error[E-CAP-004]: "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Fix: set `capabilities.containment: sealed` in murmur.yaml"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("All checks passed."), "{stdout}");
+}
+
+/// A `sealed` capsule allowed a script whose interpreter nothing grants into the composed root is
+/// an `E-CAP-006` refusal at `mur run`, so doctor fails with it.
+#[cfg(unix)]
+#[test]
+fn doctor_fails_on_an_interpreted_entrypoint_a_sealed_root_cannot_reach() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let script = bin.path().join("doctor-fixture-tool");
+    fs::write(&script, "#!/usr/bin/env python3\nprint('hi')\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: doctor-fixture\nversion: 0.0.1\nartifacts: []\n\
+         capabilities:\n  containment: sealed\n  shell:\n    allow: [doctor-fixture-tool]\n",
+    )
+    .unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .current_dir(project.path())
+        .arg("doctor")
+        .assert()
+        .code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stderr.contains("[mur doctor] error[E-CAP-006]:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning[E-CAP-006]"), "{stderr}");
+    assert!(
+        first_refusal(&stdout).starts_with("First refusal: error[E-CAP-006]: "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Fix: declare capabilities.shell.interpreter_runtime or \
+             capabilities.shell.staged_runtime for python3"
+        ),
+        "{stdout}"
+    );
 }
 
 // ── Environment requirements ─────────────────────────────────────────────────

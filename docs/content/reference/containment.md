@@ -533,7 +533,7 @@ instead of the tier warnings. The stance is recorded and reported everywhere:
 | `mur run --explain-scope` | `achieved:  unconfined`, `mechanism: unconfined`, and an `Unconfined` block with the user, uid, `HOME`, the routes it applies to and the declared resource limits; `--json` carries the block as `unconfined`, `null` on a contained run, and `filesystem_boundary.restriction` as `none` |
 | `mur trace show` | The `containment:` line names the user and `HOME` the commands ran as |
 | `mur ps` | A line below the table per unconfined session; `--json` carries `"unconfined": true` |
-| `mur doctor` | A `Containment stance:` line when the global config chooses it, and an `E-RUN-059` warning when a floor is declared too |
+| `mur doctor` | A `Containment stance:` line when the global config chooses it, and an `E-RUN-059` error that makes it exit `1` when a floor is declared too |
 
 See [Run a capsule on the host](../how-to/run-capsule-on-the-host.md).
 

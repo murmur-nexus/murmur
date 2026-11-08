@@ -1042,13 +1042,14 @@ For a capsule whose installed tools declare [needs](containment.md#declared-prog
 | `warning[W-RUN-011]: <artifact> declares <need> for <program>, and it is not granted: <reason>` | One per need whose program is not on `PATH`, or that resolves to a location no need may reach. Counted as a warning |
 | `✗ error[E-RUN-062]: …` | A tool's `programs:` block is malformed. Adds a `Fix:` line and makes `mur doctor` exit `1` |
 
-Ahead of the checklist it prints these blocks. None of them affects the exit code.
+Ahead of the checklist it prints these blocks. A block changes the exit code only through a
+[refusal `mur run` will make](#doctor-refusals).
 
 | Block | What it reports |
 |---|---|
 | `AppArmor / user namespaces` | The running binary's resolved path and the profile confining it. AppArmor attaches profiles by executable path, so a `mur` run from a build output or any other unusual location is told that no profile attaches to it, and which paths the shipped profile does attach to. Then the `userns grant:` line, and a `network namespace:` line with the answer of the probe `mur run` uses for [`E-CAP-005`](diagnostics.md#e-cap-005): `created`, or `refused — <failed call> failed with <ERRNO>`. See [Where the user namespace comes from](containment.md#userns-grant) |
 | `Landlock` | The kernel's Landlock ABI and the ABI a capsule's ruleset is built at (the kernel's, capped at 3). Below ABI 2 it adds that moving or hard-linking a file between folders inside the workdir fails with `EXDEV` on this host; below ABI 3, that `truncate(2)` on a file outside the workdir is not refused. See [Which Landlock ABI the ruleset is built at](containment.md#landlock-abi) |
-| `Filesystem preopens` | One line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default). An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>`, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it |
+| `Filesystem preopens` | One line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default). An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>`, with an [`E-CAP-002`](diagnostics.md#e-cap-002) error on stderr naming it |
 | `Routes` | The `Routes` block `mur run --explain-scope` prints, on the tier the project's declared floor installs here: every route the capsule runs code on and what holds it — see [Routes and what holds each](containment.md#routes). A `scoped` or `sealed` floor with a route outside the class also prints [`W-SEC-034`](diagnostics.md#w-sec-034) to stderr |
 | `Read-only paths` | The subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects, and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter |
 | `Install grant` | The `install skill` and `install tool` entries of [`capabilities.install`](manifest.md#field-install) |
@@ -1058,7 +1059,14 @@ Ahead of the checklist it prints these blocks. None of them affects the exit cod
 
 `Read-only paths` and `Install grant` print the same lines, in the same words, as [`mur run --explain-scope`](#mur-run).
 
-For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilities), `mur doctor` also reports whether `mur-roost` — the daemon that capsule registers with at launch — is installed and answering, naming [`E-RUN-019`](diagnostics.md#e-run-019) as the error a `mur run` would meet. It tells apart three states: the binary is not on `PATH`, `MURMUR_ROOST_URL` is not set, and nothing answers at the URL that variable names. A reachable daemon prints nothing, and a capsule declaring no `spawn.allow` gets no such line. Like the blocks above, this warning goes to stderr and never changes the exit code.
+For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilities), `mur doctor` also checks the `mur-roost` daemon that capsule registers with at launch, as the launch does: through `MURMUR_ROOST_URL` alone. It prints [`E-RUN-019`](diagnostics.md#e-run-019) as an error in two states:
+
+| State | Error says |
+|---|---|
+| `MURMUR_ROOST_URL` is unset or blank | `… MURMUR_ROOST_URL … is not set.` |
+| Nothing answers `GET <url>/health` at the URL it names | `… no daemon answered at <url>: <reason>` |
+
+When `mur-roost` is not on `PATH` either, the error adds `mur-roost was not found on PATH` and the install command, `curl -fsSL https://install.murmur.rs | sh`. A URL that answers prints nothing, whether or not `mur-roost` is on this machine's `PATH`, and a capsule declaring no `spawn.allow` gets no such line.
 
 For the same capsule, `mur doctor` also prints an `Environment requirements` block: what the capsule's spawn closure — that capsule plus the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched and no daemon is contacted.
 
@@ -1085,8 +1093,6 @@ Four findings, of which two change the exit code:
 | A capsule declaring a `capabilities.env.allow` entry the capsule that spawns it does not hold — the spawn `mur-roost` refuses | `declarations mur-roost will refuse:` | non-zero, [`E-CAP-015`](diagnostics.md#e-cap-015) on stderr |
 | A capsule the walk could not read: not installed, more than one version installed with nothing pinning which, or an unreadable archive | `could not inspect N of M capsules in the spawn closure:` | `0`, [`W-REG-002`](diagnostics.md#w-reg-002) on stderr |
 | A `spawn.allow` edge pointing back at a capsule already on the walk | `spawn.allow cycle: a@1 → b@2` | `0` |
-
-This block is stricter than the manifest blocks above, which report a refusal of the root capsule as a warning: a failure in the spawn closure lands at depth, after the parent has already spent tokens reaching the point of delegating.
 
 Only names are printed. No variable's value is read into the report or written anywhere, and set/unset is decided by presence alone, so a name set to the empty string counts as set. The workspace `.env` counts because `mur run` loads it; a `.env` that cannot be parsed is reported by file and line, adds a `Fix:` entry, and leaves the variable list computed from this shell's environment alone.
 
@@ -1138,8 +1144,57 @@ Checking /path/to/murmur.yaml...
   ✗  murmur/tool-git@{{ v.murmur_tool_git }}   — missing
 
 0 checks passed, 1 error found.
+First refusal: murmur/tool-git@{{ v.murmur_tool_git }} — missing
 
 Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
+```
+
+### Refusals and the exit code { #doctor-refusals }
+
+`mur doctor` exits `1` when any finding predicts that `mur run`, with no flags, refuses this
+project's capsule on this host. Each such finding is an error: it is counted in the tally and adds
+a `Fix:` line. A refusal never stops the check; every block still prints, and the tally prints
+last.
+
+These findings print on stderr as `[mur doctor] error[<CODE>]: <message>`, followed by a line
+saying that `mur run` will refuse the capsule:
+
+| Code | Finding | `Fix:` |
+|---|---|---|
+| [`E-CAP-016`](diagnostics.md#e-cap-016) | A `capabilities.env.allow` entry the credential backstop strips | Remove the named entries from `capabilities.env.allow` |
+| [`E-RUN-059`](diagnostics.md#e-run-059) | `containment: unconfined` in `~/.murmur/config.yaml` with a declared containment floor | The error's hint |
+| [`E-CAP-004`](diagnostics.md#e-cap-004) | `capabilities.shell.staged_runtime` without an effective `sealed` floor | Set `capabilities.containment: sealed`, set `containment: sealed` in `.murmur/config.yaml`, or pass `--containment sealed` |
+| [`E-CAP-006`](diagnostics.md#e-cap-006) | A `sealed` capsule's interpreted `shell.allow` entry whose interpreter is not in the composed root | Declare `capabilities.shell.interpreter_runtime` or `staged_runtime` for the interpreter, or lower `capabilities.containment` |
+| [`E-CAP-005`](diagnostics.md#e-cap-005) | A capsule that can run a subprocess, on a host that cannot create its network namespace | Make this host able to create the namespace |
+| [`E-RUN-019`](diagnostics.md#e-run-019) | A `capabilities.spawn.allow` capsule whose `MURMUR_ROOST_URL` is unset or does not answer | Set `MURMUR_ROOST_URL` to a running daemon, started with `mur-roost --port 7700 --registry-path <store>`, plus the install command when `mur-roost` is not on `PATH` |
+| [`E-CAP-002`](diagnostics.md#e-cap-002) | A `capabilities.filesystem.scope` outside the workdir | Give the named entry a `capabilities.filesystem.scope` inside the workdir |
+| [`E-CFG-004`](diagnostics.md#e-cfg-004) | A [`host_paths`](#doctor-host-paths) entry `mur run` cannot use | Fix or remove that `host_paths` entry in `~/.murmur/config.yaml` |
+
+The other errors are the `✗` checklist and lock lines, an [`E-RUN-061`](diagnostics.md#e-run-061)
+or [`E-RUN-043`](diagnostics.md#e-run-043) pin, a `Model limits` refusal, a malformed tool
+`programs:` block in `Declared needs` ([`E-RUN-062`](diagnostics.md#e-run-062)), the `Environment
+requirements` errors ([`E-CAP-014`](diagnostics.md#e-cap-014),
+[`E-CAP-015`](diagnostics.md#e-cap-015)), a refused [roster](#doctor-roster), a refused
+[cgroup scope](#doctor-cgroup-scope) and a `HOME` that cannot hold `~/.murmur`.
+
+With an error, the line after the tally is `First refusal: <headline>`, naming the first error in
+the order `mur doctor` printed them:
+
+| Error | Headline |
+|---|---|
+| Carries a code | `error[<CODE>]: <first line of its message>` |
+| A `✗` checklist or lock line | `<name>@<version> — <the line's reason>` |
+
+Then a blank line, one `Fix:` line per error, and one per warning.
+
+**Output — a host that cannot create the network namespace:**
+
+```text
+0 checks passed, 2 errors found.
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with ENOSPC (No space left on device). Likely cause: …
+
+Fix: make this host able to create the capsule's network namespace — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-005
+Fix: give `mur` a delegated cgroup v2 scope: …
 ```
 
 ### Memory bound { #doctor-memory-bound }
@@ -1194,6 +1249,7 @@ Checking /path/to/murmur.yaml for linux-x86_64...
   ·  ana/other-tool@2.0.0   pulled at runtime by session ses_0190a1b2c3d4 — not declared in murmur.yaml, so mur run does not stage it
 
 1 check passed, 1 error found, 1 warning.
+First refusal: ana/demo-tool@0.1.0 — murmur.lock pins 'ana/demo-tool' from a runtime pull by session ses_0190a1b2c3d4; murmur.yaml declares it with gateway:
 
 Fix: mur install ana/demo-tool@0.1.0
 Fix: mur install ana/demo-skill@0.1.0
@@ -1208,6 +1264,7 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
         actual sha256 (on disk):       0e29c7e8c291a2800a266a01c28300e24f2a640d4a21a085e4fd9aee01adfaef
 
 0 checks passed, 1 error found.
+First refusal: ana/demo-skill@0.1.0 — artifact integrity check failed for ana/demo-skill@0.1.0
 
 Fix: ana/demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
 ```
@@ -1238,8 +1295,9 @@ code.
 A `Host paths` block follows: each [`host_paths:`](config.md#host-paths) entry in
 `~/.murmur/config.yaml`, the folder it resolves to, its access, and what this host's tier does with
 it for the project's declared containment, or `<none>`. An entry reaching a credential location
-prints [`W-SEC-034`](diagnostics.md#w-sec-034), and an entry `mur run` would refuse prints
-`warning[E-CFG-004]` naming it; both go to stderr, and neither changes the exit code.
+prints [`W-SEC-034`](diagnostics.md#w-sec-034) to stderr. An entry `mur run` would refuse prints
+`error[E-CFG-004]` naming it on stderr, and `mur doctor` exits `1` — see
+[Refusals and the exit code](#doctor-refusals).
 
 ### Murmur home { #doctor-murmur-home }
 
@@ -1303,7 +1361,7 @@ directory's own `.murmur/artifacts` store, then the global store, and against th
     |---|---|---:|
     | Admitted, no warning | `All checks passed.` | `0` |
     | Admitted, with warnings | `0 checks passed, 0 errors found, N warning(s).`, a blank line, and one `Fix: <remedy>` per warning | `0` |
-    | Refused | `0 checks passed, 1 error found.`, a blank line, and `Fix: <hint>` | `1` |
+    | Refused | `0 checks passed, 1 error found.`, `First refusal: error[<CODE>]: <message>`, a blank line, and `Fix: <hint>` | `1` |
 
 No member's artifacts, environment requirements, door or host checks are reported, and `--bind`
 changes nothing.
@@ -1345,6 +1403,7 @@ Roster
 Checking /path/to/murmur.yaml for linux-x86_64...
 
 0 checks passed, 1 error found.
+First refusal: error[E-ROS-006]: roster.yaml: member 'coder' declares no `network.authentication`, and this roster declares peer traffic, so every member's door must require authentication
 
 Fix: declare `network.authentication` in the murmur.yaml of the capsule 'coder' runs and rebuild it, or remove the peer traffic from roster.yaml. A capsule that declares network.authentication cannot also declare capabilities.spawn.allow (E-MAN-003)
 ```
@@ -1433,8 +1492,8 @@ resolves everything it is asked for still exits `0`.
 
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, declares no native implementation, and speaks only interface versions this `mur` serves; and the `Environment requirements` block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, declare a native implementation (`E-RUN-061`), or speak an interface version this `mur` does not serve (checklist printed to stdout first); or the `Environment requirements` block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
+- `0` — no error: nothing predicts that `mur run` with no flags refuses this capsule on this host. Warnings do not change this
+- `1` — one or more errors, listed in [Refusals and the exit code](#doctor-refusals), with every block and the tally printed first; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -1447,6 +1506,7 @@ resolves everything it is asked for still exits `0`.
 | `E-RUN-043` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the spawn closure's `capabilities.env.allow` declares is unset in this environment |
 | `E-CAP-015` | A capsule in the spawn closure declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
+| `E-CAP-002`, `E-CAP-004`, `E-CAP-005`, `E-CAP-006`, `E-CAP-016`, `E-CFG-004`, `E-RUN-019`, `E-RUN-059` | A refusal `mur run` will make of this capsule — see [Refusals and the exit code](#doctor-refusals) |
 | `W-REG-002` | A capsule in the spawn closure could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |
 | `W-REG-003` | An installed artifact this project does not declare speaks an interface version this `mur` does not serve — a warning; the exit code is unchanged |
 

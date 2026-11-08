@@ -869,7 +869,8 @@ fn host_paths_appear_in_explain_scope_text_json_and_doctor() {
         "{doctor_out}"
     );
 
-    // A refusal is a doctor warning, and the checklist carries on to its tally.
+    // A refusal is a doctor error that fails the exit code, and the checklist carries on to its
+    // tally.
     capsule.global_config(&format!(
         "  - path: {}\n    access: read\n",
         base.join("missing").display()
@@ -877,7 +878,14 @@ fn host_paths_appear_in_explain_scope_text_json_and_doctor() {
     let doctor = capsule.doctor();
     let doctor_text = format!("{}{}", stdout(&doctor), stderr(&doctor));
     assert!(
-        doctor_text.contains("[mur doctor] warning[E-CFG-004]"),
+        doctor_text.contains("[mur doctor] error[E-CFG-004]"),
+        "{doctor_text}"
+    );
+    assert!(!doctor_text.contains("warning[E-CFG-004]"), "{doctor_text}");
+    assert_eq!(doctor.status.code(), Some(1), "{doctor_text}");
+    assert!(
+        stdout(&doctor)
+            .contains("Fix: fix or remove that host_paths entry in ~/.murmur/config.yaml"),
         "{doctor_text}"
     );
     assert!(

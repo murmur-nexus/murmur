@@ -207,15 +207,14 @@ fn a_real_run_refuses_before_any_registry_work() {
     );
 }
 
-/// `mur doctor` reports what `mur run` will refuse as a warning and carries on with its checklist.
+/// `mur doctor` fails with the `E-CAP-016` refusal `mur run` will make, names it first after the
+/// tally, and carries on with its checklist.
 #[test]
-fn doctor_warns_that_run_will_refuse_and_keeps_going() {
+fn doctor_fails_with_the_refusal_run_will_make_and_keeps_going() {
     let home = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();
     project(dir.path(), &env_allow_manifest(&["GITHUB_TOKEN"], ""));
 
-    // Doctor's exit status depends on the artifact checklist, so the stream is taken without
-    // asserting on it.
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
@@ -223,14 +222,19 @@ fn doctor_warns_that_run_will_refuse_and_keeps_going() {
         .current_dir(dir.path())
         .arg("doctor")
         .assert()
+        .code(1)
         .get_output()
         .clone();
     let stderr = String::from_utf8(output.stderr).unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
 
+    assert!(
+        !stderr.contains("warning[E-CAP-016]"),
+        "stderr was: {stderr}"
+    );
     let warning = stderr
         .lines()
-        .position(|line| line.starts_with("[mur doctor] warning[E-CAP-016]:"))
+        .position(|line| line.starts_with("[mur doctor] error[E-CAP-016]:"))
         .unwrap_or_else(|| panic!("stderr was: {stderr}"));
     let lines: Vec<&str> = stderr.lines().collect();
     assert!(
@@ -243,9 +247,17 @@ fn doctor_warns_that_run_will_refuse_and_keeps_going() {
         "stderr was: {stderr}"
     );
     assert!(!stderr.contains("W-SEC-024"), "stderr was: {stderr}");
-    // The preopen report comes after the manifest-only prologue the warning is part of.
+    // The preopen report comes after the manifest-only prologue the refusal is part of.
     assert!(
         stdout.contains("Filesystem preopens") || stderr.contains("Filesystem preopens"),
-        "doctor stopped after the warning; stdout: {stdout}\nstderr: {stderr}"
+        "doctor stopped after the refusal; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\nFirst refusal: error[E-CAP-016]: "),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("Fix: remove GITHUB_TOKEN from capabilities.env.allow"),
+        "stdout was: {stdout}"
     );
 }
