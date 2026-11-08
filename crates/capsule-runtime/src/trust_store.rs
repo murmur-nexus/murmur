@@ -158,6 +158,17 @@ pub(crate) fn derive_in(
     if shell_allow.is_empty() || network_allow.is_empty() {
         return Vec::new();
     }
+    select_in(candidates, capsule_writable)
+}
+
+/// The trust-store paths this host has among `candidates`, with no network gate: [`derive_in`]
+/// past its gate, and what a tool's `system: ca_bundle` need resolves to
+/// ([`crate::declared_needs`]). The rules are [`derive_in`]'s.
+#[cfg(target_os = "linux")]
+pub(crate) fn select_in(
+    candidates: &[TrustStoreCandidate<'_>],
+    capsule_writable: &[&Path],
+) -> Vec<TrustStorePath> {
     let roots: Vec<PathBuf> = capsule_writable
         .iter()
         .map(|root| crate::protected_paths::canonicalize_existing_prefix(root))

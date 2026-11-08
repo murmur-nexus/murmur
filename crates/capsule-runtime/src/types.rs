@@ -258,6 +258,15 @@ pub struct CapabilityPolicy {
     /// [`crate::trust_store::derive_trust_store`]. Each becomes a readable, non-executable
     /// Landlock grant (`sandbox::resolve_trust_store_grants`), listable for a directory.
     pub shell_trust_store: Vec<crate::trust_store::TrustStorePath>,
+    /// What the host programs the capsule's tools run need, as each tool's own `programs:` block
+    /// declares it, for the tools pinned with an `operator` lock origin and the programs
+    /// `shell_allow` grants (see [`crate::declared_needs`]). Not a manifest field: empty from
+    /// [`capability_policy_from_runtime_manifest`], filled once by `stage_session` and by
+    /// `mur run --explain-scope` through [`crate::declared_needs::derive_declared_needs`]. Each
+    /// granted path becomes a readable, non-executable Landlock grant
+    /// (`sandbox::resolve_declared_need_grants`), listable for a directory, and on `sealed` an
+    /// optional composed-root mirror at its own path.
+    pub shell_declared_needs: Vec<crate::declared_needs::ResolvedProgramNeeds>,
     /// The host folders `~/.murmur/config.yaml`'s `host_paths:` lends every contained capsule on
     /// this host, checked on this host, in config order (see [`crate::host_paths`]). Not a
     /// manifest field: empty from [`capability_policy_from_runtime_manifest`], filled by `mur run`
@@ -1050,6 +1059,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_staged_runtime,
         shell_derived_interpreter_runtime: Vec::new(),
         shell_trust_store: Vec::new(),
+        shell_declared_needs: Vec::new(),
         host_paths: Vec::new(),
         env_allow,
         limits,

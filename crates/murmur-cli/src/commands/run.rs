@@ -634,6 +634,23 @@ pub(crate) fn run_run(
             &capability_policy.network_allow,
             &capsule_runtime::capsule_writable_roots(&placement),
         );
+        // The needs the tools this manifest pins declare, read from the stores and the lock a
+        // launch reads, through the derivation `stage_session` runs. An installed capsule has no
+        // lock, so its pins are the operator's.
+        let lock = match installed_capsule {
+            Some(_) => None,
+            None => crate::commands::read_optional_lockfile(&project_dir)
+                .map_err(|error| fail(&session_id, &workdir, error, json))?,
+        };
+        capability_policy.shell_declared_needs =
+            crate::commands::declared_needs::installed_declared_needs(
+                &runtime_manifest.artifacts,
+                lock.as_ref(),
+                &project_dir,
+                &capability_policy.shell_allow,
+                &capsule_runtime::capsule_writable_roots(&placement),
+            )
+            .map_err(|error| fail(&session_id, &workdir, error, json))?;
         // Where each path the manifest names resolves, from the inputs `stage_session` reports:
         // the package bytes already in memory, or the project directory, and the inference
         // `--system-prompt` would leave, which names no `system_prompt_file`.

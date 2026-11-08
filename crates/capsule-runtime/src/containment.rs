@@ -966,6 +966,81 @@ pub fn render_temp_dir(report: &TempDirReport) -> String {
     )
 }
 
+/// One element of [`ScopeReport::declared_needs`]: what one artifact's needs for one program
+/// resolved to. Every key is always serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeclaredNeedsReport {
+    /// The artifact as the capsule's manifest names it, scope included.
+    pub artifact: String,
+    /// The program key, as `capabilities.shell.allow` names it.
+    pub program: String,
+    pub granted: Vec<GrantedNeedReport>,
+    pub missing: Vec<MissingNeedReport>,
+}
+
+/// A granted need: its label (`library libm.so.6`, `program_folder .`) and each path, rendered
+/// `<path>` for a file and `<path> (list_dir)` for a directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GrantedNeedReport {
+    pub need: String,
+    pub paths: Vec<String>,
+}
+
+/// A missing need: its label and why it is not granted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingNeedReport {
+    pub need: String,
+    pub reason: String,
+}
+
+impl From<&crate::declared_needs::ResolvedProgramNeeds> for DeclaredNeedsReport {
+    fn from(resolved: &crate::declared_needs::ResolvedProgramNeeds) -> Self {
+        Self {
+            artifact: resolved.artifact.clone(),
+            program: resolved.program.clone(),
+            granted: resolved
+                .granted
+                .iter()
+                .map(|need| GrantedNeedReport {
+                    need: need.need.form.to_string(),
+                    paths: need
+                        .paths
+                        .iter()
+                        .map(crate::declared_needs::NeedPath::render)
+                        .collect(),
+                })
+                .collect(),
+            missing: resolved
+                .missing
+                .iter()
+                .map(|need| MissingNeedReport {
+                    need: need.need.form.to_string(),
+                    reason: need.reason.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DeclaredNeedsReport {
+    /// One line per need, as `--explain-scope` prints them under `declared needs:`:
+    /// `<artifact> (<program>): <need> -> <path>[, <path>…]` for a granted need and
+    /// `<artifact> (<program>): <need> -> missing (<reason>)` for a missing one.
+    #[must_use]
+    pub fn render_lines(&self) -> Vec<String> {
+        let owner = format!("{} ({})", self.artifact, self.program);
+        self.granted
+            .iter()
+            .map(|need| format!("{owner}: {} -> {}", need.need, need.paths.join(", ")))
+            .chain(
+                self.missing
+                    .iter()
+                    .map(|need| format!("{owner}: {} -> missing ({})", need.need, need.reason)),
+            )
+            .collect()
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one [`ContainmentDecision`]. Nothing
@@ -1129,6 +1204,11 @@ pub struct ScopeReport {
     /// `network.allow` is empty or the host has none of the locations
     /// [`crate::trust_store`] checks.
     pub trust_store: Vec<String>,
+    /// What the host programs the capsule's tools run need, one element per (artifact, program)
+    /// with at least one need, as [`crate::declared_needs`] resolved it: each granted need with
+    /// its paths, each missing one with why. Always serialized, `[]` when no tool pinned with an
+    /// `operator` lock origin declares a need for a program `shell.allow` grants.
+    pub declared_needs: Vec<DeclaredNeedsReport>,
     /// The host files a command reads to resolve `localhost` and the other names `/etc/hosts`
     /// carries, granted read-only by the tier: `/etc/hosts` and `/etc/nsswitch.conf` on the
     /// Landlock tiers (`scoped`, `sealed`), `[]` on every other. Always serialized.
@@ -1527,6 +1607,15 @@ impl ScopeReport {
             &self.derived_interpreter_runtime,
         );
         push_list(&mut out, "trust store", &self.trust_store);
+        push_list(
+            &mut out,
+            "declared needs",
+            &self
+                .declared_needs
+                .iter()
+                .flat_map(DeclaredNeedsReport::render_lines)
+                .collect::<Vec<_>>(),
+        );
         push_list(&mut out, "name resolution", &self.name_resolution);
         push_list(
             &mut out,
@@ -1679,6 +1768,17 @@ impl ScopeReport {
             transport,
         );
         self.routes = route_table(&inputs, self.enforcement_tier);
+        self
+    }
+
+    /// This report with [`Self::declared_needs`] built from `needs`: what staging derives after
+    /// it has read every tool's manifest, which is after the report is first built.
+    #[must_use]
+    pub fn with_declared_needs(
+        mut self,
+        needs: &[crate::declared_needs::ResolvedProgramNeeds],
+    ) -> Self {
+        self.declared_needs = needs.iter().map(DeclaredNeedsReport::from).collect();
         self
     }
 
@@ -2158,6 +2258,11 @@ pub(crate) fn scope_report_for_tier(
             }
             _ => Vec::new(),
         },
+        declared_needs: policy
+            .shell_declared_needs
+            .iter()
+            .map(DeclaredNeedsReport::from)
+            .collect(),
         trust_store: policy
             .shell_trust_store
             .iter()
@@ -5006,6 +5111,7 @@ mod tests {
                 "derived_interpreter_runtime",
             ),
             ("shell_trust_store", "trust_store"),
+            ("shell_declared_needs", "declared_needs"),
             ("host_paths", "host_paths"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),

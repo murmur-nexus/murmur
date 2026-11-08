@@ -1593,6 +1593,117 @@ fn report_model_limits(
     capsule_runtime::report_println!();
 }
 
+/// The `Declared needs` section: for each tool the capsule pins that declares needs for a program
+/// `shell.allow` grants, one line with how many needs this host grants and lacks, then one
+/// `W-RUN-011` warning per missing need, each counted in the tally, naming the package the tool
+/// declares for this host's distribution. Nothing is printed when no need applies. A malformed
+/// `programs:` block is the launch's `E-RUN-062`, a failed check.
+fn report_declared_needs(
+    runtime_manifest: &RuntimeManifest,
+    lock: Option<&murmur_artifact::MurmurLock>,
+    project_root: &std::path::Path,
+    shell_allow: &[String],
+    fixes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(writable) =
+        crate::commands::declared_needs::capsule_writable_trees(&project_root.join("workdir"))
+    else {
+        return;
+    };
+    let writable: Vec<&Path> = writable.iter().map(std::path::PathBuf::as_path).collect();
+    let resolved = match crate::commands::declared_needs::installed_declared_needs(
+        &runtime_manifest.artifacts,
+        lock,
+        project_root,
+        shell_allow,
+        &writable,
+    ) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            capsule_runtime::report_println!("Declared needs:");
+            capsule_runtime::report_println!(
+                "  \u{2717}  error[{}]: {}",
+                refusal.code,
+                refusal.message
+            );
+            fixes.push(refusal.hint.unwrap_or_default());
+            capsule_runtime::report_println!();
+            return;
+        }
+    };
+    if resolved.is_empty() {
+        return;
+    }
+    let distributions = capsule_runtime::declared_needs::host_distributions();
+    capsule_runtime::report_println!("Declared needs:");
+    for program in &resolved {
+        let mark = if program.missing.is_empty() {
+            "\u{2713}"
+        } else {
+            "\u{26A0}"
+        };
+        capsule_runtime::report_println!(
+            "  {mark}  {} ({}): {} granted, {} missing",
+            program.artifact,
+            program.program,
+            program.granted.len(),
+            program.missing.len()
+        );
+    }
+    for program in &resolved {
+        for missing in &program.missing {
+            let (line, fix) = declared_need_warning(
+                &program.artifact,
+                &program.program,
+                &missing.need,
+                &distributions,
+            );
+            capsule_runtime::report_println!("  {line}");
+            warnings.push(fix);
+        }
+    }
+    capsule_runtime::report_println!();
+}
+
+/// The `W-RUN-011` line for one missing need, and the `Fix:` the tally prints for it.
+fn declared_need_warning(
+    artifact: &str,
+    program: &str,
+    need: &murmur_artifact::DeclaredNeed,
+    distributions: &[String],
+) -> (String, String) {
+    let head = format!(
+        "warning[{}]: {artifact} declares {} for {program}, and this host has none",
+        murmur_artifact::W_RUN_011,
+        need.form
+    );
+    match capsule_runtime::declared_needs::package_for(need, distributions) {
+        Some((package, distribution)) => (
+            format!("{head}; install {package} ({distribution})"),
+            format!(
+                "install {package} for {} ({program}, {artifact})",
+                need.form
+            ),
+        ),
+        None => {
+            let ids = if distributions.is_empty() {
+                "this host, which has no os-release".to_string()
+            } else {
+                distributions.join(", ")
+            };
+            (
+                format!("{head}; the artifact names no package for {ids}"),
+                format!(
+                    "install what provides {} for {program} on this host ({artifact} names no \
+                     package for it)",
+                    need.form
+                ),
+            )
+        }
+    }
+}
+
 /// Print doctor's closing lines: `All checks passed.` when nothing was found, or else the tally
 /// and one `Fix:` line per fix, then per warning. Exits the process with status 1 when `fixes` is
 /// not empty; a warning alone returns.
@@ -2142,6 +2253,15 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 .to_string(),
         );
     }
+
+    report_declared_needs(
+        &runtime_manifest,
+        lock.as_ref(),
+        &project_root,
+        &capability_policy.shell_allow,
+        &mut fixes,
+        &mut warnings,
+    );
 
     // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
     // reported but neither fails nor warns.

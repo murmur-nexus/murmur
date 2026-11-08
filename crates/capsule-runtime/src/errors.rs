@@ -484,6 +484,12 @@ pub enum RuntimeError {
     #[error("artifact '{artifact}' ships a malformed provider_tool: block: {reason}")]
     ProviderToolMalformed { artifact: String, reason: String },
 
+    /// A staged tool's `programs:` block does not parse: it names a need by host path, holds a
+    /// malformed entry, or sits on an artifact that is not a tool. `artifact` is `name@version`;
+    /// `reason` is [`murmur_artifact::parse_program_needs`]'s, naming the dotted field.
+    #[error("artifact '{artifact}' ships a malformed programs: block: {reason}")]
+    ProgramNeedsMalformed { artifact: String, reason: String },
+
     /// A `sealed` capsule allowlists a script whose interpreter's package tree nothing declared
     /// could make reachable inside the composed root.
     ///

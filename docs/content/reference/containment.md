@@ -1349,7 +1349,10 @@ interpreter_runtime:
 `ldd <addon>.node` inside the workdir names the libraries and the folder they resolve to.
 
 The runtime does not grant that folder itself: doing so would widen every capsule with a shell for
-the few that load addons, without its manifest saying so. Naming it has a cost the manifest states:
+the few that load addons, without its manifest saying so. A tool that runs a known program can
+instead declare that program's libraries by soname, which grants each library file and no folder:
+see [Declared program needs](#declared-program-needs). Naming the folder has a cost the manifest
+states:
 
 | Cost | What it means |
 |---|---|
@@ -1396,6 +1399,77 @@ binary nor either directory, and goes unseen. Delete `~/.murmur/host_facts/` aft
 Which reported paths a launch grants is decided again on every launch: paths inside the two
 capsule-writable trees are dropped and skipped in the library walk, so a launch with a kept entry
 grants exactly what working the facts out from scratch would grant.
+
+## Declared program needs { #declared-program-needs }
+
+A tool that runs a host program declares, in its own manifest's
+[`programs:` block](manifest.md#artifact-programs), what that program needs from the host. A need
+reaches a session only when the capsule's manifest makes both declarations:
+
+| Declaration | Where |
+|---|---|
+| The tool is pinned, with an `operator` lock origin or no `murmur.lock` | `artifacts:` and `murmur.lock` |
+| The program key, verbatim, is granted | `capabilities.shell.allow` |
+
+A tool a session pulled at runtime (lock origin `runtime`), a tool added mid-session, a program the
+capsule does not grant, and a different granted program get nothing. Every staged tool's block is
+parsed all the same, and a malformed one refuses the launch with
+[`E-RUN-062`](diagnostics.md#e-run-062).
+
+At staging each need resolves against this host, on Linux only:
+
+| Form | Resolves to | Grant |
+|---|---|---|
+| `library: S` | `S` as the loader resolves it for each binary the program resolves to on `PATH` (the binary's folder and `DT_RUNPATH`, then the standard library folders; the standard folders alone when it resolves to none), and that library's own `DT_NEEDED` closure | Read, each file |
+| `file: F, beside: S` | `F` in the folder `S` resolved to, a regular file | Read |
+| `program_folder: R` | `R` under the folder of each binary the program resolves to | Read and list for a folder, read for a file |
+| `system: fonts` | Each of `/etc/fonts`, `/usr/share/fonts`, `/usr/local/share/fonts`, `/usr/share/fontconfig`, `/var/cache/fontconfig` this host has | Read and list |
+| `system: ca_bundle` | The locations [the trust store](#trust-store) checks, with no network gate | As the trust store |
+| `etc: N` | `/etc/N` | Read and list for a folder, read for a file |
+
+Every path is canonical, and no grant is executable or writable. A path is reported `missing`
+instead of granted when it is `/`, or is, lies beneath, or holds `/proc`, `/sys`, `/dev`, the home
+folder, a tree the capsule's commands can write, or an `/etc` credential location. A need that
+resolves to nothing is `missing` with `not found on this host`; a `program_folder` need for a
+program not on `PATH` with `program not found on PATH`. A missing need never refuses a launch.
+
+| Tier | Effect of a granted path |
+|---|---|
+| `landlock+seccomp` (`scoped`) | A Landlock rule, read-only |
+| `sealed` | A Landlock rule, and an optional read-only bind into the composed root at the path itself, a file as that file and never its folder. A path under `/usr`, `/bin`, `/sbin`, `/lib*`, the composed root's `/etc` allowlist or a bound program folder is already there |
+| `advisory`, `unconfined` | Nothing: commands' reads are not path-scoped |
+
+Two tools declaring needs for one program each contribute, each reported under its own artifact.
+A capsule's own `interpreter_runtime` and [`host_paths`](config.md#host-paths)
+grants are unchanged and joined with the needs.
+
+A need is granted on the session's command scope, as a granted program's `DT_NEEDED` closure is:
+every command of the session, and every [program a WASM tool runs](#wasm-tool-programs), can read
+it. "For this program" decides whether it is granted and where it is reported, not which process
+may open it.
+
+This is not the folder grant [Native addons](#native-addons) refuses to make on its own:
+
+| Property | Declared needs |
+|---|---|
+| Consent | Nothing is granted unless the capsule's manifest pins the tool and grants the program |
+| Libraries | File by file, never their folder |
+| Execute | Never |
+| Host paths | No manifest names one, so no [`W-SEC-009`](diagnostics.md#w-sec-009) |
+| Otherwise | A capsule that does not make both declarations gains nothing |
+
+`mur run --explain-scope` lists each need under `declared needs`, and
+`session_start.effective_grants.declared_needs` records the same:
+
+```text
+  declared needs:
+    - local/browser (chromium): library libsoftokn3.so -> /usr/lib/x86_64-linux-gnu/libsoftokn3.so, /usr/lib/x86_64-linux-gnu/libnss3.so
+    - local/browser (chromium): program_folder . -> /usr/lib/chromium (list_dir)
+    - local/browser (chromium): system fonts -> missing (not found on this host)
+```
+
+[`mur doctor`](cli.md#mur-doctor) warns with [`W-RUN-011`](diagnostics.md#w-run-011) for each
+missing need.
 
 ## The trust store for commands that reach the network { #trust-store }
 

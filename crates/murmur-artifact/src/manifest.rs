@@ -284,7 +284,7 @@ fn optional_string_seq(
         .map(Some)
 }
 
-fn optional_string(root: &serde_norway::Mapping, field: &str) -> Option<String> {
+pub(crate) fn optional_string(root: &serde_norway::Mapping, field: &str) -> Option<String> {
     let key = serde_norway::Value::String(field.to_string());
     root.get(&key)?.as_str().map(str::to_string)
 }
@@ -319,7 +319,7 @@ pub fn describe_yaml_shape(value: &Value) -> &'static str {
     }
 }
 
-fn yaml_type_name(value: &Value) -> String {
+pub(crate) fn yaml_type_name(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),
         Value::Bool(_) => "boolean".into(),
@@ -408,7 +408,7 @@ fn refuse_retired_key(value: &Value) -> Result<(), ManifestError> {
     Ok(())
 }
 
-fn parse_manifest_value(manifest_yaml: &str) -> Result<Value, ManifestError> {
+pub(crate) fn parse_manifest_value(manifest_yaml: &str) -> Result<Value, ManifestError> {
     serde_norway::from_str(manifest_yaml).map_err(|err| {
         ManifestError::YamlSyntax(format!("{MANIFEST_FILENAME}: YAML syntax error: {err}"))
     })

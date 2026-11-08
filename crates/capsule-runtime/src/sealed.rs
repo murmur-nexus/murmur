@@ -2745,6 +2745,51 @@ mod tests {
         plan.steps.iter().map(|step| step.op.clone()).collect()
     }
 
+    /// A declared-need file handed in as an optional mirror lands at its own path, and its folder
+    /// is not bound: `/etc` keeps only its allowlist, which still binds whole.
+    #[test]
+    fn a_declared_need_file_is_mirrored_at_its_own_path() {
+        let mut host = FakeHost::usrmerge();
+        host.0
+            .insert(PathBuf::from("/etc/fonts/fonts.conf"), PathKind::File);
+        host.0
+            .insert(PathBuf::from("/opt/fixture/share"), PathKind::Dir);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            &test_sources(),
+            Path::new("/tmp"),
+            &[
+                PathBuf::from("/etc/fonts/fonts.conf"),
+                PathBuf::from("/opt/fixture/share"),
+            ],
+            &[],
+            &host,
+        );
+        let binds: Vec<(PathBuf, PathBuf)> = ops(&plan)
+            .into_iter()
+            .filter_map(|op| match op {
+                RootOp::Bind { source, target, .. } => Some((source, target)),
+                _ => None,
+            })
+            .collect();
+        for (source, target) in [
+            ("/etc/fonts/fonts.conf", "/tmp/etc/fonts/fonts.conf"),
+            ("/opt/fixture/share", "/tmp/opt/fixture/share"),
+            ("/etc/ssl", "/tmp/etc/ssl"),
+        ] {
+            assert!(
+                binds.contains(&(PathBuf::from(source), PathBuf::from(target))),
+                "{source} is bound at {target}: {binds:?}"
+            );
+        }
+        for folder in ["/etc", "/etc/fonts", "/opt", "/opt/fixture"] {
+            assert!(
+                !binds.iter().any(|(source, _)| source == Path::new(folder)),
+                "{folder} is bound whole: {binds:?}"
+            );
+        }
+    }
+
     #[test]
     fn base_selection_skips_any_ancestor_of_the_workdir() {
         // The default case: a workdir under the user's home, so `/tmp` is free.

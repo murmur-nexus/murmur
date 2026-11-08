@@ -4,6 +4,7 @@ pub(crate) mod cancel;
 pub(crate) mod config_cmd;
 pub(crate) mod control;
 pub(crate) mod conversation;
+pub(crate) mod declared_needs;
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod deploy;
 #[cfg(feature = "beta-mur-deploy")]

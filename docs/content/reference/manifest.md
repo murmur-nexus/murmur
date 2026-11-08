@@ -23,6 +23,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
 | `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens` and `vision`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
 | `provider_tool` | map | no | `runtime: tool` only. Says the tool is one the model's provider defines itself: `kind: computer` with `display_width` and `display_height`. Default: absent, an ordinary tool. A capsule that declares such a tool must run `sealed`. See [`provider_tool:` block](#provider-tool). |
+| `programs` | map | no | `runtime: tool` only. What each host program the tool runs needs from the host, named portably: by soname, by file name beside a declared library, relative to the program's folder, by system location or by `/etc` name, never by host path. Default: absent, no needs. A capsule gets a program's needs only when it pins the tool with an `operator` lock origin and grants the program in `capabilities.shell.allow`. See [`programs:` block](#artifact-programs). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -142,6 +143,75 @@ No other key is accepted.
 | The capsule's effective containment floor is below `sealed` | `mur run` refuses with [`E-CAP-003`](diagnostics.md#e-cap-003) before the session directory exists, naming every such tool — see [Provider tools](containment.md#provider-tools) |
 | A `transport: http` driver choice's model is [`vision: false`](#driver-models) | `mur run` refuses with [`E-RUN-057`](diagnostics.md#e-run-057) |
 | A running session pulls such a tool with `pull-artifact` | Refused on the same two terms, with nothing installed |
+
+### `programs:` block { #artifact-programs }
+
+Declared in a `runtime: tool` artifact's own `murmur.yaml`, never in the capsule manifest. For each
+host program the tool runs, it lists what that program needs from the host. Each need names *what*
+the program needs; the runtime finds *where* on the host at launch. What a need grants, and to
+whom, is in [Declared program needs](containment.md#declared-program-needs).
+
+```yaml
+name: browser
+version: "0.1.0"
+runtime: tool
+requires_files:
+  - tool.wasm
+programs:
+  chromium:                       # a bare program name, as capabilities.shell.allow spells it
+    needs:
+      - library: libsoftokn3.so   # a soname, resolved as DT_NEEDED is
+        packages:                 # optional: os-release ID -> package
+          debian: libnss3
+          fedora: nss-softokn
+      - file: libsoftokn3.chk     # a file name, in the folder the named library resolved to
+        beside: libsoftokn3.so
+      - program_folder: .         # relative to the program's folder; "." is the folder
+      - system: fonts
+      - etc: fonts/fonts.conf     # a path under /etc, by name
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `programs.<program>` | map | — | The key is a bare program name: non-empty, no `/`, not `.` or `..`. Holds `needs` and nothing else |
+| `programs.<program>.needs` | list | yes | The program's needs. May be empty |
+| `needs[].library` | string | one form | A soname: a file name containing `.so`, no `/` |
+| `needs[].file` | string | one form | A bare file name, no `/`. Requires `beside` |
+| `needs[].beside` | string | with `file` | Equal to a `library` value of the same program. Valid only with `file` |
+| `needs[].program_folder` | string | one form | `.`, or a relative path of plain components: no leading `/`, no empty, `.` or `..` component |
+| `needs[].system` | string | one form | `fonts` or `ca_bundle` |
+| `needs[].etc` | string | one form | A relative path of plain components under `/etc`. Not a credential location, a path beneath one, or a folder holding one (see below) |
+| `needs[].packages` | map | no | os-release `ID` to package name, used by [`mur doctor`](cli.md#mur-doctor) when the need is missing. Keys match `[a-z0-9._-]+`; values are non-empty with no whitespace. Default: empty |
+
+Each need holds exactly one of `library`, `file`, `program_folder`, `system` and `etc`, plus
+`packages` optionally. No other key is accepted.
+
+The `/etc` credential locations no `etc` need may name, sit beneath, or hold: `shadow`, `shadow-`,
+`gshadow`, `gshadow-`, `sudoers`, `sudoers.d`, `ssh`, `ssl/private`, `pki/tls/private`,
+`krb5.keytab`, `security`, `ipsec.secrets`, `ipsec.d`, `ppp`, `wpa_supplicant`,
+`NetworkManager/system-connections`. So `etc: ssl` is refused, because it holds `ssl/private`, and
+`etc: ssl/certs` is accepted.
+
+A refusal names the program, the need's index, the value and the reason:
+
+| Value | Reason in the message |
+|---|---|
+| Starts with `/proc` | `under /proc, and /proc is the runtime's rule` |
+| Any other absolute path | `an absolute host path` |
+| Starts with `~` | `a home folder` |
+| Contains `$` | `an environment expansion` |
+| A `..` component | `a path climbing with '..'` |
+| An `/etc` credential location | `a credential location` |
+| A need with no form, or two | `a need holds exactly one form` |
+| A key that is not a form, `beside` or `packages` | names the key: `field 'programs.cat.needs[0].path' is not a need key` |
+| `beside` naming no `library` of the program | `which names no library: entry of program '<program>'` |
+| `system` not `fonts` or `ca_bundle` | `which is not a system location` |
+
+| Case | Result |
+|---|---|
+| The block is malformed, names a need by host path, or is declared on a `driver`, `hook` or `skill` artifact | `mur build` refuses with [`E-BLD-008`](diagnostics.md#e-bld-008) and writes no archive |
+| A stored tool whose block is malformed | `mur run`, `mur run --explain-scope` and `mur doctor` refuse with [`E-RUN-062`](diagnostics.md#e-run-062), naming `name@version` and the field |
+| A need this host lacks | Reported `missing`; never refuses a launch. `mur doctor` warns with [`W-RUN-011`](diagnostics.md#w-run-011) |
 
 ### `input_schema` { #input-schema }
 

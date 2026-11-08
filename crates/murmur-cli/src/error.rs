@@ -111,6 +111,7 @@ pub const E_RUN_058: &str = "E-RUN-058"; // an installed artifact ships a malfor
 pub const E_RUN_059: &str = "E-RUN-059"; // the unconfined stance was chosen for a capsule some source declares a containment floor for
 pub const E_RUN_060: &str = "E-RUN-060"; // --unconfined was given to a launch the runtime started contained (--contained-launch or --spawn-grant-stdin)
 pub const E_RUN_061: &str = "E-RUN-061"; // an installed artifact's murmur.yaml declares implementation: native or execution: native
+pub const E_RUN_062: &str = "E-RUN-062"; // a staged tool ships a malformed programs: block
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -232,6 +233,7 @@ pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired
 pub const E_BLD_005: &str = "E-BLD-005"; // driver manifest's models: table is malformed or on a non-driver
 pub const E_BLD_006: &str = "E-BLD-006"; // artifact manifest's provider_tool: block is malformed or on a driver, hook or skill
 pub const E_BLD_007: &str = "E-BLD-007"; // artifact manifest declares implementation: native or execution: native
+pub const E_BLD_008: &str = "E-BLD-008"; // artifact manifest's programs: block names a need by host path, is malformed, or is on a driver, hook or skill
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -943,6 +945,17 @@ impl From<RuntimeError> for CliError {
                     murmur_artifact::diagnostic_link("E-RUN-058")
                 ),
             ),
+            error @ RuntimeError::ProgramNeedsMalformed { .. } => CliError::with_hint(
+                E_RUN_062,
+                error.to_string(),
+                format!(
+                    "a programs: need names a library by soname, a file beside a declared \
+                     library, a program_folder, a system location or an etc name, never a host \
+                     path; install a version of the artifact that ships a valid block, or remove \
+                     it from artifacts: — see {}",
+                    murmur_artifact::diagnostic_link("E-RUN-062")
+                ),
+            ),
             error @ RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth { .. } => {
                 CliError::with_hint(
                     E_RUN_025,
@@ -1389,6 +1402,15 @@ impl From<BuildError> for CliError {
                 "provider_tool: goes on a runtime: tool artifact and holds kind: computer with \
                  display_width and display_height, each an integer from 1 to 65535; a tool \
                  shipped with a malformed block is refused at launch with E-RUN-058",
+            ),
+            error @ BuildError::ProgramNeeds(_) => CliError::with_hint(
+                E_BLD_008,
+                error.to_string(),
+                "programs: goes on a runtime: tool artifact; each need names what the program \
+                 needs, never where: library (a soname), file with beside (a file name beside a \
+                 declared library), program_folder (relative to the program's folder), system \
+                 (fonts or ca_bundle) or etc (a name under /etc) — see \
+                 https://docs.murmur.nexus/reference/manifest/#artifact-programs",
             ),
         }
     }
@@ -1896,6 +1918,23 @@ mod tests {
         });
         assert_eq!(malformed.code, E_RUN_058);
         assert!(malformed.message.contains("local/computer@0.1.0"));
+        let needs = CliError::from(RuntimeError::ProgramNeedsMalformed {
+            artifact: "local/needs-tool@0.1.0".to_string(),
+            reason: "murmur.yaml: field 'programs.cat.needs[0].library' is '/usr/lib/libx.so', an \
+                     absolute host path"
+                .to_string(),
+        });
+        assert_eq!(needs.code, E_RUN_062);
+        assert!(
+            needs.message.contains("local/needs-tool@0.1.0"),
+            "{}",
+            needs.message
+        );
+        assert!(
+            needs.message.contains("an absolute host path"),
+            "{}",
+            needs.message
+        );
     }
 
     /// `E-CAP-003`'s hint names the change that meets the floor for the cause that missed it: a

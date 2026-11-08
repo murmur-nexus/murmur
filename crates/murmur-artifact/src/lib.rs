@@ -17,6 +17,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod manifest_path;
 pub mod payload_shape;
+pub mod program_needs;
 pub mod registry;
 pub mod registry_warnings;
 pub mod roster;
@@ -86,6 +87,10 @@ pub use payload_shape::{
     select_root_wasm_in_archive, PayloadShapeError, CAPSULE_WASM_ENTRY, SKILL_MD_ENTRY,
     WASM_EXTENSION,
 };
+pub use program_needs::{
+    parse_program_needs, DeclaredNeed, NeedForm, ProgramNeeds, SystemLocation,
+    ETC_CREDENTIAL_LOCATIONS, PROGRAMS_KEY,
+};
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
     LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
@@ -123,7 +128,7 @@ pub use runtime_manifest::{
 };
 pub use runtime_warnings::{
     runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008,
-    W_RUN_009, W_RUN_010,
+    W_RUN_009, W_RUN_010, W_RUN_011,
 };
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,
