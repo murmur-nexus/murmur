@@ -23,7 +23,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
 | `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens` and `vision`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
 | `provider_tool` | map | no | `runtime: tool` only. Says the tool is one the model's provider defines itself: `kind: computer` with `display_width` and `display_height`. Default: absent, an ordinary tool. A capsule that declares such a tool must run `sealed`. See [`provider_tool:` block](#provider-tool). |
-| `programs` | map | no | `runtime: tool` only. What each host program the tool runs needs from the host, named portably: by soname, by file name beside a declared library, relative to the program's folder, by system location or by `/etc` name, never by host path. Default: absent, no needs. A capsule gets a program's needs only when it pins the tool with an `operator` lock origin and grants the program in `capabilities.shell.allow`. See [`programs:` block](#artifact-programs). |
+| `programs` | map | no | `runtime: tool` only. What each host program the tool runs needs from the host, named portably: by soname, by file name beside a declared library, relative to the program's folder, by system location or by `/etc` name, never by host path, and optionally a pinned download of the program per platform. Default: absent, no needs and no downloads. A capsule gets a program's needs and its pinned copy only when it pins the tool with an `operator` lock origin and grants the program in `capabilities.shell.allow`. See [`programs:` block](#artifact-programs). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -173,8 +173,9 @@ programs:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `programs.<program>` | map | — | The key is a bare program name: non-empty, no `/`, not `.` or `..`. Holds `needs` and nothing else |
-| `programs.<program>.needs` | list | yes | The program's needs. May be empty |
+| `programs.<program>` | map | — | The key is a bare program name: non-empty, no `/`, not `.` or `..`. Holds `needs`, `download` or both, and nothing else; a program holding neither is refused |
+| `programs.<program>.needs` | list | yes, unless `download` is present | The program's needs. May be empty |
+| `programs.<program>.download` | map | no | A pinned download of the program per platform. Default: absent. See [`download:`](#artifact-programs-download) |
 | `needs[].library` | string | one form | A soname: a file name containing `.so`, no `/` |
 | `needs[].file` | string | one form | A bare file name, no `/`. Requires `beside` |
 | `needs[].beside` | string | with `file` | Equal to a `library` value of the same program. Valid only with `file` |
@@ -212,6 +213,60 @@ A refusal names the program, the need's index, the value and the reason:
 | The block is malformed, names a need by host path, or is declared on a `driver`, `hook` or `skill` artifact | `mur build` refuses with [`E-BLD-008`](diagnostics.md#e-bld-008) and writes no archive |
 | A stored tool whose block is malformed | `mur run`, `mur run --explain-scope` and `mur doctor` refuse with [`E-RUN-062`](diagnostics.md#e-run-062), naming `name@version` and the field |
 | A need this host lacks | Reported `missing`; never refuses a launch. `mur doctor` warns with [`W-RUN-011`](diagnostics.md#w-run-011) |
+
+#### `download:` { #artifact-programs-download }
+
+A pinned upstream download of the program, one entry per platform. [`mur install`](cli.md#mur-install)
+fetches it once into the host's program store and checks its SHA-256; mur never re-hosts it. Which
+copy a session runs, and what it is granted, is in
+[Pinned program downloads](containment.md#pinned-program-downloads). The how-to is
+[How to pin a program download](../how-to/pin-a-program-download.md).
+
+```yaml
+programs:
+  render:
+    download:
+      linux-x86_64:
+        url: https://downloads.example.org/render/1.0.0/render-linux-x86_64.zip
+        sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: render-linux-x86_64/render     # the file to run inside the zip
+      darwin-aarch64:
+        url: https://downloads.example.org/render/1.0.0/render-darwin-arm64
+        sha256: fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `download` | map | no | Non-empty. Each key is a platform: `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64` |
+| `download.<platform>.url` | string | yes | `https://` with a host, or `http://` to `127.0.0.1`, `[::1]` or `localhost`. No user information (`user@`), no fragment. Redirects of it are followed |
+| `download.<platform>.sha256` | string | yes | The SHA-256 of the downloaded bytes: exactly 64 lowercase hex digits |
+| `download.<platform>.run` | string | no | Present: the download is a zip and `run` names the regular file to run inside it, a relative path of plain components. Absent: the downloaded bytes are the program itself |
+
+No other key is accepted under `download.<platform>`. A zip with a symlink entry, an entry escaping
+the zip's folder, or more than 2 GiB downloaded or unpacked is refused at install. tar archives are
+not supported.
+
+A refusal names the dotted field, `programs.<program>.download.<platform>.<key>`, the value and the
+reason:
+
+| Value | Reason in the message |
+|---|---|
+| `url` with a scheme other than `https`, or `http` to another host | `an http URL to a host that is not loopback`, `a <scheme> URL` |
+| `url` with no host | `a URL with no host` |
+| `url` with `user@` | `a URL carrying user information before its host` |
+| `url` with `#…` | `a URL with a fragment` |
+| `sha256` not 64 lowercase hex digits | `which is not a sha256: exactly 64 lowercase hex digits` |
+| A platform key not in the list | `is not a platform a download is pinned for` |
+| `run` absolute, under `~`, with `$`, with a `..`, empty or `.` component | the reasons of the table above |
+| Another key under a platform | `is not a key of a pinned download` |
+| `download: {}` | `is an empty mapping` |
+
+| Case | Result |
+|---|---|
+| The entry is malformed | `mur build` refuses with [`E-BLD-008`](diagnostics.md#e-bld-008); a stored tool with one refuses `mur run` with [`E-RUN-062`](diagnostics.md#e-run-062) |
+| The download cannot be fetched, does not match `sha256`, or cannot be unpacked | `mur install` fails with [`E-REG-013`](diagnostics.md#e-reg-013), [`E-REG-014`](diagnostics.md#e-reg-014) or [`E-REG-015`](diagnostics.md#e-reg-015); the artifact stays installed and pinned |
+| No entry for this host's platform | `mur install` prints one line and fetches nothing; a host program of that name runs if the capsule grants it |
+| The store holds no usable copy and the host has no program of that name | Never refuses a launch. `mur doctor` warns with [`W-RUN-012`](diagnostics.md#w-run-012) |
 
 ### `input_schema` { #input-schema }
 

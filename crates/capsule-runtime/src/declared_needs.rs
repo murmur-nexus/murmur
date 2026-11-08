@@ -105,19 +105,24 @@ pub struct MissingNeed {
 /// equal to an entry of `shell_allow`. One element per (artifact, program) with at least one
 /// need, tools in the order given and programs in declaration order. `capsule_writable` are the
 /// trees the capsule's commands can write ([`crate::interpreter_runtime::capsule_writable_roots`]).
+/// `pinned` is staging's source choice for pinned program downloads
+/// ([`crate::pinned_programs::derive_pinned_programs`]): a program is looked up on `PATH` and then
+/// in each pinned copy's `bin/` folder, and a need resolving at or under a pinned copy's store
+/// entry is granted, though that entry lies under the home folder.
 ///
 /// Reads the filesystem only, runs nothing, and fails nothing. Off Linux this returns nothing.
 pub fn derive_declared_needs(
     tools: &[DeclaredToolNeeds],
     shell_allow: &[String],
     capsule_writable: &[&Path],
+    pinned: &[crate::pinned_programs::ResolvedPinnedProgram],
 ) -> Vec<ResolvedProgramNeeds> {
     #[cfg(target_os = "linux")]
     {
+        let mut path_dirs = crate::pinned_programs::host_path_dirs();
+        path_dirs.extend(crate::pinned_programs::pinned_bin_dirs(pinned));
         let host = NeedHost {
-            path_dirs: std::env::var_os("PATH")
-                .map(|path| std::env::split_paths(&path).collect())
-                .unwrap_or_default(),
+            path_dirs,
             search_dirs: crate::sandbox::DEFAULT_LIBRARY_SEARCH_DIRS
                 .iter()
                 .map(PathBuf::from)
@@ -132,12 +137,13 @@ pub fn derive_declared_needs(
                 .iter()
                 .map(|root| root.to_path_buf())
                 .collect(),
+            pinned_trees: crate::pinned_programs::pinned_trees(pinned),
         };
         derive_in(tools, shell_allow, &host)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (tools, shell_allow, capsule_writable);
+        let _ = (tools, shell_allow, capsule_writable, pinned);
         Vec::new()
     }
 }
@@ -145,7 +151,7 @@ pub fn derive_declared_needs(
 /// Everything [`derive_in`] reads from the host, injected.
 #[cfg(target_os = "linux")]
 pub(crate) struct NeedHost<'a> {
-    /// `PATH`, split.
+    /// `PATH`, split, then each pinned program copy's `bin/` folder.
     pub(crate) path_dirs: Vec<PathBuf>,
     /// The soname fallback directories ([`crate::sandbox::DEFAULT_LIBRARY_SEARCH_DIRS`]).
     pub(crate) search_dirs: Vec<PathBuf>,
@@ -157,6 +163,9 @@ pub(crate) struct NeedHost<'a> {
     pub(crate) etc_root: PathBuf,
     pub(crate) home: Option<PathBuf>,
     pub(crate) capsule_writable: Vec<PathBuf>,
+    /// The store entry of each pinned program copy: a need at or under one is granted even where
+    /// the home-folder rule would move it to `missing`.
+    pub(crate) pinned_trees: Vec<PathBuf>,
 }
 
 /// [`derive_declared_needs`] with the host injected.
@@ -207,7 +216,7 @@ fn resolve_program(
                 let Ok(closure) = crate::sandbox::walk_dependency_closure(
                     &seeds,
                     &host.search_dirs,
-                    &unreachable.roots,
+                    &unreachable.walk_excluded,
                     |path| -> Result<_, std::convert::Infallible> {
                         Ok(crate::sandbox::read_elf_dependencies(path))
                     },
@@ -348,6 +357,10 @@ struct Unreachable {
     /// Canonical; a path equal to, beneath or holding one is refused.
     roots: Vec<PathBuf>,
     labels: Vec<String>,
+    /// Pinned program store entries: a path at or under one is never refused.
+    pinned: Vec<PathBuf>,
+    /// `roots` minus those holding a pinned entry: where a library closure walk stops.
+    walk_excluded: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -356,6 +369,17 @@ impl Unreachable {
         let mut unreachable = Self {
             roots: Vec::new(),
             labels: Vec::new(),
+            pinned: host
+                .pinned_trees
+                .iter()
+                .flat_map(|tree| {
+                    [
+                        tree.clone(),
+                        crate::protected_paths::canonicalize_existing_prefix(tree),
+                    ]
+                })
+                .collect(),
+            walk_excluded: Vec::new(),
         };
         let mut add = |path: &Path, label: &str| {
             for root in [
@@ -382,6 +406,12 @@ impl Unreachable {
         for location in murmur_artifact::ETC_CREDENTIAL_LOCATIONS {
             add(&host.etc_root.join(location), "the credential location");
         }
+        unreachable.walk_excluded = unreachable
+            .roots
+            .iter()
+            .filter(|root| !unreachable.pinned.iter().any(|tree| tree.starts_with(root)))
+            .cloned()
+            .collect();
         unreachable
     }
 
@@ -389,6 +419,9 @@ impl Unreachable {
     fn reason(&self, path: &Path) -> Option<String> {
         if path == Path::new("/") {
             return Some("resolved to /, the filesystem root".to_string());
+        }
+        if self.pinned.iter().any(|tree| path.starts_with(tree)) {
+            return None;
         }
         self.roots
             .iter()
@@ -521,6 +554,7 @@ mod tests {
                 etc_root: self.root.join("etc"),
                 home: Some(self.root.join("home/user")),
                 capsule_writable: vec![self.root.join("workdir")],
+                pinned_trees: Vec::new(),
             }
         }
     }
@@ -574,6 +608,52 @@ mod tests {
       - program_folder: share
       - system: fonts
 ";
+
+    /// A program found only through a pinned copy's `bin/` folder (after `PATH`) resolves its
+    /// `program_folder: .` need to the copy's folder, and keeps it granted though the store lies
+    /// under the home folder; a home path outside the copy is still moved to `missing`.
+    #[test]
+    fn declared_needs_a_pinned_only_program_resolves_into_its_store_copy_under_home() {
+        let scratch = Scratch::new();
+        let tree = scratch.root.join("home/user/.murmur/programs/abc");
+        std::fs::create_dir_all(tree.join("files/fixture")).unwrap();
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::copy(host_binary("true"), tree.join("files/fixture/pinprog")).unwrap();
+        symlink("../files/fixture/pinprog", tree.join("bin/pinprog")).unwrap();
+        std::fs::create_dir_all(scratch.root.join("home/user/elsewhere")).unwrap();
+        symlink(
+            scratch.root.join("home/user/elsewhere"),
+            tree.join("files/fixture/outside"),
+        )
+        .unwrap();
+        let block = "programs:\n  pinprog:\n    needs:\n      - program_folder: .\n      - program_folder: outside\n";
+        let tools = [tool("local/pinned-tool", LockOrigin::Operator, block)];
+
+        // Without the pinned folder the program resolves to no binary.
+        let unpinned = derive_in(&tools, &allow(&["pinprog"]), &scratch.host());
+        assert_eq!(unpinned[0].missing[0].reason, PROGRAM_NOT_ON_PATH);
+
+        let mut host = scratch.host();
+        host.path_dirs.push(tree.join("bin"));
+        host.pinned_trees = vec![tree.clone()];
+        let resolved = derive_in(&tools, &allow(&["pinprog"]), &host);
+        assert_eq!(
+            granted_paths(&resolved[0]),
+            BTreeSet::from([tree.join("files/fixture")])
+        );
+        assert_eq!(resolved[0].missing.len(), 1);
+        assert_eq!(
+            resolved[0].missing[0].need.form,
+            NeedForm::ProgramFolder("outside".to_string())
+        );
+        assert!(
+            resolved[0].missing[0]
+                .reason
+                .contains("beneath the home folder"),
+            "{}",
+            resolved[0].missing[0].reason
+        );
+    }
 
     #[test]
     fn declared_needs_resolve_to_exactly_the_declared_paths_read_only() {

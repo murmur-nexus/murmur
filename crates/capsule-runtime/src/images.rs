@@ -362,7 +362,9 @@ impl ImageStore {
     /// The bytes of the blob named `sha256` when it holds exactly `len` bytes, or `None` when it is
     /// missing, a link, unreadable or another length.
     pub(crate) fn read(&self, sha256: &str, len: u64) -> Option<Vec<u8>> {
-        if !is_sha256_hex(sha256) {
+        // 64 lowercase hex digits is the only blob name a record's image block may carry, so a
+        // hand-edited or hook-supplied block cannot name a path.
+        if !murmur_artifact::is_sha256_hex(sha256) {
             return None;
         }
         let bytes = self
@@ -378,15 +380,6 @@ impl ImageStore {
 pub(crate) fn read_blob(blob: &Path) -> Option<Vec<u8>> {
     let dir = WorkdirRoot::open(blob.parent()?).ok()?;
     dir.read_file(blob.file_name()?, u64::MAX).ok().flatten()
-}
-
-/// Whether `text` is 64 lowercase hex digits: the only blob name a record's image block may carry,
-/// so a hand-edited or hook-supplied block cannot name a path.
-pub(crate) fn is_sha256_hex(text: &str) -> bool {
-    text.len() == 64
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The `source` of `block` when it is an image block in record form, with the three facts it

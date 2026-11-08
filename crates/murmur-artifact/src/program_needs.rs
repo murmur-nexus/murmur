@@ -146,7 +146,9 @@ const ONE_FORM: &str = "a need holds exactly one form: library, file (with besid
 /// `program_folder` or `etc` an absolute path, a home folder, an environment expansion or a path
 /// climbing with `..`; `etc` naming a credential location ([`ETC_CREDENTIAL_LOCATIONS`]);
 /// `system` not one of [`SystemLocation::ALL`]; `packages` not a map of lowercase os-release IDs
-/// to package names.
+/// to package names; a program holding neither `needs` nor `download`, or a malformed `download`
+/// entry ([`crate::parse_program_downloads`] reads those). A program with only `download` has no
+/// needs.
 pub fn parse_program_needs(manifest_yaml: &str) -> Result<Vec<ProgramNeeds>, ManifestError> {
     let value = parse_manifest_value(manifest_yaml)?;
     let Some(root) = value.as_mapping() else {
@@ -197,18 +199,36 @@ fn parse_program(
     entry: &Mapping,
     field: &str,
 ) -> Result<Vec<DeclaredNeed>, ManifestError> {
-    if let Some(extra) = entry.keys().find(|key| key.as_str() != Some("needs")) {
+    if let Some(extra) = entry.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            Some("needs") | Some(crate::program_download::DOWNLOAD_KEY)
+        )
+    }) {
         return Err(invalid(
             format!("{field}.{}", key_text(extra)),
-            "is not a key of a program; a program holds needs".to_string(),
+            "is not a key of a program; a program holds needs, download or both".to_string(),
         ));
     }
+    let download = entry.get(Value::String(
+        crate::program_download::DOWNLOAD_KEY.to_string(),
+    ));
+    if let Some(download) = download {
+        crate::program_download::parse_download(
+            download,
+            &format!("{field}.{}", crate::program_download::DOWNLOAD_KEY),
+        )?;
+    }
     let needs_field = format!("{field}.needs");
-    let needs = entry
-        .get(Value::String("needs".to_string()))
-        .ok_or_else(|| ManifestError::MissingField {
-            field: needs_field.clone(),
-        })?;
+    let Some(needs) = entry.get(Value::String("needs".to_string())) else {
+        if download.is_some() {
+            return Ok(Vec::new());
+        }
+        return Err(invalid(
+            field.to_string(),
+            "holds neither needs nor download; a program holds needs, download or both".to_string(),
+        ));
+    };
     let needs = needs
         .as_sequence()
         .ok_or_else(|| ManifestError::InvalidType {
@@ -404,7 +424,7 @@ fn host_path_reason(value: &str) -> Option<&'static str> {
 }
 
 /// Refuses `path` unless it is a relative path of normal components.
-fn relative_path(
+pub(crate) fn relative_path(
     key: &str,
     path: &str,
     refuse: &impl Fn(&str, &str, String) -> ManifestError,
@@ -481,7 +501,7 @@ fn parse_packages(need: &Mapping, field: &str) -> Result<BTreeMap<String, String
     Ok(parsed)
 }
 
-fn mapping<'a>(value: &'a Value, field: &str) -> Result<&'a Mapping, ManifestError> {
+pub(crate) fn mapping<'a>(value: &'a Value, field: &str) -> Result<&'a Mapping, ManifestError> {
     value
         .as_mapping()
         .ok_or_else(|| ManifestError::InvalidType {
@@ -491,12 +511,12 @@ fn mapping<'a>(value: &'a Value, field: &str) -> Result<&'a Mapping, ManifestErr
         })
 }
 
-fn key_text(key: &Value) -> String {
+pub(crate) fn key_text(key: &Value) -> String {
     key.as_str()
         .map_or_else(|| yaml_type_name(key), str::to_string)
 }
 
-fn invalid(field: String, message: String) -> ManifestError {
+pub(crate) fn invalid(field: String, message: String) -> ManifestError {
     ManifestError::InvalidValue { field, message }
 }
 
@@ -711,7 +731,7 @@ mod tests {
             ("programs:\n  /usr/bin/cat:\n    needs: []\n", "is not a bare program name"),
             ("programs:\n  '..':\n    needs: []\n", "is not a bare program name"),
             ("programs:\n  cat:\n    needs: []\n    other: 1\n", "programs.cat.other' is not a key of a program"),
-            ("programs:\n  cat: {}\n", "missing required field 'programs.cat.needs'"),
+            ("programs:\n  cat: {}\n", "field 'programs.cat' holds neither needs nor download"),
             ("programs: [cat]\n", "field 'programs' has invalid type (expected mapping"),
             (
                 "programs:\n  cat:\n    needs:\n      - library: libm.so.6\n        packages: {Debian: x}\n",

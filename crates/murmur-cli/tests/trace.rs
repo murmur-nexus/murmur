@@ -1194,3 +1194,127 @@ fn session_start_declared_needs_match_explain_scope_json() {
     );
     assert_eq!(session_start["effective_grants"], explain_report);
 }
+
+/// [`session_start_effective_grants_match_explain_scope_json`] for a capsule whose tool pins a
+/// download of a program `shell.allow` grants and the program store holds it:
+/// `session_start.effective_grants`, `pinned_programs` included and `pinned`, is the object
+/// `--explain-scope --json` prints.
+#[test]
+#[allow(clippy::print_stdout)]
+fn session_start_pinned_programs_match_explain_scope_json() {
+    use std::io::Write;
+    let test = "session_start_pinned_programs_match_explain_scope_json";
+    if capsule_runtime::skip_without_egress_namespace(test) {
+        return;
+    }
+    let Some(platform) = murmur_artifact::host_download_platform() else {
+        eprintln!("SKIP — PROVES NOTHING: this host has no download platform");
+        return;
+    };
+    let program = "murmur-pinned-trace-fixture";
+    let process_home = common::process_home();
+
+    // The store entry `mur install` would have written, committed through the store's own API.
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "fixture/prog",
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+        )
+        .unwrap();
+    writer.write_all(b"#!/bin/sh\necho pinned\n").unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let download = murmur_artifact::PinnedDownload {
+        platform: platform.to_string(),
+        url: "http://127.0.0.1:1/fixture.zip".to_string(),
+        sha256: murmur_artifact::sha256_hex(&bytes),
+        run: Some("fixture/prog".to_string()),
+    };
+    let store = capsule_runtime::pinned_programs::ensure_program_store().unwrap();
+    let partial = capsule_runtime::pinned_programs::PartialDownload::begin(&store).unwrap();
+    partial
+        .create_download_file()
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+    capsule_runtime::pinned_programs::commit_download(&store, &download, program, partial).unwrap();
+
+    let server = common::ScriptedServer::start(vec![end_turn_response()]);
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    setup_driver(&home, &artifact_dir);
+    let tool = common::create_tool_artifact_with_auth(
+        artifact_dir.path(),
+        GRANTS_TOOL_NAME,
+        GRANTS_TOOL_VERSION,
+        &common::fixture_path("graduation/tool/jsonl-line-count.wasm"),
+        &format!(
+            "programs:\n  {program}:\n    download:\n      {platform}:\n        url: {}\n        \
+             sha256: {}\n        run: fixture/prog\n",
+            download.url, download.sha256
+        ),
+    );
+    common::publish_local(&home, &tool).success();
+    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+    let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+        "capabilities:\n",
+        &format!("capabilities:\n  shell:\n    allow:\n      - {program}\n"),
+    );
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+    // `--explain-scope` reads the tool's own manifest from the stores of the home it runs under,
+    // as the launch does; staging above read `home`'s.
+    assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", &process_home)
+        .args(["publish", tool.to_str().unwrap()])
+        .assert()
+        .success();
+    let explain_stdout = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", &process_home)
+        .current_dir(project.path())
+        .args([
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--explain-scope",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_report: Value =
+        serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
+    let records = staged.records_dir.clone();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Report and stop.",
+    )
+    .unwrap();
+    launch_session(staged, |_| {}).expect("agent launch should succeed");
+    let session_start = parse_events(&records)
+        .into_iter()
+        .find(|event| event["event_type"] == "session_start")
+        .expect("a completed session must have written session_start");
+    let pinned = &session_start["effective_grants"]["pinned_programs"];
+    println!("session_start.effective_grants.pinned_programs: {pinned}");
+    let entry = store.join(&download.sha256).canonicalize().unwrap();
+    assert_eq!(
+        pinned,
+        &json!([{
+            "artifact": GRANTS_TOOL_NAME,
+            "program": program,
+            "platform": platform,
+            "source": "pinned",
+            "path": entry.join("files/fixture/prog").display().to_string(),
+            "url": download.url,
+            "sha256": download.sha256,
+        }])
+    );
+    assert_eq!(session_start["effective_grants"], explain_report);
+}

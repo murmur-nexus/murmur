@@ -15,7 +15,9 @@ use crate::stores::FallbackRegistry;
 /// The needs [`capsule_runtime::declared_needs::derive_declared_needs`] derives for `artifacts`,
 /// each `runtime: tool` entry read from `<project_dir>/.murmur/artifacts`, then the global store,
 /// at the version and with the lock origin `lock` pins (the manifest's version and `operator`
-/// with no lock, as staging reads them).
+/// with no lock, as staging reads them). `pinned` is the source choice for pinned program
+/// downloads ([`super::pinned_programs::installed_pinned_programs`]), which the needs resolve
+/// against.
 ///
 /// Read-only: nothing is pulled, compiled or written. A tool neither store holds, or one `lock`
 /// does not pin, contributes nothing: the launch would refuse it before staging. A malformed
@@ -26,6 +28,7 @@ pub(crate) fn installed_declared_needs(
     project_dir: &Path,
     shell_allow: &[String],
     capsule_writable: &[&Path],
+    pinned: &[capsule_runtime::pinned_programs::ResolvedPinnedProgram],
 ) -> Result<Vec<ResolvedProgramNeeds>, CliError> {
     let registry = FallbackRegistry {
         primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
@@ -73,6 +76,7 @@ pub(crate) fn installed_declared_needs(
         &tools,
         shell_allow,
         capsule_writable,
+        pinned,
     ))
 }
 

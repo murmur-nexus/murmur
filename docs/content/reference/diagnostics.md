@@ -80,6 +80,9 @@ section that explains it.
 | `E-REG-010` | A scope's GitHub owner id is not the one recorded for it in `murmur.lock`, in the stored payload, or compiled in for `murmur` | [E-REG-010](#e-reg-010) |
 | `E-REG-011` | `mur install` or `mur publish` was handed a payload whose packed `murmur.yaml` ships a malformed `models:` table | [E-REG-011](#e-reg-011) |
 | `E-REG-012` | `mur install` or `mur publish` was handed a payload whose packed `murmur.yaml` declares `implementation: native` or `execution: native` | [E-REG-012](#e-reg-012) |
+| `E-REG-013` | `mur install` could not fetch a program download a tool pins: a transport failure, a non-2xx status, or more than 2 GiB | [E-REG-013](#e-reg-013) |
+| `E-REG-014` | A program download a tool pins does not hash to the sha256 the tool pins; nothing was stored | [E-REG-014](#e-reg-014) |
+| `E-REG-015` | A program download a tool pins cannot be unpacked: `run` names no regular file, a symlink or escaping entry, or more than 2 GiB unpacked | [E-REG-015](#e-reg-015) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -174,6 +177,7 @@ section that explains it.
 | `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
 | `W-RUN-010` | `capabilities.shell.allow` names `node` or `nodejs` and the address-space limit its commands run under is below 32 GiB | [W-RUN-010](#w-run-010) |
 | `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host cannot grant it | [W-RUN-011](#w-run-011) |
+| `W-RUN-012` | A tool the capsule pins pins a download of a program `shell.allow` grants, and nothing usable runs under that name, or the stored copy fails its checksum | [W-RUN-012](#w-run-012) |
 | `W-RUN-013` | `mur doctor` could not tell whether a `transport: process` harness is logged in | [W-RUN-013](#w-run-013) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
@@ -2831,6 +2835,60 @@ error[E-REG-012]: local/nat-tool@0.1.0 declares implementation: native in its mu
 When one install names several artifacts, the others still install, and the native one is reported
 as failed; the command exits non-zero.
 
+### E-REG-013 — a pinned program download could not be fetched { #e-reg-013 }
+
+```text
+error[E-REG-013]: could not fetch the pinned download of fixture-prog for linux-x86_64 (local/pinned-tool@0.1.0) from https://downloads.example.org/fixture.zip: HTTP 404
+  hint: the artifact stays installed and pinned; check this host reaches the URL and run mur install again to retry — see https://docs.murmur.nexus/reference/diagnostics/#e-reg-013
+```
+
+**Fires when** [`mur install`](cli.md#mur-install) fetches a program download a tool
+[pins](manifest.md#artifact-programs-download) and the request fails, the server answers with a
+status other than 2xx, or the body runs past 2 GiB. The reason after the URL names which.
+
+The artifact is stored and pinned; nothing of the download is kept, and `mur install` exits 1.
+
+**What to do:** check the host reaches the URL, then run `mur install` again. A URL the upstream has
+withdrawn needs a release of the tool that pins another.
+
+### E-REG-014 — a pinned program download does not match its sha256 { #e-reg-014 }
+
+```text
+error[E-REG-014]: the pinned download of fixture-prog for linux-x86_64 (local/pinned-tool@0.1.0) from https://downloads.example.org/fixture.zip has sha256 5ac22964f3ba6483f435783da1b85c69c0fc3839af3591f667c01defd92670b9, and the artifact pins abababababababababababababababababababababababababababababababab; nothing was stored
+```
+
+**Fires when** the bytes `mur install` downloaded hash to another SHA-256 than the tool's
+`download.<platform>.sha256`. The message names both.
+
+Nothing is stored under `~/.murmur/programs/`; the artifact stays stored and pinned, and
+`mur install` exits 1.
+
+**What to do:** the upstream file is not the one the tool's author pinned. Install a release of the
+tool whose pin matches, or ask its author to pin the file again.
+
+### E-REG-015 — a pinned program download cannot be unpacked { #e-reg-015 }
+
+```text
+error[E-REG-015]: the pinned download of fixture-prog for linux-x86_64 (local/pinned-tool@0.1.0) cannot be unpacked: run names fixture/absent, and the zip holds no such file
+```
+
+**Fires when** a download that matched its sha256 is not a tree the program store takes:
+
+| Reason in the message | Cause |
+|---|---|
+| `run names <path>, and the zip holds no such file` | `run` names a file the zip does not hold |
+| `run names <path>, which is not a regular file in the zip` | `run` names a folder |
+| `zip entry '<name>' is a symlink` | The zip holds a symlink |
+| `zip entry '<name>' escapes the archive's folder` | An entry name is absolute or climbs with `..` |
+| `zip entry '<name>' appears more than once` | Two entries name the same file |
+| `the unpacked tree is over the <n>-byte cap` | More than 2 GiB unpacked |
+| `the download is no zip` | `run` is set and the bytes are not a zip |
+
+Nothing is stored; the artifact stays stored and pinned, and `mur install` exits 1.
+
+**What to do:** ask the tool's author to fix the `download:` entry: `run` names a regular file inside
+the zip, or is absent for a download that is the program itself.
+
 ---
 
 ## Registry warnings
@@ -3302,6 +3360,31 @@ warnings. Nothing is refused: a launch grants the needs this host has and report
 **What to do:** install the package named, or the one that provides the need on this
 distribution. For a need that is not granted, put the program on `PATH`, or install the library
 or file where the reason shows it is not under the home folder or a folder the capsule can write.
+
+### W-RUN-012 — a pinned program with no usable copy { #w-run-012 }
+
+```text
+  warning[W-RUN-012]: local/pinned-tool pins fixture-prog for linux-x86_64, and the store holds no copy; run mur install
+  warning[W-RUN-012]: local/pinned-tool's pinned copy of fixture-prog fails its checksum: files/fixture/data.txt changed since install; run mur install to fetch it again
+  warning[W-RUN-012]: local/pinned-tool pins no download of fixture-prog for darwin-x86_64, and this host has no fixture-prog
+```
+
+**Fires when** a tool the capsule pins with an `operator` lock origin
+[pins a download](containment.md#pinned-program-downloads) of a program
+`capabilities.shell.allow` grants, and:
+
+| Case | Line |
+|---|---|
+| No program of that name is on `PATH` and the store holds no copy | `… and the store holds no copy; run mur install` |
+| A stored file changed, went missing or was added since install, even when a host program runs | `…'s pinned copy of <program> fails its checksum: <file> …` |
+| The tool pins no download for this platform and no program of that name is on `PATH` | `… pins no download of <program> for <platform>, and this host has no <program>` |
+
+[`mur doctor`](cli.md#mur-doctor) prints one line per program under `Pinned programs:` and counts
+each warning with a `Fix:` line. Nothing is refused: a command naming the program fails as an
+unknown command does.
+
+**What to do:** run `mur install` in the project, which fetches a missing copy and replaces one that
+fails its checksum. With no download for this platform, install the program so it is on `PATH`.
 
 ### W-RUN-013 — a process harness's login was not checked { #w-run-013 }
 

@@ -83,6 +83,7 @@ pub mod peer_handoff;
 pub(crate) mod peer_tasks;
 #[cfg(test)]
 mod pinned_port;
+pub mod pinned_programs;
 pub mod plan;
 pub mod precompile;
 pub mod proc_view;

@@ -503,7 +503,7 @@ fn sweep_orphan_blobs(path: &Path) -> u64 {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !crate::images::is_sha256_hex(name) || referenced.contains(name) {
+        if !murmur_artifact::is_sha256_hex(name) || referenced.contains(name) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
