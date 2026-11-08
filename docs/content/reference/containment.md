@@ -548,8 +548,19 @@ exactly as a shell command of the same session is, at every tier:
 | The decision point | The `capabilities.filesystem.read_only` check and every `on-shell` deny hook see its argv before it starts; the argv they see is the argv that runs |
 | The work-folder size limit | Checked before it starts |
 | Environment | The sanitized shell environment, plus the tool's additions |
-| [Enforcement tier](#subprocess-enforcement-tiers) | Landlock, seccomp, the sealed composed root and the per-process limits of the session's tier |
+| [Enforcement tier](#subprocess-enforcement-tiers) | The session's; the rows below are what it applies |
+| Privileges | The capsule's user, no capabilities, `no_new_privs` set, and the tier's [syscall filter](#default-deny-syscall-allowlist) |
+| [Landlock ruleset](#library-grant-reach) | The session's one ruleset, built from every grant in the manifest |
+| [Per-process limits](resource-limits.md#host-resource-limits) | The same `capabilities.resources` limits: address space, file size, open files, CPU time, and no core file |
 | [Cgroup scope](#cgroup-scope) and network namespace | The session's own; outbound connections go through its egress proxy |
+| User and PID namespaces | The session's own; on Sealed, a user namespace of its own nested inside the session's. The program's parent is outside the PID namespace, and the program is killed when that parent dies |
+| Mount namespace | Its own: the session's [temporary folder](#temp-folder) over `/tmp` on Full, the [composed root](#composed-root-listability) on Sealed |
+| Devices | The [fixed capsule device set](#capsule-device-set) of the tier; `/dev/shm` is refused on Full and absent on Sealed |
+| Process group and descriptors | Its own process group; stdout and stderr are pipes, stdin is `/dev/null` or, for `start` and a `run` given input, a pipe; no other descriptor is inherited, and the signal mask is empty |
+
+A program either one starts inherits all of these except its own process group, which it shares
+with its parent, and the kill on its parent's death, which applies to the program the runtime
+started.
 
 A session holds at most 8 running session processes. When a program exits, whatever it left
 running in its process group is killed, so the 8 count everything that runs. When the session
@@ -1364,6 +1375,37 @@ with code 13 (`node: OpenSSL configuration error`) when `scoped` refuses it. A c
 `node` names that one file the same way, as a `dirs` entry with `list_dir: false`; the error names
 the path, usually `/etc/ssl/openssl.cnf`. [How to run Node tests in a capsule](../how-to/run-node-tests-in-capsule.md)
 shows both grants in a complete manifest.
+
+### A library a grant brings in reach { #library-grant-reach }
+
+A session has one Landlock ruleset for all its commands. Among its rules are each
+`capabilities.shell.allow` binary's `DT_NEEDED` closure, every `interpreter_runtime` directory,
+the [derived interpreter runtimes](#derived-interpreter-runtime), the [trust store](#trust-store)
+and the [staged runtime](#field-staged-runtime) trees. The `binary` an `interpreter_runtime` entry
+names says why the grant is there; every command of the session, at every depth, reads what it
+grants. A shell command and a program a [WASM tool runs](#wasm-tool-programs) get the same ruleset.
+
+A program that loads optional libraries with `dlopen` takes the ones a grant brings in reach, and
+those libraries can need host files no grant names. The system library folder is the common case:
+
+| Program | Library it then loads | What the library reads | When refused |
+|---|---|---|---|
+| Chrome's GPU process | `libpci.so.3` | `/sys/bus/pci` and `/sys/devices`, the device folders its entries link to | `pcilib: Cannot open /sys/bus/pci/devices`, the GPU process exits with status 1 (`GPU process exited unexpectedly: exit_code=256`) and Chrome stops with `GPU process isn't usable. Goodbye.` |
+
+The capsule names what the library reads in the program's own `interpreter_runtime` entry:
+
+```yaml
+interpreter_runtime:
+  - binary: chrome-headless-shell
+    dirs:
+      - path: /sys/bus/pci
+        list_dir: true
+      - path: /sys/devices
+        list_dir: true
+```
+
+[How to run a Playwright suite in a capsule](../how-to/run-playwright-in-capsule.md) shows it in a
+complete manifest.
 
 ### Kept host facts { #host-facts }
 
