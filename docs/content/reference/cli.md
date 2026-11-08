@@ -1162,7 +1162,7 @@ saying that `mur run` will refuse the capsule:
 | Code | Finding | `Fix:` |
 |---|---|---|
 | [`E-CAP-016`](diagnostics.md#e-cap-016) | A `capabilities.env.allow` entry the credential backstop strips | Remove the named entries from `capabilities.env.allow` |
-| [`E-RUN-059`](diagnostics.md#e-run-059) | `containment: unconfined` in `~/.murmur/config.yaml` with a declared containment floor | The error's hint |
+| [`E-RUN-059`](diagnostics.md#e-run-059) | `containment: unconfined` in `~/.murmur/config.yaml` with a declared containment floor | Remove the declared floor to run unconfined, or pass `--containment <class>` to run contained |
 | [`E-CAP-004`](diagnostics.md#e-cap-004) | `capabilities.shell.staged_runtime` without an effective `sealed` floor | Set `capabilities.containment: sealed`, set `containment: sealed` in `.murmur/config.yaml`, or pass `--containment sealed` |
 | [`E-CAP-006`](diagnostics.md#e-cap-006) | A `sealed` capsule's interpreted `shell.allow` entry whose interpreter is not in the composed root | Declare `capabilities.shell.interpreter_runtime` or `staged_runtime` for the interpreter, or lower `capabilities.containment` |
 | [`E-CAP-005`](diagnostics.md#e-cap-005) | A capsule that can run a subprocess, on a host that cannot create its network namespace | Make this host able to create the namespace |

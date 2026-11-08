@@ -2426,9 +2426,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                     refusal.code,
                     refusal.message
                 );
-                if let Some(hint) = refusal.hint {
-                    findings.coded(refusal.code, &refusal.message, hint);
-                }
+                findings.coded(
+                    refusal.code,
+                    &refusal.message,
+                    refusal.hint.unwrap_or_default(),
+                );
             }
             // A missing artifact is already one failure; there is nothing on disk to
             // hash, so it never also gets a lock line.
@@ -2805,8 +2807,6 @@ mod tests {
         );
     }
 
-    /// The `network namespace:` line reports the probe's answer, and names the failed call and
-    /// its `errno` when it refused.
     /// Nothing found closes with `All checks passed.` and does not fail.
     #[test]
     fn the_tally_with_nothing_found_passes() {
@@ -2947,6 +2947,8 @@ mod tests {
         );
     }
 
+    /// The `network namespace:` line reports the probe's answer, and names the failed call and
+    /// its `errno` when it refused.
     #[test]
     fn the_network_namespace_line_reports_the_probe() {
         assert!(network_namespace_line(true, None).starts_with("created ("));

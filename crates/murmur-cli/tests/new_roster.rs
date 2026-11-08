@@ -984,8 +984,8 @@ fn error_line(stderr: &str) -> &str {
 }
 
 /// `mur doctor` in `crew/` checks the formation: before the members are installed it refuses with
-/// the error `mur run --roster crew` gives, named again after the tally, and once the printed steps have run it prints the
-/// admitted roster and passes.
+/// the error `mur run --roster crew` gives, named again after the tally, and once the printed
+/// steps have run it prints the admitted roster and passes.
 #[test]
 fn doctor_in_the_scaffolded_formation_checks_its_roster() {
     let scratch = Scratch::new();
