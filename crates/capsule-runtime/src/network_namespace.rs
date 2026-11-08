@@ -860,6 +860,9 @@ impl CapsuleNetnsPlan {
 #[derive(Debug, Default)]
 pub(crate) struct SessionNetns {
     state: std::sync::Mutex<SessionNetnsState>,
+    /// The session's bind observer, created by the first [`Self::establish`] handed a held-port
+    /// map and stopped by [`Self::end`]. `None` for a session whose commands are not observed.
+    bind_observer: std::sync::Mutex<Option<crate::held_ports::BindObserver>>,
     /// Successful creations, which a test compares against the commands it ran.
     #[cfg(test)]
     creations: std::sync::atomic::AtomicUsize,
@@ -921,16 +924,30 @@ impl SessionNetns {
     /// failed creation leaves the namespace not yet created and leaks nothing, so that command's
     /// spawn fails and the next one tries again. `tcp_ports` and `policy` are read on the call
     /// that creates the namespace; every later call is handed the namespace that call created.
+    ///
+    /// `bind_observation` is the held-port map of an enforcement whose commands are observed
+    /// ([`crate::sandbox::ShellEnforcement::observed_held_ports`]): the first call handed one
+    /// creates the session's [`crate::held_ports::BindObserver`] with it, so the observer exists
+    /// before the first listener reaches [`Self::observe_bind_listener`].
     #[cfg(target_os = "linux")]
     pub(crate) fn establish(
         &self,
         tcp_ports: &[u16],
         policy: crate::egress_proxy::EgressPolicy,
+        bind_observation: Option<&crate::held_ports::HeldPorts>,
     ) -> Result<SessionNetnsJoin, String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&*state, SessionNetnsState::Ended) {
+            if let Some(held) = bind_observation {
+                self.bind_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(|| crate::held_ports::BindObserver::new(held.clone()));
+            }
+        }
         match &*state {
             SessionNetnsState::Established(established) => return Ok(established.join()),
             SessionNetnsState::Ended => {
@@ -986,6 +1003,65 @@ impl SessionNetns {
         }
         #[cfg(not(target_os = "linux"))]
         drop(previous);
+        if let Some(observer) = self
+            .bind_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            observer.stop();
+        }
+    }
+
+    /// Hands one command's bind-notification listener to the session's observer. A session with
+    /// no observer — never handed a held-port map, or ended — closes it at once.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_bind_listener(&self, listener: std::os::fd::OwnedFd) {
+        match self
+            .bind_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            Some(observer) => observer.add_listener(listener),
+            None => drop(listener),
+        }
+    }
+
+    /// One [`crate::held_ports::held_port_line`] per held port a process of this session tried to
+    /// bind since the last call, ascending; empty for a session with no observer.
+    pub(crate) fn take_held_port_lines(&self) -> Vec<String> {
+        self.bind_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(crate::held_ports::BindObserver::take_lines)
+            .unwrap_or_default()
+    }
+
+    /// Records a bind on `port` as the observer would, creating the observer over `held` if the
+    /// session has none: the seam a test of what drains the records uses instead of a real bind.
+    #[cfg(test)]
+    pub(crate) fn record_held_port_for_test(
+        &self,
+        held: &crate::held_ports::HeldPorts,
+        port: u16,
+    ) -> bool {
+        self.bind_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| crate::held_ports::BindObserver::new(held.clone()))
+            .record_for_test(port)
+    }
+
+    /// Whether the session's bind observer thread is running.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn bind_observer_running(&self) -> bool {
+        self.bind_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(crate::held_ports::BindObserver::thread_running)
     }
 
     /// How many namespaces this session has created: `0` before its first command, `1` after.
@@ -2791,6 +2867,7 @@ mod tests {
             .establish(
                 &[],
                 crate::egress_proxy::EgressPolicy::new(Vec::new(), Vec::new()),
+                None,
             )
             .expect_err("an ended session creates nothing");
         assert!(refusal.contains("session has ended"), "{refusal}");
@@ -2816,10 +2893,10 @@ mod tests {
         );
 
         let first = netns
-            .establish(&[], policy())
+            .establish(&[], policy(), None)
             .expect("the namespace is created");
         let second = netns
-            .establish(&[], policy())
+            .establish(&[], policy(), None)
             .expect("the namespace is reused");
         assert_eq!(netns.creations(), 1);
         let inode = |fd: std::os::fd::RawFd| {
@@ -2839,7 +2916,7 @@ mod tests {
 
         netns.end();
         netns.end();
-        assert!(netns.establish(&[], policy()).is_err());
+        assert!(netns.establish(&[], policy(), None).is_err());
         assert_eq!(
             netns.creations(),
             1,
@@ -2945,7 +3022,7 @@ mod tests {
             let end_explicitly = |explicit: bool| {
                 let netns = SessionNetns::new();
                 let join = netns
-                    .establish(&[], policy())
+                    .establish(&[], policy(), None)
                     .expect("the namespace is created");
                 // This session's own PID namespace, not the first one the test process holds:
                 // tests running beside this one hold sessions of their own, whose holders are

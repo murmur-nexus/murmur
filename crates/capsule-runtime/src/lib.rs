@@ -48,6 +48,7 @@ pub mod formation_launch;
 pub(crate) mod gateway_credential;
 pub mod guest_roots;
 pub(crate) mod harness_session;
+pub(crate) mod held_ports;
 pub(crate) mod hooks;
 mod host_facts;
 pub mod host_paths;

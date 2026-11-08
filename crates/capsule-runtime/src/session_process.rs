@@ -1491,6 +1491,7 @@ fn connect_in_session(
                 enforcement.network_allow_rules.clone(),
                 enforcement.network_allow_ips.clone(),
             ),
+            enforcement.observed_held_ports(),
         )?;
         let (user_fd, net_fd) = join.raw_fds();
         linux_connect::connect_in_namespace(user_fd, net_fd, address)

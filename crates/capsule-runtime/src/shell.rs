@@ -596,6 +596,9 @@ pub(crate) fn spawn_contained(
             )))
         }
     };
+    // Before anything waits on the child: on an observed spawn, a `bind` it makes waits on the
+    // session's observer, which starts reading this command's listener here.
+    supervisor.hand_off_bind_listener(enforcement);
     // The child is its group's leader, so its pid names the group.
     let pgid = child.id() as i32;
     SPAWNED_GROUP.with(|slot| {

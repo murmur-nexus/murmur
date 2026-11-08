@@ -1210,13 +1210,9 @@ files under `name resolution` in its `Effective grants`, and `--explain-scope --
   dual-stack name's real `AAAA` records are returned unchanged. A client that tries IPv6 first pays
   a fallback-to-IPv4 delay but is granted nothing. A capsule whose allowlisted host is IPv6-only
   cannot reach it.
-- **The proxy's ports are held for the whole session.** Each listener the allowlist implies sits
-  on `0.0.0.0:<port>` in the session's namespace from its first shell call to its end. That
-  listener is the session's egress path: every outbound connection in the namespace lands on the
-  local listener for its destination port. A server bound to one of those ports would receive the
-  session's own outbound connections to allowlisted hosts on that port, so the ports are never
-  released between commands. A server a capsule starts on one of them — `443` under an `https://`
-  allowlist entry, for example — fails with `EADDRINUSE`. Pick a port no allow entry names.
+- **The proxy's ports are held for the whole session.** A server a capsule starts on a port an
+  allow entry implies fails with `EADDRINUSE`; serve on a port no allow entry names. See
+  [Held ports](#held-ports).
 - **A loopback server is reachable from its own session only.** Later shell calls of the same
   session reach it; the host, other sessions, delegated children and formation members get
   `Connection refused`.
@@ -1230,6 +1226,58 @@ files under `name resolution` in its `Effective grants`, and `--explain-scope --
   60-second TTL the resolver puts on its answers. A client that caches an address far past its TTL
   and connects much later is checked against the addresses the allowlist resolved to at launch
   instead, as a literal address is.
+
+### Held ports { #held-ports }
+
+Each listener the allowlist implies sits on `0.0.0.0:<port>` in the session's namespace from its
+first shell call to its end. That listener is the session's egress path: every outbound connection
+in the namespace lands on the local listener for its destination port. A server bound to one of
+those ports would receive the session's own outbound connections to allowlisted hosts on that port,
+so the ports are never released between commands. A server a capsule starts on one of them fails
+with `EADDRINUSE`: `nc -l 127.0.0.1 8091` under a `127.0.0.1:8091` allow entry, for example.
+
+| Allow entry | Ports it holds |
+|---|---|
+| `host:port` | that port |
+| `https://host` | 443, or the entry's explicit port |
+| `http://host` | 80, or the entry's explicit port |
+| `host` | 80 and 443 |
+
+At most 16 ports are held, the lowest 16 the allowlist implies; a port past that is neither held
+nor reachable. A bind below 1024 is refused for another reason first: a command holds no
+capabilities, so it fails with `EACCES` (`Permission denied`) rather than `EADDRINUSE`.
+
+**The shell result names the port.** On the Full and Sealed tiers, a finished shell result of a
+session in which a process tried to bind a held port ends with one runtime line per such port,
+after the untrusted-content fence:
+
+```text
+held_port: 8091 — a process in this session tried to bind port 8091, which this session's egress proxy holds for the capabilities.network.allow entry "127.0.0.1:8091", so no server inside the capsule can listen on it. Serve on a port no allow entry names; the allow entry is for connecting to a server outside the capsule on that port.
+```
+
+| Property | Behaviour |
+|---|---|
+| Which result carries it | The session's next finished shell result. A server started in the background whose bind fails after its command returned, a plan's shell step and a program a WASM tool runs are reported on the next one too. |
+| More than one entry | The line names every entry that implies the port, in manifest order: `entries "https://b.example.com", "a.example.com"`. |
+| More than one port | One line per port, ascending. A port appears once per result however many binds hit it. |
+| Where it sits | After the fence and after the other runtime notes, so command output cannot produce it. The result's `status` is unchanged. |
+| Tiers without it | Seccomp-only, Environment-only and Unconfined, and any session whose allowlist holds no port, carry no line; the bind fails exactly as it does with one. |
+| Session end | A bind not yet reported when the session ends is not reported. |
+
+The runtime learns of the bind from the `bind(2)` call itself, never from command output. The
+session's seccomp filter routes `bind` to a user notification; the runtime reads the address the
+process passed and answers every notification by letting the kernel perform the call, so every
+bind succeeds or fails exactly as it would without the notification. The line records the attempt,
+not its result: a bind on a held port that the kernel refuses for another reason — `EACCES` below
+1024 — is reported too.
+
+**What the notification costs.** The notification is installed for every session on the Full or
+Sealed tier whose allowlist holds at least one port; no setting turns it off. Its one cost is the
+filter chain's listener: a program in such a session that asks for a seccomp user-notification
+listener of its own would be refused with `EBUSY`, the kernel's rule of one listener per chain.
+The request never gets that far: `seccomp(2)` is outside the
+[syscall allowlist](#default-deny-syscall-allowlist) on every tier, so it fails with `EPERM`, as
+it does in every session.
 
 ---
 
