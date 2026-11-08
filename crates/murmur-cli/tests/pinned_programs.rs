@@ -391,12 +391,15 @@ fn warning_count(doctor: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// The error count of doctor's closing tally; a tally naming no errors counts 0.
+/// The error count of doctor's closing tally; a tally naming no errors counts 0. The count is
+/// the tally's last part when no warning follows it (`2 checks passed, 1 error found.`), so the
+/// closing period is dropped before matching.
 fn error_count(doctor: &str) -> usize {
     doctor
         .lines()
         .flat_map(|line| line.split(", "))
         .find_map(|part| {
+            let part = part.strip_suffix('.').unwrap_or(part);
             part.strip_suffix(" errors found")
                 .or(part.strip_suffix(" error found"))
         })
