@@ -3684,10 +3684,9 @@ pub(crate) fn prepare_enforcement(
         observed_held_ports,
     )?;
 
-    // On an observed spawn, the socketpair the child sends its seccomp listener over and the
-    // `SCM_RIGHTS` control message it sends it in, built here so the child allocates nothing.
-    // Both ends are `CLOEXEC`: the child's end closes at `execve`, and the listener itself is
-    // closed by the child before it.
+    // On an observed spawn, the socketpair the child sends its seccomp listener over. Both ends
+    // are `CLOEXEC`: the child's end closes at `execve`, and the child closes the listener itself
+    // before that.
     let (bind_listener_socket, bind_listener_handoff) = match observed_held_ports {
         Some(_) => {
             let (parent, handoff) = linux_enforce::bind_listener_socketpair()?;
@@ -3735,8 +3734,7 @@ pub(crate) fn prepare_enforcement(
     // (bounding-set drop, capset clear, and the explicit `no_new_privs` `prctl`) plus one
     // allocation-free `open`/`read`/`close` of `/proc/sys/kernel/cap_last_cap`; libseccomp filter
     // construction/load (kernel syscalls), and on an observed spawn one `sendmsg` of the filter's
-    // listener over the socketpair end, from a control message built here, then one `close` of
-    // the listener; on `KernelFull`/`KernelSealed` Landlock ruleset
+    // listener over the socketpair end, from stack buffers, then one `close` of the listener; on `KernelFull`/`KernelSealed` Landlock ruleset
     // construction/`restrict_self` against already-open fds (also kernel syscalls); and last, the
     // `getrlimit`/`setrlimit` pairs of `resources::apply_per_process_rlimits`. No `canonicalize()`, no
     // path lookup beyond those prepared paths and `cap_last_cap`, no locks beyond what those
@@ -5299,56 +5297,26 @@ mod linux_enforce {
         })
     }
 
-    /// Byte length of the `SCM_RIGHTS` control buffer: room for `CMSG_SPACE(sizeof(int))`, which
-    /// is 24 on every 64-bit Linux target.
-    const BIND_LISTENER_CMSG_CAPACITY: usize = 64;
-
-    /// The control buffer, aligned for `struct cmsghdr`.
-    #[repr(C, align(8))]
-    #[derive(Clone, Copy)]
-    struct CmsgBuffer([u8; BIND_LISTENER_CMSG_CAPACITY]);
-
-    /// What an observed spawn's child sends its seccomp listener with: its end of the socketpair
-    /// and an `SCM_RIGHTS` control message for one descriptor, header filled in the parent so
-    /// the child only copies the buffer and writes the descriptor number.
+    /// The child's end of an observed spawn's socketpair, which its seccomp listener is sent
+    /// over.
     pub(super) struct BindListenerHandoff {
         socket: OwnedFd,
-        cmsg: CmsgBuffer,
-        cmsg_len: usize,
-        data_offset: usize,
     }
 
     impl BindListenerHandoff {
-        /// Sends `listener` in one `sendmsg` carrying one payload byte. Runs in the `pre_exec`
-        /// window: stack copies only, no allocation.
+        /// Sends `listener` in one `SCM_RIGHTS` message. Runs in the `pre_exec` window, so it goes
+        /// through [`crate::network_namespace::send_fds`], which uses stack buffers only.
         fn send(&self, listener: RawFd) -> io::Result<()> {
             use std::os::fd::AsRawFd;
-            let mut cmsg = self.cmsg;
-            cmsg.0[self.data_offset..self.data_offset + std::mem::size_of::<RawFd>()]
-                .copy_from_slice(&listener.to_ne_bytes());
-            let mut payload = [0u8; 1];
-            let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr().cast(),
-                iov_len: payload.len(),
-            };
-            // SAFETY: `msghdr` is a plain C struct for which all-zero is a valid value.
-            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-            message.msg_iov = &mut iov;
-            message.msg_iovlen = 1;
-            message.msg_control = cmsg.0.as_mut_ptr().cast();
-            message.msg_controllen = self.cmsg_len as _;
-            // SAFETY: every pointer in `message` names a stack local that outlives the call, and
-            // the socket is the end this struct owns.
-            let sent = unsafe { libc::sendmsg(self.socket.as_raw_fd(), &message, 0) };
-            if sent < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            // SAFETY: called only from the forked child's `pre_exec` window, which is the context
+            // `send_fds` requires; the socket is the end this struct owns.
+            unsafe { crate::network_namespace::send_fds(self.socket.as_raw_fd(), &[listener]) }
+                .map_err(|()| io::Error::last_os_error())
         }
     }
 
     /// A `SOCK_SEQPACKET | SOCK_CLOEXEC` socketpair for one observed spawn: the parent's end, and
-    /// the child's end with its control message built.
+    /// the child's.
     pub(super) fn bind_listener_socketpair() -> Result<(OwnedFd, BindListenerHandoff), String> {
         use std::os::fd::FromRawFd;
         let mut fds = [0 as RawFd; 2];
@@ -5370,43 +5338,7 @@ mod linux_enforce {
         // SAFETY: both descriptors were just returned by `socketpair` and nothing else owns them.
         let (parent, child) =
             unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-
-        let mut cmsg = CmsgBuffer([0; BIND_LISTENER_CMSG_CAPACITY]);
-        let fd_len = std::mem::size_of::<RawFd>() as u32;
-        // SAFETY: `CMSG_SPACE`/`CMSG_LEN` are arithmetic on their argument.
-        let (cmsg_len, header_len) = unsafe {
-            (
-                libc::CMSG_SPACE(fd_len) as usize,
-                libc::CMSG_LEN(fd_len) as usize,
-            )
-        };
-        if cmsg_len > BIND_LISTENER_CMSG_CAPACITY {
-            return Err(format!(
-                "sandbox: an SCM_RIGHTS message for one descriptor needs {cmsg_len} bytes,                  more than {BIND_LISTENER_CMSG_CAPACITY}"
-            ));
-        }
-        // SAFETY: `msghdr` is a plain C struct for which all-zero is valid; `CMSG_FIRSTHDR` and
-        // `CMSG_DATA` only compute addresses inside `cmsg`, which is aligned for `cmsghdr` and
-        // at least `cmsg_len` bytes long, and the header writes stay inside it.
-        let data_offset = unsafe {
-            let mut message: libc::msghdr = std::mem::zeroed();
-            message.msg_control = cmsg.0.as_mut_ptr().cast();
-            message.msg_controllen = cmsg_len as _;
-            let header = libc::CMSG_FIRSTHDR(&message);
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = header_len as _;
-            libc::CMSG_DATA(header).offset_from(cmsg.0.as_ptr()) as usize
-        };
-        Ok((
-            parent,
-            BindListenerHandoff {
-                socket: child,
-                cmsg,
-                cmsg_len,
-                data_offset,
-            },
-        ))
+        Ok((parent, BindListenerHandoff { socket: child }))
     }
 
     /// The parent's receive of the listener [`BindListenerHandoff::send`] sent, without waiting
@@ -5418,7 +5350,10 @@ mod linux_enforce {
             iov_base: payload.as_mut_ptr().cast(),
             iov_len: payload.len(),
         };
-        let mut cmsg = CmsgBuffer([0; BIND_LISTENER_CMSG_CAPACITY]);
+        /// Room for `CMSG_SPACE(sizeof(int))`, aligned for `struct cmsghdr`.
+        #[repr(C, align(8))]
+        struct Control([u8; 64]);
+        let mut cmsg = Control([0; 64]);
         // SAFETY: `msghdr` is a plain C struct for which all-zero is valid; every pointer set in
         // it names a local that outlives the `recvmsg` call, and `CMSG_FIRSTHDR`/`CMSG_DATA` read
         // only inside `cmsg`, whose length the kernel wrote back into `msg_controllen`.
@@ -5427,7 +5362,7 @@ mod linux_enforce {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = cmsg.0.as_mut_ptr().cast();
-            message.msg_controllen = BIND_LISTENER_CMSG_CAPACITY as _;
+            message.msg_controllen = cmsg.0.len() as _;
             let received = libc::recvmsg(
                 socket.as_raw_fd(),
                 &mut message,

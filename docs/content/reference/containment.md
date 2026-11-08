@@ -1264,20 +1264,17 @@ held_port: 8091 — a process in this session tried to bind port 8091, which thi
 | Tiers without it | Seccomp-only, Environment-only and Unconfined, and any session whose allowlist holds no port, carry no line; the bind fails exactly as it does with one. |
 | Session end | A bind not yet reported when the session ends is not reported. |
 
-The runtime learns of the bind from the `bind(2)` call itself, never from command output. The
-session's seccomp filter routes `bind` to a user notification; the runtime reads the address the
-process passed and answers every notification by letting the kernel perform the call, so every
-bind succeeds or fails exactly as it would without the notification. The line records the attempt,
-not its result: a bind on a held port that the kernel refuses for another reason — `EACCES` below
-1024 — is reported too.
+The line records the attempt, not its result: the runtime sees the `bind(2)` call itself and lets
+the kernel perform it unchanged, so a bind on a held port that the kernel refuses for another
+reason — `EACCES` below 1024 — is reported too, and a server's own log output never produces the
+line.
 
-**What the notification costs.** The notification is installed for every session on the Full or
-Sealed tier whose allowlist holds at least one port; no setting turns it off. Its one cost is the
-filter chain's listener: a program in such a session that asks for a seccomp user-notification
-listener of its own would be refused with `EBUSY`, the kernel's rule of one listener per chain.
-The request never gets that far: `seccomp(2)` is outside the
-[syscall allowlist](#default-deny-syscall-allowlist) on every tier, so it fails with `EPERM`, as
-it does in every session.
+**What it costs.** The bind check is on for every session on the Full or Sealed tier whose
+allowlist holds at least one port; no setting turns it off. It takes the session's one seccomp
+user-notification listener, so a program in such a session cannot install a listener of its own
+(the kernel would refuse it with `EBUSY`). In practice a program never gets that far:
+`seccomp(2)` is outside the [syscall allowlist](#default-deny-syscall-allowlist) on every tier and
+fails with `EPERM` in every session.
 
 ---
 

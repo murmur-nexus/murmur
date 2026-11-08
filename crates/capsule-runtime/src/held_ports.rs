@@ -3,11 +3,14 @@
 //!
 //! The session's network namespace binds one TCP listener per port its allowlist implies
 //! ([`crate::egress_proxy::egress_listen_ports`]) on `INADDR_ANY`, for the whole session, so a
-//! server a command starts on one of those ports gets `EADDRINUSE`. That rule stays. This module
-//! makes it legible: on the Landlock tiers the per-command seccomp filter routes `bind(2)` to a
-//! user notification, and the session's [`BindObserver`] reads the `sockaddr` the process passed,
-//! records the port when it is one the proxy holds, and always answers "continue". The kernel
-//! performs every bind exactly as it would without the observer; the observer decides nothing.
+//! server a command starts on one of those ports gets `EADDRINUSE`. On the Landlock tiers the
+//! per-command seccomp filter routes `bind(2)` to a user notification, and the session's
+//! [`BindObserver`] reads the `sockaddr` the process passed, records the port when it is one the
+//! proxy holds, and always answers "continue".
+//!
+//! The observer must never decide: the kernel performs every bind exactly as it would without it.
+//! The `sockaddr` it reads can change before the kernel's own read, so the record may only ever
+//! choose which line a later shell result carries, never the outcome of a call.
 //!
 //! A record is only a port. The next finished shell result of the session drains the pending
 //! records into one [`held_port_line`] per port, after the fence, as a runtime note.
@@ -24,8 +27,8 @@ use crate::network_policy::NetworkAllowRule;
 /// entries that imply it, in manifest order and quoted as the operator wrote them (trimmed).
 ///
 /// A bare host implies 80 and 443, an `http(s)://` entry its explicit port or its scheme's
-/// default, and `host:port` its port — the mapping [`crate::egress_proxy::egress_listen_ports`]
-/// uses, whose result (truncation included) is the held set this is built over.
+/// default, and `host:port` its port ([`crate::egress_proxy::implied_tcp_ports`]). The held set
+/// it is built over is [`crate::egress_proxy::egress_listen_ports`]'s result, truncation included.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HeldPorts {
     by_port: BTreeMap<u16, Vec<String>>,
@@ -41,13 +44,9 @@ impl HeldPorts {
             let Ok(rule) = NetworkAllowRule::parse(entry) else {
                 continue;
             };
-            let implied: &[u16] = match rule.port {
-                Some(ref port) => std::slice::from_ref(port),
-                None => &[80, 443],
-            };
             let quoted = entry.trim();
-            for port in implied {
-                if let Some(entries) = by_port.get_mut(port) {
+            for port in crate::egress_proxy::implied_tcp_ports(&rule) {
+                if let Some(entries) = by_port.get_mut(&port) {
                     if !entries.iter().any(|known| known == quoted) {
                         entries.push(quoted.to_string());
                     }
