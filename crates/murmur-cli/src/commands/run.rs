@@ -548,6 +548,7 @@ pub(crate) fn run_run(
             .capabilities
             .as_ref()
             .and_then(|capabilities| capabilities.containment),
+        effective_uid: None,
     })
     .map_err(|error| fail(&session_id, &workdir, error, json))?;
     let declared_containment_floor = stance.declared_floor();

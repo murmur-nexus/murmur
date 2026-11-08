@@ -6,6 +6,10 @@ coding agent working on your own machine, you may want it to run the way a local
 does — as you, with your home folder, your environment and `sudo`. Running it unconfined does
 that, and keeps the trace, the spend ceilings, the turn limit and the policy hooks.
 
+Run `mur` as your normal user. As root, `mur` refuses the unconfined stance with
+[E-RUN-063](../reference/diagnostics.md#e-run-063), because the capsule's commands would run as root
+on the host; on a machine whose only user is root, add a user first.
+
 ??? definition "What is the unconfined stance?"
     **Unconfined** is a stance only the operator chooses, with `mur run --unconfined` or
     `containment: unconfined` in `~/.murmur/config.yaml`. The capsule's shell commands, plan shell
@@ -190,6 +194,7 @@ refused with [E-RUN-059](../reference/diagnostics.md#e-run-059): a declared floo
 | `mur run --unconfined` | Runs this launch as you: your `HOME`, environment, filesystem, network and `sudo` |
 | `containment: unconfined` in `~/.murmur/config.yaml` | Runs every launch you make unconfined; `--containment <class>` runs one contained |
 | A declared floor | Refuses the unconfined stance with `E-RUN-059` |
+| Running `mur` as root | Refuses the unconfined stance with `E-RUN-063`; a contained run as root is unaffected |
 | What stays on | The trace, spend ceilings, `inference.max_turns`, deadlines, policy hooks, the untrusted-content fence, and the boundaries of drivers, hooks and scoped WASM tools |
 | What a WASM tool gains | An unscoped WASM tool is handed the whole host at `murmur-host/` |
 | What never spreads | Delegated children, plan `capsule` steps and deployed capsules run contained |

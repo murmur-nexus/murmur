@@ -66,6 +66,7 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         global: containment_config.global,
         project: containment_config.project,
         manifest: None,
+        effective_uid: None,
     })?;
     let project_dir = roster_project_dir(launch.roster)?;
 

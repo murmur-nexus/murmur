@@ -5,7 +5,9 @@
 //! it spawns, and the records it writes. Every scratch directory is created under
 //! `CARGO_TARGET_TMPDIR`. An unconfined run creates no namespace, so its half never skips; a
 //! contained comparison half that declares `shell.allow` first asks whether this host can give it
-//! one.
+//! one. The tests of `mur` running as root run the cargo-built binary inside `unshare --user
+//! --map-root-user`, where its effective uid is genuinely 0, and skip on a host that cannot build
+//! that namespace.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -102,10 +104,32 @@ impl Fixture {
     fn mur(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = Command::cargo_bin("mur").unwrap();
         command
+            .args(["run", "--manifest", "murmur.yaml"])
+            .args(args);
+        self.output(command, env)
+    }
+
+    /// `mur run --manifest murmur.yaml` with `args`, as uid 0 in a user namespace.
+    fn mur_as_root(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.as_root(&[&["run", "--manifest", "murmur.yaml"], args].concat(), env)
+    }
+
+    /// `mur` with `args`, as uid 0: inside `unshare --user --map-root-user`, which maps this
+    /// user to root in a new user namespace, so `geteuid` in `mur` returns 0.
+    fn as_root(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new("unshare");
+        command
+            .args(["--user", "--map-root-user"])
+            .arg(assert_cmd::cargo::cargo_bin("mur"))
+            .args(args);
+        self.output(command, env)
+    }
+
+    /// Runs `command` with the scratch `HOME`, in the project, on empty stdin.
+    fn output(&self, mut command: Command, env: &[(&str, &str)]) -> Output {
+        command
             .env("HOME", self.home.path())
             .current_dir(self.project.path())
-            .args(["run", "--manifest", "murmur.yaml"])
-            .args(args)
             .write_stdin("");
         for (key, value) in env {
             command.env(key, value);
@@ -145,6 +169,50 @@ impl Fixture {
 
     fn records_exist(&self) -> bool {
         common::records_root(self.home.path()).exists()
+    }
+
+    /// Whether `<home>/.murmur/formations` holds anything.
+    fn formations_exist(&self) -> bool {
+        fs::read_dir(self.home.path().join(".murmur").join("formations"))
+            .is_ok_and(|mut entries| entries.next().is_some())
+    }
+
+    /// Asserts a refused launch left no records directory, workdir or formation behind.
+    fn assert_nothing_created(&self, case: &str) {
+        assert!(!self.records_exist(), "{case}: left a records directory");
+        assert!(
+            !self.project.path().join("workdir").exists(),
+            "{case}: left a workdir"
+        );
+        assert!(
+            !self.formations_exist(),
+            "{case}: left a formation directory"
+        );
+    }
+}
+
+/// `true`, after printing `[SKIP-HOST]`, when this host cannot run a process as uid 0 in a user
+/// namespace: `unshare --user --map-root-user id -u` does not print `0`.
+fn skip_without_root_namespace(test: &str) -> bool {
+    let probe = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "id", "-u"])
+        .output();
+    match probe {
+        Ok(output) if output.status.success() && output.stdout == b"0\n" => false,
+        Ok(output) => {
+            eprintln!(
+                "[SKIP-HOST] {test}: `unshare --user --map-root-user id -u` exited {} printing \
+                 {:?}, {:?}, so no process here can run as uid 0 without sudo",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("[SKIP-HOST] {test}: unshare cannot run: {error}");
+            true
+        }
     }
 }
 
@@ -963,5 +1031,218 @@ fn wasm_tool_grants_differ_only_in_extra_roots_when_unconfined() {
             .iter()
             .any(|preopen| preopen.to_string().contains("data")),
         "{contained}"
+    );
+}
+
+/// The environment a caller might hope lifts the root refusal; none of it does.
+const ROOT_OVERRIDE_ATTEMPT: &[(&str, &str)] = &[
+    ("MURMUR_ALLOW_ROOT", "1"),
+    ("SUDO_USER", "agape"),
+    ("SUDO_UID", "1000"),
+];
+
+/// Asserts `output` is the `E-RUN-063` refusal, not a usage error, and returns its stderr.
+fn assert_refused_as_root(output: &Output, case: &str) -> String {
+    let err = stderr(output);
+    assert!(!output.status.success(), "{case}: {err}");
+    assert_ne!(output.status.code(), Some(2), "{case}: {err}");
+    assert!(err.contains("error[E-RUN-063]"), "{case}: {err}");
+    assert!(err.contains("normal user"), "{case}: {err}");
+    err
+}
+
+/// `--unconfined` as uid 0 is `E-RUN-063` before anything exists, ahead of a declared floor's
+/// `E-RUN-059`, and no environment lifts it.
+#[test]
+fn unconfined_as_root_is_refused_before_anything_is_created() {
+    const TEST: &str = "unconfined_as_root_is_refused_before_anything_is_created";
+    if skip_without_root_namespace(TEST) {
+        return;
+    }
+    for capabilities in ["", "  containment: scoped\n"] {
+        let fixture = Fixture::new();
+        fixture.manifest("http://127.0.0.1:9", "", capabilities, "");
+        let no_env: &[(&str, &str)] = &[];
+        for (args, env) in [
+            (&["--unconfined", "--task", "go"][..], no_env),
+            (&["--unconfined", "--explain-scope", "--json"], no_env),
+            (&["--unconfined", "--task", "go"], ROOT_OVERRIDE_ATTEMPT),
+        ] {
+            let case = format!("{capabilities:?} {args:?} {env:?}");
+            let output = fixture.mur_as_root(args, env);
+            let err = assert_refused_as_root(&output, &case);
+            assert!(
+                err.contains("--unconfined cannot run as root"),
+                "{case}: {err}"
+            );
+            assert!(!err.contains("E-RUN-059"), "{case}: {err}");
+            fixture.assert_nothing_created(&case);
+        }
+    }
+}
+
+/// The global config's `unconfined` as uid 0 is `E-RUN-063` naming the global config, before
+/// anything exists.
+#[test]
+fn global_unconfined_as_root_is_refused_before_anything_is_created() {
+    const TEST: &str = "global_unconfined_as_root_is_refused_before_anything_is_created";
+    if skip_without_root_namespace(TEST) {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.global_config("containment: unconfined\n");
+    fixture.manifest("http://127.0.0.1:9", "", "", "");
+    for args in [&["--task", "go"][..], &["--explain-scope", "--json"]] {
+        let case = format!("{args:?}");
+        let output = fixture.mur_as_root(args, &[]);
+        let err = assert_refused_as_root(&output, &case);
+        assert!(
+            err.contains("containment: unconfined in ~/.murmur/config.yaml cannot run as root"),
+            "{case}: {err}"
+        );
+        assert!(err.contains("--containment"), "{case}: {err}");
+        fixture.assert_nothing_created(&case);
+    }
+}
+
+/// A contained run as uid 0 runs as before: with no stance chosen, and with the global
+/// config's `unconfined` overridden by `--containment advisory`.
+#[test]
+fn a_contained_run_as_root_is_unchanged() {
+    const TEST: &str = "a_contained_run_as_root_is_unchanged";
+    if skip_without_root_namespace(TEST) {
+        return;
+    }
+    for (global, args) in [
+        (None, &[][..]),
+        (
+            Some("containment: unconfined\n"),
+            &["--containment", "advisory"][..],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        if let Some(yaml) = global {
+            fixture.global_config(yaml);
+        }
+        let server = common::ScriptedServer::start(vec![end_turn("Done.")]);
+        fixture.manifest(&server.endpoint, "", "", "");
+
+        let case = format!("{global:?} {args:?} --explain-scope");
+        let output = fixture.mur_as_root(&[args, &["--explain-scope", "--json"]].concat(), &[]);
+        let err = stderr(&output);
+        assert!(output.status.success(), "{case}: {err}");
+        assert!(!err.contains("E-RUN-063"), "{case}: {err}");
+        let scope: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+        assert_ne!(
+            scope["achieved_containment"], "unconfined",
+            "{case}: {scope}"
+        );
+        assert!(scope["unconfined"].is_null(), "{case}: {scope}");
+
+        let case = format!("{global:?} {args:?} --task go");
+        let output = fixture.mur_as_root(&[args, &["--task", "go"]].concat(), &[]);
+        let err = stderr(&output);
+        assert!(output.status.success(), "{case}: {err}");
+        assert!(!err.contains("E-RUN-063"), "{case}: {err}");
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "{case}: the session asked its model"
+        );
+        let start = first(&fixture.trace(), "session_start");
+        assert_eq!(start["containment_declared"], "advisory", "{case}: {start}");
+        assert!(
+            start["effective_grants"]["unconfined"].is_null(),
+            "{case}: {start}"
+        );
+    }
+}
+
+/// An unconfined roster as uid 0, chosen by the flag or by the global config, is `E-RUN-063`
+/// before the roster is read or any member starts; as a normal user the same launch gets as far
+/// as reading the roster.
+#[test]
+fn an_unconfined_roster_as_root_is_refused_before_any_member_starts() {
+    const TEST: &str = "an_unconfined_roster_as_root_is_refused_before_any_member_starts";
+    if skip_without_root_namespace(TEST) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let roster = scratch();
+    let roster_dir = roster.path().to_str().unwrap();
+
+    let output = fixture.output(
+        {
+            let mut command = Command::cargo_bin("mur").unwrap();
+            command.args([
+                "run",
+                "--roster",
+                roster_dir,
+                "--unconfined",
+                "--task",
+                "go",
+            ]);
+            command
+        },
+        &[],
+    );
+    let err = stderr(&output);
+    assert!(!output.status.success(), "normal user: {err}");
+    assert!(err.contains("roster.yaml"), "normal user: {err}");
+    assert!(!err.contains("E-RUN-063"), "normal user: {err}");
+    let _ = fs::remove_dir_all(fixture.home.path().join(".murmur").join("formations"));
+    let _ = fs::remove_dir_all(common::records_root(fixture.home.path()));
+
+    for (global, args) in [
+        (None, &["--unconfined", "--task", "go"][..]),
+        (Some("containment: unconfined\n"), &["--task", "go"][..]),
+    ] {
+        if let Some(yaml) = global {
+            fixture.global_config(yaml);
+        }
+        let case = format!("{global:?} {args:?}");
+        let output = fixture.as_root(&[&["run", "--roster", roster_dir], args].concat(), &[]);
+        let err = assert_refused_as_root(&output, &case);
+        assert!(!err.contains("roster.yaml"), "{case}: {err}");
+        assert!(!err.contains("E-ROS-"), "{case}: {err}");
+        fixture.assert_nothing_created(&case);
+    }
+}
+
+/// `mur doctor` as uid 0 reports the `E-RUN-063` refusal `mur run` will make when the global
+/// config chooses `unconfined`, in place of the stance line; without that config it reports
+/// neither.
+#[test]
+fn mur_doctor_as_root_warns_of_the_unconfined_refusal() {
+    const TEST: &str = "mur_doctor_as_root_warns_of_the_unconfined_refusal";
+    if skip_without_root_namespace(TEST) {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.global_config("containment: unconfined\n");
+    fixture.manifest("http://127.0.0.1:9", "", "", "");
+    let output = fixture.as_root(&["doctor"], &[]);
+    let err = stderr(&output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(err.contains("[mur doctor] error[E-RUN-063]:"), "{out}{err}");
+    assert!(err.contains("`mur run` will refuse this capsule"), "{err}");
+    assert!(
+        !out.lines()
+            .any(|line| line.starts_with("Containment stance: unconfined")),
+        "{out}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{out}{err}");
+    assert!(out.contains("\nFirst refusal: error[E-RUN-063]: "), "{out}");
+
+    fs::remove_file(fixture.home.path().join(".murmur").join("config.yaml")).unwrap();
+    let output = fixture.as_root(&["doctor"], &[]);
+    let err = stderr(&output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(!err.contains("E-RUN-063"), "{out}{err}");
+    assert!(!out.contains("E-RUN-063"), "{out}{err}");
+    assert!(
+        !out.lines()
+            .any(|line| line.starts_with("Containment stance: unconfined")),
+        "{out}"
     );
 }

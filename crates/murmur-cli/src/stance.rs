@@ -6,10 +6,15 @@
 //! meeting a floor from any source is refused, naming both. A launch the runtime started on the
 //! operator's behalf (`--contained-launch`, `--spawn-grant-stdin`) is contained whatever the
 //! global file says, and refuses `--unconfined`.
+//!
+//! The unconfined stance is refused when `mur`'s effective uid is 0, whichever source chose it: an
+//! unconfined capsule's commands run as the launching user, so as root they would run as root on
+//! the host with no boundary at all. Nothing overrides that refusal. A contained stance runs at
+//! any uid and never consults it.
 
 use murmur_artifact::{effective_containment_floor, ContainmentClass};
 
-use crate::error::{CliError, E_IO_003, E_RUN_059, E_RUN_060};
+use crate::error::{CliError, E_IO_003, E_RUN_059, E_RUN_060, E_RUN_063};
 
 /// Where the global file is named in a refusal.
 const GLOBAL_CONFIG: &str = "~/.murmur/config.yaml";
@@ -44,6 +49,9 @@ pub(crate) struct StanceInputs {
     pub(crate) project: Option<ContainmentClass>,
     /// The manifest's `capabilities.containment`, never `unconfined` (refused at parse).
     pub(crate) manifest: Option<ContainmentClass>,
+    /// The effective uid the unconfined stance is checked against. `None` reads this process's
+    /// own with `geteuid`; only tests pass `Some`.
+    pub(crate) effective_uid: Option<u32>,
 }
 
 /// Who chose the unconfined stance.
@@ -61,6 +69,14 @@ impl UnconfinedSource {
         match self {
             Self::Flag => "--unconfined",
             Self::GlobalConfig => "containment: unconfined in ~/.murmur/config.yaml",
+        }
+    }
+
+    /// How a refusal tells the operator to run this launch contained instead.
+    fn run_contained(self) -> &'static str {
+        match self {
+            Self::Flag => "run without --unconfined to run contained",
+            Self::GlobalConfig => "pass --containment <class> to run this launch contained",
         }
     }
 }
@@ -130,12 +146,13 @@ pub(crate) fn refuse_unconfined_contained_launch(
 }
 
 /// Resolves the stance, in order: `E-RUN-060` for `--unconfined` on a contained launch;
-/// `--unconfined` (refused with `E-RUN-059` against any floor from the global file, the project
-/// file or the manifest); the global file's `unconfined` on a launch with no `--contained-launch`,
-/// no `--spawn-grant-stdin` and no `--containment` (refused on the same terms against the project
-/// file and the manifest); otherwise contained, at the strongest floor any source declares,
-/// defaulting to `advisory`. `--unconfined` with `--containment` is a usage error clap raises
-/// before this runs.
+/// `--unconfined`; the global file's `unconfined` on a launch with no `--contained-launch`, no
+/// `--spawn-grant-stdin` and no `--containment`; otherwise contained, at the strongest floor any
+/// source declares, defaulting to `advisory`. Either unconfined choice is refused with `E-RUN-063`
+/// when the effective uid is 0, and only then with `E-RUN-059` against a declared floor: any floor
+/// from the global file, the project file or the manifest for `--unconfined`, a floor from the
+/// project file or the manifest for the global file's choice. `--unconfined` with `--containment`
+/// is a usage error clap raises before this runs.
 pub(crate) fn resolve_stance(inputs: StanceInputs) -> Result<Stance, CliError> {
     refuse_unconfined_contained_launch(
         inputs.unconfined_flag,
@@ -146,6 +163,10 @@ pub(crate) fn resolve_stance(inputs: StanceInputs) -> Result<Stance, CliError> {
         .global
         .filter(|class| *class != ContainmentClass::Unconfined);
     if inputs.unconfined_flag {
+        refuse_unconfined_as_root(
+            UnconfinedSource::Flag,
+            inputs.effective_uid.unwrap_or_else(process_effective_uid),
+        )?;
         let floors = [
             (global_floor, GLOBAL_CONFIG),
             (inputs.project, PROJECT_CONFIG),
@@ -158,6 +179,10 @@ pub(crate) fn resolve_stance(inputs: StanceInputs) -> Result<Stance, CliError> {
         && !inputs.spawn_grant_stdin
         && inputs.containment_flag.is_none();
     if global_unconfined {
+        refuse_unconfined_as_root(
+            UnconfinedSource::GlobalConfig,
+            inputs.effective_uid.unwrap_or_else(process_effective_uid),
+        )?;
         let floors = [
             (inputs.project, PROJECT_CONFIG),
             (inputs.manifest, MANIFEST),
@@ -169,6 +194,32 @@ pub(crate) fn resolve_stance(inputs: StanceInputs) -> Result<Stance, CliError> {
         inputs.manifest,
         inputs.containment_flag,
     )))
+}
+
+/// This process's effective uid.
+#[allow(unsafe_code)]
+fn process_effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory of the caller and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// `E-RUN-063` when the unconfined stance chosen by `source` would run with effective uid 0.
+fn refuse_unconfined_as_root(source: UnconfinedSource, effective_uid: u32) -> Result<(), CliError> {
+    if effective_uid != 0 {
+        return Ok(());
+    }
+    Err(CliError::with_hint(
+        E_RUN_063,
+        format!(
+            "{} cannot run as root: mur's effective uid is 0, so the capsule's commands would run \
+             as root on this host with no boundary at all",
+            source.describe()
+        ),
+        format!(
+            "run mur as a normal user (on a machine whose only user is root, add one), or {}",
+            source.run_contained()
+        ),
+    ))
 }
 
 /// The unconfined stance chosen by `source`, or `E-RUN-059` naming it and every floor present in
@@ -184,10 +235,6 @@ fn unconfined_unless_floored(
     if declared.is_empty() {
         return Ok(Stance::Unconfined(source));
     }
-    let remedy = match source {
-        UnconfinedSource::Flag => "run without --unconfined to run contained",
-        UnconfinedSource::GlobalConfig => "pass --containment <class> to run this launch contained",
-    };
     Err(CliError::with_hint(
         E_RUN_059,
         format!(
@@ -196,7 +243,10 @@ fn unconfined_unless_floored(
             source.describe(),
             declared.join("; ")
         ),
-        format!("remove the declared floor to run unconfined, or {remedy}"),
+        format!(
+            "remove the declared floor to run unconfined, or {}",
+            source.run_contained()
+        ),
     ))
 }
 
@@ -204,6 +254,9 @@ fn unconfined_unless_floored(
 mod tests {
     use super::*;
     use ContainmentClass::{Advisory, Scoped, Sealed, Unconfined};
+
+    /// An effective uid other than 0, for the tests where the unconfined stance must stand.
+    const NORMAL_USER: u32 = 1000;
 
     fn refused(inputs: StanceInputs) -> CliError {
         resolve_stance(inputs).expect_err("this stance is refused")
@@ -290,6 +343,7 @@ mod tests {
         assert_eq!(
             resolve_stance(StanceInputs {
                 unconfined_flag: true,
+                effective_uid: Some(NORMAL_USER),
                 ..StanceInputs::default()
             })
             .unwrap(),
@@ -300,6 +354,7 @@ mod tests {
             resolve_stance(StanceInputs {
                 unconfined_flag: true,
                 global: Some(Unconfined),
+                effective_uid: Some(NORMAL_USER),
                 ..StanceInputs::default()
             })
             .unwrap(),
@@ -310,6 +365,7 @@ mod tests {
             global: Some(Advisory),
             project: Some(Scoped),
             manifest: Some(Sealed),
+            effective_uid: Some(NORMAL_USER),
             ..StanceInputs::default()
         });
         assert_eq!(error.code, E_RUN_059);
@@ -346,6 +402,7 @@ mod tests {
         ] {
             let error = refused(StanceInputs {
                 unconfined_flag: true,
+                effective_uid: Some(NORMAL_USER),
                 ..inputs
             });
             assert_eq!(error.code, E_RUN_059);
@@ -360,6 +417,7 @@ mod tests {
         assert_eq!(
             resolve_stance(StanceInputs {
                 global: Some(Unconfined),
+                effective_uid: Some(NORMAL_USER),
                 ..StanceInputs::default()
             })
             .unwrap(),
@@ -369,6 +427,7 @@ mod tests {
             global: Some(Unconfined),
             manifest: Some(Sealed),
             project: Some(Advisory),
+            effective_uid: Some(NORMAL_USER),
             ..StanceInputs::default()
         });
         assert_eq!(error.code, E_RUN_059);
@@ -427,6 +486,144 @@ mod tests {
         assert_eq!(
             Stance::Unconfined(UnconfinedSource::Flag).declared_floor(),
             Unconfined
+        );
+    }
+
+    /// As root, either unconfined choice is `E-RUN-063`, naming the choice, the rule and both
+    /// fixes; it comes before `E-RUN-059`, and after `E-RUN-060`.
+    #[test]
+    fn stance_unconfined_as_root_is_e_run_063() {
+        let error = refused(StanceInputs {
+            unconfined_flag: true,
+            effective_uid: Some(0),
+            ..StanceInputs::default()
+        });
+        assert_eq!(error.code, E_RUN_063);
+        for named in ["--unconfined", "root", "effective uid is 0"] {
+            assert!(error.message.contains(named), "{named}: {error}");
+        }
+        let hint = error.hint.clone().unwrap();
+        for named in ["normal user", "without --unconfined"] {
+            assert!(hint.contains(named), "{named}: {hint}");
+        }
+        assert_eq!(
+            error.to_string(),
+            "error[E-RUN-063]: --unconfined cannot run as root: mur's effective uid is 0, so the \
+             capsule's commands would run as root on this host with no boundary at all\n  hint: \
+             run mur as a normal user (on a machine whose only user is root, add one), or run \
+             without --unconfined to run contained"
+        );
+
+        let error = refused(StanceInputs {
+            global: Some(Unconfined),
+            effective_uid: Some(0),
+            ..StanceInputs::default()
+        });
+        assert_eq!(error.code, E_RUN_063);
+        assert!(
+            error
+                .message
+                .starts_with("containment: unconfined in ~/.murmur/config.yaml cannot run as root"),
+            "{error}"
+        );
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--containment <class>"),
+            "{error}"
+        );
+
+        let error = refused(StanceInputs {
+            unconfined_flag: true,
+            manifest: Some(Scoped),
+            effective_uid: Some(0),
+            ..StanceInputs::default()
+        });
+        assert_eq!(error.code, E_RUN_063, "{error}");
+        let error = refused(StanceInputs {
+            global: Some(Unconfined),
+            project: Some(Sealed),
+            effective_uid: Some(0),
+            ..StanceInputs::default()
+        });
+        assert_eq!(error.code, E_RUN_063, "{error}");
+
+        let error = refused(StanceInputs {
+            unconfined_flag: true,
+            contained_launch: true,
+            effective_uid: Some(0),
+            ..StanceInputs::default()
+        });
+        assert_eq!(error.code, E_RUN_060, "{error}");
+    }
+
+    /// As root, a contained stance resolves exactly as at any other uid.
+    #[test]
+    fn stance_contained_as_root_is_unchanged() {
+        let root = |inputs: StanceInputs| {
+            resolve_stance(StanceInputs {
+                effective_uid: Some(0),
+                ..inputs
+            })
+            .unwrap()
+        };
+        assert_eq!(root(StanceInputs::default()), Stance::Contained(Advisory));
+        assert_eq!(
+            root(StanceInputs {
+                global: Some(Unconfined),
+                containment_flag: Some(Scoped),
+                ..StanceInputs::default()
+            }),
+            Stance::Contained(Scoped)
+        );
+        for (contained_launch, spawn_grant_stdin) in [(true, false), (false, true)] {
+            assert_eq!(
+                root(StanceInputs {
+                    global: Some(Unconfined),
+                    contained_launch,
+                    spawn_grant_stdin,
+                    ..StanceInputs::default()
+                }),
+                Stance::Contained(Advisory)
+            );
+        }
+    }
+
+    /// As a normal user, both unconfined choices stand; with no uid given, the process's own
+    /// effective uid decides.
+    #[test]
+    fn stance_unconfined_as_a_normal_user_stands() {
+        assert_eq!(
+            resolve_stance(StanceInputs {
+                unconfined_flag: true,
+                effective_uid: Some(NORMAL_USER),
+                ..StanceInputs::default()
+            })
+            .unwrap(),
+            Stance::Unconfined(UnconfinedSource::Flag)
+        );
+        assert_eq!(
+            resolve_stance(StanceInputs {
+                global: Some(Unconfined),
+                effective_uid: Some(NORMAL_USER),
+                ..StanceInputs::default()
+            })
+            .unwrap(),
+            Stance::Unconfined(UnconfinedSource::GlobalConfig)
+        );
+        let flag = StanceInputs {
+            unconfined_flag: true,
+            ..StanceInputs::default()
+        };
+        let own = StanceInputs {
+            effective_uid: Some(process_effective_uid()),
+            ..flag
+        };
+        assert_eq!(
+            resolve_stance(flag).map_err(|error| error.code),
+            resolve_stance(own).map_err(|error| error.code)
         );
     }
 }
