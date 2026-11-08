@@ -1378,7 +1378,7 @@ pub(crate) fn resolve_sealed_bind_dirs(
 pub(crate) fn host_path_execute_roots(
     policy: &CapabilityPolicy,
 ) -> Vec<crate::host_paths::ExecuteRoot> {
-    let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+    let exec_allow_paths = resolve_policy_exec_allowlist(policy);
     execute_roots_from(&resolve_landlock_grants(&exec_allow_paths), policy)
 }
 
@@ -1407,7 +1407,54 @@ fn execute_roots_from(
     for dir in resolve_staged_runtime_dirs(policy) {
         push(dir.clone(), dir);
     }
+    for dir in resolve_pinned_program_dirs(policy) {
+        push(dir.clone(), dir);
+    }
     roots
+}
+
+/// The canonical binaries `policy`'s `shell.allow` names: every match on this process's `PATH`
+/// ([`resolve_exec_allowlist`]), then every match in the `bin/` folder of each program staging
+/// chose the store's pinned copy of ([`crate::pinned_programs`]) — the folders every command's
+/// own `PATH` ends with, so the allowlist and what `execvp` can find agree.
+pub(crate) fn resolve_policy_exec_allowlist(policy: &CapabilityPolicy) -> Vec<PathBuf> {
+    let mut resolved: std::collections::BTreeSet<PathBuf> =
+        resolve_exec_allowlist(&policy.shell_allow)
+            .into_iter()
+            .collect();
+    resolved.extend(resolve_exec_allowlist_in(
+        &policy.shell_allow,
+        &crate::pinned_programs::pinned_bin_dirs(&policy.shell_pinned_programs),
+    ));
+    resolved.into_iter().collect()
+}
+
+/// The store entry, `~/.murmur/programs/<sha256>`, of each program staging chose the pinned copy
+/// of: one listable, executable Landlock grant each ([`resolve_pinned_program_landlock_grants`])
+/// and, on `sealed`, one optional read-only bind at its own path. One list feeds both, so the
+/// grant and the bind cannot drift. A `host` or `missing` choice contributes nothing.
+///
+/// Pure and syscall-free.
+pub(crate) fn resolve_pinned_program_dirs(policy: &CapabilityPolicy) -> Vec<PathBuf> {
+    crate::pinned_programs::pinned_trees(&policy.shell_pinned_programs)
+        .into_iter()
+        .filter(|tree| tree.is_absolute())
+        .collect()
+}
+
+/// One listable, executable [`LandlockGrant`] per [`resolve_pinned_program_dirs`] entry. Read and
+/// execute only, never write: a capsule can run the store's copy and never change it.
+pub(crate) fn resolve_pinned_program_landlock_grants(
+    policy: &CapabilityPolicy,
+) -> Vec<LandlockGrant> {
+    resolve_pinned_program_dirs(policy)
+        .into_iter()
+        .map(|path| LandlockGrant {
+            path,
+            list_dir: true,
+            executable: true,
+        })
+        .collect()
 }
 
 /// What `tier` does with a host path.
@@ -2405,6 +2452,12 @@ pub(crate) struct ShellEnforcement {
     /// parity, exactly like the two fields above.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) staged_runtime_dirs: Vec<PathBuf>,
+    /// The store entry of each pinned program the session runs ([`resolve_pinned_program_dirs`]),
+    /// bound read-only at its own path into the composed root, ahead of the other optional binds.
+    /// Optional: an entry that vanished since staging makes the root narrower, never refuses.
+    /// Consumed only on `KernelSealed`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) pinned_program_dirs: Vec<PathBuf>,
     /// Fully-resolved OS-level bounds for every subprocess this session spawns — `rlimit(2)`
     /// ceilings applied before `execve`, plus the values the cgroup scope below was built from.
     /// Unlike everything above it, this is enforced on **every** platform: `setrlimit` is POSIX,
@@ -2503,7 +2556,9 @@ impl ShellEnforcement {
                 )
             })
             .filter(|held| !held.is_empty());
-        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        // Every `shell.allow` name, looked up on `PATH` and then in each pinned program's store
+        // `bin/` folder, the order every command's `PATH` has.
+        let exec_allow_paths = resolve_policy_exec_allowlist(policy);
         // The `DT_NEEDED`-closure files (individual files → non-listable), one grant per
         // author-declared `interpreter_runtime` directory (each with its own `list_dir`), and one
         // read-only grant per entry a recognised interpreter reported on its own import path at
@@ -2538,6 +2593,10 @@ impl ShellEnforcement {
         // composed root and then denied by the Landlock ruleset installed inside it — see
         // `resolve_staged_runtime_landlock_grants`.
         landlock_grants.extend(resolve_staged_runtime_landlock_grants(policy));
+        // Plus one listable, executable, never-writable grant per pinned program's store entry,
+        // on every Landlock tier: the copy is reached through its `bin/` link, so the whole entry
+        // must be readable, not only the closure of the file it resolves to.
+        landlock_grants.extend(resolve_pinned_program_landlock_grants(policy));
         // Plus, on `KernelSealed` only, one listable grant per fixed `SEALED_RUNTIME_PATHS`
         // directory — the composed root binds them but Landlock inside the root still denies
         // enumerating them. Gated on `tier`, not on the manifest: on `KernelFull` (the tier a
@@ -2556,6 +2615,7 @@ impl ShellEnforcement {
         let sealed_need_mirrors =
             resolve_sealed_need_mirrors(&policy.shell_declared_needs, &sealed_bind_dirs);
         let staged_runtime_dirs = resolve_staged_runtime_dirs(policy);
+        let pinned_program_dirs = resolve_pinned_program_dirs(policy);
         Ok(Self {
             tier,
             network_allow_ips,
@@ -2569,6 +2629,7 @@ impl ShellEnforcement {
             sealed_bind_dirs,
             sealed_need_mirrors,
             staged_runtime_dirs,
+            pinned_program_dirs,
             resource_limits: policy.resources,
             declared_resources: policy.declared_resources,
             cgroup_scope: None,
@@ -2803,6 +2864,7 @@ impl ShellEnforcement {
             sealed_bind_dirs: Vec::new(),
             sealed_need_mirrors: Vec::new(),
             staged_runtime_dirs: Vec::new(),
+            pinned_program_dirs: Vec::new(),
             // Defaults, not "no limits": the rlimit ceilings apply unchanged on this tier, so
             // zeroing them out here would misrepresent what a real macOS host does.
             resource_limits: crate::resources::HostResourceLimits::default(),
@@ -3630,9 +3692,11 @@ pub(crate) fn prepare_enforcement(
         Some(sources) => Some(build_sealed_root(
             accessible_workdir,
             sources,
-            // Both optional mirrors at their own paths: the bind directories first, so a need
-            // inside one is already carried.
+            // Every optional mirror at its own path: pinned program entries first, so the bind
+            // of a pinned binary's own folder lands inside the entry rather than under it; then
+            // the bind directories, so a need inside one is already carried.
             &[
+                enforcement.pinned_program_dirs.as_slice(),
                 enforcement.sealed_bind_dirs.as_slice(),
                 enforcement.sealed_need_mirrors.as_slice(),
             ]
@@ -7498,6 +7562,101 @@ mod tests {
                 PathBuf::from("/opt/fixture/share"),
             ]
         );
+    }
+
+    /// A `pinned` program choice: its store entry is granted listable and executable (never a
+    /// write right), the exec allowlist resolves the name through the entry's `bin/` folder to the
+    /// canonical file, the sealed bind list carries the entry and the host-path check counts it
+    /// as an execute root. A `host` or `missing` choice adds none of these.
+    #[test]
+    fn pinned_programs_grant_list_and_execute_on_the_entry_and_bind_it_only_when_pinned() {
+        use crate::pinned_programs::{PinnedSource, ResolvedPinnedProgram};
+        let temp = tempfile::tempdir().unwrap();
+        let tree = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("programs/abc");
+        std::fs::create_dir_all(tree.join("files/fixture")).unwrap();
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        let file = tree.join("files/fixture/murmur-pinned-fixture-prog");
+        std::fs::copy("/bin/true", &file).unwrap();
+        std::os::unix::fs::symlink(
+            "../files/fixture/murmur-pinned-fixture-prog",
+            tree.join("bin/murmur-pinned-fixture-prog"),
+        )
+        .unwrap();
+        let chosen = |source: PinnedSource| CapabilityPolicy {
+            shell_allow: vec!["murmur-pinned-fixture-prog".to_string()],
+            shell_pinned_programs: vec![ResolvedPinnedProgram {
+                artifact: "local/pinned-tool".to_string(),
+                program: "murmur-pinned-fixture-prog".to_string(),
+                platform: "linux-x86_64".to_string(),
+                source,
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let resolve = |policy: &CapabilityPolicy| {
+            ShellEnforcement::resolve_declared(
+                policy,
+                murmur_artifact::ContainmentClass::Scoped,
+                HostProbe::probe(),
+            )
+            .unwrap()
+        };
+
+        let pinned = chosen(PinnedSource::Pinned {
+            path: file.clone(),
+            bin_dir: tree.join("bin"),
+            tree: tree.clone(),
+            url: "http://127.0.0.1:1/f.zip".to_string(),
+            sha256: "abc".to_string(),
+        });
+        assert_eq!(resolve_policy_exec_allowlist(&pinned), vec![file.clone()]);
+        assert_eq!(
+            resolve_pinned_program_landlock_grants(&pinned),
+            vec![LandlockGrant {
+                path: tree.clone(),
+                list_dir: true,
+                executable: true,
+            }]
+        );
+        let enforcement = resolve(&pinned);
+        assert!(enforcement.landlock_grants.contains(&LandlockGrant {
+            path: tree.clone(),
+            list_dir: true,
+            executable: true,
+        }));
+        assert!(
+            enforcement
+                .landlock_grants
+                .iter()
+                .any(|grant| grant.path == file && grant.executable),
+            "the pinned file seeds the DT_NEEDED closure like any shell.allow binary"
+        );
+        assert_eq!(enforcement.pinned_program_dirs, vec![tree.clone()]);
+        assert!(host_path_execute_roots(&pinned)
+            .iter()
+            .any(|root| root.dir == tree));
+
+        for source in [
+            PinnedSource::Host {
+                path: PathBuf::from("/bin/true"),
+            },
+            PinnedSource::Missing {
+                reason: "the store holds no copy".to_string(),
+            },
+        ] {
+            let policy = chosen(source);
+            assert!(resolve_policy_exec_allowlist(&policy).is_empty());
+            let enforcement = resolve(&policy);
+            assert!(enforcement.pinned_program_dirs.is_empty());
+            assert!(!enforcement
+                .landlock_grants
+                .iter()
+                .any(|grant| grant.path.starts_with(&tree)));
+            assert!(!host_path_execute_roots(&policy)
+                .iter()
+                .any(|root| root.dir.starts_with(&tree)));
+        }
     }
 
     #[test]

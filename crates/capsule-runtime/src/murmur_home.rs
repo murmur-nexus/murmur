@@ -333,13 +333,14 @@ pub enum HomeEntryKind {
     Formations,
     Sessions,
     Records,
+    Programs,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 15] = [
+    const KNOWN: [HomeEntryKind; 16] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -355,6 +356,7 @@ impl HomeEntryKind {
         Self::Formations,
         Self::Sessions,
         Self::Records,
+        Self::Programs,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -376,6 +378,7 @@ impl HomeEntryKind {
             Self::Formations => crate::formation_launch::FORMATIONS_DIR,
             Self::Sessions => crate::runtime_dir::SESSIONS_DIR_NAME,
             Self::Records => crate::records_dir::RECORDS_DIR_NAME,
+            Self::Programs => crate::pinned_programs::PROGRAMS_DIR,
             Self::Unrecognised(name) => name,
         })
     }
@@ -399,6 +402,7 @@ impl HomeEntryKind {
             Self::Formations => "formation members' working directories",
             Self::Sessions => "running sessions' runtime directories",
             Self::Records => "every session's trace, logs, eval scores and delegation outcome",
+            Self::Programs => "pinned program downloads",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -437,6 +441,15 @@ impl HomeEntryKind {
             self,
             Self::Artifacts | Self::BinaryCache | Self::Unrecognised(_)
         )
+    }
+
+    /// The widest mode a regular file beneath the entry may have: [`PRIVATE_FILE_MODE`], or
+    /// `0700` under `programs/`, whose unpacked downloads keep their owner execute bit.
+    pub fn allowed_file_mode(&self) -> u32 {
+        match self {
+            Self::Programs => crate::pinned_programs::EXECUTABLE_FILE_MODE,
+            _ => PRIVATE_FILE_MODE,
+        }
     }
 
     /// How many directory levels below the entry the audit holds owner-only, or `None` for every
@@ -581,6 +594,7 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
         collect_wide_descendants(
             &path,
             kind.private_depth(),
+            kind.allowed_file_mode(),
             &mut wide_descendants,
             &mut omitted,
         );
@@ -602,6 +616,7 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
 fn collect_wide_descendants(
     dir: &Path,
     depth: Option<usize>,
+    file_allowed: u32,
     found: &mut Vec<WideEntry>,
     omitted: &mut usize,
 ) {
@@ -624,7 +639,11 @@ fn collect_wide_descendants(
             continue;
         }
         let mode = metadata.permissions().mode() & 0o777;
-        let allowed = allowed_for_type(file_type);
+        let allowed = if file_type.is_dir() {
+            MURMUR_HOME_DIR_MODE
+        } else {
+            file_allowed
+        };
         if is_wider_than(mode, allowed) {
             if found.len() < WIDE_DESCENDANT_CAP {
                 found.push(WideEntry {
@@ -637,7 +656,13 @@ fn collect_wide_descendants(
             }
         }
         if file_type.is_dir() {
-            collect_wide_descendants(&path, depth.map(|depth| depth - 1), found, omitted);
+            collect_wide_descendants(
+                &path,
+                depth.map(|depth| depth - 1),
+                file_allowed,
+                found,
+                omitted,
+            );
         }
     }
 }
@@ -939,7 +964,7 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 16);
+        assert_eq!(reports.len(), 17);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
@@ -949,9 +974,64 @@ mod tests {
         assert_eq!(reports[13].kind, HomeEntryKind::Formations);
         assert_eq!(reports[14].kind, HomeEntryKind::Sessions);
         assert_eq!(reports[15].kind, HomeEntryKind::Records);
+        assert_eq!(reports[16].kind, HomeEntryKind::Programs);
+        assert_eq!(reports[16].path, home.join("programs"));
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
+    }
+
+    /// `programs/` holds pinned program downloads, is kept until removed by hand, and its
+    /// executable files may be `0700`: a store entry as `mur install` writes it is not wide, a
+    /// group-readable file under it is.
+    #[test]
+    fn murmur_home_programs_entry_names_the_store_and_allows_owner_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(HomeEntryKind::Programs.file_name(), Some("programs"));
+        assert_eq!(HomeEntryKind::Programs.holds(), "pinned program downloads");
+        assert_eq!(HomeEntryKind::Programs.kept(), None);
+        assert!(HomeEntryKind::Programs.expected_private());
+        assert!(!HomeEntryKind::Programs.safe_to_delete());
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".murmur");
+        let files = home.join("programs/abc/files");
+        std::fs::create_dir_all(&files).unwrap();
+        for path in [
+            home.clone(),
+            home.join("programs"),
+            home.join("programs/abc"),
+            files.clone(),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (name, mode) in [("prog", 0o700), ("data.txt", 0o600)] {
+            std::fs::write(files.join(name), "x").unwrap();
+            std::fs::set_permissions(files.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        std::os::unix::fs::symlink("../files/prog", home.join("programs/abc/prog-link")).unwrap();
+        let programs = |reports: Vec<HomeEntryReport>| {
+            reports
+                .into_iter()
+                .find(|report| report.kind == HomeEntryKind::Programs)
+                .unwrap()
+                .state
+        };
+        assert!(matches!(
+            programs(audit_murmur_home(&home)),
+            HomeEntryState::Present { wide: false, wide_descendants, .. } if wide_descendants.is_empty()
+        ));
+        std::fs::set_permissions(
+            files.join("data.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(matches!(
+            programs(audit_murmur_home(&home)),
+            HomeEntryState::Present { wide_descendants, .. }
+                if wide_descendants.len() == 1 && wide_descendants[0].path == files.join("data.txt")
+        ));
     }
 
     /// Only `formations/`, `sessions/` and `records/` say how long they are kept, and only

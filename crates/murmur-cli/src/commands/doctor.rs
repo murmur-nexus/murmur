@@ -2109,6 +2109,7 @@ fn report_declared_needs(
     lock: Option<&murmur_artifact::MurmurLock>,
     project_root: &std::path::Path,
     shell_allow: &[String],
+    pinned: &[capsule_runtime::pinned_programs::ResolvedPinnedProgram],
     findings: &mut Findings,
 ) {
     let Some(writable) =
@@ -2123,6 +2124,7 @@ fn report_declared_needs(
         project_root,
         shell_allow,
         &writable,
+        pinned,
     ) {
         Ok(resolved) => resolved,
         Err(refusal) => {
@@ -2175,6 +2177,125 @@ fn report_declared_needs(
                 fix,
             );
         }
+    }
+    capsule_runtime::report_println!();
+}
+
+/// The `Pinned programs` section: for each program a tool the capsule pins with an `operator`
+/// lock origin pins a download of and `shell.allow` grants, one line with the state of the store's
+/// copy (verified in full) and which copy runs, then one `W-RUN-012` warning, counted in the
+/// tally, when nothing usable runs or the stored copy fails its checksum. Nothing is printed when
+/// no program applies, and nothing here is an error: a launch never refuses over a pinned program.
+fn report_pinned_programs(
+    tools: &[capsule_runtime::pinned_programs::DeclaredToolDownloads],
+    shell_allow: &[String],
+    findings: &mut Findings,
+) {
+    use capsule_runtime::pinned_programs::{host_program, verify_entry, EntryState};
+
+    let platform = murmur_artifact::host_download_platform();
+    let platform_label = crate::commands::pinned_programs::platform_label();
+    let store_root = capsule_runtime::pinned_programs::program_store_root().ok();
+    let path_dirs = capsule_runtime::pinned_programs::host_path_dirs();
+    let mut lines = Vec::new();
+    let mut warnings = Vec::new();
+    let code = murmur_artifact::W_RUN_012;
+    for (tool, program) in capsule_runtime::pinned_programs::gated_programs(tools, shell_allow) {
+        let name = &program.program;
+        let artifact = &tool.artifact;
+        let owner = format!("{artifact} ({name})");
+        let host = host_program(name, &path_dirs);
+        let runs = |path: &Path, source: &str| format!("runs {} ({source})", path.display());
+        let Some(download) = platform.and_then(|platform| program.for_platform(platform)) else {
+            match &host {
+                Some(path) => lines.push(format!(
+                    "\u{2713}  {owner}: no pinned download for {platform_label}; {}",
+                    runs(path, "host")
+                )),
+                None => {
+                    lines.push(format!(
+                        "\u{26A0}  {owner}: no pinned download for {platform_label}; nothing \
+                         runs"
+                    ));
+                    warnings.push((
+                        artifact.clone(),
+                        format!(
+                            "warning[{code}]: {artifact} pins no download of {name} for \
+                             {platform_label}, and this host has no {name}"
+                        ),
+                        format!(
+                            "install {name} on this host so it is on PATH, or use a release \
+                             of {artifact} that pins a download for {platform_label}"
+                        ),
+                    ));
+                }
+            }
+            continue;
+        };
+        let state = store_root
+            .as_deref()
+            .map_or(EntryState::Missing, |root| verify_entry(root, download));
+        let (copy, failing) = match &state {
+            EntryState::Present { .. } => ("present", None),
+            EntryState::Missing => ("missing", None),
+            EntryState::ChecksumFailed { reason } => ("failing its checksum", Some(reason.clone())),
+        };
+        let running = match (&host, &state) {
+            (Some(path), _) => Some(runs(path, "host")),
+            (None, EntryState::Present { path, .. }) => Some(runs(path, "pinned")),
+            _ => None,
+        };
+        let mark = if running.is_some() && failing.is_none() {
+            "\u{2713}"
+        } else {
+            "\u{26A0}"
+        };
+        lines.push(format!(
+            "{mark}  {owner}: pinned copy {copy}; {}",
+            running.as_deref().unwrap_or("nothing runs")
+        ));
+        if let Some(reason) = failing {
+            warnings.push((
+                artifact.clone(),
+                format!(
+                    "warning[{code}]: {artifact}'s pinned copy of {name} fails its checksum: \
+                     {reason}; run mur install to fetch it again"
+                ),
+                format!(
+                    "run mur install to fetch {name} for {platform_label} ({artifact}) again; \
+                     the stored copy fails its checksum: {reason}"
+                ),
+            ));
+        } else if running.is_none() {
+            warnings.push((
+                artifact.clone(),
+                format!(
+                    "warning[{code}]: {artifact} pins {name} for {platform_label}, and the \
+                     store holds no copy; run mur install"
+                ),
+                format!(
+                    "run mur install in this project to fetch {name} for {platform_label} \
+                     ({artifact})"
+                ),
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    capsule_runtime::report_println!("Pinned programs:");
+    for line in &lines {
+        capsule_runtime::report_println!("  {line}");
+    }
+    for (artifact, line, fix) in warnings {
+        capsule_runtime::report_println!("  {line}");
+        findings.warning(
+            code,
+            DoctorBlock::Artifacts,
+            Some(artifact),
+            without_code(&line, code),
+            fix,
+        );
     }
     capsule_runtime::report_println!();
 }
@@ -3064,13 +3185,26 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
         );
     }
 
+    // A malformed `programs:` block is reported once, by the declared-needs section below.
+    let pinned_tools = crate::commands::pinned_programs::installed_tool_downloads(
+        &runtime_manifest.artifacts,
+        lock.as_ref(),
+        &project_root,
+    )
+    .unwrap_or_default();
+    let pinned = capsule_runtime::pinned_programs::derive_pinned_programs(
+        &pinned_tools,
+        &capability_policy.shell_allow,
+    );
     report_declared_needs(
         &runtime_manifest,
         lock.as_ref(),
         &project_root,
         &capability_policy.shell_allow,
+        &pinned,
         &mut findings,
     );
+    report_pinned_programs(&pinned_tools, &capability_policy.shell_allow, &mut findings);
 
     // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
     // reported but neither fails nor warns.

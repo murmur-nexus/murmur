@@ -3131,26 +3131,46 @@ pub fn stage_session(
     // Every staged tool's `programs:` block is parsed, whatever its pin; only an operator pin's
     // needs, for a program `shell.allow` grants, are derived. Filled before `launch_session`
     // resolves the enforcement, and reported below, so `session_start` names what it grants.
-    let declared_tool_needs = tool_manifests
-        .into_iter()
-        .filter(|(.., manifest_yaml)| manifest_yaml.contains(murmur_artifact::PROGRAMS_KEY))
-        .map(|(artifact, version, origin, manifest_yaml)| {
-            murmur_artifact::parse_program_needs(&manifest_yaml)
-                .map(|programs| crate::declared_needs::DeclaredToolNeeds {
-                    artifact: artifact.clone(),
-                    origin,
-                    programs,
-                })
-                .map_err(|error| RuntimeError::ProgramNeedsMalformed {
-                    artifact: format!("{artifact}@{version}"),
-                    reason: error.to_string(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // A program a tool pins a download of is chosen first (a host program of that name, else
+    // the program store's copy, else missing), read from the store and never fetched, so the
+    // needs below resolve against the copy that runs.
+    let mut declared_tool_needs = Vec::new();
+    let mut declared_tool_downloads = Vec::new();
+    for (artifact, version, origin, manifest_yaml) in tool_manifests {
+        if !manifest_yaml.contains(murmur_artifact::PROGRAMS_KEY) {
+            continue;
+        }
+        let malformed =
+            |error: murmur_artifact::ManifestError| RuntimeError::ProgramNeedsMalformed {
+                artifact: format!("{artifact}@{version}"),
+                reason: error.to_string(),
+            };
+        let programs = murmur_artifact::parse_program_needs(&manifest_yaml).map_err(malformed)?;
+        let downloads =
+            murmur_artifact::parse_program_downloads(&manifest_yaml).map_err(malformed)?;
+        if !downloads.is_empty() {
+            declared_tool_downloads.push(crate::pinned_programs::DeclaredToolDownloads {
+                artifact: artifact.clone(),
+                origin: origin.clone(),
+                programs: downloads,
+            });
+        }
+        declared_tool_needs.push(crate::declared_needs::DeclaredToolNeeds {
+            artifact,
+            origin,
+            programs,
+        });
+    }
+    request.capability_policy.shell_pinned_programs =
+        crate::pinned_programs::derive_pinned_programs(
+            &declared_tool_downloads,
+            &request.capability_policy.shell_allow,
+        );
     request.capability_policy.shell_declared_needs = crate::declared_needs::derive_declared_needs(
         &declared_tool_needs,
         &request.capability_policy.shell_allow,
         &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
+        &request.capability_policy.shell_pinned_programs,
     );
 
     let staged_process_driver = match process_driver {
@@ -3477,7 +3497,8 @@ pub fn stage_session(
                 .as_ref()
                 .map(|inference| inference.transport.as_str()),
         )
-        .with_declared_needs(&request.capability_policy.shell_declared_needs);
+        .with_declared_needs(&request.capability_policy.shell_declared_needs)
+        .with_pinned_programs(&request.capability_policy.shell_pinned_programs);
     runtime_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings

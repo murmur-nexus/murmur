@@ -169,6 +169,7 @@ nav:
       - Let a coding capsule pull the tools it needs: how-to/self-healing-coding-capsule.md
       - Run Node tests in a capsule: how-to/run-node-tests-in-capsule.md
       - Run a Playwright suite in a capsule: how-to/run-playwright-in-capsule.md
+      - Pin a program download for a tool: how-to/pin-a-program-download.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
   - Reference:

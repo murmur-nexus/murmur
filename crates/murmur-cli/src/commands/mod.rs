@@ -21,6 +21,7 @@ pub(crate) mod list;
 #[cfg(feature = "beta-mur-new")]
 pub(crate) mod new;
 pub(crate) mod new_roster;
+pub(crate) mod pinned_programs;
 pub(crate) mod precompile;
 pub(crate) mod ps;
 pub(crate) mod publish;

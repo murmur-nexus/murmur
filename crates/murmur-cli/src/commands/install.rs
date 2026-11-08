@@ -450,6 +450,44 @@ fn compile_stored<'a>(
     }
 }
 
+/// Fetches the program downloads each payload in `stored` pins for this host
+/// ([`super::pinned_programs::fetch_pinned_downloads`]), after it is stored and pinned, printing
+/// what each did. Returns each failure with the `name@version` it belongs to.
+fn fetch_pinned_for(stored: &[Stored]) -> Vec<(String, CliError)> {
+    let mut failures = Vec::new();
+    for item in stored {
+        let outcome = super::pinned_programs::fetch_pinned_downloads(
+            &item.name,
+            &item.version,
+            &item.payload,
+        );
+        for line in &outcome.lines {
+            capsule_runtime::report_println!("{line}");
+        }
+        if let Some(failure) = outcome.failure {
+            failures.push((format!("{}@{}", item.name, item.version), failure));
+        }
+    }
+    failures
+}
+
+/// Prints the pinned downloads that failed, each under the artifact it belongs to.
+fn report_pinned_failures(failures: &[(String, CliError)]) {
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!(
+        "{} pinned download{} failed:",
+        failures.len(),
+        if failures.len() == 1 { "" } else { "s" }
+    );
+    for (artifact, error) in failures {
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("  {artifact}");
+        for line in error.to_string().lines() {
+            capsule_runtime::report_println!("    {line}");
+        }
+    }
+}
+
 /// Keeps the host facts of the `capabilities.shell.allow` binaries of the manifest at
 /// `project_root`, as `mur run` without `--workdir` would derive them, so the project's first
 /// launch keeps them instead of running each interpreter. Prints one line when at least one is
@@ -511,7 +549,7 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
     pb.abandon_with_message(msg.into());
 }
 
-fn format_bytes(n: u64) -> String {
+pub(crate) fn format_bytes(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.0} MB", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -554,9 +592,17 @@ pub(crate) fn run_install(
                 no_precompile,
                 project_root_path,
             );
+            let mut pinned_failures = fetch_pinned_for(&stored);
             installed?;
             keep_host_facts(no_precompile, project_root_path);
-            Ok(())
+            match pinned_failures.len() {
+                0 => Ok(()),
+                1 => Err(pinned_failures.remove(0).1),
+                _ => {
+                    report_pinned_failures(&pinned_failures);
+                    std::process::exit(1);
+                }
+            }
         }
         _ => install_several(
             artifact_refs,
@@ -587,25 +633,31 @@ fn install_several(
         }
     }
     compile_stored(stored.iter().map(Stored::item), no_precompile, project_root);
+    let pinned_failures = fetch_pinned_for(&stored);
     if failures.len() < artifact_refs.len() {
         keep_host_facts(no_precompile, project_root);
     }
-    if failures.is_empty() {
+    if failures.is_empty() && pinned_failures.is_empty() {
         return Ok(());
     }
 
-    capsule_runtime::report_println!();
-    capsule_runtime::report_println!(
-        "{} of {} references failed to install:",
-        failures.len(),
-        artifact_refs.len()
-    );
-    for (text, error) in &failures {
+    if !failures.is_empty() {
         capsule_runtime::report_println!();
-        capsule_runtime::report_println!("  {text}");
-        for line in error.to_string().lines() {
-            capsule_runtime::report_println!("    {line}");
+        capsule_runtime::report_println!(
+            "{} of {} references failed to install:",
+            failures.len(),
+            artifact_refs.len()
+        );
+        for (text, error) in &failures {
+            capsule_runtime::report_println!();
+            capsule_runtime::report_println!("  {text}");
+            for line in error.to_string().lines() {
+                capsule_runtime::report_println!("    {line}");
+            }
         }
+    }
+    if !pinned_failures.is_empty() {
+        report_pinned_failures(&pinned_failures);
     }
     // One `CliError` cannot name every failed reference, so the report above does and the process
     // ends here, as the manifest install's does. All I/O is done.
@@ -1097,6 +1149,24 @@ fn install_manifest_deps(
         Some(&root),
     );
 
+    // Each stored tool's pinned program downloads, after the lock is written, cached artifacts
+    // included: a present store entry costs a verification and no request. A failed download is
+    // reported under its artifact, which stays stored and pinned so the next install retries it.
+    // The lines wait for the header spinner to finish.
+    let mut pinned_lines = Vec::new();
+    for (i, outcome) in &successes {
+        let pinned = super::pinned_programs::fetch_pinned_downloads(
+            &artifacts[*i].name,
+            &artifacts[*i].version,
+            &outcome.payload,
+        );
+        pinned_lines.extend(pinned.lines);
+        if let Some(failure) = pinned.failure {
+            failures.push((*i, failure));
+        }
+    }
+    failures.sort_by_key(|(i, _)| *i);
+
     // Byte/cache accounting covers the successes only — a failed artifact contributed no
     // bytes and is neither "fetched" nor "cached".
     let fetched_bytes: u64 = successes
@@ -1114,6 +1184,7 @@ fn install_manifest_deps(
             format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
         );
         print_lock_changes(&lock_changes);
+        print_lines(&pinned_lines);
         keep_host_facts(no_precompile, Some(&root));
         return Ok(());
     }
@@ -1124,6 +1195,7 @@ fn install_manifest_deps(
         format!("{} ↓ artifacts  failed", style("✗").red().bold()),
     );
     print_lock_changes(&lock_changes);
+    print_lines(&pinned_lines);
     if !successes.is_empty() {
         keep_host_facts(no_precompile, Some(&root));
     }
@@ -1157,6 +1229,12 @@ fn install_manifest_deps(
     // failed", so the report is printed above and the process terminates here — same pattern
     // as `mur doctor`. No destructors run, which is fine: all I/O is done.
     std::process::exit(1);
+}
+
+fn print_lines(lines: &[String]) {
+    for line in lines {
+        capsule_runtime::report_println!("{line}");
+    }
 }
 
 /// Render the shared `{count} artifact{s}  {bytes-or-cache-note}` tail used by both the

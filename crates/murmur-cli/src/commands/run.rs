@@ -643,6 +643,16 @@ pub(crate) fn run_run(
             None => crate::commands::read_optional_lockfile(&project_dir)
                 .map_err(|error| fail(&session_id, &workdir, error, json))?,
         };
+        // Which copy of each pinned program download a launch would run, chosen first as
+        // `stage_session` chooses it, so the declared needs resolve against that copy.
+        capability_policy.shell_pinned_programs =
+            crate::commands::pinned_programs::installed_pinned_programs(
+                &runtime_manifest.artifacts,
+                lock.as_ref(),
+                &project_dir,
+                &capability_policy.shell_allow,
+            )
+            .map_err(|error| fail(&session_id, &workdir, error, json))?;
         capability_policy.shell_declared_needs =
             crate::commands::declared_needs::installed_declared_needs(
                 &runtime_manifest.artifacts,
@@ -650,6 +660,7 @@ pub(crate) fn run_run(
                 &project_dir,
                 &capability_policy.shell_allow,
                 &capsule_runtime::capsule_writable_roots(&placement),
+                &capability_policy.shell_pinned_programs,
             )
             .map_err(|error| fail(&session_id, &workdir, error, json))?;
         // Where each path the manifest names resolves, from the inputs `stage_session` reports:

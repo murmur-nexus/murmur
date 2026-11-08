@@ -82,6 +82,16 @@ pub const W_RUN_010: &str = "W-RUN-010";
 /// package the tool declares for this host's distribution; any other names its reason.
 pub const W_RUN_011: &str = "W-RUN-011";
 
+/// A tool the capsule pins with an `operator` lock origin pins a download (its `programs:`
+/// block's `download:`) of a program `capabilities.shell.allow` grants, and nothing usable runs
+/// under that name: no host program of that name is on `PATH` and the program store holds no copy
+/// (or the tool pins no download for this platform), or the stored copy fails its checksum, which
+/// is named even when a host program runs instead.
+///
+/// A pinned program never refuses a launch: a command naming it fails as an unknown command
+/// would. Printed by `mur doctor`, once per program.
+pub const W_RUN_012: &str = "W-RUN-012";
+
 /// `mur doctor` could not tell whether a `transport: process` capsule's harness is logged in for
 /// this user: its process driver names no way to ask without a turn, the login command could not
 /// be run or did not answer, or the driver could not read what it printed.
@@ -105,7 +115,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
-            W_RUN_011, W_RUN_013,
+            W_RUN_011, W_RUN_012, W_RUN_013,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

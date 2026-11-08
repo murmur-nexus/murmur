@@ -26,6 +26,9 @@ pub const E_REG_009: &str = "E-REG-009"; // a source's index states a scope the 
 pub const E_REG_010: &str = "E-REG-010"; // a scope's GitHub owner id is not the one recorded for it (murmur.lock, a stored payload, or compiled in for murmur)
 pub const E_REG_011: &str = "E-REG-011"; // a payload's packed murmur.yaml ships a malformed models: table, so the store refuses it
 pub const E_REG_012: &str = "E-REG-012"; // a payload's packed murmur.yaml declares implementation: native or execution: native, so the store refuses it
+pub const E_REG_013: &str = "E-REG-013"; // a tool's pinned program download could not be fetched (transport error, non-2xx status, over the size cap)
+pub const E_REG_014: &str = "E-REG-014"; // a tool's pinned program download does not hash to the sha256 the tool pins
+pub const E_REG_015: &str = "E-REG-015"; // a tool's pinned program download cannot be unpacked into the program store
 
 // WIT levels
 pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves
@@ -1411,8 +1414,9 @@ impl From<BuildError> for CliError {
                 "programs: goes on a runtime: tool artifact; each need names what the program \
                  needs, never where: library (a soname), file with beside (a file name beside a \
                  declared library), program_folder (relative to the program's folder), system \
-                 (fonts or ca_bundle) or etc (a name under /etc) — see \
-                 https://docs.murmur.nexus/reference/manifest/#artifact-programs",
+                 (fonts or ca_bundle) or etc (a name under /etc); a download: entry pins, per \
+                 platform, an https url, its sha256 and optionally the file to run inside the zip \
+                 — see https://docs.murmur.nexus/reference/manifest/#artifact-programs",
             ),
         }
     }

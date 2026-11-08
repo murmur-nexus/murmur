@@ -1422,26 +1422,69 @@ pub(crate) fn subprocess_env(
     env_overrides: &[(String, String)],
     enforcement: &crate::sandbox::ShellEnforcement,
 ) -> Result<BTreeMap<OsString, OsString>, String> {
-    if enforcement.tier == crate::sandbox::EnforcementTier::Unconfined {
-        return Ok(build_unconfined_env(
-            policy,
-            std::env::vars_os(),
-            env_overrides,
-            enforcement.runtime_dir_path(),
-            enforcement.records_dir_path(),
-        ));
+    let mut env: BTreeMap<OsString, OsString> =
+        if enforcement.tier == crate::sandbox::EnforcementTier::Unconfined {
+            build_unconfined_env(
+                policy,
+                std::env::vars_os(),
+                env_overrides,
+                enforcement.runtime_dir_path(),
+                enforcement.records_dir_path(),
+            )
+        } else {
+            build_shell_env(
+                policy,
+                env_overrides,
+                enforcement.home_dir_path(),
+                enforcement.runtime_dir_path(),
+                enforcement.records_dir_path(),
+                enforcement.tmpdir_value().as_deref(),
+            )?
+            .into_iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect()
+        };
+    append_pinned_program_path(&mut env, policy)?;
+    Ok(env)
+}
+
+/// Appends the `bin/` folder of each pinned program staging chose the store's copy of
+/// ([`crate::pinned_programs`]) to the end of `env`'s `PATH`, on every tier: the host's entries
+/// stay first and unchanged, so a host program of the same name still runs. With no `PATH` in
+/// `env`, `PATH` becomes the pinned folders alone.
+pub(crate) fn append_pinned_program_path(
+    env: &mut BTreeMap<OsString, OsString>,
+    policy: &CapabilityPolicy,
+) -> Result<(), String> {
+    let pinned = crate::pinned_programs::pinned_bin_dirs(&policy.shell_pinned_programs);
+    if pinned.is_empty() {
+        return Ok(());
     }
-    Ok(build_shell_env(
-        policy,
-        env_overrides,
-        enforcement.home_dir_path(),
-        enforcement.runtime_dir_path(),
-        enforcement.records_dir_path(),
-        enforcement.tmpdir_value().as_deref(),
-    )?
-    .into_iter()
-    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-    .collect())
+    let key = OsString::from("PATH");
+    let host = env.get(&key).filter(|path| !path.is_empty()).cloned();
+    let host_dirs: Vec<std::path::PathBuf> = host
+        .as_ref()
+        .map(|path| std::env::split_paths(path).collect())
+        .unwrap_or_default();
+    let added: Vec<std::path::PathBuf> = pinned
+        .into_iter()
+        .filter(|dir| !host_dirs.contains(dir))
+        .collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+    let added = std::env::join_paths(added)
+        .map_err(|err| format!("a pinned program folder cannot join PATH: {err}"))?;
+    let joined = match host {
+        Some(mut host) => {
+            host.push(":");
+            host.push(added);
+            host
+        }
+        None => added,
+    };
+    env.insert(key, joined);
+    Ok(())
 }
 
 /// The environment of one unconfined shell command, plan shell step or `murmur:process` program:
@@ -3694,6 +3737,69 @@ mod tests {
         let without = build_unconfined_env(&policy, host, &overrides, None, None);
         assert_eq!(get(&without, crate::runtime_dir::RUNTIME_DIR_ENV), None);
         assert_eq!(get(&without, crate::records_dir::RECORDS_DIR_ENV), None);
+    }
+
+    /// A `pinned` program choice puts its store `bin/` folder last on `PATH`, on a contained tier
+    /// and on the unconfined one, the host's entries first and unchanged; with no `PATH` it is
+    /// the pinned folder alone; a `host` choice adds nothing.
+    #[test]
+    fn subprocess_env_appends_the_pinned_bin_folder_last_on_every_tier() {
+        use crate::pinned_programs::{PinnedSource, ResolvedPinnedProgram};
+        let bin = std::path::PathBuf::from("/home/u/.murmur/programs/abc/bin");
+        let program = |source: PinnedSource| ResolvedPinnedProgram {
+            artifact: "local/pinned-tool".to_string(),
+            program: "fixture-prog".to_string(),
+            platform: "linux-x86_64".to_string(),
+            source,
+        };
+        let policy = CapabilityPolicy {
+            shell_pinned_programs: vec![program(PinnedSource::Pinned {
+                path: bin.join("../files/fixture-prog"),
+                bin_dir: bin.clone(),
+                tree: bin.parent().unwrap().to_path_buf(),
+                url: "http://127.0.0.1:1/f".to_string(),
+                sha256: "abc".to_string(),
+            })],
+            ..CapabilityPolicy::default()
+        };
+        let contained =
+            crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs();
+        let unconfined = crate::sandbox::ShellEnforcement {
+            tier: crate::sandbox::EnforcementTier::Unconfined,
+            ..contained.clone()
+        };
+        let path_key = std::ffi::OsStr::new("PATH");
+        for enforcement in [&contained, &unconfined] {
+            let without = subprocess_env(&CapabilityPolicy::default(), &[], enforcement).unwrap();
+            let with = subprocess_env(&policy, &[], enforcement).unwrap();
+            let host = without.get(path_key).cloned().unwrap_or_default();
+            let mut expected = host.clone();
+            if !expected.is_empty() {
+                expected.push(":");
+            }
+            expected.push(&bin);
+            assert_eq!(
+                with.get(path_key),
+                Some(&expected),
+                "{:?}",
+                enforcement.tier
+            );
+            assert!(!host.to_string_lossy().contains(".murmur/programs"));
+        }
+
+        let mut empty = BTreeMap::new();
+        append_pinned_program_path(&mut empty, &policy).unwrap();
+        assert_eq!(empty.get(path_key), Some(&bin.clone().into_os_string()));
+
+        let host_choice = CapabilityPolicy {
+            shell_pinned_programs: vec![program(PinnedSource::Host {
+                path: "/usr/bin/fixture-prog".into(),
+            })],
+            ..CapabilityPolicy::default()
+        };
+        let mut env = BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin"))]);
+        append_pinned_program_path(&mut env, &host_choice).unwrap();
+        assert_eq!(env.get(path_key), Some(&OsString::from("/usr/bin")));
     }
 
     /// `subprocess_env` builds the unconfined environment on the unconfined tier and the

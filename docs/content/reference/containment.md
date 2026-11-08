@@ -1572,6 +1572,73 @@ This is not the folder grant [Native addons](#native-addons) refuses to make on 
 [`mur doctor`](cli.md#mur-doctor) warns with [`W-RUN-011`](diagnostics.md#w-run-011) for each
 missing need.
 
+## Pinned program downloads { #pinned-program-downloads }
+
+A tool can pin, beside a program it runs, a download of that program per platform in its own
+manifest's [`download:` entry](manifest.md#artifact-programs-download).
+[`mur install`](cli.md#mur-install) fetches it into the host's program store; a launch only reads
+the store and never fetches.
+
+### The store
+
+```text
+~/.murmur/programs/
+  <sha256>/                one entry per download, named by its declared sha256, shared by every project
+    record.json            url, sha256, platform, run, tree_sha256, fetched_at, and every file's sha256
+    files/                 the unpacked zip, or the single downloaded file
+    bin/<program>          a link to the file to run, one per program name that pins this download
+  .partial-<random>/       an install in flight; removed on any failure
+```
+
+| Property | Value |
+|---|---|
+| Modes | Every folder `0700`; a file `0700` when executable, `0600` otherwise |
+| Written by | `mur install` alone, for every artifact it stores and pins; never by a runtime pull |
+| Checked | In full (every file re-hashed against `record.json`) by `mur install` and `mur doctor`; a launch checks the record's sha256 and the `bin/` link only |
+| Removed | Only by hand; `mur install` replaces an entry that fails its checksum |
+
+### Which copy runs
+
+A program gets a source only when all three hold:
+
+1. The capsule pins the tool with an `operator` lock origin: `mur install`, not a runtime pull.
+2. `capabilities.shell.allow` names the program exactly as the tool's `programs:` key spells it.
+3. The tool pins a download for this host's platform.
+
+Then:
+
+| Condition | Source | What the session gets |
+|---|---|---|
+| An executable of that name on `PATH` | `host` | Nothing new; the host program runs |
+| Otherwise, the store's entry pins the declared sha256 and its `bin/<program>` leads to an executable file | `pinned` | The entry's `bin/` folder last on every command's `PATH`, and the grants below |
+| Otherwise | `missing` | Nothing; the reason names `run mur install` or the fault |
+
+A `missing` program never refuses a launch: a command naming it fails as an unknown command does,
+and [`mur doctor`](cli.md#mur-doctor) warns with [`W-RUN-012`](diagnostics.md#w-run-012). The
+capsule's manifest and the operator's `PATH` carry no path for a pinned program.
+
+### Grants of a `pinned` copy
+
+| Tier | Effect |
+|---|---|
+| Every tier, `unconfined` included | `<sha256>/bin` appended to the `PATH` of every command, plan shell step and [program a WASM tool runs](#wasm-tool-programs) |
+| `landlock+seccomp` (`scoped`) | The file to run joins the exec allowlist, so its `DT_NEEDED` closure is granted as any `shell.allow` binary's is; the entry `<sha256>/` gets one listable, executable Landlock rule, never writable |
+| `sealed` | The same, and `<sha256>/` bound read-only at its own path into the composed root |
+
+A [declared need](#declared-program-needs) of a pinned-only program resolves against the copy: the
+`bin/` folder is searched after `PATH`, and a need path in the entry is granted though the store
+lies under the home folder.
+
+`mur run --explain-scope` lists each program under `pinned programs`, and
+`session_start.effective_grants.pinned_programs` records the same:
+
+```text
+  pinned programs:
+    - local/pinned-tool (fixture-prog): pinned /home/u/.murmur/programs/<sha256>/files/fixture/fixture-prog (sha256 <sha256>, from https://downloads.example.org/fixture.zip)
+    - local/other-tool (render): host /usr/bin/render
+    - local/third-tool (conv): missing (the store holds no copy for sha256 <sha256>; run mur install)
+```
+
 ## The trust store for commands that reach the network { #trust-store }
 
 A command that opens a TLS connection reads the host's CA certificates to verify the server. When

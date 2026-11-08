@@ -1041,6 +1041,82 @@ impl DeclaredNeedsReport {
     }
 }
 
+/// One element of [`ScopeReport::pinned_programs`]: which copy of a program a tool pins a
+/// download of the session runs. `path` is absent for `missing`, `url` and `sha256` are present
+/// only for `pinned`, and `reason` only for `missing`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PinnedProgramReport {
+    /// The artifact as the capsule's manifest names it, scope included.
+    pub artifact: String,
+    /// The program key, as `capabilities.shell.allow` names it.
+    pub program: String,
+    /// This host's platform, as the download is pinned for it (`linux-x86_64`).
+    pub platform: String,
+    /// `pinned` (the program store's copy), `host` (a program of that name on `PATH`) or
+    /// `missing`.
+    pub source: String,
+    /// The file that runs, canonical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl From<&crate::pinned_programs::ResolvedPinnedProgram> for PinnedProgramReport {
+    fn from(resolved: &crate::pinned_programs::ResolvedPinnedProgram) -> Self {
+        use crate::pinned_programs::PinnedSource;
+        let mut report = Self {
+            artifact: resolved.artifact.clone(),
+            program: resolved.program.clone(),
+            platform: resolved.platform.clone(),
+            source: resolved.source.label().to_string(),
+            path: None,
+            url: None,
+            sha256: None,
+            reason: None,
+        };
+        match &resolved.source {
+            PinnedSource::Pinned {
+                path, url, sha256, ..
+            } => {
+                report.path = Some(path.display().to_string());
+                report.url = Some(url.clone());
+                report.sha256 = Some(sha256.clone());
+            }
+            PinnedSource::Host { path } => report.path = Some(path.display().to_string()),
+            PinnedSource::Missing { reason } => report.reason = Some(reason.clone()),
+        }
+        report
+    }
+}
+
+impl PinnedProgramReport {
+    /// The line `--explain-scope` prints under `pinned programs:`:
+    /// `<artifact> (<program>): pinned <path> (sha256 <sha>, from <url>)`,
+    /// `<artifact> (<program>): host <path>` or `<artifact> (<program>): missing (<reason>)`.
+    #[must_use]
+    pub fn render_line(&self) -> String {
+        let owner = format!("{} ({})", self.artifact, self.program);
+        let path = self.path.as_deref().unwrap_or_default();
+        match self.source.as_str() {
+            "pinned" => format!(
+                "{owner}: pinned {path} (sha256 {}, from {})",
+                self.sha256.as_deref().unwrap_or_default(),
+                self.url.as_deref().unwrap_or_default()
+            ),
+            "host" => format!("{owner}: host {path}"),
+            _ => format!(
+                "{owner}: missing ({})",
+                self.reason.as_deref().unwrap_or_default()
+            ),
+        }
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one [`ContainmentDecision`]. Nothing
@@ -1209,6 +1285,10 @@ pub struct ScopeReport {
     /// its paths, each missing one with why. Always serialized, `[]` when no tool pinned with an
     /// `operator` lock origin declares a need for a program `shell.allow` grants.
     pub declared_needs: Vec<DeclaredNeedsReport>,
+    /// Which copy of each program a tool pins a download of runs, one element per (artifact,
+    /// program) gated as [`Self::declared_needs`] and with a download for this host's platform,
+    /// as [`crate::pinned_programs`] chose it. Always serialized, `[]` when none applies.
+    pub pinned_programs: Vec<PinnedProgramReport>,
     /// The host files a command reads to resolve `localhost` and the other names `/etc/hosts`
     /// carries, granted read-only by the tier: `/etc/hosts` and `/etc/nsswitch.conf` on the
     /// Landlock tiers (`scoped`, `sealed`), `[]` on every other. Always serialized.
@@ -1616,6 +1696,15 @@ impl ScopeReport {
                 .flat_map(DeclaredNeedsReport::render_lines)
                 .collect::<Vec<_>>(),
         );
+        push_list(
+            &mut out,
+            "pinned programs",
+            &self
+                .pinned_programs
+                .iter()
+                .map(PinnedProgramReport::render_line)
+                .collect::<Vec<_>>(),
+        );
         push_list(&mut out, "name resolution", &self.name_resolution);
         push_list(
             &mut out,
@@ -1779,6 +1868,17 @@ impl ScopeReport {
         needs: &[crate::declared_needs::ResolvedProgramNeeds],
     ) -> Self {
         self.declared_needs = needs.iter().map(DeclaredNeedsReport::from).collect();
+        self
+    }
+
+    /// This report with [`Self::pinned_programs`] built from `programs`, staging's source choice
+    /// for each pinned program download.
+    #[must_use]
+    pub fn with_pinned_programs(
+        mut self,
+        programs: &[crate::pinned_programs::ResolvedPinnedProgram],
+    ) -> Self {
+        self.pinned_programs = programs.iter().map(PinnedProgramReport::from).collect();
         self
     }
 
@@ -2262,6 +2362,11 @@ pub(crate) fn scope_report_for_tier(
             .shell_declared_needs
             .iter()
             .map(DeclaredNeedsReport::from)
+            .collect(),
+        pinned_programs: policy
+            .shell_pinned_programs
+            .iter()
+            .map(PinnedProgramReport::from)
             .collect(),
         trust_store: policy
             .shell_trust_store
@@ -5110,6 +5215,7 @@ mod tests {
             ),
             ("shell_trust_store", "trust_store"),
             ("shell_declared_needs", "declared_needs"),
+            ("shell_pinned_programs", "pinned_programs"),
             ("host_paths", "host_paths"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),

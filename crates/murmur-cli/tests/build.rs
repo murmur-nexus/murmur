@@ -705,3 +705,176 @@ fn programs_a_non_portable_need_fails_the_build_naming_it() {
         assert!(!dir.path().join("out.mur.zip").exists(), "{block}");
     }
 }
+
+const DOWNLOAD_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A `programs:` block pinning `fixture-prog` for two platforms, one a zip with `run`, one a
+/// single file from a loopback `http` URL, and declaring no `needs`.
+fn programs_download_block() -> String {
+    format!(
+        "programs:\n  fixture-prog:\n    download:\n      linux-x86_64:\n        url: \
+         https://downloads.example.org/fixture/1.0/fixture-linux64.zip\n        sha256: \
+         {DOWNLOAD_SHA}\n        run: fixture-linux64/fixture-prog\n      darwin-aarch64:\n        \
+         url: http://127.0.0.1:1/fixture-prog\n        sha256: {DOWNLOAD_SHA}\n"
+    )
+}
+
+/// A tool pinning a download per platform, with no `needs`, builds, and its manifest is packed
+/// byte for byte.
+#[test]
+fn programs_download_builds_and_is_packed_byte_for_byte() {
+    let block = programs_download_block();
+    let (dir, manifest) = programs_source("tool", &block);
+    build_in(dir.path()).success();
+    let mut archive =
+        ZipArchive::new(fs::File::open(dir.path().join("out.mur.zip")).unwrap()).unwrap();
+    let mut packed = String::new();
+    archive
+        .by_name("murmur.yaml")
+        .unwrap()
+        .read_to_string(&mut packed)
+        .unwrap();
+    assert_eq!(packed, manifest);
+    let downloads = murmur_artifact::parse_program_downloads(&packed).unwrap();
+    assert_eq!(downloads[0].downloads.len(), 2);
+}
+
+/// Builds a tool carrying `download` (indented under `programs.fixture-prog.download`, or the
+/// whole block when it starts with `programs:`) and asserts the build fails with `E-BLD-008`
+/// naming `expected`, writing no archive.
+#[allow(clippy::print_stdout)]
+fn assert_download_refused(runtime: &str, block: &str, expected: &str) {
+    let (dir, _) = programs_source(runtime, block);
+    let output = build_in(dir.path()).failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("{stderr}");
+    assert!(stderr.contains("error[E-BLD-008]:"), "{stderr}");
+    assert!(stderr.contains(expected), "{block}: {stderr}");
+    assert!(
+        stderr.contains("hint: programs: goes on a runtime: tool artifact"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("out.mur.zip").exists(), "{block}");
+}
+
+/// One linux-x86_64 entry with `url`, `sha256` and an optional extra line.
+fn download_entry(url: &str, sha: &str, extra: &str) -> String {
+    format!(
+        "programs:\n  fixture-prog:\n    download:\n      linux-x86_64:\n        url: '{url}'\n        \
+         sha256: '{sha}'\n{extra}"
+    )
+}
+
+#[test]
+fn programs_download_refuses_a_url_that_is_not_https_or_loopback_http() {
+    let field = "field 'programs.fixture-prog.download.linux-x86_64.url' is";
+    for (url, reason) in [
+        (
+            "http://example.com/x.zip",
+            "an http URL to a host that is not loopback",
+        ),
+        (
+            "https://user@host.example/x.zip",
+            "a URL carrying user information",
+        ),
+        ("ftp://h/x", "a ftp URL"),
+        ("https://", "a URL with no host"),
+        ("https://host.example/x.zip#part", "a URL with a fragment"),
+    ] {
+        assert_download_refused(
+            "tool",
+            &download_entry(url, DOWNLOAD_SHA, ""),
+            &format!("{field} '{url}', {reason}"),
+        );
+    }
+    let (dir, _) = programs_source(
+        "tool",
+        &download_entry("http://127.0.0.1:1/x.zip", DOWNLOAD_SHA, ""),
+    );
+    build_in(dir.path()).success();
+}
+
+#[test]
+fn programs_download_refuses_a_sha256_that_is_not_64_lowercase_hex() {
+    for sha in [
+        DOWNLOAD_SHA[1..].to_string(),
+        DOWNLOAD_SHA.to_uppercase(),
+        DOWNLOAD_SHA.replace('a', "z"),
+    ] {
+        assert_download_refused(
+            "tool",
+            &download_entry("https://h.example/x.zip", &sha, ""),
+            &format!(
+                "field 'programs.fixture-prog.download.linux-x86_64.sha256' is '{sha}', which is \
+                 not a sha256: exactly 64 lowercase hex digits"
+            ),
+        );
+    }
+}
+
+#[test]
+fn programs_download_refuses_a_platform_it_does_not_know() {
+    assert_download_refused(
+        "tool",
+        &format!(
+            "programs:\n  fixture-prog:\n    download:\n      windows-x86_64:\n        url: \
+             https://h.example/x.zip\n        sha256: {DOWNLOAD_SHA}\n"
+        ),
+        "field 'programs.fixture-prog.download.windows-x86_64' is not a platform a download is \
+         pinned for; the platforms are: darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64",
+    );
+}
+
+#[test]
+fn programs_download_refuses_a_run_that_is_not_a_plain_relative_path() {
+    for (run, reason) in [
+        ("/abs", "an absolute host path"),
+        ("a/../b", "a path climbing with '..'"),
+        ("", "not a relative path of plain components"),
+        ("~/x", "a home folder"),
+        ("$X/y", "an environment expansion"),
+    ] {
+        assert_download_refused(
+            "tool",
+            &download_entry(
+                "https://h.example/x.zip",
+                DOWNLOAD_SHA,
+                &format!("        run: '{run}'\n"),
+            ),
+            &format!(
+                "field 'programs.fixture-prog.download.linux-x86_64.run' is '{run}', {reason}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn programs_download_refuses_an_unknown_key_or_an_empty_download() {
+    assert_download_refused(
+        "tool",
+        &download_entry("https://h.example/x.zip", DOWNLOAD_SHA, "        size: 3\n"),
+        "field 'programs.fixture-prog.download.linux-x86_64.size' is not a key of a pinned \
+         download; a pinned download holds url, sha256 and optionally run",
+    );
+    assert_download_refused(
+        "tool",
+        "programs:\n  fixture-prog:\n    download: {}\n",
+        "field 'programs.fixture-prog.download' is an empty mapping; a download names at least \
+         one platform",
+    );
+    assert_download_refused(
+        "tool",
+        "programs:\n  fixture-prog: {}\n",
+        "field 'programs.fixture-prog' holds neither needs nor download",
+    );
+}
+
+#[test]
+fn programs_download_refuses_off_a_tool() {
+    assert_download_refused(
+        "driver",
+        &programs_download_block(),
+        "field 'programs' is only valid on an artifact whose runtime is tool; this one is \
+         runtime: driver",
+    );
+}
