@@ -74,11 +74,12 @@ pub const W_RUN_009: &str = "W-RUN-009";
 pub const W_RUN_010: &str = "W-RUN-010";
 
 /// A tool the capsule pins with an `operator` lock origin declares a need (its `programs:` block)
-/// for a program `capabilities.shell.allow` grants, and this host has nothing it resolves to.
+/// for a program `capabilities.shell.allow` grants, and this host cannot grant it: it resolves to
+/// nothing, its program is not on `PATH`, or it resolves to a location no need may reach.
 ///
 /// A missing need never refuses a launch: the program may run without it, or fail for want of it.
-/// Printed by `mur doctor`, once per missing need, naming the package the tool declares for this
-/// host's distribution when it declares one.
+/// Printed by `mur doctor`, once per missing need. A need that resolves to nothing names the
+/// package the tool declares for this host's distribution; any other names its reason.
 pub const W_RUN_011: &str = "W-RUN-011";
 
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.

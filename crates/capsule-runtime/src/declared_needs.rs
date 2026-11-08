@@ -84,22 +84,9 @@ pub struct ResolvedNeed {
     pub paths: Vec<NeedPath>,
 }
 
-/// One granted path.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NeedPath {
-    pub path: PathBuf,
-    /// Whether `path` is a directory, which makes its grant listable.
-    pub directory: bool,
-}
-
-impl NeedPath {
-    /// `<path>`, or `<path> (list_dir)` for a directory: how every report spells a grant.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let listable = if self.directory { " (list_dir)" } else { "" };
-        format!("{}{listable}", self.path.display())
-    }
-}
+/// One granted path: canonical, listable when a directory. The trust store's path type, since a
+/// `system: ca_bundle` need resolves to exactly the trust store's paths.
+pub type NeedPath = crate::trust_store::TrustStorePath;
 
 /// A need, or part of one, that is not granted, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,13 +245,7 @@ fn resolve_program(
             NeedForm::System(SystemLocation::CaBundle) => {
                 let writable: Vec<&Path> =
                     host.capsule_writable.iter().map(PathBuf::as_path).collect();
-                Ok(crate::trust_store::select_in(host.ca_candidates, &writable)
-                    .into_iter()
-                    .map(|entry| NeedPath {
-                        path: entry.path,
-                        directory: entry.directory,
-                    })
-                    .collect())
+                Ok(crate::trust_store::select_in(host.ca_candidates, &writable))
             }
             NeedForm::Etc(name) => Ok(existing(&host.etc_root.join(name)).into_iter().collect()),
         };

@@ -1653,12 +1653,8 @@ fn report_declared_needs(
     }
     for program in &resolved {
         for missing in &program.missing {
-            let (line, fix) = declared_need_warning(
-                &program.artifact,
-                &program.program,
-                &missing.need,
-                &distributions,
-            );
+            let (line, fix) =
+                declared_need_warning(&program.artifact, &program.program, missing, &distributions);
             capsule_runtime::report_println!("  {line}");
             warnings.push(fix);
         }
@@ -1667,15 +1663,32 @@ fn report_declared_needs(
 }
 
 /// The `W-RUN-011` line for one missing need, and the `Fix:` the tally prints for it.
+///
+/// Only a need that resolves to nothing ([`capsule_runtime::declared_needs::NOT_FOUND`]) names a
+/// package: a need whose program is not on `PATH`, or that resolves to a location no need may
+/// reach, would stay missing with the package installed, so its line gives the reason instead.
 fn declared_need_warning(
     artifact: &str,
     program: &str,
-    need: &murmur_artifact::DeclaredNeed,
+    missing: &capsule_runtime::declared_needs::MissingNeed,
     distributions: &[String],
 ) -> (String, String) {
+    let need = &missing.need;
+    let code = murmur_artifact::W_RUN_011;
+    if missing.reason != capsule_runtime::declared_needs::NOT_FOUND {
+        return (
+            format!(
+                "warning[{code}]: {artifact} declares {} for {program}, and it is not granted: {}",
+                need.form, missing.reason
+            ),
+            format!(
+                "{} for {program} ({artifact}) is not granted: {}",
+                need.form, missing.reason
+            ),
+        );
+    }
     let head = format!(
-        "warning[{}]: {artifact} declares {} for {program}, and this host has none",
-        murmur_artifact::W_RUN_011,
+        "warning[{code}]: {artifact} declares {} for {program}, and this host has none",
         need.form
     );
     match capsule_runtime::declared_needs::package_for(need, distributions) {
@@ -2451,6 +2464,53 @@ fn unconfined_stance_line(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `W-RUN-011` names a package only for a need that resolves to nothing; a need that resolves
+    /// somewhere no need may reach, or whose program is not on `PATH`, gives its reason instead.
+    #[test]
+    fn declared_need_warning_names_a_package_only_for_a_need_the_host_lacks() {
+        use capsule_runtime::declared_needs::{MissingNeed, NOT_FOUND, PROGRAM_NOT_ON_PATH};
+        let need = murmur_artifact::DeclaredNeed {
+            form: murmur_artifact::NeedForm::Library("libx.so.1".to_string()),
+            packages: std::collections::BTreeMap::from([(
+                "debian".to_string(),
+                "libx1".to_string(),
+            )]),
+        };
+        let missing = |reason: &str| MissingNeed {
+            need: need.clone(),
+            reason: reason.to_string(),
+        };
+        let ids = ["ubuntu".to_string(), "debian".to_string()];
+        assert_eq!(
+            declared_need_warning("local/t", "cat", &missing(NOT_FOUND), &ids),
+            (
+                "warning[W-RUN-011]: local/t declares library libx.so.1 for cat, and this host \
+                 has none; install libx1 (debian)"
+                    .to_string(),
+                "install libx1 for library libx.so.1 (cat, local/t)".to_string()
+            )
+        );
+        assert_eq!(
+            declared_need_warning("local/t", "cat", &missing(NOT_FOUND), &["arch".to_string()]).0,
+            "warning[W-RUN-011]: local/t declares library libx.so.1 for cat, and this host has \
+             none; the artifact names no package for arch"
+        );
+        let moved = "resolved to /home/u/lib/libx.so.1, beneath the home folder /home/u, which \
+                     no need reaches";
+        for reason in [moved, PROGRAM_NOT_ON_PATH] {
+            let (line, fix) = declared_need_warning("local/t", "cat", &missing(reason), &ids);
+            assert_eq!(
+                line,
+                format!(
+                    "warning[W-RUN-011]: local/t declares library libx.so.1 for cat, and it is \
+                     not granted: {reason}"
+                )
+            );
+            assert!(!line.contains("install"), "{line}");
+            assert!(fix.ends_with(reason), "{fix}");
+        }
+    }
 
     fn unserved(
         interface: &str,

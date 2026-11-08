@@ -2266,10 +2266,7 @@ pub(crate) fn scope_report_for_tier(
         trust_store: policy
             .shell_trust_store
             .iter()
-            .map(|entry| {
-                let listable = if entry.directory { " (list_dir)" } else { "" };
-                format!("{}{listable}", entry.path.display())
-            })
+            .map(crate::trust_store::TrustStorePath::render)
             .collect(),
         // Keyed on the applied tier, like `filesystem_boundary`: what scopes a host path is the
         // mechanism this session installs, not the class it achieves.

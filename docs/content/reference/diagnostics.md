@@ -170,7 +170,7 @@ section that explains it.
 | `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
 | `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
 | `W-RUN-010` | `capabilities.shell.allow` names `node` or `nodejs` and the address-space limit its commands run under is below 32 GiB | [W-RUN-010](#w-run-010) |
-| `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host has nothing it resolves to | [W-RUN-011](#w-run-011) |
+| `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host cannot grant it | [W-RUN-011](#w-run-011) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -3192,11 +3192,12 @@ Where a warning is written depends on whether the session's records directory ex
 | `W-SEC-035` — decided before staging by `mur run`, and by `mur doctor` | stderr |
 | `W-SEC-036` — decided at launch, after staging succeeds | stderr, with `--json` too, and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
 
-### W-RUN-011 — a declared program need this host lacks { #w-run-011 }
+### W-RUN-011 — a declared program need this host cannot grant { #w-run-011 }
 
 ```text
   warning[W-RUN-011]: local/browser declares library libsoftokn3.so for chromium, and this host has none; install libnss3 (debian)
   warning[W-RUN-011]: local/browser declares system fonts for chromium, and this host has none; the artifact names no package for ubuntu, debian
+  warning[W-RUN-011]: local/browser declares program_folder . for chromium, and it is not granted: program not found on PATH
 ```
 
 **Fires when** a tool the capsule pins with an `operator` lock origin declares a
@@ -3205,13 +3206,17 @@ the need is reported `missing`: it resolves to nothing on this host, its program
 or what it resolves to is a location no need may reach.
 
 [`mur doctor`](cli.md#mur-doctor) prints one line per missing need and counts each among its
-warnings. The package is the need's `packages` entry for this host's os-release `ID`, else for
-each `ID_LIKE` word in order, read from `/etc/os-release`, else `/usr/lib/os-release`; with none,
-the line names the IDs it checked. Nothing is refused: a launch grants the needs this host has and
-reports the rest under `declared_needs`.
+warnings. Nothing is refused: a launch grants the needs this host has and reports the rest under
+`declared_needs`.
+
+| Why the need is missing | The line ends with |
+|---|---|
+| It resolves to nothing on this host | `this host has none; install <package> (<distribution>)`, the need's `packages` entry for this host's os-release `ID`, else for each `ID_LIKE` word in order (read from `/etc/os-release`, else `/usr/lib/os-release`). With no entry for this host: `the artifact names no package for <IDs checked>` |
+| Its program is not on `PATH`, or it resolves to a location no need may reach | `it is not granted: <reason>`, with no package: installing one would not change it |
 
 **What to do:** install the package named, or the one that provides the need on this
-distribution.
+distribution. For a need that is not granted, put the program on `PATH`, or install the library
+or file where the reason shows it is not under the home folder or a folder the capsule can write.
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 

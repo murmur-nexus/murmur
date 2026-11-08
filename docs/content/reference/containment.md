@@ -1463,9 +1463,10 @@ This is not the folder grant [Native addons](#native-addons) refuses to make on 
 
 ```text
   declared needs:
-    - local/browser (chromium): library libsoftokn3.so -> /usr/lib/x86_64-linux-gnu/libsoftokn3.so, /usr/lib/x86_64-linux-gnu/libnss3.so
-    - local/browser (chromium): program_folder . -> /usr/lib/chromium (list_dir)
-    - local/browser (chromium): system fonts -> missing (not found on this host)
+    - local/needs-tool (cat): library libm.so.6 -> /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2, /usr/lib/x86_64-linux-gnu/libc.so.6, /usr/lib/x86_64-linux-gnu/libm.so.6
+    - local/needs-tool (cat): program_folder . -> /usr/bin (list_dir)
+    - local/needs-tool (cat): etc fonts/fonts.conf -> /etc/fonts/fonts.conf
+    - local/needs-tool (cat): library libmurmur-absent.so.7 -> missing (not found on this host)
 ```
 
 [`mur doctor`](cli.md#mur-doctor) warns with [`W-RUN-011`](diagnostics.md#w-run-011) for each

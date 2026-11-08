@@ -16,13 +16,23 @@
 
 use std::path::{Path, PathBuf};
 
-/// One host path staging granted as part of the trust store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One host path staging granted read-only: a trust-store location, or a path a tool's declared
+/// program need resolved to ([`crate::declared_needs::NeedPath`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TrustStorePath {
     /// Canonical: symlinks resolved, so the rule names the inode the host really keeps.
     pub path: PathBuf,
     /// Whether `path` is a directory, which decides whether its grant is listable.
     pub directory: bool,
+}
+
+impl TrustStorePath {
+    /// `<path>`, or `<path> (list_dir)` for a directory: how every report spells the grant.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let listable = if self.directory { " (list_dir)" } else { "" };
+        format!("{}{listable}", self.path.display())
+    }
 }
 
 /// One well-known trust-store location: a CA bundle file or a hashed certificate directory.

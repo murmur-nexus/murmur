@@ -1039,6 +1039,7 @@ For a capsule whose installed tools declare [needs](containment.md#declared-prog
 | `⚠ <artifact> (<program>): <n> granted, <m> missing` | Some need does not |
 | `warning[W-RUN-011]: <artifact> declares <need> for <program>, and this host has none; install <package> (<distribution>)` | One per missing need, when the need's `packages` names one for this host's os-release `ID` or an `ID_LIKE` word, first match wins. Counted as a warning with a `Fix:` line; see [`W-RUN-011`](diagnostics.md#w-run-011) |
 | `warning[W-RUN-011]: …; the artifact names no package for <ID>[, <ID_LIKE>…]` | The same, when it names none for this host |
+| `warning[W-RUN-011]: <artifact> declares <need> for <program>, and it is not granted: <reason>` | One per need whose program is not on `PATH`, or that resolves to a location no need may reach. Counted as a warning |
 | `✗ error[E-RUN-062]: …` | A tool's `programs:` block is malformed. Adds a `Fix:` line and makes `mur doctor` exit `1` |
 
 Ahead of the checklist it prints these blocks. None of them affects the exit code.

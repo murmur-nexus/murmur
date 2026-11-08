@@ -3,14 +3,14 @@
 //!
 //! ```yaml
 //! programs:
-//!   chromium:
+//!   render:
 //!     needs:
-//!       - library: libsoftokn3.so
+//!       - library: libexample.so.1
 //!         packages:
-//!           debian: libnss3
-//!           fedora: nss-softokn
-//!       - file: libsoftokn3.chk
-//!         beside: libsoftokn3.so
+//!           debian: libexample1
+//!           fedora: example-libs
+//!       - file: libexample.chk
+//!         beside: libexample.so.1
 //!       - program_folder: .
 //!       - system: fonts
 //!       - etc: fonts/fonts.conf
