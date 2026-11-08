@@ -100,6 +100,64 @@ fn mur_doctor_with_roost_env(
     command.assert()
 }
 
+/// Whether this host refuses the network namespace a capsule declaring
+/// `capabilities.spawn.allow` needs, asked of the probe `mur run` stages with. Where it does,
+/// `mur run` refuses every such capsule with `E-CAP-005`, and doctor prints that error ahead of
+/// the roost and `Environment requirements` findings.
+fn namespace_refused_here() -> bool {
+    capsule_runtime::detect_egress_namespace_failure().is_some()
+}
+
+/// Asserts how doctor ends for a `capabilities.spawn.allow` fixture whose own findings are
+/// `errors` errors, the first carrying `first`: exit `0` with no error counted when there are
+/// none, else exit `1`, the tally counting them, and `First refusal:` naming the first. On a host
+/// that refuses the capsule's network namespace, `E-CAP-005` is one more error, and the first.
+fn assert_delegating_tally(output: &std::process::Output, errors: usize, first: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let refused = namespace_refused_here();
+    let (errors, first) = if refused {
+        assert!(
+            stderr.contains("[mur doctor] error[E-CAP-005]:"),
+            "this host refuses the namespace, so doctor must say so:\n{stderr}"
+        );
+        (errors + 1, "E-CAP-005")
+    } else {
+        assert!(!stderr.contains("E-CAP-005"), "{stderr}");
+        (errors, first)
+    };
+    let tally = stdout
+        .lines()
+        .position(|line| line.contains(" passed, ") && line.contains(" found"));
+    if errors == 0 {
+        assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+        if let Some(tally) = tally {
+            let line = stdout.lines().nth(tally).unwrap();
+            assert!(line.contains(" 0 errors found"), "{stdout}");
+        }
+        return;
+    }
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    let tally = tally.unwrap_or_else(|| panic!("no tally in:\n{stdout}"));
+    let lines: Vec<&str> = stdout.lines().collect();
+    let s = if errors == 1 { "" } else { "s" };
+    assert!(
+        lines[tally].contains(&format!(" {errors} error{s} found")),
+        "{stdout}"
+    );
+    assert!(
+        lines[tally + 1].starts_with(&format!("First refusal: error[{first}]: ")),
+        "{stdout}"
+    );
+}
+
+/// [`assert_delegating_tally`] for a fixture whose own findings hold no error, returning the
+/// assertion for its stream checks.
+fn delegating_doctor_passes(assert: Assert) -> Assert {
+    assert_delegating_tally(assert.get_output(), 0, "");
+    assert
+}
+
 // ── Project fixture helpers ───────────────────────────────────────────────────
 
 /// Write a `murmur.yaml` declaring `artifacts_yaml`. `mur doctor` never loads a
@@ -1121,7 +1179,8 @@ fn doctor_fails_on_an_unset_roost_url_and_says_how_to_install_mur_roost() {
     let empty_path = TempDir::new().unwrap();
     create_delegating_project(&home, project.path());
 
-    let assert = mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).code(1);
+    let assert = mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None);
+    assert_delegating_tally(assert.get_output(), 1, "E-RUN-019");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
@@ -1138,10 +1197,6 @@ fn doctor_fails_on_an_unset_roost_url_and_says_how_to_install_mur_roost() {
     assert!(stderr.contains("install.murmur.rs"), "{stderr}");
     assert!(!stdout.contains("All checks passed."), "{stdout}");
     assert!(
-        stdout.contains("0 checks passed, 1 error found.\nFirst refusal: error[E-RUN-019]: "),
-        "{stdout}"
-    );
-    assert!(
         stdout.contains("Fix: set MURMUR_ROOST_URL to a running mur-roost daemon"),
         "{stdout}"
     );
@@ -1156,9 +1211,8 @@ fn doctor_fails_on_an_unset_roost_url_when_mur_roost_is_installed() {
     create_delegating_project(&home, project.path());
 
     let assert =
-        mur_doctor_with_roost_env(&home, project.path(), &path_with_roost(bin.path()), None)
-            .code(1);
-    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        mur_doctor_with_roost_env(&home, project.path(), &path_with_roost(bin.path()), None);
+    assert_delegating_tally(assert.get_output(), 1, "E-RUN-019");
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
     assert!(
@@ -1168,10 +1222,6 @@ fn doctor_fails_on_an_unset_roost_url_when_mur_roost_is_installed() {
     assert!(stderr.contains("MURMUR_ROOST_URL"), "{stderr}");
     assert!(stderr.contains("is not set"), "{stderr}");
     assert!(!stderr.contains("was not found on PATH"), "{stderr}");
-    assert!(
-        stdout.contains("First refusal: error[E-RUN-019]: "),
-        "{stdout}"
-    );
 }
 
 /// The daemon is installed, a URL names it, and nothing answers there. Port 1 is reserved and
@@ -1217,13 +1267,15 @@ fn doctor_passes_a_roost_url_that_answers_without_mur_roost_on_path() {
     create_delegating_project(&home, project.path());
     let (url, _registry) = start_roost();
 
-    let assert =
-        mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), Some(&url)).code(0);
+    let assert = mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), Some(&url));
+    assert_delegating_tally(assert.get_output(), 0, "");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
     assert!(!stderr.contains("E-RUN-019"), "{stderr}");
-    assert!(stdout.contains("All checks passed."), "{stdout}");
+    if !namespace_refused_here() {
+        assert!(stdout.contains("All checks passed."), "{stdout}");
+    }
 }
 
 /// A daemon that answers is the state doctor has nothing to say about.
@@ -1240,8 +1292,8 @@ fn doctor_says_nothing_about_roost_when_the_daemon_answers() {
         project.path(),
         &path_with_roost(bin.path()),
         Some(&url),
-    )
-    .success();
+    );
+    assert_delegating_tally(assert.get_output(), 0, "");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
@@ -1384,7 +1436,7 @@ fn env_requirements_reports_the_whole_closure_three_levels_deep() {
     let project = tempfile::tempdir().unwrap();
     create_three_level_closure(&home, project.path());
 
-    mur_doctor_with_env(
+    delegating_doctor_passes(mur_doctor_with_env(
         &home,
         project.path(),
         &[
@@ -1392,8 +1444,7 @@ fn env_requirements_reports_the_whole_closure_three_levels_deep() {
             ("WORKER_KEY", Some("x")),
             ("DEEP_KEY", Some("x")),
         ],
-    )
-    .success()
+    ))
     .stdout(predicate::str::contains("Environment requirements"))
     .stdout(predicate::str::contains(
         "capsules: root-capsule@0.0.1, local/worker@0.1.0, local/deep-worker@0.2.0",
@@ -1437,7 +1488,7 @@ fn env_requirements_never_prints_a_variables_value() {
     let project = tempfile::tempdir().unwrap();
     create_three_level_closure(&home, project.path());
 
-    let output = mur_doctor_with_env(
+    let output = delegating_doctor_passes(mur_doctor_with_env(
         &home,
         project.path(),
         &[
@@ -1445,8 +1496,7 @@ fn env_requirements_never_prints_a_variables_value() {
             ("WORKER_KEY", Some("x")),
             ("DEEP_KEY", Some("sk-do-not-print-me-4c7e05b1")),
         ],
-    )
-    .success()
+    ))
     .get_output()
     .clone();
 
@@ -1526,10 +1576,13 @@ fn env_requirements_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
     )
     .unwrap();
 
-    let output = mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
-        .success()
-        .get_output()
-        .clone();
+    let output = delegating_doctor_passes(mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_KEY", Some("x"))],
+    ))
+    .get_output()
+    .clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
@@ -1563,20 +1616,23 @@ fn env_requirements_counts_and_names_a_capsule_it_could_not_inspect() {
     )
     .unwrap();
 
-    mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
-        .success()
-        .stdout(predicate::str::contains(
-            "could not inspect 1 of 3 capsules in the spawn closure",
-        ))
-        .stdout(predicate::str::contains(
-            "- local/ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
+    delegating_doctor_passes(mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_KEY", Some("x"))],
+    ))
+    .stdout(predicate::str::contains(
+        "could not inspect 1 of 3 capsules in the spawn closure",
+    ))
+    .stdout(predicate::str::contains(
+        "- local/ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
              global store",
-        ))
-        .stdout(predicate::str::contains("Fix: local/ghost-worker:"))
-        .stderr(predicate::str::contains(
-            "warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it \
+    ))
+    .stdout(predicate::str::contains("Fix: local/ghost-worker:"))
+    .stderr(predicate::str::contains(
+        "warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it \
              declares is absent from the report above: local/ghost-worker",
-        ));
+    ));
 }
 
 /// The word no line of the `Environment requirements` block may print: a group of capsules
@@ -1734,7 +1790,7 @@ fn the_workspace_dotenv_counts_a_variable_as_set() {
     create_three_level_closure(&home, project.path());
     fs::write(project.path().join(".env"), "DEEP_KEY=from-dotenv\n").unwrap();
 
-    let output = mur_doctor_with_env(
+    let output = delegating_doctor_passes(mur_doctor_with_env(
         &home,
         project.path(),
         &[
@@ -1742,8 +1798,7 @@ fn the_workspace_dotenv_counts_a_variable_as_set() {
             ("WORKER_KEY", Some("x")),
             ("DEEP_KEY", None),
         ],
-    )
-    .success()
+    ))
     .stdout(predicate::str::contains("\u{2713}  DEEP_KEY"))
     .stdout(predicate::str::contains("Fix: export DEEP_KEY").not())
     .get_output()
@@ -1781,16 +1836,19 @@ fn two_installed_versions_with_nothing_pinning_which_is_uninspectable() {
     )
     .unwrap();
 
-    mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
-        .success()
-        .stdout(predicate::str::contains(
-            "could not inspect 1 of 2 capsules in the spawn closure",
-        ))
-        .stdout(predicate::str::contains(
-            "2 versions installed (0.1.0, 0.2.0) and nothing pins which one a run would get",
-        ))
-        .stdout(predicate::str::contains("OLD_ONLY").not())
-        .stdout(predicate::str::contains("NEW_ONLY").not());
+    delegating_doctor_passes(mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_KEY", Some("x"))],
+    ))
+    .stdout(predicate::str::contains(
+        "could not inspect 1 of 2 capsules in the spawn closure",
+    ))
+    .stdout(predicate::str::contains(
+        "2 versions installed (0.1.0, 0.2.0) and nothing pins which one a run would get",
+    ))
+    .stdout(predicate::str::contains("OLD_ONLY").not())
+    .stdout(predicate::str::contains("NEW_ONLY").not());
 }
 
 #[test]
@@ -1818,7 +1876,7 @@ fn the_lockfile_decides_which_version_the_walk_reads() {
     .unwrap();
     write_lock(project.path(), "local/worker", "0.1.0", &pinned_sha256);
 
-    mur_doctor_with_env(
+    let output = delegating_doctor_passes(mur_doctor_with_env(
         &home,
         project.path(),
         &[
@@ -1826,15 +1884,31 @@ fn the_lockfile_decides_which_version_the_walk_reads() {
             ("OLD_ONLY", Some("x")),
             ("NEW_ONLY", None),
         ],
-    )
-    .success()
+    ))
     .stdout(predicate::str::contains(
         "capsules: root-capsule@0.0.1, local/worker@0.1.0",
     ))
     .stdout(predicate::str::contains("OLD_ONLY"))
     .stdout(predicate::str::contains("NEW_ONLY").not())
     .stdout(predicate::str::contains("could not inspect").not())
-    .stdout(predicate::str::contains("Fix:").not());
+    .get_output()
+    .clone();
+
+    // The walk reads the pinned version, which needs nothing unset, so no finding of its own adds a
+    // `Fix:` line; the only one allowed is this host's `E-CAP-005`.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let refused = namespace_refused_here();
+    let fixes: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("Fix:"))
+        .filter(|line| {
+            !(refused
+                && line.starts_with(
+                    "Fix: make this host able to create the capsule's network namespace",
+                ))
+        })
+        .collect();
+    assert!(fixes.is_empty(), "{stdout}");
 }
 
 #[test]
