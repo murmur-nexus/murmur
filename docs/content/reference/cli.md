@@ -110,7 +110,7 @@ Every command that names a session spells the address the same way.
 | Form | Example | Names |
 |---|---|---|
 | Full ID | `ses_019f01a940ce7761854e768ecbe3d399` | The session with that ID: `ses_` followed by 32 hex characters. In the recorded set it is looked up in the workdir root's records group first, then in every records group under `~/.murmur/records`, so it resolves from any folder |
-| Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them. In the recorded set, only the workdir root's sessions are matched |
+| Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. Any length in the recorded set; 4 characters or more in the running set. Two or more matches are refused, and the refusal lists them. In the recorded set, only the workdir root's sessions are matched |
 | Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest. In the recorded set, only the workdir root's sessions are counted |
 | Path | `~/.murmur/records/…/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session's records directory itself |
 

@@ -79,7 +79,7 @@ fn folders() -> Folders {
     }
 }
 
-/// S1: the Finding 4 repro — a full id recorded under folder A, read from folder B.
+/// A full id recorded under folder A, read from folder B.
 #[test]
 fn trace_show_finds_a_full_id_recorded_under_another_folder() {
     let f = folders();
@@ -99,7 +99,7 @@ fn trace_show_finds_a_full_id_recorded_under_another_folder() {
     );
 }
 
-/// S2: the same lookup serves `mur trace steps` and `mur eval show`.
+/// The same lookup serves `mur trace steps` and `mur eval show`.
 #[test]
 fn trace_steps_and_eval_show_find_it_too() {
     let f = folders();
@@ -121,7 +121,7 @@ fn trace_steps_and_eval_show_find_it_too() {
     assert!(eval.contains("scorer_from_folder_a"), "{eval}");
 }
 
-/// S3: ordinals and suffixes count the current workdir root's sessions only.
+/// Ordinals and suffixes count the current workdir root's sessions only.
 #[test]
 fn short_addresses_stay_with_the_current_workdir_root() {
     let f = folders();
@@ -172,7 +172,7 @@ fn short_addresses_stay_with_the_current_workdir_root() {
     );
 }
 
-/// S4: a full id recorded nowhere names the group and the records root it searched.
+/// A full id recorded nowhere names the group and the records root it searched.
 #[test]
 fn a_missing_full_id_names_where_it_looked() {
     let f = folders();
@@ -234,7 +234,7 @@ fn a_missing_full_id_names_where_it_looked() {
     );
 }
 
-/// S5: the current workdir root's session wins over the same id recorded elsewhere.
+/// The current workdir root's session wins over the same id recorded elsewhere.
 #[test]
 fn the_current_workdir_root_wins() {
     let f = folders();
@@ -254,7 +254,7 @@ fn the_current_workdir_root_wins() {
     }
 }
 
-/// S6: one id recorded in two other groups names neither; both are listed.
+/// One id recorded in two other groups names neither; both are listed.
 #[test]
 fn a_full_id_in_two_other_groups_is_refused_with_both_listed() {
     let f = folders();
@@ -281,7 +281,7 @@ fn a_full_id_in_two_other_groups_is_refused_with_both_listed() {
     );
 }
 
-/// S8: `mur trace rm` removes only the named workdir root's session, so its full id is looked up
+/// `mur trace rm` removes only the named workdir root's session, so its full id is looked up
 /// there alone.
 #[test]
 fn trace_rm_stays_with_its_workdir_root() {

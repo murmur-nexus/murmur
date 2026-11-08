@@ -192,7 +192,7 @@ pub(crate) fn is_full_session_id(address: &str) -> bool {
 /// The record file a session address names, among the sessions of the workdir root `workdir`.
 ///
 /// Four forms, and nothing else: an `@N` ordinal counting back from the most recent session, a
-/// literal path, a full `ses_` id, or a 4+-character case-insensitive suffix of one. A literal
+/// literal path, a full `ses_` id, or a case-insensitive suffix of one, of any length. A literal
 /// path is read as given and consults no records group; every other form reads `workdir`'s, and a
 /// full id `workdir`'s group does not hold is looked for in every other records group, by
 /// [`resolve_full_session_id`]. An omitted address is [`LATEST`] and takes the ordinal arm, so
