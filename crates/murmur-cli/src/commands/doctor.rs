@@ -2218,6 +2218,7 @@ fn report_pinned_programs(
                          runs"
                     ));
                     warnings.push((
+                        artifact.clone(),
                         format!(
                             "warning[{code}]: {artifact} pins no download of {name} for \
                              {platform_label}, and this host has no {name}"
@@ -2255,6 +2256,7 @@ fn report_pinned_programs(
         ));
         if let Some(reason) = failing {
             warnings.push((
+                artifact.clone(),
                 format!(
                     "warning[{code}]: {artifact}'s pinned copy of {name} fails its checksum: \
                      {reason}; run mur install to fetch it again"
@@ -2266,6 +2268,7 @@ fn report_pinned_programs(
             ));
         } else if running.is_none() {
             warnings.push((
+                artifact.clone(),
                 format!(
                     "warning[{code}]: {artifact} pins {name} for {platform_label}, and the \
                      store holds no copy; run mur install"
@@ -2284,9 +2287,15 @@ fn report_pinned_programs(
     for line in &lines {
         capsule_runtime::report_println!("  {line}");
     }
-    for (line, fix) in warnings {
+    for (artifact, line, fix) in warnings {
         capsule_runtime::report_println!("  {line}");
-        findings.warning(fix);
+        findings.warning(
+            code,
+            DoctorBlock::Artifacts,
+            Some(artifact),
+            without_code(&line, code),
+            fix,
+        );
     }
     capsule_runtime::report_println!();
 }

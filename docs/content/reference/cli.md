@@ -1299,7 +1299,7 @@ lines: errors in print order, then warnings in print order. When `verdict` is `r
 | `environment` | `Environment requirements`: [`E-CAP-014`](diagnostics.md#e-cap-014), [`E-CAP-015`](diagnostics.md#e-cap-015), [`W-REG-002`](diagnostics.md#w-reg-002), and an unreadable `.env` as `E-IO-003` |
 | `roster` | [`Roster`](#doctor-roster): its `E-ROS-*` refusal and [`W-ROS-001`](diagnostics.md#w-ros-001) |
 | `preopens` | `Filesystem preopens`: [`E-CAP-002`](diagnostics.md#e-cap-002) |
-| `artifacts` | The checklist (`E-RUN-008`, `E-RUN-003`, [`E-REG-002`](diagnostics.md#e-reg-002), [`E-RUN-043`](diagnostics.md#e-run-043), [`E-RUN-061`](diagnostics.md#e-run-061), [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), [`W-REG-004`](diagnostics.md#w-reg-004)) and `Declared needs` ([`E-RUN-062`](diagnostics.md#e-run-062), [`W-RUN-011`](diagnostics.md#w-run-011)) |
+| `artifacts` | The checklist (`E-RUN-008`, `E-RUN-003`, [`E-REG-002`](diagnostics.md#e-reg-002), [`E-RUN-043`](diagnostics.md#e-run-043), [`E-RUN-061`](diagnostics.md#e-run-061), [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), [`W-REG-004`](diagnostics.md#w-reg-004)), `Declared needs` ([`E-RUN-062`](diagnostics.md#e-run-062), [`W-RUN-011`](diagnostics.md#w-run-011)) and `Pinned programs` ([`W-RUN-012`](diagnostics.md#w-run-012)) |
 | `model-limits` | `Model limits`: [`E-RUN-052`](diagnostics.md#e-run-052), [`E-RUN-054`](diagnostics.md#e-run-054), [`E-RUN-055`](diagnostics.md#e-run-055), [`W-RUN-009`](diagnostics.md#w-run-009) |
 | `harness` | [`Process harness`](#doctor-process-harness) |
 | `resources` | [`W-RUN-010`](diagnostics.md#w-run-010) |
