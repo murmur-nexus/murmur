@@ -802,11 +802,16 @@ fn show_full_session_id_resolves_correctly() {
         .stdout(predicate::str::contains("test-capsule"));
 }
 
+/// Under its own `HOME`: a full id is looked up in every records group of that home, and the
+/// shared scratch home holds this id in other tests' groups.
 #[test]
 fn show_full_session_id_not_present_gives_clear_error() {
+    let home = TempDir::new().unwrap();
     let tmp = TempDir::new().unwrap();
 
-    mur()
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
         .args([
             "trace",
             "show",
@@ -816,7 +821,10 @@ fn show_full_session_id_not_present_gives_clear_error() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not found"));
+        .stderr(predicate::str::contains("not found"))
+        .stderr(predicate::str::contains(
+            common::records_root(home.path()).display().to_string(),
+        ));
 }
 
 #[test]

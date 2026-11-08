@@ -109,16 +109,16 @@ Every command that names a session spells the address the same way.
 
 | Form | Example | Names |
 |---|---|---|
-| Full ID | `ses_019f01a940ce7761854e768ecbe3d399` | The session with that ID: `ses_` followed by 32 hex characters |
-| Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them |
-| Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest |
+| Full ID | `ses_019f01a940ce7761854e768ecbe3d399` | The session with that ID: `ses_` followed by 32 hex characters. In the recorded set it is looked up in the workdir root's records group first, then in every records group under `~/.murmur/records`, so it resolves from any folder |
+| Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them. In the recorded set, only the workdir root's sessions are matched |
+| Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest. In the recorded set, only the workdir root's sessions are counted |
 | Path | `~/.murmur/records/…/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session's records directory itself |
 
 What an address is resolved against depends on what the command needs.
 
 | Command | Candidate set | `@1` means |
 |---|---|---|
-| [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` [records directories](workdir.md#records-directory) of one workdir root, whether or not the session is still running | The most recent recorded session |
+| [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` [records directories](workdir.md#records-directory) of one workdir root, whether or not the session is still running. A full ID missing from that root is also looked up in every other records group under `~/.murmur/records`, delegated children's included | The most recent recorded session |
 | [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop), [`mur token`](#mur-token) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
 
 The recorded set is the records group of one workdir root: the directory a run was given as
@@ -152,6 +152,13 @@ Omitting the address selects a default:
 `mur trace diff` and `mur eval diff` take their arguments in *before, after* order, so the bare
 `@2 @1` puts the older run in the Run A column and the delta column reads forwards in time. Both
 take two addresses or none; one address is refused.
+
+A full ID in the recorded set is refused in two cases:
+
+| Case | The refusal |
+|---|---|
+| No records group holds it | Names the workdir root's records group, `~/.murmur/records`, and how many other records groups it looked in |
+| The workdir root's group does not hold it and two or more other records groups do | Lists each session's records directory and asks for the path form: the session's `trace.jsonl`, or its `hooks/eval.jsonl` under `mur eval` |
 
 An address matching no session, or several, is refused with
 [`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`,
@@ -3710,8 +3717,10 @@ mur trace rm <session> [--workdir <dir>] [--json]
 | `--json` | off | Print one JSON object, the stable interface below, instead of one line per removal |
 
 `@N` and a suffix name a session in the root's records group, as [`mur trace list`](#mur-trace-list)
-lists it. A full `ses_` id is also accepted while only the session's work folder is left, so a
-session an earlier removal only half removed can be removed again.
+lists it. A full `ses_` id is looked up in that group only, never in other records groups, because
+the command also removes `<workdir root>/<session_id>`. It is also accepted while only the
+session's work folder is left, so a session an earlier removal only half removed can be removed
+again.
 
 What is removed, in this order:
 

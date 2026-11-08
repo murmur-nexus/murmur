@@ -14,7 +14,10 @@
 //!
 //! The candidates are the sessions of one **workdir root** — the directory a run was given as
 //! `--workdir`, or `<manifest-dir>/workdir` — whose records directories sit in that root's records
-//! group under `~/.murmur/records`, outside every workdir a capsule's commands can write.
+//! group under `~/.murmur/records`, outside every workdir a capsule's commands can write. A full
+//! session id names one session wherever it ran, so when that root's group does not hold it,
+//! [`sessions_named`] looks for it in every records group under the records root, delegated
+//! children's mirrored groups included. Ordinals and suffixes count one root's sessions only.
 //!
 //! The commands that need a capsule running right now — `mur watch`, `mur cancel` — spell an
 //! address the same way but resolve it against a different candidate set, and go through
@@ -22,7 +25,8 @@
 //! names a recorded session directory, which says nothing about whether a process is running.
 
 use std::{
-    fs,
+    ffi::OsStr,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -45,6 +49,9 @@ pub(crate) struct RecordKind {
     nouns: &'static str,
     /// The fewest characters a suffix address may have.
     min_suffix: usize,
+    /// Whether a full id missing from the workdir root's group is looked for in every records
+    /// group under the records root.
+    full_id_in_every_group: bool,
 }
 
 /// A session: a `ses_` records directory.
@@ -55,6 +62,7 @@ pub(crate) const SESSION: RecordKind = RecordKind {
     noun: "session",
     nouns: "sessions",
     min_suffix: 0,
+    full_id_in_every_group: true,
 };
 
 /// An eval run: an `evr_<id>.json` record `mur eval run` writes.
@@ -65,6 +73,7 @@ pub(crate) const EVAL_RUN: RecordKind = RecordKind {
     noun: "eval run",
     nouns: "eval runs",
     min_suffix: 4,
+    full_id_in_every_group: false,
 };
 
 impl RecordKind {
@@ -184,10 +193,12 @@ pub(crate) fn is_full_session_id(address: &str) -> bool {
 ///
 /// Four forms, and nothing else: an `@N` ordinal counting back from the most recent session, a
 /// literal path, a full `ses_` id, or a 4+-character case-insensitive suffix of one. A literal
-/// path is read as given and consults no records group; every other form reads `workdir`'s. An omitted
-/// address is [`LATEST`] and takes the ordinal arm, so `mur trace show` and `mur trace show @1`
-/// resolve through the same code rather than through two derivations of "latest" that a later
-/// edit could pull apart. Ordinals count [`sessions_newest_first`].
+/// path is read as given and consults no records group; every other form reads `workdir`'s, and a
+/// full id `workdir`'s group does not hold is looked for in every other records group, by
+/// [`resolve_full_session_id`]. An omitted address is [`LATEST`] and takes the ordinal arm, so
+/// `mur trace show` and `mur trace show @1` resolve through the same code rather than through two
+/// derivations of "latest" that a later edit could pull apart. Ordinals count
+/// [`sessions_newest_first`].
 pub(crate) fn resolve(
     address: Option<&str>,
     workdir: &Path,
@@ -198,7 +209,8 @@ pub(crate) fn resolve(
 
 /// The record file an address names among the candidates of `kind` in the workdir root
 /// `workdir`'s records group: [`resolve`] for any kind. A file kind also refuses a suffix
-/// shorter than its `min_suffix`.
+/// shorter than its `min_suffix`. Only a kind with `full_id_in_every_group` looks beyond that
+/// group, and only for a full id.
 pub(crate) fn resolve_kind(
     address: Option<&str>,
     workdir: &Path,
@@ -212,7 +224,136 @@ pub(crate) fn resolve_kind(
         return Ok(PathBuf::from(address));
     }
     let group = records_group(workdir)?;
+    if kind.full_id_in_every_group && kind.is_full_id(address) {
+        let records_root = capsule_runtime::records_dir_root().map_err(CliError::from)?;
+        return resolve_full_session_id(address, &group, &records_root, kind, query);
+    }
     resolve_in_group(address, workdir, &group, kind, query)
+}
+
+/// The record file of the session `id`, a full id: the one in `group`, the current workdir root's
+/// records group, when it is there, else the one session recorded under `id` in any records group
+/// beneath `records_root`.
+///
+/// Refused with `query.code` when no group holds it, naming `group`, `records_root` and how many
+/// other groups were searched, and when two or more other groups do, listing each session
+/// directory and asking for the path of `query.record_file`, the one form that tells them apart.
+fn resolve_full_session_id(
+    id: &str,
+    group: &Path,
+    records_root: &Path,
+    kind: &RecordKind,
+    query: &SessionQuery<'_>,
+) -> Result<PathBuf, CliError> {
+    let here = kind.record_path(group, id, query.record_file);
+    if here.exists() {
+        return Ok(here);
+    }
+    let found = sessions_named(records_root, id, query.record_file)?;
+    match found.sessions.as_slice() {
+        [] => {
+            let others = found.groups.iter().filter(|g| *g != group).count();
+            Err(query.err(format!(
+                "{} {id} not found: looked in {} and in {others} other records {} under {}",
+                kind.noun,
+                group.display(),
+                if others == 1 { "group" } else { "groups" },
+                records_root.display()
+            )))
+        }
+        [session] => Ok(session.join(query.record_file)),
+        sessions => Err(query.err(format!(
+            "{} {id} is recorded in {} records groups — name one by its {} path instead\n{}",
+            kind.noun,
+            sessions.len(),
+            query.record_file,
+            sessions
+                .iter()
+                .map(|s| format!("  {}", s.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))),
+    }
+}
+
+/// What [`sessions_named`] finds beneath a records root.
+#[derive(Debug, Default)]
+struct Found {
+    /// Every session records directory named the id that holds the record file, sorted.
+    sessions: Vec<PathBuf>,
+    /// Every records group seen — a directory holding at least one session records directory —
+    /// sorted, whether or not it holds the id.
+    groups: Vec<PathBuf>,
+}
+
+/// The session records directories named `id` holding `record_file`, anywhere beneath
+/// `records_root`, and the records groups the walk saw.
+///
+/// A session records directory is a directory named `ses_…` holding an entry named
+/// `trace.jsonl`. It is a leaf: its `home/`, `out/` and `children/` hold whatever its commands
+/// wrote, so a `ses_…/trace.jsonl` among them is not a session. A `ses_…` directory without
+/// `trace.jsonl` is a component of a delegated child's group path — the mirror of
+/// `<parent records dir>/children/<capsule>-<hex>` — and is walked like any other directory.
+/// Directory types come from `DirEntry::file_type`, which does not follow links, so a symbolic
+/// link is neither walked nor matched.
+///
+/// A records root or directory that does not exist, or vanishes during the walk, holds nothing.
+/// `E-IO-003` names a directory that cannot be read.
+fn sessions_named(records_root: &Path, id: &str, record_file: &str) -> Result<Found, CliError> {
+    let id = OsStr::new(id);
+    let mut found = Found::default();
+    let mut pending = vec![records_root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let reader = match fs::read_dir(&dir) {
+            Ok(reader) => reader,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(&dir, &e)),
+        };
+        let mut holds_a_session = false;
+        for entry in reader {
+            let entry = entry.map_err(|e| unreadable(&dir, &e))?;
+            let is_dir = entry
+                .file_type()
+                .map_err(|e| unreadable(&dir, &e))?
+                .is_dir();
+            if !is_dir {
+                continue;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            if name
+                .as_encoded_bytes()
+                .starts_with(SESSION.prefix.as_bytes())
+                && holds_trace(&path)?
+            {
+                holds_a_session = true;
+                if name == id && path.join(record_file).exists() {
+                    found.sessions.push(path);
+                }
+            } else {
+                pending.push(path);
+            }
+        }
+        if holds_a_session {
+            found.groups.push(dir);
+        }
+    }
+    found.sessions.sort();
+    found.groups.sort();
+    Ok(found)
+}
+
+/// Whether `dir` holds an entry named `trace.jsonl`, of any type, without following it.
+fn holds_trace(dir: &Path) -> Result<bool, CliError> {
+    match fs::symlink_metadata(dir.join("trace.jsonl")) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(unreadable(dir, &e)),
+    }
+}
+
+fn unreadable(dir: &Path, e: &io::Error) -> CliError {
+    CliError::new(E_IO_003, format!("failed to read {}: {e}", dir.display()))
 }
 
 /// The non-literal arms of [`resolve_kind`], against `group`, the records group of the workdir
@@ -407,5 +548,194 @@ mod tests {
         assert!(!is_literal_path_of("beef", &EVAL_RUN));
         assert!(is_literal_path("trace.jsonl"));
         assert!(!is_literal_path("evr_1.json"));
+    }
+
+    const TARGET: &str = "ses_0192dddd0000700080000000beef5678";
+
+    const TRACE: SessionQuery<'static> = SessionQuery {
+        record_file: "trace.jsonl",
+        code: "E-TEST",
+        label: Some("before"),
+    };
+
+    /// A session records directory `id` under `group`, holding a `trace.jsonl`.
+    fn session(group: &Path, id: &str) -> PathBuf {
+        let dir = group.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("trace.jsonl"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_session_directory_is_a_leaf_of_the_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let group = root.path().join("w");
+        let other = session(&group, "ses_0192aaaa0000700080000000aaaa0000");
+        session(&other.join("home/x"), TARGET);
+        session(&other.join("children/c-0123456789abcdef"), TARGET);
+
+        let found = sessions_named(root.path(), TARGET, "trace.jsonl").unwrap();
+        assert!(found.sessions.is_empty(), "{found:?}");
+        assert_eq!(found.groups, vec![group]);
+    }
+
+    #[test]
+    fn a_link_under_the_records_root_is_neither_walked_nor_matched() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = session(elsewhere.path(), TARGET);
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("linked-group")).unwrap();
+        let group = root.path().join("w");
+        session(&group, "ses_0192aaaa0000700080000000aaaa0000");
+        std::os::unix::fs::symlink(&real, group.join(TARGET)).unwrap();
+
+        let found = sessions_named(root.path(), TARGET, "trace.jsonl").unwrap();
+        assert!(found.sessions.is_empty(), "{found:?}");
+        assert_eq!(found.groups, vec![group]);
+    }
+
+    #[test]
+    fn a_delegated_childs_mirrored_group_is_walked_and_its_parent_component_never_matched() {
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "ses_0192aaaa0000700080000000aaaa0001";
+        let child_id = "ses_0192aaaa0000700080000000cccc0002";
+        let parent_group = root.path().join("w");
+        let parent = session(&parent_group, parent_id);
+        let mirror = root
+            .path()
+            .join(root.path().strip_prefix("/").unwrap())
+            .join("w");
+        let child_group = mirror
+            .join(parent_id)
+            .join("children")
+            .join("c-0123456789abcdef");
+        let child = session(&child_group, child_id);
+
+        let found = sessions_named(root.path(), child_id, "trace.jsonl").unwrap();
+        assert_eq!(found.sessions, vec![child]);
+        let mut groups = vec![parent_group, child_group];
+        groups.sort();
+        assert_eq!(found.groups, groups);
+
+        let found = sessions_named(root.path(), parent_id, "trace.jsonl").unwrap();
+        assert_eq!(found.sessions, vec![parent]);
+    }
+
+    #[test]
+    fn a_missing_records_root_holds_no_groups() {
+        let root = tempfile::tempdir().unwrap();
+        let found = sessions_named(&root.path().join("records"), TARGET, "trace.jsonl").unwrap();
+        assert!(
+            found.sessions.is_empty() && found.groups.is_empty(),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_under_the_records_root_is_e_io_003() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok();
+        let result = sessions_named(root.path(), TARGET, "trace.jsonl");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            return; // a process that bypasses permission checks reads it anyway
+        }
+        let err = result.unwrap_err();
+        assert_eq!(err.code, E_IO_003);
+        assert!(
+            err.to_string().contains(&locked.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_full_id_in_the_current_group_wins_without_a_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let here = root.path().join("b");
+        session(&here, TARGET);
+        session(&root.path().join("a"), TARGET);
+        let path = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &TRACE).unwrap();
+        assert_eq!(path, here.join(TARGET).join("trace.jsonl"));
+    }
+
+    #[test]
+    fn a_full_id_in_one_other_group_resolves_there() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = session(&root.path().join("a"), TARGET);
+        let here = root.path().join("b");
+        let path = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &TRACE).unwrap();
+        assert_eq!(path, elsewhere.join("trace.jsonl"));
+    }
+
+    #[test]
+    fn a_full_id_recorded_nowhere_names_where_it_looked() {
+        let root = tempfile::tempdir().unwrap();
+        let here = root.path().join("b");
+        session(&here, "ses_0192aaaa0000700080000000aaaa0000");
+        session(
+            &root.path().join("a"),
+            "ses_0192aaaa0000700080000000aaaa0001",
+        );
+        let err = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &TRACE)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "before: session {TARGET} not found: looked in {} and in 1 other records group \
+                 under {}",
+                here.display(),
+                root.path().display()
+            )),
+            "{err}"
+        );
+
+        session(
+            &root.path().join("c"),
+            "ses_0192aaaa0000700080000000aaaa0002",
+        );
+        let err = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &TRACE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("and in 2 other records groups under"), "{err}");
+    }
+
+    #[test]
+    fn a_full_id_needs_the_record_file_the_command_reads() {
+        let root = tempfile::tempdir().unwrap();
+        session(&root.path().join("a"), TARGET);
+        let here = root.path().join("b");
+        let eval = SessionQuery {
+            record_file: "hooks/eval.jsonl",
+            code: "E-TEST",
+            label: None,
+        };
+        let err = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &eval)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("and in 1 other records group under"), "{err}");
+    }
+
+    #[test]
+    fn a_full_id_in_two_other_groups_lists_both() {
+        let root = tempfile::tempdir().unwrap();
+        let a = session(&root.path().join("a"), TARGET);
+        let c = session(&root.path().join("c"), TARGET);
+        let here = root.path().join("b");
+        let err = resolve_full_session_id(TARGET, &here, root.path(), &SESSION, &TRACE)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "before: session {TARGET} is recorded in 2 records groups — name one by its \
+                 trace.jsonl path instead\n  {}\n  {}",
+                a.display(),
+                c.display()
+            )),
+            "{err}"
+        );
     }
 }
