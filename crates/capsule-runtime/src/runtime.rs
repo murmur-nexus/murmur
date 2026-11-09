@@ -3128,8 +3128,7 @@ pub fn stage_session(
                 });
             }
             ArtifactRuntime::Skill => {
-                let files =
-                    extract_skill_files(&artifact.name, &resolved_version, &resolved.bytes)?;
+                let files = extract_skill_files(&full_name, &resolved_version, &resolved.bytes)?;
                 skill_files.push((artifact.name.clone(), files));
             }
         }
@@ -17512,7 +17511,10 @@ inference:
         let skill_md = local_skill_md("hi", "# hi from file");
         fs::write(skill_dir.join("SKILL.md"), &skill_md).unwrap();
         let skill = load_local_skill_files(&dir_files(dir.path()), "hi/SKILL.md").unwrap();
-        assert_eq!(skill.files, [("SKILL.md".to_string(), skill_md.into_bytes())]);
+        assert_eq!(
+            skill.files,
+            [("SKILL.md".to_string(), skill_md.into_bytes())]
+        );
     }
 
     #[test]
@@ -17520,7 +17522,11 @@ inference:
         let manifest_dir = tempfile::tempdir().unwrap();
         let skill_dir = manifest_dir.path().join("skills").join("my-skill");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("SKILL.MD"), local_skill_md("my-skill", "# upper")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.MD"),
+            local_skill_md("my-skill", "# upper"),
+        )
+        .unwrap();
         let err =
             load_local_skill_files(&dir_files(manifest_dir.path()), "skills/my-skill").unwrap_err();
         match err {
@@ -17841,8 +17847,7 @@ inference:
             fs::read(&installed).unwrap(),
             b"---\nname: my-skill\ndescription: My local skill.\n---\n# my local skill"
         );
-        let manifest =
-            fs::read_to_string(installed.with_file_name(PACKED_MANIFEST_ENTRY)).unwrap();
+        let manifest = fs::read_to_string(installed.with_file_name(PACKED_MANIFEST_ENTRY)).unwrap();
         assert!(
             manifest.contains("description: My local skill."),
             "{manifest}"
@@ -18471,6 +18476,47 @@ inference:
         let outcome = call_skill(&state, PULLED_SKILL_TOOL);
         assert_eq!(outcome.fence_source, None);
         assert_eq!(outcome.result.data.as_deref(), Some(PULLED_SKILL_MD));
+    }
+
+    /// A skill an older mur stored in the old layout (a root `skill.md`, no `SKILL.md`) fails a
+    /// mid-session pull as a tool error carrying the refusal, and nothing is installed.
+    #[test]
+    fn a_pull_of_an_old_layout_skill_fails_as_a_tool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let root = dir.path().join("registry");
+        let bytes = zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                format!("name: {PULLED_SKILL_TOOL}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+            ),
+            ("skill.md", PULLED_SKILL_MD.as_bytes()),
+        ]);
+        let version_dir = root.join(PULLED_SKILL).join("1.0.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("pulled-style-1.0.0.mur.zip"), &bytes).unwrap();
+        fs::write(
+            version_dir.join("pulled-style-1.0.0.sha256"),
+            murmur_artifact::sha256_hex(&bytes),
+        )
+        .unwrap();
+        let registry = Arc::new(murmur_artifact::LocalRegistry::new(root));
+        let mut state = build_test_state(registry, workdir, dir.path().join("murmur.lock"));
+        grant_install(&mut state, &[PULLED_SKILL], &[]);
+
+        let error = pull_skill(&mut state).unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "skill artifact {PULLED_SKILL}@1.0.0 cannot be installed: it holds skill.md, so it \
+                 was built before skills followed the Agent Skills standard"
+            )),
+            "{error}"
+        );
+        assert!(!state
+            .runtime_root
+            .host_path(format!("tools/{PULLED_SKILL_TOOL}"))
+            .exists());
     }
 
     /// A refused pull and a failed one buffer nothing.

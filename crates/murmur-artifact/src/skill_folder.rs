@@ -112,7 +112,9 @@ impl SkillFrontBlockError {
                     .to_string()
             }
             Self::NotText { key } => format!("give {key} a string value; quote it if it must be"),
-            Self::MissingName => "add name: <the skill folder's name> to the front block".to_string(),
+            Self::MissingName => {
+                "add name: <the skill folder's name> to the front block".to_string()
+            }
             Self::NameCharacters { .. }
             | Self::NameTooLong { .. }
             | Self::NameEdgeHyphen { .. }
@@ -317,7 +319,8 @@ pub fn check_skill_md(
         path: path.to_path_buf(),
         error,
     };
-    let text = std::str::from_utf8(bytes).map_err(|_| front_block(SkillFrontBlockError::NotUtf8))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| front_block(SkillFrontBlockError::NotUtf8))?;
     check_skill_front_block(text, folder, version_rule).map_err(front_block)
 }
 
@@ -360,8 +363,8 @@ pub enum SkillFolderError {
 }
 
 impl SkillFolderError {
-    /// Whether the folder breaks the Agent Skills standard itself (`E-BLD-009`), as opposed to
-    /// holding something no artifact packs or being unreadable.
+    /// Whether the folder breaks the Agent Skills standard itself (`E-BLD-009`). A symlink, a
+    /// root `murmur-build.json`, a missing `SKILL.md` and an unreadable folder do not.
     #[must_use]
     pub fn breaks_standard(&self) -> bool {
         matches!(
@@ -446,7 +449,9 @@ pub fn skill_folder_root_refusal(
     path: PathBuf,
 ) -> Option<SkillFolderError> {
     match class {
-        SkillFolderRootFile::MisspelledSkillMd => Some(SkillFolderError::MisspelledSkillMd { path }),
+        SkillFolderRootFile::MisspelledSkillMd => {
+            Some(SkillFolderError::MisspelledSkillMd { path })
+        }
         SkillFolderRootFile::Manifest => Some(SkillFolderError::ManifestBeside { path }),
         SkillFolderRootFile::ReservedBuildInfo => {
             Some(SkillFolderError::ReservedBuildInfo { path })
@@ -645,7 +650,9 @@ mod tests {
             matches!(&error, SkillFrontBlockError::NotYaml { error } if error.contains("mapping values")),
             "{error}"
         );
-        assert!(error.to_string().starts_with("front block is not valid YAML: "));
+        assert!(error
+            .to_string()
+            .starts_with("front block is not valid YAML: "));
         assert!(error.hint().contains("quote a value that holds ': '"));
     }
 
@@ -721,12 +728,8 @@ mod tests {
 
     #[test]
     fn a_name_without_a_folder_is_refused() {
-        let error = check_skill_front_block(
-            PDF_HELPER_SKILL_MD,
-            None,
-            SkillVersionRule::Required,
-        )
-        .unwrap_err();
+        let error = check_skill_front_block(PDF_HELPER_SKILL_MD, None, SkillVersionRule::Required)
+            .unwrap_err();
         assert_eq!(
             error,
             SkillFrontBlockError::NoFolder {
@@ -750,8 +753,7 @@ mod tests {
 
     #[test]
     fn description_rules_are_refused_by_name() {
-        let no_description =
-            "---\nname: pdf-helper\nmetadata:\n  version: \"1.2.0\"\n---\nbody\n";
+        let no_description = "---\nname: pdf-helper\nmetadata:\n  version: \"1.2.0\"\n---\nbody\n";
         assert_eq!(
             refusal(no_description, "pdf-helper").to_string(),
             "front block has no description"
@@ -830,7 +832,10 @@ mod tests {
         );
         assert!(error.breaks_standard());
         let error = check_skill_md(path, &[0xff], None, SkillVersionRule::Required).unwrap_err();
-        assert_eq!(error.to_string(), "/x/pdf-helper/SKILL.md: is not UTF-8 text");
+        assert_eq!(
+            error.to_string(),
+            "/x/pdf-helper/SKILL.md: is not UTF-8 text"
+        );
     }
 
     #[test]
@@ -843,7 +848,10 @@ mod tests {
             skill_md_body("---\nname: x\n---\n\n  \r\n  indented\n"),
             "  indented\n"
         );
-        assert_eq!(skill_md_body("---\r\nname: x\r\n---\r\nbody\r\n"), "body\r\n");
+        assert_eq!(
+            skill_md_body("---\r\nname: x\r\n---\r\nbody\r\n"),
+            "body\r\n"
+        );
         assert_eq!(skill_md_body("---\nname: x\n---"), "");
         assert_eq!(skill_md_body("# No block\n---\n"), "# No block\n---\n");
     }
@@ -937,7 +945,8 @@ mod tests {
             );
             assert!(err.breaks_standard());
             assert!(
-                err.to_string().ends_with("a skill's file is named SKILL.md, exactly"),
+                err.to_string()
+                    .ends_with("a skill's file is named SKILL.md, exactly"),
                 "{err}"
             );
             assert_eq!(

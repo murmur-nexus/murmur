@@ -674,7 +674,7 @@ fn s8_a_launch_refuses_an_old_layout_skill_already_in_the_store() {
     let stderr = String::from_utf8_lossy(&run.get_output().stderr).into_owned();
     assert!(
         stderr.contains(
-            "error[E-REG-017]: skill artifact old-skill@0.1.0 cannot be installed: it \
+            "error[E-REG-017]: skill artifact local/old-skill@0.1.0 cannot be installed: it \
              holds skill.md, so it was built before"
         ),
         "{stderr}"

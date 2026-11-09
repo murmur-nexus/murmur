@@ -5,11 +5,11 @@ use std::{
 };
 
 use murmur_artifact::{
-    build_artifact, build_warning_link, check_skill_md, collect_skill_folder,
-    is_skill_md_spelling, lint_build_warnings, load_manifest, newest_fitting_level,
-    refuse_skill_manifest, resolve_manifest_path, scan_yaml_secrets, security_warning_link,
-    BuildInfo, SkillFolderError, SkillVersionRule, WitContracts, BUILD_INFO_FILE,
-    PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY, W_SEC_004,
+    build_artifact, build_warning_link, check_skill_md, collect_skill_folder, is_skill_md_spelling,
+    lint_build_warnings, load_manifest, newest_fitting_level, refuse_skill_manifest,
+    resolve_manifest_path, scan_yaml_secrets, security_warning_link, BuildInfo, SkillFolderError,
+    SkillVersionRule, WitContracts, BUILD_INFO_FILE, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY,
+    W_SEC_004,
 };
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -248,12 +248,13 @@ fn write_skill_zip(
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    zip.start_file(PACKED_MANIFEST_ENTRY, options).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("zip error writing {PACKED_MANIFEST_ENTRY}: {e}"),
-        )
-    })?;
+    zip.start_file(PACKED_MANIFEST_ENTRY, options)
+        .map_err(|e| {
+            CliError::new(
+                E_IO_003,
+                format!("zip error writing {PACKED_MANIFEST_ENTRY}: {e}"),
+            )
+        })?;
     zip.write_all(manifest_bytes)
         .map_err(|e| CliError::new(E_IO_003, format!("zip write error: {e}")))?;
 
@@ -344,9 +345,12 @@ mod tests {
         assert_eq!(zip_path, out.path().join("pdf-helper-1.2.0.mur.zip"));
         assert_eq!(
             zip_entries(&zip_path),
-            [BUILD_INFO_FILE, "SKILL.md", "murmur.yaml"]
+            ["SKILL.md", BUILD_INFO_FILE, "murmur.yaml"]
         );
-        assert_eq!(zip_entry_content(&zip_path, "SKILL.md"), PDF_HELPER_SKILL_MD);
+        assert_eq!(
+            zip_entry_content(&zip_path, "SKILL.md"),
+            PDF_HELPER_SKILL_MD
+        );
         assert_eq!(
             zip_entry_content(&zip_path, "murmur.yaml"),
             "name: pdf-helper\nversion: '1.2.0'\nruntime: skill\ndescription: Fill PDF forms; use when a form must be filled.\n"
@@ -391,7 +395,9 @@ mod tests {
         let error = build_skill_artifact(&dir, out.path()).unwrap_err();
         assert_eq!(error.code, E_BLD_009);
         assert!(
-            error.message.ends_with("skill.md: a skill's file is named SKILL.md, exactly"),
+            error
+                .message
+                .ends_with("skill.md: a skill's file is named SKILL.md, exactly"),
             "{}",
             error.message
         );
@@ -426,7 +432,10 @@ mod tests {
     #[test]
     fn only_a_root_spelling_of_skill_md_takes_the_skill_path() {
         let src = tempdir().unwrap();
-        assert!(holds_skill_md_spelling(&make_skill_dir(src.path(), "Skill.md")));
+        assert!(holds_skill_md_spelling(&make_skill_dir(
+            src.path(),
+            "Skill.md"
+        )));
         let nested = src.path().join("nested");
         fs::create_dir_all(nested.join("sub")).unwrap();
         fs::write(nested.join("sub/SKILL.md"), "x").unwrap();

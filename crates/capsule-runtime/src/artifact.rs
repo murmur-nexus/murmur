@@ -682,7 +682,10 @@ mod tests {
     #[test]
     fn extract_skill_files_refuses_an_archive_built_before_the_standard() {
         let archive = archive_with_files(&[
-            (PACKED_MANIFEST_ENTRY, b"name: demo\nversion: 0.0.1\nruntime: skill\n"),
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: demo\nversion: 0.0.1\nruntime: skill\n",
+            ),
             ("skill.md", b"# Demo\n"),
         ]);
 

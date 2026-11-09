@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn non_wasm_entries_are_not_root_candidates() {
         assert!(!is_root_wasm_candidate("capsule.wat"));
-        assert!(!is_root_wasm_candidate("skill.md"));
+        assert!(!is_root_wasm_candidate("SKILL.md"));
         assert!(is_root_wasm_candidate("capsule.wasm"));
     }
 

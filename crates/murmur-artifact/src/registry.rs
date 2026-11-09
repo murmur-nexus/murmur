@@ -1575,7 +1575,10 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                RegistryError::SkillLayout { reason: crate::SkillPayloadError::BuiltBeforeStandard, .. }
+                RegistryError::SkillLayout {
+                    reason: crate::SkillPayloadError::BuiltBeforeStandard,
+                    ..
+                }
             ),
             "{error:?}"
         );
@@ -1589,7 +1592,9 @@ mod tests {
             .publish(test_meta("old-skill", "0.1.0"), &bare)
             .unwrap_err();
         assert!(
-            error.to_string().ends_with("it holds no SKILL.md at its root"),
+            error
+                .to_string()
+                .ends_with("it holds no SKILL.md at its root"),
             "{error}"
         );
         assert!(!dir.path().join("ana/old-skill").exists());

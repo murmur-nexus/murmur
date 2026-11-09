@@ -17,8 +17,8 @@ use std::path::{Component, Path, PathBuf};
 use bytes::Bytes;
 use murmur_artifact::payload_shape::SKILL_MD_ENTRY;
 use murmur_artifact::{
-    check_skill_md, classify_skill_folder_root_file, skill_folder_root_refusal,
-    skill_folder_skips, zip_guard, SkillFolderError, SkillFolderRootFile, SkillVersionRule,
+    check_skill_md, classify_skill_folder_root_file, skill_folder_root_refusal, skill_folder_skips,
+    zip_guard, SkillFolderError, SkillFolderRootFile, SkillVersionRule,
 };
 use serde::Serialize;
 use zip::ZipArchive;
@@ -203,8 +203,8 @@ fn checked_local_skill(
     folder: Option<&str>,
     files: SkillFiles,
 ) -> Result<LocalSkill, RuntimeError> {
-    let front = check_skill_md(path, &files[0].1, folder, SkillVersionRule::NotRead)
-        .map_err(refused)?;
+    let front =
+        check_skill_md(path, &files[0].1, folder, SkillVersionRule::NotRead).map_err(refused)?;
     Ok(LocalSkill {
         files,
         description: front.description,
@@ -560,7 +560,8 @@ mod tests {
         }
     }
 
-    const HOUSE_SKILL_MD: &[u8] = b"---\nname: house\ndescription: How the house works.\n---\n# House skill\n";
+    const HOUSE_SKILL_MD: &[u8] =
+        b"---\nname: house\ndescription: How the house works.\n---\n# House skill\n";
 
     fn house() -> ManifestFiles {
         ManifestFiles::Package(package(&[
@@ -664,7 +665,9 @@ mod tests {
 
     #[test]
     fn a_package_file_source_installs_that_skill_md_alone() {
-        let skill = house().read_skill_source("./skills/house/SKILL.md").unwrap();
+        let skill = house()
+            .read_skill_source("./skills/house/SKILL.md")
+            .unwrap();
         assert_eq!(
             skill,
             LocalSkill {
@@ -739,7 +742,10 @@ mod tests {
         match house().read_skill_source("skills/built") {
             Err(RuntimeError::SkillSourceRefused { message, hint }) => {
                 assert!(message.contains("reserved for mur build"), "{message}");
-                assert!(hint.contains("mur build writes murmur-build.json"), "{hint}");
+                assert!(
+                    hint.contains("mur build writes murmur-build.json"),
+                    "{hint}"
+                );
             }
             other => panic!("expected SkillSourceRefused, got {other:?}"),
         }
@@ -769,7 +775,10 @@ mod tests {
         );
 
         let file = files.read_skill_source("./pdf-helper/SKILL.md").unwrap();
-        assert_eq!(file.files, vec![("SKILL.md".to_string(), PDF_HELPER.as_bytes().to_vec())]);
+        assert_eq!(
+            file.files,
+            vec![("SKILL.md".to_string(), PDF_HELPER.as_bytes().to_vec())]
+        );
         let absolute = dir.join("SKILL.md");
         let file = files.read_skill_source(absolute.to_str().unwrap()).unwrap();
         assert_eq!(file.files.len(), 1);
@@ -780,28 +789,57 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let files = ManifestFiles::Directory(base.path().to_path_buf());
 
-        let dir = host_skill(base.path(), "lower", &PDF_HELPER.replace("pdf-helper", "lower"));
+        let dir = host_skill(
+            base.path(),
+            "lower",
+            &PDF_HELPER.replace("pdf-helper", "lower"),
+        );
         fs::rename(dir.join("SKILL.md"), dir.join("skill.md")).unwrap();
         let (message, hint) = not_standard(files.read_skill_source("./lower"));
-        assert!(message.ends_with("lower/skill.md: a skill's file is named SKILL.md, exactly"), "{message}");
-        assert_eq!(hint, "rename skill.md to SKILL.md");
-        let (message, _) = not_standard(files.read_skill_source("./lower/skill.md"));
-        assert!(message.ends_with("a skill's file is named SKILL.md, exactly"), "{message}");
-
-        let dir = host_skill(base.path(), "manifest", &PDF_HELPER.replace("pdf-helper", "manifest"));
-        fs::write(dir.join("murmur.yaml"), "name: manifest\n").unwrap();
-        let (message, _) = not_standard(files.read_skill_source("./manifest"));
-        assert!(message.ends_with("a skill folder holds no murmur.yaml beside SKILL.md"), "{message}");
-
-        host_skill(base.path(), "pdf-helper", &PDF_HELPER.replace("name: pdf-helper", "name: other-name"));
-        let (message, hint) = not_standard(files.read_skill_source("./pdf-helper"));
         assert!(
-            message.ends_with("SKILL.md: front block name 'other-name' differs from the folder name 'pdf-helper'"),
+            message.ends_with("lower/skill.md: a skill's file is named SKILL.md, exactly"),
             "{message}"
         );
-        assert_eq!(hint, "set name: pdf-helper, or rename the folder to other-name");
+        assert_eq!(hint, "rename skill.md to SKILL.md");
+        let (message, _) = not_standard(files.read_skill_source("./lower/skill.md"));
+        assert!(
+            message.ends_with("a skill's file is named SKILL.md, exactly"),
+            "{message}"
+        );
+
+        let dir = host_skill(
+            base.path(),
+            "manifest",
+            &PDF_HELPER.replace("pdf-helper", "manifest"),
+        );
+        fs::write(dir.join("murmur.yaml"), "name: manifest\n").unwrap();
+        let (message, _) = not_standard(files.read_skill_source("./manifest"));
+        assert!(
+            message.ends_with("a skill folder holds no murmur.yaml beside SKILL.md"),
+            "{message}"
+        );
+
+        host_skill(
+            base.path(),
+            "pdf-helper",
+            &PDF_HELPER.replace("name: pdf-helper", "name: other-name"),
+        );
+        let (message, hint) = not_standard(files.read_skill_source("./pdf-helper"));
+        assert!(
+            message.ends_with(
+                "SKILL.md: front block name 'other-name' differs from the folder name 'pdf-helper'"
+            ),
+            "{message}"
+        );
+        assert_eq!(
+            hint,
+            "set name: pdf-helper, or rename the folder to other-name"
+        );
         let (message, _) = not_standard(files.read_skill_source("./pdf-helper/SKILL.md"));
-        assert!(message.contains("differs from the folder name 'pdf-helper'"), "{message}");
+        assert!(
+            message.contains("differs from the folder name 'pdf-helper'"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -865,7 +903,10 @@ mod tests {
         let rows = manifest_file_reports(
             &house(),
             Some(&inference),
-            [("house", "skills/house"), ("abs", "/opt/pdf-helper/SKILL.md")],
+            [
+                ("house", "skills/house"),
+                ("abs", "/opt/pdf-helper/SKILL.md"),
+            ],
         );
         assert_eq!(
             rows,
