@@ -582,6 +582,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "model",
             "model_limits",
             "parent_id",
+            "prev_hash",
             "resumed_from",
             "runtime_artifacts",
             "session_id",

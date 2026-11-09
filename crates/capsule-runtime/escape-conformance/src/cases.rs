@@ -77,6 +77,11 @@ pub enum Prepare {
     /// Launch `mur` from a shell that has already opened `path` on fd 7 without `FD_CLOEXEC`,
     /// mirroring `subprocess-fd-hygiene-verification.md` step 4 exactly.
     LeakFdIntoMur { fd: u32, path: &'static str },
+    /// Resolve the host's record-seal key path through `capsule_runtime::record_seal` under the
+    /// harness's own `HOME` (creating the key when it is missing), and write the path, never the
+    /// key, into the case workdir as `dest`. The capsule's `$HOME` is synthetic, so the probe
+    /// cannot compute the host's path itself.
+    WriteSealKeyPath { dest: &'static str },
 }
 
 /// Where a case's verdict is read from once the capsule has run.
@@ -183,8 +188,8 @@ def main():
 /// fails this package's own `cargo test` rather than quietly shrinking the suite.
 pub const PERMANENT_CASE_IDS: &[&str] = &["exec-renamed-disallowed-binary"];
 
-/// Minimum case set: 23 boundary cases.
-pub const BOUNDARY_CASE_COUNT: usize = 23;
+/// Minimum case set: 24 boundary cases.
+pub const BOUNDARY_CASE_COUNT: usize = 24;
 /// Minimum case set: 5 resource-exhaustion cases.
 pub const RESOURCE_CASE_COUNT: usize = 5;
 
@@ -229,6 +234,52 @@ def main():
         verdict("ALLOWED", "read %d bytes of /etc/shadow; %s; %s" % (len(head), note, control))
     else:
         verdict("REFUSED", "%s ; %s ; %s" % (note, ctl_note, control))
+"#,
+    },
+    Case {
+        id: "read-record-seal-key",
+        category: Category::Boundary,
+        summary: "opens and stats the host's record-seal private key, ~/.murmur/keys/record-seal.key",
+        attribution: "Unambiguous: the key is the operator's own 0600 file, so ordinary file \
+                      permissions allow this uid to read it; only containment can refuse it. At \
+                      `scoped` the refusal is EACCES from Landlock: `~/.murmur/keys` lies under \
+                      no rule the capsule's commands are given, and a `host_paths` entry that \
+                      is or contains it is refused before launch. The probe's stat succeeds \
+                      there: Landlock mediates opening a file, not its metadata, so the key's \
+                      existence, size and mode are visible and its bytes are not. The verdict is \
+                      the open's. At `sealed` both are ENOENT: the \
+                      composed root reproduces no `~/.murmur/keys`, so the path does not exist \
+                      for the command at all. NOT ASSERTED AT `advisory`: `advisory` and \
+                      `unconfined` reach the key by design, which is why only the `mur` process \
+                      signs and a record sealed under those tiers proves less.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        prepare: Prepare::WriteSealKeyPath {
+            dest: "seal-key-path.txt",
+        },
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+def main():
+    try:
+        with open("seal-key-path.txt") as handle:
+            target = handle.read().strip()
+    except OSError as exc:
+        verdict("INCONCLUSIVE", "the harness wrote no key path: %s" % en(exc))
+        return
+    fd, note = probe_open(target)
+    try:
+        os.stat(target)
+        stat_note = "stat=ok"
+    except OSError as exc:
+        stat_note = "stat=%s" % en(exc)
+    if fd is not None:
+        head = os.read(fd, 8)
+        os.close(fd)
+        verdict("ALLOWED", "read %d bytes of the record-seal key; %s; %s" % (len(head), note, stat_note))
+    else:
+        verdict("REFUSED", "%s ; %s" % (note, stat_note))
 "#,
     },
     Case {

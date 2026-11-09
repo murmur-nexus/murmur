@@ -92,6 +92,7 @@ pub(crate) mod protected_paths;
 pub mod provider_tool;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
+pub mod record_seal;
 pub mod records_dir;
 pub mod registration;
 pub(crate) mod required_fields;

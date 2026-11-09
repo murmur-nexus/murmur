@@ -1,12 +1,9 @@
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use murmur_artifact::{ContainmentClass, LockOrigin, TraceCapture};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{
-    fs::File,
-    io::{AsyncWriteExt, BufWriter},
-};
 
 use crate::{
     agent::{DriverUsage, OccupancyBasis},
@@ -19,14 +16,19 @@ use crate::{
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
     types::InstalledArtifactSummary,
-    workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE},
+    workdir_fs::WorkdirRoot,
 };
 
 /// A session's trace file, directly under its session root.
 pub(crate) const TRACE_FILE_NAME: &str = "trace.jsonl";
 
 pub(crate) struct TraceWriter {
-    writer: BufWriter<File>,
+    /// The file's chain, shared with every other appender of the same `trace.jsonl`.
+    chain: Arc<crate::record_seal::InlineChain>,
+    /// The records directory the trace is in, which its seal is written beside.
+    records_root: WorkdirRoot,
+    /// What the seal written after `session_end` covered, for the OTel session span.
+    sealed_head: Option<crate::record_seal::SealedHead>,
     session_id: String,
     capsule_name: String,
     capsule_version: String,
@@ -2619,7 +2621,7 @@ impl TraceWriter {
         spawned_by: Option<String>,
         spawn_delegation_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let file = File::from_std(records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
+        let chain = crate::record_seal::InlineChain::open(records_root, TRACE_FILE_NAME)?;
         // `"cli"` wins over `"none"` when the override cleared the prompt: the operator passed
         // `--system-prompt ""`, which is a decision worth recording, not an absence.
         let system_prompt_source = match (system_prompt_overridden, system_prompt.is_some()) {
@@ -2642,7 +2644,9 @@ impl TraceWriter {
             blobs.put(sha, prompt.as_bytes()).await?;
         }
         Ok(Self {
-            writer: BufWriter::new(file),
+            chain,
+            records_root: records_root.clone(),
+            sealed_head: None,
             session_id,
             capsule_name,
             capsule_version,
@@ -4577,7 +4581,32 @@ impl TraceWriter {
         };
         self.write_event(&event).await?;
         self.session_ended = true;
+        self.sealed_head =
+            crate::record_seal::seal_session_end(&self.records_root, &self.session_id);
         Ok(())
+    }
+
+    /// What the seal written after `session_end` covered: the `session_end` line's hash and
+    /// number, and the key that signed it. `None` before `session_end` or when the trace could
+    /// not be read back.
+    pub(crate) fn sealed_head(&self) -> Option<&crate::record_seal::SealedHead> {
+        self.sealed_head.as_ref()
+    }
+
+    /// The chain's head as the file holds it now, unsealed: what a task's OTel session span
+    /// carries when the next task begins.
+    pub(crate) fn current_head(&self) -> Option<crate::record_seal::SealedHead> {
+        let head = self.chain.head().ok()?;
+        Some(crate::record_seal::SealedHead {
+            head: head.head,
+            lines: head.lines,
+            key_id: None,
+        })
+    }
+
+    /// The records directory this trace is written in.
+    pub(crate) fn records_root(&self) -> &WorkdirRoot {
+        &self.records_root
     }
 
     /// Writes session_end with the accumulated totals if session_start was written but
@@ -4592,8 +4621,9 @@ impl TraceWriter {
         Ok(())
     }
 
+    /// Every line is written whole as it is recorded; nothing is buffered.
     pub(crate) async fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush().await
+        Ok(())
     }
 
     /// Write `event` as one line, after a `call_deadline` line for each firing the session's
@@ -4676,18 +4706,11 @@ impl TraceWriter {
         Ok(())
     }
 
-    /// Writes one event as one line, and flushes.
-    ///
-    /// The flush is not an optimisation choice: [`ResourceTraceAppender`] appends to this same
-    /// `trace.jsonl` while a task runs, so a line left half-buffered here would be split around
-    /// whatever the appender wrote in between and the file would stop parsing as JSONL. The
-    /// two writers agree on one rule — a complete line per write, then flush — and that rule is
-    /// what makes concurrent reads during a running task safe to record.
+    /// Writes one event as one line through the file's [`crate::record_seal::InlineChain`],
+    /// which every other appender of this `trace.jsonl` shares: each line ends with the hash of
+    /// the line before it, and lands with one `write_all`.
     async fn write_line(&mut self, event: &impl Serialize) -> std::io::Result<()> {
-        let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-        line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await
+        self.chain.append_event(event)
     }
 }
 
@@ -4975,8 +4998,11 @@ fn credential_change_fields(
 /// Interleaving is safe because both writers emit exactly one complete line per `write_all` and
 /// flush it, and `O_APPEND` makes each such write atomic against the other's.
 pub struct ResourceTraceAppender {
-    /// Async rather than a `std::sync::Mutex`: this is held across an `await` on the write.
-    file: tokio::sync::Mutex<File>,
+    /// The trace's chain, shared with [`TraceWriter`]. Held across `admit` and the write, so no
+    /// other line lands between them; never across an `await`.
+    chain: Arc<crate::record_seal::InlineChain>,
+    /// Serializes `admit` with the line it admits.
+    admit: std::sync::Mutex<()>,
     session_id: String,
     /// The session node every line this appender writes hangs off — [`TraceWriter`]'s own
     /// [`TraceWriter::session_event_id`], handed over at open time. The plane has no turn or
@@ -4991,9 +5017,10 @@ impl ResourceTraceAppender {
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = File::from_std(records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
+        let chain = crate::record_seal::InlineChain::open(records_root, TRACE_FILE_NAME)?;
         Ok(Self {
-            file: tokio::sync::Mutex::new(file),
+            chain,
+            admit: std::sync::Mutex::new(()),
             session_id,
             session_event_id,
         })
@@ -5602,20 +5629,23 @@ impl ResourceTraceAppender {
         self.append_if(event, || true).await;
     }
 
+    /// [`Self::append`], for a test that needs a resource-plane line without a resource.
+    #[cfg(test)]
+    pub(crate) async fn append_for_test(&self, event: &impl Serialize) {
+        self.append(event).await;
+    }
+
     /// [`Self::append`] when `admit`, run with the trace held, returns `true`; returns what
     /// `admit` did. No other line lands between `admit` and this one.
     async fn append_if(&self, event: &impl Serialize, admit: impl FnOnce() -> bool) -> bool {
-        let Ok(mut line) = serde_json::to_string(event) else {
+        let Ok(line) = serde_json::to_string(event) else {
             return admit();
         };
-        line.push('\n');
-        let mut file = self.file.lock().await;
+        let _held = self.admit.lock().unwrap_or_else(|p| p.into_inner());
         if !admit() {
             return false;
         }
-        if file.write_all(line.as_bytes()).await.is_ok() {
-            let _ = file.flush().await;
-        }
+        let _ = self.chain.append_json(&line);
         true
     }
 }
@@ -5635,15 +5665,17 @@ impl ResourceTraceAppender {
 /// [`ResourceTraceAppender`] does: one complete line per `write_all`, then flush, which `O_APPEND`
 /// makes atomic against any other writer.
 pub(crate) struct PriorSessionTraceAppender {
-    file: File,
+    /// The prior trace's chain: a torn last line is terminated, and its hash chained, by the
+    /// first append.
+    chain: Arc<crate::record_seal::InlineChain>,
+    /// The prior session's records directory and its trace's name, which the reseal is written
+    /// beside.
+    trace_dir: WorkdirRoot,
+    trace: String,
     /// The prior session's id, which is what its own lines carry.
     session_id: String,
     /// That session's `session_start` node, read back from the same file.
     session_event_id: Option<String>,
-    /// Whether the file's last record is unterminated, which a writer killed mid-`write_all`
-    /// leaves behind. The first appended line opens with a newline when it is, so the marker is
-    /// a line of its own rather than spliced onto the torn one.
-    terminate_torn_tail: bool,
 }
 
 impl PriorSessionTraceAppender {
@@ -5656,17 +5688,18 @@ impl PriorSessionTraceAppender {
         session_id: String,
         session_event_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let contents = trace_dir
-            .read_file(trace, u64::MAX)?
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        // An empty file counts as terminated: there is no record for an appended line to run into.
-        let terminate_torn_tail = contents.last().is_some_and(|last| *last != b'\n');
-        let file = File::from_std(trace_dir.open_append(trace, DEFAULT_FILE_MODE)?);
+        // A missing trace is an error rather than an empty file to create: there is no session
+        // to account for.
+        if trace_dir.entry_kind(trace)?.is_none() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        let chain = crate::record_seal::InlineChain::open(trace_dir, trace)?;
         Ok(Self {
-            file,
+            chain,
+            trace_dir: trace_dir.clone(),
+            trace: trace.to_string(),
             session_id,
             session_event_id,
-            terminate_torn_tail,
         })
     }
 
@@ -5694,17 +5727,22 @@ impl PriorSessionTraceAppender {
             reconciled_by_session: reconciled_by_session.to_string(),
             reconciled_task_id: reconciled_task_id.to_string(),
         };
-        let mut line = if self.terminate_torn_tail {
-            "\n".to_string()
-        } else {
-            String::new()
-        };
-        line.push_str(&serde_json::to_string(&event).map_err(std::io::Error::other)?);
-        line.push('\n');
-        self.file.write_all(line.as_bytes()).await?;
-        self.file.flush().await?;
-        self.terminate_torn_tail = false;
+        // The chain terminates a torn tail itself, before this line, from the file as it is.
+        self.chain.append_event(&event)?;
         Ok(())
+    }
+
+    /// Seals the prior session's trace again, for that session, once its last `shell_lost` line
+    /// is written: the seal its own runtime wrote covers fewer lines than the file now holds.
+    pub(crate) fn reseal(&self) {
+        if let Err(reason) =
+            crate::record_seal::seal_inline(&self.trace_dir, &self.trace, &self.session_id, None)
+        {
+            crate::runtime_err!(
+                "[capsule-runtime] could not reseal {} ({reason}); it reads as unsealed",
+                self.trace_dir.display_path(&self.trace)
+            );
+        }
     }
 }
 
@@ -5860,7 +5898,8 @@ pub(crate) struct PlanEndRecord {
 /// Handing one of these to a [`crate::plan::SchedulerContext`] is the whole of the opt-in: a
 /// context carrying `None` opens no file and writes no line.
 pub struct PlanTraceAppender {
-    file: std::sync::Mutex<std::fs::File>,
+    /// The trace's chain, shared with [`TraceWriter`] and the resource plane.
+    chain: Arc<crate::record_seal::InlineChain>,
     session_id: String,
     /// The session node a run's `plan_start` hangs off — [`TraceWriter`]'s own
     /// `session_start`, handed over at open time so an appended line names a real parent.
@@ -5873,9 +5912,9 @@ impl PlanTraceAppender {
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?;
+        let chain = crate::record_seal::InlineChain::open(records_root, TRACE_FILE_NAME)?;
         Ok(Self {
-            file: std::sync::Mutex::new(file),
+            chain,
             session_id,
             session_event_id,
         })
@@ -6039,18 +6078,7 @@ impl PlanTraceAppender {
     /// [`ResourceTraceAppender::append`] swallows one: a trace that cannot be written must never
     /// turn a step that ran into a step that failed.
     fn append(&self, event: &impl Serialize) {
-        use std::io::Write as _;
-
-        let Ok(mut line) = serde_json::to_string(event) else {
-            return;
-        };
-        line.push('\n');
-        let Ok(mut file) = self.file.lock() else {
-            return;
-        };
-        if file.write_all(line.as_bytes()).is_ok() {
-            let _ = file.flush();
-        }
+        let _ = self.chain.append_event(event);
     }
 }
 
@@ -6124,7 +6152,11 @@ mod tests {
             .write(true)
             .open("/dev/full")
             .unwrap();
-        writer.writer = BufWriter::new(File::from_std(full));
+        writer.chain = crate::record_seal::InlineChain::over_file_for_test(
+            full,
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            TRACE_FILE_NAME,
+        );
         let info = demotion_info();
 
         assert!(
@@ -7218,6 +7250,7 @@ mod tests {
                 "input_tokens_actual",
                 "message_ids",
                 "parent_id",
+                "prev_hash",
                 "provider_status",
                 "session_id",
                 "stop_reason",
@@ -9537,7 +9570,7 @@ mod tests {
         );
         assert!(rejected["event_id"].is_string());
         assert!(rejected["timestamp"].is_u64());
-        assert_eq!(rejected.as_object().unwrap().len(), 10, "{rejected}");
+        assert_eq!(rejected.as_object().unwrap().len(), 11, "{rejected}");
     }
 
     /// `task_failed` hangs off the task it failed, and a reason past the cap is cut on a character
@@ -10410,7 +10443,8 @@ mod tests {
             assert_eq!(planned["parent_id"], node.as_str());
             assert_eq!(called["parent_id"], node.as_str());
             for (key, value) in planned {
-                if key == "event_id" || key == "timestamp" {
+                // `prev_hash` names the line before, which differs between the two traces.
+                if key == "event_id" || key == "timestamp" || key == "prev_hash" {
                     continue;
                 }
                 assert_eq!(value, &called[key], "{key}: {planned:?} vs {called:?}");
@@ -10463,6 +10497,7 @@ mod tests {
                 "event_id",
                 "event_type",
                 "parent_id",
+                "prev_hash",
                 "session_id",
                 "spawned_by",
                 "timestamp"

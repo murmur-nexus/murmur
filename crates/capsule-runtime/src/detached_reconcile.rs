@@ -129,6 +129,8 @@ pub(crate) async fn reconcile_prior_session(
     if lost.is_empty() {
         return None;
     }
+    // The prior session sealed its trace when it ended; the markers are lines after that seal.
+    appender.reseal();
 
     Some(LostReport {
         started_in_session,
@@ -384,6 +386,46 @@ mod tests {
             .expect("the complete records above the tear still report");
         assert_eq!(report.lost.len(), 1);
         assert_eq!(lost_lines(&root).len(), 1);
+    }
+
+    /// A sealed prior trace is continued on its chain and sealed again for its own session,
+    /// across a line its writer tore: the record verifies, with the torn line as a note.
+    #[test]
+    fn a_sealed_trace_is_continued_and_resealed_across_a_torn_line() {
+        use crate::record_seal::{self, InlineChain, PublicKey, Verdict};
+        let home = tempfile::tempdir().unwrap();
+        record_seal::set_test_seal_home(Some(home.path().to_path_buf()));
+        let (_root, dir) = trace_dir_with("ses_prior", "");
+        let root = crate::workdir_fs::WorkdirRoot::open(&dir).unwrap();
+        {
+            let chain = InlineChain::open(&root, "trace.jsonl").unwrap();
+            for line in trace_with("").lines() {
+                chain.append_json(line).unwrap();
+            }
+        }
+        record_seal::seal_session_end(&root, "ses_prior").unwrap();
+        let mut raw = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("trace.jsonl"))
+            .unwrap();
+        std::io::Write::write_all(&mut raw, b"{\"event_type\":\"shell_comple").unwrap();
+        drop(raw);
+        let key = PublicKey::load(&record_seal::public_key_path(home.path())).unwrap();
+        assert_eq!(
+            record_seal::verify_session_records(&dir, Some(&key), None).verdict,
+            Verdict::Unsealed
+        );
+
+        assert!(reconcile(&dir, "ses_resumed").is_some());
+        let report = record_seal::verify_session_records(&dir, Some(&key), None);
+        let trace = &report.streams[0];
+        assert_eq!(trace.verdict, Verdict::Verified, "{trace:#?}");
+        assert_eq!(trace.notes.len(), 1, "{trace:#?}");
+        let seal = record_seal::read_seal(&root, "trace.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seal.session_id, "ses_prior");
+        assert_eq!(lost_lines(&dir).len(), 1);
     }
 
     /// Nothing to read is nothing to report, and never a refused launch.

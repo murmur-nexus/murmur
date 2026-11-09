@@ -1063,7 +1063,8 @@ written, its resolved path when it has one, and the reason, and happens before a
 |---|---|
 | Relative, `/`, missing, or not a directory | A host path names one existing folder |
 | Is or lies under `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/etc`, `/proc`, `/sys`, `/dev` or `/tmp` | A composed root carries its own copy of these or replaces them, and the private `/tmp` replaces `/tmp`, so the entry would not reach the host's folder on every tier |
-| `read-write`, and is, lies under, or contains `~/.murmur` | It holds this config, whose `host_paths` and `containment` grant every later session, and every session's records. A `read` entry there is allowed and warned about |
+| `read-write`, and is, lies under, or contains `~/.murmur` | It holds this config, whose `host_paths` and `containment` grant every later session, and every session's records. A `read` entry there is allowed and warned about, unless the next row refuses it |
+| Is, lies under, or contains `~/.murmur/keys`, at any access: `~/.murmur` itself or the whole home included | It holds the [record-seal key](#record-seal-key) that signs every session's records. Lend `~/.murmur/records` or another folder that does not contain it |
 | Is or lies under the work folder | The capsule already reaches it read-write, so a `read` entry would not be read-only |
 | The same resolved directory as an earlier entry | One directory, one entry |
 | `read-write`, and is or lies under a folder the session may run from | On `sealed` that folder's read-only bind would hide it; on `scoped` the capsule could write a file there and run it |
@@ -1079,6 +1080,22 @@ A folder the session may run from is:
 On `sealed` a `read-write` entry that contains one is allowed: that folder is bound read-only on
 top of the entry, so the capsule cannot write it while the rest of the entry stays writable. Below `landlock+seccomp`
 neither rule applies.
+
+### The record-seal key { #record-seal-key }
+
+`mur` signs every session's records with the host's record-seal key, `~/.murmur/keys/record-seal.key`
+([Sealed records](observability-schemas.md#sealed-records)). Only the `mur` process reads it, and
+whether a capsule's commands can reach it depends on the tier:
+
+| Tier | A command opening the key |
+|---|---|
+| `sealed` | Fails with `ENOENT`: the composed root reproduces no `~/.murmur/keys`, so the path does not exist for the command, and `stat` fails the same way |
+| `scoped` | Fails with `EACCES`: no Landlock rule covers `~/.murmur/keys`. `stat` succeeds, since Landlock mediates opening a file and not its metadata, so the key's existence, size and mode are visible and its bytes are not |
+| `advisory`, `unconfined` | Succeeds, by design: these tiers scope no filesystem. A record sealed under them proves less, since the capsule could have signed what it wrote |
+
+A [host path](#host-path-refusals) that is or contains `~/.murmur/keys` is refused at any access,
+so no grant widens `scoped` or `sealed` onto it. The escape-conformance case
+`read-record-seal-key` checks both tiers.
 
 ### What an entry lends { #host-path-reach }
 
@@ -1857,6 +1874,12 @@ The run needs:
 
 It needs no registry access, model or API key: the harness carries its own process driver,
 `escape-conformance-driver`, and installs it into each case's project with `mur install`.
+
+The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) of the `HOME` the
+harness runs with: the harness resolves `~/.murmur/keys/record-seal.key` there, creating the key
+when it is missing, and hands the probe its path, never its bytes, since the capsule's own `$HOME`
+is a different folder. It must be refused at `scoped` and `sealed` and is not asserted at
+`advisory`.
 
 It runs on bare metal: a host that cannot back the class under test, and a host that looks like a
 container, are both refused before the first case runs, and a refused run writes no record.

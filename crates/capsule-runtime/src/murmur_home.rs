@@ -334,13 +334,14 @@ pub enum HomeEntryKind {
     Sessions,
     Records,
     Programs,
+    Keys,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 16] = [
+    const KNOWN: [HomeEntryKind; 17] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -357,6 +358,7 @@ impl HomeEntryKind {
         Self::Sessions,
         Self::Records,
         Self::Programs,
+        Self::Keys,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -379,6 +381,7 @@ impl HomeEntryKind {
             Self::Sessions => crate::runtime_dir::SESSIONS_DIR_NAME,
             Self::Records => crate::records_dir::RECORDS_DIR_NAME,
             Self::Programs => crate::pinned_programs::PROGRAMS_DIR,
+            Self::Keys => crate::record_seal::KEYS_DIR,
             Self::Unrecognised(name) => name,
         })
     }
@@ -403,6 +406,7 @@ impl HomeEntryKind {
             Self::Sessions => "running sessions' runtime directories",
             Self::Records => "every session's trace, logs, eval scores and delegation outcome",
             Self::Programs => "pinned program downloads",
+            Self::Keys => "the record-seal key",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -448,6 +452,9 @@ impl HomeEntryKind {
     pub fn allowed_file_mode(&self) -> u32 {
         match self {
             Self::Programs => crate::pinned_programs::EXECUTABLE_FILE_MODE,
+            // `record-seal.pub` is world-readable by design; the seed beside it is refused by
+            // every launch at any group or other bit ([`crate::record_seal::HostKey`]).
+            Self::Keys => crate::record_seal::PUBLIC_KEY_MODE,
             _ => PRIVATE_FILE_MODE,
         }
     }
@@ -964,7 +971,7 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 17);
+        assert_eq!(reports.len(), 18);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
@@ -976,6 +983,8 @@ mod tests {
         assert_eq!(reports[15].kind, HomeEntryKind::Records);
         assert_eq!(reports[16].kind, HomeEntryKind::Programs);
         assert_eq!(reports[16].path, home.join("programs"));
+        assert_eq!(reports[17].kind, HomeEntryKind::Keys);
+        assert_eq!(reports[17].path, home.join("keys"));
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));

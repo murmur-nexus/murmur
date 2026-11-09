@@ -252,6 +252,14 @@ fn stage(
 
     match case.prepare {
         Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
+        Prepare::WriteSealKeyPath { dest } => {
+            let home =
+                capsule_runtime::murmur_home::ensure_murmur_home().map_err(io::Error::other)?;
+            capsule_runtime::record_seal::HostKey::load_or_create(&home)
+                .map_err(io::Error::other)?;
+            let key = capsule_runtime::record_seal::private_key_path(&home);
+            fs::write(workdir.join(dest), format!("{}\n", key.display()))?;
+        }
         Prepare::CopyBinaryAs { sources, dest } => {
             let source = sources
                 .iter()

@@ -29,6 +29,14 @@ use crate::session_address::{self, ses_entries, SessionQuery};
 
 const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
+/// A session's record no longer matches its chain or seal.
+const E_TRC_003: &str = "E-TRC-003";
+/// A session's record is not covered by a seal: it ended without one, or lines were appended
+/// after it or cut off.
+const E_TRC_004: &str = "E-TRC-004";
+/// A session's record cannot be checked: written before records were sealed, no public key, or
+/// sealed by another key.
+const E_TRC_005: &str = "E-TRC-005";
 
 /// The `inference.stop_reason` value a provider reports for a turn it cut off at the output cap.
 const MAX_TOKENS_STOP_REASON: &str = "max_tokens";
@@ -116,6 +124,26 @@ pub(crate) enum TraceCommand {
         #[arg(long)]
         workdir: Option<PathBuf>,
         /// Print one JSON object, the stable interface documented under mur trace list
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check that a session's records are unchanged since the host sealed them, with the host's
+    /// public key alone
+    ///
+    /// Checks trace.jsonl, hooks/eval.jsonl, completion.json and the conversation record the
+    /// session appended to; exits non-zero unless every one verifies.
+    Verify {
+        /// Session: @N, a full ses_ id, a suffix of one (4+ characters), a records directory, or
+        /// a trace.jsonl path; omit for the most recent session
+        session: Option<String>,
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// The record-seal public key to check against (default: ~/.murmur/keys/record-seal.pub)
+        #[arg(long, value_name = "FILE")]
+        public_key: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace verify
         #[arg(long)]
         json: bool,
     },
@@ -4590,6 +4618,7 @@ pub(crate) fn run_trace_show(
     }
     let (metrics, tasks) = load_metrics_for_show(&path)?;
     print_show(&metrics);
+    print_record_mark(&path);
     if tasks.len() > 1 {
         capsule_runtime::report_println!("── Tasks ───────────────────────────────────────");
         for (i, t) in tasks.iter().enumerate() {
@@ -6726,6 +6755,179 @@ fn refused(base: &Path, refused_at: &str, message: String, place: RefusedPlace) 
         format!("{message} (in {})", base.display()),
         path_refused_hint(place, &base.join(refused_at).display().to_string()),
     )
+}
+
+// ── mur trace verify ──────────────────────────────────────────────────────────
+
+/// The records directory a resolved session address names: the directory itself, or the one
+/// holding the `trace.jsonl` it names.
+fn records_dir_of(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+    path.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The public key to check against: `--public-key`, or `~/.murmur/keys/record-seal.pub` when it
+/// exists. `Ok(None)` when no key was given and the default does not exist, which reads every
+/// sealed stream as unverifiable.
+fn record_public_key(
+    given: Option<&Path>,
+) -> Result<Option<capsule_runtime::record_seal::PublicKey>, CliError> {
+    use capsule_runtime::record_seal::{public_key_path, PublicKey};
+    if let Some(path) = given {
+        return PublicKey::load(path).map(Some).map_err(|reason| {
+            CliError::new(E_TRC_005, format!("--public-key cannot be used: {reason}"))
+        });
+    }
+    let Ok(home) = capsule_runtime::murmur_home::usable_murmur_home() else {
+        return Ok(None);
+    };
+    Ok(PublicKey::load(&public_key_path(&home)).ok())
+}
+
+/// The conversation records root, `~/.murmur/conversations`, of this host.
+fn conversations_root() -> Option<PathBuf> {
+    capsule_runtime::murmur_home::usable_murmur_home()
+        .ok()
+        .map(|home| home.join(capsule_runtime::record_seal::CONVERSATIONS_DIR))
+}
+
+/// Every stream of the records directory `records_dir`, checked.
+fn verify_records(
+    records_dir: &Path,
+    public_key: Option<&Path>,
+) -> Result<capsule_runtime::record_seal::RecordReport, CliError> {
+    let key = record_public_key(public_key)?;
+    Ok(capsule_runtime::record_seal::verify_session_records(
+        records_dir,
+        key.as_ref(),
+        conversations_root().as_deref(),
+    ))
+}
+
+/// The worst stream of `report`, the one its verdict comes from.
+fn worst_stream(
+    report: &capsule_runtime::record_seal::RecordReport,
+) -> Option<&capsule_runtime::record_seal::StreamReport> {
+    report
+        .streams
+        .iter()
+        .filter(|stream| stream.verdict == report.verdict)
+        .find(|stream| stream.verdict != capsule_runtime::record_seal::Verdict::Absent)
+}
+
+/// `stream: detail`, naming the first bad line when there is one.
+fn stream_finding(stream: &capsule_runtime::record_seal::StreamReport) -> String {
+    match stream.first_bad_line {
+        Some(line) => format!("{} line {line}: {}", stream.stream, stream.detail),
+        None => format!("{}: {}", stream.stream, stream.detail),
+    }
+}
+
+/// `mur trace show`'s `record:` line: printed for every verdict but `verified`.
+fn print_record_mark(trace_path: &Path) {
+    use capsule_runtime::record_seal::Verdict;
+    let Ok(report) = verify_records(&records_dir_of(trace_path), None) else {
+        return;
+    };
+    if matches!(report.verdict, Verdict::Verified | Verdict::Absent) {
+        return;
+    }
+    let finding = worst_stream(&report)
+        .map(stream_finding)
+        .unwrap_or_default();
+    capsule_runtime::report_println!("record:        {}: {finding}", report.verdict.as_str());
+}
+
+pub(crate) fn run_trace_verify(
+    session: Option<String>,
+    workdir_arg: Option<PathBuf>,
+    public_key: Option<PathBuf>,
+    json: bool,
+) -> Result<(), CliError> {
+    use capsule_runtime::record_seal::Verdict;
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let workdir = workdir_arg.unwrap_or_else(|| current_dir.join("workdir"));
+    let path = resolve_session(session, &workdir)?;
+    let records_dir = records_dir_of(&path);
+    let report = verify_records(&records_dir, public_key.as_deref())?;
+    if json {
+        capsule_runtime::report_println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        print_record_report(&report);
+    }
+    let session_name = report
+        .session_id
+        .clone()
+        .unwrap_or_else(|| records_dir.display().to_string());
+    let finding = worst_stream(&report)
+        .map(stream_finding)
+        .unwrap_or_default();
+    match report.verdict {
+        Verdict::Verified => Ok(()),
+        Verdict::Changed => Err(CliError::new(
+            E_TRC_003,
+            format!("the record of session {session_name} has changed: {finding}"),
+        )),
+        Verdict::Unsealed => Err(CliError::new(
+            E_TRC_004,
+            format!("the record of session {session_name} is not sealed: {finding}"),
+        )),
+        Verdict::Unverifiable => Err(CliError::new(
+            E_TRC_005,
+            format!("the record of session {session_name} cannot be verified: {finding}"),
+        )),
+        Verdict::Absent => Err(CliError::new(
+            E_TRC_001,
+            format!("{} holds no trace.jsonl to verify", records_dir.display()),
+        )),
+    }
+}
+
+/// One row per stream, then the `record:` line naming the key used.
+fn print_record_report(report: &capsule_runtime::record_seal::RecordReport) {
+    let width = report
+        .streams
+        .iter()
+        .map(|stream| stream.stream.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    capsule_runtime::report_println!(
+        "{:<width$}  {:<12}  {:>6}  detail",
+        "stream",
+        "verdict",
+        "lines"
+    );
+    for stream in &report.streams {
+        let lines = if stream.verdict == capsule_runtime::record_seal::Verdict::Absent {
+            "-".to_string()
+        } else {
+            stream.lines.to_string()
+        };
+        capsule_runtime::report_println!(
+            "{:<width$}  {:<12}  {:>6}  {}",
+            stream.stream,
+            stream.verdict.as_str(),
+            lines,
+            stream.detail
+        );
+        for note in &stream.notes {
+            capsule_runtime::report_println!("{:<width$}  note: {note}", "");
+        }
+    }
+    let key = match (&report.public_key.key_id, &report.public_key.path) {
+        (Some(id), Some(path)) => format!("key {id} ({path})"),
+        (Some(id), None) => format!("key {id}"),
+        _ => "no public key".to_string(),
+    };
+    capsule_runtime::report_println!("record: {}, checked with {key}", report.verdict.as_str());
 }
 
 #[cfg(test)]

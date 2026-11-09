@@ -4696,6 +4696,9 @@ fn launch(
                 capsule_name.clone(),
                 capsule_version.clone(),
             );
+            // Each task's `capsule.session` span is posted when the next task begins or the
+            // session ends, carrying the trace's chain head at that point.
+            otel.defer_session_span();
 
             let local = tokio::task::LocalSet::new();
             local
@@ -5369,6 +5372,7 @@ fn launch(
                             .await;
 
                         // ── RUN AGENT LOOP ──
+                        otel.flush_session_end(trace.current_head().as_ref()).await;
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
@@ -5656,6 +5660,13 @@ fn launch(
                     // signal, so the door is closed before the session returns.
                     let _ = shutdown_tx.send(());
                     let _ = server_handle.await;
+
+                    // The door is shut and every hook has drained: no line of this session's
+                    // lands after this. `trace.jsonl` is sealed again when a resource read landed
+                    // after `session_end`'s seal, beside `hooks/eval.jsonl` and every
+                    // conversation record this session appended to.
+                    crate::record_seal::seal_session_teardown(&records_root, &session_id);
+                    otel.flush_session_end(trace.sealed_head()).await;
 
                     outcome.into_launch_result()
                 })
@@ -5999,7 +6010,14 @@ fn launch(
         let exit_status = script_exit_status(&ran);
         let ended = rt.block_on(async {
             let written = session.trace.write_session_end(exit_status).await;
-            session.otel.emit_session_end(exit_status).await;
+            session
+                .otel
+                .emit_session_end_sealed(exit_status, session.trace.sealed_head())
+                .await;
+            crate::record_seal::seal_session_teardown(
+                session.trace.records_root(),
+                &staged.session_id,
+            );
             written.and(session.trace.flush().await)
         });
         if let (Ok(()), Err(error)) = (&ran, ended) {
