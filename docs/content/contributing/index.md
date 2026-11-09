@@ -111,32 +111,29 @@ checkout. A contract that repository owns belongs in a test there, where the cha
 is the change that reddens it.
 
 CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
-request, in two jobs.
+request, in two jobs:
 
-`cargo-test` runs it on a stock GitHub runner, for fast feedback. That runner refuses an
-unprivileged user namespace and gives no delegated cgroup v2 scope, so a test that needs to
-isolate a capsule skips itself with a `[SKIP-HOST]`-prefixed line instead of failing. The job's
-step summary counts those tests.
+| Job | Runner | A test that needs to isolate a capsule | What a green run shows |
+|---|---|---|---|
+| `cargo-test` | a stock GitHub runner, which refuses an unprivileged user namespace and gives no delegated cgroup v2 scope | prints a `[SKIP-HOST]` line and passes; the step summary counts these | fast feedback on everything the stock runner can execute |
+| `contained` | the same runner, first made into a host that installs `scoped` and `sealed` | runs; any `[SKIP-HOST]` line fails the job | Landlock, the user, mount and network namespaces, and the cgroup scope work, on every pull request |
 
-`contained` first makes the runner a host that installs `scoped` and `sealed`. It grants user
-namespaces to the checkout's `mur`, delegates cgroup controllers to a lingering systemd user
-manager, and asserts each class with `mur run --explain-scope --json` and `mur doctor --json`
-before it builds any test. It then runs the same suite inside a delegated scope and fails on any
-`[SKIP-HOST]` line. A class the runner does not reach fails the job and is never turned into a
-skip. The
+Before `contained` builds any test, it grants user namespaces to the checkout's `mur`, delegates
+cgroup controllers to a lingering systemd user manager, and asserts each class with
+`mur run --explain-scope --json` and `mur doctor --json`. A class the runner does not reach fails
+the job at that step. It then runs the suite inside a delegated scope. The
 [scripts it runs](https://github.com/murmur-nexus/murmur/blob/main/.github/scripts/README.md)
 print what they found at every step.
 
-`contained` is regression evidence. Landlock, the user, mount and network namespaces, and the
-cgroup scope are exercised on every pull request, so a change that breaks one of them fails there.
-What it does not prove:
+`contained` is regression evidence. What it does not prove:
 
 - A GitHub runner is a virtual machine, so its records are not release evidence. Release evidence
-  comes from a bare host, and
-  `docs/content/reference/resource-limits-manual-verification.md` is the procedure for it.
+  comes from a bare host, following the
+  [resource-limits manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/resource-limits-manual-verification.md)
+  procedure.
 - The escape suite, `escape-conformance`, does not run in `contained`.
 - WASM guests, drivers, hooks and the process harness run on routes no containment class
-  confines today, so `contained` says nothing about them.
+  confines, so `contained` says nothing about them.
 
 ## Changing a WIT interface
 

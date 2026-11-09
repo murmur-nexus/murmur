@@ -36,6 +36,7 @@ echo "== ${step}"
 # The inner script reports its own step and exits 10 or more, so a failure of systemd-run itself
 # (no bus, no scope) is told apart from a failure inside the scope.
 set +e
+# shellcheck disable=SC2016  # the single-quoted script expands its variables in the inner bash
 systemd-run --user --scope --quiet --collect -p Delegate=yes -- bash -c '
     set -u
     in_step() { echo "check-cgroup-delegation: step '"'"'$1'"'"' failed: $2" >&2; exit "$3"; }

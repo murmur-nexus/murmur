@@ -75,7 +75,9 @@ begin "grant user namespaces to mur"
 echo "apparmor_parser: $(command -v apparmor_parser || sudo sh -c 'command -v apparmor_parser' || echo 'not on PATH')"
 grant=""
 if sudo scripts/install-dev-apparmor.sh; then
-    if sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null | grep -q '^mur-sealed-dev '; then
+    # One command, not `sudo cat … | grep -q`: under pipefail, grep -q's early exit gives cat
+    # SIGPIPE and the pipeline reads as no match.
+    if sudo grep -q '^mur-sealed-dev ' /sys/kernel/security/apparmor/profiles 2>/dev/null; then
         grant="AppArmor profile mur-sealed-dev (scripts/install-dev-apparmor.sh)"
     else
         echo "install-dev-apparmor.sh exited 0 but no mur-sealed-dev profile is loaded"

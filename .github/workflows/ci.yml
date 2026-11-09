@@ -195,7 +195,8 @@ jobs:
         # namespaces themselves: capsule-runtime's lib tests, and the skip_without_host_support and
         # tiers probes in murmur-cli's test processes. Under the restriction they would print
         # `[SKIP-HOST]`, so the restriction is lifted host-wide for the suite. The tier assertions
-        # above have already run under the narrower grant.
+        # above ran under the grant the host preparation chose, which is the dev profile unless it
+        # fell back to this same sysctl.
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           {
