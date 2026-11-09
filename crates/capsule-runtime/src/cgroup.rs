@@ -2120,15 +2120,54 @@ pub(crate) static DELEGATED_BASE_RESOLUTION_SPAWNS: std::sync::atomic::AtomicUsi
 /// this process into its own scope and possibly into `<base>/murmur-supervisor`, and a child
 /// forked meanwhile stays in the cgroup the process held at the fork, where it can occupy the base
 /// whose `cgroup.subtree_control` the resolution writes.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn resolve_delegated_base_in_background() {
+    resolve_delegated_base_in_background_with(&[]);
+}
+
+/// The guest-worker processes that move with this process: into its transient scope and into
+/// `<base>/murmur-supervisor`. Registered before the resolution starts and removed once it has
+/// run.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static COMPANION_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn companion_pids() -> Vec<u32> {
+    COMPANION_PIDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The delegated-base resolution described above, with `companions` (this session's guest-worker
+/// pids, children of this process forked before this call) moving wherever this process moves.
+pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
+    {
+        let mut registered = COMPANION_PIDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pid in companions {
+            if !registered.contains(pid) {
+                registered.push(*pid);
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         #[cfg(test)]
         DELEGATED_BASE_RESOLUTION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let companions = companions.to_vec();
         let _ = std::thread::Builder::new()
             .name("murmur-cgroup-base".to_string())
-            .spawn(|| {
+            .spawn(move || {
                 let _ = delegated_base();
+                // This session's workers have moved, or never will: a later session's
+                // resolution must not find their pids, which the kernel may hand to an unrelated
+                // process once they exit.
+                COMPANION_PIDS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|pid| !companions.contains(pid));
             });
     }
 }
@@ -2214,6 +2253,18 @@ fn request_transient_scope(unit: &str) -> Result<(), String> {
     await_scope_membership(unit)
 }
 
+/// This process, then every companion still alive: what the transient scope is started with.
+#[cfg(target_os = "linux")]
+fn scope_pids() -> Vec<u32> {
+    let mut pids = vec![std::process::id()];
+    pids.extend(
+        companion_pids()
+            .into_iter()
+            .filter(|pid| Path::new(&format!("/proc/{pid}")).exists()),
+    );
+    pids
+}
+
 /// `StartTransientUnit` on the systemd user manager: create `unit` as a scope containing this
 /// process, with its cgroup subtree delegated to us.
 ///
@@ -2224,7 +2275,8 @@ fn request_transient_scope(unit: &str) -> Result<(), String> {
 /// to `$XDG_RUNTIME_DIR/bus`) so the unit lands in this user's manager and needs no privilege.
 /// The properties are the same set `systemd-run --user --scope -p Delegate=yes` sends:
 ///
-/// * `PIDs` (`au`) — this process, which is what makes systemd *move* it rather than fork a new one.
+/// * `PIDs` (`au`) — this process, which is what makes systemd *move* it rather than fork a new one,
+///   then its guest workers ([`scope_pids`]).
 /// * `Delegate` (`b`) — hand the scope's subtree to us, controllers and all, and stop managing it.
 /// * `CollectMode` (`s`) — `inactive-or-failed`, so the unit is garbage-collected when this
 ///   process exits rather than lingering as a failed unit an operator has to reset.
@@ -2238,7 +2290,7 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
             "Description",
             Variant::from("Murmur capsule subprocess scope"),
         ),
-        ("PIDs", Variant::from(vec![std::process::id()])),
+        ("PIDs", Variant::from(scope_pids())),
         ("Delegate", Variant::from(true)),
         ("CollectMode", Variant::from("inactive-or-failed")),
     ];
@@ -2492,7 +2544,13 @@ fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), CgroupError> {
             ),
             &error,
         )
-    })
+    })?;
+    // The guest workers vacate the base with this process. A worker that already exited has
+    // nothing to move.
+    for pid in companion_pids() {
+        let _ = std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n"));
+    }
+    Ok(())
 }
 
 /// `open(path, O_WRONLY | O_CLOEXEC)`.

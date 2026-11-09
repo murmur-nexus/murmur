@@ -217,6 +217,123 @@ pub(crate) fn add_task_io_to_linker<T: 'static>(
     Ok(())
 }
 
+/// Register the four `murmur:task-io/read@0.1.0` functions on a guest worker's hook linker:
+/// every call is a host call to the supervisor, which answers it from the state
+/// [`add_task_io_to_linker`] would have been handed, or `not-granted` when there is none.
+pub(crate) fn add_remote_task_io_to_linker<T: 'static>(
+    linker: &mut Linker<T>,
+    link: Arc<crate::guest_worker::RemoteLink>,
+) -> Result<(), String> {
+    use crate::guest_worker::wire::{TaskIoCall, TaskIoReply};
+    type Fut<R> = Box<dyn std::future::Future<Output = wasmtime::Result<(R,)>> + Send>;
+    fn len(reply: TaskIoReply) -> Result<u64, IoError> {
+        match reply {
+            TaskIoReply::Len(len) => len,
+            TaskIoReply::Text(_) => Err(IoError::NotGranted),
+        }
+    }
+    fn text(reply: TaskIoReply) -> Result<String, IoError> {
+        match reply {
+            TaskIoReply::Text(text) => text,
+            TaskIoReply::Len(_) => Err(IoError::NotGranted),
+        }
+    }
+    let mut instance = linker
+        .instance(TASK_IO_IFACE_VERSIONED)
+        .map_err(|e| format!("failed to define {TASK_IO_IFACE_VERSIONED}: {e}"))?;
+
+    let to = Arc::clone(&link);
+    instance
+        .func_wrap_async(
+            "input-len",
+            move |_store: wasmtime::StoreContextMut<'_, T>, (form,): (TaskInputForm,)| {
+                let link = Arc::clone(&to);
+                let fut: Fut<Result<u64, IoError>> =
+                    Box::new(
+                        async move { Ok((len(link.task_io(TaskIoCall::InputLen(form)).await),)) },
+                    );
+                fut
+            },
+        )
+        .map_err(|e| register_err("input-len", &e))?;
+
+    let to = Arc::clone(&link);
+    instance
+        .func_wrap_async(
+            "read-input",
+            move |_store: wasmtime::StoreContextMut<'_, T>,
+                  (form, offset, max_bytes): (TaskInputForm, u64, u64)| {
+                let link = Arc::clone(&to);
+                let fut: Fut<Result<String, IoError>> = Box::new(async move {
+                    Ok((text(
+                        link.task_io(TaskIoCall::ReadInput(form, offset, max_bytes))
+                            .await,
+                    ),))
+                });
+                fut
+            },
+        )
+        .map_err(|e| register_err("read-input", &e))?;
+
+    let to = Arc::clone(&link);
+    instance
+        .func_wrap_async(
+            "output-len",
+            move |_store: wasmtime::StoreContextMut<'_, T>, (): ()| {
+                let link = Arc::clone(&to);
+                let fut: Fut<Result<u64, IoError>> =
+                    Box::new(async move { Ok((len(link.task_io(TaskIoCall::OutputLen).await),)) });
+                fut
+            },
+        )
+        .map_err(|e| register_err("output-len", &e))?;
+
+    let to = link;
+    instance
+        .func_wrap_async(
+            "read-output",
+            move |_store: wasmtime::StoreContextMut<'_, T>, (offset, max_bytes): (u64, u64)| {
+                let link = Arc::clone(&to);
+                let fut: Fut<Result<String, IoError>> = Box::new(async move {
+                    Ok((text(
+                        link.task_io(TaskIoCall::ReadOutput(offset, max_bytes))
+                            .await,
+                    ),))
+                });
+                fut
+            },
+        )
+        .map_err(|e| register_err("read-output", &e))?;
+
+    Ok(())
+}
+
+/// The supervisor's answer to a worker's `call`, from `state`, or `not-granted` without one.
+pub(crate) fn answer_task_io(
+    state: Option<&TaskIoState>,
+    call: crate::guest_worker::wire::TaskIoCall,
+) -> crate::guest_worker::wire::TaskIoReply {
+    use crate::guest_worker::wire::{TaskIoCall, TaskIoReply};
+    let Some(state) = state else {
+        return match call {
+            TaskIoCall::InputLen(_) | TaskIoCall::OutputLen => {
+                TaskIoReply::Len(Err(IoError::NotGranted))
+            }
+            TaskIoCall::ReadInput(..) | TaskIoCall::ReadOutput(..) => {
+                TaskIoReply::Text(Err(IoError::NotGranted))
+            }
+        };
+    };
+    match call {
+        TaskIoCall::InputLen(form) => TaskIoReply::Len(state.input_len(form)),
+        TaskIoCall::ReadInput(form, offset, max) => {
+            TaskIoReply::Text(state.read_input(form, offset, max))
+        }
+        TaskIoCall::OutputLen => TaskIoReply::Len(state.output_len()),
+        TaskIoCall::ReadOutput(offset, max) => TaskIoReply::Text(state.read_output(offset, max)),
+    }
+}
+
 fn register_err(func: &str, err: &wasmtime::Error) -> String {
     format!("failed to register {TASK_IO_IFACE_VERSIONED}#{func}: {err}")
 }

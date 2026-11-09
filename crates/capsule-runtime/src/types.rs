@@ -660,6 +660,8 @@ pub struct StagedSession {
     pub(crate) capsule_url: String,
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
+    /// The session's guest workers, when this process runs its guests in worker processes.
+    pub(crate) guest_workers: Option<std::sync::Arc<crate::guest_worker::GuestWorkers>>,
     /// Where staging took the facts about each allowlisted binary it examined, for
     /// `session_start.host_facts`.
     pub(crate) host_facts: Vec<crate::host_facts::HostFactsUse>,

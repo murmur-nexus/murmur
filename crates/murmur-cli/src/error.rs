@@ -118,6 +118,8 @@ pub const E_RUN_061: &str = "E-RUN-061"; // an installed artifact's murmur.yaml 
 pub const E_RUN_062: &str = "E-RUN-062"; // a staged tool ships a malformed programs: block
 pub const E_RUN_063: &str = "E-RUN-063"; // the unconfined stance was chosen while mur's effective uid is 0
 pub const E_RUN_064: &str = "E-RUN-064"; // mur doctor: a transport: process capsule's harness is not logged in for this user, as its process driver reads its login check
+pub const E_RUN_065: &str = "E-RUN-065"; // a guest worker died or stopped answering mid-task: the task failed and the session ended
+pub const E_RUN_066: &str = "E-RUN-066"; // a guest worker could not be started, or answered with the wrong protocol
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -1138,6 +1140,24 @@ impl From<RuntimeError> for CliError {
                  capabilities.spawn.allow from the manifest if this capsule spawns nothing",
             ),
             RuntimeError::NativeTool { artifact, field } => native_tool_launch_error(&artifact, &field),
+            RuntimeError::GuestWorkerLost(message) => CliError::with_hint(
+                E_RUN_065,
+                message,
+                format!(
+                    "a guest worker runs this session's WASM guests; one that dies takes its task \
+                     with it, and the run's records end with the failure ({})",
+                    murmur_artifact::diagnostic_link(E_RUN_065)
+                ),
+            ),
+            RuntimeError::GuestWorkerStart(message) => CliError::with_hint(
+                E_RUN_066,
+                message,
+                format!(
+                    "mur starts its guest workers by re-running its own binary; check that the \
+                     binary is intact and not replaced by another version mid-launch ({})",
+                    murmur_artifact::diagnostic_link(E_RUN_066)
+                ),
+            ),
             error @ RuntimeError::SpawnerHandleUnreadable { .. } => CliError::with_hint(
                 E_RUN_020,
                 error.to_string(),
@@ -1626,6 +1646,39 @@ fn extract_interface_name(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e_run_065_names_the_lost_worker_and_links_its_entry() {
+        let message =
+            "the tools guest worker (pid 4242) was lost while running tool 'stall-tool': \
+                       it was killed by signal 9 (SIGKILL); the task failed and the session ended";
+        let cli = CliError::from(RuntimeError::GuestWorkerLost(message.to_string()));
+        assert_eq!(cli.code, E_RUN_065);
+        assert_eq!(cli.message, message);
+        let rendered = cli.to_string();
+        assert!(rendered.starts_with("error[E-RUN-065]: the tools guest worker (pid 4242)"));
+        assert!(
+            rendered.contains(&murmur_artifact::diagnostic_link("E-RUN-065")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn e_run_066_names_the_kind_and_the_reason_and_links_its_entry() {
+        let message = "the driver guest worker could not be started: it speaks guest-worker \
+                       protocol 99 (mur 0.0.0), not 1";
+        let cli = CliError::from(RuntimeError::GuestWorkerStart(message.to_string()));
+        assert_eq!(cli.code, E_RUN_066);
+        let rendered = cli.to_string();
+        assert!(
+            rendered.starts_with(&format!("error[E-RUN-066]: {message}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&murmur_artifact::diagnostic_link("E-RUN-066")),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn a_workdir_path_refusal_maps_to_e_run_050_naming_the_path_and_the_link() {

@@ -116,7 +116,7 @@ pub(crate) fn tool_extra_roots(
 }
 
 /// One directory a guest's WASI context preopens.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlannedPreopen {
     pub(crate) host_path: PathBuf,
     /// The preopen's name, which `wasi:filesystem/preopens.get-directories` hands the guest.

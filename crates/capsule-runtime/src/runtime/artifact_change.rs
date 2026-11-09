@@ -294,6 +294,9 @@ impl CapsuleStoreState {
         // and stays, so a later pull of the same version is warm.
         let tool = murmur_artifact::tool_name_of(name).to_string();
         self.tool_components.remove(&tool);
+        if let Some(workers) = &self.guest_workers {
+            workers.forget(&tool);
+        }
         self.allowlisted_tools.remove(&tool);
         self.installed_artifacts
             .retain(|artifact| artifact.name != name);
@@ -910,6 +913,9 @@ impl CapsuleStoreState {
         // The session: list()/describe() see the artifact at once, and a tool is dispatchable
         // from its next call.
         if let Some(component) = wasm_component {
+            if let Some(workers) = &self.guest_workers {
+                workers.forget(&tool);
+            }
             self.tool_components.insert(tool.clone(), component);
         }
         if artifact_runtime == ArtifactRuntime::Tool {

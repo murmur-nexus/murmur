@@ -2,6 +2,7 @@ pub mod host {
     wasmtime::component::bindgen!({
         path: "wit/host",
         world: "runtime-host",
+        additional_derives: [serde::Serialize, serde::Deserialize],
     });
 }
 
@@ -12,6 +13,7 @@ pub mod tool_host {
         path: "wit/host",
         world: "tool-host",
         imports: { default: async },
+        additional_derives: [serde::Serialize, serde::Deserialize],
         with: {
             "murmur:process/process.connection": crate::session_process::Connection,
         },
@@ -22,6 +24,7 @@ pub mod hook {
     wasmtime::component::bindgen!({
         path: "wit/hook",
         world: "hook",
+        additional_derives: [serde::Serialize, serde::Deserialize],
     });
 }
 
@@ -30,5 +33,6 @@ pub mod process_driver {
         path: "wit/process-driver",
         world: "process-driver",
         exports: { default: async },
+        additional_derives: [serde::Serialize, serde::Deserialize],
     });
 }

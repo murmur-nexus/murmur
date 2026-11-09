@@ -1907,9 +1907,15 @@ fn lifeline_ends_are_held_once() {
         assert_eq!(held[0].access_mode(), libc::O_WRONLY as u32, "{name}");
     }
 
-    // No member, nor anything a member started, holds any other end of any lifeline.
+    // No member, nor anything a member started, holds any other end of any lifeline. A member's
+    // guest workers are skipped: they are non-dumpable, so their descriptors cannot be read from
+    // here, and they hold none past fd 3 by construction, which
+    // `guest_worker::tests::a_worker_inherits_no_descriptor_past_its_connection` proves.
     for (name, pid) in &members {
-        for process in process_tree(*pid) {
+        for process in process_tree(*pid)
+            .into_iter()
+            .filter(|process| !is_guest_worker(*process))
+        {
             for fd in open_fds(process) {
                 let Some((owner, number)) = fd.pipe_inode().and_then(|inode| lifelines.get(&inode))
                 else {
@@ -2235,6 +2241,19 @@ fn mur_run_without_roster_ignores_an_invalid_roster() {
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     values[values.len() / 2]
+}
+
+/// Whether `pid` is a `mur __guest-worker` process.
+#[cfg(target_os = "linux")]
+fn is_guest_worker(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| {
+            cmdline
+                .split(|byte| *byte == 0)
+                .nth(1)
+                .is_some_and(|arg| arg == b"__guest-worker")
+        })
+        .unwrap_or(false)
 }
 
 /// Every descendant of `root`, `root` included.

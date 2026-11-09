@@ -27,6 +27,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Capsules](/concepts/capsules.md): Murmur's primary execution abstraction — the unit that packages an agent's inference, tools, skills, and configuration together.
 - [Artifacts](/concepts/artifacts.md): Tools, drivers, hooks, and skills — the named, versioned pieces a capsule's manifest declares as dependencies.
 - [Session Loop](/concepts/session-loop.md): The runtime's execution environment for a capsule: the inference loop and its extension points (tools, hooks, drivers).
+- [Guest Workers](/concepts/guest-workers.md): The processes a `mur run` session runs its WASM tools, drivers and hooks in, what stays in `mur`, and what a lost worker does.
 - [Hooks](/concepts/hooks.md): An artifact that observes a lifecycle point, receives structured input from the runtime, and can return output the runtime commits.
 - [Tools](/concepts/tools.md): How murmur defines tool artifacts — WASM components — and how the runtime invokes them during a session.
 - [Access Control](/concepts/access-control.md): The `capabilities` block: what a capsule and its artifacts are allowed to reach — filesystem, network, and subprocesses.

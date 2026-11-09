@@ -2380,6 +2380,32 @@ fn refuse_undeclarable_runtime_pin(
 ///
 /// This function is intentionally separate from `launch_session` so policy/capability
 /// checks can be layered in the seam between stage and launch without mixing concerns.
+/// The guest workers a capsule with `artifacts` starts at staging, one per guest kind it stages:
+/// tools for a staged WASM tool, driver for any `runtime: driver` artifact (the process driver
+/// included) or a script component, hooks for any hook. A skill runs no guest.
+fn guest_worker_kinds(
+    artifacts: &[ArtifactRequest],
+    has_script_component: bool,
+) -> Vec<crate::guest_worker::WorkerKind> {
+    use crate::guest_worker::WorkerKind;
+    let mut kinds = Vec::new();
+    if has_script_component {
+        kinds.push(WorkerKind::Driver);
+    }
+    for artifact in artifacts
+        .iter()
+        .filter(|artifact| artifact.source.is_none())
+    {
+        let Some(kind) = WorkerKind::for_runtime(artifact.runtime.clone()) else {
+            continue;
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
 pub fn stage_session(
     registry: Arc<dyn Registry>,
     mut request: StageRequest,
@@ -2744,6 +2770,23 @@ pub fn stage_session(
         request.declared_containment_floor,
     );
 
+    // The guest workers this capsule needs: forked past every pre-staging refusal and the host
+    // probes' forks, and before the token tables start growing the heap, for the same reason the
+    // probes come first. Their pids join this process's scope below, and their start overlaps
+    // artifact resolution; each is waited for once the artifact loop is done.
+    let guest_workers = crate::guest_worker::session_launcher().map(|launcher| {
+        let workers = crate::guest_worker::GuestWorkers::new(launcher);
+        let has_script_component =
+            request.inference.is_none() && !request.capsule_component_bytes.is_empty();
+        for kind in guest_worker_kinds(&request.artifacts, has_script_component) {
+            workers.start(kind);
+        }
+        workers
+    });
+    let worker_pids = guest_workers
+        .as_ref()
+        .map(|workers| workers.spawned_pids())
+        .unwrap_or_default();
     // Past every pre-staging refusal, so a refused launch builds nothing, and past the host
     // probes' forks: a thread growing the heap across `fork()` makes each fork copy more page
     // tables and each later write take a copy-on-write fault.
@@ -2755,7 +2798,7 @@ pub fn stage_session(
     // `launch` (later in staging, in a caller before it launches, or early in `launch`) goes above
     // this call, or this call moves below it.
     if cgroup::requires_process_bounding(&request.capability_policy) {
-        cgroup::resolve_delegated_base_in_background();
+        cgroup::resolve_delegated_base_in_background_with(&worker_pids);
     }
     let engine = build_engine()?;
     let compiled_forms = CompiledForms::new(
@@ -3104,6 +3147,19 @@ pub fn stage_session(
         });
     }
 
+    // Every worker started above has said hello, or the launch is refused before the session
+    // directory exists.
+    if let Some(workers) = &guest_workers {
+        workers.ready()?;
+        // The inference driver's first call is the launch's first model request: hand it to its
+        // worker now, beside the rest of the launch, rather than on that call.
+        if let Some(("http", driver)) = inference_driver {
+            if let Some(component) = tool_components.get(driver) {
+                workers.preload(crate::guest_worker::WorkerKind::Driver, driver, component);
+            }
+        }
+    }
+
     // Read off the manifests the pulls above already hold, before any driver is described or
     // called and before the session directory exists. A manifest that never names the key is not
     // parsed, so a capsule without a provider tool does nothing more here.
@@ -3182,7 +3238,8 @@ pub fn stage_session(
                     RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
                 })?;
             let description = rt.block_on(async {
-                let mut driver = ProcessDriver::instantiate(
+                let mut driver = ProcessDriver::open(
+                    guest_workers.as_ref(),
                     &engine,
                     &component,
                     &name,
@@ -3598,6 +3655,7 @@ pub fn stage_session(
         formation_member: request.formation_member.as_ref(),
         call_deadlines: call_deadlines.clone(),
         member_requests: member_requests.clone(),
+        guest_workers: guest_workers.as_ref(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -3717,6 +3775,7 @@ pub fn stage_session(
         resolved_lock_artifacts,
         installed_artifacts,
         host_facts,
+        guest_workers,
         inference: request.inference,
         artifact_full_names: full_names,
         gateways,
@@ -4451,6 +4510,7 @@ fn launch(
         let host_facts = staged.host_facts;
         let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
+        let guest_workers = staged.guest_workers.clone();
         let call_deadlines = staged.call_deadlines.clone();
         let member_requests = staged.member_requests.clone();
         let capability_policy = staged.capability_policy.clone();
@@ -4749,6 +4809,7 @@ fn launch(
 
                     // Build CapsuleStoreState ONCE — reused across all task iterations
                     let mut state = CapsuleStoreState {
+                        guest_workers: guest_workers.clone(),
                         // Agent capsules have no WASM component of their own, so this state
                         // never backs a `Store` and this limiter is never registered. It is
                         // the per-tool limiters built in `dispatch_tool_async` (from
@@ -4927,6 +4988,7 @@ fn launch(
                                     deadline: session_status.deadline(),
                                     call_deadlines: state.call_deadlines.clone(),
                                     member_requests: state.member_requests.clone(),
+                                    guest_workers: guest_workers.clone(),
                                 })
                             })
                             .ok_or(InferenceUnavailable::NotConfigured)
@@ -4954,6 +5016,7 @@ fn launch(
                             formation_member: formation_member.as_ref(),
                             call_deadlines: call_deadlines.clone(),
                             member_requests: member_requests.clone(),
+                            guest_workers: guest_workers.as_ref(),
                         },
                         hook_limits,
                         hook_inference,
@@ -5745,7 +5808,7 @@ fn launch(
     // Read before `staged.capability_policy` moves into the store state below.
     let capsule_limits = staged.capability_policy.limits;
 
-    let wasi = build_wasi_ctx(
+    let wasi_plan = plan_wasi_ctx(
         &staged.accessible_workdir,
         // The capsule component runs on the ceiling, not on any artifact's grant — so it gets
         // neither a narrowed workdir preopen, nor a state preopen, nor a config block. A capsule
@@ -5762,6 +5825,12 @@ fn launch(
         Some(&staged.runtime_dir),
         &[],
     )?;
+    // In the driver worker the root's WASI context is built there from the plan; the session
+    // state here holds none.
+    let wasi = match &staged.guest_workers {
+        Some(_) => WasiCtxBuilder::new().build(),
+        None => apply_wasi_plan(&wasi_plan)?,
+    };
 
     // Script capsule uses a multi-thread runtime so block_in_place works inside the host
     // functions (`invoke`, `send`, `pull`), which write the session's trace lines as they run.
@@ -5830,6 +5899,7 @@ fn launch(
     let running_guard = write_running_record(&running_record, &records_root);
 
     let state = CapsuleStoreState {
+        guest_workers: staged.guest_workers.clone(),
         table: ResourceTable::new(),
         wasi,
         http: WasiHttpCtx::new(),
@@ -5934,72 +6004,118 @@ fn launch(
         member_requests: staged.member_requests.clone(),
     };
 
-    let mut store = Store::new(&staged.engine, state);
-    // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
-    // the store enforces, and instantiation itself allocates against them.
-    store.limiter(|state| &mut state.limits);
-
     let call_deadlines = staged.call_deadlines.clone();
     let capsule_name = staged.capsule_name.clone();
-    // A phase the wall-clock bound stopped fails exactly as one the epoch interrupted.
-    let stopped = || RuntimeError::CapsuleDeadlineExceeded {
-        seconds: capsule_limits.deadline_seconds,
-    };
-    let ran: Result<(), RuntimeError> = rt.block_on(async {
-        // Instantiation runs the guest's own start/init code, so it gets a deadline too.
-        store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let instantiated = call_deadlines
-            .bound(
-                &capsule_name,
-                ComponentRole::Capsule,
-                "instantiate",
-                &capsule_limits,
-                linker.instantiate_async(&mut store, &capsule_component),
-            )
-            .await
-            .map_err(|_| stopped())?;
-        let instance = match instantiated {
-            Ok(instance) => instance,
-            Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+    let (ran, mut state) = if let Some(workers) = staged.guest_workers.clone() {
+        let shared = Arc::new(Mutex::new(state));
+        let spec = CapsuleSpec {
+            name: capsule_name.clone(),
+            limits: capsule_limits,
+            wasi: wasi_plan,
         };
+        let ran = match rt.block_on(workers.run_capsule(
+            &capsule_name,
+            &capsule_component,
+            spec,
+            Arc::clone(&shared),
+            &call_deadlines,
+        )) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into_runtime()),
+            Err(error) => Err(workers.runtime_error(error)),
+        };
+        // A worker lost while the root ran fails the run, whatever the root made of it.
+        let ran = match workers.lost() {
+            Some(lost) => Err(RuntimeError::GuestWorkerLost(lost)),
+            None => ran,
+        };
+        let mut shared = shared;
+        let state = loop {
+            match Arc::try_unwrap(shared) {
+                Ok(state) => {
+                    break state
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+                // A host call still finishing holds the state for a moment.
+                Err(still_shared) => {
+                    shared = still_shared;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        };
+        (ran, state)
+    } else {
+        crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Capsule)?;
+        let mut store = Store::new(&staged.engine, state);
+        // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
+        // the store enforces, and instantiation itself allocates against them.
+        store.limiter(|state| &mut state.limits);
 
-        let capsule_iface =
-            resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+        let call_deadlines = staged.call_deadlines.clone();
+        let capsule_name = staged.capsule_name.clone();
+        // A phase the wall-clock bound stopped fails exactly as one the epoch interrupted.
+        let stopped = || RuntimeError::CapsuleDeadlineExceeded {
+            seconds: capsule_limits.deadline_seconds,
+        };
+        let ran: Result<(), RuntimeError> = rt.block_on(async {
+            // Instantiation runs the guest's own start/init code, so it gets a deadline too.
+            store.set_epoch_deadline(capsule_limits.deadline_ticks());
+            let instantiated = call_deadlines
+                .bound(
+                    &capsule_name,
+                    ComponentRole::Capsule,
+                    "instantiate",
+                    &capsule_limits,
+                    linker.instantiate_async(&mut store, &capsule_component),
+                )
+                .await
+                .map_err(|_| stopped())?;
+            let instance = match instantiated {
+                Ok(instance) => instance,
+                Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+            };
+
+            let capsule_iface =
+                resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+                    .ok_or(RuntimeError::CapsuleExportMissing)?;
+            let capsule_run = instance
+                .get_export_index(&mut store, Some(&capsule_iface), "run")
+                .and_then(|idx| instance.get_func(&mut store, idx))
                 .ok_or(RuntimeError::CapsuleExportMissing)?;
-        let capsule_run = instance
-            .get_export_index(&mut store, Some(&capsule_iface), "run")
-            .and_then(|idx| instance.get_func(&mut store, idx))
-            .ok_or(RuntimeError::CapsuleExportMissing)?;
 
-        let run = capsule_run
-            .typed::<(), ()>(&store)
-            .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+            let run = capsule_run
+                .typed::<(), ()>(&store)
+                .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
 
-        // Fresh budget for `run` itself, so instantiation cost cannot eat into it.
-        store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let called = call_deadlines
-            .bound(
-                &capsule_name,
-                ComponentRole::Capsule,
-                "run",
-                &capsule_limits,
-                run.call_async(&mut store, ()),
-            )
-            .await
-            .map_err(|_| stopped())?;
-        if let Err(err) = called {
-            return Err(capsule_guest_error(&err, &store.data().limits));
-        }
+            // Fresh budget for `run` itself, so instantiation cost cannot eat into it.
+            store.set_epoch_deadline(capsule_limits.deadline_ticks());
+            let called = call_deadlines
+                .bound(
+                    &capsule_name,
+                    ComponentRole::Capsule,
+                    "run",
+                    &capsule_limits,
+                    run.call_async(&mut store, ()),
+                )
+                .await
+                .map_err(|_| stopped())?;
+            if let Err(err) = called {
+                return Err(capsule_guest_error(&err, &store.data().limits));
+            }
 
-        Ok(())
-    });
+            Ok(())
+        });
 
+        (ran, store.into_data())
+    };
+    let state = &mut state;
     // The capsule's run has ended, however it ended, so its session ends: every process a shell
     // call started is killed and the session's network namespace is released.
-    store.data().shell_enforcement.end_session();
+    state.shell_enforcement.end_session();
 
     let mut ran = ran;
-    if let Some(mut session) = store.data_mut().script_session.take() {
+    if let Some(mut session) = state.script_session.take() {
         // A line a host function could not write leaves the record incomplete, which fails the
         // launch whatever `run` did.
         if let Some(error) = session.write_error.take() {
@@ -6041,6 +6157,316 @@ fn launch(
         records_dir: staged.records_dir,
         ending: LaunchEnding::Completed,
     })
+}
+
+/// What a script capsule's root store is built from in the driver worker, decided in the
+/// supervisor: the capsule's name, its limits and its WASI plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CapsuleSpec {
+    pub(crate) name: String,
+    pub(crate) limits: crate::ExecutionLimits,
+    pub(crate) wasi: WasiPlan,
+}
+
+/// One `murmur:tool-registry/invoke`, `murmur:artifact-manager/manage` or `murmur:message/send`
+/// call of a script capsule's root, as it crosses from the driver worker.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleCall {
+    Invoke {
+        name: String,
+        input: murmur::tool::run::ToolInput,
+    },
+    Send {
+        peer_url: String,
+        message: send::Message,
+    },
+    List,
+    Describe(String),
+    Search(String),
+    Pull(String, String),
+    Remove(String),
+    Diagnostics,
+}
+
+/// The supervisor's answer to a [`CapsuleCall`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleReply {
+    Invoke(Result<murmur::tool::run::ToolResult, String>),
+    Send(Result<send::TaskResult, String>),
+    List(Vec<manage::ArtifactSummary>),
+    Describe(Result<manage::ArtifactInfo, String>),
+    Search(Result<Vec<manage::ArtifactSummary>, String>),
+    Pull(Result<manage::ArtifactSummary, String>),
+    Remove(Result<bool, String>),
+    Diagnostics(Result<manage::RuntimeState, String>),
+    /// Not answered, with why.
+    Unanswered(String),
+}
+
+/// A script capsule root's failure in the driver worker, as the [`RuntimeError`] the same failure
+/// raises in process.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleRunError {
+    Trap(String),
+    DeadlineExceeded { seconds: u64 },
+    ResourceLimit { message: String },
+    ExportMissing,
+    Runtime(String),
+}
+
+impl CapsuleRunError {
+    fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::CapsuleTrap(message) => Self::Trap(message),
+            RuntimeError::CapsuleDeadlineExceeded { seconds } => Self::DeadlineExceeded { seconds },
+            RuntimeError::CapsuleResourceLimit { message } => Self::ResourceLimit { message },
+            RuntimeError::CapsuleExportMissing => Self::ExportMissing,
+            other => Self::Runtime(other.to_string()),
+        }
+    }
+
+    pub(crate) fn into_runtime(self) -> RuntimeError {
+        match self {
+            Self::Trap(message) => RuntimeError::CapsuleTrap(message),
+            Self::DeadlineExceeded { seconds } => RuntimeError::CapsuleDeadlineExceeded { seconds },
+            Self::ResourceLimit { message } => RuntimeError::CapsuleResourceLimit { message },
+            Self::ExportMissing => RuntimeError::CapsuleExportMissing,
+            Self::Runtime(message) => RuntimeError::Runtime(message),
+        }
+    }
+}
+
+/// Answers a script capsule root's `call` from its session `state`, with the same host functions
+/// the root's store calls in process.
+pub(crate) fn answer_capsule_call(
+    state: &mut CapsuleStoreState,
+    call: CapsuleCall,
+) -> CapsuleReply {
+    match call {
+        CapsuleCall::Invoke { name, input } => {
+            CapsuleReply::Invoke(invoke::Host::invoke(state, name, input))
+        }
+        CapsuleCall::Send { peer_url, message } => {
+            CapsuleReply::Send(send::Host::send(state, peer_url, message))
+        }
+        CapsuleCall::List => CapsuleReply::List(manage::Host::list(state)),
+        CapsuleCall::Describe(name) => CapsuleReply::Describe(manage::Host::describe(state, name)),
+        CapsuleCall::Search(query) => CapsuleReply::Search(manage::Host::search(state, query)),
+        CapsuleCall::Pull(name, version) => {
+            CapsuleReply::Pull(manage::Host::pull(state, name, version))
+        }
+        CapsuleCall::Remove(name) => CapsuleReply::Remove(manage::Host::remove(state, name)),
+        CapsuleCall::Diagnostics => CapsuleReply::Diagnostics(manage::Host::diagnostics(state)),
+    }
+}
+
+/// A script capsule root's store in the driver worker: WASI from the supervisor's plan, and every
+/// Murmur import a host call to the supervisor.
+struct ScriptGuestState {
+    table: ResourceTable,
+    wasi: WasiCtx,
+    http: WasiHttpCtx,
+    http_hooks: ToolHttpHooks,
+    limits: ExecutionLimiter,
+    link: Arc<crate::guest_worker::RemoteLink>,
+}
+
+impl ScriptGuestState {
+    /// Sends `call` to the supervisor from a synchronous host function, as the in-process root's
+    /// host functions block on their own work.
+    fn ask(&self, call: CapsuleCall) -> CapsuleReply {
+        let link = Arc::clone(&self.link);
+        block_on_host(async move { link.capsule(call).await })
+    }
+}
+
+impl WasiView for ScriptGuestState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for ScriptGuestState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
+impl send::Host for ScriptGuestState {
+    fn send(
+        &mut self,
+        peer_url: String,
+        message: send::Message,
+    ) -> Result<send::TaskResult, String> {
+        match self.ask(CapsuleCall::Send { peer_url, message }) {
+            CapsuleReply::Send(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+}
+
+impl manage::Host for ScriptGuestState {
+    fn list(&mut self) -> Vec<manage::ArtifactSummary> {
+        match self.ask(CapsuleCall::List) {
+            CapsuleReply::List(list) => list,
+            _ => Vec::new(),
+        }
+    }
+
+    fn describe(&mut self, name: String) -> Result<manage::ArtifactInfo, String> {
+        match self.ask(CapsuleCall::Describe(name)) {
+            CapsuleReply::Describe(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn search(&mut self, query: String) -> Result<Vec<manage::ArtifactSummary>, String> {
+        match self.ask(CapsuleCall::Search(query)) {
+            CapsuleReply::Search(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
+        match self.ask(CapsuleCall::Pull(name, version)) {
+            CapsuleReply::Pull(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn remove(&mut self, name: String) -> Result<bool, String> {
+        match self.ask(CapsuleCall::Remove(name)) {
+            CapsuleReply::Remove(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn diagnostics(&mut self) -> Result<manage::RuntimeState, String> {
+        match self.ask(CapsuleCall::Diagnostics) {
+            CapsuleReply::Diagnostics(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+}
+
+fn unanswered(reply: CapsuleReply) -> String {
+    match reply {
+        CapsuleReply::Unanswered(reason) => reason,
+        other => format!("unexpected reply {other:?}"),
+    }
+}
+
+/// Instantiates a script capsule's root `component` in the driver worker and calls its
+/// `murmur:capsule/run#run`, in the same phases and under the same bounds as the in-process root.
+pub(crate) async fn run_capsule_guest(
+    engine: &Engine,
+    component: &Component,
+    spec: &CapsuleSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: &CallDeadlines,
+) -> Result<(), CapsuleRunError> {
+    run_capsule_root(engine, component, spec, link, call_deadlines)
+        .await
+        .map_err(CapsuleRunError::from_runtime)
+}
+
+async fn run_capsule_root(
+    engine: &Engine,
+    component: &Component,
+    spec: &CapsuleSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: &CallDeadlines,
+) -> Result<(), RuntimeError> {
+    crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Capsule)?;
+    let mut linker: Linker<ScriptGuestState> = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    linker
+        .instance(WIT_TOOL_REGISTRY_IFACE)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?
+        .func_wrap(
+            "invoke",
+            |store: wasmtime::StoreContextMut<'_, ScriptGuestState>,
+             (tool_name, input): (String, murmur::tool::run::ToolInput)|
+             -> wasmtime::Result<(Result<murmur::tool::run::ToolResult, String>,)> {
+                let reply = store.data().ask(CapsuleCall::Invoke {
+                    name: tool_name,
+                    input,
+                });
+                Ok((match reply {
+                    CapsuleReply::Invoke(result) => result,
+                    other => Err(unanswered(other)),
+                },))
+            },
+        )
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    manage::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    send::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+
+    let limits = spec.limits;
+    let state = ScriptGuestState {
+        table: ResourceTable::new(),
+        wasi: apply_wasi_plan(&spec.wasi)?,
+        http: WasiHttpCtx::new(),
+        http_hooks: ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(Arc::clone(&link))),
+        limits: limits.limiter(),
+        link,
+    };
+    let mut store = Store::new(engine, state);
+    store.limiter(|state| &mut state.limits);
+    let stopped = || RuntimeError::CapsuleDeadlineExceeded {
+        seconds: limits.deadline_seconds,
+    };
+    store.set_epoch_deadline(limits.deadline_ticks());
+    let instantiated = call_deadlines
+        .bound(
+            &spec.name,
+            ComponentRole::Capsule,
+            "instantiate",
+            &limits,
+            linker.instantiate_async(&mut store, component),
+        )
+        .await
+        .map_err(|_| stopped())?;
+    let instance = match instantiated {
+        Ok(instance) => instance,
+        Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+    };
+    let capsule_iface = resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+        .ok_or(RuntimeError::CapsuleExportMissing)?;
+    let capsule_run = instance
+        .get_export_index(&mut store, Some(&capsule_iface), "run")
+        .and_then(|idx| instance.get_func(&mut store, idx))
+        .ok_or(RuntimeError::CapsuleExportMissing)?;
+    let run = capsule_run
+        .typed::<(), ()>(&store)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    store.set_epoch_deadline(limits.deadline_ticks());
+    let called = call_deadlines
+        .bound(
+            &spec.name,
+            ComponentRole::Capsule,
+            "run",
+            &limits,
+            run.call_async(&mut store, ()),
+        )
+        .await
+        .map_err(|_| stopped())?;
+    if let Err(err) = called {
+        return Err(capsule_guest_error(&err, &store.data().limits));
+    }
+    Ok(())
 }
 
 /// `session_end.exit_status` for a script capsule whose `run` ended in `ran`: `ok` when it
@@ -7513,17 +7939,45 @@ fn build_wasi_ctx(
     runtime_dir: Option<&Path>,
     extra_roots: &[crate::guest_roots::GuestRoot],
 ) -> Result<WasiCtx, RuntimeError> {
-    let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
-    for (key, value) in build_declared_env(policy) {
-        builder.env(key, value);
-    }
+    let plan = plan_wasi_ctx(
+        workdir,
+        filesystem_scope,
+        state_dir,
+        config_json,
+        extra_env,
+        policy,
+        runtime_dir,
+        extra_roots,
+    )?;
+    apply_wasi_plan(&plan)
+}
+
+/// What a guest's WASI context is built from, decided where the manifest, the configuration and
+/// the host environment are in reach: every variable in the order it is set, and every preopen in
+/// registration order. A declared scope directory already exists once the plan does.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WasiPlan {
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) preopens: Vec<crate::guest_roots::PlannedPreopen>,
+}
+
+/// [`build_wasi_ctx`]'s decisions, without building the context. See it for each argument.
+#[allow(clippy::too_many_arguments)]
+fn plan_wasi_ctx(
+    workdir: &Path,
+    filesystem_scope: Option<&str>,
+    state_dir: Option<&Path>,
+    config_json: Option<&str>,
+    extra_env: &[(String, String)],
+    policy: &CapabilityPolicy,
+    runtime_dir: Option<&Path>,
+    extra_roots: &[crate::guest_roots::GuestRoot],
+) -> Result<WasiPlan, RuntimeError> {
+    let mut env: Vec<(String, String)> = build_declared_env(policy).into_iter().collect();
     if let Some(config_json) = config_json {
-        builder.env(ARTIFACT_CONFIG_ENV, config_json);
+        env.push((ARTIFACT_CONFIG_ENV.to_string(), config_json.to_string()));
     }
-    for (key, value) in extra_env {
-        builder.env(key, value);
-    }
+    env.extend(extra_env.iter().cloned());
 
     // Hard error rather than a silent fall back to the unscoped workdir (which would widen
     // the grant) or to no preopen at all (which would look like a guest bug).
@@ -7532,9 +7986,21 @@ fn build_wasi_ctx(
         Some(scope) => resolve_scoped_dir(workdir, scope)?,
     };
 
-    let planned =
+    let preopens =
         crate::guest_roots::planned_preopens(&preopen_root, state_dir, runtime_dir, extra_roots);
-    for preopen in planned {
+    Ok(WasiPlan { env, preopens })
+}
+
+/// The WASI context `plan` describes, with the process's own stdio. Reads nothing of the
+/// process's environment, so a guest worker with an empty one builds the same context the
+/// supervisor planned.
+pub(crate) fn apply_wasi_plan(plan: &WasiPlan) -> Result<WasiCtx, RuntimeError> {
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdio();
+    for (key, value) in &plan.env {
+        builder.env(key, value);
+    }
+    for preopen in &plan.preopens {
         let perms = if preopen.read_only {
             FsPerms::ReadOnly
         } else {
@@ -7544,7 +8010,6 @@ fn build_wasi_ctx(
             .preopened_dir(&preopen.host_path, &preopen.guest_path, perms)
             .map_err(|err| RuntimeError::wasi(preopen.host_path.clone(), err.to_string()))?;
     }
-
     Ok(builder.build())
 }
 
@@ -8085,6 +8550,9 @@ pub(crate) struct RequiredFieldRefusal {
 }
 
 pub(crate) struct CapsuleStoreState {
+    /// The session's guest workers, when this process runs its guests in worker processes:
+    /// every tool and driver call dispatched from here then runs in one. `None` runs them here.
+    pub(crate) guest_workers: Option<Arc<crate::guest_worker::GuestWorkers>>,
     /// Resource limiter for this store, registered via `Store::limiter`. Also the record of
     /// any growth request it denied, which `classify_guest_failure` reads to tell a
     /// limit trap apart from a guest panic.
@@ -9257,8 +9725,90 @@ pub(crate) async fn invoke_tool_component(
     component: &Component,
     input: murmur::tool::run::ToolInput,
 ) -> Result<murmur::tool::run::ToolResult, String> {
-    let ToolInvokeEnv {
+    let engine = env.engine;
+    let call_deadlines = env.call_deadlines.clone();
+    let (spec, host) = prepare_tool_call(env, a2a, name)?;
+    execute_tool_call(
         engine,
+        &spec,
+        ToolHostSide::Local(Box::new(host)),
+        &call_deadlines,
+        component,
+        input,
+    )
+    .await
+}
+
+/// Everything a tool or driver store is built from that the supervisor decides: the guest's
+/// environment and preopens, its limits and the role its calls are recorded under. Sent whole
+/// to the guest worker that runs the call; it carries no credential.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolCallSpec {
+    pub(crate) name: String,
+    pub(crate) role: ComponentRole,
+    pub(crate) limits: crate::limits::ExecutionLimits,
+    pub(crate) wasi: WasiPlan,
+}
+
+/// The supervisor-held objects one tool or driver call's host imports reach: the network policy
+/// with its gateway and formation routes, the stream the call's events go to, the input wait and
+/// the session's processes. Never sent to a worker; a worker reaches each through a host call.
+pub(crate) struct ToolCallHost {
+    pub(crate) http_hooks: NetworkPolicyHooks,
+    pub(crate) events: StreamEventsTarget,
+    pub(crate) input: InputWiring,
+    pub(crate) process: crate::session_process::ProcessAccess,
+}
+
+/// What `murmur:task/task#request-input` waits on for one call.
+#[derive(Clone)]
+pub(crate) struct InputWiring {
+    task_registry: Option<Arc<Mutex<TaskRegistry>>>,
+    sse: crate::streaming::StreamSink,
+    task: Option<StreamTask>,
+    timeout_secs: Option<u64>,
+}
+
+impl InputWiring {
+    /// Wiring with no task: every request is refused as outside an A2A task context.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            task_registry: None,
+            sse: None,
+            task: None,
+            timeout_secs: None,
+        }
+    }
+
+    /// The person's answer to `prompt`, or why there is none.
+    pub(crate) async fn request(&self, prompt: String) -> wasmtime::Result<String> {
+        match (self.task_registry.clone(), self.task.clone()) {
+            (Some(reg), Some(task)) => {
+                request_input_impl(task, prompt, reg, self.sse.clone(), self.timeout_secs).await
+            }
+            _ => Err(wasmtime::Error::msg(
+                "request-input is not available outside an A2A task context",
+            )),
+        }
+    }
+}
+
+/// Where a tool or driver store's host imports are answered: by the objects themselves, in this
+/// process, or by the supervisor across the worker's connection.
+pub(crate) enum ToolHostSide {
+    Local(Box<ToolCallHost>),
+    Remote(Arc<crate::guest_worker::RemoteLink>),
+}
+
+/// The supervisor half of a tool or driver call: resolves the grant, the guest environment and
+/// the preopen plan (creating a declared scope directory), and assembles the host objects.
+pub(crate) fn prepare_tool_call(
+    env: ToolInvokeEnv<'_>,
+    a2a: ToolA2aWiring,
+    name: &str,
+) -> Result<(ToolCallSpec, ToolCallHost), String> {
+    let ToolInvokeEnv {
+        engine: _,
         accessible_workdir,
         runtime_dir,
         extra_roots,
@@ -9270,7 +9820,7 @@ pub(crate) async fn invoke_tool_component(
         formation,
         task_provenance,
         role,
-        call_deadlines,
+        call_deadlines: _,
         member_requests,
         task_id,
         process,
@@ -9284,6 +9834,130 @@ pub(crate) async fn invoke_tool_component(
         input_timeout_secs,
     } = a2a;
 
+    let tool_limits = capability_policy.limits;
+    // Both halves of the grant are resolved here, on the one path every WASM tool and the
+    // inference driver share, so a driver needs no enforcement code of its own.
+    let effective_network_rules = effective_tool_network_rules(artifact_grant, network_allow_rules);
+    let filesystem_scope = artifact_grant.and_then(|grant| grant.filesystem_scope.as_deref());
+    // Absent for every artifact that declared no `capabilities.state`, so an undeclared tool is
+    // built with the workdir preopen and nothing else.
+    let state_dir = artifact_grant.and_then(|grant| grant.state_dir.as_deref());
+    // Absent for every artifact that declared no `config:`, so an unconfigured tool is built with
+    // no `MURMUR_ARTIFACT_CONFIG` in its environment at all. Read off this artifact's own grant,
+    // which is what keeps one artifact's config out of every other artifact's guest.
+    let config_json = artifact_grant.and_then(|grant| grant.config_json.as_deref());
+    // Same scoping as the config block: only the store that holds the gateway is told where it is.
+    let gateway = gateway_for_store(gateway, name);
+    let mut guest_env = inference_env.to_vec();
+    if let Some(gateway) = gateway.as_deref() {
+        guest_env.push(gateway_env_pair(gateway));
+    }
+    let wasi = plan_wasi_ctx(
+        accessible_workdir,
+        filesystem_scope,
+        state_dir,
+        config_json,
+        &guest_env,
+        capability_policy,
+        runtime_dir,
+        extra_roots,
+    )
+    .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?;
+    let host = ToolCallHost {
+        http_hooks: NetworkPolicyHooks {
+            network_allow_rules: effective_network_rules.to_vec(),
+            gateway,
+            formation: formation.cloned(),
+            task_provenance,
+            member_requests: Some(MemberRequestScope::new(
+                member_requests,
+                name,
+                role,
+                task_id,
+            )),
+        },
+        events: StreamEventsTarget {
+            sse: a2a_sse.clone(),
+            task: a2a_task.clone(),
+            chunks_emitted: a2a_chunks_emitted,
+            tool_calls: a2a_tool_calls,
+        },
+        input: InputWiring {
+            task_registry: a2a_task_registry,
+            sse: a2a_sse,
+            task: a2a_task,
+            timeout_secs: input_timeout_secs,
+        },
+        process,
+    };
+    let spec = ToolCallSpec {
+        name: name.to_string(),
+        role,
+        limits: tool_limits,
+        wasi,
+    };
+    Ok((spec, host))
+}
+
+/// The four `murmur:stream/events` functions' target: the call's own stream, or the supervisor.
+#[derive(Clone)]
+enum EventsSink {
+    Local(StreamEventsTarget),
+    Remote(Arc<crate::guest_worker::RemoteLink>),
+}
+
+impl EventsSink {
+    fn emit(&self, event: crate::guest_worker::StreamEvent) {
+        use crate::guest_worker::StreamEvent;
+        match self {
+            Self::Remote(link) => link.stream_event(event),
+            Self::Local(target) => match event {
+                StreamEvent::Chunk(chunk) => stream_events::emit_chunk(target, &chunk),
+                StreamEvent::ThinkingChunk(chunk) => {
+                    stream_events::emit_thinking_chunk(target, &chunk)
+                }
+                StreamEvent::ToolCallStarted { id, name } => {
+                    stream_events::tool_call_started(target, &id, &name)
+                }
+                StreamEvent::ToolCallInputBytes { id, bytes } => {
+                    stream_events::tool_call_input_bytes(target, &id, bytes, Instant::now())
+                }
+            },
+        }
+    }
+}
+
+/// The guest half of a tool or driver call: builds the store from `spec`, wires every host import
+/// to `side`, and instantiates and runs `component`, each phase under the wall-clock bound. The
+/// same body runs in a guest worker, with [`ToolHostSide::Remote`], and in-process.
+pub(crate) async fn execute_tool_call(
+    engine: &Engine,
+    spec: &ToolCallSpec,
+    side: ToolHostSide,
+    call_deadlines: &CallDeadlines,
+    component: &Component,
+    input: murmur::tool::run::ToolInput,
+) -> Result<murmur::tool::run::ToolResult, String> {
+    let name = spec.name.as_str();
+    let role = spec.role;
+    let (events, input_sink, http_hooks, process) = match side {
+        ToolHostSide::Local(host) => {
+            let host = *host;
+            (
+                EventsSink::Local(host.events),
+                InputSink::Local(host.input),
+                ToolHttpHooks::Local(host.http_hooks),
+                host.process,
+            )
+        }
+        ToolHostSide::Remote(link) => (
+            EventsSink::Remote(Arc::clone(&link)),
+            InputSink::Remote(Arc::clone(&link)),
+            ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(Arc::clone(&link))),
+            crate::session_process::ProcessAccess::Remote(link),
+        ),
+    };
+
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|err| format!("failed to add WASI linker for tool '{name}': {err}"))?;
@@ -9296,32 +9970,27 @@ pub(crate) async fn invoke_tool_component(
     // .instance() for the same interface name. Registered under the versioned name only (see
     // WIT_STREAM_EVENTS_IFACE / wit/VERSIONING.md).
     {
+        use crate::guest_worker::StreamEvent;
         let events_iface = WIT_STREAM_EVENTS_IFACE;
-        let target = StreamEventsTarget {
-            sse: a2a_sse.clone(),
-            task: a2a_task.clone(),
-            chunks_emitted: a2a_chunks_emitted,
-            tool_calls: a2a_tool_calls,
-        };
         let mut inst = linker.instance(events_iface).map_err(|err| {
             format!("failed to define {events_iface} instance for '{name}': {err}")
         })?;
 
-        let chunk_target = target.clone();
+        let chunk_target = events.clone();
         inst.func_wrap(
             "emit-chunk",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
-                stream_events::emit_chunk(&chunk_target, &chunk);
+                chunk_target.emit(StreamEvent::Chunk(chunk));
                 Ok(())
             },
         )
         .map_err(|err| format!("failed to register emit-chunk for tool '{name}': {err}"))?;
 
-        let thinking_target = target.clone();
+        let thinking_target = events.clone();
         inst.func_wrap(
             "emit-thinking-chunk",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
-                stream_events::emit_thinking_chunk(&thinking_target, &chunk);
+                thinking_target.emit(StreamEvent::ThinkingChunk(chunk));
                 Ok(())
             },
         )
@@ -9329,12 +9998,15 @@ pub(crate) async fn invoke_tool_component(
             format!("failed to register emit-thinking-chunk for tool '{name}': {err}")
         })?;
 
-        let started_target = target.clone();
+        let started_target = events.clone();
         inst.func_wrap(
             "tool-call-started",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
                   (id, call_name): (String, String)| {
-                stream_events::tool_call_started(&started_target, &id, &call_name);
+                started_target.emit(StreamEvent::ToolCallStarted {
+                    id,
+                    name: call_name,
+                });
                 Ok(())
             },
         )
@@ -9344,7 +10016,7 @@ pub(crate) async fn invoke_tool_component(
             "tool-call-input-bytes",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
                   (id, bytes): (String, u64)| {
-                stream_events::tool_call_input_bytes(&target, &id, bytes, Instant::now());
+                events.emit(StreamEvent::ToolCallInputBytes { id, bytes });
                 Ok(())
             },
         )
@@ -9358,10 +10030,6 @@ pub(crate) async fn invoke_tool_component(
     // Components that do not import this interface ignore the registration.
     {
         let task_iface = WIT_TASK_IFACE;
-        let ri_task_registry = a2a_task_registry.clone();
-        let ri_sse = a2a_sse.clone();
-        let ri_task = a2a_task.clone();
-        let ri_timeout = input_timeout_secs;
         linker
             .instance(task_iface)
             .map_err(|err| format!("failed to define {task_iface} instance for '{name}': {err}"))?
@@ -9369,22 +10037,10 @@ pub(crate) async fn invoke_tool_component(
                 "request-input",
                 move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
                       (prompt,): (String,)| {
-                    let reg = ri_task_registry.clone();
-                    let sse = ri_sse.clone();
-                    let task = ri_task.clone();
+                    let sink = input_sink.clone();
                     let fut: std::pin::Pin<
                         Box<dyn std::future::Future<Output = wasmtime::Result<(String,)>> + Send>,
-                    > = Box::pin(async move {
-                        let result = match (reg, task) {
-                            (Some(reg), Some(task)) => {
-                                request_input_impl(task, prompt, reg, sse, ri_timeout).await
-                            }
-                            _ => Err(wasmtime::Error::msg(
-                                "request-input is not available outside an A2A task context",
-                            )),
-                        };
-                        result.map(|s| (s,))
-                    });
+                    > = Box::pin(async move { sink.request(prompt).await.map(|s| (s,)) });
                     Box::new(fut)
                         as Box<
                             dyn std::future::Future<Output = wasmtime::Result<(String,)>>
@@ -9411,51 +10067,19 @@ pub(crate) async fn invoke_tool_component(
         )
     })?;
 
-    let tool_limits = capability_policy.limits;
-    // Both halves of the grant are resolved here, on the one path every WASM tool and the
-    // inference driver share, so a driver needs no enforcement code of its own.
-    let effective_network_rules = effective_tool_network_rules(artifact_grant, network_allow_rules);
-    let filesystem_scope = artifact_grant.and_then(|grant| grant.filesystem_scope.as_deref());
-    // Absent for every artifact that declared no `capabilities.state`, so an undeclared tool is
-    // built with the workdir preopen and nothing else.
-    let state_dir = artifact_grant.and_then(|grant| grant.state_dir.as_deref());
-    // Absent for every artifact that declared no `config:`, so an unconfigured tool is built with
-    // no `MURMUR_ARTIFACT_CONFIG` in its environment at all. Read off this artifact's own grant,
-    // which is what keeps one artifact's config out of every other artifact's guest.
-    let config_json = artifact_grant.and_then(|grant| grant.config_json.as_deref());
-    // Same scoping as the config block: only the store that holds the gateway is told where it is.
-    let gateway = gateway_for_store(gateway, name);
-    let mut guest_env = inference_env.to_vec();
-    if let Some(gateway) = gateway.as_deref() {
-        guest_env.push(gateway_env_pair(gateway));
-    }
+    let tool_limits = spec.limits;
+    let site = match role {
+        ComponentRole::Driver => crate::guest_worker::StoreSite::Driver,
+        _ => crate::guest_worker::StoreSite::Tool,
+    };
+    crate::guest_worker::check_store_placement(site).map_err(|err| err.to_string())?;
     let state = ToolStoreState {
         limits: tool_limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(
-            accessible_workdir,
-            filesystem_scope,
-            state_dir,
-            config_json,
-            &guest_env,
-            capability_policy,
-            runtime_dir,
-            extra_roots,
-        )
-        .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
+        wasi: apply_wasi_plan(&spec.wasi)
+            .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
         http: WasiHttpCtx::new(),
-        http_hooks: NetworkPolicyHooks {
-            network_allow_rules: effective_network_rules.to_vec(),
-            gateway,
-            formation: formation.cloned(),
-            task_provenance,
-            member_requests: Some(MemberRequestScope::new(
-                member_requests,
-                name,
-                role,
-                task_id,
-            )),
-        },
+        http_hooks,
         process,
     };
 
@@ -9527,6 +10151,55 @@ pub(crate) async fn invoke_tool_component(
         }
     };
     Ok(result)
+}
+
+/// `request-input`'s answerer: the call's own input wait, or the supervisor.
+#[derive(Clone)]
+enum InputSink {
+    Local(InputWiring),
+    Remote(Arc<crate::guest_worker::RemoteLink>),
+}
+
+impl InputSink {
+    async fn request(&self, prompt: String) -> wasmtime::Result<String> {
+        match self {
+            Self::Local(wiring) => wiring.request(prompt).await,
+            Self::Remote(link) => link.request_input(prompt).await,
+        }
+    }
+}
+
+/// A tool store's `wasi:http` policy: the network policy itself, or the supervisor applying it.
+pub(crate) enum ToolHttpHooks {
+    Local(NetworkPolicyHooks),
+    Remote(crate::guest_worker::RemoteHttp),
+}
+
+#[cfg(test)]
+impl ToolHttpHooks {
+    /// [`NetworkPolicyHooks::admit`] for a local policy.
+    pub(crate) fn admit(&self, uri: &http::Uri) -> Result<Admission, WasiHttpError> {
+        match self {
+            Self::Local(hooks) => hooks.admit(uri),
+            Self::Remote(_) => panic!("a remote policy is applied by the supervisor"),
+        }
+    }
+}
+
+impl WasiHttpHooks for ToolHttpHooks {
+    fn send_request(
+        &mut self,
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        response_errors: Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>,
+    ) -> Box<
+        dyn Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>> + Send,
+    > {
+        match self {
+            Self::Local(hooks) => hooks.send_request(request, options, response_errors),
+            Self::Remote(remote) => remote.send_request(request, options, response_errors),
+        }
+    }
 }
 
 /// Reduce a dispatched result to the one string the model will read, and fence it under
@@ -9730,44 +10403,72 @@ impl CapsuleStoreState {
             return Err(format!("tool '{name}' is not available in this session"));
         };
         let extra_roots = self.extra_roots_preopen(name);
+        let env = ToolInvokeEnv {
+            engine: &self.engine,
+            accessible_workdir: &self.accessible_workdir,
+            runtime_dir: self.runtime_dir_preopen(name),
+            extra_roots: &extra_roots,
+            inference_env,
+            capability_policy: &self.capability_policy,
+            network_allow_rules: &self.network_allow_rules,
+            // Absent for every artifact that declared no `capabilities:` block, and for
+            // anything pulled in at runtime via `manage.pull()` (which has no operator
+            // manifest entry to narrow from) — both keep the full ceiling.
+            artifact_grant: self.artifact_grants.get(name),
+            gateway,
+            formation: self.http_hooks.formation.as_ref(),
+            task_provenance: self.current_task_provenance,
+            role,
+            call_deadlines: &self.call_deadlines,
+            member_requests: &self.member_requests,
+            task_id: self.current_task_id.clone(),
+            process,
+        };
+        let a2a = ToolA2aWiring {
+            sse: self.a2a_sse.clone(),
+            task: self.a2a_task.clone(),
+            chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
+            tool_calls,
+            task_registry: self.a2a_task_registry.clone(),
+            input_timeout_secs: self.input_timeout_secs,
+        };
+        if let Some(workers) = &self.guest_workers {
+            let (spec, host) = prepare_tool_call(env, a2a, name)?;
+            let kind = self.worker_kind_of(name);
+            return Box::pin(workers.run_tool(
+                kind,
+                component,
+                spec,
+                host,
+                input,
+                &self.call_deadlines,
+            ))
+            .await;
+        }
         // Boxed: the invocation's state machine is large, and inlined into every caller's future
         // it overflows a 2 MiB thread stack on the process transport's bridged path, which
         // `launch_session` drives on the caller's own thread.
-        Box::pin(invoke_tool_component(
-            ToolInvokeEnv {
-                engine: &self.engine,
-                accessible_workdir: &self.accessible_workdir,
-                runtime_dir: self.runtime_dir_preopen(name),
-                extra_roots: &extra_roots,
-                inference_env,
-                capability_policy: &self.capability_policy,
-                network_allow_rules: &self.network_allow_rules,
-                // Absent for every artifact that declared no `capabilities:` block, and for
-                // anything pulled in at runtime via `manage.pull()` (which has no operator
-                // manifest entry to narrow from) — both keep the full ceiling.
-                artifact_grant: self.artifact_grants.get(name),
-                gateway,
-                formation: self.http_hooks.formation.as_ref(),
-                task_provenance: self.current_task_provenance,
-                role,
-                call_deadlines: &self.call_deadlines,
-                member_requests: &self.member_requests,
-                task_id: self.current_task_id.clone(),
-                process,
-            },
-            ToolA2aWiring {
-                sse: self.a2a_sse.clone(),
-                task: self.a2a_task.clone(),
-                chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
-                tool_calls,
-                task_registry: self.a2a_task_registry.clone(),
-                input_timeout_secs: self.input_timeout_secs,
-            },
-            name,
-            component,
-            input,
-        ))
-        .await
+        Box::pin(invoke_tool_component(env, a2a, name, component, input)).await
+    }
+
+    /// The session's lost guest worker, as the error that ends the task and the session.
+    pub(crate) fn guest_worker_lost(&self) -> Option<RuntimeError> {
+        self.guest_workers
+            .as_ref()
+            .and_then(|workers| workers.lost())
+            .map(RuntimeError::GuestWorkerLost)
+    }
+
+    /// The worker that runs tool `name`: the driver worker for a `runtime: driver` artifact, the
+    /// tools worker for every other.
+    pub(crate) fn worker_kind_of(&self, name: &str) -> crate::guest_worker::WorkerKind {
+        self.installed_artifacts
+            .iter()
+            .find(|artifact| murmur_artifact::tool_name_of(&artifact.name) == name)
+            .and_then(|artifact| {
+                crate::guest_worker::WorkerKind::for_runtime(artifact.runtime.clone())
+            })
+            .unwrap_or(crate::guest_worker::WorkerKind::Tools)
     }
 
     /// Resolve what a tool call is about to run, for the policy decision point.
@@ -11754,7 +12455,7 @@ struct ToolStoreState {
     table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
-    http_hooks: NetworkPolicyHooks,
+    http_hooks: ToolHttpHooks,
     /// What `murmur:process` serves this call: the session's processes, or the reason it serves
     /// nothing.
     process: crate::session_process::ProcessAccess,
@@ -18358,6 +19059,7 @@ inference:
         // One root for both, as `stage_session` holds them without `--workdir`: one latch.
         let root = WorkdirRoot::open(&workdir).unwrap();
         CapsuleStoreState {
+            guest_workers: None,
             limits: crate::limits::ExecutionLimits::default().limiter(),
             call_deadlines: CallDeadlines::default(),
             member_requests: MemberRequests::default(),
@@ -24865,6 +25567,7 @@ inference:
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: MemberRequests::default(),
+            guest_workers: None,
         });
         let mut hooks =
             crate::hooks::test_support::inference_calling_hooks(&state.engine, &workdir, ctx).await;
