@@ -666,6 +666,11 @@ fn killing_the_tools_worker_fails_the_task_and_ends_the_records() {
 /// moves with it: each worker's `/proc/<pid>/cgroup` equals `mur`'s.
 #[test]
 fn workers_share_the_cgroup_mur_moves_into() {
+    // A shell grant needs the capsule's own network namespace, which staging refuses
+    // (`E-CAP-005`) on a host that cannot create one.
+    if capsule_runtime::skip_without_egress_namespace("workers_share_the_cgroup_mur_moves_into") {
+        return;
+    }
     let home = Home::new();
     let upstream = Upstream::start(vec![END_TURN.to_string()]);
     let extra = format!(
