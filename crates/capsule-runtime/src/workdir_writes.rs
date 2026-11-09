@@ -1001,17 +1001,21 @@ mod tests {
         (
             "record_seal.rs",
             "create_seed",
-            "Creates `~/.murmur/keys/record-seal.key` under a temporary name opened with `O_NOFOLLOW | O_EXCL` and links it into place: the murmur home's key folder, outside every work folder and records directory.",
+            "Creates `~/.murmur/keys/record-seal.key` under a temporary name opened with \
+             `O_NOFOLLOW | O_EXCL` and links it into place: the murmur home's key folder, outside \
+             every work folder and records directory.",
         ),
         (
             "record_seal.rs",
             "read_seed",
-            "Opens `~/.murmur/keys/record-seal.key` with `O_NOFOLLOW` and checks its type, owner and mode before reading it: outside every work folder.",
+            "Opens `~/.murmur/keys/record-seal.key` with `O_NOFOLLOW` and checks its type, owner and \
+             mode before reading it: outside every work folder.",
         ),
         (
             "record_seal.rs",
             "load_or_create_uncached",
-            "Creates `~/.murmur/keys` and writes `record-seal.pub` beside the key: the murmur home, outside every work folder.",
+            "Creates `~/.murmur/keys` and writes `record-seal.pub` beside the key: the murmur home, \
+             outside every work folder.",
         ),
         (
             "record_seal.rs",

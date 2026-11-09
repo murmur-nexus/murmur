@@ -523,9 +523,13 @@ pub fn resolve_host_paths(
                 return Err(refuse(
                     Some(path.clone()),
                     format!(
-                        "is or contains {}, which holds the record-seal key that signs every                          session's records; no capsule may reach it, at any access. Name a                          folder that does not contain it, such as {}",
+                        "is or contains {}, which holds the record-seal key that signs every \
+                         session's records; no capsule may reach it, at any access. Name a \
+                         folder that does not contain it, such as {}",
                         keys.display(),
-                        murmur_home.join(crate::records_dir::RECORDS_DIR_NAME).display()
+                        murmur_home
+                            .join(crate::records_dir::RECORDS_DIR_NAME)
+                            .display()
                     ),
                 ));
             }

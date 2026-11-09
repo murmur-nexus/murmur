@@ -299,24 +299,12 @@ stays under the old path.
 ### Sealed records { #sealed-records }
 
 `trace.jsonl`, `hooks/eval.jsonl`, `completion.json` and the session's
-[conversation record](#the-conversation-record) are sealed with the host's record-seal key, so
-[`mur trace verify`](cli.md#mur-trace-verify) can say whether any of them changed, given only the
-public key. The format, the verdicts and when each seal is written are under
-[Sealed records](observability-schemas.md#sealed-records). The key lives under `~/.murmur/keys`:
-
-| Path | Contents | Mode |
-|---|---|---|
-| `~/.murmur/keys/` | Created by the first launch that seals a record | `0700` |
-| `~/.murmur/keys/record-seal.key` | The Ed25519 seed, 64 hex characters | `0600`. A launch refuses a key file that is a link, owned by another user, or readable by group or others, and its records read as unsealed |
-| `~/.murmur/keys/record-seal.pub` | The public key, 64 hex characters | `0644`. Written again when missing |
-
-No capsule command reaches `~/.murmur/keys` at `scoped` or `sealed`, and a
-[`host_paths`](config.md#host-paths) entry that is or contains it is refused
-([containment](containment.md#record-seal-key)).
-
-`home/`, `tmp/`, `logs/`, `out/` and `blobs/` are not sealed streams: `home/` and `tmp/` are the
-commands' own, and a blob is named by its sha256, which the sealed trace records. Deleting a stream
-together with its seal reads as `absent`.
+[conversation record](#the-conversation-record) are sealed with the host's record-seal key in
+`~/.murmur/keys` ([modes](config.md#murmur-home-permissions)), so [`mur trace verify`](cli.md#mur-trace-verify)
+can say whether any of them changed, given only the public key. The format, the verdicts, when
+each seal is written and what is not sealed are under
+[Sealed records](observability-schemas.md#sealed-records). No capsule command reaches
+`~/.murmur/keys` at `scoped` or `sealed` ([containment](containment.md#record-seal-key)).
 
 Beside the session directories, a group holds one [eval-run record](observability-schemas.md#eval-run-record),
 `evr_<32 hex>.json`, for each `mur eval run` whose baseline capsule's workdir root it is.

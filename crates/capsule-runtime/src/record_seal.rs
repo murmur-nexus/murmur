@@ -488,15 +488,6 @@ fn host_key_for(session_id: &str) -> Option<Arc<HostKey>> {
     }
 }
 
-/// The key id this process would seal with, without reporting a failure.
-#[must_use]
-pub fn host_key_id() -> Option<String> {
-    let home = seal_home()?.ok()?;
-    HostKey::load_or_create(&home)
-        .ok()
-        .map(|key| key.key_id().to_string())
-}
-
 // ── The seal file ─────────────────────────────────────────────────────────────
 
 /// `trace.jsonl.seal`'s pointer to the conversation record its session appended to. Not signed.
@@ -1529,6 +1520,19 @@ fn read_stream(root: &WorkdirRoot, rel: &str) -> Result<Option<Vec<u8>>, String>
     }
 }
 
+/// A conversation record found under `conversation_root` by the name the trace's seal points at,
+/// but sealed by another key than the trace: a record of the same capsule and context id on the
+/// host doing the checking, not the one the trace's host appended to. A host seals every stream
+/// with its one key, so the record the pointer meant is not here.
+fn other_hosts_conversation(name: &str, found_key: &str, trace_key: &str) -> StreamReport {
+    let mut report = StreamReport::absent(name);
+    report.detail = format!(
+        "not here: the record of this name was sealed by key {found_key}, and the trace by key \
+         {trace_key}"
+    );
+    report
+}
+
 /// Checks every stream of the records directory `records_dir` with `public_key` alone.
 ///
 /// `trace.jsonl`, `hooks/eval.jsonl` and `completion.json` are read from `records_dir`; the
@@ -1571,6 +1575,8 @@ pub fn verify_session_records(
     };
 
     let mut pointer = None;
+    // The key that sealed the trace: the host's one key, which seals its conversations too.
+    let mut trace_key_id = None;
     match read_stream(&root, TRACE_STREAM) {
         Ok(None) => streams.push(StreamReport::absent(TRACE_STREAM)),
         Err(reason) => streams.push(error_report(TRACE_STREAM, reason)),
@@ -1588,6 +1594,7 @@ pub fn verify_session_records(
                 }
                 Ok(seal) => {
                     pointer = seal.as_ref().and_then(|seal| seal.conversation.clone());
+                    trace_key_id = seal.as_ref().map(|seal| seal.key_id.clone());
                     verify_inline(
                         TRACE_STREAM,
                         &bytes,
@@ -1653,6 +1660,17 @@ pub fn verify_session_records(
                             Err(reason) => error_report(&name, reason),
                             Ok(Some(bytes)) => {
                                 match read_seal(&dir_root, crate::conversation::RECORD_FILE_NAME) {
+                                    Ok(Some(seal))
+                                        if trace_key_id
+                                            .as_deref()
+                                            .is_some_and(|id| id != seal.key_id) =>
+                                    {
+                                        other_hosts_conversation(
+                                            &name,
+                                            &seal.key_id,
+                                            trace_key_id.as_deref().unwrap_or_default(),
+                                        )
+                                    }
                                     Ok(seal) => verify_listed(
                                         &name,
                                         &bytes,

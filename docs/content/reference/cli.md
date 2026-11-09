@@ -3125,8 +3125,9 @@ The second line is printed only when a blob was removed. A record already at or 
 
 ## `mur trace`
 
-Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`, and remove ended sessions. Every command
-but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies no file and launches no capsule.
+Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`, and
+remove ended sessions. Every command but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies
+no file and launches no capsule.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -3157,8 +3158,8 @@ the lines it has, and the command exits `0`:
 | `totals:` | `counted from the events recorded; no session_end recorded the session's own`. The turn, token, tool-call and shell-call totals below are counted from the trace's `inference`, `tool_call`, `shell` and `shell_detached` lines |
 
 `mur trace show` checks the session's records as [`mur trace verify`](#mur-trace-verify) does,
-with this host's public key, and prints a `record:` line after its summary, before the Tasks section, for every
-verdict but `verified`:
+with this host's public key, and prints a `record:` line after its summary, before the Tasks
+section, for every verdict but `verified`:
 
 | Verdict | `record:` line |
 |---|---|
@@ -3975,7 +3976,10 @@ mur trace verify [<session>] [--workdir <dir>] [--public-key <file>] [--json]
 
 It checks every stream of the session: `trace.jsonl`, `hooks/eval.jsonl` and `completion.json`
 beside it, and the conversation record its `trace.jsonl.seal` names, looked up under this host's
-`~/.murmur/conversations`. A stream that is not there reads `absent` and does not count.
+`~/.murmur/conversations`. A stream that is not there reads `absent` and does not count, and so
+does a conversation record of that name sealed by another key than the trace: on another host it
+is that host's own record, not the one the session appended to. A record copied to another
+machine is therefore checked without its conversation record.
 
 Without `--json` it prints one row per stream, then the key it used:
 

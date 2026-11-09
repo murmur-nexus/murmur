@@ -309,7 +309,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 // ── scenarios ────────────────────────────────────────────────────────────────
 
-/// Scenario 1: a finished session's every stream verifies, every trace line chains, the key
+/// A finished session's every stream verifies, every trace line chains, the key
 /// files carry their modes, and the key's bytes appear nowhere but in its own file.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -436,7 +436,7 @@ fn finished_session_verifies() {
     }
 }
 
-/// Scenario 2: one changed byte is named by its stream and line; restoring it verifies again.
+/// One changed byte is named by its stream and line; restoring it verifies again.
 #[test]
 #[allow(clippy::print_stdout)]
 fn one_changed_byte_names_the_line() {
@@ -493,7 +493,7 @@ fn one_changed_byte_names_the_line() {
     p.verify(&records, &[]).success();
 }
 
-/// Scenario 3: cut lines read as unsealed, with where the chain stops and what the seal covers;
+/// Cut lines read as unsealed, with where the chain stops and what the seal covers;
 /// deleting the seal too reads as no seal. Never verified, never changed.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -535,7 +535,7 @@ fn cut_lines_report_no_seal() {
     assert!(stream(&report, "trace.jsonl")["sealed_lines"].is_null());
 }
 
-/// Scenario 4: a runtime killed mid-session leaves a record that says it ended without a seal,
+/// A runtime killed mid-session leaves a record that says it ended without a seal,
 /// with the chain intact through its last complete line.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -579,6 +579,12 @@ fn killed_runtime_is_unsealed() {
         .expect("the killed session left its records");
     let trace = fs::read_to_string(records.join("trace.jsonl")).unwrap();
     let complete = trace.lines().count();
+    assert!(
+        trace.contains("\"event_type\":\"session_start\""),
+        "{trace}"
+    );
+    assert!(!trace.contains("\"event_type\":\"session_end\""), "{trace}");
+    assert!(!records.join("trace.jsonl.seal").exists());
     let unsealed = p.verify(&records, &[]).failure();
     let error = stderr_of(&unsealed);
     println!("── killed\n{}{error}", stdout_of(&unsealed));
@@ -596,10 +602,10 @@ fn killed_runtime_is_unsealed() {
     assert!(mark.contains("unsealed"), "{mark}");
 }
 
-/// Scenario 5: a capsule command at `scoped` or `sealed` cannot read the host's record-seal key,
-/// and at `sealed` cannot stat it either. The home is outside `/tmp`, which both tiers replace with a private one, so
-/// the refusal is the tier's own: Landlock's `EACCES` at `scoped`, absence from the composed root
-/// at `sealed`.
+/// A capsule command at `scoped` or `sealed` cannot read the host's record-seal key, and at
+/// `sealed` cannot stat it either. The home is outside `/tmp`, which both tiers replace with a
+/// private one, so the refusal is the tier's own: Landlock's `EACCES` at `scoped`, absence from
+/// the composed root at `sealed`.
 fn commands_cannot_read_the_seal_key(test: &str, floor: ContainmentClass) {
     if skip(test) {
         return;
@@ -686,7 +692,7 @@ fn commands_cannot_read_the_seal_key_at_sealed() {
     );
 }
 
-/// Scenario 7: a record copied off its host verifies anywhere, given only that host's public
+/// A record copied off its host verifies anywhere, given only that host's public
 /// key; without it, the record names the key that sealed it and the key it was checked with.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -699,7 +705,9 @@ fn another_hosts_record_needs_only_its_public_key() {
     let (records_a, _) = a.run("ctx-host-a");
     let server_b = common::ScriptedServer::start(ordinary_script());
     let b = project(&server_b.endpoint, "");
-    b.run("ctx-host-b");
+    // The same context id on both hosts: B holds a conversation record of the same name, sealed
+    // by B's key, which is not the one A's trace points at.
+    b.run("ctx-host-a");
 
     let elsewhere = TempDir::new().unwrap();
     let copy = elsewhere.path().join("copied-record");
@@ -733,6 +741,11 @@ fn another_hosts_record_needs_only_its_public_key() {
         text.contains(&format!("record: verified, checked with key {a_id}")),
         "{text}"
     );
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("conversation:seal-capsule/ctx-host-a"))
+        .unwrap_or_else(|| panic!("no conversation row: {text}"));
+    assert!(row.contains("absent"), "{row}");
 
     let foreign = mur(b.home.path())
         .args(["trace", "verify", trace.to_str().unwrap()])
@@ -745,7 +758,7 @@ fn another_hosts_record_needs_only_its_public_key() {
     assert!(error.contains(&b_id), "{error}");
 }
 
-/// Scenario 8: the `capsule.session` span carries the chain head at `session_end`.
+/// The `capsule.session` span carries the chain head at `session_end`.
 #[test]
 fn session_span_carries_the_chain_head() {
     if skip("session_span_carries_the_chain_head") {
@@ -799,7 +812,7 @@ fn session_span_carries_the_chain_head() {
     assert_eq!(seal["head"], head.as_str());
 }
 
-/// Scenario 10: a truncated conversation verifies after `mur conversation truncate`, a second
+/// A truncated conversation verifies after `mur conversation truncate`, a second
 /// run's appends are resealed with every earlier message byte for byte, and every write of a
 /// delegated child's `completion.json` leaves a seal that verifies.
 #[test]
@@ -888,7 +901,7 @@ fn completion_json() -> Value {
     })
 }
 
-/// Scenario 11: a trace written before records were sealed is unverifiable and every reader
+/// A trace written before records were sealed is unverifiable and every reader
 /// still reads it; a wide or linked key leaves the session running and its record unsealed;
 /// a missing public half is written again; two first launches share one key.
 #[test]

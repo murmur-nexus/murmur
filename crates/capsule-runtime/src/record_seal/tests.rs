@@ -471,7 +471,7 @@ fn record_seal_listed_streams_name_a_changed_appended_or_cut_line() {
     assert_eq!(scratch.verify().verdict, Verdict::Unsealed);
 }
 
-/// The phase rule's timing: one key load and seal, and `verify` of a 10 000-line trace. Asserts
+/// Prints the time of one key load and seal, and of `verify` on a 10 000-line trace. Asserts
 /// nothing about the numbers.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -518,4 +518,40 @@ fn record_seal_a_held_flock_costs_one_wait_not_one_per_line() {
     drop(reader);
     seal_session_end(&root, "ses_0001").unwrap();
     assert_eq!(scratch.verify().verdict, Verdict::Verified);
+}
+
+/// A conversation record found by the trace's pointer but sealed by another key is the checking
+/// host's own record of the same capsule and context id: it reads `absent`, and a copied record
+/// verifies with its own host's public key.
+#[test]
+fn record_seal_another_hosts_conversation_of_the_same_name_is_not_this_records() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    write_events(&root, 3);
+    let conversations = scratch._dir.path().join("conversations");
+    let dir = conversations.join("seal-review").join("ctx-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("conversation.jsonl"), "{\"a\":1}\n{\"b\":2}\n").unwrap();
+    seal_conversation(&dir, "ses_0001");
+    let pointer = ConversationPointer {
+        record: "seal-review".into(),
+        context_id: "ctx-1".into(),
+    };
+    seal_inline(&root, TRACE_STREAM, "ses_0001", Some(pointer)).unwrap();
+    let key = scratch.public_key();
+    let own = verify_session_records(&scratch.records, Some(&key), Some(&conversations));
+    assert_eq!(own.verdict, Verdict::Verified, "{own:#?}");
+    assert_eq!(own.streams[3].verdict, Verdict::Verified, "{own:#?}");
+
+    // The same name on another host, sealed there under that host's key.
+    let other = tempfile::tempdir().unwrap();
+    set_test_seal_home(Some(other.path().to_path_buf()));
+    std::fs::write(dir.join("conversation.jsonl"), "{\"c\":3}\n").unwrap();
+    seal_conversation(&dir, "ses_other");
+    let report = verify_session_records(&scratch.records, Some(&key), Some(&conversations));
+    let conversation = &report.streams[3];
+    assert_eq!(conversation.stream, "conversation:seal-review/ctx-1");
+    assert_eq!(conversation.verdict, Verdict::Absent, "{report:#?}");
+    assert!(conversation.detail.contains("not here"), "{report:#?}");
+    assert_eq!(report.verdict, Verdict::Verified, "{report:#?}");
 }

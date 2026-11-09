@@ -1909,9 +1909,20 @@ verify it on another machine.
 
 **What is not covered.** The records directory's `home/`, `tmp/`, `logs/` and `out/` are not
 sealed streams, nor is `blobs/` (each blob is named by its own sha256, which the trace records).
-Deleting a stream together with its seal reads as `absent`. At `advisory` and `unconfined` a
-capsule's commands can reach the key, so a record sealed under those tiers proves only that
-`mur` or the capsule wrote it ([containment](containment.md#record-seal-key)).
+Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.seal`'s
+`conversation` pointer is not signed, so removing it drops the conversation record from the check.
+
+**Who can re-seal.** A seal proves a record unchanged by anything that cannot read
+`record-seal.key`:
+
+| Who | Can read the key |
+|---|---|
+| A capsule's commands at `scoped` or `sealed` | No ([containment](containment.md#record-seal-key)) |
+| A capsule's commands at `advisory` or `unconfined` | Yes: a record sealed under those tiers proves only that `mur` or the capsule wrote it |
+| Any other process running as your user | Yes: it can change a record and seal it again |
+
+To keep a copy of each session's head that nothing on the host can rewrite, export spans to an
+OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-span-emission).
 
 ## Task stream `artifact` frame { #task-stream-artifact-frame }
 
@@ -2109,9 +2120,9 @@ rewrite, held wherever the spans are exported:
 | `murmur.record.key_id` | The `key_id` of the key that sealed it. Absent on a span posted before `session_end`, and when no key was usable |
 
 An agent session posts each task's `capsule.session` span when the next task begins, and the last
-one at teardown, after `session_end` is sealed. A script capsule posts one `capsule.session` span for its run, with a
-`capsule.tool_call` child for each `invoke`, and stamps its outgoing `murmur:message/send`
-requests, and their `a2a_send.traceparent`, with that session span.
+one at teardown, after `session_end` is sealed. A script capsule posts one `capsule.session` span
+for its run, with a `capsule.tool_call` child for each `invoke`, and stamps its outgoing
+`murmur:message/send` requests, and their `a2a_send.traceparent`, with that session span.
 
 **Non-obvious behaviour:**
 

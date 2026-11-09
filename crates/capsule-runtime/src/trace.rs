@@ -4985,21 +4985,20 @@ fn credential_change_fields(
 
 // ── Resource-plane appender ───────────────────────────────────────────────────
 
-/// A second, independent `O_APPEND` handle to the session's `trace.jsonl`, used by the resource
-/// plane, by the peer plane's listener, and by the peer-handoff tools in the agent loop.
+/// A second appender to the session's `trace.jsonl`, used by the resource plane, by the peer
+/// plane's listener, and by the peer-handoff tools in the agent loop.
 ///
-/// [`TraceWriter`] is `&mut`-owned by the agent loop and cannot be shared, and the motivating
-/// case for a resource-plane event — a gateway reading a finished-but-alive capsule — happens
-/// after `session_end` has already been written. So the plane gets its own handle rather than a
-/// borrow of the loop's, and every event is written at the moment of the request rather than
-/// deferred to a task boundary: a denied read that only surfaced at the next task end would be a
-/// record of the wrong thing at the wrong time.
+/// [`TraceWriter`] is `&mut`-owned by the agent loop and cannot be shared, and a resource-plane
+/// event — a gateway reading a finished-but-alive capsule — can happen after `session_end` has
+/// already been written. So the plane gets its own appender rather than a borrow of the loop's,
+/// and every event is written at the moment of the request rather than deferred to a task
+/// boundary: a denied read that only surfaced at the next task end would be a record of the wrong
+/// thing at the wrong time.
 ///
-/// Interleaving is safe because both writers emit exactly one complete line per `write_all` and
-/// flush it, and `O_APPEND` makes each such write atomic against the other's.
+/// Interleaving is safe because every appender of the file writes through one shared
+/// [`crate::record_seal::InlineChain`], which writes each line whole, chained to the one before.
 pub struct ResourceTraceAppender {
-    /// The trace's chain, shared with [`TraceWriter`]. Held across `admit` and the write, so no
-    /// other line lands between them; never across an `await`.
+    /// The trace's chain, shared with [`TraceWriter`]; never held across an `await`.
     chain: Arc<crate::record_seal::InlineChain>,
     /// Serializes `admit` with the line it admits.
     admit: std::sync::Mutex<()>,
@@ -5661,9 +5660,8 @@ impl ResourceTraceAppender {
 /// accounts for together.
 ///
 /// Writing to another session's trace is safe because that session's writer is dead — that is the
-/// precondition for there being anything unaccounted — and because this obeys the same rule
-/// [`ResourceTraceAppender`] does: one complete line per `write_all`, then flush, which `O_APPEND`
-/// makes atomic against any other writer.
+/// precondition for there being anything unaccounted — and because it writes through the file's
+/// [`crate::record_seal::InlineChain`], which takes the file's `flock` and writes each line whole.
 pub(crate) struct PriorSessionTraceAppender {
     /// The prior trace's chain: a torn last line is terminated, and its hash chained, by the
     /// first append.
