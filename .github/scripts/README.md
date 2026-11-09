@@ -159,3 +159,144 @@ those two matrices are written in rather than YAML in general.
 `build-macos` runs only on a release tag, so an Apple target missing from CI's
 matrix would first be compiled by a release. Adding an Apple target means
 adding it to both matrices.
+
+---
+
+## The `contained` job's scripts
+
+`ci.yml`'s `contained` job runs the workspace suite on a runner it has first made into a host
+that installs the `scoped` and `sealed` containment classes, and fails if it has not. These four
+scripts are its steps, in the order the job runs them. Each prints what it found at every step,
+so a failed run is still evidence. Each writes to `$GITHUB_STEP_SUMMARY` only when that variable
+is set, and prints `::error::` annotations only when `GITHUB_ACTIONS=true`.
+
+---
+
+## `prepare-contained-runner.sh`
+
+```bash
+.github/scripts/prepare-contained-runner.sh
+```
+
+**Used by:** `ci.yml`'s `contained` job, step "Prepare the host for scoped and sealed".
+
+Run from a checkout, as a user with passwordless sudo. It changes host-wide settings, so it is
+meant for a disposable runner. In order:
+
+1. Prints the kernel, the active LSMs and `kernel.apparmor_restrict_unprivileged_userns`, and
+   fails if Landlock is not an active LSM.
+2. Fails if sudo needs a password.
+3. Grants user namespaces to the checkout's `target/{debug,release}/mur` with
+   `sudo scripts/install-dev-apparmor.sh`. If that fails or loads no `mur-sealed-dev` profile, it
+   sets `kernel.apparmor_restrict_unprivileged_userns=0` instead. It says which it used.
+4. Installs `/etc/systemd/system/user@.service.d/10-murmur-delegate.conf` with
+   `Delegate=memory pids cpu io`, restarts a user manager that was already running, and enables
+   lingering, so a user manager runs for this user and delegates those controllers.
+5. Waits up to 30 s for the user manager's bus, then writes `XDG_RUNTIME_DIR`,
+   `DBUS_SESSION_BUS_ADDRESS` and `CONTAINED_USERNS_GRANT` (the mechanism step 3 used) to
+   `$GITHUB_ENV`. Without `$GITHUB_ENV` it prints the `export` lines instead.
+6. Runs `check-cgroup-delegation.sh`.
+
+| Exit | Meaning |
+|---|---|
+| `0` | the host is prepared |
+| `1` | a step failed; the message names the step and, for an unexpected command failure, the command |
+
+---
+
+## `check-cgroup-delegation.sh`
+
+```bash
+bash .github/scripts/check-cgroup-delegation.sh
+```
+
+**Used by:** `prepare-contained-runner.sh`, as its last step.
+
+Needs no root. Finds the user manager through `XDG_RUNTIME_DIR` (default `/run/user/<uid>`),
+then runs `systemd-run --user --scope -p Delegate=yes` around a shell that prints the scope's
+cgroup, its parent's `cgroup.subtree_control` and its own `cgroup.controllers`, and creates and
+removes a child cgroup named `tier-probe`. A capsule that spawns subprocesses needs exactly that,
+or its launch is refused with `E-RUN-012`.
+
+| Exit | Meaning |
+|---|---|
+| `0` | a child cgroup was created and removed |
+| `1` | a step failed: no user manager bus, `systemd-run` could not create the scope, or the child cgroup could not be created or removed. The message names the step |
+
+---
+
+## `assert-containment-tier.py`
+
+```bash
+systemd-run --user --scope --quiet --collect -p Delegate=yes -- \
+  python3 -I .github/scripts/assert-containment-tier.py --class scoped|sealed [--mur target/debug/mur]
+```
+
+**Used by:** `ci.yml`'s `contained` job, steps "Tier assertion: scoped" and "Tier assertion:
+sealed", before any test is built.
+
+Writes a probe capsule to a temporary directory, declaring the class and `shell.allow: [bash]`,
+so it needs a cgroup scope and a network namespace like any subprocess-capable capsule. It
+passes only when all of these hold:
+
+| Command | Check |
+|---|---|
+| `mur version --json` | `commands` lists `run --explain-scope --json` at schema 2 and `doctor --json` at schema 1 |
+| `mur run --manifest murmur.yaml --explain-scope --json` | `achieved_containment` is the class, `floor_met` is `true`, `landlock_abi` is not null, `cgroup_scope.status` is `delegated` |
+| `mur doctor --json`, in the probe's directory | no finding has severity `error` |
+
+`mur doctor` is what catches `E-CAP-005` (no network namespace) and `E-RUN-012` (no cgroup
+scope): `--explain-scope` alone can report `scoped` with the floor met on a host that would refuse
+the launch. The findings list decides; doctor's `errors` tally is printed beside it, and its exit
+code is ignored.
+
+A failing leg prints every unmet check, each quoting the report's own words: `shortfall_reason`,
+`userns_grant`, `cgroup_scope.errno` and `reason`, each error finding's code and message, or the
+schema mismatch. It keeps the probe directory and prints its path. It never skips. Run it inside
+the scope a capsule launch gets, as above: outside one, the cgroup check fails.
+
+With `$GITHUB_STEP_SUMMARY` set it appends one block, passed or failed:
+
+```markdown
+### Tier assertion `sealed`: passed
+
+- class asked: sealed
+- class installed: sealed (enforcement tier `mountns+pivot_root+landlock+seccomp`)
+- Landlock ruleset ABI: 3
+- userns grant: profile_confining
+- cgroup scope: delegated
+- mur doctor: ready (0 errors, 0 warnings)
+- kernel: <uname -r>
+- mur: 0.11.0-dev (<commit>)
+```
+
+A failed block reads `FAILED` in its heading and ends with one `- reason:` line per unmet check.
+
+| Exit | Meaning |
+|---|---|
+| `0` | the class is installed |
+| `1` | at least one check failed, each printed |
+| `2` | bad arguments |
+
+---
+
+## `fail-on-host-skips.py`
+
+```bash
+python3 -I .github/scripts/fail-on-host-skips.py target/nextest/ci/junit.xml
+```
+
+**Used by:** `ci.yml`'s `contained` job, step "Fail on any test skipped for the host", under
+`if: always()`.
+
+A test that cannot isolate a capsule prints `[SKIP-HOST] <test>: <reason>` and returns, which
+nextest counts as a pass. nextest's `ci` profile keeps passing tests' output in the JUnit report,
+so the line is there to find. On a host prepared to install `scoped` and `sealed`, this gate makes
+every such test a failure and lists it with its first `[SKIP-HOST]` line. `[SKIP]` lines, for a
+local fixture or checkout the runner lacks, are counted in the summary and do not fail it.
+
+| Exit | Meaning |
+|---|---|
+| `0` | no test printed `[SKIP-HOST]` |
+| `1` | at least one did; each is listed with the count |
+| `2` | no report at that path, or one that cannot be parsed or holds no test. A missing report is never read as zero skips |

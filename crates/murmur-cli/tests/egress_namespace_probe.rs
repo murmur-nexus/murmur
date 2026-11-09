@@ -363,11 +363,14 @@ fn a_creatable_namespace_is_not_refused_while_the_restriction_reads_one() {
             "{test}: a profile confines the cargo-built mur here, so its grant is not `withheld`"
         );
     }
+    // Every remediation that points at the dev profile quotes the script in backticks. Matching
+    // the closing backtick leaves out the "not installed" note under the profile file, which
+    // names the script plainly on any host without /etc/apparmor.d/mur-sealed.
     for absent in [
         "E-CAP-005",
         "E-CAP-003",
         "This path is why the grant below is withheld",
-        "install-dev-apparmor.sh",
+        "install-dev-apparmor.sh`",
     ] {
         assert!(!doctor.all().contains(absent), "{absent}\n{}", doctor.all());
     }
