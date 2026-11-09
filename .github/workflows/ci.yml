@@ -129,6 +129,108 @@ jobs:
             echo "hand on a real uncontainerised Linux host."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  contained:
+    name: contained
+    # Pinned rather than ubuntu-latest: the host preparation below depends on this image's kernel,
+    # AppArmor and systemd, and an image change should be a deliberate edit here.
+    runs-on: ubuntu-24.04
+    # cargo-test's 35 minutes plus the host preparation and tier assertions, and the tests that
+    # skip on cargo-test's host and run here, `sealed` variants included. A cold cache is the case
+    # to clear: this job has its own cache, saved only when the job succeeds.
+    timeout-minutes: 60
+    # cargo-test runs the suite on a stock runner, where every test that needs to isolate a capsule
+    # prints `[SKIP-HOST]` and returns. This job first makes the runner a host that installs
+    # `scoped` and `sealed`, proves it did before building or running any test, then runs the same
+    # suite and fails on any `[SKIP-HOST]` line. Both classes need the same host, and the suite
+    # already runs each test at every class the host reaches (`common::tiers`), so the two tiers
+    # are two assertion steps here rather than a matrix that would run the suite twice.
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI-only build settings
+        # The same settings as cargo-test, before rust-cache and before anything builds. What they
+        # are and why: .github/cargo-test-ci.toml.
+        run: cat .github/cargo-test-ci.toml >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The cache's default key includes the job id, so this job's cache is its own.
+          key: profile-${{ hashFiles('.github/cargo-test-ci.toml') }}
+      - name: Install libseccomp
+        # Bounded separately from the job, as in cargo-test: an unreachable mirror otherwise reads
+        # as a cancelled job with no failing step.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Prepare the host for scoped and sealed
+        # Checks Landlock, grants user namespaces to this checkout's target/{debug,release}/mur
+        # (the dev AppArmor profile, else the host-wide sysctl, and says which), delegates cgroup
+        # controllers to a lingering user manager, exports XDG_RUNTIME_DIR and
+        # DBUS_SESSION_BUS_ADDRESS to the later steps, and creates and removes a child cgroup in a
+        # delegated scope. Every failure names the step that failed.
+        timeout-minutes: 10
+        run: .github/scripts/prepare-contained-runner.sh
+      - name: Build mur
+        # At target/debug/mur, the path the dev AppArmor profile attaches to. No CARGO_TARGET_DIR:
+        # a binary outside the checkout's target/ gets no grant.
+        run: cargo build -p murmur-cli --bin mur --features beta-all
+      - name: "Tier assertion: scoped"
+        # Inside the delegated scope a capsule launch gets. Passes only when --explain-scope
+        # reports scoped with the floor met and a delegated cgroup scope, and mur doctor reports
+        # no error for a probe capsule that needs a network namespace. Never skips.
+        timeout-minutes: 5
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes --
+          python3 -I .github/scripts/assert-containment-tier.py --class scoped --mur target/debug/mur
+      - name: "Tier assertion: sealed"
+        timeout-minutes: 5
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes --
+          python3 -I .github/scripts/assert-containment-tier.py --class sealed --mur target/debug/mur
+      - name: Open user namespaces to the test binaries
+        # The dev AppArmor profile names only target/{debug,release}/mur. Test binaries create
+        # namespaces themselves: capsule-runtime's lib tests, and the skip_without_host_support and
+        # tiers probes in murmur-cli's test processes. Under the restriction they would print
+        # `[SKIP-HOST]`, so the restriction is lifted host-wide for the suite. The tier assertions
+        # above have already run under the narrower grant.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          {
+            echo "### User namespaces for the test binaries"
+            echo
+            echo "- \`kernel.apparmor_restrict_unprivileged_userns=0\` for the suite: the dev profile"
+            echo "  names only \`target/{debug,release}/mur\`, and test processes create namespaces themselves."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the test binaries
+        # The same packages and features as cargo-test's build and the run below.
+        run: |
+          cargo test --workspace --no-run --timings --features beta-all
+      - name: Run the workspace test suite in a delegated scope
+        # cargo-test's run, inside a scope whose cgroup the tests' capsule launches can write. The
+        # scope inherits this step's environment. TasksMax=infinity lifts the user manager's
+        # default task limit from the scope; the limits the tests set are on the cgroups they create.
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes -p TasksMax=infinity --
+          cargo nextest run --profile ci --workspace --features beta-all
+      - name: Fail on any test skipped for the host
+        # On this host a `[SKIP-HOST]` line is a failure. A missing report is a failure too, not
+        # zero skips. Runs even when the suite failed, so a red job still lists them.
+        if: always()
+        run: python3 -I .github/scripts/fail-on-host-skips.py target/nextest/ci/junit.xml
+      - name: Upload the test report and build timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contained-test-report
+          path: |
+            target/nextest/ci/junit.xml
+            target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+
   lint:
     name: cargo-clippy + cargo-fmt
     runs-on: ubuntu-latest
