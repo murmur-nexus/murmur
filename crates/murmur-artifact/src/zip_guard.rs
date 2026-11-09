@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn normalized_entry_name_joins_normal_components() {
         assert_eq!(normalized_entry_name("./a//b.md").unwrap(), "a/b.md");
-        assert_eq!(normalized_entry_name("/skill.md").unwrap(), "skill.md");
+        assert_eq!(normalized_entry_name("/SKILL.md").unwrap(), "SKILL.md");
         assert!(normalized_entry_name("a/../../b").is_err());
     }
 

@@ -28,8 +28,48 @@ use crate::zip_guard::sanitize_entry_path;
 /// selected payload, regardless of how many other root `*.wasm` entries exist.
 pub const CAPSULE_WASM_ENTRY: &str = "capsule.wasm";
 
-/// The fixed payload entry name for a skill (static) artifact.
-pub const SKILL_MD_ENTRY: &str = "skill.md";
+/// The fixed payload entry name for a skill artifact, and the file a skill folder holds at its
+/// root: the Agent Skills standard spells it exactly so.
+pub const SKILL_MD_ENTRY: &str = "SKILL.md";
+
+/// Why a skill archive's root entries hold no [`SKILL_MD_ENTRY`].
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPayloadError {
+    /// The root holds `skill.md` in another casing: the layout `mur build` wrote before skills
+    /// followed the Agent Skills standard.
+    #[error("it holds skill.md, so it was built before skills followed the Agent Skills standard, which names the file SKILL.md")]
+    BuiltBeforeStandard,
+    /// The root holds no spelling of `skill.md` at all.
+    #[error("it holds no SKILL.md at its root")]
+    MissingSkillMd,
+}
+
+/// Whether the root entries among `raw_names` (archive entry names as stored) hold the skill
+/// payload [`SKILL_MD_ENTRY`]. Entries below the root never count.
+pub fn check_skill_payload_entries<S: AsRef<str>>(
+    raw_names: impl IntoIterator<Item = S>,
+) -> Result<(), SkillPayloadError> {
+    let mut misspelled = false;
+    for raw in raw_names {
+        let Ok(path) = sanitize_entry_path(raw.as_ref()) else {
+            continue;
+        };
+        let mut components = path.components();
+        let (Some(first), None) = (components.next(), components.next()) else {
+            continue;
+        };
+        let name = first.as_os_str().to_string_lossy();
+        if name == SKILL_MD_ENTRY {
+            return Ok(());
+        }
+        misspelled |= name.to_lowercase() == SKILL_MD_ENTRY.to_lowercase();
+    }
+    Err(if misspelled {
+        SkillPayloadError::BuiltBeforeStandard
+    } else {
+        SkillPayloadError::MissingSkillMd
+    })
+}
 
 /// File extension (including the dot) of a wasm payload entry.
 pub const WASM_EXTENSION: &str = ".wasm";
@@ -148,6 +188,27 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::*;
+
+    #[test]
+    fn a_skill_payload_needs_a_root_skill_md_spelled_exactly() {
+        assert_eq!(
+            check_skill_payload_entries(["murmur.yaml", "SKILL.md", "references/a.md"]),
+            Ok(())
+        );
+        assert_eq!(check_skill_payload_entries(["/SKILL.md"]), Ok(()));
+        assert_eq!(
+            check_skill_payload_entries(["murmur.yaml", "skill.md"]),
+            Err(SkillPayloadError::BuiltBeforeStandard)
+        );
+        assert_eq!(
+            check_skill_payload_entries(["Skill.md"]),
+            Err(SkillPayloadError::BuiltBeforeStandard)
+        );
+        assert_eq!(
+            check_skill_payload_entries(["murmur.yaml", "references/SKILL.md"]),
+            Err(SkillPayloadError::MissingSkillMd)
+        );
+    }
 
     fn archive_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());

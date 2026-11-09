@@ -61,8 +61,8 @@ pub use artifact_name::{
 };
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{
-    artifact_name_format_error, build_artifact, validate_artifact_name, BuildError, BuiltArtifact,
-    MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY,
+    artifact_name_format_error, build_artifact, refuse_skill_manifest, validate_artifact_name,
+    BuildError, BuiltArtifact, MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY,
 };
 pub use build_info::{build_info_from_artifact_bytes, BuildInfo, BuildInfoError, BUILD_INFO_FILE};
 pub use build_lints::{
@@ -85,9 +85,9 @@ pub use manifest::{
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{
-    is_root_wasm_candidate, root_wasm_candidates, select_root_wasm, select_root_wasm_from_entries,
-    select_root_wasm_in_archive, PayloadShapeError, CAPSULE_WASM_ENTRY, SKILL_MD_ENTRY,
-    WASM_EXTENSION,
+    check_skill_payload_entries, is_root_wasm_candidate, root_wasm_candidates, select_root_wasm,
+    select_root_wasm_from_entries, select_root_wasm_in_archive, PayloadShapeError,
+    SkillPayloadError, CAPSULE_WASM_ENTRY, SKILL_MD_ENTRY, WASM_EXTENSION,
 };
 pub use program_download::{
     host_download_platform, is_sha256_hex, parse_program_downloads, PinnedDownload,
@@ -150,9 +150,10 @@ pub use security_warnings::{
 };
 pub use shell_words::split_shell_words;
 pub use skill_folder::{
-    classify_skill_folder_root_file, collect_skill_folder, parse_skill_front_block,
-    skill_folder_skips, skill_md_description, SkillFolder, SkillFolderError, SkillFolderRootFile,
-    SkillFrontBlock,
+    check_skill_front_block, check_skill_md, classify_skill_folder_root_file,
+    collect_skill_folder, is_skill_md_spelling, skill_folder_root_refusal, skill_folder_skips,
+    skill_md_body, SkillFolder, SkillFolderError, SkillFolderRootFile, SkillFrontBlock,
+    SkillFrontBlockError, SkillVersionRule, SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_LEN,
 };
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,
