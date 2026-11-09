@@ -11,8 +11,8 @@
 //! * A run that refused before executing any case writes **no record at all**. Not an empty one,
 //!   not one marked "refused" — none. The refusal goes to stderr and the exit code.
 //! * A run that executed cases always writes one, pass or fail, and stamps at the top anything
-//!   that makes it uncitable: a detected container, a partial `--only` run, a class the host
-//!   could only barely meet.
+//!   that makes it uncitable: a container or pod run under `--allow-container`, a VM, a partial
+//!   `--only` run, a work root on a different filesystem from `/etc` and `/var/tmp`.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -22,9 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use murmur_artifact::ContainmentClass;
 
-use crate::host::HostFacts;
+use crate::host::{Environment, HostFacts, WorkRootFilesystem};
 use crate::runner::CaseOutcome;
-use crate::verdict::Category;
+use crate::verdict::{Category, Grade};
 
 /// A UTC timestamp, kept as its parts so both the filename and the body can render it.
 #[derive(Debug, Clone, Copy)]
@@ -107,8 +107,10 @@ pub struct Record<'a> {
     pub outcomes: &'a [CaseOutcome],
     /// Set when `--only` narrowed the run. A narrowed run is not evidence for `W-SEC-005`.
     pub partial: bool,
-    /// Set when `--allow-container` was used to run despite a container signal.
+    /// Set when `--allow-container` was used to run despite a container or pod signal.
     pub container_override: bool,
+    /// Whether the work root shares a filesystem with `/etc` and `/var/tmp`.
+    pub work_root_fs: WorkRootFilesystem,
     /// The exact argv the harness was invoked with, so the record reproduces itself.
     pub invocation: String,
 }
@@ -118,34 +120,57 @@ pub fn filename(class: ContainmentClass, stamp: &Stamp) -> String {
     format!("escape-conformance-{}-{}.md", class, stamp.compact())
 }
 
-impl Record<'_> {
-    /// True when nothing about this run disqualifies it as `W-SEC-005` evidence.
-    pub fn is_citable(&self) -> bool {
-        !self.partial && !self.container_override && !self.host.container.detected
-    }
+/// The rows of one rollup, counted by [`Grade`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub passed: usize,
+    pub failed: usize,
+    pub not_asserted: usize,
+    pub gaps_held: usize,
+    pub gaps_changed: usize,
+}
 
-    fn counts(&self, category: Category) -> (usize, usize, usize) {
-        let rows = self.outcomes.iter().filter(|o| o.case.category == category);
-        let mut passed = 0;
-        let mut failed = 0;
-        let mut ungraded = 0;
-        for outcome in rows {
-            if !outcome.expectation.gates() {
-                ungraded += 1;
-            } else if outcome.passed {
-                passed += 1;
-            } else {
-                failed += 1;
+impl Counts {
+    /// Counts `outcomes`, every route included.
+    pub fn of<'o>(outcomes: impl IntoIterator<Item = &'o CaseOutcome>) -> Counts {
+        let mut counts = Counts::default();
+        for outcome in outcomes {
+            match outcome.grade {
+                Grade::Pass => counts.passed += 1,
+                Grade::Fail => counts.failed += 1,
+                Grade::NotAsserted => counts.not_asserted += 1,
+                Grade::GapHeld => counts.gaps_held += 1,
+                Grade::GapChanged => counts.gaps_changed += 1,
             }
         }
-        (passed, failed, ungraded)
+        counts
+    }
+}
+
+impl Record<'_> {
+    /// True when nothing about this run disqualifies it as `W-SEC-005` evidence: a full run, on a
+    /// bare host with no override, with its work root on the same filesystem as `/etc` and
+    /// `/var/tmp`.
+    pub fn is_citable(&self) -> bool {
+        !self.partial
+            && !self.container_override
+            && self.host.environment.is_bare_host()
+            && self.work_root_fs.is_same()
+    }
+
+    fn counts(&self, category: Category) -> Counts {
+        Counts::of(self.outcomes.iter().filter(|o| o.case.category == category))
     }
 
     /// Renders the whole document.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        let (bp, bf, bu) = self.counts(Category::Boundary);
-        let (rp, rf, ru) = self.counts(Category::ResourceExhaustion);
+        let boundary = self.counts(Category::Boundary);
+        let resource = self.counts(Category::ResourceExhaustion);
+        let gaps = Counts::of(self.outcomes);
+        let (bp, bf, bu) = (boundary.passed, boundary.failed, boundary.not_asserted);
+        let (rp, rf, ru) = (resource.passed, resource.failed, resource.not_asserted);
+        let (gh, gc) = (gaps.gaps_held, gaps.gaps_changed);
 
         let _ = writeln!(
             out,
@@ -157,15 +182,42 @@ impl Record<'_> {
         // ── The stamp a reader hits before anything else ───────────────────────────────────
         if !self.is_citable() {
             let _ = writeln!(out, "> ## THIS RECORD IS NOT `W-SEC-005` EVIDENCE\n>");
-            if self.host.container.detected {
+            match self.host.environment.environment {
+                Environment::Container | Environment::Pod => {
+                    let _ = writeln!(
+                        out,
+                        "> **A {} was detected** ({}). A container masked three separate \
+                         findings during the original investigation — the raw-disk escape, the \
+                         `docker.sock` escape, and the entire syscall surface all looked closed \
+                         inside Docker and were wide open outside it. Every verdict below may be \
+                         the {}'s answer rather than this runtime's. Re-run on bare metal.\n>",
+                        self.host.environment.environment,
+                        self.host.environment.firing(),
+                        self.host.environment.environment,
+                    );
+                }
+                Environment::VirtualMachine => {
+                    let _ = writeln!(
+                        out,
+                        "> **A virtual machine was detected** ({}). The run is a valid gate, \
+                         and every verdict below is this runtime's, but a hypervisor sits \
+                         between it and the hardware, so it is not the bare-host evidence \
+                         `W-SEC-005` rests on. Re-run on bare metal to cite it.\n>",
+                        self.host.environment.firing()
+                    );
+                }
+                Environment::BareHost => {}
+            }
+            if !self.work_root_fs.is_same() {
                 let _ = writeln!(
                     out,
-                    "> **A container was detected** ({}). A container masked three separate \
-                     findings during the original investigation — the raw-disk escape, the \
-                     `docker.sock` escape, and the entire syscall surface all looked closed \
-                     inside Docker and were wide open outside it. Every verdict below may be \
-                     the container's answer rather than this runtime's. Re-run on bare metal.\n>",
-                    self.host.container.firing()
+                    "> **The work root crosses filesystems** ({}). `hardlink-escape` links \
+                     `/etc/passwd` into the workdir and `rename-across-boundary` renames a \
+                     workdir file into `/var/tmp`; across filesystems both fail with `EXDEV` \
+                     before any containment is consulted, so their verdicts are false negatives \
+                     about the boundary. Re-run with `--work-root` on the filesystem that holds \
+                     `/etc` and `/var/tmp`.\n>",
+                    self.work_root_fs
                 );
             }
             if self.partial {
@@ -179,8 +231,9 @@ impl Record<'_> {
         } else {
             let _ = writeln!(
                 out,
-                "> Bare-metal run, full case registry. Citable as `W-SEC-005` evidence for the \
-                 `{}` containment class on this host.\n",
+                "> Bare-host run, full case registry, work root on the filesystem that holds \
+                 `/etc` and `/var/tmp`. Citable as `W-SEC-005` evidence for the `{}` \
+                 containment class on this host.\n",
                 self.declared
             );
         }
@@ -218,6 +271,18 @@ impl Record<'_> {
                  not containment, and must not be reported as an escape."
             }
         );
+        let _ = writeln!(
+            out,
+            "**Known gaps: {}.** A known gap is a route asserted as not contained today. It is \
+             counted here and nowhere else: a gap that holds is not a passing boundary, and a gap \
+             that changed is not an escape — it means the expectation has to flip in the change \
+             that moved it.\n",
+            if gc == 0 {
+                format!("{gh} asserted, every one holds")
+            } else {
+                format!("{gc} of {} CHANGED", gh + gc)
+            }
+        );
 
         // ── Host ───────────────────────────────────────────────────────────────────────────
         let _ = writeln!(out, "## Host\n");
@@ -247,7 +312,12 @@ impl Record<'_> {
                 None => "unknown".to_string(),
             }
         );
-        let _ = writeln!(out, "| container detection | {} |", self.host.container);
+        let _ = writeln!(out, "| environment | {} |", self.host.environment);
+        let _ = writeln!(
+            out,
+            "| work root filesystem | {} |",
+            sanitize_cell(&self.work_root_fs.to_string())
+        );
         let _ = writeln!(
             out,
             "| declared containment class | **{}** |",
@@ -263,11 +333,17 @@ impl Record<'_> {
         let _ = writeln!(out, "| `mur` version | `{}` |", self.mur_version);
         let _ = writeln!(out, "| invocation | `{}` |\n", self.invocation);
 
-        let _ = writeln!(out, "### Container signals checked\n");
-        let _ = writeln!(out, "| signal | result |");
-        let _ = writeln!(out, "|---|---|");
-        for (name, result) in &self.host.container.signals {
-            let _ = writeln!(out, "| `{name}` | {result} |");
+        let _ = writeln!(out, "### Environment signals checked\n");
+        let _ = writeln!(out, "| signal | result | evidence of |");
+        let _ = writeln!(out, "|---|---|---|");
+        for signal in &self.host.environment.signals {
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} |",
+                signal.name,
+                sanitize_cell(&signal.result),
+                signal.fires.map(Environment::as_str).unwrap_or("—")
+            );
         }
         let _ = writeln!(out);
 
@@ -284,7 +360,9 @@ impl Record<'_> {
              where independent bind mounts make link(2)/rename(2) fail with EXDEV before Landlock \
              is consulted). `write-outside-workdir` at `sealed` is the one case whose target has \
              not been measured against a composed root. The per-case `attribution` below says \
-             which applies.\n"
+             which applies. A `known-gap` expectation is a route asserted as not contained today: \
+             `known gap holds` is not a pass of the boundary, and `KNOWN GAP CHANGED` is not an \
+             escape but a gap that moved, whose expectation has to flip.\n"
         );
         self.render_table(&mut out, Category::Boundary);
 
@@ -301,25 +379,30 @@ impl Record<'_> {
         // ── Per-case evidence ──────────────────────────────────────────────────────────────
         let _ = writeln!(out, "## Per-case evidence\n");
         for outcome in self.outcomes {
-            let _ = writeln!(out, "### `{}`\n", outcome.case.id);
+            let _ = writeln!(
+                out,
+                "### `{}` — {}\n",
+                outcome.case.id,
+                outcome.route.as_str()
+            );
             let _ = writeln!(out, "- **category:** {}", outcome.case.category);
+            let _ = writeln!(out, "- **route:** {}", outcome.route.as_str());
             let _ = writeln!(out, "- **what it does:** {}", outcome.case.summary);
             let _ = writeln!(
                 out,
-                "- **expected ({}):** {}",
+                "- **expected ({}, {}):** {}",
                 self.declared,
+                outcome.route.as_str(),
                 outcome.expectation.as_str()
             );
             let _ = writeln!(out, "- **actual:** {}", outcome.verdict);
             let _ = writeln!(
                 out,
                 "- **result:** {}",
-                if !outcome.expectation.gates() {
-                    "recorded, not asserted at this class".to_string()
-                } else if outcome.passed {
-                    "PASS".to_string()
-                } else {
-                    "**FAIL**".to_string()
+                match outcome.grade {
+                    Grade::NotAsserted => "recorded, not asserted at this class".to_string(),
+                    Grade::Pass | Grade::GapHeld => outcome.grade.as_str().to_string(),
+                    Grade::Fail | Grade::GapChanged => format!("**{}**", outcome.grade.as_str()),
                 }
             );
             let _ = writeln!(out, "- **evidence:** {}", outcome.detail);
@@ -343,19 +426,27 @@ impl Record<'_> {
              bind mounts make link(2)/rename(2) fail with EXDEV before Landlock is consulted, and \
              `write-outside-workdir`, whose `/var/tmp` target has not been measured there. \
              `not-asserted` in the `advisory` column means something different — a class with no \
-             mechanism — and the two must not be read as one.\n"
+             mechanism — and the two must not be read as one. The three class columns are the \
+             shell-tool route; the `process-harness` column is that route at every class, and \
+             `—` there means the case does not run on it.\n"
         );
-        let _ = writeln!(out, "| case | category | advisory | scoped | sealed |");
-        let _ = writeln!(out, "|---|---|---|---|---|");
+        let _ = writeln!(
+            out,
+            "| case | category | advisory | scoped | sealed | process-harness |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|---|");
         for case in crate::cases::all_cases() {
             let _ = writeln!(
                 out,
-                "| `{}` | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} |",
                 case.id,
                 case.category,
                 case.advisory.as_str(),
                 case.scoped.as_str(),
-                case.sealed.as_str()
+                case.sealed.as_str(),
+                case.harness
+                    .map(|e| e.as_str())
+                    .unwrap_or_else(|| "—".to_string())
             );
         }
         let _ = writeln!(out);
@@ -364,20 +455,18 @@ impl Record<'_> {
     }
 
     fn render_table(&self, out: &mut String, category: Category) {
-        let _ = writeln!(out, "| case | expected | actual | result |");
-        let _ = writeln!(out, "|---|---|---|---|");
+        let _ = writeln!(out, "| case | route | expected | actual | result |");
+        let _ = writeln!(out, "|---|---|---|---|---|");
         for outcome in self.outcomes.iter().filter(|o| o.case.category == category) {
-            let result = if !outcome.expectation.gates() {
-                "not asserted"
-            } else if outcome.passed {
-                "PASS"
-            } else {
-                "**FAIL**"
+            let result = match outcome.grade {
+                Grade::Fail | Grade::GapChanged => format!("**{}**", outcome.grade.as_str()),
+                grade => grade.as_str().to_string(),
             };
             let _ = writeln!(
                 out,
-                "| `{}` | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} |",
                 outcome.case.id,
+                outcome.route.as_str(),
                 outcome.expectation.as_str(),
                 outcome.verdict,
                 result
@@ -430,34 +519,78 @@ mod tests {
         );
     }
 
-    /// The header table names the class the run achieved and the tier it was read off, side by
-    /// side, so a `scoped` record from a sealed-capable host says `landlock+seccomp`.
-    #[test]
-    fn the_record_names_the_achieved_class_and_its_enforcement_tier() {
-        let host = HostFacts {
+    use crate::cases::{self, Route};
+    use crate::host::{classify, EnvironmentReadings, FsReading, INITIAL_CGROUP_NS};
+    use crate::runner::RunReach;
+    use crate::verdict::{Expectation, Verdict};
+
+    fn host(readings: EnvironmentReadings) -> HostFacts {
+        HostFacts {
             kernel_release: "7.0.0".to_string(),
             kernel_system: "Linux x86_64".to_string(),
             arch: "x86_64",
             os: "linux",
             euid: "1000".to_string(),
-            container: crate::host::ContainerDetection {
-                detected: false,
-                signals: Vec::new(),
-            },
+            environment: classify(&readings),
             cgroup_v2: Some(true),
+        }
+    }
+
+    fn bare_readings() -> EnvironmentReadings {
+        EnvironmentReadings {
+            dockerenv: false,
+            containerenv: false,
+            pid1_cgroup: Ok("0::/init.scope".to_string()),
+            self_cgroup_ns: Ok(INITIAL_CGROUP_NS.to_string()),
+            pid1_cgroup_ns: Err("Permission denied".to_string()),
+            serviceaccount: false,
+            kubernetes_service_host: None,
+            root_fstype: Some("ext4".to_string()),
+            detect_virt: Some("none".to_string()),
+            dmi: None,
+        }
+    }
+
+    fn fs(work_root_dev: u64) -> WorkRootFilesystem {
+        let reading = |path: &str, dev: u64| FsReading {
+            path: PathBuf::from(path),
+            dev: Ok(dev),
+            mount_point: Some(if dev == 30 { "/" } else { "/space" }.to_string()),
         };
-        let record = Record {
+        WorkRootFilesystem {
+            readings: vec![
+                reading("/work", work_root_dev),
+                reading("/etc", 30),
+                reading("/var/tmp", 30),
+            ],
+        }
+    }
+
+    fn record<'a>(host: &'a HostFacts, outcomes: &'a [CaseOutcome]) -> Record<'a> {
+        Record {
             stamp: Stamp::from_unix(1_000_000_000),
             declared: ContainmentClass::Scoped,
             achieved: ContainmentClass::Scoped,
             enforcement_tier: "landlock+seccomp",
-            host: &host,
+            host,
             mur_binary: "/usr/bin/mur".to_string(),
             mur_version: "mur 0.0.0".to_string(),
-            outcomes: &[],
-            partial: true,
+            outcomes,
+            partial: false,
             container_override: false,
+            work_root_fs: fs(30),
             invocation: "escape-conformance --class scoped".to_string(),
+        }
+    }
+
+    /// The header table names the class the run achieved and the tier it was read off, side by
+    /// side, so a `scoped` record from a sealed-capable host says `landlock+seccomp`.
+    #[test]
+    fn the_record_names_the_achieved_class_and_its_enforcement_tier() {
+        let host = host(bare_readings());
+        let record = Record {
+            partial: true,
+            ..record(&host, &[])
         };
         let rendered = record.render();
         let achieved = rendered
@@ -467,6 +600,116 @@ mod tests {
             .find("| enforcement tier | `landlock+seccomp` |\n")
             .expect("the enforcement tier row");
         assert!(achieved < tier, "{rendered}");
+    }
+
+    /// Only a full bare-host run with a same-filesystem work root is citable.
+    #[test]
+    fn only_a_bare_host_record_on_one_filesystem_is_citable() {
+        let bare = host(bare_readings());
+        assert!(record(&bare, &[]).is_citable());
+        let rendered = record(&bare, &[]).render();
+        assert!(!rendered.contains("NOT `W-SEC-005` EVIDENCE"), "{rendered}");
+        assert!(rendered.contains("| environment | bare host (no container, pod or VM signal) |"));
+
+        let vm = host(EnvironmentReadings {
+            detect_virt: Some("microsoft".to_string()),
+            ..bare_readings()
+        });
+        let vm_record = record(&vm, &[]);
+        assert!(!vm_record.is_citable());
+        let rendered = vm_record.render();
+        assert!(rendered.contains("THIS RECORD IS NOT `W-SEC-005` EVIDENCE"));
+        assert!(rendered.contains("**A virtual machine was detected** (systemd-detect-virt --vm)"));
+        assert!(
+            rendered.contains("| environment | VIRTUAL MACHINE DETECTED ("),
+            "{rendered}"
+        );
+
+        let pod = host(EnvironmentReadings {
+            kubernetes_service_host: Some("10.96.0.1".to_string()),
+            ..bare_readings()
+        });
+        let pod_record = Record {
+            container_override: true,
+            ..record(&pod, &[])
+        };
+        assert!(!pod_record.is_citable());
+        assert!(pod_record
+            .render()
+            .contains("**A pod was detected** (KUBERNETES_SERVICE_HOST set)"));
+
+        let crossing = Record {
+            work_root_fs: fs(42),
+            ..record(&bare, &[])
+        };
+        assert!(!crossing.is_citable());
+        let rendered = crossing.render();
+        assert!(
+            rendered.contains("**The work root crosses filesystems**"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("| work root filesystem | CROSSES FILESYSTEMS"));
+
+        let partial = Record {
+            partial: true,
+            ..record(&bare, &[])
+        };
+        assert!(!partial.is_citable());
+    }
+
+    fn outcome(id: &str, route: Route, expectation: Expectation, verdict: Verdict) -> CaseOutcome {
+        CaseOutcome {
+            case: cases::find(id).unwrap(),
+            route,
+            expectation,
+            verdict,
+            detail: "detail".to_string(),
+            grade: Grade::of(expectation, verdict),
+            case_dir: PathBuf::from("/work").join(id),
+            reach: RunReach::NotStaged,
+        }
+    }
+
+    /// A route is a row of its own, and a known gap rolls up apart from the boundary verdict:
+    /// a changed gap does not read as a crossing.
+    #[test]
+    fn routes_are_rows_and_known_gaps_roll_up_on_their_own() {
+        let host = host(bare_readings());
+        let outcomes = [
+            outcome(
+                "read-record-seal-key",
+                Route::ShellTool,
+                Expectation::Must(Verdict::Refused),
+                Verdict::Refused,
+            ),
+            outcome(
+                "read-record-seal-key",
+                Route::ProcessHarness,
+                Expectation::KnownGap(Verdict::Allowed),
+                Verdict::Refused,
+            ),
+        ];
+        let rendered = record(&host, &outcomes).render();
+        assert!(
+            rendered.contains("| `read-record-seal-key` | shell-tool | REFUSED | REFUSED | PASS |")
+        );
+        assert!(rendered.contains(
+            "| `read-record-seal-key` | process-harness | known-gap: ALLOWED | REFUSED | \
+             **KNOWN GAP CHANGED** |"
+        ));
+        assert!(rendered.contains("**Boundary verdict: no boundary was crossed.**"));
+        assert!(
+            rendered.contains("**Known gaps: 1 of 1 CHANGED.**"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("| **boundary** (a failure here is an escape) | 1 | 1 | 0 | 0 |"));
+        assert!(rendered.contains("### `read-record-seal-key` — process-harness"));
+        assert!(rendered.contains(
+            "| `read-record-seal-key` | boundary | not-asserted | REFUSED | REFUSED | \
+             known-gap: ALLOWED |"
+        ));
+        assert!(rendered
+            .contains("| `read-etc-shadow` | boundary | not-asserted | REFUSED | REFUSED | — |"));
     }
 
     #[test]

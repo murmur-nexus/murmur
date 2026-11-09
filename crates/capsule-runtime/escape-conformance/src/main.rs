@@ -1,4 +1,5 @@
-//! `escape-conformance` — the one-command hand-run gate.
+//! `escape-conformance` — the one-command containment gate, run by hand and by CI's `contained`
+//! job.
 //!
 //! Exit codes are part of the interface and are deliberately distinct, because "the suite refused
 //! to run" and "a boundary was crossed" are different facts and a wrapper script must be able to
@@ -8,24 +9,27 @@
 //! |---|---|---|
 //! | 0 | every asserted case matched its expected verdict | yes |
 //! | 1 | usage error, or the harness itself could not proceed | no |
-//! | 2 | **refused before running any case** — class gate, container, a missing prerequisite, a stale driver, or a failed preflight | **no** |
+//! | 2 | **refused before running any case** — class gate, container or pod, a missing prerequisite, a stale driver, or a failed preflight | **no** |
 //! | 3 | at least one **boundary** case failed — a containment escape | yes |
 //! | 4 | boundary clean, but a **resource-exhaustion** case failed — denial of service | yes |
+//! | 5 | boundary and resources clean, but a **known gap changed** — flip its expectation | yes |
 //!
-//! 3 and 4 are separate so a resource failure can never be mistaken for an escape by a reader of
-//! the exit status alone, which is the same rule the record and the stdout summary follow.
+//! 3, 4 and 5 are separate so a resource failure or a moved known gap can never be mistaken for an
+//! escape by a reader of the exit status alone, which is the same rule the record and the stdout
+//! summary follow. The lowest-numbered failure wins: an escape is reported over a ceiling, and a
+//! ceiling over a gap.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
 use std::time::Duration;
 
-use escape_conformance::cases::{self, Case};
+use escape_conformance::cases::{self, Case, Route};
 use escape_conformance::driver_artifact;
-use escape_conformance::host;
-use escape_conformance::record::{Record, Stamp};
+use escape_conformance::host::{self, WorkRootFilesystem};
+use escape_conformance::record::{Counts, Record, Stamp};
 use escape_conformance::runner::{self, RunnerConfig};
-use escape_conformance::verdict::Category;
+use escape_conformance::verdict::{Category, Grade};
 use murmur_artifact::ContainmentClass;
 
 const EXIT_OK: u8 = 0;
@@ -33,10 +37,11 @@ const EXIT_USAGE: u8 = 1;
 const EXIT_REFUSED: u8 = 2;
 const EXIT_BOUNDARY_FAILURE: u8 = 3;
 const EXIT_RESOURCE_FAILURE: u8 = 4;
+const EXIT_KNOWN_GAP_DRIFT: u8 = 5;
 
 const USAGE: &str = concat!(
     "\
-escape-conformance — hand-run containment release gate (never wired into CI)
+escape-conformance — containment release gate, run by hand and in CI's contained job
 
 USAGE:
     escape-conformance --class <advisory|scoped|sealed> [options]
@@ -50,10 +55,14 @@ REQUIRED:
 OPTIONS:
     --record-dir <DIR>     Where the dated record is written. Default: the current directory.
     --work-root <DIR>      Per-case scratch (manifests, probes, mur output, traces). Kept after
-                           the run; the record points at it per case. Must not exist yet, be
+                           the run; the record points at it per case. What each probe leaves in
+                           its workdir is deleted once the case is graded. Must not exist yet, be
                            empty, or be a work root an earlier run left: those carry
                            .escape-conformance-work-root and are emptied before the run.
-                           Any other non-empty directory is refused (exit 1).
+                           Any other non-empty directory is refused (exit 1). Put it on the
+                           filesystem that holds /etc and /var/tmp: a work root on another one
+                           makes two cases EXDEV false negatives, and the record is stamped
+                           NOT W-SEC-005 EVIDENCE.
                            Default: <record-dir>/escape-conformance-work-<stamp>.
     --mur <PATH>           The built `mur` binary. Default: $MUR_BIN, then this repository's
                            target/release/mur and target/debug/mur, then PATH.
@@ -65,13 +74,20 @@ OPTIONS:
                            cgroup v2 subtree `mur run` refuses every subprocess-capable capsule
                            with E-RUN-012.
     --no-systemd-scope     Turn that off (e.g. already inside a delegated scope).
-    --allow-container      Run even though a container was detected. The record is stamped
-                           NOT W-SEC-005 EVIDENCE and cannot be cited.
+    --allow-container      Run even though a container or pod was detected. The record is
+                           stamped NOT W-SEC-005 EVIDENCE and cannot be cited. A virtual
+                           machine needs no flag: it runs, and its record is stamped the same.
     --only <CASE-ID>       Run one case (repeatable). The record is stamped PARTIAL RUN and
                            cannot be cited. For iterating by hand, never for a release gate.
-    --list-cases           Print the case registry with per-class expectations and exit. Runs
+    --list-cases           Print the case registry with each route's expectations (the shell
+                           tool per class, the process harness at every class) and exit. Runs
                            nothing and writes no record.
     -h, --help             This text.
+
+EXIT CODES:
+    0 every asserted case matched   1 usage error            2 refused, no record
+    3 a boundary case failed        4 a resource ceiling failed
+    5 a known gap changed — flip its expectation in the same change
 
 The gate carries its own process driver (escape-conformance-driver), packs it with
 `mur build` and installs it into each case's project with `mur install`; nothing is fetched
@@ -264,23 +280,40 @@ fn list_cases() {
         cases::in_category(Category::ResourceExhaustion).count()
     );
     println!(
-        "{:<34} {:<20} {:<14} {:<14} SEALED",
-        "CASE", "CATEGORY", "ADVISORY", "SCOPED"
+        "  routes: {} (every case, per class), {} ({} cases, the same at every class)\n",
+        Route::ShellTool.as_str(),
+        Route::ProcessHarness.as_str(),
+        cases::all_cases()
+            .iter()
+            .filter(|case| case.harness.is_some())
+            .count()
+    );
+    println!(
+        "{:<34} {:<20} {:<20} {:<20} {:<20} PROCESS-HARNESS",
+        "CASE", "CATEGORY", "SHELL-TOOL ADVISORY", "SHELL-TOOL SCOPED", "SHELL-TOOL SEALED"
     );
     for case in cases::all_cases() {
         println!(
-            "{:<34} {:<20} {:<14} {:<14} {}",
+            "{:<34} {:<20} {:<20} {:<20} {:<20} {}",
             case.id,
             // `as_str`, not the Display impl: a custom Display ignores the width specifier, so
             // the columns would not line up.
             case.category.as_str(),
             case.advisory.as_str(),
             case.scoped.as_str(),
-            case.sealed.as_str()
+            case.sealed.as_str(),
+            case.harness
+                .map(|e| e.as_str())
+                .unwrap_or_else(|| "—".to_string())
         );
     }
     println!(
-        "\n`not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
+        "\n`known-gap: <VERDICT>` asserts a route that is not contained today, at the verdict it \
+         measurably produces. It gates: a run whose verdict differs fails with exit 5, so a change \
+         that closes the gap flips the expectation in the same change. It is never counted as a \
+         boundary pass or an escape. `—` in the PROCESS-HARNESS column means the case does not \
+         run on that route.\n\n\
+         `not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
          but nothing can pass or fail, because there is no claim to compare the result against. \
          It appears for two different reasons and they must not be conflated.\n\
          In the `advisory` column it means the *class* has no mechanism that could back a claim.\n\
@@ -326,17 +359,18 @@ fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> 
         ));
     }
 
-    if facts.container.detected && !options.allow_container {
+    let environment = facts.environment.environment;
+    if environment.is_refused_by_default() && !options.allow_container {
         return Err(format!(
-            "REFUSED — a container was detected ({}).\n\n\
-             The suite must run on bare metal. During the original investigation a container \
+            "REFUSED — this looks like a {environment} ({}).\n\n\
+             The suite must run outside one. During the original investigation a container \
              masked three separate findings: the raw-disk escape, the `docker.sock` escape, and \
              the entire syscall surface all looked closed inside Docker and were wide open \
-             outside it. A run in here would certify the container's boundary, not this \
+             outside it. A run in here would certify the {environment}'s boundary, not this \
              runtime's.\n\n\
              No record file was written. Pass --allow-container to run anyway; the record is \
              then stamped NOT W-SEC-005 EVIDENCE and cannot be cited.",
-            facts.container.firing()
+            facts.environment.firing()
         ));
     }
 
@@ -362,12 +396,12 @@ fn run() -> Result<u8, String> {
     let (decision, _) = capsule_runtime::detect_containment_decision(class);
     let achieved = decision.achieved();
 
-    println!("escape-conformance — hand-run containment gate");
+    println!("escape-conformance — containment gate");
     println!(
         "  host:      {} ({})",
         facts.kernel_system, facts.kernel_release
     );
-    println!("  container: {}", facts.container);
+    println!("  environment: {}", facts.environment);
     println!("  declared:  {class}");
     println!("  achieved:  {achieved}");
     println!("  mechanism: {}", decision.enforcement_tier());
@@ -388,6 +422,16 @@ fn run() -> Result<u8, String> {
     };
     let mur = absolute(resolve_mur(options.mur.clone())?)?;
     let probe_driver = absolute(resolve_probe_driver(options.probe_driver.clone())?)?;
+    // The process-harness route runs the probe with this interpreter by absolute path: the
+    // harness starts with a cleared environment and has no PATH to look it up on.
+    let Some(harness_interpreter) = on_path("python3") else {
+        eprintln!(
+            "\nREFUSED — `python3` is not on PATH. Every probe is a Python script, and the \
+             process-harness route runs it by the absolute path found here. No record file was \
+             written."
+        );
+        return Ok(EXIT_REFUSED);
+    };
 
     let systemd_scope = options
         .systemd_scope
@@ -403,6 +447,7 @@ fn run() -> Result<u8, String> {
     // against each case's capsule workdir, and a file an earlier run left would be graded as this
     // run's evidence. A directory the harness cannot safely clear is a usage error.
     let work_root = escape_conformance::work_root::prepare_work_root(&work_root)?;
+    let work_root_fs = WorkRootFilesystem::probe(&work_root);
 
     // The embedded driver has to export the process interface this build's runtime accepts, or
     // every case would be refused at load; checked before anything is packed or run.
@@ -439,6 +484,21 @@ fn run() -> Result<u8, String> {
     );
     println!("  harness:   {}", probe_driver.display());
     println!("  scratch:   {}", work_root.display());
+    println!("  work root: {work_root_fs}");
+    if !work_root_fs.is_same() {
+        println!(
+            "  note:      the work root is not on the filesystem that holds /etc and /var/tmp, so \
+             hardlink-escape and rename-across-boundary hit EXDEV before any containment is \
+             consulted. The run goes ahead and its record is stamped NOT W-SEC-005 EVIDENCE; pass \
+             --work-root on that filesystem for a citable one."
+        );
+    }
+    if !facts.environment.is_bare_host() {
+        println!(
+            "  note:      not a bare host ({}). The record is stamped NOT W-SEC-005 EVIDENCE.",
+            facts.environment.environment
+        );
+    }
     if !facts.is_root() {
         println!(
             "  note:      non-root run (euid {}). `mknod`, `bpf` and `open_by_handle_at` refuse \
@@ -454,21 +514,9 @@ fn run() -> Result<u8, String> {
         driver_artifact: driver_zip,
         work_root,
         timeout: options.timeout,
+        harness_interpreter,
         systemd_scope,
     };
-
-    // Last gate before the first case. A host where no probe can start is refused, not run with
-    // every case reporting INCONCLUSIVE — see `runner::preflight`.
-    print!("\npreflight … ");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    match runner::preflight(&config, class) {
-        Ok(evidence) => println!("ok — {evidence}"),
-        Err(refusal) => {
-            println!("REFUSED");
-            eprintln!("\n{refusal}");
-            return Ok(EXIT_REFUSED);
-        }
-    }
 
     let selected: Vec<&'static Case> = if options.only.is_empty() {
         cases::all_cases().iter().collect()
@@ -479,22 +527,45 @@ fn run() -> Result<u8, String> {
             .filter_map(|id| cases::find(id))
             .collect()
     };
+    let runs: Vec<(&'static Case, Route)> = selected
+        .iter()
+        .flat_map(|case| case.routes().map(move |route| (*case, route)))
+        .collect();
 
-    println!("\nrunning {} case(s)\n", selected.len());
-    let mut outcomes = Vec::with_capacity(selected.len());
-    for case in &selected {
-        print!("  {:<34} … ", case.id);
+    // Last gate before the first case, once per route the run uses. A host where no probe can
+    // start is refused, not run with every case reporting INCONCLUSIVE — see `runner::preflight`.
+    for route in Route::ALL {
+        if !runs.iter().any(|(_, r)| *r == route) {
+            continue;
+        }
+        print!("\npreflight ({}) … ", route.as_str());
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        let outcome = runner::run_case(case, &config, class);
-        let status = if !outcome.expectation.gates() {
-            "recorded (not asserted at this class)".to_string()
-        } else if outcome.passed {
-            "PASS".to_string()
-        } else {
-            "FAIL".to_string()
+        match runner::preflight(&config, class, route) {
+            Ok(evidence) => println!("ok — {evidence}"),
+            Err(refusal) => {
+                println!("REFUSED");
+                eprintln!("\n{refusal}");
+                return Ok(EXIT_REFUSED);
+            }
+        }
+    }
+
+    println!(
+        "\nrunning {} case(s), {} case-route run(s)\n",
+        selected.len(),
+        runs.len()
+    );
+    let mut outcomes = Vec::with_capacity(runs.len());
+    for (case, route) in runs {
+        print!("  {:<34} {:<16} … ", case.id, route.as_str());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let outcome = runner::run_case(case, route, &config, class);
+        let status = match outcome.grade {
+            Grade::NotAsserted => "recorded (not asserted at this class)",
+            grade => grade.as_str(),
         };
         println!(
-            "{:<12} expected {:<14} → {}",
+            "{:<12} expected {:<20} → {}",
             outcome.verdict.as_str(),
             outcome.expectation.as_str(),
             status
@@ -502,15 +573,13 @@ fn run() -> Result<u8, String> {
         outcomes.push(outcome);
     }
 
-    // ── The two rollups, never merged ─────────────────────────────────────────────────────
+    // ── The rollups, never merged ──────────────────────────────────────────────────────────
     let failed_in = |category: Category| -> usize {
-        outcomes
-            .iter()
-            .filter(|o| o.case.category == category && o.expectation.gates() && !o.passed)
-            .count()
+        Counts::of(outcomes.iter().filter(|o| o.case.category == category)).failed
     };
     let boundary_failures = failed_in(Category::Boundary);
     let resource_failures = failed_in(Category::ResourceExhaustion);
+    let gaps = Counts::of(&outcomes);
 
     let record = Record {
         stamp,
@@ -522,7 +591,9 @@ fn run() -> Result<u8, String> {
         mur_version: mur_version(&mur),
         outcomes: &outcomes,
         partial: !options.only.is_empty(),
-        container_override: options.allow_container && facts.container.detected,
+        container_override: options.allow_container
+            && facts.environment.environment.is_refused_by_default(),
+        work_root_fs,
         invocation: argv.join(" "),
     };
     let record_path = record
@@ -548,6 +619,29 @@ fn run() -> Result<u8, String> {
             )
         }
     );
+    println!(
+        "  known gaps:          {}",
+        if gaps.gaps_changed == 0 {
+            format!("{} asserted, every one holds", gaps.gaps_held)
+        } else {
+            let changed: Vec<String> = outcomes
+                .iter()
+                .filter(|o| o.grade == Grade::GapChanged)
+                .map(|o| format!("{} ({}: now {})", o.case.id, o.route.as_str(), o.verdict))
+                .collect();
+            format!(
+                "{} CHANGED — flip the expectation in cases.rs in this change: {}",
+                gaps.gaps_changed,
+                changed.join(", ")
+            )
+        }
+    );
+    if !record.work_root_fs.is_same() {
+        println!(
+            "  work root:           crosses filesystems — an INCONCLUSIVE hardlink-escape or \
+             rename-across-boundary measured EXDEV between filesystems, not the boundary"
+        );
+    }
     println!("  record:              {}", record_path.display());
     if !record.is_citable() {
         println!("  NOTE:                this record is stamped NOT W-SEC-005 EVIDENCE");
@@ -557,6 +651,8 @@ fn run() -> Result<u8, String> {
         EXIT_BOUNDARY_FAILURE
     } else if resource_failures > 0 {
         EXIT_RESOURCE_FAILURE
+    } else if gaps.gaps_changed > 0 {
+        EXIT_KNOWN_GAP_DRIFT
     } else {
         EXIT_OK
     })

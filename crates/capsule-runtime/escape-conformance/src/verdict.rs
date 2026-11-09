@@ -100,13 +100,25 @@ pub enum Expectation {
     /// containment class". Starting a new column at `Must` from reasoning about what the mechanism
     /// ought to do would skip the step that found four of `sealed`'s own documented verdicts wrong.
     Documented(Verdict),
+    /// A route the runtime does **not contain**, asserted at the verdict it measurably produces.
+    ///
+    /// It gates exactly like [`Expectation::Must`]: the verdict is compared exactly, and a
+    /// mismatch fails the suite. What differs is what a mismatch *means*. A `Must` mismatch is a
+    /// boundary crossing; a `KnownGap` mismatch is a known gap that changed — usually because a
+    /// fix closed it — and the suite fails so the expectation flips in the same change that moved
+    /// it. It is therefore rolled up on its own line and its own exit code, never into the
+    /// boundary or resource counts, and a match reads "known gap holds", never "contained".
+    ///
+    /// Recording the gap as an expectation rather than leaving the route unmeasured is the point:
+    /// a gap nobody asserts can close or widen without anyone noticing.
+    KnownGap(Verdict),
 }
 
 impl Expectation {
     /// The verdict this expectation names, if it names one.
     pub fn verdict(self) -> Option<Verdict> {
         match self {
-            Expectation::Must(v) | Expectation::Documented(v) => Some(v),
+            Expectation::Must(v) | Expectation::Documented(v) | Expectation::KnownGap(v) => Some(v),
             Expectation::NotAsserted => None,
         }
     }
@@ -117,6 +129,7 @@ impl Expectation {
             Expectation::Must(v) => v.as_str().to_string(),
             Expectation::NotAsserted => "not-asserted".to_string(),
             Expectation::Documented(v) => format!("{} (not graded)", v.as_str()),
+            Expectation::KnownGap(v) => format!("known-gap: {}", v.as_str()),
         }
     }
 
@@ -127,14 +140,61 @@ impl Expectation {
     /// does not gate, which is honest — at `advisory` there is no claim for it to have broken.
     pub fn is_satisfied_by(self, actual: Verdict) -> bool {
         match self {
-            Expectation::Must(expected) => actual == expected,
+            Expectation::Must(expected) | Expectation::KnownGap(expected) => actual == expected,
             Expectation::NotAsserted | Expectation::Documented(_) => true,
         }
     }
 
     /// Whether a mismatch here can fail the suite. `NotAsserted` cases are reported, never gated.
     pub fn gates(self) -> bool {
-        matches!(self, Expectation::Must(_))
+        matches!(self, Expectation::Must(_) | Expectation::KnownGap(_))
+    }
+
+    /// Whether this asserts a known gap. A mismatch here is known-gap drift, counted apart from
+    /// every boundary and resource rollup.
+    pub fn is_known_gap(self) -> bool {
+        matches!(self, Expectation::KnownGap(_))
+    }
+}
+
+/// What grading one outcome concluded, in the terms the rollups count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grade {
+    /// Graded and matched a [`Expectation::Must`].
+    Pass,
+    /// Graded and missed a [`Expectation::Must`]: a boundary crossing for a boundary case, a
+    /// ceiling that gave way for a resource case.
+    Fail,
+    /// Matched a [`Expectation::KnownGap`]: the route is still not contained, as asserted.
+    GapHeld,
+    /// Missed a [`Expectation::KnownGap`]: the gap changed, and the expectation has to flip.
+    GapChanged,
+    /// Nothing to compare against: [`Expectation::NotAsserted`] or [`Expectation::Documented`].
+    NotAsserted,
+}
+
+impl Grade {
+    /// Grades `actual` against `expectation`.
+    pub fn of(expectation: Expectation, actual: Verdict) -> Grade {
+        let satisfied = expectation.is_satisfied_by(actual);
+        match expectation {
+            Expectation::Must(_) if satisfied => Grade::Pass,
+            Expectation::Must(_) => Grade::Fail,
+            Expectation::KnownGap(_) if satisfied => Grade::GapHeld,
+            Expectation::KnownGap(_) => Grade::GapChanged,
+            Expectation::NotAsserted | Expectation::Documented(_) => Grade::NotAsserted,
+        }
+    }
+
+    /// The result cell of a stdout line or a record row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Grade::Pass => "PASS",
+            Grade::Fail => "FAIL",
+            Grade::GapHeld => "known gap holds",
+            Grade::GapChanged => "KNOWN GAP CHANGED",
+            Grade::NotAsserted => "not asserted",
+        }
     }
 }
 
@@ -186,6 +246,54 @@ mod tests {
         assert!(!e.is_satisfied_by(Verdict::Allowed));
         // The one that matters: a case that produced no evidence is not a pass.
         assert!(!e.is_satisfied_by(Verdict::Inconclusive));
+    }
+
+    #[test]
+    fn known_gap_gates_and_compares_exactly() {
+        let e = Expectation::KnownGap(Verdict::Allowed);
+        assert!(e.gates());
+        assert!(e.is_known_gap());
+        assert!(e.is_satisfied_by(Verdict::Allowed));
+        assert!(!e.is_satisfied_by(Verdict::Refused));
+        assert!(!e.is_satisfied_by(Verdict::Inconclusive));
+        assert_eq!(e.as_str(), "known-gap: ALLOWED");
+        assert_eq!(e.verdict(), Some(Verdict::Allowed));
+        assert!(!Expectation::Must(Verdict::Allowed).is_known_gap());
+    }
+
+    /// A known gap that holds is not a pass of a boundary, and one that changed is not a
+    /// boundary crossing: both have grades of their own, which is what keeps them out of the
+    /// boundary rollup and its exit code.
+    #[test]
+    fn known_gap_gates_but_is_not_a_boundary_crossing() {
+        let gap = Expectation::KnownGap(Verdict::Allowed);
+        assert_eq!(Grade::of(gap, Verdict::Allowed), Grade::GapHeld);
+        assert_ne!(Grade::of(gap, Verdict::Allowed), Grade::Pass);
+        assert_ne!(Grade::of(gap, Verdict::Refused), Grade::Fail);
+    }
+
+    #[test]
+    fn known_gap_drift_fails() {
+        let gap = Expectation::KnownGap(Verdict::Allowed);
+        // The gap closed: the suite fails until the expectation flips.
+        assert_eq!(Grade::of(gap, Verdict::Refused), Grade::GapChanged);
+        // No evidence is not the gap holding either.
+        assert_eq!(Grade::of(gap, Verdict::Inconclusive), Grade::GapChanged);
+    }
+
+    #[test]
+    fn must_and_not_asserted_grades() {
+        let must = Expectation::Must(Verdict::Refused);
+        assert_eq!(Grade::of(must, Verdict::Refused), Grade::Pass);
+        assert_eq!(Grade::of(must, Verdict::Allowed), Grade::Fail);
+        assert_eq!(
+            Grade::of(Expectation::NotAsserted, Verdict::Allowed),
+            Grade::NotAsserted
+        );
+        assert_eq!(
+            Grade::of(Expectation::Documented(Verdict::Refused), Verdict::Allowed),
+            Grade::NotAsserted
+        );
     }
 
     #[test]

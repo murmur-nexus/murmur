@@ -1836,7 +1836,7 @@ ground.
 
 | | Escape-conformance harness | Manual procedures |
 |---|---|---|
-| Form | One command, graded against a declared containment class | Written scenarios with exact commands and expected output |
+| Form | One command, graded against a declared containment class, run by hand and in CI | Written scenarios with exact commands and expected output |
 | Covers | Filesystem escape, `/proc` re-open paths, inherited descriptors, device-node creation, the exec allowlist, network egress, unix sockets, the dangerous-syscall table, resource exhaustion | Launch-time refusals, the composed root observed from inside a live capsule, the fixed device set, shell-binary reachability, staged runtimes, the child's capability sets |
 | Where the result lives | A dated record file the run writes | A dated entry in the procedure itself |
 
@@ -1855,15 +1855,44 @@ cargo build --release -p murmur-cli -p escape-conformance
 ```
 
 `--class` takes `advisory`, `scoped` or `sealed` and is what the run is graded against.
-`--list-cases` prints the registry with each case's expectation per class, and `--help` lists the
+`--list-cases` prints the registry with each case's expectation per route, and `--help` lists the
 remaining options.
+
+The `contained` job in `.github/workflows/ci.yml` runs it at `scoped` and at `sealed` on every pull
+request, after asserting that its runner reaches both classes, and uploads each record as the
+`escape-conformance-records` artifact. A non-zero exit fails the job.
+
+Each case runs through one or more routes, and each route gets its own verdict and its own row in
+the record:
+
+| Route | How the probe runs | Graded on |
+|---|---|---|
+| `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
+| `process-harness` | As a child of the [process harness](manifest.md#transport-process) itself, which the runtime starts with a cleared environment and no other containment | One expectation for every class |
+
+An expectation is one of:
+
+| Expectation | Graded | A mismatch means |
+|---|---|---|
+| a verdict, such as `REFUSED` | yes | a boundary was crossed, or a resource ceiling gave way |
+| `known-gap: <VERDICT>` | yes | a route that is not contained gave a different verdict: the gap moved, and the expectation flips in the same change |
+| `not-asserted` | no | — |
+
+A known gap is counted on its own line of the summary and the record, never as a boundary pass or
+an escape, and a changed one exits `5`.
 
 Each run stages its cases under a work root: the directory `--work-root` names, or a new
 `escape-conformance-work-<stamp>` directory next to the record. A work root carries a
 `.escape-conformance-work-root` marker file, and a marked work root is emptied before a run reuses
 it, so every case is graded only on files its own run wrote. A non-empty directory without the
 marker is refused with exit `1`; clear it with the `rm -rf` command the refusal prints, or pass an
-empty directory.
+empty directory. Once a case is graded, whatever its probe wrote into its workdir and into its
+sessions' `tmp/` and `home/` folders is deleted; the manifest, the probe and its verdict file,
+`mur`'s output and each session's trace are kept.
+
+Put the work root on the filesystem that holds `/etc` and `/var/tmp`. On another one,
+`hardlink-escape` and `rename-across-boundary` fail with `EXDEV` before any containment is
+consulted, and the record is stamped not citable.
 
 The run needs:
 
@@ -1879,10 +1908,18 @@ The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) o
 harness runs with: the harness resolves `~/.murmur/keys/record-seal.key` there, creating the key
 when it is missing, and hands the probe its path, never its bytes, since the capsule's own `$HOME`
 is a different folder. It must be refused at `scoped` and `sealed` and is not asserted at
-`advisory`.
+`advisory`. On the `process-harness` route it is `known-gap: ALLOWED`: the harness reads the key.
 
-It runs on bare metal: a host that cannot back the class under test, and a host that looks like a
-container, are both refused before the first case runs, and a refused run writes no record.
+A host that cannot back the class under test is refused before the first case runs, and a refused
+run writes no record. The record names the environment the run happened in, and only a bare-host
+record is `W-SEC-005` evidence:
+
+| Environment | Detected by | Run |
+|---|---|---|
+| container | `/.dockerenv`, `/run/.containerenv`, a container runtime in `/proc/1/cgroup`, a cgroup namespace, an `overlay` root filesystem | refused; `--allow-container` runs it, stamped not citable |
+| pod | `KUBERNETES_SERVICE_HOST`, `/var/run/secrets/kubernetes.io/serviceaccount`, `kubepods` in `/proc/1/cgroup` | refused; `--allow-container` runs it, stamped not citable |
+| virtual machine | `systemd-detect-virt --vm`, a hypervisor in the DMI vendor or product name | runs, stamped not citable |
+| bare host | none of the above | runs; citable when every case ran and the work root shares the filesystem of `/etc` and `/var/tmp` |
 
 The exit code separates a refusal from a failure, and an escape from a ceiling that gave way:
 
@@ -1893,9 +1930,11 @@ The exit code separates a refusal from a failure, and an escape from a ceiling t
 | `2` | refused — this host cannot back the class, a prerequisite is missing, or no probe could run | none |
 | `3` | a boundary case failed — a containment escape | written |
 | `4` | boundary clean, a resource ceiling did not hold — denial of service | written |
+| `5` | boundary and resources clean, a known gap changed | written |
 
-When no probe can run, the refusal names the check the preflight case failed — `stage`, `launch`,
-`harness`, `interpreter exec` or `probe file` — and what to check first for it.
+When no probe can run on a route, the refusal names the route and the check the preflight case
+failed — `stage`, `launch`, `harness`, `interpreter exec` or `probe file` — and what to check first
+for it.
 
 ### The manual procedures
 

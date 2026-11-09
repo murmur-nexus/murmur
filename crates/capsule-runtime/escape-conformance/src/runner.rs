@@ -26,6 +26,22 @@
 //! evidence, and "no evidence" must never read as "contained". It also costs no API calls and
 //! needs no key, so the suite is runnable by anyone with the repository and a Linux host.
 //!
+//! # Routes
+//!
+//! A case runs once per route it lists ([`Case::routes`]). On [`Route::ShellTool`] the probe is a
+//! tool call, as above. On [`Route::ProcessHarness`] the same manifest shape is launched, but the
+//! driver config tells `probe-driver` to run the staged probe as its own child instead of calling
+//! the bridge, so the verdict says what a process-transport harness can reach. Each route stages
+//! its own case directory, so neither grades the other's probe file.
+//!
+//! # Scratch is removed after each case
+//!
+//! Once a case is graded, everything its probe left in the capsule workdir is deleted, along with
+//! the contents of each session's `tmp/` and `home/` folders. The disk-filler cases write about a
+//! gigabyte each, and the evidence a record points at is elsewhere: the staged probe and its
+//! verdict file, the manifest, `mur`'s output, the driver's summary and each session's trace are
+//! kept.
+//!
 //! # Why the probe writes a file instead of returning a value
 //!
 //! Every resource-exhaustion case ends with its process killed. A verdict carried back through
@@ -39,11 +55,11 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::cases::{Case, Evidence, Prepare, Profile};
+use crate::cases::{Case, Evidence, Prepare, Profile, Route};
 use crate::driver_artifact;
-use crate::harness_protocol::ProbeConfig;
+use crate::harness_protocol::{ProbeConfig, ProbeRoute};
 use crate::probe;
-use crate::verdict::{Expectation, Verdict};
+use crate::verdict::{Expectation, Grade, Verdict};
 
 /// Everything a run needs that is not the case itself.
 pub struct RunnerConfig {
@@ -61,6 +77,9 @@ pub struct RunnerConfig {
     pub work_root: PathBuf,
     /// Wall-clock ceiling for one case's `mur run`.
     pub timeout: Duration,
+    /// The interpreter `probe-driver` runs the probe with on [`Route::ProcessHarness`], absolute:
+    /// the harness starts with a cleared environment, so it has no `PATH` to look `python3` up on.
+    pub harness_interpreter: PathBuf,
     /// Wrap each `mur run` in `systemd-run --user --scope --property=Delegate=yes`. Without a
     /// delegated cgroup v2 subtree, `mur run` refuses any subprocess-capable capsule with
     /// `E-RUN-012` and no case can report anything — see the install requirement in
@@ -68,14 +87,16 @@ pub struct RunnerConfig {
     pub systemd_scope: bool,
 }
 
-/// One case's result.
+/// One case's result on one route.
 pub struct CaseOutcome {
     pub case: &'static Case,
+    pub route: Route,
     pub expectation: Expectation,
     pub verdict: Verdict,
     /// One line. Carries the attribution evidence — which errno, which control, which mechanism.
     pub detail: String,
-    pub passed: bool,
+    /// [`Self::verdict`] graded against [`Self::expectation`].
+    pub grade: Grade,
     pub case_dir: PathBuf,
     /// How far the run got before it was graded. `classify_preflight` reads it.
     pub reach: RunReach,
@@ -133,8 +154,29 @@ fn yaml_str(value: &str) -> String {
     serde_json::to_string(value).expect("a string serializes")
 }
 
-/// What `probe-driver` is told about one case, through `inference.driver.config`.
-pub fn probe_config(case: &Case, driver_log: &Path) -> ProbeConfig {
+/// The directory one case is staged in on `route`. The shell tool keeps the bare case id; every
+/// other route appends its name, so no two routes share a probe file.
+pub fn case_dir(config: &RunnerConfig, case: &Case, route: Route) -> PathBuf {
+    match route {
+        Route::ShellTool => config.work_root.join(case.id),
+        _ => config
+            .work_root
+            .join(format!("{}--{}", case.id, route.as_str())),
+    }
+}
+
+/// The capsule workdir inside a case directory.
+fn workdir_in(case_dir: &Path) -> PathBuf {
+    case_dir.join("wd")
+}
+
+/// What `probe-driver` is told about one case on `route`, through `inference.driver.config`.
+pub fn probe_config(
+    case: &Case,
+    route: Route,
+    config: &RunnerConfig,
+    case_dir: &Path,
+) -> ProbeConfig {
     ProbeConfig {
         tool: "python3".to_string(),
         script: probe::PROBE_SCRIPT.to_string(),
@@ -143,11 +185,19 @@ pub fn probe_config(case: &Case, driver_log: &Path) -> ProbeConfig {
             _ => None,
         },
         case: case.id.to_string(),
-        log: driver_log.display().to_string(),
+        log: driver_log_path(case_dir).display().to_string(),
+        route: match route {
+            Route::ShellTool => ProbeRoute::ShellTool,
+            Route::ProcessHarness => ProbeRoute::ProcessHarness {
+                interpreter: config.harness_interpreter.display().to_string(),
+                workdir: workdir_in(case_dir).display().to_string(),
+            },
+        },
     }
 }
 
-/// The manifest one case runs under. `driver_log` is where `probe-driver` writes its summary.
+/// The manifest one case runs under on `route`, staged in `case_dir`. Both routes declare the
+/// same capabilities: only the driver config differs, so the class under test is the same.
 ///
 /// Declares `capabilities.containment: <class>` explicitly. Without this, every case would run at
 /// the manifest default (`advisory`), and on a `sealed`-capable host `applied_tier` would still
@@ -160,9 +210,10 @@ pub fn probe_config(case: &Case, driver_log: &Path) -> ProbeConfig {
 /// calls.
 pub fn manifest_yaml(
     case: &Case,
+    route: Route,
     config: &RunnerConfig,
     class: murmur_artifact::ContainmentClass,
-    driver_log: &Path,
+    case_dir: &Path,
 ) -> String {
     let mut yaml = String::new();
     yaml.push_str(&format!("name: escape-conformance-{}\n", case.id));
@@ -192,7 +243,7 @@ pub fn manifest_yaml(
     // subprocess's. `lifecycle.shell_grace_secs` is left undeclared too, so no probe is ever
     // demoted to the background: a demoted command's tool result carries a `wrk_` handle instead
     // of an exit code, which a `ShellExit` case cannot grade.
-    let probe = probe_config(case, driver_log);
+    let probe = probe_config(case, route, config, case_dir);
     yaml.push_str("\ninference:\n");
     yaml.push_str("  transport: process\n");
     yaml.push_str("  driver:\n");
@@ -208,6 +259,18 @@ pub fn manifest_yaml(
     }
     yaml.push_str(&format!("      case: {}\n", yaml_str(&probe.case)));
     yaml.push_str(&format!("      log: {}\n", yaml_str(&probe.log)));
+    yaml.push_str(&format!(
+        "      route: {}\n",
+        yaml_str(probe.route.route().as_str())
+    ));
+    if let ProbeRoute::ProcessHarness {
+        interpreter,
+        workdir,
+    } = &probe.route
+    {
+        yaml.push_str(&format!("      interpreter: {}\n", yaml_str(interpreter)));
+        yaml.push_str(&format!("      workdir: {}\n", yaml_str(workdir)));
+    }
     // The binary override: the driver's `describe().binary` names `probe-driver` bare, and this
     // package's build is not on any PATH `mur` would search.
     yaml.push_str(&format!(
@@ -223,14 +286,15 @@ fn driver_log_path(case_dir: &Path) -> PathBuf {
     case_dir.join("probe-driver.txt")
 }
 
-/// Stages one case's directory and returns `(case_dir, capsule_workdir, manifest_path)`.
+/// Stages one case's directory for `route` and returns `(capsule_workdir, manifest_path)`.
 fn stage(
     case: &Case,
+    route: Route,
     config: &RunnerConfig,
     class: murmur_artifact::ContainmentClass,
-) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
-    let case_dir = config.work_root.join(case.id);
-    let workdir = case_dir.join("wd");
+    case_dir: &Path,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let workdir = workdir_in(case_dir);
     fs::create_dir_all(&workdir)?;
 
     fs::write(workdir.join(probe::PROBE_SCRIPT), probe::render(case.body))?;
@@ -243,11 +307,11 @@ fn stage(
     let manifest = case_dir.join("murmur.yaml");
     fs::write(
         &manifest,
-        manifest_yaml(case, config, class, &driver_log_path(&case_dir)),
+        manifest_yaml(case, route, config, class, case_dir),
     )?;
     // `mur install` upserts the artifact into the project the manifest's directory names, and
     // `mur run --manifest` resolves its artifacts from that same project's store.
-    driver_artifact::install_into(&config.mur, &config.driver_artifact, &case_dir)
+    driver_artifact::install_into(&config.mur, &config.driver_artifact, case_dir)
         .map_err(io::Error::other)?;
 
     match case.prepare {
@@ -275,7 +339,116 @@ fn stage(
             set_executable(&target)?;
         }
     }
-    Ok((case_dir, workdir, manifest))
+    Ok((workdir, manifest))
+}
+
+/// The workdir entries the harness staged for `case`, which the scratch cleanup keeps: the probe,
+/// its verdict file, the follow-up script and whatever [`Prepare`] wrote.
+fn staged_names(case: &Case) -> Vec<&'static str> {
+    let mut names = vec![probe::PROBE_SCRIPT, probe::PROBE_FILE];
+    if let Evidence::SecondSpawnRefused(_) = case.evidence {
+        names.push(probe::SECOND_SCRIPT);
+    }
+    match case.prepare {
+        Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
+        Prepare::CopyBinaryAs { dest, .. } | Prepare::WriteSealKeyPath { dest } => names.push(dest),
+    }
+    names
+}
+
+/// What [`remove_scratch`] removed, and what it could not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScratchRemoved {
+    /// Top-level entries removed.
+    pub entries: usize,
+    /// Bytes of regular files removed, counted before removal.
+    pub bytes: u64,
+    /// One line per entry that could not be removed.
+    pub errors: Vec<String>,
+}
+
+impl ScratchRemoved {
+    /// The note folded into a case's DETAIL, `None` when there was nothing to say.
+    fn note(&self) -> Option<String> {
+        if self.entries == 0 && self.errors.is_empty() {
+            return None;
+        }
+        let mut note = format!(
+            "[scratch removed after grading: {} entr{}, {} bytes",
+            self.entries,
+            if self.entries == 1 { "y" } else { "ies" },
+            self.bytes
+        );
+        if !self.errors.is_empty() {
+            note.push_str(&format!("; NOT removed: {}", self.errors.join("; ")));
+        }
+        note.push(']');
+        Some(note)
+    }
+}
+
+/// Bytes of the regular files under `path`, without following symlinks.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| tree_bytes(&entry.path()))
+                    .sum()
+            })
+            .unwrap_or(0)
+    } else if meta.is_file() {
+        meta.len()
+    } else {
+        0
+    }
+}
+
+/// Removes every entry of `dir` whose name is not in `keep`, into `removed`. A symlink is removed
+/// as a link; its target is never entered.
+fn remove_entries(dir: &Path, keep: &[&str], removed: &mut ScratchRemoved) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if keep.iter().any(|name| entry.file_name() == *name) {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = tree_bytes(&path);
+        let result = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                removed.entries += 1;
+                removed.bytes += bytes;
+            }
+            Err(err) => removed.errors.push(format!("{}: {err}", path.display())),
+        }
+    }
+}
+
+/// Deletes what `case`'s probe left behind in `workdir`, and the contents of each of its sessions'
+/// `tmp/` and `home/` folders, keeping what the harness staged and every session's record.
+pub fn remove_scratch(case: &Case, workdir: &Path) -> ScratchRemoved {
+    let mut removed = ScratchRemoved::default();
+    remove_entries(workdir, &staged_names(case), &mut removed);
+    let sessions = capsule_runtime::records_group(workdir)
+        .ok()
+        .and_then(|group| fs::read_dir(group).ok());
+    for session in sessions.into_iter().flatten().flatten() {
+        for folder in ["tmp", "home"] {
+            remove_entries(&session.path().join(folder), &[], &mut removed);
+        }
+    }
+    removed
 }
 
 #[cfg(unix)]
@@ -500,11 +673,15 @@ fn excerpt(text: &str, needle: &str) -> String {
 /// case as a failure, and "twenty-three boundary escapes" is a far more damaging false statement
 /// than "this harness declined to measure anything here". The refusal carries the hint for the
 /// check that failed, from `classify_preflight` and `preflight_hint`.
+///
+/// Runs once per route a registry case uses, so a host where the process harness cannot start a
+/// probe is refused too, rather than reporting every harness-route known gap as changed.
 pub fn preflight(
     config: &RunnerConfig,
     class: murmur_artifact::ContainmentClass,
+    route: Route,
 ) -> Result<String, String> {
-    let outcome = run_case(&crate::cases::PREFLIGHT, config, class);
+    let outcome = run_case(&crate::cases::PREFLIGHT, route, config, class);
     if outcome.verdict == Verdict::Succeeded {
         return Ok(outcome.detail);
     }
@@ -516,7 +693,7 @@ pub fn preflight_refusal(outcome: &CaseOutcome) -> String {
     let check = classify_preflight(outcome);
     format!(
         "REFUSED — no probe can run on this host, so nothing can be measured.\n\n\
-         The preflight capsule failed the {} check:\n\
+         The preflight capsule failed the {} check on the {} route:\n\
          \x20 {}\n\n\
          Every case would report INCONCLUSIVE and every asserted case would fail, which would \
          read as a boundary escape when in fact nothing was exercised. No record file was \
@@ -524,6 +701,7 @@ pub fn preflight_refusal(outcome: &CaseOutcome) -> String {
          {}\n\n\
          Artifacts for this preflight run: {}",
         check.name(),
+        outcome.route.as_str(),
         outcome.detail,
         preflight_hint(&check),
         outcome.case_dir.display()
@@ -688,26 +866,42 @@ pub fn preflight_hint(check: &PreflightCheck) -> String {
 /// these are the refusal codes a run is read for.
 const LAUNCH_REFUSAL_CODES: [&str; 4] = ["E-RUN-012", "E-RUN-007", "E-RUN-008", "E-MAN-"];
 
-/// Runs one case end to end and grades it.
+/// Runs one case end to end on `route`, grades it, and removes its scratch.
+///
+/// `route` is one of [`Case::routes`]; any other is reported `INCONCLUSIVE` without staging.
 pub fn run_case(
     case: &'static Case,
+    route: Route,
     config: &RunnerConfig,
     class: murmur_artifact::ContainmentClass,
 ) -> CaseOutcome {
-    let expectation = case.expectation(class);
+    let case_dir = case_dir(config, case, route);
+    let not_run = |expectation: Expectation, detail: String, reach: RunReach| CaseOutcome {
+        case,
+        route,
+        expectation,
+        verdict: Verdict::Inconclusive,
+        grade: Grade::of(expectation, Verdict::Inconclusive),
+        detail,
+        case_dir: case_dir.clone(),
+        reach,
+    };
+    let Some(expectation) = case.expectation_on(route, class) else {
+        return not_run(
+            Expectation::NotAsserted,
+            format!("{} does not run on the {} route", case.id, route.as_str()),
+            RunReach::NotStaged,
+        );
+    };
 
-    let (case_dir, workdir, manifest) = match stage(case, config, class) {
+    let (workdir, manifest) = match stage(case, route, config, class, &case_dir) {
         Ok(paths) => paths,
         Err(err) => {
-            return CaseOutcome {
-                case,
+            return not_run(
                 expectation,
-                verdict: Verdict::Inconclusive,
-                detail: format!("could not stage the case: {err}"),
-                passed: !expectation.gates(),
-                case_dir: config.work_root.join(case.id),
-                reach: RunReach::NotStaged,
-            };
+                format!("could not stage the case: {err}"),
+                RunReach::NotStaged,
+            );
         }
     };
 
@@ -718,15 +912,11 @@ pub fn run_case(
     {
         Ok(result) => result,
         Err(err) => {
-            return CaseOutcome {
-                case,
+            return not_run(
                 expectation,
-                verdict: Verdict::Inconclusive,
-                detail: format!("could not launch `{}`: {err}", argv.join(" ")),
-                passed: !expectation.gates(),
-                case_dir,
-                reach: RunReach::NotLaunched,
-            };
+                format!("could not launch `{}`: {err}", argv.join(" ")),
+                RunReach::NotLaunched,
+            );
         }
     };
 
@@ -858,13 +1048,18 @@ pub fn run_case(
         }
     }
 
-    let passed = expectation.is_satisfied_by(verdict);
+    // After everything above has read the workdir and the session folders, never before.
+    if let Some(note) = remove_scratch(case, &workdir).note() {
+        detail = format!("{detail} {note}");
+    }
+
     CaseOutcome {
         case,
+        route,
         expectation,
         verdict,
+        grade: Grade::of(expectation, verdict),
         detail: crate::record::sanitize_cell(&detail),
-        passed,
         case_dir,
         reach: RunReach::Ran {
             timed_out,
@@ -890,8 +1085,8 @@ mod tests {
     use crate::cases;
     use murmur_artifact::{ArtifactRuntime, ContainmentClass, RuntimeManifest};
 
-    fn log() -> PathBuf {
-        PathBuf::from("/tmp/escape-conformance-test/case/probe-driver.txt")
+    fn case_dir_for_test() -> PathBuf {
+        PathBuf::from("/tmp/escape-conformance-test/case")
     }
 
     fn config() -> RunnerConfig {
@@ -901,8 +1096,20 @@ mod tests {
             driver_artifact: PathBuf::from("/nonexistent/escape-conformance-driver-0.1.0.mur.zip"),
             work_root: PathBuf::from("/tmp/escape-conformance-test"),
             timeout: Duration::from_secs(1),
+            harness_interpreter: PathBuf::from("/usr/bin/python3"),
             systemd_scope: false,
         }
+    }
+
+    fn scoped_yaml(id: &str, route: Route) -> String {
+        let case = cases::find(id).unwrap();
+        manifest_yaml(
+            case,
+            route,
+            &config(),
+            ContainmentClass::Scoped,
+            &case_dir_for_test(),
+        )
     }
 
     #[test]
@@ -959,10 +1166,11 @@ mod tests {
     fn preflight_outcome(detail: &str, reach: RunReach) -> CaseOutcome {
         CaseOutcome {
             case: &cases::PREFLIGHT,
+            route: Route::ShellTool,
             expectation: Expectation::Must(Verdict::Succeeded),
             verdict: Verdict::Inconclusive,
             detail: detail.to_string(),
-            passed: false,
+            grade: Grade::Fail,
             case_dir: PathBuf::from("/tmp/escape-conformance-test/preflight"),
             reach,
         }
@@ -1084,6 +1292,7 @@ mod tests {
                 "REFUSED — no probe can run on this host, so nothing can be measured."
             ));
             assert!(refusal.contains(&hint));
+            assert!(refusal.contains("on the shell-tool route"), "{refusal}");
             assert!(refusal.contains(&outcome.detail));
             assert!(refusal.contains("/tmp/escape-conformance-test/preflight"));
         }
@@ -1113,8 +1322,7 @@ mod tests {
 
     #[test]
     fn boundary_manifest_has_no_resource_block_and_declares_no_network() {
-        let case = cases::find("read-etc-shadow").unwrap();
-        let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
+        let yaml = scoped_yaml("read-etc-shadow", Route::ShellTool);
         assert!(yaml.contains("allow:\n      - bash\n      - python3"));
         assert!(!yaml.contains("resources:"));
         // Nothing may be declared network-reachable, or the four network cases assert nothing.
@@ -1126,7 +1334,13 @@ mod tests {
     fn manifest_declares_the_containment_class_under_test() {
         let case = cases::find("read-etc-shadow").unwrap();
         for class in ContainmentClass::DECLARABLE {
-            let yaml = manifest_yaml(case, &config(), class, &log());
+            let yaml = manifest_yaml(
+                case,
+                Route::ShellTool,
+                &config(),
+                class,
+                &case_dir_for_test(),
+            );
             assert!(
                 yaml.contains(&format!("containment: {class}\n")),
                 "manifest for class {class} must declare it, or applied_tier never installs \
@@ -1138,8 +1352,7 @@ mod tests {
 
     #[test]
     fn resource_manifest_carries_the_tight_ceilings() {
-        let case = cases::find("resource-fork-bomb").unwrap();
-        let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
+        let yaml = scoped_yaml("resource-fork-bomb", Route::ShellTool);
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
         // 128, not the manual-verification document's 64: see `tight_resources_yaml`. The
@@ -1205,15 +1418,21 @@ mod tests {
         config.probe_driver = PathBuf::from("/opt/a build: tree/probe-driver");
 
         let mut profiles_seen = (false, false);
+        let mut routes_seen = (false, false);
         let cases = std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases());
-        for case in cases {
+        for (case, route) in cases.flat_map(|case| case.routes().map(move |route| (case, route))) {
             match case.profile {
                 Profile::Boundary => profiles_seen.0 = true,
                 Profile::TightResources => profiles_seen.1 = true,
             }
-            let driver_log = driver_log_path(&config.work_root.join(case.id));
+            match route {
+                Route::ShellTool => routes_seen.0 = true,
+                Route::ProcessHarness => routes_seen.1 = true,
+            }
+            let case_dir = case_dir(&config, case, route);
+            let driver_log = driver_log_path(&case_dir);
             for class in ContainmentClass::DECLARABLE {
-                let yaml = manifest_yaml(case, &config, class, &driver_log);
+                let yaml = manifest_yaml(case, route, &config, class, &case_dir);
                 let id = case.id;
                 let manifest = match RuntimeManifest::from_yaml_str(&yaml) {
                     Ok(manifest) => manifest,
@@ -1278,6 +1497,15 @@ mod tests {
                 if let Some(script2) = &probe.script2 {
                     assert_eq!(script2, probe::SECOND_SCRIPT);
                 }
+                assert_eq!(probe.route.route(), route, "case {id} at class {class}");
+                if let ProbeRoute::ProcessHarness {
+                    interpreter,
+                    workdir,
+                } = &probe.route
+                {
+                    assert_eq!(interpreter, "/usr/bin/python3");
+                    assert_eq!(workdir, &workdir_in(&case_dir).display().to_string());
+                }
             }
         }
         assert_eq!(
@@ -1285,5 +1513,104 @@ mod tests {
             (true, true),
             "both profiles must be generated, or one manifest shape goes unchecked"
         );
+        assert_eq!(
+            routes_seen,
+            (true, true),
+            "both routes must be generated, or one driver config goes unchecked"
+        );
+    }
+
+    #[test]
+    fn each_route_stages_its_own_case_directory() {
+        let config = config();
+        let case = cases::find("read-record-seal-key").unwrap();
+        let shell = case_dir(&config, case, Route::ShellTool);
+        let harness = case_dir(&config, case, Route::ProcessHarness);
+        assert_eq!(shell, config.work_root.join("read-record-seal-key"));
+        assert_eq!(
+            harness,
+            config
+                .work_root
+                .join("read-record-seal-key--process-harness")
+        );
+    }
+
+    /// The harness route's manifest is the shell route's with the driver config told to run the
+    /// probe itself: same class, same shell allowlist, so the two verdicts differ by route alone.
+    #[test]
+    fn the_harness_route_manifest_differs_only_in_the_driver_config() {
+        let shell = scoped_yaml("read-record-seal-key", Route::ShellTool);
+        let harness = scoped_yaml("read-record-seal-key", Route::ProcessHarness);
+        assert!(shell.contains("      route: \"shell-tool\"\n"), "{shell}");
+        assert!(
+            harness.contains("      route: \"process-harness\"\n"),
+            "{harness}"
+        );
+        assert!(harness.contains("      interpreter: \"/usr/bin/python3\"\n"));
+        assert!(harness.contains("      workdir: \"/tmp/escape-conformance-test/case/wd\"\n"));
+        let strip = |yaml: &str| -> Vec<String> {
+            yaml.lines()
+                .filter(|line| {
+                    !["      route:", "      interpreter:", "      workdir:"]
+                        .iter()
+                        .any(|key| line.starts_with(key))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(strip(&shell), strip(&harness));
+    }
+
+    #[test]
+    fn a_route_the_case_does_not_run_on_is_not_staged() {
+        let case = cases::find("read-etc-shadow").unwrap();
+        let outcome = run_case(
+            case,
+            Route::ProcessHarness,
+            &config(),
+            ContainmentClass::Scoped,
+        );
+        assert_eq!(outcome.reach, RunReach::NotStaged);
+        assert_eq!(outcome.verdict, Verdict::Inconclusive);
+        assert_eq!(outcome.grade, Grade::NotAsserted);
+        assert!(!config()
+            .work_root
+            .join("read-etc-shadow--process-harness")
+            .exists());
+    }
+
+    /// The disk-filler leak: a graded case's probe output goes, its evidence stays.
+    #[test]
+    fn scratch_is_removed_after_grading_and_the_evidence_is_kept() {
+        let root = crate::work_root::tests::scratch_path("scratch");
+        let workdir = root.join("wd");
+        fs::create_dir_all(workdir.join("nested")).unwrap();
+        let case = cases::find("read-record-seal-key").unwrap();
+        for kept in [probe::PROBE_SCRIPT, probe::PROBE_FILE, "seal-key-path.txt"] {
+            fs::write(workdir.join(kept), "evidence").unwrap();
+        }
+        fs::write(workdir.join("ec-fill-0"), vec![0u8; 4096]).unwrap();
+        fs::write(workdir.join("nested").join("ec-fill-1"), vec![0u8; 1024]).unwrap();
+        // A link to something outside the workdir goes as a link; its target is untouched.
+        let outside = root.join("outside");
+        fs::write(&outside, "not scratch").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, workdir.join("ec-symlink")).unwrap();
+
+        let removed = remove_scratch(case, &workdir);
+        assert!(removed.errors.is_empty(), "{:?}", removed.errors);
+        assert_eq!(removed.bytes, 4096 + 1024);
+        let mut left: Vec<String> = fs::read_dir(&workdir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["__ec.probe", "ec-probe.py", "seal-key-path.txt"]);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "not scratch");
+        assert!(removed.note().unwrap().contains("5120 bytes"));
+
+        // Nothing left: nothing to say.
+        assert_eq!(remove_scratch(case, &workdir).note(), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
