@@ -619,7 +619,8 @@ impl HostFacts {
 mod tests {
     use super::*;
 
-    /// What this kind of laptop reads: a systemd host, a non-root run, no hypervisor.
+    /// A bare systemd host read by a non-root run: PID 1's cgroup namespace is unreadable, no
+    /// hypervisor.
     fn bare() -> EnvironmentReadings {
         EnvironmentReadings {
             dockerenv: false,

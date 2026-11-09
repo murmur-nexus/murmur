@@ -95,9 +95,9 @@ impl ProbeConfig {
     }
 
     /// Reads a config out of `text`. Errors name the first required key that is missing or not
-    /// a string; `script2` may be absent, `null` or empty, all meaning no second call. An absent
-    /// `route` is the shell tool; `"process-harness"` requires `interpreter` and `workdir`. Keys
-    /// it does not know are ignored.
+    /// a string; `script2` may be absent, `null` or empty, all meaning no second call. `route` is
+    /// required, and `"process-harness"` also requires `interpreter` and `workdir`. Keys it does
+    /// not know are ignored.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text)
             .map_err(|err| format!("the probe config is not JSON: {err}"))?;
@@ -118,7 +118,7 @@ impl ProbeConfig {
             Some(_) => return Err("the probe config's \"script2\" is not a string".to_string()),
         };
         let route = match object.get("route") {
-            None => ProbeRoute::ShellTool,
+            None => return Err("the probe config has no string \"route\"".to_string()),
             Some(Value::String(name)) if name == Route::ShellTool.as_str() => ProbeRoute::ShellTool,
             Some(Value::String(name)) if name == Route::ProcessHarness.as_str() => {
                 ProbeRoute::ProcessHarness {
@@ -212,13 +212,14 @@ mod tests {
         assert!(!config(None).to_json().to_string().contains("interpreter"));
     }
 
-    /// A config written before routes existed has no `route` key, and still means the shell tool.
+    /// The runner always names the route, so a config without one is refused rather than read as
+    /// the shell tool: a harness-route case must never quietly run through the bridge.
     #[test]
-    fn an_absent_route_is_the_shell_tool() {
+    fn a_config_without_a_route_is_refused() {
         let mut value = config(None).to_json();
         value.as_object_mut().unwrap().remove("route");
-        let read = ProbeConfig::from_json(&value.to_string()).unwrap();
-        assert_eq!(read.route, ProbeRoute::ShellTool);
+        let err = ProbeConfig::from_json(&value.to_string()).unwrap_err();
+        assert!(err.contains("\"route\""), "{err}");
     }
 
     #[test]

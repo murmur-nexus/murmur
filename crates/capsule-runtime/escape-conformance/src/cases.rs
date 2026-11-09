@@ -104,8 +104,7 @@ pub enum Prepare {
 /// A path from a capsule's code to the host, which a case's probe body can be run through.
 ///
 /// One case, one body, several routes: the same probe run through each route a capsule has, so
-/// the record shows per route whether the boundary holds. The WASM guest is not a route here
-/// yet, and there is no native-tool route because native tools no longer exist.
+/// the record shows per route whether the boundary holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// A shell-tool command: `probe-driver` calls the capsule's `python3` tool over the tool

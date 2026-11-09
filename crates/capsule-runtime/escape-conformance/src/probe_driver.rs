@@ -241,7 +241,7 @@ fn run_in_harness(
     let stdout = clip(stdout.join().unwrap_or_default());
     let stderr = clip(stderr.join().unwrap_or_default());
     let exit =
-        exit.unwrap_or_else(|| format!("none (killed after {}s) ", SELF_PROBE_TIMEOUT.as_secs()));
+        exit.unwrap_or_else(|| format!("none (killed after {}s)", SELF_PROBE_TIMEOUT.as_secs()));
     Ok(format!(
         "case={} route=process-harness interpreter={interpreter} :: isError=false :: Exit code: \
          {exit} Stdout: {stdout} Stderr: {stderr}",

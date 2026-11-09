@@ -193,7 +193,7 @@ but nothing prevents the subprocess from reading files outside the workdir, exec
 unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 
 These are kernel behaviours, so the only check that means anything is a run on a real host. The
-hand-run procedures that do that are listed under [Verification](#verification).
+harness and the procedures that do that are listed under [Verification](#verification).
 
 ### Where the user namespace comes from { #userns-grant }
 
@@ -1912,7 +1912,7 @@ is a different folder. It must be refused at `scoped` and `sealed` and is not as
 
 A host that cannot back the class under test is refused before the first case runs, and a refused
 run writes no record. The record names the environment the run happened in, and only a bare-host
-record is `W-SEC-005` evidence:
+record is evidence for the enforcement [`W-SEC-005`](diagnostics.md#w-sec-005) describes:
 
 | Environment | Detected by | Run |
 |---|---|---|
