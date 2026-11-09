@@ -1070,6 +1070,7 @@ pub(crate) fn run_run(
                     sha256: locked_sha256(entry),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 })
                 .collect(),
         };

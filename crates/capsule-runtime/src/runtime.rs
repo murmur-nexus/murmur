@@ -19832,6 +19832,7 @@ inference:
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 }],
             },
         )
@@ -19934,6 +19935,7 @@ inference:
                 sha256: LockedSha256::any(registry.sha256.clone()),
                 origin: pinned_origin.clone(),
                 owner_id: None,
+                signer: None,
             };
             let project = tempfile::tempdir().unwrap();
             let workdir = project.path().join("workdir");
@@ -20579,6 +20581,7 @@ inference:
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 }],
             },
         )

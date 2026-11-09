@@ -185,9 +185,10 @@ pub(crate) fn ensure_artifact_for_deploy(
     };
 
     // Cached through the registry rather than written by hand, so the cached payload carries the
-    // metadata every other resolve reads, including the owner id of the source that served it.
+    // metadata every other resolve reads, including the owner id of the source that served it,
+    // and the attestation that verified, if any. A deploy reads no lock, so it records no signer.
     local_registry
-        .store_installed_overwrite(
+        .store_installed_attested(
             murmur_artifact::ArtifactMeta {
                 name: name.clone(),
                 version: version.to_string(),
@@ -201,8 +202,16 @@ pub(crate) fn ensure_artifact_for_deploy(
             },
             &resolved.bytes,
             &resolved.sha256,
+            resolved.bundle.as_deref(),
         )
         .map_err(crate::error::CliError::from)?;
+    super::install::print_warnings(&super::install::attestation_warnings(
+        name,
+        version,
+        &resolved.source,
+        &resolved.attestation,
+        None,
+    ));
 
     Ok(StagedArtifact {
         name: name.clone(),

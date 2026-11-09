@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod allocator;
+mod attestation;
 mod beta;
 // `build.rs` compiles the same file to fix the commit `mur version` reports.
 #[cfg(test)]

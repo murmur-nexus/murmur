@@ -354,7 +354,9 @@ impl ArtifactSource for GitHubSource {
             .ok_or_else(|| {
                 SourceError::NotFound(format!("release {release} has no asset {file}"))
             })?;
-        self.download_asset(asset, true)
+        // An attestation is a few kilobytes fetched after its payload: no bar of its own.
+        let progress = !file.ends_with(crate::attestation::BUNDLE_SUFFIX);
+        self.download_asset(asset, progress)
     }
 }
 

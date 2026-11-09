@@ -336,6 +336,7 @@ fn install_upserts_lock_preserving_existing_entries() {
             sha256: LockedSha256::any("preexisting-hash".to_string()),
             origin: LockOrigin::Operator,
             owner_id: None,
+            signer: None,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &preexisting).unwrap();
@@ -513,6 +514,7 @@ fn an_install_keeps_an_existing_entrys_owner_id() {
                 sha256: LockedSha256::any("owned-hash".to_string()),
                 origin: LockOrigin::Operator,
                 owner_id: Some(4242),
+                signer: None,
             }],
         },
     )
@@ -554,6 +556,7 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
             sha256: LockedSha256::any("a-completely-different-hash-from-a-prior-pull".to_string()),
             origin: LockOrigin::Operator,
             owner_id: None,
+            signer: None,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();
@@ -632,6 +635,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
             sha256: LockedSha256::any("operator-hash".to_string()),
             origin: LockOrigin::Operator,
             owner_id: None,
+            signer: None,
         },
         LockedArtifact {
             name: "local/other-pull".to_string(),
@@ -639,6 +643,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
             sha256: LockedSha256::any("other-hash".to_string()),
             origin: pulled_by("ses_other"),
             owner_id: None,
+            signer: None,
         },
     ];
     let mut artifacts = untouched.clone();
@@ -648,6 +653,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
         sha256: LockedSha256::any(named_sha),
         origin: pulled_by("ses_puller"),
         owner_id: None,
+        signer: None,
     });
     artifacts.push(LockedArtifact {
         name: "local/pulled-dep".to_string(),
@@ -655,6 +661,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
         sha256: LockedSha256::any(declared_sha),
         origin: pulled_by("ses_dep_puller"),
         owner_id: None,
+        signer: None,
     });
     murmur_artifact::write_lockfile_atomic(
         &lock_path,
@@ -802,6 +809,7 @@ fn a_manifest_install_refuses_new_bytes_for_the_pinned_version() {
             sha256: LockedSha256::any("a-completely-different-hash"),
             origin: LockOrigin::Operator,
             owner_id: None,
+            signer: None,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();

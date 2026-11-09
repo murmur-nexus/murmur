@@ -788,6 +788,13 @@ see [Artifact names](../concepts/registry.md#artifact-names). An entry may carry
 GitHub's numeric id of the scope's owner, written only when known: by `mur install` from a source,
 and by a runtime pull whose source or stored payload records one.
 
+An entry may also carry `signer`: the workflow whose verified [attestation](installing-artifacts.md#attestation)
+covers the pinned payload, for example `https://github.com/ana/artifacts/.github/workflows/release.yml`.
+
+| Key | Written | Notes |
+|---|---|---|
+| `signer` | By `mur install`, when the payload's attestation verified | Describes the bytes the entry pins: an install of unattested bytes removes it, and a new pin by any other path drops it. Must not be empty. A change prints [`W-REG-006`](diagnostics.md#w-reg-006) |
+
 Each entry pins one hash, `sha256.any`: the SHA-256 of the one payload every host resolves. An
 entry carrying `sha256.platforms` is refused with `E-RUN-003`, naming the entry; delete that entry
 from `murmur.lock` and run `mur install` to regenerate it.

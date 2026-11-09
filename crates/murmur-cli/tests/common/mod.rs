@@ -5,6 +5,7 @@
 /// `a2a.proto`.
 #[path = "../../../capsule-runtime/src/a2a_conformance.rs"]
 pub mod a2a_conformance;
+pub mod attestation;
 pub mod door_capsule;
 pub mod formation;
 pub mod github_release;

@@ -83,6 +83,7 @@ section that explains it.
 | `E-REG-013` | `mur install` could not fetch a program download a tool pins: a transport failure, a non-2xx status, or more than 2 GiB | [E-REG-013](#e-reg-013) |
 | `E-REG-014` | A program download a tool pins does not hash to the sha256 the tool pins; nothing was stored | [E-REG-014](#e-reg-014) |
 | `E-REG-015` | A program download a tool pins cannot be unpacked: `run` names no regular file, a symlink or escaping entry, or more than 2 GiB unpacked | [E-REG-015](#e-reg-015) |
+| `E-REG-016` | An attestation published beside a payload, or kept beside it in a store, does not verify against it; nothing was stored | [E-REG-016](#e-reg-016) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -170,6 +171,8 @@ section that explains it.
 | `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-REG-003` | An installed artifact does not fit the WIT level this `mur` serves | [W-REG-003](#w-reg-003) |
 | `W-REG-004` | A declared artifact's `murmur.lock` pin came from a capsule's runtime pull | [W-REG-004](#w-reg-004) |
+| `W-REG-005` | An artifact was installed, or is held, with no attestation this `mur` verified | [W-REG-005](#w-reg-005) |
+| `W-REG-006` | An artifact's attested signer differs from the `signer` its `murmur.lock` entry records, or an attested artifact came back unattested | [W-REG-006](#w-reg-006) |
 | `W-ROS-001` | A roster lets more members call a member than its `lifecycle` holds at once | [W-ROS-001](#w-ros-001) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
@@ -2939,11 +2942,38 @@ Nothing is stored; the artifact stays stored and pinned, and `mur install` exits
 **What to do:** ask the tool's author to fix the `download:` entry: `run` names a regular file inside
 the zip, or is absent for a download that is the program itself.
 
+### E-REG-016 — a payload does not match its attestation { #e-reg-016 }
+
+```text
+error[E-REG-016]: ana/tool-git@1.0.0 from github:ana/artifacts does not match its attestation: the attestation does not cover the payload's sha256 9f2c…
+  hint: the payload or its attestation changed after it was published; nothing was stored — tell the artifact's publisher
+```
+
+**Fires when** a `<payload file>.sigstore.json` bundle is present and parses, and a check of
+[Attestation](installing-artifacts.md#attestation) fails. The origin is the source label, `the
+project store` or `the global store`. The reason names the check:
+
+| Reason in the message | Cause |
+|---|---|
+| `the attestation does not cover the payload's sha256 <hex>` | No subject of the statement carries the payload's digest |
+| `its DSSE signature does not verify with the signing certificate's key` | The envelope or its signature changed |
+| `its certificate was issued for <repository> with owner id <id>, not …` | The bundle was signed for another repository or owner |
+| `it was issued by <issuer>, not by GitHub Actions …` | The certificate's OIDC issuer is not GitHub Actions |
+| `its signing certificate does not chain to a certificate authority in the trusted root at <time> …` | The certificate was not issued by a trusted authority, or not valid at the signing time |
+| `its log entry names a log key the trusted root does not hold …`, `its signed entry timestamp does not verify …`, `its inclusion proof …`, `its checkpoint …`, `its log entry records a different …` | The transparency-log entry does not verify or does not record this bundle |
+
+Nothing is written to the store or `murmur.lock`. Under `mur install` with no argument and
+`mur install github:<owner>/<repo>@<tag>`, the artifact is a failure in the per-artifact report and
+the others install. A runtime pull through `manage.pull()` is refused the same way.
+
+**What to do:** tell the artifact's publisher; the payload or its bundle changed after it was
+built. For a store copy, `mur install <name>@<version>` from the source replaces both.
+
 ---
 
 ## Registry warnings
 
-`mur run` and `mur doctor` print non-fatal warnings about what an artifact store holds. Each one
+`mur run`, `mur install` and `mur doctor` print non-fatal warnings about what an artifact store holds. Each one
 carries a `W-REG-NNN` code and a link back to its section on this page, and none of them changes
 the exit code of `mur doctor`.
 
@@ -3013,6 +3043,44 @@ when it pulled the artifact at runtime, rather than `mur install`. `mur run` sta
 [`mur doctor`](cli.md#lock-integrity) counts it among its warnings.
 
 **What to do:** run `mur install <name>@<version>`, which makes the pin the operator's.
+
+### W-REG-005 — no verified attestation { #w-reg-005 }
+
+```text
+warning[W-REG-005]: ana/tool-git@1.0.0 from github:ana/artifacts has no attestation; installed without proof of who published it
+  → https://docs.murmur.nexus/reference/diagnostics/#w-reg-005
+```
+
+**Fires when** `mur install` installs an artifact from a source or a store and no
+[attestation](installing-artifacts.md#attestation) verified for it:
+
+| Message | Cause |
+|---|---|
+| `… has no attestation; installed without proof of who published it` | The release lists no `<payload file>.sigstore.json`, or the store keeps none |
+| `… has an attestation in a form this mur does not verify (<reason>); installed without proof of who published it` | The bundle is not JSON, has another media type, has no DSSE envelope or Rekor entry this `mur` reads, or its certificate lacks an identity extension. The reason names what was not understood |
+
+The artifact is installed with no `signer` on its `murmur.lock` entry. `mur doctor` reports the
+same finding for each declared artifact whose kept bundle is missing or does not verify. Never
+printed for `local/` artifacts.
+
+**What to do:** nothing is refused. To have the install prove who published the artifact, ask the
+publisher to attest its release assets with `actions/attest-build-provenance` and publish each
+bundle as `<payload file>.sigstore.json`.
+
+### W-REG-006 — the signer changed { #w-reg-006 }
+
+```text
+warning[W-REG-006]: ana/tool-git@1.1.0 is attested by https://github.com/ana/artifacts/.github/workflows/other.yml; murmur.lock recorded https://github.com/ana/artifacts/.github/workflows/release.yml
+warning[W-REG-006]: ana/tool-git@1.2.0 has no attestation; murmur.lock recorded it as attested by https://github.com/ana/artifacts/.github/workflows/release.yml
+```
+
+**Fires when** an install's verified signer differs from the `signer` the artifact's `murmur.lock`
+entry records, or the entry records a signer and the new bytes have no verified attestation (with
+`W-REG-005` beside it). `mur doctor` reports the first case for a kept bundle. The entry's `signer`
+is rewritten to describe the new bytes, except under `--frozen`.
+
+**What to do:** confirm with the publisher that the new workflow, or the unattested release, is
+theirs. Nothing is refused.
 
 ---
 

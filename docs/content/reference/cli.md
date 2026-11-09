@@ -1402,6 +1402,20 @@ one of three lines:
 | `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver`, `gateway:` or `inference.system_prompt_artifact`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
 | `· name@version   pulled at runtime by session <session> — not declared in murmur.yaml, so mur run does not stage it` | A pulled entry `murmur.yaml` does not declare, printed after the checklist | None |
 
+An installed artifact that is neither `local/` nor a `source:` path shows its
+[attestation](installing-artifacts.md#attestation) state after `installed`, verified offline from
+the bundle the store keeps beside it. None changes the exit code:
+
+| Line | Finding |
+|---|---|
+| `✓ name@version   installed · attested by <signer>` | None |
+| `⚠ name@version   installed · attested by <signer>; murmur.lock recorded <other>` | Warning [`W-REG-006`](diagnostics.md#w-reg-006): `Fix: mur install name@version` |
+| `⚠ name@version   installed · no attestation` | Warning [`W-REG-005`](diagnostics.md#w-reg-005) |
+| `⚠ name@version   installed · attestation does not verify: <reason>` | Warning [`W-REG-005`](diagnostics.md#w-reg-005): `Fix: mur install name@version` |
+
+When `MUR_SIGSTORE_TRUSTED_ROOT` replaces the built-in trusted root, the checklist names the file
+it reads.
+
 **Output — runtime-pulled pins:**
 
 ```text

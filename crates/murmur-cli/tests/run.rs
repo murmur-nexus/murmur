@@ -649,6 +649,7 @@ fn add_undeclared_runtime_pin(lock_path: &Path, session: &str) {
             session: session.to_string(),
         },
         owner_id: None,
+        signer: None,
     });
     write_lockfile_atomic(lock_path, &lock).unwrap();
 }

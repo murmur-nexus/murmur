@@ -131,6 +131,7 @@ fn lock_entry(name: &str, version: &str, zip: &Path) -> LockedArtifact {
         sha256: LockedSha256::any(sha256_hex(&fs::read(zip).unwrap())),
         origin: LockOrigin::Operator,
         owner_id: None,
+        signer: None,
     }
 }
 

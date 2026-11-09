@@ -112,6 +112,60 @@ A different id is refused with [`E-REG-010`](diagnostics.md#e-reg-010). It means
 
 `mur install -g` reads no `murmur.lock`, so it checks only the `murmur` scope's id. `mur deploy` does the same.
 
+## Attestation { #attestation }
+
+An attestation is a Sigstore bundle, as GitHub's `actions/attest-build-provenance` writes it, that ties a payload's SHA-256 to the GitHub repository and workflow that built it. `mur install` looks for one beside every payload it installs from a source:
+
+| Install | Bundle looked up |
+|---|---|
+| `<scope>/<name>@<version>`, or `mur install` with no argument | The asset `<payload file>.sigstore.json` on the release that holds the payload, for example `tool-git-1.0.0.mur.zip.sigstore.json` |
+| `github:<owner>/<repo>@<tag>` | `<payload file>.sigstore.json` on release `<tag>`, for each `.mur.zip` it installs |
+| From the project or global store | The `<name>-<version>.sigstore.json` file kept beside the payload |
+
+A release that lists no bundle costs no request. Verification reads the bundle and the trusted root and nothing else, so it needs no network: a store copied to a host with none verifies the same way.
+
+### What is checked
+
+1. The bundle is a Sigstore bundle v0.3 (or v0.2) holding a DSSE envelope over an in-toto v1 statement, signed with an ECDSA P-256 key.
+2. The envelope's signature verifies with the key of the bundle's signing certificate.
+3. The bundle's Rekor transparency-log entry (kind `dsse` 0.0.1) carries a signed entry timestamp from a log the trusted root holds, its inclusion proof and signed checkpoint verify when present, and the entry records this envelope and this certificate. The entry's integrated time is the signing time.
+4. The signing certificate chains to a certificate authority in the trusted root, valid for code signing at the signing time.
+5. The certificate was issued to GitHub Actions (`https://token.actions.githubusercontent.com`), for the repository that served the payload and its owner id. For a payload read from a store, the owner id is the one the stored payload records (`190196424` for the `murmur` scope) and the repository is not compared.
+6. Some subject of the statement carries the payload's SHA-256.
+
+The signer `mur` records is the workflow from the certificate, without its `@<ref>`: `https://github.com/<owner>/<repo>/.github/workflows/<file>`. Certificate transparency timestamps (SCTs) in the certificate are not checked.
+
+### Outcomes
+
+| Outcome | `mur install` |
+|---|---|
+| The bundle verifies | Installs, and prints `attested by <signer>`. Keeps the bundle in the store as `<name>-<version>.sigstore.json` and records `signer` on the `murmur.lock` entry |
+| A bundle is present and the payload's bytes, a signature, the certificate chain, the log entry or the identity does not hold | Refuses with [`E-REG-016`](diagnostics.md#e-reg-016). Writes nothing to the store or `murmur.lock` |
+| No bundle, or a bundle in a form this `mur` does not verify | Installs with [`W-REG-005`](diagnostics.md#w-reg-005) naming the artifact and where it came from. Keeps no bundle and records no `signer` |
+
+An entry whose recorded `signer` changes, or an artifact recorded as attested that comes back with no attestation, also prints [`W-REG-006`](diagnostics.md#w-reg-006). The `signer` on an entry always describes the bytes it pins. Under `--frozen` the warnings print and `murmur.lock` is not written.
+
+`mur install -g` and `mur deploy` read no `murmur.lock`: they verify, keep a bundle that verifies and warn, and record no `signer`. `local/` artifacts, artifacts installed from a file and `source:` artifacts are never checked. An artifact with no attestation is installed with a warning; no setting refuses it. `mur run` checks no attestation.
+
+[`mur doctor`](cli.md#mur-doctor) verifies each declared artifact's kept bundle offline and shows its state on the artifact's checklist line:
+
+| Line | Finding |
+|---|---|
+| `installed · attested by <signer>` | None |
+| `installed · attested by <signer>; murmur.lock recorded <other>` | `W-REG-006` |
+| `installed · no attestation` | `W-REG-005` |
+| `installed · attestation does not verify: <reason>` | `W-REG-005`, fix `mur install <name>@<version>` |
+
+### Trusted root
+
+`mur` carries Sigstore's public-good trusted root (`targets/trusted_root.json` of [sigstore/root-signing](https://github.com/sigstore/root-signing)) compiled in. It changes only with a `mur` release.
+
+| Variable | Effect |
+|---|---|
+| `MUR_SIGSTORE_TRUSTED_ROOT` | Path of a `trusted_root.json` that replaces the built-in root completely. A file that cannot be read or parsed refuses the command with `E-IO-003` naming the variable; `mur` never falls back to the built-in root |
+
+The root is read only when a bundle is checked.
+
 ## Authentication
 
 Token resolution happens in this order:
@@ -178,6 +232,7 @@ Under either root, an artifact occupies `<scope>/<name>/<version>/`, and the fil
 | `<name>-<version>.mur.zip` | The artifact — a WASM component or a static skill |
 | `<name>-<version>.sha256` | Its SHA-256 |
 | `<name>-<version>.meta.json` | Its full name, version, runtime, description, tags, WIT contracts and, for a payload a source served, the [owner id](#owner-identity) |
+| `<name>-<version>.sigstore.json` | The [attestation](#attestation) the payload was installed with. Present only when it verified |
 
 An artifact is filed under the bare name its own `murmur.yaml` declares: a payload whose packed `name:` differs from the bare part of the name it is installed as is refused with [`E-REG-002`](diagnostics.md#e-reg-002).
 

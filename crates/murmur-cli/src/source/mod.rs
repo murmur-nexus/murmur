@@ -19,6 +19,9 @@ use murmur_artifact::{
     UnservedInterface, VersionFit, ARTIFACT_INDEX_FILE_NAME, MURMUR_SCOPE, RESERVED_SCOPES,
 };
 
+use crate::attestation::{
+    assess, AttestationState, Expected, RootError, TrustedRoot, BUNDLE_SUFFIX,
+};
 use crate::config::{
     mur_config_path, project_mur_config_path, read_mur_config_file, RegistryConfig, SourceConfig,
 };
@@ -487,6 +490,11 @@ pub(crate) struct Resolved {
     pub owner_id: u64,
     /// The payload's packed `murmur.yaml`, whose `name:` and `version:` were checked.
     pub manifest: Manifest,
+    /// What the attestation published beside the payload proved. A bundle that does not verify
+    /// is never here: it is [`ResolveError::AttestationRefused`].
+    pub attestation: AttestationState,
+    /// The bundle to keep in the store beside the payload: `Some` only when it verified.
+    pub bundle: Option<Bytes>,
 }
 
 /// Where the owner id a scope is held to was recorded.
@@ -619,6 +627,14 @@ pub(crate) enum ResolveError {
         file: String,
         error: String,
     },
+    /// The attestation published beside the payload was read and does not hold for it.
+    AttestationRefused {
+        source: String,
+        target: String,
+        reason: String,
+    },
+    /// The trusted root attestations are checked against could not be loaded.
+    TrustedRoot(RootError),
 }
 
 /// Whether [`resolve`] holds an explicitly named version to the WIT level this mur serves. A
@@ -648,14 +664,37 @@ fn target(name: &ArtifactName, version: Option<&str>) -> String {
 /// Checked in order, each before anything further is requested: the owner id against `lock` and,
 /// for the [`MURMUR_SCOPE`], against [`MURMUR_OWNER_ID`]; the index's scope against the
 /// source's; under [`ExplicitVersion::FitChecked`], an explicit `version`'s interfaces against the
-/// served WIT level; then, once the payload is fetched, its SHA-256 against the index and its
-/// packed `name:` and `version:` against what was asked.
+/// served WIT level; then, once the payload is fetched, its SHA-256 against the index, its
+/// packed `name:` and `version:` against what was asked, and the attestation published beside it
+/// as `<asset file>.sigstore.json` against the payload's digest, the source's repository and its
+/// owner id. A release that lists no bundle costs no request and resolves as
+/// [`AttestationState::Absent`].
 pub(crate) fn resolve(
     source: &dyn ArtifactSource,
     name: &ArtifactName,
     version: Option<&str>,
     explicit: ExplicitVersion,
     lock: Option<&MurmurLock>,
+) -> Result<Resolved, Box<ResolveError>> {
+    resolve_with_root(
+        source,
+        name,
+        version,
+        explicit,
+        lock,
+        crate::attestation::trusted_root,
+    )
+}
+
+/// [`resolve`], checking attestations against the root `root` answers. The root is asked for only
+/// when a bundle is published.
+fn resolve_with_root<'r>(
+    source: &dyn ArtifactSource,
+    name: &ArtifactName,
+    version: Option<&str>,
+    explicit: ExplicitVersion,
+    lock: Option<&MurmurLock>,
+    root: impl FnOnce() -> Result<&'r TrustedRoot, RootError>,
 ) -> Result<Resolved, Box<ResolveError>> {
     let label = source.label().to_string();
     let wanted = target(name, version);
@@ -813,6 +852,32 @@ pub(crate) fn resolve(
         }));
     }
 
+    let bundle_file = format!("{}{BUNDLE_SUFFIX}", asset.file);
+    let bundle = match source.fetch(&chosen.release, &bundle_file) {
+        Ok(bundle) => Some(bundle),
+        Err(SourceError::NotFound(_)) => None,
+        Err(error) => return Err(unanswered(error)),
+    };
+    let attestation = match &bundle {
+        None => AttestationState::Absent,
+        Some(bundle) => {
+            let root = root().map_err(|error| Box::new(ResolveError::TrustedRoot(error)))?;
+            let expected = Expected {
+                sha256: &actual,
+                owner_id: Some(owner_id),
+                repo: Some(source.repo()),
+            };
+            assess(Some(bundle), &expected, root).map_err(|reason| {
+                Box::new(ResolveError::AttestationRefused {
+                    source: label.clone(),
+                    target: format!("{name}@{}", chosen.version),
+                    reason,
+                })
+            })?
+        }
+    };
+    let bundle = bundle.filter(|_| matches!(attestation, AttestationState::Verified { .. }));
+
     Ok(Resolved {
         bytes,
         sha256: actual,
@@ -820,6 +885,8 @@ pub(crate) fn resolve(
         source: label,
         owner_id,
         manifest,
+        attestation,
+        bundle,
     })
 }
 
@@ -994,6 +1061,12 @@ fn index_hint(repo: &str, release: Option<&str>) -> String {
 impl From<ResolveError> for CliError {
     fn from(error: ResolveError) -> Self {
         match error {
+            ResolveError::AttestationRefused {
+                source,
+                target,
+                reason,
+            } => crate::attestation::refusal(&target, &source, &reason),
+            ResolveError::TrustedRoot(error) => error.into(),
             ResolveError::Unanswered {
                 source,
                 target,
@@ -1305,7 +1378,8 @@ pub(crate) mod memory {
         files: BTreeMap<(String, String), Bytes>,
         /// Overrides [`ArtifactSource::index`] when set.
         pub index_error: Option<SourceError>,
-        /// Every `(release, file)` fetched, in order.
+        /// Every `(release, file)` downloaded, in order. A file the release does not hold is
+        /// answered `NotFound` without a download, as GitHub's cached asset listing answers it.
         pub fetches: Mutex<Vec<(String, String)>>,
     }
 
@@ -1376,6 +1450,13 @@ pub(crate) mod memory {
             self
         }
 
+        /// Serve `bytes` as the asset `file` of `release`, listed in no index: an attestation.
+        pub(crate) fn serve(&mut self, release: &str, file: &str, bytes: Vec<u8>) -> &mut Self {
+            self.files
+                .insert((release.to_string(), file.to_string()), Bytes::from(bytes));
+            self
+        }
+
         pub(crate) fn fetched(&self) -> Vec<(String, String)> {
             self.fetches.lock().unwrap().clone()
         }
@@ -1409,14 +1490,16 @@ pub(crate) mod memory {
         }
 
         fn fetch(&self, release: &str, file: &str) -> Result<Bytes, SourceError> {
+            let bytes = self
+                .files
+                .get(&(release.to_string(), file.to_string()))
+                .cloned()
+                .ok_or_else(|| SourceError::NotFound(format!("release {release} has no {file}")))?;
             self.fetches
                 .lock()
                 .unwrap()
                 .push((release.to_string(), file.to_string()));
-            self.files
-                .get(&(release.to_string(), file.to_string()))
-                .cloned()
-                .ok_or_else(|| SourceError::NotFound(format!("release {release} has no {file}")))
+            Ok(bytes)
         }
     }
 }
@@ -1430,6 +1513,7 @@ mod tests {
 
     use super::memory::MemorySource;
     use super::*;
+    use crate::attestation::minting::{signer_for, BundleSpec, Minter};
 
     fn zip_bytes(name: &str, version: &str) -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::new());
@@ -1516,6 +1600,142 @@ mod tests {
             matches!(&*error, ResolveError::NameNotListed { name, .. } if name.as_str() == "ana/tool-gi"),
             "{error:?}"
         );
+    }
+
+    fn tool_git_bundle(edit: impl FnOnce(&mut BundleSpec)) -> (Minter, Vec<u8>) {
+        let minter = Minter::new();
+        let sha = sha256_hex(&zip_bytes("tool-git", "1.0.0"));
+        let mut spec = BundleSpec::new("ana/artifacts", 1111, &sha);
+        edit(&mut spec);
+        let bundle = minter.bundle(&spec);
+        (minter, bundle)
+    }
+
+    fn resolve_against(
+        source: &MemorySource,
+        root: &TrustedRoot,
+    ) -> Result<Resolved, Box<ResolveError>> {
+        resolve_with_root(
+            source,
+            &name("ana/tool-git"),
+            Some("1.0.0"),
+            ExplicitVersion::FitChecked,
+            None,
+            || Ok(root),
+        )
+    }
+
+    #[test]
+    fn a_release_without_a_bundle_resolves_unattested_with_no_extra_download() {
+        let source = ana();
+        let resolved = resolve_in(&source, "ana/tool-git", Some("1.0.0")).unwrap();
+        assert_eq!(resolved.attestation, AttestationState::Absent);
+        assert!(resolved.bundle.is_none());
+        assert_eq!(source.fetched().len(), 1, "{:?}", source.fetched());
+    }
+
+    #[test]
+    fn a_verified_bundle_is_handed_back_with_its_signer() {
+        let (minter, bundle) = tool_git_bundle(|_| {});
+        let root = TrustedRoot::from_json(&minter.trusted_root_json()).unwrap();
+        let mut source = ana();
+        source.serve("v2", "tool-git-1.0.0.mur.zip.sigstore.json", bundle.clone());
+        let resolved = resolve_against(&source, &root).unwrap();
+        assert_eq!(
+            resolved.attestation,
+            AttestationState::Verified {
+                signer: signer_for("ana/artifacts", "release.yml")
+            }
+        );
+        assert_eq!(resolved.bundle.as_deref(), Some(&bundle[..]));
+    }
+
+    #[test]
+    fn a_bundle_that_does_not_match_refuses_the_resolution() {
+        let (minter, bundle) = tool_git_bundle(|spec| spec.subject_sha256 = "ab".repeat(32));
+        let root = TrustedRoot::from_json(&minter.trusted_root_json()).unwrap();
+        let mut source = ana();
+        source.serve("v2", "tool-git-1.0.0.mur.zip.sigstore.json", bundle);
+        let error = resolve_against(&source, &root).unwrap_err();
+        assert!(
+            matches!(&*error, ResolveError::AttestationRefused { target, .. } if target == "ana/tool-git@1.0.0"),
+            "{error:?}"
+        );
+        let cli = CliError::from(*error);
+        assert_eq!(cli.code, crate::error::E_REG_016);
+        assert!(
+            cli.message.starts_with(
+                "ana/tool-git@1.0.0 from github:ana/artifacts does not match its attestation: \
+                 the attestation does not cover the payload's sha256 "
+            ),
+            "{}",
+            cli.message
+        );
+
+        // The runtime pull resolves through `resolve` and its built-in root: a bundle that
+        // root cannot vouch for is refused, never downgraded to unattested.
+        let error = resolve_in(&source, "ana/tool-git", Some("1.0.0")).unwrap_err();
+        assert_eq!(CliError::from(*error).code, crate::error::E_REG_016);
+    }
+
+    #[test]
+    fn a_bundle_in_an_unknown_form_resolves_unverifiable_and_keeps_no_bundle() {
+        let (minter, bundle) = tool_git_bundle(|spec| {
+            spec.media_type = "application/vnd.dev.sigstore.bundle.v9.9+json".into()
+        });
+        let root = TrustedRoot::from_json(&minter.trusted_root_json()).unwrap();
+        let mut source = ana();
+        source.serve("v2", "tool-git-1.0.0.mur.zip.sigstore.json", bundle);
+        let resolved = resolve_against(&source, &root).unwrap();
+        assert!(
+            matches!(&resolved.attestation, AttestationState::Unverifiable(reason) if reason.contains("v9.9")),
+            "{:?}",
+            resolved.attestation
+        );
+        assert!(resolved.bundle.is_none());
+    }
+
+    #[test]
+    fn a_bundle_that_cannot_be_fetched_is_not_read_as_absent() {
+        struct Failing(MemorySource);
+        impl ArtifactSource for Failing {
+            fn label(&self) -> &str {
+                self.0.label()
+            }
+            fn repo(&self) -> &str {
+                self.0.repo()
+            }
+            fn scope(&self) -> &str {
+                self.0.scope()
+            }
+            fn owner_id(&self) -> Result<u64, SourceError> {
+                self.0.owner_id()
+            }
+            fn index(&self) -> Result<Arc<PublishedIndex>, SourceError> {
+                self.0.index()
+            }
+            fn fetch(&self, release: &str, file: &str) -> Result<Bytes, SourceError> {
+                if file.ends_with(BUNDLE_SUFFIX) {
+                    return Err(SourceError::Http {
+                        status: 502,
+                        message: "bad gateway".into(),
+                    });
+                }
+                self.0.fetch(release, file)
+            }
+        }
+        let error = resolve_in_source(&Failing(ana())).unwrap_err();
+        assert_eq!(CliError::from(*error).code, E_REG_006);
+    }
+
+    fn resolve_in_source(source: &dyn ArtifactSource) -> Result<Resolved, Box<ResolveError>> {
+        resolve(
+            source,
+            &name("ana/tool-git"),
+            Some("1.0.0"),
+            ExplicitVersion::FitChecked,
+            None,
+        )
     }
 
     #[test]
@@ -2042,10 +2262,15 @@ mod tests {
                 packed: "tool-gx".into(),
             },
             ResolveError::Unreadable {
-                source,
-                target,
+                source: source.clone(),
+                target: target.clone(),
                 file,
                 error: "not a zip".into(),
+            },
+            ResolveError::AttestationRefused {
+                source,
+                target,
+                reason: "its DSSE signature does not verify".into(),
             },
         ]
     }

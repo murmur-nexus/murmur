@@ -317,6 +317,7 @@ mod tests {
                 sha256: LockedSha256::any("aaa"),
                 origin: artifact.origin.clone(),
                 owner_id: None,
+                signer: None,
             });
             state.installed_artifacts.push(artifact.clone());
         }
@@ -485,6 +486,7 @@ mod tests {
                     sha256: LockedSha256::any(sha256),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 }],
             },
         )

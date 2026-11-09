@@ -162,6 +162,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
                 owner_id: None,
+                signer: None,
             }],
         },
     )
