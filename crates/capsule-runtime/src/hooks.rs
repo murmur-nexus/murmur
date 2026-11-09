@@ -6,7 +6,7 @@ use std::{
 };
 
 use wasmtime::{component::Linker, Store};
-use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use murmur_artifact::{
@@ -15,6 +15,7 @@ use murmur_artifact::{
 };
 use tokio::sync::mpsc;
 
+use crate::guest_roots::PlannedPreopen;
 use crate::workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE};
 use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
@@ -33,7 +34,7 @@ use crate::{
         ExecutionLimiter, ExecutionLimits,
     },
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
-    runtime::NetworkPolicyHooks,
+    runtime::{apply_wasi_plan, NetworkPolicyHooks, ToolHttpHooks, WasiPlan},
     state_store::STATE_PREOPEN_NAME,
     task_io_import::{add_task_io_to_linker, TaskIoState},
     tokens_import::add_tokens_to_linker,
@@ -314,20 +315,109 @@ pub(crate) struct DispatchFault {
     pub arm: String,
 }
 
-struct HookInstance {
+pub(crate) struct HookInstance {
     name: String,
     /// [`StagedHookArtifact::entry`].
     entry: String,
     config: HookConfig,
-    store: Store<HookStoreState>,
+    store: HookStore,
     /// Name-based dispatch table keyed by the WIT function name
     /// (e.g. `"on-session-start"`). Always holds every entry in [`REQUIRED_HOOK_FNS`];
-    /// entries from [`OPTIONAL_HOOK_FNS`] are present only if the component exports them.
-    funcs: HashMap<String, wasmtime::component::Func>,
+    /// entries from [`OPTIONAL_HOOK_FNS`] are present only if the component exports them. A
+    /// local instance holds each function; an instance in the hooks worker holds the names only.
+    funcs: HashMap<String, Option<wasmtime::component::Func>>,
     /// The call the wall-clock bound stopped on this instance, once one has. The stopped call's
     /// future was dropped mid-guest, so the instance is never entered again: every later call
     /// fails at once, naming this one.
     cut: Option<HookCut>,
+}
+
+/// Where a hook instance's store is: in this process, or in the hooks guest worker, which holds
+/// the same instance and runs each call the supervisor sends it.
+enum HookStore {
+    Local(Store<HookStoreState>),
+    Remote(RemoteHook),
+}
+
+impl HookStore {
+    /// What a `run-inference` call made from now on is for.
+    fn set_purpose(&mut self, purpose: HookInferencePurpose) {
+        match self {
+            Self::Local(store) => store.data_mut().inference_purpose = purpose,
+            Self::Remote(remote) => remote.purpose = purpose,
+        }
+    }
+
+    #[cfg(test)]
+    fn data(&self) -> &HookStoreState {
+        match self {
+            Self::Local(store) => store.data(),
+            Self::Remote(_) => panic!("a hook instance in the hooks worker has no store here"),
+        }
+    }
+}
+
+/// The supervisor's handle on a hook instance the hooks worker holds.
+struct RemoteHook {
+    workers: Arc<crate::guest_worker::GuestWorkers>,
+    instance: u64,
+    /// What the instance's host imports reach, registered with each call.
+    host: Arc<HookCallHost>,
+    /// The entry's limits, which bound how long the supervisor waits for a call's answer.
+    limits: ExecutionLimits,
+    purpose: HookInferencePurpose,
+    call_deadlines: CallDeadlines,
+}
+
+impl Drop for RemoteHook {
+    fn drop(&mut self) {
+        self.workers.close_hook(self.instance);
+    }
+}
+
+/// The supervisor-side objects one hook's host imports reach when its instance runs in the hooks
+/// worker: its own network policy, the session's inference context and, only for a granted hook,
+/// the task-io and conversation state.
+pub(crate) struct HookCallHost {
+    pub(crate) http: Arc<std::sync::Mutex<NetworkPolicyHooks>>,
+    /// `hook:<name>`, the origin every `run-inference` record of the hook carries.
+    pub(crate) origin: String,
+    pub(crate) inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
+    pub(crate) task_io: Option<Arc<TaskIoState>>,
+    pub(crate) conversation: Option<Arc<ConversationState>>,
+}
+
+/// What a hook store is built from in the hooks worker, decided in the supervisor: the entry's
+/// names, its limits and its WASI plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HookSpec {
+    pub(crate) name: String,
+    pub(crate) entry: String,
+    pub(crate) version: String,
+    pub(crate) limits: ExecutionLimits,
+    pub(crate) wasi: WasiPlan,
+}
+
+/// One lifecycle function's argument, as it crosses to the hooks worker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum HookArg {
+    SessionStart(SessionContext),
+    TaskStart(TaskStartEvent),
+    Inference(InferenceEvent),
+    Tool(ToolEvent),
+    Shell(ShellEvent),
+    Compaction(CompactionEvent),
+    TaskEnd(TaskEndEvent),
+    SessionEnd(SessionEndEvent),
+}
+
+impl HookInstance {
+    /// The lifecycle functions the instance exports, by WIT name.
+    pub(crate) fn exported_fns(&self) -> Vec<String> {
+        let mut fns: Vec<String> = self.funcs.keys().cloned().collect();
+        fns.sort();
+        fns
+    }
 }
 
 /// A lifecycle call the wall-clock bound stopped on a session-long hook instance.
@@ -389,8 +479,8 @@ struct HookStoreState {
     http: WasiHttpCtx,
     /// Per-hook allow-list enforcement, built from this hook's `HookCapabilityGrant`. An
     /// empty rule set (the default, for a hook the operator granted no `capabilities.network`)
-    /// denies every request.
-    http_hooks: NetworkPolicyHooks,
+    /// denies every request. In the hooks worker, the supervisor applies it.
+    http_hooks: ToolHttpHooks,
     /// What a `run-inference` call made now is for: set by [`call_hook`] for the length of each
     /// lifecycle call, `Lifecycle` between calls.
     inference_purpose: HookInferencePurpose,
@@ -735,6 +825,9 @@ pub(crate) struct HookEnvVars<'a> {
     /// The session's latch, where a request a hook routes to a member's virtual address is
     /// recorded. Carried here for the same reason as `call_deadlines`.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's guest workers, when guests run in worker processes: every hook instance and
+    /// every `on-stage` call then runs in the hooks worker.
+    pub(crate) guest_workers: Option<&'a Arc<crate::guest_worker::GuestWorkers>>,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -839,85 +932,114 @@ async fn call_stage_once(
     limits: ExecutionLimits,
 ) -> Result<HookOutput, String> {
     let limits = limits.for_hook_entry(staged.grant.deadline_seconds);
-    let mut linker: Linker<HookStoreState> = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
-    // `on-stage` runs during staging, long before an inference driver exists —
-    // the import is defined so an inference-importing hook still links, and
-    // always errors.
-    add_inference_to_linker(
-        &mut linker,
-        format!("hook:{}", staged.name),
-        |_| HookInferencePurpose::Lifecycle,
-        Err(InferenceUnavailable::NotConfigured),
-    )?;
-    // `on-stage` runs before any task exists. A granted hook gets a state of its own so its
-    // reads truthfully report `no-task` rather than `not-granted`; the throwaway store this
-    // instance lives on is discarded with it.
-    add_task_io_to_linker(
-        &mut linker,
-        staged
-            .grant
-            .task_io_read
-            .then(|| Arc::new(TaskIoState::new())),
-    )?;
-    // `on-stage` runs before any task, so a granted hook gets a state with no context in scope:
-    // its reads truthfully report an empty page rather than `not-granted`.
-    add_conversation_to_linker(
-        &mut linker,
-        staged
-            .grant
-            .conversation_read
-            .then(|| Arc::new(ConversationState::new(None, records_root))),
-    )?;
-    // Counting text reaches nothing, so the counter is defined on every linker
-    // with no grant to consult.
-    add_tokens_to_linker(&mut linker)?;
-
-    let state = HookStoreState {
-        limits: limits.limiter(),
-        table: ResourceTable::new(),
-        wasi: build_wasi_ctx(
+    let spec = HookSpec {
+        name: staged.name.clone(),
+        entry: staged.entry.clone(),
+        version: staged.version.clone(),
+        limits,
+        wasi: plan_hook_wasi(
             workdir.path(),
             env_vars,
             &staged.grant,
             staged.gateway.as_deref(),
         )
         .map_err(|e| e.to_string())?,
-        http: WasiHttpCtx::new(),
-        http_hooks: NetworkPolicyHooks {
-            network_allow_rules: staged.grant.network_allow_rules.clone(),
-            gateway: staged.gateway.clone(),
-            formation: env_vars.formation_member.cloned(),
-            // A hook runs for no task of its own, so a formation call from it stamps
-            // `untrusted`, and its `member_request` names no task.
-            task_provenance: None,
-            member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
-                &env_vars.member_requests,
-                staged.name.clone(),
-            )),
+    };
+    // `on-stage` runs during staging, long before an inference driver exists — the import is
+    // defined so an inference-importing hook still links, and always errors.
+    let inference = Err(InferenceUnavailable::NotConfigured);
+    // `on-stage` runs before any task exists. A granted hook gets a state of its own so its
+    // reads truthfully report `no-task` rather than `not-granted`; the throwaway store this
+    // instance lives on is discarded with it.
+    let task_io = staged
+        .grant
+        .task_io_read
+        .then(|| Arc::new(TaskIoState::new()));
+    // `on-stage` runs before any task, so a granted hook gets a state with no context in scope:
+    // its reads truthfully report an empty page rather than `not-granted`.
+    let conversation = staged
+        .grant
+        .conversation_read
+        .then(|| Arc::new(ConversationState::new(None, records_root)));
+    let http = hook_network_policy(staged, env_vars);
+    if let Some(workers) = env_vars.guest_workers {
+        let host = Arc::new(HookCallHost {
+            http: Arc::new(std::sync::Mutex::new(http)),
+            origin: format!("hook:{}", staged.name),
+            inference,
+            task_io,
+            conversation,
+        });
+        return workers
+            .stage_hook(
+                &staged.name,
+                &staged.component,
+                spec,
+                host,
+                &env_vars.call_deadlines,
+                evt.clone(),
+            )
+            .await;
+    }
+    stage_on_store(
+        engine,
+        &staged.component,
+        &spec,
+        HookImports::Local {
+            origin: format!("hook:{}", staged.name),
+            inference,
+            task_io,
+            conversation,
         },
+        ToolHttpHooks::Local(http),
+        env_vars.call_deadlines.clone(),
+        evt,
+    )
+    .await
+}
+
+/// Calls `on-stage` on a throwaway instance of `component` built from `spec`: the one body for a
+/// store in this process and a store in the hooks worker.
+#[allow(clippy::too_many_arguments)]
+async fn stage_on_store(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    spec: &HookSpec,
+    imports: HookImports,
+    http_hooks: ToolHttpHooks,
+    call_deadlines: CallDeadlines,
+    evt: &StageEvent,
+) -> Result<HookOutput, String> {
+    crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Hook)
+        .map_err(|e| e.to_string())?;
+    let limits = spec.limits;
+    let linker = hook_linker(engine, imports)?;
+    let state = HookStoreState {
+        limits: limits.limiter(),
+        table: ResourceTable::new(),
+        wasi: apply_wasi_plan(&spec.wasi).map_err(|e| e.to_string())?,
+        http: WasiHttpCtx::new(),
+        http_hooks,
         inference_purpose: HookInferencePurpose::Lifecycle,
-        call_deadlines: env_vars.call_deadlines.clone(),
+        call_deadlines: call_deadlines.clone(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(limits.deadline_ticks());
 
-    let instance = env_vars
-        .call_deadlines
+    let instance = call_deadlines
         .bound(
-            &staged.name,
+            &spec.name,
             ComponentRole::Hook,
             "instantiate",
             &limits,
-            linker.instantiate_async(&mut store, &staged.component),
+            linker.instantiate_async(&mut store, component),
         )
         .await
         .map_err(|_| {
             wall_deadline_hook_message(
-                &staged.name,
-                &staged.entry,
+                &spec.name,
+                &spec.entry,
                 "instantiate",
                 limits.deadline_seconds,
             )
@@ -925,21 +1047,117 @@ async fn call_stage_once(
         .map_err(|e| {
             format!(
                 "failed to instantiate hook {}@{}: {e}",
-                staged.name, staged.version
+                spec.name, spec.version
             )
         })?;
 
     let obs_idx = resolve_lifecycle_iface(&instance, &mut store)
-        .ok_or_else(|| missing_lifecycle_msg(&format!("{}@{}", staged.name, staged.version)))?;
+        .ok_or_else(|| missing_lifecycle_msg(&format!("{}@{}", spec.name, spec.version)))?;
 
     let func = instance
         .get_export_index(&mut store, Some(&obs_idx), "on-stage")
         .and_then(|idx| instance.get_func(&mut store, idx))
-        .ok_or_else(|| format!("hook {}@{} missing on-stage", staged.name, staged.version))?;
+        .ok_or_else(|| format!("hook {}@{} missing on-stage", spec.name, spec.version))?;
 
     // `on-stage` runs on its own throwaway store, so this cannot reuse the
     // blocking-hook path.
-    call_stage_lift::<HookOutput>(&mut store, &func, evt, &staged.name, &staged.entry, limits).await
+    call_stage_lift::<HookOutput>(&mut store, &func, evt, &spec.name, &spec.entry, limits).await
+}
+
+/// `on-stage` in the hooks worker: [`stage_on_store`] with every host import answered by the
+/// supervisor.
+pub(crate) async fn stage_remote_once(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    spec: &HookSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: CallDeadlines,
+    evt: StageEvent,
+) -> Result<HookOutput, String> {
+    stage_on_store(
+        engine,
+        component,
+        spec,
+        HookImports::Remote(Arc::clone(&link)),
+        ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(link)),
+        call_deadlines,
+        &evt,
+    )
+    .await
+}
+
+/// What a hook linker's Murmur imports are backed by: the objects themselves, in this process, or
+/// the supervisor across the hooks worker's connection.
+enum HookImports {
+    Local {
+        origin: String,
+        inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
+        task_io: Option<Arc<TaskIoState>>,
+        conversation: Option<Arc<ConversationState>>,
+    },
+    Remote(Arc<crate::guest_worker::RemoteLink>),
+}
+
+/// A hook linker: WASI, `wasi:http`, `inference`, `task-io`, `conversation` and `tokens`. An
+/// ungranted hook gets `task-io` and `conversation` defined but backed by nothing, so it links
+/// exactly as a granted one does and every read returns `not-granted`.
+fn hook_linker(
+    engine: &wasmtime::Engine,
+    imports: HookImports,
+) -> Result<Linker<HookStoreState>, String> {
+    let mut linker: Linker<HookStoreState> = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
+    match imports {
+        HookImports::Local {
+            origin,
+            inference,
+            task_io,
+            conversation,
+        } => {
+            add_inference_to_linker(
+                &mut linker,
+                origin,
+                |state: &HookStoreState| state.inference_purpose,
+                inference,
+            )?;
+            add_task_io_to_linker(&mut linker, task_io)?;
+            add_conversation_to_linker(&mut linker, conversation)?;
+        }
+        HookImports::Remote(link) => {
+            crate::inference_import::add_remote_inference_to_linker(
+                &mut linker,
+                |state: &HookStoreState| state.inference_purpose,
+                Arc::clone(&link),
+            )?;
+            crate::task_io_import::add_remote_task_io_to_linker(&mut linker, Arc::clone(&link))?;
+            crate::conversation_import::add_remote_conversation_to_linker(&mut linker, link)?;
+        }
+    }
+    // Counting text reaches nothing, so the counter is defined on every linker
+    // with no grant to consult.
+    add_tokens_to_linker(&mut linker)?;
+    Ok(linker)
+}
+
+/// A hook store's network policy, from the hook's own grant and gateway and the session's
+/// formation membership.
+fn hook_network_policy(
+    staged: &StagedHookArtifact,
+    env_vars: &HookEnvVars<'_>,
+) -> NetworkPolicyHooks {
+    NetworkPolicyHooks {
+        network_allow_rules: staged.grant.network_allow_rules.clone(),
+        gateway: staged.gateway.clone(),
+        formation: env_vars.formation_member.cloned(),
+        // A hook runs for no task of its own, so a formation call from it stamps
+        // `untrusted`, and its `member_request` names no task.
+        task_provenance: None,
+        member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
+            &env_vars.member_requests,
+            staged.name.clone(),
+        )),
+    }
 }
 
 /// Call `on-stage` on a throwaway store, lifting its `result<O, string>` where `O` is
@@ -1333,7 +1551,7 @@ impl HookRuntime {
                         // dispatch at which its `deny` is honored.
                         outcome: None,
                     };
-                    call_typed(hook, event_fn, evt).await
+                    call_typed(hook, event_fn, HookArg::Shell(evt)).await
                 }
                 ResolvedCall::Tool {
                     tool_name,
@@ -1347,7 +1565,7 @@ impl HookRuntime {
                         input: input.clone(),
                         outcome: None,
                     };
-                    call_typed(hook, event_fn, evt).await
+                    call_typed(hook, event_fn, HookArg::Tool(evt)).await
                 }
             };
 
@@ -1715,114 +1933,200 @@ async fn instantiate_hook(
 ) -> Result<HookInstance, RuntimeError> {
     // The store keeps these for every call, so the entry's deadline holds for each event.
     let limits = limits.for_hook_entry(staged.grant.deadline_seconds);
-    let mut linker: Linker<HookStoreState> = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
-        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
-    add_inference_to_linker(
-        &mut linker,
-        format!("hook:{}", staged.name),
-        |state: &HookStoreState| state.inference_purpose,
-        inference,
-    )
-    .map_err(RuntimeError::Runtime)?;
-    // An ungranted hook gets the import defined but backed by nothing, so it links exactly as
-    // a granted one does and every read returns `not-granted`.
-    add_task_io_to_linker(
-        &mut linker,
-        staged
-            .grant
-            .task_io_read
-            .then(|| Arc::clone(&host_state.task_io)),
-    )
-    .map_err(RuntimeError::Runtime)?;
-    add_conversation_to_linker(
-        &mut linker,
-        staged
-            .grant
-            .conversation_read
-            .then(|| Arc::clone(&host_state.conversation)),
-    )
-    .map_err(RuntimeError::Runtime)?;
-    add_tokens_to_linker(&mut linker).map_err(RuntimeError::Runtime)?;
-
-    let state = HookStoreState {
-        limits: limits.limiter(),
-        table: ResourceTable::new(),
-        wasi: build_wasi_ctx(
+    let spec = HookSpec {
+        name: staged.name.clone(),
+        entry: staged.entry.clone(),
+        version: staged.version.clone(),
+        limits,
+        wasi: plan_hook_wasi(
             project_dir,
             env_vars,
             &staged.grant,
             staged.gateway.as_deref(),
         )?,
-        http: WasiHttpCtx::new(),
-        http_hooks: NetworkPolicyHooks {
-            network_allow_rules: staged.grant.network_allow_rules.clone(),
-            gateway: staged.gateway.clone(),
-            formation: env_vars.formation_member.cloned(),
-            // A hook runs for no task of its own, so a formation call from it stamps
-            // `untrusted`, and its `member_request` names no task.
-            task_provenance: None,
-            member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
-                &env_vars.member_requests,
-                staged.name.clone(),
-            )),
+    };
+    let task_io = staged
+        .grant
+        .task_io_read
+        .then(|| Arc::clone(&host_state.task_io));
+    let conversation = staged
+        .grant
+        .conversation_read
+        .then(|| Arc::clone(&host_state.conversation));
+    let http = hook_network_policy(staged, env_vars);
+    if let Some(workers) = env_vars.guest_workers {
+        let host = Arc::new(HookCallHost {
+            http: Arc::new(std::sync::Mutex::new(http)),
+            origin: format!("hook:{}", staged.name),
+            inference,
+            task_io,
+            conversation,
+        });
+        let (instance, fns) = workers
+            .open_hook(
+                &staged.name,
+                &staged.component,
+                spec,
+                Arc::clone(&host),
+                &env_vars.call_deadlines,
+            )
+            .await
+            .map_err(|error| workers.runtime_error(error))?;
+        return Ok(HookInstance {
+            name: staged.name.clone(),
+            entry: staged.entry.clone(),
+            config: staged.config.clone(),
+            store: HookStore::Remote(RemoteHook {
+                workers: Arc::clone(workers),
+                instance,
+                host,
+                limits,
+                purpose: HookInferencePurpose::Lifecycle,
+                call_deadlines: env_vars.call_deadlines.clone(),
+            }),
+            funcs: fns.into_iter().map(|name| (name, None)).collect(),
+            cut: None,
+        });
+    }
+    open_instance(
+        engine,
+        &staged.component,
+        &spec,
+        HookImports::Local {
+            origin: format!("hook:{}", staged.name),
+            inference,
+            task_io,
+            conversation,
         },
+        ToolHttpHooks::Local(http),
+        env_vars.call_deadlines.clone(),
+        staged.config.clone(),
+    )
+    .await
+    .map_err(RuntimeError::Runtime)
+}
+
+/// Instantiates `component` against a store built from `spec` and resolves its lifecycle
+/// exports: the one body for an instance in this process and an instance in the hooks worker.
+#[allow(clippy::too_many_arguments)]
+async fn open_instance(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    spec: &HookSpec,
+    imports: HookImports,
+    http_hooks: ToolHttpHooks,
+    call_deadlines: CallDeadlines,
+    config: HookConfig,
+) -> Result<HookInstance, String> {
+    crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Hook)
+        .map_err(|e| e.to_string())?;
+    let limits = spec.limits;
+    let linker = hook_linker(engine, imports)?;
+    let state = HookStoreState {
+        limits: limits.limiter(),
+        table: ResourceTable::new(),
+        wasi: apply_wasi_plan(&spec.wasi).map_err(|e| e.to_string())?,
+        http: WasiHttpCtx::new(),
+        http_hooks,
         inference_purpose: HookInferencePurpose::Lifecycle,
-        call_deadlines: env_vars.call_deadlines.clone(),
+        call_deadlines: call_deadlines.clone(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(limits.deadline_ticks());
 
-    let instance = env_vars
-        .call_deadlines
+    let instance = call_deadlines
         .bound(
-            &staged.name,
+            &spec.name,
             ComponentRole::Hook,
             "instantiate",
             &limits,
-            linker.instantiate_async(&mut store, &staged.component),
+            linker.instantiate_async(&mut store, component),
         )
         .await
         .map_err(|_| {
-            RuntimeError::Runtime(wall_deadline_hook_message(
-                &staged.name,
-                &staged.entry,
+            wall_deadline_hook_message(
+                &spec.name,
+                &spec.entry,
                 "instantiate",
                 limits.deadline_seconds,
-            ))
+            )
         })?
         .map_err(|err| {
-            RuntimeError::Runtime(format!(
+            format!(
                 "failed to instantiate hook {}@{}: {err}",
-                staged.name, staged.version
-            ))
+                spec.name, spec.version
+            )
         })?;
 
-    let obs_idx = resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| {
-        RuntimeError::Runtime(missing_lifecycle_msg(&format!(
-            "{}@{}",
-            staged.name, staged.version
-        )))
-    })?;
+    let obs_idx = resolve_lifecycle_iface(&instance, &mut store)
+        .ok_or_else(|| missing_lifecycle_msg(&format!("{}@{}", spec.name, spec.version)))?;
 
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
-        RuntimeError::Runtime(format!(
+        format!(
             "hook {}@{} missing function {LIFECYCLE_IFACE}#{fn_name}",
-            staged.name, staged.version
-        ))
+            spec.name, spec.version
+        )
     })?;
 
     Ok(HookInstance {
-        funcs,
-        name: staged.name.clone(),
-        entry: staged.entry.clone(),
-        config: staged.config.clone(),
-        store,
+        funcs: funcs
+            .into_iter()
+            .map(|(name, func)| (name, Some(func)))
+            .collect(),
+        name: spec.name.clone(),
+        entry: spec.entry.clone(),
+        config,
+        store: HookStore::Local(store),
         cut: None,
     })
+}
+
+/// A session-long hook instance in the hooks worker: [`open_instance`] with every host import
+/// answered by the supervisor through `link`.
+pub(crate) async fn open_remote_instance(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    spec: &HookSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: CallDeadlines,
+) -> Result<HookInstance, String> {
+    open_instance(
+        engine,
+        component,
+        spec,
+        HookImports::Remote(Arc::clone(&link)),
+        ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(link)),
+        call_deadlines,
+        HookConfig::default(),
+    )
+    .await
+}
+
+/// Calls lifecycle function `fn_name` on `hook` with `arg`, `run-inference` calls made meanwhile
+/// being for `purpose`: what the hooks worker runs for each call the supervisor sends it.
+pub(crate) async fn call_instance(
+    hook: &mut HookInstance,
+    fn_name: &str,
+    arg: HookArg,
+    purpose: HookInferencePurpose,
+) -> Result<Option<HookOutput>, String> {
+    hook.store.set_purpose(purpose);
+    let output = call_typed(hook, fn_name, arg).await;
+    hook.store.set_purpose(HookInferencePurpose::Lifecycle);
+    output
+}
+
+/// Marks `hook` stopped in `fn_name`: its future was dropped mid-guest, so it is never entered
+/// again.
+pub(crate) fn mark_cut(hook: &mut HookInstance, fn_name: &str) {
+    let HookStore::Local(store) = &hook.store else {
+        return;
+    };
+    hook.cut = Some(HookCut {
+        fn_name: fn_name.to_string(),
+        deadline_seconds: store.data().limits.limits().deadline_seconds,
+    });
 }
 
 /// Build the name-based dispatch table for a hook component: every function in
@@ -1885,19 +2189,48 @@ impl WasiHttpView for HookStoreState {
 /// only ever true for an [`OPTIONAL_HOOK_FNS`] entry, which is how a hook that predates
 /// `on-task-start`/`on-task-end` is silently skipped for those events. A hook-returned
 /// `Err` is propagated as the call error, matching the pre-refactor behavior.
-async fn call_typed<T>(
+async fn call_typed(
     hook: &mut HookInstance,
     fn_name: &str,
-    arg: T,
-) -> Result<Option<HookOutput>, String>
-where
-    T: wasmtime::component::ComponentType + wasmtime::component::Lower,
-{
+    arg: HookArg,
+) -> Result<Option<HookOutput>, String> {
     let func = match hook.funcs.get(fn_name) {
         Some(f) => *f,
         None => return Ok(None),
     };
-    let out = invoke_typed::<T, HookOutput>(hook, &func, fn_name, arg).await?;
+    if let HookStore::Remote(remote) = &hook.store {
+        return remote
+            .workers
+            .call_hook(
+                remote.instance,
+                &hook.name,
+                fn_name,
+                arg,
+                remote.purpose,
+                &remote.host,
+                remote.limits,
+                &remote.call_deadlines,
+            )
+            .await;
+    }
+    let Some(func) = func else {
+        return Err(format!(
+            "hook '{}' holds no function {fn_name} in this process",
+            hook.name
+        ));
+    };
+    let out = match arg {
+        HookArg::SessionStart(arg) => {
+            invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await
+        }
+        HookArg::TaskStart(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::Inference(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::Tool(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::Shell(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::Compaction(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::TaskEnd(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+        HookArg::SessionEnd(arg) => invoke_typed::<_, HookOutput>(hook, &func, fn_name, arg).await,
+    }?;
     Ok(Some(out))
 }
 
@@ -1921,23 +2254,26 @@ where
             hook.name, cut.fn_name, cut.deadline_seconds
         ));
     }
+    let HookStore::Local(store) = &mut hook.store else {
+        return Err(format!("hook '{}' has no store in this process", hook.name));
+    };
     let f = func
-        .typed::<(T,), (Result<O, String>,)>(&hook.store)
+        .typed::<(T,), (Result<O, String>,)>(&*store)
         .map_err(|e| e.to_string())?;
 
     // A blocking hook's store outlives every event it handles, so each lifecycle call is
     // given its own fresh budget rather than sharing one across the whole session.
-    let limits = hook.store.data().limits.limits();
-    hook.store.set_epoch_deadline(limits.deadline_ticks());
+    let limits = store.data().limits.limits();
+    store.set_epoch_deadline(limits.deadline_ticks());
 
-    let call_deadlines = hook.store.data().call_deadlines.clone();
+    let call_deadlines = store.data().call_deadlines.clone();
     let called = call_deadlines
         .bound(
             &hook.name,
             ComponentRole::Hook,
             fn_name,
             &limits,
-            f.call_async(&mut hook.store, (arg,)),
+            f.call_async(&mut *store, (arg,)),
         )
         .await;
     let Ok(called) = called else {
@@ -1958,7 +2294,7 @@ where
             // Still a plain `String` on the same `Err` path an ordinary hook error takes —
             // `dispatch` isolates it via `log_hook_error` and the session continues.
             // Classification only makes the message name the limit that fired.
-            let failure = classify_guest_failure(&err, &hook.store.data().limits);
+            let failure = classify_guest_failure(&err, &store.data().limits);
             return Err(failure.hook_message(&hook.name, &hook.entry, fn_name, &err));
         }
     };
@@ -1980,9 +2316,9 @@ async fn call_hook(
 ) -> Result<HookCallResult, String> {
     // Recorded on the store for the length of this call only: the decision point calls the same
     // instance with no event of its own to record, and must find `Lifecycle` there.
-    hook.store.data_mut().inference_purpose = inference_purpose(event);
+    hook.store.set_purpose(inference_purpose(event));
     let output = call_event(hook, context, event, elapsed, totals).await;
-    hook.store.data_mut().inference_purpose = HookInferencePurpose::Lifecycle;
+    hook.store.set_purpose(HookInferencePurpose::Lifecycle);
     let output = output?;
 
     // A single decision against `HONORED_OUTPUT_ARM`: commit the one arm this event
@@ -2056,7 +2392,7 @@ async fn call_event(
                 model: context.model.clone(),
                 capabilities: context.capabilities.clone(),
             };
-            call_typed(hook, "on-session-start", ctx).await?
+            call_typed(hook, "on-session-start", HookArg::SessionStart(ctx)).await?
         }
         HookEvent::TaskStart {
             task_id,
@@ -2076,7 +2412,7 @@ async fn call_event(
                 context_window: *context_window,
                 prior_tokens: *prior_tokens,
             };
-            call_typed(hook, "on-task-start", evt).await?
+            call_typed(hook, "on-task-start", HookArg::TaskStart(evt)).await?
         }
         HookEvent::Inference {
             turn,
@@ -2098,7 +2434,7 @@ async fn call_event(
                 output: output.clone(),
                 tools: tools.clone(),
             };
-            call_typed(hook, "on-inference", evt).await?
+            call_typed(hook, "on-inference", HookArg::Inference(evt)).await?
         }
         HookEvent::ToolCall {
             turn,
@@ -2122,7 +2458,7 @@ async fn call_event(
                     status: status.clone(),
                 }),
             };
-            call_typed(hook, "on-tool-call", evt).await?
+            call_typed(hook, "on-tool-call", HookArg::Tool(evt)).await?
         }
         HookEvent::Shell {
             turn,
@@ -2156,7 +2492,7 @@ async fn call_event(
                     duration_ms: *duration_ms,
                 }),
             };
-            call_typed(hook, "on-shell", evt).await?
+            call_typed(hook, "on-shell", HookArg::Shell(evt)).await?
         }
         HookEvent::Compaction {
             messages,
@@ -2172,7 +2508,7 @@ async fn call_event(
                 model: model.clone(),
                 system_prompt: system_prompt.clone(),
             };
-            call_typed(hook, "on-compaction", evt).await?
+            call_typed(hook, "on-compaction", HookArg::Compaction(evt)).await?
         }
         HookEvent::TaskEnd {
             task_id,
@@ -2182,7 +2518,7 @@ async fn call_event(
                 task_id: task_id.clone(),
                 exit_status: exit_status.clone(),
             };
-            call_typed(hook, "on-task-end", evt).await?
+            call_typed(hook, "on-task-end", HookArg::TaskEnd(evt)).await?
         }
         HookEvent::SessionEnd {
             total_turns,
@@ -2197,7 +2533,7 @@ async fn call_event(
                 duration_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
                 exit_status: exit_status.clone(),
             };
-            call_typed(hook, "on-session-end", evt).await?
+            call_typed(hook, "on-session-end", HookArg::SessionEnd(evt)).await?
         }
     })
 }
@@ -2296,56 +2632,86 @@ async fn run_async_hook_worker(
 ///
 /// `root_dir` is the hook's working directory: the session dir for `on-stage`, the project
 /// directory for blocking and async hooks.
+#[cfg(test)]
 fn build_wasi_ctx(
     root_dir: &Path,
     env: &HookEnvVars<'_>,
     grant: &HookCapabilityGrant,
     gateway: Option<&crate::credential_gateway::CredentialGateway>,
 ) -> Result<WasiCtx, RuntimeError> {
+    apply_wasi_plan(&plan_hook_wasi(root_dir, env, grant, gateway)?)
+}
+
+/// [`build_wasi_ctx`]'s decisions, without building the context: every variable in the order it
+/// is set and every preopen in registration order. A declared scope directory exists once the
+/// plan does. Decided in the supervisor, so a hook in the hooks worker gets the same context.
+fn plan_hook_wasi(
+    root_dir: &Path,
+    env: &HookEnvVars<'_>,
+    grant: &HookCapabilityGrant,
+    gateway: Option<&crate::credential_gateway::CredentialGateway>,
+) -> Result<WasiPlan, RuntimeError> {
     // No host env inheritance: the explicit injections below are the entire environment a hook
     // component ever sees. Hooks have no manifest-declared allowlist because no hook artifact
     // reads an arbitrary host var, so the only operator-authored value that can reach one is the
     // `config:` block on its own entry, which arrives here already lowered on the grant.
-    let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
+    let mut builder = WasiPlan {
+        env: Vec::new(),
+        preopens: Vec::new(),
+    };
 
     // First, so the runtime-owned `MURMUR_*` variables below are applied after it and keep
     // precedence: a `config:` block can carry any key an operator writes, and none of them may
     // shadow a value the runtime owns.
     if let Some(config_json) = grant.config_json.as_deref() {
-        builder.env(ARTIFACT_CONFIG_ENV, config_json);
+        builder
+            .env
+            .push((ARTIFACT_CONFIG_ENV.to_string(), config_json.to_string()));
     }
 
     if let Some(endpoint) = env.otel_endpoint {
-        builder.env("MURMUR_OTEL_ENDPOINT", endpoint);
+        builder
+            .env
+            .push(("MURMUR_OTEL_ENDPOINT".to_string(), endpoint.to_string()));
     }
     // Only a hook whose own entry declares `gateway:` is told where the gateway is.
     if let Some(gateway) = gateway {
         let (name, value) = crate::runtime::gateway_env_pair(gateway);
-        builder.env(name, value);
+        builder.env.push((name.to_string(), value.to_string()));
     }
     if let Some(id) = env.formation_id {
-        builder.env(crate::formation::FORMATION_ID_ENV, id);
+        builder.env.push((
+            crate::formation::FORMATION_ID_ENV.to_string(),
+            id.to_string(),
+        ));
     }
     if let Some(peers) = env.formation_member.and_then(|member| member.guest_peers()) {
         let (name, value) = peers.env_pair();
-        builder.env(name, value);
+        builder.env.push((name.to_string(), value.to_string()));
     }
     if let Some(config_json) = env.eval_config_json {
-        builder.env("MURMUR_EVAL_CONFIG", config_json);
+        builder
+            .env
+            .push(("MURMUR_EVAL_CONFIG".to_string(), config_json.to_string()));
     }
     if let Some(id) = env.case_id {
-        builder.env("MURMUR_CASE_ID", id);
+        builder
+            .env
+            .push(("MURMUR_CASE_ID".to_string(), id.to_string()));
     }
     if let Some(id) = env.dataset_id {
-        builder.env("MURMUR_DATASET_ID", id);
+        builder
+            .env
+            .push(("MURMUR_DATASET_ID".to_string(), id.to_string()));
     }
 
     if let Some(scope) = grant.filesystem_scope.as_deref() {
         let scoped_dir = resolve_scoped_dir(root_dir, scope)?;
-        builder
-            .preopened_dir(&scoped_dir, ".", FsPerms::ReadWrite)
-            .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;
+        builder.preopens.push(PlannedPreopen {
+            host_path: scoped_dir,
+            guest_path: ".".to_string(),
+            read_only: false,
+        });
     } else if grant.filesystem_records {
         // Fail closed: a records grant with no staged directory fails the instantiation rather
         // than preopening anything else as ".".
@@ -2357,18 +2723,22 @@ fn build_wasi_ctx(
                     .to_string(),
             )
         })?;
-        builder
-            .preopened_dir(hooks_dir, ".", FsPerms::ReadWrite)
-            .map_err(|err| RuntimeError::wasi(hooks_dir.to_path_buf(), err.to_string()))?;
+        builder.preopens.push(PlannedPreopen {
+            host_path: hooks_dir.to_path_buf(),
+            guest_path: ".".to_string(),
+            read_only: false,
+        });
     }
 
     if let Some(state_dir) = grant.state_dir.as_deref() {
-        builder
-            .preopened_dir(state_dir, STATE_PREOPEN_NAME, FsPerms::ReadWrite)
-            .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
+        builder.preopens.push(PlannedPreopen {
+            host_path: state_dir.to_path_buf(),
+            guest_path: STATE_PREOPEN_NAME.to_string(),
+            read_only: false,
+        });
     }
 
-    Ok(builder.build())
+    Ok(builder)
 }
 
 /// Appends `error` to `logs/hook-<hook_name>.log` in the session's records directory. A refused
@@ -2389,6 +2759,70 @@ async fn log_hook_error(records_root: &WorkdirRoot, hook_name: &str, error: &str
         }
     })
     .await;
+}
+
+/// Drives both hook store sites, a session-long instance's and `on-stage`'s, with `component`
+/// in this process: for the store guard's test, which runs it on a supervisor's thread.
+#[cfg(test)]
+pub(crate) async fn guard_probe(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    dir: &Path,
+) -> (Result<(), String>, Result<(), String>) {
+    let spec = HookSpec {
+        name: "probe".to_string(),
+        entry: "probe".to_string(),
+        version: "1.0.0".to_string(),
+        limits: ExecutionLimits::default(),
+        wasi: WasiPlan {
+            env: Vec::new(),
+            preopens: vec![PlannedPreopen {
+                host_path: dir.to_path_buf(),
+                guest_path: ".".to_string(),
+                read_only: false,
+            }],
+        },
+    };
+    let imports = || HookImports::Local {
+        origin: "hook:probe".to_string(),
+        inference: Err(InferenceUnavailable::NotConfigured),
+        task_io: None,
+        conversation: None,
+    };
+    let http = || {
+        ToolHttpHooks::Local(NetworkPolicyHooks {
+            network_allow_rules: Vec::new(),
+            gateway: None,
+            formation: None,
+            task_provenance: None,
+            member_requests: None,
+        })
+    };
+    let instance = open_instance(
+        engine,
+        component,
+        &spec,
+        imports(),
+        http(),
+        CallDeadlines::default(),
+        HookConfig::default(),
+    )
+    .await
+    .map(|_| ());
+    let stage = stage_on_store(
+        engine,
+        component,
+        &spec,
+        imports(),
+        http(),
+        CallDeadlines::default(),
+        &StageEvent {
+            shell_allow: Vec::new(),
+        },
+    )
+    .await
+    .map(|_| ());
+    (instance, stage)
 }
 
 /// Hook runtimes other modules' tests drive the compaction path through.
@@ -3356,6 +3790,59 @@ mod tests {
         let messages = result.expect("hook succeeded").expect("replace-context");
         assert_eq!(messages[0].role, "model");
         assert_eq!(messages[0].content, "claude-haiku-4-5");
+    }
+
+    /// A hook instance held by a hooks guest worker (on a thread, speaking the same protocol a
+    /// worker process speaks) answers its lifecycle call exactly as an instance in this process
+    /// does, and an `on-stage` call runs on a throwaway instance there.
+    #[test]
+    fn a_hook_runs_in_a_thread_guest_worker() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let workers = crate::guest_worker::GuestWorkers::new(crate::guest_worker::Launcher::Thread);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let mut hooks = new_with_hooks_full(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "compactor",
+                    HookBinding::OnCompaction,
+                    hook_compaction_echo_model_double(&engine),
+                )],
+                ExecutionLimits::default(),
+                HookEnvVars {
+                    guest_workers: Some(&workers),
+                    ..HookEnvVars::default()
+                },
+            )
+            .await
+            .expect("the double instantiates in the hooks worker");
+            hooks
+                .dispatch_compaction(
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                        id: None,
+                        source_id: None,
+                        inserted_by: None,
+                    }],
+                    1234,
+                    0.98,
+                    Some("claude-haiku-4-5".to_string()),
+                    None,
+                )
+                .await
+        });
+        let messages = result.expect("hook succeeded").expect("replace-context");
+        assert_eq!(messages[0].role, "model");
+        assert_eq!(messages[0].content, "claude-haiku-4-5");
+        assert_eq!(
+            workers.started_kinds(),
+            vec![crate::guest_worker::WorkerKind::Hooks]
+        );
     }
 
     /// `inference.compaction.system_prompt` set in the manifest reaches the hook
@@ -5194,13 +5681,13 @@ mod tests {
             wasi: build_wasi_ctx(root, &HookEnvVars::default(), grant, gateway.as_deref())
                 .expect("wasi ctx builds"),
             http: WasiHttpCtx::new(),
-            http_hooks: NetworkPolicyHooks {
+            http_hooks: ToolHttpHooks::Local(NetworkPolicyHooks {
                 network_allow_rules: grant.network_allow_rules.clone(),
                 gateway,
                 formation: None,
                 task_provenance: None,
                 member_requests: None,
-            },
+            }),
             inference_purpose: HookInferencePurpose::Lifecycle,
             call_deadlines: CallDeadlines::default(),
         }

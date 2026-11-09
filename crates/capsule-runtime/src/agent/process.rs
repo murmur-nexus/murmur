@@ -844,7 +844,8 @@ async fn run_harness(
     }
 
     // One driver instance for the whole run, so `parse` may answer from what `launch` was given.
-    let mut driver = ProcessDriver::instantiate(
+    let mut driver = ProcessDriver::open(
+        store_state.guest_workers.as_ref(),
         &store_state.engine,
         &staged.component,
         &staged.name,
@@ -1325,6 +1326,11 @@ async fn drive_harness(
             // the output arm is polled, this arm was polled just before it in the same pass.
             report = next_call_report(&mut report_rx) => {
                 sink.queue_report(report);
+                // A guest worker lost under a bridged call ends the run, never a tool error the
+                // harness carries on from.
+                if let Some(lost) = store_state.guest_worker_lost() {
+                    break RunEnd::Failed(lost);
+                }
                 continue;
             }
             line = line_rx.recv() => line,
@@ -1360,6 +1366,9 @@ async fn drive_harness(
             Ok(events) => events,
             Err(error) => break RunEnd::Failed(error),
         };
+        if let Some(lost) = store_state.guest_worker_lost() {
+            break RunEnd::Failed(lost);
+        }
         match sink.consume(events, hooks, trace, otel).await {
             SinkOutcome::Continue => {}
             SinkOutcome::Ended => break RunEnd::Terminal(Ok(())),

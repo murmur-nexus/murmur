@@ -17,6 +17,7 @@
 
 mod http;
 mod launch;
+mod remote;
 mod supervisor;
 pub(crate) mod wire;
 mod worker;
@@ -30,6 +31,7 @@ use crate::errors::RuntimeError;
 
 pub(crate) use http::RemoteHttp;
 pub(crate) use launch::Launcher;
+pub(crate) use remote::RemoteProcessDriver;
 pub use supervisor::GuestWorkers;
 pub(crate) use wire::StreamEvent;
 pub use worker::RemoteLink;
@@ -121,7 +123,27 @@ pub fn use_worker_processes() {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A placement a test puts its own thread at, ahead of the process-wide one.
+    static TEST_PLACEMENT: std::cell::Cell<Option<Placement>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with this thread at `placement`, for a test that drives a store site as a supervisor
+/// would without changing the process-wide placement other tests read.
+#[cfg(test)]
+pub(crate) fn with_placement<R>(placement: Placement, f: impl FnOnce() -> R) -> R {
+    TEST_PLACEMENT.with(|cell| cell.set(Some(placement)));
+    let result = f();
+    TEST_PLACEMENT.with(|cell| cell.set(None));
+    result
+}
+
 pub(crate) fn current_placement() -> Placement {
+    #[cfg(test)]
+    if let Some(placement) = TEST_PLACEMENT.with(std::cell::Cell::get) {
+        return placement;
+    }
     match PLACEMENT.load(Ordering::SeqCst) {
         PLACEMENT_SUPERVISOR => Placement::Supervisor,
         PLACEMENT_WORKER => Placement::Worker,
@@ -142,6 +164,9 @@ pub(crate) fn session_launcher() -> Option<Launcher> {
 pub(crate) enum StoreSite {
     Tool,
     Driver,
+    Hook,
+    ProcessDriver,
+    Capsule,
 }
 
 impl StoreSite {
@@ -149,6 +174,9 @@ impl StoreSite {
         match self {
             Self::Tool => "a tool",
             Self::Driver => "an inference driver",
+            Self::Hook => "a hook",
+            Self::ProcessDriver => "a process driver",
+            Self::Capsule => "a script capsule's component",
         }
     }
 }
@@ -238,7 +266,8 @@ fn connection_on_fd3() -> Option<std::os::unix::net::UnixStream> {
     if !is_socket {
         return None;
     }
-    // SAFETY: fd 3 is a socket this process was started with and nothing else owns.
+    // SAFETY: fd 3 is the socket the supervisor started this process with. `main` reaches this
+    // before anything else runs or opens a descriptor, so nothing else owns fd 3.
     let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
     // CLOEXEC, so no guest-spawned process could inherit it.
     // SAFETY: integer arguments only.

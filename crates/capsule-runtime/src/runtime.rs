@@ -2380,19 +2380,24 @@ fn refuse_undeclarable_runtime_pin(
 ///
 /// This function is intentionally separate from `launch_session` so policy/capability
 /// checks can be layered in the seam between stage and launch without mixing concerns.
-/// The guest workers a capsule with `artifacts` starts at staging: a tools worker for any staged
-/// WASM tool, a driver worker for any `runtime: driver` artifact. A skill runs no guest.
-fn guest_worker_kinds(artifacts: &[ArtifactRequest]) -> Vec<crate::guest_worker::WorkerKind> {
+/// The guest workers a capsule with `artifacts` starts at staging, one per guest kind it stages:
+/// tools for a staged WASM tool, driver for any `runtime: driver` artifact (the process driver
+/// included) or a script component, hooks for any hook. A skill runs no guest.
+fn guest_worker_kinds(
+    artifacts: &[ArtifactRequest],
+    has_script_component: bool,
+) -> Vec<crate::guest_worker::WorkerKind> {
     use crate::guest_worker::WorkerKind;
     let mut kinds = Vec::new();
+    if has_script_component {
+        kinds.push(WorkerKind::Driver);
+    }
     for artifact in artifacts
         .iter()
         .filter(|artifact| artifact.source.is_none())
     {
-        let kind = match artifact.runtime {
-            ArtifactRuntime::Tool => WorkerKind::Tools,
-            ArtifactRuntime::Driver => WorkerKind::Driver,
-            ArtifactRuntime::Hook | ArtifactRuntime::Skill => continue,
+        let Some(kind) = WorkerKind::for_runtime(artifact.runtime.clone()) else {
+            continue;
         };
         if !kinds.contains(&kind) {
             kinds.push(kind);
@@ -2771,7 +2776,9 @@ pub fn stage_session(
     // artifact resolution; each is waited for once the artifact loop is done.
     let guest_workers = crate::guest_worker::session_launcher().map(|launcher| {
         let workers = crate::guest_worker::GuestWorkers::new(launcher);
-        for kind in guest_worker_kinds(&request.artifacts) {
+        let has_script_component =
+            request.inference.is_none() && !request.capsule_component_bytes.is_empty();
+        for kind in guest_worker_kinds(&request.artifacts, has_script_component) {
             workers.start(kind);
         }
         workers
@@ -3231,7 +3238,8 @@ pub fn stage_session(
                     RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
                 })?;
             let description = rt.block_on(async {
-                let mut driver = ProcessDriver::instantiate(
+                let mut driver = ProcessDriver::open(
+                    guest_workers.as_ref(),
                     &engine,
                     &component,
                     &name,
@@ -3647,6 +3655,7 @@ pub fn stage_session(
         formation_member: request.formation_member.as_ref(),
         call_deadlines: call_deadlines.clone(),
         member_requests: member_requests.clone(),
+        guest_workers: guest_workers.as_ref(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -5007,6 +5016,7 @@ fn launch(
                             formation_member: formation_member.as_ref(),
                             call_deadlines: call_deadlines.clone(),
                             member_requests: member_requests.clone(),
+                            guest_workers: guest_workers.as_ref(),
                         },
                         hook_limits,
                         hook_inference,
@@ -5798,7 +5808,7 @@ fn launch(
     // Read before `staged.capability_policy` moves into the store state below.
     let capsule_limits = staged.capability_policy.limits;
 
-    let wasi = build_wasi_ctx(
+    let wasi_plan = plan_wasi_ctx(
         &staged.accessible_workdir,
         // The capsule component runs on the ceiling, not on any artifact's grant — so it gets
         // neither a narrowed workdir preopen, nor a state preopen, nor a config block. A capsule
@@ -5815,6 +5825,12 @@ fn launch(
         Some(&staged.runtime_dir),
         &[],
     )?;
+    // In the driver worker the root's WASI context is built there from the plan; the session
+    // state here holds none.
+    let wasi = match &staged.guest_workers {
+        Some(_) => WasiCtxBuilder::new().build(),
+        None => apply_wasi_plan(&wasi_plan)?,
+    };
 
     // Script capsule uses a multi-thread runtime so block_in_place works inside the host
     // functions (`invoke`, `send`, `pull`), which write the session's trace lines as they run.
@@ -5988,72 +6004,118 @@ fn launch(
         member_requests: staged.member_requests.clone(),
     };
 
-    let mut store = Store::new(&staged.engine, state);
-    // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
-    // the store enforces, and instantiation itself allocates against them.
-    store.limiter(|state| &mut state.limits);
-
     let call_deadlines = staged.call_deadlines.clone();
     let capsule_name = staged.capsule_name.clone();
-    // A phase the wall-clock bound stopped fails exactly as one the epoch interrupted.
-    let stopped = || RuntimeError::CapsuleDeadlineExceeded {
-        seconds: capsule_limits.deadline_seconds,
-    };
-    let ran: Result<(), RuntimeError> = rt.block_on(async {
-        // Instantiation runs the guest's own start/init code, so it gets a deadline too.
-        store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let instantiated = call_deadlines
-            .bound(
-                &capsule_name,
-                ComponentRole::Capsule,
-                "instantiate",
-                &capsule_limits,
-                linker.instantiate_async(&mut store, &capsule_component),
-            )
-            .await
-            .map_err(|_| stopped())?;
-        let instance = match instantiated {
-            Ok(instance) => instance,
-            Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+    let (ran, mut state) = if let Some(workers) = staged.guest_workers.clone() {
+        let shared = Arc::new(Mutex::new(state));
+        let spec = CapsuleSpec {
+            name: capsule_name.clone(),
+            limits: capsule_limits,
+            wasi: wasi_plan,
         };
+        let ran = match rt.block_on(workers.run_capsule(
+            &capsule_name,
+            &capsule_component,
+            spec,
+            Arc::clone(&shared),
+            &call_deadlines,
+        )) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into_runtime()),
+            Err(error) => Err(workers.runtime_error(error)),
+        };
+        // A worker lost while the root ran fails the run, whatever the root made of it.
+        let ran = match workers.lost() {
+            Some(lost) => Err(RuntimeError::GuestWorkerLost(lost)),
+            None => ran,
+        };
+        let mut shared = shared;
+        let state = loop {
+            match Arc::try_unwrap(shared) {
+                Ok(state) => {
+                    break state
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+                // A host call still finishing holds the state for a moment.
+                Err(still_shared) => {
+                    shared = still_shared;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        };
+        (ran, state)
+    } else {
+        crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Capsule)?;
+        let mut store = Store::new(&staged.engine, state);
+        // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
+        // the store enforces, and instantiation itself allocates against them.
+        store.limiter(|state| &mut state.limits);
 
-        let capsule_iface =
-            resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+        let call_deadlines = staged.call_deadlines.clone();
+        let capsule_name = staged.capsule_name.clone();
+        // A phase the wall-clock bound stopped fails exactly as one the epoch interrupted.
+        let stopped = || RuntimeError::CapsuleDeadlineExceeded {
+            seconds: capsule_limits.deadline_seconds,
+        };
+        let ran: Result<(), RuntimeError> = rt.block_on(async {
+            // Instantiation runs the guest's own start/init code, so it gets a deadline too.
+            store.set_epoch_deadline(capsule_limits.deadline_ticks());
+            let instantiated = call_deadlines
+                .bound(
+                    &capsule_name,
+                    ComponentRole::Capsule,
+                    "instantiate",
+                    &capsule_limits,
+                    linker.instantiate_async(&mut store, &capsule_component),
+                )
+                .await
+                .map_err(|_| stopped())?;
+            let instance = match instantiated {
+                Ok(instance) => instance,
+                Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+            };
+
+            let capsule_iface =
+                resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+                    .ok_or(RuntimeError::CapsuleExportMissing)?;
+            let capsule_run = instance
+                .get_export_index(&mut store, Some(&capsule_iface), "run")
+                .and_then(|idx| instance.get_func(&mut store, idx))
                 .ok_or(RuntimeError::CapsuleExportMissing)?;
-        let capsule_run = instance
-            .get_export_index(&mut store, Some(&capsule_iface), "run")
-            .and_then(|idx| instance.get_func(&mut store, idx))
-            .ok_or(RuntimeError::CapsuleExportMissing)?;
 
-        let run = capsule_run
-            .typed::<(), ()>(&store)
-            .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+            let run = capsule_run
+                .typed::<(), ()>(&store)
+                .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
 
-        // Fresh budget for `run` itself, so instantiation cost cannot eat into it.
-        store.set_epoch_deadline(capsule_limits.deadline_ticks());
-        let called = call_deadlines
-            .bound(
-                &capsule_name,
-                ComponentRole::Capsule,
-                "run",
-                &capsule_limits,
-                run.call_async(&mut store, ()),
-            )
-            .await
-            .map_err(|_| stopped())?;
-        if let Err(err) = called {
-            return Err(capsule_guest_error(&err, &store.data().limits));
-        }
+            // Fresh budget for `run` itself, so instantiation cost cannot eat into it.
+            store.set_epoch_deadline(capsule_limits.deadline_ticks());
+            let called = call_deadlines
+                .bound(
+                    &capsule_name,
+                    ComponentRole::Capsule,
+                    "run",
+                    &capsule_limits,
+                    run.call_async(&mut store, ()),
+                )
+                .await
+                .map_err(|_| stopped())?;
+            if let Err(err) = called {
+                return Err(capsule_guest_error(&err, &store.data().limits));
+            }
 
-        Ok(())
-    });
+            Ok(())
+        });
 
+        (ran, store.into_data())
+    };
+    let state = &mut state;
     // The capsule's run has ended, however it ended, so its session ends: every process a shell
     // call started is killed and the session's network namespace is released.
-    store.data().shell_enforcement.end_session();
+    state.shell_enforcement.end_session();
 
     let mut ran = ran;
-    if let Some(mut session) = store.data_mut().script_session.take() {
+    if let Some(mut session) = state.script_session.take() {
         // A line a host function could not write leaves the record incomplete, which fails the
         // launch whatever `run` did.
         if let Some(error) = session.write_error.take() {
@@ -6095,6 +6157,316 @@ fn launch(
         records_dir: staged.records_dir,
         ending: LaunchEnding::Completed,
     })
+}
+
+/// What a script capsule's root store is built from in the driver worker, decided in the
+/// supervisor: the capsule's name, its limits and its WASI plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CapsuleSpec {
+    pub(crate) name: String,
+    pub(crate) limits: crate::ExecutionLimits,
+    pub(crate) wasi: WasiPlan,
+}
+
+/// One `murmur:tool-registry/invoke`, `murmur:artifact-manager/manage` or `murmur:message/send`
+/// call of a script capsule's root, as it crosses from the driver worker.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleCall {
+    Invoke {
+        name: String,
+        input: murmur::tool::run::ToolInput,
+    },
+    Send {
+        peer_url: String,
+        message: send::Message,
+    },
+    List,
+    Describe(String),
+    Search(String),
+    Pull(String, String),
+    Remove(String),
+    Diagnostics,
+}
+
+/// The supervisor's answer to a [`CapsuleCall`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleReply {
+    Invoke(Result<murmur::tool::run::ToolResult, String>),
+    Send(Result<send::TaskResult, String>),
+    List(Vec<manage::ArtifactSummary>),
+    Describe(Result<manage::ArtifactInfo, String>),
+    Search(Result<Vec<manage::ArtifactSummary>, String>),
+    Pull(Result<manage::ArtifactSummary, String>),
+    Remove(Result<bool, String>),
+    Diagnostics(Result<manage::RuntimeState, String>),
+    /// Not answered, with why.
+    Unanswered(String),
+}
+
+/// A script capsule root's failure in the driver worker, as the [`RuntimeError`] the same failure
+/// raises in process.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CapsuleRunError {
+    Trap(String),
+    DeadlineExceeded { seconds: u64 },
+    ResourceLimit { message: String },
+    ExportMissing,
+    Runtime(String),
+}
+
+impl CapsuleRunError {
+    fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::CapsuleTrap(message) => Self::Trap(message),
+            RuntimeError::CapsuleDeadlineExceeded { seconds } => Self::DeadlineExceeded { seconds },
+            RuntimeError::CapsuleResourceLimit { message } => Self::ResourceLimit { message },
+            RuntimeError::CapsuleExportMissing => Self::ExportMissing,
+            other => Self::Runtime(other.to_string()),
+        }
+    }
+
+    pub(crate) fn into_runtime(self) -> RuntimeError {
+        match self {
+            Self::Trap(message) => RuntimeError::CapsuleTrap(message),
+            Self::DeadlineExceeded { seconds } => RuntimeError::CapsuleDeadlineExceeded { seconds },
+            Self::ResourceLimit { message } => RuntimeError::CapsuleResourceLimit { message },
+            Self::ExportMissing => RuntimeError::CapsuleExportMissing,
+            Self::Runtime(message) => RuntimeError::Runtime(message),
+        }
+    }
+}
+
+/// Answers a script capsule root's `call` from its session `state`, with the same host functions
+/// the root's store calls in process.
+pub(crate) fn answer_capsule_call(
+    state: &mut CapsuleStoreState,
+    call: CapsuleCall,
+) -> CapsuleReply {
+    match call {
+        CapsuleCall::Invoke { name, input } => {
+            CapsuleReply::Invoke(invoke::Host::invoke(state, name, input))
+        }
+        CapsuleCall::Send { peer_url, message } => {
+            CapsuleReply::Send(send::Host::send(state, peer_url, message))
+        }
+        CapsuleCall::List => CapsuleReply::List(manage::Host::list(state)),
+        CapsuleCall::Describe(name) => CapsuleReply::Describe(manage::Host::describe(state, name)),
+        CapsuleCall::Search(query) => CapsuleReply::Search(manage::Host::search(state, query)),
+        CapsuleCall::Pull(name, version) => {
+            CapsuleReply::Pull(manage::Host::pull(state, name, version))
+        }
+        CapsuleCall::Remove(name) => CapsuleReply::Remove(manage::Host::remove(state, name)),
+        CapsuleCall::Diagnostics => CapsuleReply::Diagnostics(manage::Host::diagnostics(state)),
+    }
+}
+
+/// A script capsule root's store in the driver worker: WASI from the supervisor's plan, and every
+/// Murmur import a host call to the supervisor.
+struct ScriptGuestState {
+    table: ResourceTable,
+    wasi: WasiCtx,
+    http: WasiHttpCtx,
+    http_hooks: ToolHttpHooks,
+    limits: ExecutionLimiter,
+    link: Arc<crate::guest_worker::RemoteLink>,
+}
+
+impl ScriptGuestState {
+    /// Sends `call` to the supervisor from a synchronous host function, as the in-process root's
+    /// host functions block on their own work.
+    fn ask(&self, call: CapsuleCall) -> CapsuleReply {
+        let link = Arc::clone(&self.link);
+        block_on_host(async move { link.capsule(call).await })
+    }
+}
+
+impl WasiView for ScriptGuestState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiHttpView for ScriptGuestState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
+impl send::Host for ScriptGuestState {
+    fn send(
+        &mut self,
+        peer_url: String,
+        message: send::Message,
+    ) -> Result<send::TaskResult, String> {
+        match self.ask(CapsuleCall::Send { peer_url, message }) {
+            CapsuleReply::Send(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+}
+
+impl manage::Host for ScriptGuestState {
+    fn list(&mut self) -> Vec<manage::ArtifactSummary> {
+        match self.ask(CapsuleCall::List) {
+            CapsuleReply::List(list) => list,
+            _ => Vec::new(),
+        }
+    }
+
+    fn describe(&mut self, name: String) -> Result<manage::ArtifactInfo, String> {
+        match self.ask(CapsuleCall::Describe(name)) {
+            CapsuleReply::Describe(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn search(&mut self, query: String) -> Result<Vec<manage::ArtifactSummary>, String> {
+        match self.ask(CapsuleCall::Search(query)) {
+            CapsuleReply::Search(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
+        match self.ask(CapsuleCall::Pull(name, version)) {
+            CapsuleReply::Pull(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn remove(&mut self, name: String) -> Result<bool, String> {
+        match self.ask(CapsuleCall::Remove(name)) {
+            CapsuleReply::Remove(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+
+    fn diagnostics(&mut self) -> Result<manage::RuntimeState, String> {
+        match self.ask(CapsuleCall::Diagnostics) {
+            CapsuleReply::Diagnostics(result) => result,
+            other => Err(unanswered(other)),
+        }
+    }
+}
+
+fn unanswered(reply: CapsuleReply) -> String {
+    match reply {
+        CapsuleReply::Unanswered(reason) => reason,
+        other => format!("unexpected reply {other:?}"),
+    }
+}
+
+/// Instantiates a script capsule's root `component` in the driver worker and calls its
+/// `murmur:capsule/run#run`, in the same phases and under the same bounds as the in-process root.
+pub(crate) async fn run_capsule_guest(
+    engine: &Engine,
+    component: &Component,
+    spec: &CapsuleSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: &CallDeadlines,
+) -> Result<(), CapsuleRunError> {
+    run_capsule_root(engine, component, spec, link, call_deadlines)
+        .await
+        .map_err(CapsuleRunError::from_runtime)
+}
+
+async fn run_capsule_root(
+    engine: &Engine,
+    component: &Component,
+    spec: &CapsuleSpec,
+    link: Arc<crate::guest_worker::RemoteLink>,
+    call_deadlines: &CallDeadlines,
+) -> Result<(), RuntimeError> {
+    crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::Capsule)?;
+    let mut linker: Linker<ScriptGuestState> = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    linker
+        .instance(WIT_TOOL_REGISTRY_IFACE)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?
+        .func_wrap(
+            "invoke",
+            |store: wasmtime::StoreContextMut<'_, ScriptGuestState>,
+             (tool_name, input): (String, murmur::tool::run::ToolInput)|
+             -> wasmtime::Result<(Result<murmur::tool::run::ToolResult, String>,)> {
+                let reply = store.data().ask(CapsuleCall::Invoke {
+                    name: tool_name,
+                    input,
+                });
+                Ok((match reply {
+                    CapsuleReply::Invoke(result) => result,
+                    other => Err(unanswered(other)),
+                },))
+            },
+        )
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    manage::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    send::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+
+    let limits = spec.limits;
+    let state = ScriptGuestState {
+        table: ResourceTable::new(),
+        wasi: apply_wasi_plan(&spec.wasi)?,
+        http: WasiHttpCtx::new(),
+        http_hooks: ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(Arc::clone(&link))),
+        limits: limits.limiter(),
+        link,
+    };
+    let mut store = Store::new(engine, state);
+    store.limiter(|state| &mut state.limits);
+    let stopped = || RuntimeError::CapsuleDeadlineExceeded {
+        seconds: limits.deadline_seconds,
+    };
+    store.set_epoch_deadline(limits.deadline_ticks());
+    let instantiated = call_deadlines
+        .bound(
+            &spec.name,
+            ComponentRole::Capsule,
+            "instantiate",
+            &limits,
+            linker.instantiate_async(&mut store, component),
+        )
+        .await
+        .map_err(|_| stopped())?;
+    let instance = match instantiated {
+        Ok(instance) => instance,
+        Err(err) => return Err(capsule_guest_error(&err, &store.data().limits)),
+    };
+    let capsule_iface = resolve_versioned_iface(&instance, &mut store, WIT_CAPSULE_IFACE_VERSIONED)
+        .ok_or(RuntimeError::CapsuleExportMissing)?;
+    let capsule_run = instance
+        .get_export_index(&mut store, Some(&capsule_iface), "run")
+        .and_then(|idx| instance.get_func(&mut store, idx))
+        .ok_or(RuntimeError::CapsuleExportMissing)?;
+    let run = capsule_run
+        .typed::<(), ()>(&store)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    store.set_epoch_deadline(limits.deadline_ticks());
+    let called = call_deadlines
+        .bound(
+            &spec.name,
+            ComponentRole::Capsule,
+            "run",
+            &limits,
+            run.call_async(&mut store, ()),
+        )
+        .await
+        .map_err(|_| stopped())?;
+    if let Err(err) = called {
+        return Err(capsule_guest_error(&err, &store.data().limits));
+    }
+    Ok(())
 }
 
 /// `session_end.exit_status` for a script capsule whose `run` ended in `ran`: `ok` when it
@@ -9399,7 +9771,6 @@ pub(crate) struct InputWiring {
 
 impl InputWiring {
     /// Wiring with no task: every request is refused as outside an A2A task context.
-    #[cfg(test)]
     pub(crate) fn unavailable() -> Self {
         Self {
             task_registry: None,
@@ -9804,6 +10175,17 @@ pub(crate) enum ToolHttpHooks {
     Remote(crate::guest_worker::RemoteHttp),
 }
 
+#[cfg(test)]
+impl ToolHttpHooks {
+    /// [`NetworkPolicyHooks::admit`] for a local policy.
+    pub(crate) fn admit(&self, uri: &http::Uri) -> Result<Admission, WasiHttpError> {
+        match self {
+            Self::Local(hooks) => hooks.admit(uri),
+            Self::Remote(_) => panic!("a remote policy is applied by the supervisor"),
+        }
+    }
+}
+
 impl WasiHttpHooks for ToolHttpHooks {
     fn send_request(
         &mut self,
@@ -10080,15 +10462,13 @@ impl CapsuleStoreState {
     /// The worker that runs tool `name`: the driver worker for a `runtime: driver` artifact, the
     /// tools worker for every other.
     pub(crate) fn worker_kind_of(&self, name: &str) -> crate::guest_worker::WorkerKind {
-        let is_driver = self.installed_artifacts.iter().any(|artifact| {
-            murmur_artifact::tool_name_of(&artifact.name) == name
-                && artifact.runtime == ArtifactRuntime::Driver
-        });
-        if is_driver {
-            crate::guest_worker::WorkerKind::Driver
-        } else {
-            crate::guest_worker::WorkerKind::Tools
-        }
+        self.installed_artifacts
+            .iter()
+            .find(|artifact| murmur_artifact::tool_name_of(&artifact.name) == name)
+            .and_then(|artifact| {
+                crate::guest_worker::WorkerKind::for_runtime(artifact.runtime.clone())
+            })
+            .unwrap_or(crate::guest_worker::WorkerKind::Tools)
     }
 
     /// Resolve what a tool call is about to run, for the policy decision point.

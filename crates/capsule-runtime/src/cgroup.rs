@@ -2126,7 +2126,8 @@ pub(crate) fn resolve_delegated_base_in_background() {
 }
 
 /// The guest-worker processes that move with this process: into its transient scope and into
-/// `<base>/murmur-supervisor`. Registered before the resolution starts.
+/// `<base>/murmur-supervisor`. Registered before the resolution starts and removed once it has
+/// run.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 static COMPANION_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
@@ -2155,10 +2156,18 @@ pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
     {
         #[cfg(test)]
         DELEGATED_BASE_RESOLUTION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let companions = companions.to_vec();
         let _ = std::thread::Builder::new()
             .name("murmur-cgroup-base".to_string())
-            .spawn(|| {
+            .spawn(move || {
                 let _ = delegated_base();
+                // This session's workers have moved, or never will: a later session's
+                // resolution must not find their pids, which the kernel may hand to an unrelated
+                // process once they exit.
+                COMPANION_PIDS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|pid| !companions.contains(pid));
             });
     }
 }

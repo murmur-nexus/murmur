@@ -24,6 +24,7 @@ pub mod hook {
     wasmtime::component::bindgen!({
         path: "wit/hook",
         world: "hook",
+        additional_derives: [serde::Serialize, serde::Deserialize],
     });
 }
 
@@ -32,5 +33,6 @@ pub mod process_driver {
         path: "wit/process-driver",
         world: "process-driver",
         exports: { default: async },
+        additional_derives: [serde::Serialize, serde::Deserialize],
     });
 }

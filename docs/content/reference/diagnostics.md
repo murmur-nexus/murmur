@@ -526,18 +526,20 @@ reason says. `mur run` checks nothing at launch: the code comes only from `mur d
 
 ### E-RUN-065 — a guest worker was lost { #e-run-065 }
 
-A [guest worker](../concepts/guest-workers.md) died while it ran a call, or stopped answering past
-the call's deadline plus five seconds and was killed. The task in flight fails and the session
-ends.
+A [guest worker](../concepts/guest-workers.md) died while it ran a call, or stopped answering well
+past the call's `capabilities.limits.deadline_seconds` and was killed. The task in flight fails and
+the session ends.
 
 ```text
 error[E-RUN-065]: the tools guest worker (pid 48211) was lost while running tool 'stall-tool': it was killed by signal 9 (SIGKILL); the task failed and the session ended
 ```
 
 The message names the worker kind, its pid, the call it was running and how it ended: `exited
-with status N` or `was killed by signal N (NAME)`. The trace records `task_failed` with cause
-`runtime_error` and this message as its reason, then `task_end` with `exit_status: failed`, then
-`session_end`. `completion.json` is written and `mur` exits non-zero. The worker is not restarted.
+with status N`, `was killed by signal N (NAME)`, `closed its connection` or `stopped answering and
+was killed`. The trace records `task_failed` with cause `runtime_error` and this message as its
+reason, then `task_end` with `exit_status: failed`, then `session_end`, and `mur` exits non-zero.
+A script capsule, which runs no task, records `session_end` with `exit_status: failed`. The worker
+is not restarted.
 
 **What to do:** look for what ended the process: an out-of-memory kill in the system log, a signal
 sent from outside, or a guest that crashed the worker. Run the capsule again.
@@ -4590,9 +4592,9 @@ warning names every such route and the artifacts on it:
 ```
 
 **Why it matters:** the class confines shell commands and plan shell steps. WASM
-tools and drivers run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree
-and hooks run inside the `mur` process, each held by its WASI preopens and the network allowlist;
-the process harness and its tools run with your authority.
+tools, drivers and hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process
+tree, each held by its WASI preopens and the network allowlist; the process harness and its tools
+run with your authority.
 
 **What the runtime does about it:** nothing is refused. The launch runs at the declared class.
 

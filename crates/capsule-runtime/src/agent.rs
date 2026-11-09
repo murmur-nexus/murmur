@@ -1972,6 +1972,10 @@ pub(crate) async fn run_agent_loop(
         // handling the event just emitted above — flush whatever it buffered
         // before writing this turn's own record.
         flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+        // A hooks worker lost while a hook handled the event ends the task and the session.
+        if let Some(lost) = store_state.guest_worker_lost() {
+            return Err(lost);
+        }
         // A response that says the call failed is recorded as the failed call it is: no estimate,
         // no wire hash, and no turn counted, the same record every other failed call writes.
         if stop_reason == "error" {
@@ -2417,6 +2421,9 @@ pub(crate) async fn run_agent_loop(
                                 )
                                 .await;
                             flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+                            if let Some(lost) = store_state.guest_worker_lost() {
+                                return Err(lost);
+                            }
                             if outcome.is_skill {
                                 trace
                                     .write_skill_call(
@@ -2488,6 +2495,12 @@ pub(crate) async fn run_agent_loop(
                                     )
                                     .await;
                                 flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+                                if let Some(lost) = store_state.guest_worker_lost() {
+                                    return Err(lost);
+                                }
+                                if let Some(lost) = store_state.guest_worker_lost() {
+                                    return Err(lost);
+                                }
                                 trace
                                     .write_shell(
                                         turn_u32,
@@ -2573,6 +2586,9 @@ pub(crate) async fn run_agent_loop(
                                 )
                                 .await;
                             flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+                            if let Some(lost) = store_state.guest_worker_lost() {
+                                return Err(lost);
+                            }
                             trace
                                 .write_tool_call(
                                     turn_u32,

@@ -247,7 +247,7 @@ Routes
   drivers           present  host process, not confined by the class (murmur/driver-anthropic)
     Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             present  host process, not confined by the class (ana/hook-telemetry)
-    Runs inside the mur process, held only by the preopens and network grants its own capabilities block declares.
+    Runs inside the mur process tree, in a guest worker held only by the preopens and network grants its own capabilities block declares.
   process harness   absent   host process, not confined by the class
   harness tools     absent   host process, not confined by the class
 
@@ -306,8 +306,9 @@ the composed root; on the same host every other capsule runs on `landlock+seccom
 | `none` | `advisory` | No kernel sandboxing primitive (macOS and every non-Linux target) |
 
 `Routes` names every way this capsule runs code and what holds each. The mechanism confines shell
-commands and shell steps of a submitted plan. WASM tools, drivers and hooks run inside the `mur`
-process, held by their own preopens and network grants, and a process harness runs as a child of
+commands and shell steps of a submitted plan. WASM tools, drivers and hooks run in
+[guest workers](../concepts/guest-workers.md) in the `mur` process tree, held by their own
+preopens and network grants, and a process harness runs as a child of
 `mur` outside the class. A program a WASM tool runs, such as the `git` that `murmur/tool-git` runs
 here because `shell allow:` names it, runs under the mechanism like a shell command. See
 [Routes and what holds each](../reference/containment.md#routes).

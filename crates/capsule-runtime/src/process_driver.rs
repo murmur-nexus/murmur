@@ -284,8 +284,7 @@ impl WasiView for ProcessDriverStoreState {
 pub struct ProcessDriver {
     name: String,
     version: String,
-    store: Store<ProcessDriverStoreState>,
-    bindings: ProcessDriverBindings,
+    body: DriverBody,
     /// The session's latch, where a call the wall-clock bound stops is recorded.
     call_deadlines: CallDeadlines,
     /// The call the wall-clock bound stopped, once one has, and its deadline in seconds. The
@@ -293,7 +292,133 @@ pub struct ProcessDriver {
     cut: Option<(&'static str, u64)>,
 }
 
+/// Where a process driver instance lives: in this process's store, or in the driver guest worker,
+/// which runs the same instance body and answers each call.
+enum DriverBody {
+    Local {
+        store: Store<ProcessDriverStoreState>,
+        bindings: ProcessDriverBindings,
+    },
+    Remote(crate::guest_worker::RemoteProcessDriver),
+}
+
+/// One process driver call, as it crosses to the driver guest worker.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DriverCall {
+    Describe,
+    Launch(LaunchRequest),
+    Parse(Vec<String>),
+    ClassifyExit(ExitStatus),
+    ReadLogin(LoginOutput),
+}
+
+/// A process driver call's answer from the driver guest worker.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DriverAnswer {
+    Opened,
+    Description(Description),
+    Launch(Result<LaunchPlan, String>),
+    Events(Vec<Event>),
+    Event(Event),
+    Login(LoginState),
+}
+
+/// A process driver's [`RuntimeError`] as it crosses from the driver guest worker; the
+/// supervisor names the driver again on the way back.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DriverError {
+    Load(String),
+    CallFailed { call: String, message: String },
+    Other(String),
+}
+
+impl DriverError {
+    pub(crate) fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::ProcessDriverLoad { message, .. } => Self::Load(message),
+            RuntimeError::ProcessDriverCallFailed { call, message, .. } => {
+                Self::CallFailed { call, message }
+            }
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub(crate) fn into_runtime(self, name: &str, version: &str) -> RuntimeError {
+        match self {
+            Self::Load(message) => RuntimeError::ProcessDriverLoad {
+                name: name.to_string(),
+                version: version.to_string(),
+                message,
+            },
+            Self::CallFailed { call, message } => RuntimeError::ProcessDriverCallFailed {
+                name: name.to_string(),
+                version: version.to_string(),
+                call,
+                message,
+            },
+            Self::Other(message) => RuntimeError::Runtime(message),
+        }
+    }
+}
+
 impl ProcessDriver {
+    /// Instantiates `component` as [`Self::instantiate`] does: in the driver guest worker when
+    /// `workers` is given, in this process otherwise.
+    pub(crate) async fn open(
+        workers: Option<&std::sync::Arc<crate::guest_worker::GuestWorkers>>,
+        engine: &Engine,
+        component: &Component,
+        name: &str,
+        version: &str,
+        call_deadlines: CallDeadlines,
+    ) -> Result<Self, RuntimeError> {
+        let Some(workers) = workers else {
+            return Self::instantiate(engine, component, name, version, call_deadlines).await;
+        };
+        let remote = crate::guest_worker::RemoteProcessDriver::open(
+            workers,
+            component,
+            name,
+            version,
+            &call_deadlines,
+        )
+        .await?;
+        Ok(Self {
+            name: name.to_string(),
+            version: version.to_string(),
+            body: DriverBody::Remote(remote),
+            call_deadlines,
+            cut: None,
+        })
+    }
+
+    /// Runs `call` on this instance, whichever process holds it. The worker side of a remote
+    /// instance runs this same method on its local instance.
+    pub(crate) async fn call(&mut self, call: DriverCall) -> Result<DriverAnswer, RuntimeError> {
+        Ok(match call {
+            DriverCall::Describe => DriverAnswer::Description(self.describe().await?),
+            DriverCall::Launch(request) => DriverAnswer::Launch(self.launch(request).await?),
+            DriverCall::Parse(lines) => DriverAnswer::Events(self.parse(lines).await?),
+            DriverCall::ClassifyExit(exit) => DriverAnswer::Event(self.classify_exit(exit).await?),
+            DriverCall::ReadLogin(output) => DriverAnswer::Login(self.read_login(output).await?),
+        })
+    }
+
+    /// `call` on the driver worker's instance, or `None` for a local instance.
+    async fn remote_call(
+        &mut self,
+        call: DriverCall,
+    ) -> Option<Result<DriverAnswer, RuntimeError>> {
+        match &self.body {
+            DriverBody::Remote(remote) => Some(remote.call(call, &self.call_deadlines).await),
+            DriverBody::Local { .. } => None,
+        }
+    }
+
+    fn unexpected(&self, call: &str, answer: DriverAnswer) -> RuntimeError {
+        self.failed_in(call, format!("the guest worker answered {answer:?}"))
+    }
+
     /// Instantiates `component` with no grants: a WASI context with no environment, arguments,
     /// preopened directories, inherited stdio or network, and no Murmur host import.
     ///
@@ -316,6 +441,7 @@ impl ProcessDriver {
             message,
         };
         let limits = ExecutionLimits::default().for_hook_calls(None);
+        crate::guest_worker::check_store_placement(crate::guest_worker::StoreSite::ProcessDriver)?;
 
         let mut linker: Linker<ProcessDriverStoreState> = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -346,8 +472,7 @@ impl ProcessDriver {
         Ok(Self {
             name: name.to_string(),
             version: version.to_string(),
-            store,
-            bindings,
+            body: DriverBody::Local { store, bindings },
             call_deadlines,
             cut: None,
         })
@@ -360,9 +485,18 @@ impl ProcessDriver {
     /// [`RuntimeError::ProcessDriverLoad`]. The bare harness binary may start a session, so the
     /// login check must never run it with nothing after it.
     pub async fn describe(&mut self) -> Result<Description, RuntimeError> {
+        if let Some(answer) = self.remote_call(DriverCall::Describe).await {
+            return match answer? {
+                DriverAnswer::Description(description) => Ok(description),
+                other => Err(self.unexpected("describe", other)),
+            };
+        }
         self.enter("describe")
             .map_err(|message| self.load_error(message))?;
         let limits = self.reset_deadline();
+        let DriverBody::Local { store, bindings } = &mut self.body else {
+            unreachable!("a remote driver answered above")
+        };
         let called = self
             .call_deadlines
             .bound(
@@ -370,16 +504,14 @@ impl ProcessDriver {
                 ComponentRole::ProcessDriver,
                 "describe",
                 &limits,
-                self.bindings
-                    .murmur_driver_process()
-                    .call_describe(&mut self.store),
+                bindings.murmur_driver_process().call_describe(&mut *store),
             )
             .await;
         let description = self
             .settle("describe", &limits, called)
             .map_err(|message| self.load_error(format!("describe() {message}")))?
             .map_err(|e| {
-                let message = match classify_guest_failure(&e, &self.store.data().limits) {
+                let message = match classify_guest_failure(&e, self.limiter()) {
                     GuestFailure::DeadlineExceeded { seconds } => {
                         format!("describe() exceeded its {seconds}s deadline and was interrupted")
                     }
@@ -400,9 +532,21 @@ impl ProcessDriver {
         &mut self,
         request: LaunchRequest,
     ) -> Result<Result<LaunchPlan, String>, RuntimeError> {
+        if let DriverBody::Remote(remote) = &self.body {
+            return match remote
+                .call(DriverCall::Launch(request), &self.call_deadlines)
+                .await?
+            {
+                DriverAnswer::Launch(plan) => Ok(plan),
+                other => Err(self.unexpected("launch", other)),
+            };
+        }
         self.enter("launch")
             .map_err(|message| self.failed_in("launch", message))?;
         let limits = self.reset_deadline();
+        let DriverBody::Local { store, bindings } = &mut self.body else {
+            unreachable!("a remote driver answered above")
+        };
         let called = self
             .call_deadlines
             .bound(
@@ -410,9 +554,9 @@ impl ProcessDriver {
                 ComponentRole::ProcessDriver,
                 "launch",
                 &limits,
-                self.bindings
+                bindings
                     .murmur_driver_process()
-                    .call_launch(&mut self.store, &request),
+                    .call_launch(&mut *store, &request),
             )
             .await;
         self.settle("launch", &limits, called)
@@ -423,9 +567,21 @@ impl ProcessDriver {
     /// Reads one batch of complete stdout lines into events. The same instance serves a whole
     /// run, so the driver may answer from what `launch` was given.
     pub async fn parse(&mut self, lines: Vec<String>) -> Result<Vec<Event>, RuntimeError> {
+        if let DriverBody::Remote(remote) = &self.body {
+            return match remote
+                .call(DriverCall::Parse(lines), &self.call_deadlines)
+                .await?
+            {
+                DriverAnswer::Events(events) => Ok(events),
+                other => Err(self.unexpected("parse", other)),
+            };
+        }
         self.enter("parse")
             .map_err(|message| self.failed_in("parse", message))?;
         let limits = self.reset_deadline();
+        let DriverBody::Local { store, bindings } = &mut self.body else {
+            unreachable!("a remote driver answered above")
+        };
         let called = self
             .call_deadlines
             .bound(
@@ -433,9 +589,9 @@ impl ProcessDriver {
                 ComponentRole::ProcessDriver,
                 "parse",
                 &limits,
-                self.bindings
+                bindings
                     .murmur_driver_process()
-                    .call_parse(&mut self.store, &lines),
+                    .call_parse(&mut *store, &lines),
             )
             .await;
         self.settle("parse", &limits, called)
@@ -445,9 +601,21 @@ impl ProcessDriver {
 
     /// Asks the driver what a run whose output ended without a terminal event amounts to.
     pub async fn classify_exit(&mut self, exit: ExitStatus) -> Result<Event, RuntimeError> {
+        if let DriverBody::Remote(remote) = &self.body {
+            return match remote
+                .call(DriverCall::ClassifyExit(exit), &self.call_deadlines)
+                .await?
+            {
+                DriverAnswer::Event(event) => Ok(event),
+                other => Err(self.unexpected("classify-exit", other)),
+            };
+        }
         self.enter("classify-exit")
             .map_err(|message| self.failed_in("classify-exit", message))?;
         let limits = self.reset_deadline();
+        let DriverBody::Local { store, bindings } = &mut self.body else {
+            unreachable!("a remote driver answered above")
+        };
         let called = self
             .call_deadlines
             .bound(
@@ -455,9 +623,9 @@ impl ProcessDriver {
                 ComponentRole::ProcessDriver,
                 "classify-exit",
                 &limits,
-                self.bindings
+                bindings
                     .murmur_driver_process()
-                    .call_classify_exit(&mut self.store, &exit),
+                    .call_classify_exit(&mut *store, &exit),
             )
             .await;
         self.settle("classify-exit", &limits, called)
@@ -467,9 +635,21 @@ impl ProcessDriver {
 
     /// Asks the driver to read what its `login-check` command printed.
     pub async fn read_login(&mut self, output: LoginOutput) -> Result<LoginState, RuntimeError> {
+        if let DriverBody::Remote(remote) = &self.body {
+            return match remote
+                .call(DriverCall::ReadLogin(output), &self.call_deadlines)
+                .await?
+            {
+                DriverAnswer::Login(state) => Ok(state),
+                other => Err(self.unexpected("read-login", other)),
+            };
+        }
         self.enter("read-login")
             .map_err(|message| self.failed_in("read-login", message))?;
         let limits = self.reset_deadline();
+        let DriverBody::Local { store, bindings } = &mut self.body else {
+            unreachable!("a remote driver answered above")
+        };
         let called = self
             .call_deadlines
             .bound(
@@ -477,9 +657,9 @@ impl ProcessDriver {
                 ComponentRole::ProcessDriver,
                 "read-login",
                 &limits,
-                self.bindings
+                bindings
                     .murmur_driver_process()
-                    .call_read_login(&mut self.store, &output),
+                    .call_read_login(&mut *store, &output),
             )
             .await;
         self.settle("read-login", &limits, called)
@@ -491,9 +671,20 @@ impl ProcessDriver {
     /// the ticks the previous call spent would count against it, so a long run would eventually
     /// interrupt a driver that had done nothing wrong.
     fn reset_deadline(&mut self) -> ExecutionLimits {
-        let limits = self.store.data().limits.limits();
-        self.store.set_epoch_deadline(limits.deadline_ticks());
+        let DriverBody::Local { store, .. } = &mut self.body else {
+            return ExecutionLimits::default().for_hook_calls(None);
+        };
+        let limits = store.data().limits.limits();
+        store.set_epoch_deadline(limits.deadline_ticks());
         limits
+    }
+
+    /// The local store's limiter, read when a guest failure is classified.
+    fn limiter(&self) -> &ExecutionLimiter {
+        match &self.body {
+            DriverBody::Local { store, .. } => &store.data().limits,
+            DriverBody::Remote(_) => unreachable!("a remote driver classifies in its worker"),
+        }
     }
 
     /// Refuses a call into an instance the wall-clock bound stopped earlier, naming that call.
@@ -531,7 +722,7 @@ impl ProcessDriver {
     }
 
     fn call_error(&self, call: &str, error: &wasmtime::Error) -> RuntimeError {
-        let message = match classify_guest_failure(error, &self.store.data().limits) {
+        let message = match classify_guest_failure(error, self.limiter()) {
             GuestFailure::DeadlineExceeded { seconds } => {
                 format!("exceeded its {seconds}s deadline and was interrupted")
             }
@@ -625,6 +816,8 @@ pub(crate) struct StandaloneDriver {
     _ticker: EpochTicker,
     name: String,
     version: String,
+    /// The driver guest worker the instance runs in, when this process uses worker processes.
+    workers: Option<std::sync::Arc<crate::guest_worker::GuestWorkers>>,
 }
 
 impl StandaloneDriver {
@@ -659,11 +852,14 @@ impl StandaloneDriver {
             _ticker: ticker,
             name: name.to_string(),
             version: version.to_string(),
+            workers: crate::guest_worker::session_launcher()
+                .map(crate::guest_worker::GuestWorkers::new),
         })
     }
 
     pub(crate) async fn instantiate(&self) -> Result<ProcessDriver, RuntimeError> {
-        ProcessDriver::instantiate(
+        ProcessDriver::open(
+            self.workers.as_ref(),
             &self.engine,
             &self.component,
             &self.name,

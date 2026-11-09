@@ -6,9 +6,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bindings::hook::exports::murmur::hook::lifecycle::{HookOutput, StageEvent};
+use crate::bindings::hook::murmur::conversation::read::MessagePage;
+use crate::bindings::hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse};
+use crate::bindings::hook::murmur::task_io::read::{IoError, TaskInputForm};
 use crate::bindings::host::murmur::tool::run::{ToolInput, ToolResult};
+use crate::hooks::{HookArg, HookSpec};
+use crate::inference_import::HookInferencePurpose;
 use crate::limits::CallDeadline;
-use crate::runtime::ToolCallSpec;
+use crate::process_driver::{DriverAnswer, DriverCall, DriverError};
+use crate::runtime::{CapsuleCall, CapsuleReply, CapsuleRunError, CapsuleSpec, ToolCallSpec};
 use crate::session_process::{ProcessCall, ProcessReply};
 
 use super::WorkerKind;
@@ -39,6 +46,60 @@ pub(crate) enum ToWorker {
         guest: u64,
         spec: Box<ToolCallSpec>,
         input: ToolInput,
+    },
+    /// Instantiate guest `guest` as session-long hook instance `instance`, in a store built from
+    /// `spec`. `req` is also the call id the instantiation's host calls name. Replied to with
+    /// [`Reply::HookOpened`].
+    HookOpen {
+        req: u64,
+        guest: u64,
+        instance: u64,
+        spec: Box<HookSpec>,
+    },
+    /// Call lifecycle function `fn_name` of hook instance `instance` with `arg`, `run-inference`
+    /// calls made meanwhile being for `purpose`. `req` is also the call id. Replied to with
+    /// [`Reply::Hook`].
+    HookCall {
+        req: u64,
+        instance: u64,
+        fn_name: String,
+        arg: Box<HookArg>,
+        purpose: HookInferencePurpose,
+    },
+    /// Call `on-stage` on a throwaway instance of guest `guest` built from `spec`. Replied to with
+    /// [`Reply::Hook`].
+    HookStage {
+        req: u64,
+        guest: u64,
+        spec: Box<HookSpec>,
+        event: StageEvent,
+    },
+    /// Drop hook instance `instance`; no reply.
+    HookClose { instance: u64 },
+    /// Instantiate guest `guest` as process driver instance `instance`. Replied to with
+    /// [`Reply::Driver`].
+    DriverOpen {
+        req: u64,
+        guest: u64,
+        instance: u64,
+        name: String,
+        version: String,
+    },
+    /// Run `call` on process driver instance `instance`. Replied to with [`Reply::Driver`].
+    DriverCall {
+        req: u64,
+        instance: u64,
+        call: Box<DriverCall>,
+    },
+    /// Drop process driver instance `instance`; no reply.
+    DriverClose { instance: u64 },
+    /// Instantiate guest `guest` as the script capsule's root and call its
+    /// `murmur:capsule/run#run`, in a store built from `spec`. `req` is also the call id.
+    /// Replied to with [`Reply::Capsule`].
+    RunCapsule {
+        req: u64,
+        guest: u64,
+        spec: Box<CapsuleSpec>,
     },
     /// Drop the guest call `req`, as dropping its future in-process does; no reply.
     Cancel { req: u64 },
@@ -95,6 +156,38 @@ pub(crate) enum Reply {
         result: Result<ToolResult, String>,
         deadlines: Vec<CallDeadline>,
     },
+    /// The hook instance's exported lifecycle functions, by WIT name.
+    HookOpened {
+        result: Result<Vec<String>, String>,
+        deadlines: Vec<CallDeadline>,
+    },
+    /// A lifecycle call's output: `None` when the instance does not export the function.
+    Hook {
+        result: Result<Option<HookOutput>, String>,
+        deadlines: Vec<CallDeadline>,
+    },
+    Driver {
+        result: Result<DriverAnswer, DriverError>,
+        deadlines: Vec<CallDeadline>,
+    },
+    Capsule {
+        result: Result<(), CapsuleRunError>,
+        deadlines: Vec<CallDeadline>,
+    },
+}
+
+impl Reply {
+    /// Every wall-clock bound that fired in the call, to be recorded in the session's latch.
+    pub(crate) fn take_deadlines(&mut self) -> Vec<CallDeadline> {
+        match self {
+            Self::Loaded(_) => Vec::new(),
+            Self::Tool { deadlines, .. }
+            | Self::HookOpened { deadlines, .. }
+            | Self::Hook { deadlines, .. }
+            | Self::Driver { deadlines, .. }
+            | Self::Capsule { deadlines, .. } => std::mem::take(deadlines),
+        }
+    }
 }
 
 /// A host import the supervisor answers.
@@ -106,6 +199,34 @@ pub(crate) enum HostRequest {
     RequestInput { prompt: String },
     /// A `murmur:process` function.
     Process(ProcessCall),
+    /// A hook's `murmur:runtime/inference#run-inference`.
+    Inference {
+        purpose: HookInferencePurpose,
+        request: InferenceRequest,
+    },
+    /// A hook's `murmur:task-io/read` function.
+    TaskIo(TaskIoCall),
+    /// A hook's `murmur:conversation/read#read-messages`.
+    Conversation { cursor: Option<String>, limit: u32 },
+    /// A script capsule root's `murmur:tool-registry/invoke`, `murmur:artifact-manager/manage` or
+    /// `murmur:message/send` function.
+    Capsule(Box<CapsuleCall>),
+}
+
+/// One `murmur:task-io/read` function.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum TaskIoCall {
+    InputLen(TaskInputForm),
+    ReadInput(TaskInputForm, u64, u64),
+    OutputLen,
+    ReadOutput(u64, u64),
+}
+
+/// A `murmur:task-io/read` function's answer.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum TaskIoReply {
+    Len(Result<u64, IoError>),
+    Text(Result<String, IoError>),
 }
 
 /// The supervisor's answer to a [`HostRequest`].
@@ -115,6 +236,10 @@ pub(crate) enum HostReply {
     Http(Result<HttpResponseHead, HttpError>),
     Input(Result<String, String>),
     Process(ProcessReply),
+    Inference(Result<InferenceResponse, String>),
+    TaskIo(TaskIoReply),
+    Conversation(Result<MessagePage, String>),
+    Capsule(Box<CapsuleReply>),
     /// Not answered: the call named is not in flight on this connection.
     Refused(String),
 }
@@ -214,7 +339,7 @@ pub(crate) enum HttpError {
 /// `Vec<u8>` is a sequence of `u8`s, which postcard encodes and decodes one element at a time: a
 /// serialized component of several megabytes would cost tens of milliseconds each way.
 mod raw_bytes {
-    use serde::de::{Deserializer, Error, SeqAccess, Visitor};
+    use serde::de::{Deserializer, Error, Visitor};
     use serde::Serializer;
 
     pub(crate) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -237,14 +362,6 @@ mod raw_bytes {
             }
 
             fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-                Ok(bytes)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
-                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(byte) = seq.next_element()? {
-                    bytes.push(byte);
-                }
                 Ok(bytes)
             }
         }

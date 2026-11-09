@@ -141,6 +141,36 @@ pub(crate) fn add_conversation_to_linker<T: 'static>(
     Ok(())
 }
 
+/// Register `murmur:conversation/read@0.2.0` on a guest worker's hook linker: every call is a host
+/// call to the supervisor, which answers it from the state [`add_conversation_to_linker`] would
+/// have been handed, or `not-granted` when there is none.
+pub(crate) fn add_remote_conversation_to_linker<T: 'static>(
+    linker: &mut Linker<T>,
+    link: Arc<crate::guest_worker::RemoteLink>,
+) -> Result<(), String> {
+    let mut instance = linker
+        .instance(CONVERSATION_IFACE_VERSIONED)
+        .map_err(|e| format!("failed to define {CONVERSATION_IFACE_VERSIONED}: {e}"))?;
+    instance
+        .func_wrap_async(
+            "read-messages",
+            move |_store: wasmtime::StoreContextMut<'_, T>,
+                  (cursor, limit): (Option<String>, u32)| {
+                let link = Arc::clone(&link);
+                let fut: Box<
+                    dyn std::future::Future<
+                            Output = wasmtime::Result<(Result<MessagePage, String>,)>,
+                        > + Send,
+                > = Box::new(async move { Ok((link.conversation(cursor, limit).await,)) });
+                fut
+            },
+        )
+        .map_err(|e| {
+            format!("failed to register {CONVERSATION_IFACE_VERSIONED}#read-messages: {e}")
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::CONVERSATION_IFACE_VERSIONED;

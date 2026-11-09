@@ -1,7 +1,8 @@
-//! A `mur run` session runs its WASM tools and drivers in guest workers: `mur __guest-worker
-//! <kind>` children of `mur`, each in its own process group, with an empty environment, started
-//! only for the kinds the capsule has, gone when the session ends. A worker killed mid-task fails
-//! the task with `E-RUN-065` and the run's records still end with `session_end`.
+//! A `mur run` session runs its WASM tools, drivers, hooks and script component in guest workers:
+//! `mur __guest-worker <kind>` children of `mur`, each in its own process group, with an empty
+//! environment, started only for the kinds the capsule has, gone when the session ends. A worker
+//! killed mid-task fails the task with `E-RUN-065` and the run's records still end with
+//! `session_end`.
 //!
 //! Driven through the real `mur` binary against a loopback upstream the test owns.
 
@@ -26,6 +27,8 @@ const ANTHROPIC: &str = "local/murmur-driver-anthropic";
 const STALL_DRIVER: &str = "local/stall-driver";
 const STALL_TOOL: &str = "local/stall-tool";
 const ECHO_TOOL: &str = "local/echo-tool";
+const SLEEP_HOOK: &str = "local/sleep-hook";
+const PROCESS_DRIVER: &str = "local/fixture-process-driver";
 const VERSION: &str = "0.1.0";
 const AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 const KEY: &str = "sk-guest-worker-canary-41d9";
@@ -73,6 +76,14 @@ impl Home {
             ECHO_TOOL,
             VERSION,
             &common::fixture_path("run/components/echo-tool.wasm"),
+        ));
+        published.push(sleep_hook_zip(artifacts.path()));
+        published.push(common::create_driver_artifact_with_auth(
+            artifacts.path(),
+            PROCESS_DRIVER,
+            VERSION,
+            &common::fixture_path("process-driver/tool/process-driver.wasm"),
+            "",
         ));
         for artifact in &published {
             common::publish_local(&home, artifact).success();
@@ -315,8 +326,39 @@ fn wait_for_workers(
     }
 }
 
+/// Holds a `mur run --task` session open once its task has ended: under `task_acceptance: queue`
+/// the session waits at its door for the next task until it is signalled.
 fn sleep_lifecycle() -> &'static str {
-    "lifecycle:\n  after_task: sleep\n"
+    "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n"
+}
+
+/// The sleeping hook, packed with its bundled manifest: `execution_mode: blocking` and no
+/// `binding:`, so it sleeps through `on-session-start` until its entry's deadline.
+fn sleep_hook_zip(dir: &Path) -> PathBuf {
+    use zip::{
+        write::{FileOptions, SimpleFileOptions},
+        CompressionMethod, ZipWriter,
+    };
+    let path = dir.join(format!("sleep-hook-{VERSION}.mur.zip"));
+    let mut zip = ZipWriter::new(fs::File::create(&path).unwrap());
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    zip.write_all(&fs::read(common::fixture_path("sleep-hook/murmur.yaml")).unwrap())
+        .unwrap();
+    zip.start_file("hook.wasm", options).unwrap();
+    zip.write_all(&fs::read(common::fixture_path("sleep-hook/hook/sleep-hook.wasm")).unwrap())
+        .unwrap();
+    zip.finish().unwrap();
+    path
+}
+
+/// A `runtime: hook` entry for the sleeping hook, stopped at `deadline` seconds.
+fn sleep_hook_entry(deadline: u64) -> String {
+    format!(
+        "  - name: {SLEEP_HOOK}\n    version: {VERSION}\n    runtime: hook\n    capabilities:\n      \
+         limits:\n        deadline_seconds: {deadline}\n"
+    )
 }
 
 fn alive(pid: u32) -> bool {
@@ -394,7 +436,7 @@ fn a_task_runs_through_the_driver_and_tools_workers() {
     }
 }
 
-/// With the session held open, the capsule's workers are children of `mur`, each in its own
+/// With the session held open at its door, the capsule's workers are children of `mur`, each in its own
 /// process group, with an argv of exactly `<mur> __guest-worker <kind>`, an unreadable environment
 /// and no form of the key on its command line; a capsule with a driver and a WASM tool runs two,
 /// and none survives the session.
@@ -657,4 +699,192 @@ fn workers_share_the_cgroup_mur_moves_into() {
             .unwrap_or_else(|error| panic!("worker {worker} is gone ({error})\n{}", run.context()));
         assert_eq!(cgroup, mur_cgroup, "worker {worker}\n{}", run.context());
     }
+}
+
+/// A capsule with a driver, a WASM tool and a hook runs three workers, `driver`, `hooks` and
+/// `tools`, each a child of `mur` in its own process group; the hook's call runs in the hooks
+/// worker, which holds the session in `on-session-start` while the test looks.
+#[test]
+fn a_hook_starts_the_hooks_worker() {
+    let home = Home::new();
+    let upstream = Upstream::start(vec![END_TURN.to_string()]);
+    let extra = format!(
+        "  - name: {ECHO_TOOL}\n    version: {VERSION}\n    runtime: tool\n{}",
+        sleep_hook_entry(30)
+    );
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+    let child = home.spawn(&capsule);
+    let pid = child.id();
+    let workers = wait_for_workers(pid, 3, Duration::from_secs(60));
+    let mur_pgid = pgid_of(pid);
+    // SAFETY: plain syscall on our own child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let run = finish(child, Duration::from_secs(60));
+    let kinds: Vec<&str> = workers.iter().map(|w| w.1.as_str()).collect();
+    assert_eq!(kinds, vec!["driver", "hooks", "tools"], "{}", run.context());
+    for (worker, kind, argv, pgid) in &workers {
+        assert_eq!(argv.len(), 3, "{argv:?}");
+        assert_eq!(argv[1], "__guest-worker");
+        assert_eq!(&argv[2], kind);
+        assert_ne!(*pgid, mur_pgid, "worker {worker} has its own process group");
+        assert!(!alive(*worker), "worker {worker} outlived the session");
+    }
+}
+
+/// The hooks worker killed while a hook's call is in flight in it ends the task `failed` with
+/// `E-RUN-065`.
+#[test]
+fn killing_the_hooks_worker_fails_the_task_and_ends_the_records() {
+    let home = Home::new();
+    let upstream = Upstream::start(vec![END_TURN.to_string()]);
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &sleep_hook_entry(60));
+    let (run, worker) = kill_mid_task(&home, &capsule, "hooks", Duration::from_secs(10));
+    assert_lost(&run, "hooks", worker, "hook 'sleep-hook'");
+}
+
+/// A process-transport capsule's bridged tool call whose tools worker is killed under it ends the
+/// task `failed` with `E-RUN-065`: the harness is never left to carry on from a tool error.
+#[test]
+fn killing_the_tools_worker_under_a_bridged_call_fails_the_task() {
+    let home = Home::new();
+    let project = TempDir::new().unwrap();
+    let harness = project.path().join("harness.sh");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=bridge-call\nexport \
+             FIXTURE_BRIDGE_CALL_TOOL='stall-tool'\nexport FIXTURE_BRIDGE_CALL_ARGS='{{}}'\nexec \
+             '{}' \"$@\"\n",
+            common::fixture_path("process-driver/fake-harness").display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&harness).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&harness, perms).unwrap();
+    let manifest = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "name: bridged-capsule\nversion: 0.1.0\nartifacts:\n  - name: {PROCESS_DRIVER}\n    \
+             version: {VERSION}\n    runtime: driver\n  - name: {STALL_TOOL}\n    version: \
+             {VERSION}\n    runtime: tool\ncapabilities:\n  env:\n    allow: [HOME, PATH, \
+             FIXTURE_HARNESS_PROFILE]\n\
+             inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n  \
+             command: {}\n",
+            harness.display()
+        ),
+    )
+    .unwrap();
+    let capsule = Capsule { project, manifest };
+    let (run, worker) = kill_mid_task(&home, &capsule, "tools", Duration::from_secs(15));
+    assert_lost(&run, "tools", worker, "the tools guest worker");
+}
+
+/// A script capsule's root runs in the driver worker, and the tools worker killed under its
+/// registry call ends the run with `E-RUN-065` and a `session_end` of `failed`.
+#[test]
+fn killing_the_tools_worker_under_a_script_capsules_call_ends_the_run() {
+    let home = Home::new();
+    let artifacts = TempDir::new().unwrap();
+    // The script capsule calls `echo-tool`; this one stalls.
+    let stall_echo = common::create_tool_artifact(
+        artifacts.path(),
+        ECHO_TOOL,
+        "0.2.0",
+        &common::fixture_path("stall-driver/tool/stall-driver.wasm"),
+    );
+    common::publish_local(&home.home, &stall_echo).success();
+    let project = TempDir::new().unwrap();
+    let manifest = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest,
+        format!("name: script-capsule\nversion: 0.1.0\nartifacts:\n  - name: {ECHO_TOOL}\n    version: 0.2.0\n"),
+    )
+    .unwrap();
+    fs::copy(
+        common::fixture_path("run/components/capsule-allowlisted.wasm"),
+        project.path().join("capsule.wasm"),
+    )
+    .unwrap();
+    let capsule = Capsule { project, manifest };
+    let child = Command::new(mur())
+        .env("HOME", home.home.path())
+        .current_dir(capsule.project.path())
+        .args(["run", "--manifest", capsule.manifest.to_str().unwrap()])
+        .arg("--verbose")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let workers = wait_for_workers(pid, 2, Duration::from_secs(60));
+    let kinds: Vec<String> = workers.iter().map(|w| w.1.clone()).collect();
+    // The root runs once its session has started; its registry call reaches the tools worker
+    // moments later, where the stalling tool then sleeps far past this wait.
+    let started = Instant::now();
+    while !traces_under(home.home.path())
+        .iter()
+        .any(|trace| fs::read_to_string(trace).is_ok_and(|text| text.contains("\"session_start\"")))
+    {
+        assert!(started.elapsed() < WAIT, "the script session never started");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_secs(5));
+    let tools = workers.iter().find(|w| w.1 == "tools").map(|w| w.0);
+    if let Some(tools) = tools {
+        // SAFETY: plain syscall on a grandchild of this test.
+        unsafe {
+            libc::kill(tools as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let run = finish(child, Duration::from_secs(60));
+    assert_eq!(kinds, vec!["driver", "tools"], "{}", run.context());
+    let tools = tools.expect("a tools worker");
+    assert_ne!(run.output.status.code(), Some(0), "{}", run.context());
+    let lines: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("error[E-RUN-065]"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{}", run.context());
+    assert!(
+        lines[0].contains(&format!("the tools guest worker (pid {tools})"))
+            && lines[0].contains("tool 'echo-tool'")
+            && lines[0].contains("killed by signal 9"),
+        "{}",
+        lines[0]
+    );
+    // A failed script run prints no startup block, so its trace is found under the scratch HOME.
+    let traces = traces_under(home.home.path());
+    assert_eq!(traces.len(), 1, "{traces:?}\n{}", run.context());
+    let trace = common::read_whole_trace(&traces[0]);
+    let ends: Vec<&Value> = trace
+        .iter()
+        .filter(|event| event["event_type"] == "session_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "{}", run.context());
+    assert_eq!(ends[0]["exit_status"], "failed", "{}", ends[0]);
+}
+
+/// Every `trace.jsonl` beneath `root`.
+fn traces_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && !path.is_symlink() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }

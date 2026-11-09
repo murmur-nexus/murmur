@@ -64,7 +64,7 @@ present.
 | `plan-shell-steps` | `capabilities.plan.submit` is `true` and `capabilities.shell.allow` is non-empty | `true` | — |
 | `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
 | `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
-| `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process, held only by the preopens and network grants its own `capabilities:` block declares |
+| `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process tree, in a guest worker held only by the preopens and network grants its own `capabilities:` block declares |
 | `process-harness` | `inference.transport: process` | `false` | A child of `mur` with a cleared environment and nothing else: no Landlock, seccomp, network namespace or rlimits, in a cgroup with no limits |
 | `harness-tools` | `inference.transport: process` | `false` | Run by the harness with the user's authority, kept off only by the arguments the process driver passes |
 
@@ -623,8 +623,9 @@ That entry is the whole of what `report-writer` reaches:
 
 ### Extra roots: host folders a WASM tool reaches { #wasm-extra-roots }
 
-A WASM tool runs inside `mur`, which no containment tier confines, so the folders opened for it
-are its only fence on every host and every tier. A `runtime: tool` WASM artifact whose entry
+A WASM tool runs in a [guest worker](../concepts/guest-workers.md) in the `mur` process tree, which
+no containment tier confines, so the folders opened for it are its only fence on every host and
+every tier. A `runtime: tool` WASM artifact whose entry
 declares no `capabilities.filesystem.scope` is handed:
 
 | Session | Folders the tool is handed |

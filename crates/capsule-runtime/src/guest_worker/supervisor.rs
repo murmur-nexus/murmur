@@ -1,7 +1,7 @@
 //! The supervisor side: starts each worker at most once, sends it guests and calls, and answers
 //! its host calls with the objects it registered for the call in flight.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,10 +17,16 @@ use super::wire::{
     read_frame, write_frame, FromWorker, HostReply, HostRequest, Reply, StreamEvent, ToWorker,
 };
 use super::{Launcher, WorkerKind, PROTOCOL_VERSION};
+use crate::bindings::hook::exports::murmur::hook::lifecycle::{HookOutput, StageEvent};
 use crate::bindings::host::murmur::tool::run::{ToolInput, ToolResult};
 use crate::errors::RuntimeError;
-use crate::limits::CallDeadlines;
-use crate::runtime::{NetworkPolicyHooks, ToolCallHost, ToolCallSpec};
+use crate::hooks::{HookArg, HookCallHost, HookSpec};
+use crate::inference_import::HookInferencePurpose;
+use crate::limits::{CallDeadlines, ExecutionLimits};
+use crate::process_driver::{DriverAnswer, DriverCall};
+use crate::runtime::{
+    CapsuleSpec, CapsuleStoreState, NetworkPolicyHooks, ToolCallHost, ToolCallSpec,
+};
 use crate::session_process::RemoteProcessHost;
 use crate::stream_events::StreamEventsTarget;
 
@@ -56,12 +62,52 @@ enum Start {
 /// What the supervisor holds for one guest call in flight: the objects its host imports reach.
 struct CallEntry {
     description: String,
-    http: Mutex<NetworkPolicyHooks>,
+    /// When the call was registered: the oldest call in flight is the one a loss names.
+    registered: Instant,
+    http: Arc<Mutex<NetworkPolicyHooks>>,
     events: StreamEventsTarget,
     input: crate::runtime::InputWiring,
     process: tokio::sync::Mutex<RemoteProcessHost>,
+    /// A hook's `inference`, `task-io` and `conversation` objects, for a hook call.
+    hook: Option<Arc<HookCallHost>>,
+    /// The script capsule's session state, for its root's run: its registry, artifact manager,
+    /// message send and `wasi:http` policy.
+    capsule: Option<Arc<Mutex<CapsuleStoreState>>>,
     /// The response bodies this call is streaming, stopped when the call ends.
     bodies: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl CallEntry {
+    /// A call whose guest reaches nothing past WASI: every other host import is refused or
+    /// unavailable, as it is for a store that links none.
+    fn bare(description: String) -> Self {
+        Self {
+            description,
+            registered: Instant::now(),
+            http: Arc::new(Mutex::new(NetworkPolicyHooks {
+                network_allow_rules: Vec::new(),
+                gateway: None,
+                formation: None,
+                task_provenance: None,
+                member_requests: None,
+            })),
+            events: StreamEventsTarget {
+                sse: None,
+                task: None,
+                chunks_emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                tool_calls: None,
+            },
+            input: crate::runtime::InputWiring::unavailable(),
+            process: tokio::sync::Mutex::new(RemoteProcessHost::new(
+                crate::session_process::ProcessAccess::Unavailable(
+                    crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
+                ),
+            )),
+            hook: None,
+            capsule: None,
+            bodies: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Drop for CallEntry {
@@ -82,6 +128,8 @@ pub(crate) struct WorkerConn {
     kind: WorkerKind,
     start: Mutex<Start>,
     started: Condvar,
+    /// Woken with [`Self::started`], for a waiter on an async runtime.
+    started_async: tokio::sync::Notify,
     writer: Mutex<Option<UnixStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Reply, String>>>>,
     calls: Mutex<HashMap<u64, Arc<CallEntry>>>,
@@ -143,25 +191,46 @@ impl WorkerConn {
         }
     }
 
-    async fn wait_started_async(self: &Arc<Self>) -> Result<u32, String> {
-        let conn = Arc::clone(self);
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => loop {
-                {
-                    let start = conn
-                        .start
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match &*start {
-                        Start::Ready { pid } => return Ok(*pid),
-                        Start::Failed(reason) => return Err(reason.clone()),
-                        Start::Starting | Start::Spawned { .. } => {}
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            },
-            Err(_) => conn.wait_started(HANDSHAKE_WAIT),
+    fn notify_started(&self) {
+        self.started.notify_all();
+        self.started_async.notify_waiters();
+    }
+
+    fn start_outcome(&self) -> Option<Result<u32, String>> {
+        match &*self
+            .start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Start::Ready { pid } => Some(Ok(*pid)),
+            Start::Failed(reason) => Some(Err(reason.clone())),
+            Start::Starting | Start::Spawned { .. } => None,
         }
+    }
+
+    async fn wait_started_async(self: &Arc<Self>) -> Result<u32, String> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return self.wait_started(HANDSHAKE_WAIT);
+        }
+        let waited = tokio::time::timeout(HANDSHAKE_WAIT, async {
+            loop {
+                let notified = self.started_async.notified();
+                tokio::pin!(notified);
+                // Registered before the state is read, so a start that lands in between wakes it.
+                notified.as_mut().enable();
+                if let Some(outcome) = self.start_outcome() {
+                    return outcome;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        waited.unwrap_or_else(|_| {
+            Err(format!(
+                "it did not say hello within {}s",
+                HANDSHAKE_WAIT.as_secs()
+            ))
+        })
     }
 
     /// The worker process's pid once forked, without waiting for its handshake; `None` for a
@@ -252,13 +321,14 @@ impl WorkerConn {
         }
     }
 
+    /// The call a loss names: the oldest in flight, or the guest being handed over.
     fn call_description(&self) -> Option<String> {
         let call = self
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .next()
+            .min_by_key(|entry| entry.registered)
             .map(|entry| entry.description.clone());
         call.or_else(|| {
             self.loading
@@ -356,7 +426,7 @@ impl WorkerConn {
                 };
                 let conn = Arc::clone(self);
                 self.host_runtime.spawn(async move {
-                    conn.answer(host, entry, request).await;
+                    conn.answer(host, call, entry, request).await;
                 });
             }
         }
@@ -370,7 +440,13 @@ impl WorkerConn {
             .cloned()
     }
 
-    async fn answer(self: Arc<Self>, host: u64, entry: Arc<CallEntry>, request: HostRequest) {
+    async fn answer(
+        self: Arc<Self>,
+        host: u64,
+        call: u64,
+        entry: Arc<CallEntry>,
+        request: HostRequest,
+    ) {
         match request {
             HostRequest::RequestInput { prompt } => {
                 let answer = entry
@@ -384,15 +460,87 @@ impl WorkerConn {
                 let reply = entry.process.lock().await.answer(call).await;
                 self.reply_host(host, HostReply::Process(reply));
             }
+            HostRequest::Inference { purpose, request } => {
+                let answer = match entry.hook.as_deref() {
+                    Some(HookCallHost {
+                        inference: Ok(ctx),
+                        origin,
+                        ..
+                    }) => ctx.run(origin, purpose, request).await,
+                    Some(HookCallHost {
+                        inference: Err(reason),
+                        ..
+                    }) => Err(reason.message().to_string()),
+                    None => Err(crate::inference_import::InferenceUnavailable::NotConfigured
+                        .message()
+                        .to_string()),
+                };
+                self.reply_host(host, HostReply::Inference(answer));
+            }
+            HostRequest::TaskIo(call) => {
+                let state = entry.hook.as_ref().and_then(|hook| hook.task_io.as_deref());
+                let reply = crate::task_io_import::answer_task_io(state, call);
+                self.reply_host(host, HostReply::TaskIo(reply));
+            }
+            HostRequest::Conversation { cursor, limit } => {
+                let page = match entry
+                    .hook
+                    .as_ref()
+                    .and_then(|hook| hook.conversation.as_deref())
+                {
+                    Some(state) => state.read_messages(cursor, limit),
+                    None => Err("not-granted".to_string()),
+                };
+                self.reply_host(host, HostReply::Conversation(page));
+            }
+            HostRequest::Capsule(capsule_call) => {
+                let reply = match &entry.capsule {
+                    Some(state) => {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        crate::runtime::answer_capsule_call(&mut state, *capsule_call)
+                    }
+                    None => crate::runtime::CapsuleReply::Unanswered(
+                        "this call is not a script capsule's run".to_string(),
+                    ),
+                };
+                self.reply_host(host, HostReply::Capsule(Box::new(reply)));
+                // A worker lost while the root waited on this call ends the root's run: the
+                // registry call it made may have been the one the loss failed.
+                let lost = self
+                    .session_lost
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(lost) = lost {
+                    let waiter = self
+                        .pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&call);
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(Err(lost));
+                    }
+                    let _ = self.send(&ToWorker::Cancel { req: call });
+                }
+            }
             HostRequest::Http(head) => {
                 let sent = match request_from_head(head) {
                     Err(error) => Err(error),
                     Ok((request, options)) => {
-                        let future = entry
-                            .http
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .send_request(request, options, Box::new(std::future::pending()));
+                        let future = match &entry.capsule {
+                            Some(state) => state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .http_hooks
+                                .send_request(request, options, Box::new(std::future::pending())),
+                            None => entry
+                                .http
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .send_request(request, options, Box::new(std::future::pending())),
+                        };
                         Box::into_pin(future).await
                     }
                 };
@@ -598,6 +746,7 @@ impl GuestWorkers {
             kind,
             start: Mutex::new(Start::Starting),
             started: Condvar::new(),
+            started_async: tokio::sync::Notify::new(),
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
@@ -634,7 +783,7 @@ impl GuestWorkers {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Start::Failed(reason);
-                        conn_thread.started.notify_all();
+                        conn_thread.notify_started();
                         return;
                     }
                 };
@@ -644,7 +793,7 @@ impl GuestWorkers {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Start::Spawned { child: child_pid };
-                conn_thread.started.notify_all();
+                conn_thread.notify_started();
                 if let (Some(child), Some(workers)) = (child, workers.upgrade()) {
                     workers
                         .children
@@ -652,7 +801,7 @@ impl GuestWorkers {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(child);
                 }
-                let handshake = handshake(kind, &stream);
+                let handshake = handshake(kind, &stream, child_pid);
                 let mut reader = stream;
                 match handshake {
                     Err(reason) => {
@@ -667,7 +816,7 @@ impl GuestWorkers {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Start::Failed(reason);
-                        conn_thread.started.notify_all();
+                        conn_thread.notify_started();
                         return;
                     }
                     Ok((pid, writer)) => {
@@ -680,7 +829,7 @@ impl GuestWorkers {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Start::Ready { pid };
-                        conn_thread.started.notify_all();
+                        conn_thread.notify_started();
                     }
                 }
                 while let Ok(message) = read_frame::<FromWorker>(&mut reader) {
@@ -702,25 +851,8 @@ impl GuestWorkers {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Start::Failed(format!("its connection thread did not start: {error}"));
-            conn.started.notify_all();
+            conn.notify_started();
         }
-    }
-
-    /// The pids of every started worker process, waiting for each start to finish.
-    pub fn pids(&self) -> Vec<u32> {
-        let conns: Vec<_> = self
-            .conns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        let own = std::process::id();
-        conns
-            .iter()
-            .filter_map(|conn| conn.wait_started(HANDSHAKE_WAIT).ok())
-            .filter(|pid| *pid != own)
-            .collect()
     }
 
     /// The pids of every started worker process once forked, without waiting for handshakes:
@@ -770,69 +902,364 @@ impl GuestWorkers {
         input: ToolInput,
         call_deadlines: &CallDeadlines,
     ) -> Result<ToolResult, String> {
+        let name = spec.name.clone();
+        let mut entry = CallEntry::bare(format!("{} '{name}'", spec.role.wire_name()));
+        entry.http = Arc::new(Mutex::new(host.http_hooks));
+        entry.events = host.events;
+        entry.input = host.input;
+        entry.process = tokio::sync::Mutex::new(RemoteProcessHost::new(host.process));
+        // Instantiation and `run` are each bounded by the worker; past both bounds and the grace,
+        // the worker is no longer answering.
+        let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
+        let reply = self
+            .call(
+                kind,
+                &name,
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::RunTool {
+                    req,
+                    guest,
+                    spec: Box::new(spec),
+                    input,
+                },
+            )
+            .await?;
+        match reply {
+            Reply::Tool { result, .. } => result,
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Sends one guest call to the worker of `kind`: starts the worker and hands it `component`
+    /// as guest `name` on first use, registers `entry` as what the call's host calls reach while
+    /// it is in flight, and waits up to `bound` for the answer before killing the worker as
+    /// unresponsive. Every wall-clock bound that fired in the call is recorded in
+    /// `call_deadlines` before the reply is returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn call(
+        self: &Arc<Self>,
+        kind: WorkerKind,
+        name: &str,
+        component: &Component,
+        entry: CallEntry,
+        bound: Duration,
+        call_deadlines: &CallDeadlines,
+        message: impl FnOnce(u64, u64) -> ToWorker,
+    ) -> Result<Reply, String> {
         let conn = self.start(kind);
         if let Err(reason) = conn.wait_started_async().await {
             return Err(start_error(kind, &reason).to_string());
         }
-        let name = spec.name.clone();
-        let guest = self.ensure_loaded(&conn, &name, component).await?;
+        let guest = self.ensure_loaded(&conn, name, component).await?;
+        self.send_call(&conn, entry, bound, call_deadlines, |req| {
+            message(req, guest)
+        })
+        .await
+    }
+
+    /// [`Self::call`] for a guest the worker already holds an instance of.
+    async fn send_call(
+        &self,
+        conn: &Arc<WorkerConn>,
+        entry: CallEntry,
+        bound: Duration,
+        call_deadlines: &CallDeadlines,
+        message: impl FnOnce(u64) -> ToWorker,
+    ) -> Result<Reply, String> {
         let req = next_id();
-        let description = format!("{} '{name}'", spec.role.wire_name());
-        let entry = Arc::new(CallEntry {
-            description,
-            http: Mutex::new(host.http_hooks),
-            events: host.events,
-            input: host.input,
-            process: tokio::sync::Mutex::new(RemoteProcessHost::new(host.process)),
-            bodies: Mutex::new(Vec::new()),
-        });
         conn.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(req, entry);
-        let in_flight = InFlight {
-            conn: Arc::clone(&conn),
+            .insert(req, Arc::new(entry));
+        let mut in_flight = InFlight {
+            conn: Arc::clone(conn),
             req,
             done: false,
         };
-        // Instantiation and `run` are each bounded by the worker; past both bounds and the grace,
-        // the worker is no longer answering.
-        let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
-        let message = ToWorker::RunTool {
-            req,
-            guest,
-            spec: Box::new(spec),
-            input,
-        };
-        let replied = tokio::time::timeout(bound, conn.request(req, message)).await;
-        let mut in_flight = in_flight;
-        let reply = match replied {
-            Ok(reply) => reply,
-            Err(_) => {
-                conn.kill();
-                // The reader fails the request once it sees the worker gone.
-                in_flight.done = true;
-                conn.calls
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&req);
-                return Err(wait_lost(&conn).await);
-            }
-        };
+        let replied = tokio::time::timeout(bound, conn.request(req, message(req))).await;
         in_flight.done = true;
         conn.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&req);
-        match reply {
-            Ok(Reply::Tool { result, deadlines }) => {
-                for cut in deadlines {
-                    call_deadlines.record(cut);
-                }
-                result
+        let reply = match replied {
+            Ok(reply) => reply,
+            Err(_) => {
+                conn.kill();
+                // The reader fails the request once it sees the worker gone.
+                return Err(wait_lost(conn).await);
             }
-            Ok(other) => Err(format!("the guest worker answered {other:?}")),
-            Err(lost) => Err(lost),
+        };
+        let mut reply = reply?;
+        for cut in reply.take_deadlines() {
+            call_deadlines.record(cut);
+        }
+        Ok(reply)
+    }
+
+    /// The connection of the started worker of `kind`, once it is past its handshake.
+    async fn started(self: &Arc<Self>, kind: WorkerKind) -> Result<Arc<WorkerConn>, String> {
+        let conn = self.start(kind);
+        conn.wait_started_async()
+            .await
+            .map_err(|reason| start_error(kind, &reason).to_string())?;
+        Ok(conn)
+    }
+
+    /// `error`, a guest call's failure, as the launch reports it: the session's `E-RUN-065` once
+    /// a worker was lost, a worker that could not start as `E-RUN-066`, anything else as itself.
+    pub(crate) fn runtime_error(&self, error: String) -> RuntimeError {
+        if let Some(lost) = self.lost() {
+            return RuntimeError::GuestWorkerLost(lost);
+        }
+        if error.contains(" guest worker could not be started: ") {
+            return RuntimeError::GuestWorkerStart(error);
+        }
+        RuntimeError::Runtime(error)
+    }
+
+    /// Instantiates hook `name`'s `component` in the hooks worker as a session-long instance.
+    /// Returns its instance id and the lifecycle functions it exports.
+    pub(crate) async fn open_hook(
+        self: &Arc<Self>,
+        name: &str,
+        component: &Component,
+        spec: HookSpec,
+        host: Arc<HookCallHost>,
+        call_deadlines: &CallDeadlines,
+    ) -> Result<(u64, Vec<String>), String> {
+        let instance = next_id();
+        let mut entry = CallEntry::bare(format!("hook '{name}' instantiate"));
+        entry.http = Arc::clone(&host.http);
+        entry.hook = Some(host);
+        let bound = spec.limits.wall_bound() + UNRESPONSIVE_GRACE;
+        let reply = self
+            .call(
+                WorkerKind::Hooks,
+                name,
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::HookOpen {
+                    req,
+                    guest,
+                    instance,
+                    spec: Box::new(spec),
+                },
+            )
+            .await?;
+        match reply {
+            Reply::HookOpened { result, .. } => result.map(|fns| (instance, fns)),
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Calls lifecycle function `fn_name` with `arg` on hook instance `instance`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_hook(
+        self: &Arc<Self>,
+        instance: u64,
+        name: &str,
+        fn_name: &str,
+        arg: HookArg,
+        purpose: HookInferencePurpose,
+        host: &Arc<HookCallHost>,
+        limits: ExecutionLimits,
+        call_deadlines: &CallDeadlines,
+    ) -> Result<Option<HookOutput>, String> {
+        let conn = self.started(WorkerKind::Hooks).await?;
+        let mut entry = CallEntry::bare(format!("hook '{name}' {fn_name}"));
+        entry.http = Arc::clone(&host.http);
+        entry.hook = Some(Arc::clone(host));
+        let bound = limits.wall_bound() + UNRESPONSIVE_GRACE;
+        let reply = self
+            .send_call(&conn, entry, bound, call_deadlines, |req| {
+                ToWorker::HookCall {
+                    req,
+                    instance,
+                    fn_name: fn_name.to_string(),
+                    arg: Box::new(arg),
+                    purpose,
+                }
+            })
+            .await?;
+        match reply {
+            Reply::Hook { result, .. } => result,
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Calls `on-stage` with `event` on a throwaway instance of hook `name`'s `component`.
+    pub(crate) async fn stage_hook(
+        self: &Arc<Self>,
+        name: &str,
+        component: &Component,
+        spec: HookSpec,
+        host: Arc<HookCallHost>,
+        call_deadlines: &CallDeadlines,
+        event: StageEvent,
+    ) -> Result<HookOutput, String> {
+        let mut entry = CallEntry::bare(format!("hook '{name}' on-stage"));
+        entry.http = Arc::clone(&host.http);
+        entry.hook = Some(host);
+        let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
+        let reply = self
+            .call(
+                WorkerKind::Hooks,
+                name,
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::HookStage {
+                    req,
+                    guest,
+                    spec: Box::new(spec),
+                    event,
+                },
+            )
+            .await?;
+        match reply {
+            Reply::Hook {
+                result: Ok(Some(output)),
+                ..
+            } => Ok(output),
+            Reply::Hook {
+                result: Ok(None), ..
+            } => Err(format!("hook {name} returned no on-stage output")),
+            Reply::Hook {
+                result: Err(error), ..
+            } => Err(error),
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Drops hook instance `instance` in the hooks worker.
+    pub(crate) fn close_hook(&self, instance: u64) {
+        self.close(WorkerKind::Hooks, ToWorker::HookClose { instance });
+    }
+
+    fn close(&self, kind: WorkerKind, message: ToWorker) {
+        let conn = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&kind)
+            .cloned();
+        if let Some(conn) = conn {
+            let _ = conn.send(&message);
+        }
+    }
+
+    /// Instantiates process driver `name`'s `component` in the driver worker. Returns the
+    /// instance id.
+    pub(crate) async fn open_driver(
+        self: &Arc<Self>,
+        name: &str,
+        version: &str,
+        component: &Component,
+        call_deadlines: &CallDeadlines,
+    ) -> Result<
+        (
+            u64,
+            Result<DriverAnswer, crate::process_driver::DriverError>,
+        ),
+        String,
+    > {
+        let instance = next_id();
+        let entry = CallEntry::bare(format!("process driver '{name}' instantiate"));
+        let bound = driver_bound();
+        let reply = self
+            .call(
+                WorkerKind::Driver,
+                &format!("process-driver:{name}"),
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::DriverOpen {
+                    req,
+                    guest,
+                    instance,
+                    name: name.to_string(),
+                    version: version.to_string(),
+                },
+            )
+            .await?;
+        match reply {
+            Reply::Driver { result, .. } => Ok((instance, result)),
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Runs `call` on process driver instance `instance`.
+    pub(crate) async fn call_driver(
+        self: &Arc<Self>,
+        instance: u64,
+        name: &str,
+        call: DriverCall,
+        call_deadlines: &CallDeadlines,
+    ) -> Result<Result<DriverAnswer, crate::process_driver::DriverError>, String> {
+        let conn = self.started(WorkerKind::Driver).await?;
+        let entry = CallEntry::bare(format!(
+            "process driver '{name}' {}",
+            driver_call_name(&call)
+        ));
+        let reply = self
+            .send_call(&conn, entry, driver_bound(), call_deadlines, |req| {
+                ToWorker::DriverCall {
+                    req,
+                    instance,
+                    call: Box::new(call),
+                }
+            })
+            .await?;
+        match reply {
+            Reply::Driver { result, .. } => Ok(result),
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Drops process driver instance `instance` in the driver worker.
+    pub(crate) fn close_driver(&self, instance: u64) {
+        self.close(WorkerKind::Driver, ToWorker::DriverClose { instance });
+    }
+
+    /// Runs the script capsule `name`'s root `component` in the driver worker, its host imports
+    /// answered from `state`.
+    pub(crate) async fn run_capsule(
+        self: &Arc<Self>,
+        name: &str,
+        component: &Component,
+        spec: CapsuleSpec,
+        state: Arc<Mutex<CapsuleStoreState>>,
+        call_deadlines: &CallDeadlines,
+    ) -> Result<Result<(), crate::runtime::CapsuleRunError>, String> {
+        let mut entry = CallEntry::bare(format!("capsule '{name}'"));
+        entry.capsule = Some(state);
+        let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
+        let reply = self
+            .call(
+                WorkerKind::Driver,
+                &format!("capsule:{name}"),
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::RunCapsule {
+                    req,
+                    guest,
+                    spec: Box::new(spec),
+                },
+            )
+            .await?;
+        match reply {
+            Reply::Capsule { result, .. } => Ok(result),
+            other => Err(format!("the guest worker answered {other:?}")),
         }
     }
 
@@ -853,24 +1280,9 @@ impl GuestWorkers {
             chunks_emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_calls: None,
         };
-        let entry = Arc::new(CallEntry {
-            description: "tool 'probe'".to_string(),
-            http: Mutex::new(NetworkPolicyHooks {
-                network_allow_rules: Vec::new(),
-                gateway: None,
-                formation: None,
-                task_provenance: None,
-                member_requests: None,
-            }),
-            events: events.clone(),
-            input: crate::runtime::InputWiring::unavailable(),
-            process: tokio::sync::Mutex::new(RemoteProcessHost::new(
-                crate::session_process::ProcessAccess::Unavailable(
-                    crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
-                ),
-            )),
-            bodies: Mutex::new(Vec::new()),
-        });
+        let mut entry = CallEntry::bare("tool 'probe'".to_string());
+        entry.events = events.clone();
+        let entry = Arc::new(entry);
         let id = next_id();
         conn.calls
             .lock()
@@ -1028,6 +1440,22 @@ async fn load(conn: &Arc<WorkerConn>, name: &str, component: &Component) -> Resu
     }
 }
 
+/// How long the supervisor waits for one process driver call: the worker bounds it by the hook
+/// call limits, and past that and the grace it is no longer answering.
+fn driver_bound() -> Duration {
+    ExecutionLimits::default().for_hook_calls(None).wall_bound() + UNRESPONSIVE_GRACE
+}
+
+fn driver_call_name(call: &DriverCall) -> &'static str {
+    match call {
+        DriverCall::Describe => "describe",
+        DriverCall::Launch(_) => "launch",
+        DriverCall::Parse(_) => "parse",
+        DriverCall::ClassifyExit(_) => "classify-exit",
+        DriverCall::ReadLogin(_) => "read-login",
+    }
+}
+
 /// A guest call in flight; dropped before its reply, it tells the worker to drop the call.
 struct InFlight {
     conn: Arc<WorkerConn>,
@@ -1098,7 +1526,14 @@ fn reap(pid: u32, workers: Option<Arc<GuestWorkers>>) -> Option<std::process::Ex
 }
 
 /// Exchanges `Hello` and `Init` with a just-started worker. Returns its pid and the writer half.
-fn handshake(kind: WorkerKind, stream: &UnixStream) -> Result<(u32, UnixStream), String> {
+/// A worker process is known by the pid it was spawned as: a hello naming any other pid is
+/// refused, so the supervisor never signals a process it did not start. A thread worker, which
+/// has no child, is taken at its word.
+fn handshake(
+    kind: WorkerKind,
+    stream: &UnixStream,
+    child: Option<u32>,
+) -> Result<(u32, UnixStream), String> {
     let mut reader = stream
         .try_clone()
         .map_err(|error| format!("its connection could not be shared: {error}"))?;
@@ -1118,7 +1553,15 @@ fn handshake(kind: WorkerKind, stream: &UnixStream) -> Result<(u32, UnixStream),
                     "it speaks guest-worker protocol {protocol} (mur {version}), not {PROTOCOL_VERSION}"
                 ));
             }
-            pid
+            match child {
+                Some(child) if child != pid => {
+                    return Err(format!(
+                        "it said hello as pid {pid}, but it was started as pid {child}"
+                    ));
+                }
+                Some(child) => child,
+                None => pid,
+            }
         }
         other => return Err(format!("its first frame was not a hello: {other:?}")),
     };
@@ -1132,6 +1575,15 @@ fn handshake(kind: WorkerKind, stream: &UnixStream) -> Result<(u32, UnixStream),
     Ok((pid, writer))
 }
 
+#[cfg(test)]
+pub(crate) fn handshake_for_test(
+    kind: WorkerKind,
+    stream: &UnixStream,
+    child: Option<u32>,
+) -> Result<u32, String> {
+    handshake(kind, stream, child).map(|(pid, _)| pid)
+}
+
 /// The `E-RUN-066` refusal for a worker of `kind` that did not start, for `reason`.
 pub(crate) fn start_error(kind: WorkerKind, reason: &str) -> RuntimeError {
     RuntimeError::GuestWorkerStart(format!(
@@ -1140,9 +1592,7 @@ pub(crate) fn start_error(kind: WorkerKind, reason: &str) -> RuntimeError {
     ))
 }
 
-#[allow(dead_code)]
-fn _assert_send_sync() {
+const _: fn() = || {
     fn is<T: Send + Sync>() {}
     is::<GuestWorkers>();
-    let _ = HashSet::<u8>::new();
-}
+};

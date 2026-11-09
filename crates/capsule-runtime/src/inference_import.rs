@@ -136,7 +136,7 @@ pub(crate) struct SpendRefusalRecord {
 /// Kept per store rather than per session because an async hook on another event can call
 /// `run-inference` while a compaction is being dispatched, and that call is not a compaction
 /// call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) enum HookInferencePurpose {
     /// Any event but `on-compaction`, and `on-stage`.
     #[default]
@@ -213,7 +213,7 @@ pub(crate) struct HookInferenceCtx {
 impl HookInferenceCtx {
     /// Run one completion. `Err` is the string handed straight back to the guest
     /// as the `result`'s error case.
-    async fn run(
+    pub(crate) async fn run(
         &self,
         origin: &str,
         purpose: HookInferencePurpose,
@@ -764,6 +764,36 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
                     };
                     Ok((result,))
                 });
+                fut
+            },
+        )
+        .map_err(|e| {
+            format!("failed to register {INFERENCE_IFACE_VERSIONED}#run-inference: {e}")
+        })?;
+    Ok(())
+}
+
+/// Register `run-inference` on a guest worker's hook linker: every call is a host call to the
+/// supervisor, which answers it with the session's inference context exactly as
+/// [`add_inference_to_linker`] does in process.
+pub(crate) fn add_remote_inference_to_linker<T: 'static>(
+    linker: &mut Linker<T>,
+    purpose: fn(&T) -> HookInferencePurpose,
+    link: Arc<crate::guest_worker::RemoteLink>,
+) -> Result<(), String> {
+    linker
+        .instance(INFERENCE_IFACE_VERSIONED)
+        .map_err(|e| format!("failed to define {INFERENCE_IFACE_VERSIONED}: {e}"))?
+        .func_wrap_async(
+            "run-inference",
+            move |store: wasmtime::StoreContextMut<'_, T>, (request,): (InferenceRequest,)| {
+                let purpose = purpose(store.data());
+                let link = Arc::clone(&link);
+                let fut: Box<
+                    dyn std::future::Future<
+                            Output = wasmtime::Result<(Result<InferenceResponse, String>,)>,
+                        > + Send,
+                > = Box::new(async move { Ok((link.inference(purpose, request).await,)) });
                 fut
             },
         )

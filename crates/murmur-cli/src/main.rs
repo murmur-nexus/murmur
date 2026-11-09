@@ -702,7 +702,8 @@ fn main() {
     if let Some(entry) = capsule_runtime::guest_worker::entry_kind(std::env::args_os()) {
         std::process::exit(capsule_runtime::guest_worker::worker_main(entry));
     }
-    // Every guest this process runs runs in a guest worker.
+    // Every guest a command runs runs in a guest worker; a store created in this process is
+    // refused from here on.
     capsule_runtime::guest_worker::use_worker_processes();
 
     #[cfg(any(

@@ -8,6 +8,10 @@ use super::wire::{
     HttpRequestHead, HttpResponseHead, Reply, StreamEvent, ToWorker, MAX_FRAME_BYTES,
 };
 use super::*;
+use crate::bindings::hook::exports::murmur::hook::lifecycle::{
+    HookOutput, StageEvent, TaskEndEvent,
+};
+use crate::bindings::hook::murmur::task_io::read::IoError;
 use crate::bindings::host::murmur::tool::run::{Status, ToolInput, ToolResult};
 use crate::limits::{CallDeadline, CallDeadlines, ComponentRole, ExecutionLimits};
 use crate::runtime::{ToolCallSpec, WasiPlan};
@@ -60,6 +64,19 @@ fn spec(name: &str, env: Vec<(String, String)>) -> ToolCallSpec {
                 guest_path: ".".to_string(),
                 read_only: false,
             }],
+        },
+    }
+}
+
+fn hook_spec() -> crate::hooks::HookSpec {
+    crate::hooks::HookSpec {
+        name: "compact".into(),
+        entry: "local/compact".into(),
+        version: "0.1.0".into(),
+        limits: ExecutionLimits::default(),
+        wasi: WasiPlan {
+            env: Vec::new(),
+            preopens: Vec::new(),
         },
     }
 }
@@ -128,6 +145,70 @@ fn every_frame_kind_round_trips() {
                 rcode: Some("address not available".into()),
                 info_code: None,
             }),
+        },
+        ToWorker::HookOpen {
+            req: 9,
+            guest: 10,
+            instance: 11,
+            spec: Box::new(hook_spec()),
+        },
+        ToWorker::HookCall {
+            req: 12,
+            instance: 11,
+            fn_name: "on-task-end".into(),
+            arg: Box::new(crate::hooks::HookArg::TaskEnd(TaskEndEvent {
+                task_id: "tsk_1".into(),
+                exit_status: "ok".into(),
+            })),
+            purpose: crate::inference_import::HookInferencePurpose::Compaction,
+        },
+        ToWorker::HookStage {
+            req: 13,
+            guest: 10,
+            spec: Box::new(hook_spec()),
+            event: StageEvent {
+                shell_allow: vec!["git".into()],
+            },
+        },
+        ToWorker::HookClose { instance: 11 },
+        ToWorker::DriverOpen {
+            req: 14,
+            guest: 15,
+            instance: 16,
+            name: "claude-code".into(),
+            version: "0.5.0".into(),
+        },
+        ToWorker::DriverCall {
+            req: 17,
+            instance: 16,
+            call: Box::new(crate::process_driver::DriverCall::Parse(vec![
+                "end ok".into()
+            ])),
+        },
+        ToWorker::DriverClose { instance: 16 },
+        ToWorker::RunCapsule {
+            req: 18,
+            guest: 19,
+            spec: Box::new(crate::runtime::CapsuleSpec {
+                name: "script".into(),
+                limits: ExecutionLimits::default(),
+                wasi: WasiPlan {
+                    env: vec![("MURMUR_SESSION_ID".into(), "s".into())],
+                    preopens: Vec::new(),
+                },
+            }),
+        },
+        ToWorker::HostReply {
+            host: 20,
+            reply: HostReply::TaskIo(super::wire::TaskIoReply::Len(Err(IoError::NotGranted))),
+        },
+        ToWorker::HostReply {
+            host: 21,
+            reply: HostReply::Conversation(Err("not-granted".into())),
+        },
+        ToWorker::HostReply {
+            host: 22,
+            reply: HostReply::Capsule(Box::new(crate::runtime::CapsuleReply::Remove(Ok(true)))),
         },
         ToWorker::Shutdown,
     ];
@@ -202,6 +283,58 @@ fn every_frame_kind_round_trips() {
         FromWorker::RunStarted {
             call: 3,
             deadline: Duration::from_secs(30),
+        },
+        FromWorker::Reply {
+            req: 9,
+            reply: Reply::HookOpened {
+                result: Ok(vec!["on-session-start".into()]),
+                deadlines: Vec::new(),
+            },
+        },
+        FromWorker::Reply {
+            req: 12,
+            reply: Reply::Hook {
+                result: Ok(Some(HookOutput::ReopenTask("again".into()))),
+                deadlines: Vec::new(),
+            },
+        },
+        FromWorker::Reply {
+            req: 14,
+            reply: Reply::Driver {
+                result: Err(crate::process_driver::DriverError::CallFailed {
+                    call: "parse".into(),
+                    message: "trapped".into(),
+                }),
+                deadlines: Vec::new(),
+            },
+        },
+        FromWorker::Reply {
+            req: 18,
+            reply: Reply::Capsule {
+                result: Err(crate::runtime::CapsuleRunError::DeadlineExceeded { seconds: 3 }),
+                deadlines: Vec::new(),
+            },
+        },
+        FromWorker::HostCall {
+            host: 4,
+            call: 12,
+            request: HostRequest::TaskIo(super::wire::TaskIoCall::ReadOutput(0, 64)),
+        },
+        FromWorker::HostCall {
+            host: 5,
+            call: 12,
+            request: HostRequest::Conversation {
+                cursor: None,
+                limit: 10,
+            },
+        },
+        FromWorker::HostCall {
+            host: 6,
+            call: 18,
+            request: HostRequest::Capsule(Box::new(crate::runtime::CapsuleCall::Pull(
+                "local/x".into(),
+                "1.0.0".into(),
+            ))),
         },
     ];
     for message in &from_worker {
@@ -704,7 +837,13 @@ fn refuses() {
 /// process that registered no worker processes.
 #[test]
 fn guard() {
-    let sites = [StoreSite::Tool, StoreSite::Driver];
+    let sites = [
+        StoreSite::Tool,
+        StoreSite::Driver,
+        StoreSite::Hook,
+        StoreSite::ProcessDriver,
+        StoreSite::Capsule,
+    ];
     for site in sites {
         let refused =
             store_allowed(Placement::Supervisor, site).expect_err("no store in the supervisor");
@@ -757,5 +896,175 @@ fn the_lost_worker_message_names_kind_pid_call_and_exit() {
         message,
         "the hooks guest worker (pid 77) was lost while running hook 'sleep-hook': it was killed \
          by signal 9 (SIGKILL); the task failed and the session ended"
+    );
+}
+
+/// Every place that creates a store refuses on a supervisor's thread before it creates one: the
+/// tool and driver store, a hook instance's store and its `on-stage` store, the process driver's
+/// store and a script capsule root's store.
+#[test]
+fn guard_refuses_at_every_store_site() {
+    let engine = crate::runtime::build_engine().unwrap();
+    // The empty component: magic, the component version and layer, and no sections.
+    let component = wasmtime::component::Component::new(
+        &engine,
+        [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00],
+    )
+    .unwrap();
+    let workdir = tempfile::TempDir::new().unwrap();
+    let refused = |error: String, site: &str| {
+        assert!(
+            error.contains("refused to create a store") && error.contains(site),
+            "{site}: {error}"
+        );
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    with_placement(Placement::Supervisor, || {
+        rt.block_on(async {
+            for (role, site) in [
+                (ComponentRole::Tool, "a tool"),
+                (ComponentRole::Driver, "an inference driver"),
+            ] {
+                let mut spec = spec("probe", Vec::new());
+                spec.role = role;
+                spec.wasi.preopens[0].host_path = workdir.path().to_path_buf();
+                let error = crate::runtime::execute_tool_call(
+                    &engine,
+                    &spec,
+                    crate::runtime::ToolHostSide::Local(Box::new(test_host())),
+                    &CallDeadlines::default(),
+                    &component,
+                    ToolInput {
+                        data: None,
+                        log_path: None,
+                    },
+                )
+                .await
+                .expect_err("no tool or driver store in the supervisor");
+                refused(error, site);
+            }
+
+            let (instance, stage) =
+                crate::hooks::guard_probe(&engine, &component, workdir.path()).await;
+            refused(instance.expect_err("no hook store"), "a hook");
+            refused(stage.expect_err("no on-stage store"), "a hook");
+
+            let error = crate::process_driver::ProcessDriver::instantiate(
+                &engine,
+                &component,
+                "probe",
+                "1.0.0",
+                CallDeadlines::default(),
+            )
+            .await
+            .err()
+            .expect("no process driver store");
+            refused(error.to_string(), "a process driver");
+
+            let (link, _peer) = super::worker::detached_link();
+            let error = crate::runtime::run_capsule_guest(
+                &engine,
+                &component,
+                &crate::runtime::CapsuleSpec {
+                    name: "probe".to_string(),
+                    limits: ExecutionLimits::default(),
+                    wasi: WasiPlan {
+                        env: Vec::new(),
+                        preopens: Vec::new(),
+                    },
+                },
+                link,
+                &CallDeadlines::default(),
+            )
+            .await
+            .expect_err("no capsule store");
+            refused(
+                error.into_runtime().to_string(),
+                "a script capsule's component",
+            );
+        });
+    });
+}
+
+/// A worker process holds its connection and stdio and nothing else: a pipe whose write end the
+/// supervisor held, inheritable, while the worker was started reaches end of file as soon as the
+/// supervisor closes its own copy, while the worker still runs.
+#[test]
+#[allow(unsafe_code)]
+fn a_worker_inherits_no_descriptor_past_its_connection() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let program = dir.path().join("worker.sh");
+    std::fs::write(&program, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    std::fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two descriptors into the array it is given. Neither is close-on-exec,
+    // so only the launcher keeps the write end out of the worker.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors were just created and are owned here alone.
+    let (mut read_end, write_end) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+
+    let (_ours, child) = super::launch::start_worker(
+        &Launcher::Process {
+            program: program.clone(),
+        },
+        WorkerKind::Tools,
+    )
+    .expect("the worker starts");
+    let mut child = child.expect("a worker process");
+    drop(write_end);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        let _ = tx.send(read_end.read(&mut buf).map(|read| read == 0));
+    });
+    let eof = rx.recv_timeout(Duration::from_secs(5));
+    let still_running = matches!(child.try_wait(), Ok(None));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(still_running, "the worker ran while the pipe was read");
+    assert!(
+        matches!(eof, Ok(Ok(true))),
+        "the pipe reached end of file with the worker running: {eof:?}"
+    );
+}
+
+/// A worker process's hello must name the pid it was started as: any other pid is refused, so
+/// the supervisor never signals a process it did not start.
+#[test]
+fn a_hello_naming_another_pid_is_refused() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    std::thread::spawn(move || {
+        let _ = write_frame(
+            &mut theirs,
+            &FromWorker::Hello {
+                protocol: PROTOCOL_VERSION,
+                version: "test".into(),
+                pid: 1,
+            },
+        );
+        let _ = read_frame::<ToWorker>(&mut theirs);
+    });
+    let error = super::supervisor::handshake_for_test(WorkerKind::Tools, &ours, Some(4_000_000))
+        .expect_err("a foreign pid is refused");
+    assert!(
+        error.contains("said hello as pid 1") && error.contains("started as pid 4000000"),
+        "{error}"
     );
 }

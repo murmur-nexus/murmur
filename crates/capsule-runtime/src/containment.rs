@@ -2555,8 +2555,8 @@ impl Route {
                  the host-side network allowlist only.",
             ),
             Self::Hooks => Some(
-                "Runs inside the mur process, held only by the preopens and network grants its \
-                 own capabilities block declares.",
+                "Runs inside the mur process tree, in a guest worker held only by the preopens \
+                 and network grants its own capabilities block declares.",
             ),
             Self::ProcessHarness => Some(
                 "A child of mur with a cleared environment and nothing else: no Landlock, \
