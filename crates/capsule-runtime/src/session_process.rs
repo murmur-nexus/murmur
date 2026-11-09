@@ -186,6 +186,9 @@ pub(crate) enum ProcessAccess {
     Available(ProcessCallCtx),
     /// Every function refuses with rule `unavailable` and this reason.
     Unavailable(&'static str),
+    /// In a guest worker: every function is answered by the supervisor, which holds the call's
+    /// own access.
+    Remote(Arc<crate::guest_worker::RemoteLink>),
 }
 
 /// The reasons a store holds no process context.
@@ -236,8 +239,10 @@ impl ProcessAccess {
     /// Starts this call's deadline clock: `deadline` from now, the call's
     /// `capabilities.limits.deadline_seconds`.
     pub(crate) fn begin_call(&mut self, deadline: Duration) {
-        if let Self::Available(ctx) = self {
-            ctx.deadline = Some(Instant::now() + deadline);
+        match self {
+            Self::Available(ctx) => ctx.deadline = Some(Instant::now() + deadline),
+            Self::Remote(link) => link.run_started(deadline),
+            Self::Unavailable(_) => {}
         }
     }
 
@@ -245,6 +250,16 @@ impl ProcessAccess {
         match self {
             Self::Available(ctx) => Ok(ctx),
             Self::Unavailable(reason) => Err(refused(rule::UNAVAILABLE, *reason)),
+            Self::Remote(_) => Err(wit::ProcessError::Failed(
+                "murmur:process is answered by the supervisor".to_string(),
+            )),
+        }
+    }
+
+    fn remote(&self) -> Option<&Arc<crate::guest_worker::RemoteLink>> {
+        match self {
+            Self::Remote(link) => Some(link),
+            _ => None,
         }
     }
 }
@@ -1723,13 +1738,18 @@ mod linux_connect {
 
 /// A `connection` resource: a TCP stream opened for one tool call, closed with its store.
 pub struct Connection {
-    stream: Arc<std::net::TcpStream>,
+    stream: Option<Arc<std::net::TcpStream>>,
+    /// In a guest worker, the supervisor's handle for the connection it holds.
+    remote: Option<u32>,
 }
 
 // ---------------------------------------------------------------- the bindings
 
 impl wit::Host for ProcessView<'_> {
     async fn run(&mut self, request: wit::RunRequest) -> Result<wit::RunOutput, wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Run(request)).await.run();
+        }
         let ctx = self.access.ctx()?;
         ctx.registry.run(ctx, request).await
     }
@@ -1738,16 +1758,25 @@ impl wit::Host for ProcessView<'_> {
         &mut self,
         request: wit::StartRequest,
     ) -> Result<wit::Started, wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Start(request)).await.started();
+        }
         let ctx = self.access.ctx()?;
         ctx.registry.start(ctx, request).await
     }
 
     async fn find(&mut self, name: String) -> Option<wit::Handle> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Find(name)).await.found();
+        }
         let ctx = self.access.ctx().ok()?;
         ctx.registry.find(&ctx.tool, &name)
     }
 
     async fn status(&mut self, handle: wit::Handle) -> Result<wit::State, wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Status(handle)).await.state();
+        }
         let ctx = self.access.ctx()?;
         Ok(ctx.registry.lookup(&ctx.tool, &handle)?.state())
     }
@@ -1757,6 +1786,9 @@ impl wit::Host for ProcessView<'_> {
         handle: wit::Handle,
         bytes: Vec<u8>,
     ) -> Result<(), wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Write(handle, bytes)).await.unit();
+        }
         let ctx = self.access.ctx()?;
         ctx.registry.write(ctx, &handle, bytes).await
     }
@@ -1766,11 +1798,20 @@ impl wit::Host for ProcessView<'_> {
         handle: wit::Handle,
         max_bytes: u32,
     ) -> Result<wit::Output, wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link
+                .process(ProcessCall::Read(handle, max_bytes))
+                .await
+                .output();
+        }
         let ctx = self.access.ctx()?;
         ctx.registry.read(ctx, &handle, max_bytes)
     }
 
     async fn stop(&mut self, handle: wit::Handle) -> Result<wit::State, wit::ProcessError> {
+        if let Some(link) = self.access.remote() {
+            return link.process(ProcessCall::Stop(handle)).await.state();
+        }
         let ctx = self.access.ctx()?;
         ctx.registry.stop(ctx, &handle).await
     }
@@ -1780,12 +1821,25 @@ impl wit::Host for ProcessView<'_> {
         handle: wit::Handle,
         port: u16,
     ) -> Result<Resource<Connection>, wit::ProcessError> {
-        let ctx = self.access.ctx()?;
-        let stream = ctx.registry.connect(ctx, &handle, port).await?;
+        let connection = if let Some(link) = self.access.remote() {
+            let remote = link
+                .process(ProcessCall::Connect(handle, port))
+                .await
+                .connected()?;
+            Connection {
+                stream: None,
+                remote: Some(remote),
+            }
+        } else {
+            let ctx = self.access.ctx()?;
+            let stream = ctx.registry.connect(ctx, &handle, port).await?;
+            Connection {
+                stream: Some(Arc::new(stream)),
+                remote: None,
+            }
+        };
         self.table
-            .push(Connection {
-                stream: Arc::new(stream),
-            })
+            .push(connection)
             .map_err(|error| wit::ProcessError::Failed(error.to_string()))
     }
 }
@@ -1797,6 +1851,12 @@ impl wit::HostConnection for ProcessView<'_> {
         max_bytes: u32,
         timeout_ms: u32,
     ) -> Result<Vec<u8>, wit::ProcessError> {
+        if let Some((link, remote)) = self.remote_of(&connection) {
+            return link
+                .process(ProcessCall::ConnectionRead(remote, max_bytes, timeout_ms))
+                .await
+                .bytes();
+        }
         let stream = self.stream_of(&connection)?;
         let limit = self
             .call_remaining()
@@ -1827,6 +1887,12 @@ impl wit::HostConnection for ProcessView<'_> {
         connection: Resource<Connection>,
         bytes: Vec<u8>,
     ) -> Result<(), wit::ProcessError> {
+        if let Some((link, remote)) = self.remote_of(&connection) {
+            return link
+                .process(ProcessCall::ConnectionWrite(remote, bytes))
+                .await
+                .unit();
+        }
         let stream = self.stream_of(&connection)?;
         let limit = self.call_remaining().max(Duration::from_millis(1));
         tokio::task::spawn_blocking(move || {
@@ -1844,6 +1910,9 @@ impl wit::HostConnection for ProcessView<'_> {
     }
 
     async fn drop(&mut self, connection: Resource<Connection>) -> wasmtime::Result<()> {
+        if let Some((link, remote)) = self.remote_of(&connection) {
+            let _ = link.process(ProcessCall::ConnectionDrop(remote)).await;
+        }
         self.table.delete(connection)?;
         Ok(())
     }
@@ -1856,14 +1925,174 @@ impl ProcessView<'_> {
     ) -> Result<Arc<std::net::TcpStream>, wit::ProcessError> {
         self.table
             .get(connection)
-            .map(|connection| Arc::clone(&connection.stream))
-            .map_err(|error| wit::ProcessError::Failed(error.to_string()))
+            .map_err(|error| wit::ProcessError::Failed(error.to_string()))?
+            .stream
+            .clone()
+            .ok_or_else(|| wit::ProcessError::Failed("connection is held elsewhere".to_string()))
+    }
+
+    /// The supervisor's handle for `connection`, when this view is a guest worker's.
+    fn remote_of(
+        &self,
+        connection: &Resource<Connection>,
+    ) -> Option<(Arc<crate::guest_worker::RemoteLink>, u32)> {
+        let link = self.access.remote()?;
+        let remote = self.table.get(connection).ok()?.remote?;
+        Some((Arc::clone(link), remote))
     }
 
     fn call_remaining(&self) -> Duration {
         match self.access {
             ProcessAccess::Available(ctx) => ctx.remaining(),
-            ProcessAccess::Unavailable(_) => Duration::ZERO,
+            ProcessAccess::Unavailable(_) | ProcessAccess::Remote(_) => Duration::ZERO,
+        }
+    }
+}
+
+/// One `murmur:process` function call a guest worker forwards to the supervisor. A connection is
+/// named by the supervisor's handle for it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ProcessCall {
+    Run(wit::RunRequest),
+    Start(wit::StartRequest),
+    Find(String),
+    Status(String),
+    Write(String, Vec<u8>),
+    Read(String, u32),
+    Stop(String),
+    Connect(String, u16),
+    ConnectionRead(u32, u32, u32),
+    ConnectionWrite(u32, Vec<u8>),
+    ConnectionDrop(u32),
+}
+
+/// The supervisor's answer to a [`ProcessCall`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ProcessReply {
+    Run(Result<wit::RunOutput, wit::ProcessError>),
+    Started(Result<wit::Started, wit::ProcessError>),
+    Found(Option<String>),
+    State(Result<wit::State, wit::ProcessError>),
+    Unit(Result<(), wit::ProcessError>),
+    Output(Result<wit::Output, wit::ProcessError>),
+    Connected(Result<u32, wit::ProcessError>),
+    Bytes(Result<Vec<u8>, wit::ProcessError>),
+    /// The supervisor would not answer: the call was not in flight, or the worker is lost.
+    Unanswered(String),
+}
+
+fn mismatched(reply: ProcessReply) -> wit::ProcessError {
+    match reply {
+        ProcessReply::Unanswered(reason) => wit::ProcessError::Failed(reason),
+        other => wit::ProcessError::Failed(format!("unexpected reply {other:?}")),
+    }
+}
+
+impl ProcessReply {
+    fn run(self) -> Result<wit::RunOutput, wit::ProcessError> {
+        match self {
+            Self::Run(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn started(self) -> Result<wit::Started, wit::ProcessError> {
+        match self {
+            Self::Started(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn found(self) -> Option<String> {
+        match self {
+            Self::Found(found) => found,
+            _ => None,
+        }
+    }
+    fn state(self) -> Result<wit::State, wit::ProcessError> {
+        match self {
+            Self::State(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn unit(self) -> Result<(), wit::ProcessError> {
+        match self {
+            Self::Unit(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn output(self) -> Result<wit::Output, wit::ProcessError> {
+        match self {
+            Self::Output(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn connected(self) -> Result<u32, wit::ProcessError> {
+        match self {
+            Self::Connected(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+    fn bytes(self) -> Result<Vec<u8>, wit::ProcessError> {
+        match self {
+            Self::Bytes(result) => result,
+            other => Err(mismatched(other)),
+        }
+    }
+}
+
+/// The supervisor side of a guest worker's `murmur:process`: answers each [`ProcessCall`] with
+/// the call's own access, exactly as the in-process store does, holding the call's connections.
+pub(crate) struct RemoteProcessHost {
+    access: ProcessAccess,
+    table: ResourceTable,
+}
+
+impl RemoteProcessHost {
+    pub(crate) fn new(access: ProcessAccess) -> Self {
+        Self {
+            access,
+            table: ResourceTable::new(),
+        }
+    }
+
+    pub(crate) fn begin_call(&mut self, deadline: Duration) {
+        self.access.begin_call(deadline);
+    }
+
+    pub(crate) async fn answer(&mut self, call: ProcessCall) -> ProcessReply {
+        use wit::Host as _;
+        let mut view = ProcessView {
+            access: &self.access,
+            table: &mut self.table,
+        };
+        match call {
+            ProcessCall::Run(request) => ProcessReply::Run(view.run(request).await),
+            ProcessCall::Start(request) => ProcessReply::Started(view.start(request).await),
+            ProcessCall::Find(name) => ProcessReply::Found(view.find(name).await),
+            ProcessCall::Status(handle) => ProcessReply::State(view.status(handle).await),
+            ProcessCall::Write(handle, bytes) => {
+                ProcessReply::Unit(wit::Host::write(&mut view, handle, bytes).await)
+            }
+            ProcessCall::Read(handle, max) => {
+                ProcessReply::Output(wit::Host::read(&mut view, handle, max).await)
+            }
+            ProcessCall::Stop(handle) => ProcessReply::State(view.stop(handle).await),
+            ProcessCall::Connect(handle, port) => ProcessReply::Connected(
+                view.connect(handle, port)
+                    .await
+                    .map(|resource| resource.rep()),
+            ),
+            ProcessCall::ConnectionRead(rep, max, timeout) => ProcessReply::Bytes(
+                wit::HostConnection::read(&mut view, Resource::new_borrow(rep), max, timeout).await,
+            ),
+            ProcessCall::ConnectionWrite(rep, bytes) => ProcessReply::Unit(
+                wit::HostConnection::write(&mut view, Resource::new_borrow(rep), bytes).await,
+            ),
+            ProcessCall::ConnectionDrop(rep) => {
+                let dropped = wit::HostConnection::drop(&mut view, Resource::new_own(rep)).await;
+                ProcessReply::Unit(
+                    dropped.map_err(|error| wit::ProcessError::Failed(error.to_string())),
+                )
+            }
         }
     }
 }

@@ -93,7 +93,7 @@ const _: () = assert!(
 
 /// Fully-resolved execution limits for one session's guests: the manifest's
 /// `capabilities.limits` block with every omitted field replaced by its `DEFAULT_*`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionLimits {
     /// Cap on linear-memory growth, in bytes.
     pub memory_bytes: usize,
@@ -350,7 +350,7 @@ pub(crate) async fn bound_call<F: Future>(
 }
 
 /// What a component is running as when its call is bound, as `call_deadline.role` names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ComponentRole {
     /// A script capsule's own component.
     Capsule,
@@ -377,7 +377,7 @@ impl ComponentRole {
 }
 
 /// One firing of the wall-clock bound, as its `call_deadline` line records it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallDeadline {
     /// The tool name of the artifact, the hook's name, or the capsule's manifest `name`.
     pub(crate) component: String,
@@ -441,6 +441,11 @@ impl CallDeadlines {
             });
         }
         bounded
+    }
+
+    /// Records `cut`, a firing a guest worker's own bound recorded for a call it ran.
+    pub(crate) fn record(&self, cut: CallDeadline) {
+        self.lock().push(cut);
     }
 
     /// Takes every firing recorded since the last take, oldest first.

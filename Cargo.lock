@@ -252,6 +252,7 @@ dependencies = [
  "libseccomp",
  "mur-roost",
  "murmur-artifact",
+ "postcard",
  "ring",
  "rustix",
  "serde",

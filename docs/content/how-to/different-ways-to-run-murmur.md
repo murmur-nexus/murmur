@@ -243,9 +243,9 @@ Routes
   shell commands    present  landlock+seccomp
   plan shell steps  absent   landlock+seccomp
   WASM tools        present  host process, not confined by the class (murmur/tool-git)
-    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   drivers           present  host process, not confined by the class (murmur/driver-anthropic)
-    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             present  host process, not confined by the class (ana/hook-telemetry)
     Runs inside the mur process, held only by the preopens and network grants its own capabilities block declares.
   process harness   absent   host process, not confined by the class

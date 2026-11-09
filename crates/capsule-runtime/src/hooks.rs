@@ -3848,6 +3848,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            guest_workers: None,
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3933,6 +3934,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            guest_workers: None,
         })
     }
 

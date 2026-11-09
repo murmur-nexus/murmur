@@ -154,6 +154,8 @@ section that explains it.
 | `E-RUN-062` | A staged tool's `programs:` block is malformed or names a need by host path; refused by a launch, `mur run --explain-scope` and `mur doctor` | [E-RUN-062](#e-run-062) |
 | `E-RUN-063` | The unconfined stance was chosen while `mur` runs as root | [E-RUN-063](#e-run-063) |
 | `E-RUN-064` | `mur doctor`: a `transport: process` harness is not logged in for this user, as its process driver reads its login check | [E-RUN-064](#e-run-064) |
+| `E-RUN-065` | A guest worker died or stopped answering mid-task: the task failed and the session ended | [E-RUN-065](#e-run-065) |
+| `E-RUN-066` | A guest worker could not be started, or answered with the wrong protocol | [E-RUN-066](#e-run-066) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -521,6 +523,39 @@ What the harness printed is never shown.
 **What to do:** log the harness in as the user who runs `mur`, on this host, the way the driver's
 reason says. `mur run` checks nothing at launch: the code comes only from `mur doctor`, in its
 [`Process harness`](cli.md#doctor-process-harness) block.
+
+### E-RUN-065 — a guest worker was lost { #e-run-065 }
+
+A [guest worker](../concepts/guest-workers.md) died while it ran a call, or stopped answering past
+the call's deadline plus five seconds and was killed. The task in flight fails and the session
+ends.
+
+```text
+error[E-RUN-065]: the tools guest worker (pid 48211) was lost while running tool 'stall-tool': it was killed by signal 9 (SIGKILL); the task failed and the session ended
+```
+
+The message names the worker kind, its pid, the call it was running and how it ended: `exited
+with status N` or `was killed by signal N (NAME)`. The trace records `task_failed` with cause
+`runtime_error` and this message as its reason, then `task_end` with `exit_status: failed`, then
+`session_end`. `completion.json` is written and `mur` exits non-zero. The worker is not restarted.
+
+**What to do:** look for what ended the process: an out-of-memory kill in the system log, a signal
+sent from outside, or a guest that crashed the worker. Run the capsule again.
+
+### E-RUN-066 — a guest worker could not be started { #e-run-066 }
+
+`mur` starts each [guest worker](../concepts/guest-workers.md) by running its own binary again.
+The worker did not start, or its first answer named a protocol version this `mur` does not speak.
+The launch is refused before the session directory is created.
+
+```text
+error[E-RUN-066]: the driver guest worker could not be started: it speaks guest-worker protocol 2 (mur 0.12.0), not 1
+```
+
+The message names the worker kind and the reason.
+
+**What to do:** check that the `mur` binary is intact and was not replaced by another version
+while the launch started. Reinstall `mur` if it was.
 
 ### E-RUN-015 — `--resume` and `--context` together { #e-run-015 }
 
@@ -4555,8 +4590,9 @@ warning names every such route and the artifacts on it:
 ```
 
 **Why it matters:** the class confines shell commands and plan shell steps. WASM
-tools, drivers and hooks run inside the `mur` process, held by their WASI preopens and the network
-allowlist; the process harness and its tools run with your authority.
+tools and drivers run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree
+and hooks run inside the `mur` process, each held by its WASI preopens and the network allowlist;
+the process harness and its tools run with your authority.
 
 **What the runtime does about it:** nothing is refused. The launch runs at the declared class.
 

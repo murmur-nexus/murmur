@@ -587,6 +587,16 @@ pub enum RuntimeError {
     #[error("capsule execution exceeded its configured resource limits: {message}")]
     CapsuleResourceLimit { message: String },
 
+    /// A guest worker died or stopped answering mid-session: the task in flight failed and the
+    /// session ended. The text names the worker kind, its pid, the call and how it exited.
+    #[error("{0}")]
+    GuestWorkerLost(String),
+
+    /// A guest worker could not be started, or answered with the wrong protocol. The text names
+    /// the worker kind and the reason.
+    #[error("{0}")]
+    GuestWorkerStart(String),
+
     #[error(
         "shell subprocess '{binary}' was killed for exceeding \
          capabilities.resources.{limit}: {detail}"

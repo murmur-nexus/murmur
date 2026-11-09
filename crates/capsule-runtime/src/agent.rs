@@ -1672,6 +1672,11 @@ pub(crate) async fn run_agent_loop(
                 )
                 .await);
             };
+            // A lost guest worker ends the task and the session, never a retry or a model-facing
+            // error.
+            if let Some(lost) = store_state.guest_worker_lost() {
+                return Err(lost);
+            }
             // The driver is done writing every call it started, whatever it returned: write the
             // size still held for each, ahead of the cursor removal and of anything else this
             // turn writes.
@@ -2333,6 +2338,10 @@ pub(crate) async fn run_agent_loop(
                                 .await
                         }
                     };
+                    // A lost guest worker is never handed to the model as a failed tool call.
+                    if let Some(lost) = store_state.guest_worker_lost() {
+                        return Err(lost);
+                    }
                     if tool_name == PULL_ARTIFACT_TOOL || tool_name == REMOVE_ARTIFACT_TOOL {
                         agent_changed |= store_state.installed_generation != generation_before;
                         for pulled in std::mem::take(&mut store_state.pending_artifact_pulls) {

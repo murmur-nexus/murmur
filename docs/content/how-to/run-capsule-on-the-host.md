@@ -108,7 +108,7 @@ Routes
   plan shell steps  absent   unconfined
   WASM tools        absent   host process, not confined by the class
   drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
-    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             absent   host process, not confined by the class
   process harness   absent   unconfined
   harness tools     absent   host process, not confined by the class

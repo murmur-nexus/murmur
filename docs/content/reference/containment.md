@@ -62,8 +62,8 @@ present.
 |---|---|---|---|
 | `shell` | `capabilities.shell.allow` is non-empty | `true` | — |
 | `plan-shell-steps` | `capabilities.plan.submit` is `true` and `capabilities.shell.allow` is non-empty | `true` | — |
-| `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process, held by its WASI preopens and the host-side network allowlist only |
-| `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process, held by its WASI preopens and the host-side network allowlist only |
+| `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
+| `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
 | `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process, held only by the preopens and network grants its own `capabilities:` block declares |
 | `process-harness` | `inference.transport: process` | `false` | A child of `mur` with a cleared environment and nothing else: no Landlock, seccomp, network namespace or rlimits, in a cgroup with no limits |
 | `harness-tools` | `inference.transport: process` | `false` | Run by the harness with the user's authority, kept off only by the arguments the process driver passes |
@@ -89,9 +89,9 @@ Routes
   shell commands    present  landlock+seccomp
   plan shell steps  absent   landlock+seccomp
   WASM tools        present  host process, not confined by the class (local/fs-tool)
-    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
-    Runs inside the mur process, held by its WASI preopens and the host-side network allowlist only.
+    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             absent   host process, not confined by the class
   process harness   absent   host process, not confined by the class
   harness tools     absent   host process, not confined by the class

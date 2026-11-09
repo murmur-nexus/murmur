@@ -14,8 +14,10 @@
 //! The request body is buffered so that a `401` can be answered by re-reading the credential and
 //! resending once; the response never is.
 //!
-//! The gateway is not a listener. A WASM guest runs inside the `mur` process, so there is no
-//! socket to guard and nothing another process can connect to and spend the key through.
+//! The gateway is not a listener. A WASM guest's requests reach it only as host calls over its
+//! guest worker's private connection to `mur` (see `crate::guest_worker`), so there is no socket
+//! to guard and nothing another process can connect to and spend the key through. The key never
+//! leaves `mur`.
 //!
 //! No error this module returns carries the key or the rendered header.
 

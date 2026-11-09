@@ -2547,12 +2547,12 @@ impl Route {
         match self {
             Self::Shell | Self::PlanShellSteps => None,
             Self::WasmTools => Some(
-                "Runs inside the mur process, held by its WASI preopens and the host-side network \
-                 allowlist only.",
+                "Runs inside the mur process tree, in a guest worker held by its WASI preopens and \
+                 the host-side network allowlist only.",
             ),
             Self::Drivers => Some(
-                "Runs inside the mur process, held by its WASI preopens and the host-side network \
-                 allowlist only.",
+                "Runs inside the mur process tree, in a guest worker held by its WASI preopens and \
+                 the host-side network allowlist only.",
             ),
             Self::Hooks => Some(
                 "Runs inside the mur process, held only by the preopens and network grants its \

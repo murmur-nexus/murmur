@@ -697,6 +697,14 @@ fn main() {
         );
     }
 
+    // A guest worker is this binary re-executed by `mur run`: intercepted before any
+    // configuration is read, so the worker reads nothing of its own.
+    if let Some(entry) = capsule_runtime::guest_worker::entry_kind(std::env::args_os()) {
+        std::process::exit(capsule_runtime::guest_worker::worker_main(entry));
+    }
+    // Every guest this process runs runs in a guest worker.
+    capsule_runtime::guest_worker::use_worker_processes();
+
     #[cfg(any(
         feature = "beta-mur-new",
         feature = "beta-mur-deploy",

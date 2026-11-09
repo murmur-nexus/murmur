@@ -36,6 +36,8 @@ http-body-util = "0.1"
 http-body = "1"
 libc = "0.2"
 murmur-artifact.workspace = true
+# The guest-worker wire format. Already compiled into `mur` through Wasmtime.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 # Ed25519 for formation tokens: the launcher signs, every member's door verifies.
 ring = { version = "0.17", default-features = false }
 # Safe `openat`/`mkdirat`/`renameat`/`unlinkat`/`fstatat` for `workdir_fs`'s no-follow walk.

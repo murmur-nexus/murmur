@@ -138,6 +138,7 @@ nav:
       - Capsules: concepts/capsules.md
       - Artifacts: concepts/artifacts.md
       - Session Loop: concepts/session-loop.md
+      - Guest Workers: concepts/guest-workers.md
       - Hooks: concepts/hooks.md
       - Tools: concepts/tools.md
       - Access Control: concepts/access-control.md

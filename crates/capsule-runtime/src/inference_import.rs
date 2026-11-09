@@ -205,6 +205,9 @@ pub(crate) struct HookInferenceCtx {
     /// The session's latch, where a request the driver routes to a member's virtual address is
     /// recorded.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's guest workers, when guests run in worker processes: the driver then runs in
+    /// the driver worker, as the agent loop's own turns do.
+    pub(crate) guest_workers: Option<Arc<crate::guest_worker::GuestWorkers>>,
 }
 
 impl HookInferenceCtx {
@@ -468,43 +471,58 @@ impl HookInferenceCtx {
         payload_json: String,
         inference_env: &[(String, String)],
     ) -> Result<(String, String, Option<DriverUsage>), Box<DriverFailure>> {
-        let result = invoke_tool_component(
-            ToolInvokeEnv {
-                engine: &self.engine,
-                accessible_workdir: &self.accessible_workdir,
-                // A driver is handed no runtime directory, nor any extra root.
-                runtime_dir: None,
-                extra_roots: &[],
-                inference_env,
-                capability_policy: &self.capability_policy,
-                network_allow_rules: &self.network_allow_rules,
-                artifact_grant: self.driver_grant.as_ref(),
-                gateway: self.gateway.as_ref(),
-                formation: self.formation.as_ref(),
-                // A hook's completion runs for no task of its own, so a formation call from it
-                // stamps `untrusted`.
-                task_provenance: None,
-                role: ComponentRole::Driver,
-                call_deadlines: &self.call_deadlines,
-                member_requests: &self.member_requests,
-                // Nor is its `member_request` sent for any task.
-                task_id: None,
-                process: crate::session_process::ProcessAccess::Unavailable(
-                    crate::session_process::unavailable::DRIVER,
-                ),
+        let env = ToolInvokeEnv {
+            engine: &self.engine,
+            accessible_workdir: &self.accessible_workdir,
+            // A driver is handed no runtime directory, nor any extra root.
+            runtime_dir: None,
+            extra_roots: &[],
+            inference_env,
+            capability_policy: &self.capability_policy,
+            network_allow_rules: &self.network_allow_rules,
+            artifact_grant: self.driver_grant.as_ref(),
+            gateway: self.gateway.as_ref(),
+            formation: self.formation.as_ref(),
+            // A hook's completion runs for no task of its own, so a formation call from it
+            // stamps `untrusted`.
+            task_provenance: None,
+            role: ComponentRole::Driver,
+            call_deadlines: &self.call_deadlines,
+            member_requests: &self.member_requests,
+            // Nor is its `member_request` sent for any task.
+            task_id: None,
+            process: crate::session_process::ProcessAccess::Unavailable(
+                crate::session_process::unavailable::DRIVER,
+            ),
+        };
+        // A hook's completion is not part of the user-facing turn: it must
+        // not stream chunks into the SSE stream or ask the user for input.
+        let a2a = ToolA2aWiring::silent();
+        let input = ToolInput {
+            data: Some(payload_json),
+            log_path: None,
+        };
+        let result = match &self.guest_workers {
+            Some(workers) => match crate::runtime::prepare_tool_call(env, a2a, &self.driver_name) {
+                Ok((spec, host)) => {
+                    Box::pin(workers.run_tool(
+                        crate::guest_worker::WorkerKind::Driver,
+                        &self.driver_component,
+                        spec,
+                        host,
+                        input,
+                        &self.call_deadlines,
+                    ))
+                    .await
+                }
+                Err(error) => Err(error),
             },
-            // A hook's completion is not part of the user-facing turn: it must
-            // not stream chunks into the SSE stream or ask the user for input.
-            ToolA2aWiring::silent(),
-            &self.driver_name,
-            &self.driver_component,
-            ToolInput {
-                data: Some(payload_json),
-                log_path: None,
-            },
-        )
-        .await
-        .map_err(|e| {
+            None => {
+                invoke_tool_component(env, a2a, &self.driver_name, &self.driver_component, input)
+                    .await
+            }
+        };
+        let result = result.map_err(|e| {
             Box::new(DriverFailure {
                 code: INFERENCE_ERROR_DRIVER_FAILED,
                 message: format!("inference driver '{}' failed: {e}", self.driver_name),
@@ -1133,6 +1151,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            guest_workers: None,
         }
     }
 
