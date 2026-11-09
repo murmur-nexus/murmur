@@ -1,9 +1,9 @@
 # Guest Workers
 
 A `mur run` session is one supervisor process, `mur` itself, and up to three guest workers, one
-for each kind of WASM guest. A guest worker is the same `mur` binary, started again by `mur` as
-`mur __guest-worker <kind>`. It holds every store of its kind, and it runs those guests' code.
-No guest runs in `mur`.
+for each kind of WASM artifact. A guest worker is the same `mur` binary, started again by `mur` as
+`mur __guest-worker <kind>`. It runs the code of every artifact of its kind. No WASM code runs in
+`mur`.
 
 ## Which process runs what
 
@@ -12,16 +12,16 @@ No guest runs in `mur`.
 | `driver` worker | Every `runtime: driver` artifact: the inference driver, every driver choice, a driver a capsule reaches by name as a tool, a hook's `run-inference` calls and the `transport: process` driver. Also a script capsule's own component |
 | `tools` worker | Every `runtime: tool` WASM artifact, staged at launch or pulled while the session runs |
 | `hooks` worker | Every `runtime: hook` artifact: blocking, async and `on-stage` |
-| `mur` | No guest. Everything listed under [What never enters a worker](#what-never-enters-a-worker) |
+| `mur` | No WASM code. Everything listed under [What never enters a worker](#what-never-enters-a-worker) |
 
-A guest goes to a worker by its artifact's `runtime:` kind. The role of one call never decides it.
+An artifact goes to a worker by its `runtime:` kind. The role of one call never decides it.
 No tool shares the driver's process, and no hook shares a process with the tool it checks.
 
 `mur doctor` checks a harness login by calling its process driver in a driver worker too.
 
 ## Started only when needed
 
-A worker starts only when the capsule has a guest of its kind:
+A worker starts only when the capsule has an artifact of its kind:
 
 | Capsule | Workers |
 |---|---|
@@ -41,21 +41,27 @@ A worker is started with an empty environment and nothing on its command line bu
 refuses to start if its environment is not empty. It is not dumpable, so no other process can
 read its memory or its `/proc` environment.
 
-`mur` keeps everything a guest must never hold:
+`mur` keeps everything WASM code must never hold:
 
 | Kept in `mur` | Why |
 |---|---|
-| Every credential gateway and its key | A guest's request reaches the provider only through `mur`, which attaches the key |
+| Every credential gateway and its key | A driver's or tool's request reaches the provider only through `mur`, which attaches the key |
 | Formation and door tokens | `mur` addresses a formation call and attaches the token |
 | The trace and the records directory | The run's record is written by `mur` alone |
 | The session's processes, the cgroup scope and the namespaces | `murmur:process` and the shell allowlist are decided in `mur` |
 
-Every host call that reaches past the guest's own files, clocks and randomness goes to `mur` over
-the worker's private connection: `wasi:http` requests, `murmur:process`, stream events and input
-requests, a hook's `run-inference`, `task-io` and `conversation` reads, and a script capsule's
-tool registry, artifact manager and message send. `mur` answers it only while the call it belongs
-to is running on that worker. It makes the same policy decision it would make for a guest running
-in `mur`.
+Every call a WASM artifact makes past its own files, clocks and randomness goes to `mur` over the
+worker's private connection:
+
+- `wasi:http` requests
+- `murmur:process`
+- stream events and input requests
+- a hook's `run-inference`, `task-io` and `conversation` reads
+- a script capsule's tool registry, artifact manager and message send
+
+`mur` answers a call only while the artifact call it belongs to is running on that worker, and
+applies every policy check itself: the network allowlist, the credential gateway, the shell
+allowlist and each import's grant.
 
 ## A lost worker
 
@@ -70,8 +76,8 @@ A worker that cannot be started refuses the launch with `E-RUN-066`.
 See [E-RUN-065](../reference/diagnostics.md#e-run-065) and
 [E-RUN-066](../reference/diagnostics.md#e-run-066).
 
-## Not yet under the class
+## Not confined by the containment class
 
 A worker runs as your user, with the same reach `mur` has. The containment class does not confine
-it yet. The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` says
-what holds each route today.
+it. The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` says what
+holds each route.

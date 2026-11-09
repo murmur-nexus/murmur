@@ -2498,9 +2498,6 @@ pub(crate) async fn run_agent_loop(
                                 if let Some(lost) = store_state.guest_worker_lost() {
                                     return Err(lost);
                                 }
-                                if let Some(lost) = store_state.guest_worker_lost() {
-                                    return Err(lost);
-                                }
                                 trace
                                     .write_shell(
                                         turn_u32,

@@ -137,6 +137,10 @@ pub(crate) struct WorkerConn {
     loading: Mutex<Option<String>>,
     /// Set once the connection is lost: every later request fails with it.
     lost: Mutex<Option<String>>,
+    /// Set when the supervisor killed the worker for not answering, to the call it stopped
+    /// answering in: the loss then says so, instead of reporting the supervisor's own `SIGKILL`
+    /// as if something else had sent it.
+    unresponsive: Mutex<Option<String>>,
     /// The session-wide loss latch this connection reports into.
     session_lost: Arc<Mutex<Option<String>>>,
     host_runtime: tokio::runtime::Handle,
@@ -752,6 +756,7 @@ impl GuestWorkers {
             calls: Mutex::new(HashMap::new()),
             loading: Mutex::new(None),
             lost: Mutex::new(None),
+            unresponsive: Mutex::new(None),
             session_lost: Arc::clone(&self.lost),
             host_runtime: self.host_handle.clone(),
             #[cfg(test)]
@@ -835,14 +840,17 @@ impl GuestWorkers {
                 while let Ok(message) = read_frame::<FromWorker>(&mut reader) {
                     conn_thread.dispatch(message);
                 }
-                let call = conn_thread.call_description();
                 let status = child_pid.and_then(|pid| reap(pid, workers.upgrade()));
-                let message = lost_message(
-                    kind,
-                    conn_thread.pid(),
-                    call.as_deref(),
-                    &describe_exit(status),
-                );
+                let unresponsive = conn_thread
+                    .unresponsive
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let (call, exit) = match unresponsive {
+                    Some(call) => (Some(call), "stopped answering and was killed".to_string()),
+                    None => (conn_thread.call_description(), describe_exit(status)),
+                };
+                let message = lost_message(kind, conn_thread.pid(), call.as_deref(), &exit);
                 conn_thread.mark_lost(message);
             });
         if let Err(error) = spawned {
@@ -981,13 +989,21 @@ impl GuestWorkers {
         };
         let replied = tokio::time::timeout(bound, conn.request(req, message(req))).await;
         in_flight.done = true;
-        conn.calls
+        let entry = conn
+            .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&req);
         let reply = match replied {
             Ok(reply) => reply,
             Err(_) => {
+                // Recorded before the kill, so the reader that sees the worker go names this call.
+                *conn
+                    .unresponsive
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    entry.map_or_else(|| "no call".to_string(), |entry| entry.description.clone()),
+                );
                 conn.kill();
                 // The reader fails the request once it sees the worker gone.
                 return Err(wait_lost(conn).await);

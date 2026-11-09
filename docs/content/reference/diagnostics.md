@@ -541,8 +541,10 @@ reason, then `task_end` with `exit_status: failed`, then `session_end`, and `mur
 A script capsule, which runs no task, records `session_end` with `exit_status: failed`. The worker
 is not restarted.
 
-**What to do:** look for what ended the process: an out-of-memory kill in the system log, a signal
-sent from outside, or a guest that crashed the worker. Run the capsule again.
+**What to do:** when the worker `stopped answering and was killed`, `mur` ended it: its call ran
+far past `capabilities.limits.deadline_seconds` without answering. Otherwise look for what ended
+the process: an out-of-memory kill in the system log, a signal sent from outside, or a WASM
+artifact that crashed the worker. Run the capsule again.
 
 ### E-RUN-066 — a guest worker could not be started { #e-run-066 }
 

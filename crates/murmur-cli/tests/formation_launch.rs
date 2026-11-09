@@ -2243,7 +2243,6 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-/// Every descendant of `root`, `root` included.
 /// Whether `pid` is a `mur __guest-worker` process.
 #[cfg(target_os = "linux")]
 fn is_guest_worker(pid: u32) -> bool {
@@ -2257,6 +2256,7 @@ fn is_guest_worker(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Every descendant of `root`, `root` included.
 fn process_tree(root: u32) -> Vec<u32> {
     let mut parents: Vec<(u32, u32)> = Vec::new();
     for entry in std::fs::read_dir("/proc").unwrap().flatten() {

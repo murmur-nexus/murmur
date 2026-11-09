@@ -612,6 +612,68 @@ fn dropping_a_call_sends_cancel() {
     }
 }
 
+/// A worker that stops answering is killed once its call's bound has passed, and the loss names
+/// the call it stopped answering in and says the supervisor killed it.
+#[test]
+fn an_unresponsive_worker_is_killed_and_named() {
+    let peers: Peers = Arc::default();
+    let workers = GuestWorkers::new(Launcher::Peer(Arc::clone(&peers)));
+    let mut tools = peer_worker(&workers, &peers, WorkerKind::Tools);
+    workers.ready().unwrap();
+    let engine = crate::runtime::build_engine().unwrap();
+    let component = crate::inference_import::test_support::driver_double(&engine, 0, "{}");
+    let rt = runtime();
+    let handle = {
+        let workers = Arc::clone(&workers);
+        rt.spawn(async move {
+            let mut spec = spec("probe", Vec::new());
+            // The shortest bound: twice the two-second wall grace, plus the unresponsive grace.
+            spec.limits.deadline_seconds = 0;
+            let deadlines = CallDeadlines::default();
+            workers
+                .run_tool(
+                    WorkerKind::Tools,
+                    &component,
+                    spec,
+                    test_host(),
+                    ToolInput {
+                        data: None,
+                        log_path: None,
+                    },
+                    &deadlines,
+                )
+                .await
+        })
+    };
+    let load = read_frame::<ToWorker>(&mut tools).unwrap();
+    let ToWorker::Load { req, .. } = load else {
+        panic!("expected Load, got {load:?}");
+    };
+    write_frame(
+        &mut tools,
+        &FromWorker::Reply {
+            req,
+            reply: Reply::Loaded(Ok(())),
+        },
+    )
+    .unwrap();
+    let run = read_frame::<ToWorker>(&mut tools).unwrap();
+    assert!(matches!(run, ToWorker::RunTool { .. }), "{run:?}");
+    // The worker holds its end open and never answers.
+    let error = rt
+        .block_on(handle)
+        .unwrap()
+        .expect_err("an unanswered call fails");
+    assert!(
+        error.contains("the tools guest worker")
+            && error.contains("while running tool 'probe'")
+            && error.contains("it stopped answering and was killed"),
+        "{error}"
+    );
+    assert_eq!(workers.lost().as_deref(), Some(error.as_str()));
+    drop(tools);
+}
+
 fn test_host() -> crate::runtime::ToolCallHost {
     crate::runtime::ToolCallHost {
         http_hooks: crate::runtime::NetworkPolicyHooks {
