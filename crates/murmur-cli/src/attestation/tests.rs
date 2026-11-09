@@ -306,6 +306,13 @@ fn another_issuer_is_refused() {
         refused(|spec| spec.issuer = Some("https://accounts.example".into()))
             .contains("issued by https://accounts.example")
     );
+    // A certificate for a non-GitHub identity carries no repository extensions.
+    assert!(refused(|spec| {
+        spec.issuer = Some("https://accounts.example".into());
+        spec.owner_id = None;
+        spec.source_repository_uri = None;
+    })
+    .contains("issued by https://accounts.example"));
 }
 
 #[test]

@@ -25,7 +25,6 @@ use ring::{
 };
 use rustls_pki_types::{CertificateDer, UnixTime};
 use serde::Deserialize;
-use sha2::Digest as _;
 
 pub(crate) use trusted_root::{trusted_root, trusted_root_override};
 pub use trusted_root::{RootError, TrustedRoot, TRUSTED_ROOT_ENV};
@@ -495,12 +494,19 @@ fn verify_parsed(
         ));
     }
 
-    // 5. Identity.
+    // 5. Identity. The issuer is checked before the repository extensions are looked for: a
+    // certificate for a non-GitHub identity carries none of them and must be refused, not read
+    // as a form this mur does not verify.
     let Some(issuer) = certificate.fulcio_extension(EXT_ISSUER) else {
         return Ok(Verdict::Unverifiable(
             "its certificate names no OIDC issuer (extension 1.3.6.1.4.1.57264.1.8)".to_string(),
         ));
     };
+    if issuer != GITHUB_ACTIONS_ISSUER {
+        return Err(format!(
+            "it was issued by {issuer}, not by GitHub Actions ({GITHUB_ACTIONS_ISSUER})"
+        ));
+    }
     let Some(owner_id) = certificate.fulcio_extension(EXT_SOURCE_REPOSITORY_OWNER_ID) else {
         return Ok(Verdict::Unverifiable(
             "its certificate names no repository owner id (extension 1.3.6.1.4.1.57264.1.17)"
@@ -513,11 +519,6 @@ fn verify_parsed(
                 .to_string(),
         ));
     };
-    if issuer != GITHUB_ACTIONS_ISSUER {
-        return Err(format!(
-            "it was issued by {issuer}, not by GitHub Actions ({GITHUB_ACTIONS_ISSUER})"
-        ));
-    }
     let owner_matches = expected
         .owner_id
         .is_none_or(|expected| owner_id == expected.to_string());
@@ -600,7 +601,7 @@ fn verify_body_binding(parsed: &Parsed<'_>) -> Result<(), String> {
             body.kind, body.api_version
         ));
     }
-    let payload_hash = hex(sha2::Sha256::digest(&parsed.payload).as_slice());
+    let payload_hash = murmur_artifact::sha256_hex(&parsed.payload);
     let recorded = body
         .spec
         .payload_hash

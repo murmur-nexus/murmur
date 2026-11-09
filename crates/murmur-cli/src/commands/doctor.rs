@@ -2581,9 +2581,6 @@ pub(crate) fn run_doctor(bind_addr: &str, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Check every artifact the current project declares against the stores a session
-/// resolves from, and return the passed-check count and the findings for the tally. The checklist
-/// is the manifest — editing `murmur.yaml` changes what is checked, with no change here.
 /// What the Artifacts checklist says about one installed artifact's attestation.
 enum AttestationLine {
     /// The kept bundle verified and its signer is the one `murmur.lock` records, or it records
@@ -2673,6 +2670,9 @@ fn artifact_attestation(
     })
 }
 
+/// Check every artifact the current project declares against the stores a session
+/// resolves from, and return the passed-check count and the findings for the tally. The checklist
+/// is the manifest — editing `murmur.yaml` changes what is checked, with no change here.
 fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
     let mut findings = Findings::default();
     let project_root = find_project_root().map_err(|mut error| {

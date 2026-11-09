@@ -147,14 +147,7 @@ An entry whose recorded `signer` changes, or an artifact recorded as attested th
 
 `mur install -g` and `mur deploy` read no `murmur.lock`: they verify, keep a bundle that verifies and warn, and record no `signer`. `local/` artifacts, artifacts installed from a file and `source:` artifacts are never checked. An artifact with no attestation is installed with a warning; no setting refuses it. `mur run` checks no attestation.
 
-[`mur doctor`](cli.md#mur-doctor) verifies each declared artifact's kept bundle offline and shows its state on the artifact's checklist line:
-
-| Line | Finding |
-|---|---|
-| `installed · attested by <signer>` | None |
-| `installed · attested by <signer>; murmur.lock recorded <other>` | `W-REG-006` |
-| `installed · no attestation` | `W-REG-005` |
-| `installed · attestation does not verify: <reason>` | `W-REG-005`, fix `mur install <name>@<version>` |
+[`mur doctor`](cli.md#mur-doctor) verifies each declared artifact's kept bundle offline and shows its state on the artifact's checklist line, as warnings only.
 
 ### Trusted root
 

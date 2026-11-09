@@ -35,8 +35,8 @@ pub const W_REG_004: &str = "W-REG-004";
 /// verified: no `<asset>.sigstore.json` was published or kept beside it, or the one there is in a
 /// form this `mur` does not read.
 ///
-/// `mur install` installs it and names it; nothing is refused, because publishing attestations is
-/// not yet required of a source. `mur doctor` reports it for each declared artifact in that state.
+/// `mur install` installs it and names it; nothing is refused, because a source is not required to
+/// publish attestations. `mur doctor` reports it for each declared artifact in that state.
 pub const W_REG_005: &str = "W-REG-005";
 
 /// An artifact whose verified signer differs from the `signer` its `murmur.lock` entry records,
