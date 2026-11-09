@@ -19,6 +19,9 @@ path = "src/bin/alloc_bench.rs"
 required-features = ["alloc-bench"]
 
 [dependencies]
+# Attestation verification: base64 fields of a Sigstore bundle, ECDSA and SHA-256 through ring,
+# and the Fulcio certificate chain through rustls-webpki on ring. No other crypto backend.
+base64 = "0.22"
 bytes = "1"
 console = "0.16"
 capsule-runtime.workspace = true
@@ -30,6 +33,9 @@ libc = "0.2"
 murmur-artifact.workspace = true
 dialoguer = "0.12"
 rayon = "1"
+ring = "0.17.14"
+rustls-pki-types = "1.14"
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["ring", "std"] }
 ureq = { version = "3", features = ["json"] }
 url = "2"
 serde = { version = "1", features = ["derive"] }
@@ -87,8 +93,6 @@ serde_json = "1"
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 assert_cmd = "2"
-# Already in the build through capsule-runtime: the formation-token tests forge tokens with it.
-base64 = "0.22"
 predicates = "3"
 sha2 = "0.10"
 tempfile = "3"

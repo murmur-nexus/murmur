@@ -29,6 +29,7 @@ pub const E_REG_012: &str = "E-REG-012"; // a payload's packed murmur.yaml decla
 pub const E_REG_013: &str = "E-REG-013"; // a tool's pinned program download could not be fetched (transport error, non-2xx status, over the size cap)
 pub const E_REG_014: &str = "E-REG-014"; // a tool's pinned program download does not hash to the sha256 the tool pins
 pub const E_REG_015: &str = "E-REG-015"; // a tool's pinned program download cannot be unpacked into the program store
+pub const E_REG_016: &str = "E-REG-016"; // an attestation published for, or stored with, a payload does not verify against it
 
 // WIT levels
 pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves

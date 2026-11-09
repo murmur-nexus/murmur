@@ -26,8 +26,8 @@ use murmur_artifact::{
     warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactRuntime,
     ContractDirection, FitSubject, LocalRegistry, LockOrigin, MurmurLock, Registry,
     ResolvedArtifact, RosterReachability, RuntimeManifest, UnservedInterface, VersionFit,
-    WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME, W_REG_002, W_REG_003, W_REG_004, W_ROS_001,
-    W_RUN_002, W_RUN_009, W_RUN_013,
+    WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME, W_REG_002, W_REG_003, W_REG_004, W_REG_005,
+    W_REG_006, W_ROS_001, W_RUN_002, W_RUN_009, W_RUN_013,
 };
 
 use crate::commands::install::find_project_root;
@@ -2581,6 +2581,95 @@ pub(crate) fn run_doctor(bind_addr: &str, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// What the Artifacts checklist says about one installed artifact's attestation.
+enum AttestationLine {
+    /// The kept bundle verified and its signer is the one `murmur.lock` records, or it records
+    /// none.
+    Attested(String),
+    /// Anything else, as the status after `installed ·` and its warning finding.
+    Warn {
+        code: &'static str,
+        status: String,
+        fix: String,
+    },
+}
+
+/// Verify, offline, the attestation kept beside an installed `name@version` (`resolved`): from
+/// the project store when it holds the payload, else from the global store, held to the stored
+/// owner id and to no repository. `None` for a `local/` artifact, which is never checked.
+fn artifact_attestation(
+    name: &str,
+    version: &str,
+    project_registry: &LocalRegistry,
+    global_registry: &LocalRegistry,
+    resolved: &ResolvedArtifact,
+    lock: Option<&MurmurLock>,
+) -> Option<AttestationLine> {
+    use crate::attestation::{assess, trusted_root, AttestationState, Expected};
+
+    let parsed = murmur_artifact::ArtifactName::parse(name).ok()?;
+    if parsed.is_local() {
+        return None;
+    }
+    let reference = format!("{name}@{version}");
+    let store = if project_registry
+        .artifact_path_for(&parsed, version)
+        .exists()
+    {
+        project_registry
+    } else {
+        global_registry
+    };
+    let failed = |reason: String| AttestationLine::Warn {
+        code: W_REG_005,
+        status: format!("attestation does not verify: {reason}"),
+        fix: format!("mur install {reference}"),
+    };
+    let bundle = match store.read_attestation(&parsed, version) {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            return Some(AttestationLine::Warn {
+                code: W_REG_005,
+                status: "no attestation".to_string(),
+                fix: format!(
+                    "ask the publisher of {} to attest its releases, then run mur install \
+                     {reference}",
+                    parsed.scope()
+                ),
+            })
+        }
+        Err(error) => return Some(failed(error.to_string())),
+    };
+    let root = match trusted_root() {
+        Ok(root) => root,
+        Err(error) => return Some(failed(error.0)),
+    };
+    let expected = Expected {
+        sha256: &resolved.sha256,
+        owner_id: crate::commands::install::stored_owner_expectation(
+            &parsed,
+            resolved.meta.owner_id,
+            lock,
+        ),
+        repo: None,
+    };
+    let recorded = lock
+        .and_then(|lock| lock.artifact_for(name))
+        .and_then(|entry| entry.signer.as_deref());
+    Some(match assess(Some(&bundle), &expected, root) {
+        Ok(AttestationState::Verified { signer }) => match recorded {
+            Some(recorded) if recorded != signer => AttestationLine::Warn {
+                code: W_REG_006,
+                status: format!("attested by {signer}; murmur.lock recorded {recorded}"),
+                fix: format!("mur install {reference}"),
+            },
+            _ => AttestationLine::Attested(signer),
+        },
+        Ok(AttestationState::Unverifiable(reason)) | Err(reason) => failed(reason),
+        Ok(AttestationState::Absent) => failed("no bundle".to_string()),
+    })
+}
+
 /// Check every artifact the current project declares against the stores a session
 /// resolves from, and return the passed-check count and the findings for the tally. The checklist
 /// is the manifest — editing `murmur.yaml` changes what is checked, with no change here.
@@ -2923,6 +3012,21 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
     report_artifact_stores(&project_registry, &global_registry);
 
     capsule_runtime::report_println!("Checking {}...", manifest_path.display());
+    // Named only where an attestation is checked: a declared artifact that is neither `local/`
+    // nor a `source:` path.
+    let checks_attestations = runtime_manifest.artifacts.iter().any(|artifact| {
+        artifact.source.is_none()
+            && murmur_artifact::ArtifactName::parse(&artifact.name)
+                .is_ok_and(|name| !name.is_local())
+    });
+    if let Some(path) = crate::attestation::trusted_root_override().filter(|_| checks_attestations)
+    {
+        capsule_runtime::report_println!(
+            "  attestations checked against the Sigstore trusted root at {} ({})",
+            path.display(),
+            crate::attestation::TRUSTED_ROOT_ENV
+        );
+    }
 
     // Align every check line on the widest "name@version" reference string.
     let col_width = runtime_manifest
@@ -3046,9 +3150,35 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
                                 total_pass += 1;
                             }
                             None => {
-                                capsule_runtime::report_println!(
-                                    "  \u{2713}  {ref_str:<col_width$}   installed"
-                                );
+                                match artifact_attestation(
+                                    name,
+                                    version,
+                                    &project_registry,
+                                    &global_registry,
+                                    &resolved,
+                                    lock.as_ref(),
+                                ) {
+                                    None => capsule_runtime::report_println!(
+                                        "  \u{2713}  {ref_str:<col_width$}   installed"
+                                    ),
+                                    Some(AttestationLine::Attested(signer)) => {
+                                        capsule_runtime::report_println!(
+                                            "  \u{2713}  {ref_str:<col_width$}   installed \u{00B7} attested by {signer}"
+                                        );
+                                    }
+                                    Some(AttestationLine::Warn { code, status, fix }) => {
+                                        capsule_runtime::report_println!(
+                                            "  \u{26A0}  {ref_str:<col_width$}   installed \u{00B7} {status}"
+                                        );
+                                        findings.warning(
+                                            code,
+                                            DoctorBlock::Artifacts,
+                                            Some(ref_str.clone()),
+                                            format!("{ref_str} \u{2014} {status}"),
+                                            fix,
+                                        );
+                                    }
+                                }
                                 total_pass += 1;
                             }
                         }

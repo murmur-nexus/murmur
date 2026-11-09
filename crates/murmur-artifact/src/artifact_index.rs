@@ -238,6 +238,17 @@ pub fn sha256_file_name(name: &str, version: &str) -> String {
     format!("{}.sha256", payload_stem(name, version))
 }
 
+/// The suffix a release asset's attestation adds to the asset's file name, and that a store's
+/// attestation sidecar adds to the payload stem: `<file>.sigstore.json`.
+pub const ATTESTATION_FILE_SUFFIX: &str = ".sigstore.json";
+
+/// The file name of the attestation a store keeps beside the payload [`asset_file_name`] names:
+/// `<name>-<version>.sigstore.json`, the Sigstore bundle the payload was installed with.
+#[must_use]
+pub fn attestation_file_name(name: &str, version: &str) -> String {
+    format!("{}{ATTESTATION_FILE_SUFFIX}", payload_stem(name, version))
+}
+
 /// The file name of the metadata sidecar a store keeps beside the payload [`asset_file_name`]
 /// names: `<name>-<version>.meta.json`.
 #[must_use]

@@ -12,11 +12,13 @@ use murmur_artifact::{
     resolve_manifest_path, sha256_hex, verify_sha256, version_fit, write_lockfile_atomic,
     ArtifactMeta, ArtifactName, ArtifactRef, ArtifactRefError, FitSubject, LocalRegistry,
     LockOrigin, LockedSha256, LockfileError, Manifest, MurmurLock, Registry, RegistryError,
-    ResolvedArtifact, VersionFit, LOCAL_SCOPE, LOCK_VERSION, MANIFEST_FILENAME,
+    ResolvedArtifact, VersionFit, LOCAL_SCOPE, LOCK_VERSION, MANIFEST_FILENAME, MURMUR_SCOPE,
+    W_REG_005, W_REG_006,
 };
 use rayon::prelude::*;
 
 use crate::{
+    attestation::{self, AttestationState, Expected},
     error::{
         artifact_name_arg, artifact_name_error, local_store_miss, native_payload_refusal,
         native_tool_install_error, CliError, E_IO_001, E_IO_003, E_REG_004, E_REG_005, E_REG_006,
@@ -24,7 +26,7 @@ use crate::{
     source::{
         check_owner, check_stored_owner, github::GitHubSource, github_scope, newest_fitting,
         resolve, select_version, unanswered_hint, ArtifactSource, ExplicitVersion, Resolved,
-        SourceError, Sources,
+        SourceError, Sources, MURMUR_OWNER_ID,
     },
     wit_level::{index_level_mismatch, level_mismatch},
 };
@@ -173,7 +175,8 @@ fn read_lock_if_any(lock_path: &Path) -> Result<Option<MurmurLock>, CliError> {
 /// Upsert a single artifact's entry into `murmur.lock` at `lock_path` as operator-declared,
 /// creating the lockfile if it doesn't exist yet and preserving every other pre-existing entry.
 /// `owner_id`, the GitHub owner id of the source that served the payload, is recorded on the
-/// entry when known; an entry keeps the id it has otherwise.
+/// entry when known; an entry keeps the id it has otherwise. `signer` replaces the entry's
+/// `signer` either way: it describes the bytes now pinned, so `None` clears an earlier one.
 ///
 /// Returns the line announcing the adoption when the entry was a `manage.pull()` pin, for the
 /// caller to print once nothing else is drawing on the terminal.
@@ -183,6 +186,7 @@ fn upsert_lock_entry(
     version: &str,
     sha256: LockedSha256,
     owner_id: Option<u64>,
+    signer: Option<&str>,
 ) -> Result<Option<String>, CliError> {
     let mut lock = read_lock_if_any(lock_path)?.unwrap_or_else(|| MurmurLock {
         lock_version: LOCK_VERSION,
@@ -193,6 +197,7 @@ fn upsert_lock_entry(
     if let Some(owner_id) = owner_id {
         lock.set_owner_id(name, owner_id);
     }
+    lock.set_signer(name, signer.map(str::to_string));
 
     write_lockfile_atomic(lock_path, &lock).map_err(super::lockfile_error_to_cli)?;
     Ok(match previous {
@@ -210,6 +215,148 @@ fn print_lock_changes(lines: &[String]) {
     for line in lines {
         capsule_runtime::report_println!("{line}");
     }
+}
+
+// ─── attestation ─────────────────────────────────────────────────────────────
+
+/// The owner id the attestation of a stored `name` is held to: [`MURMUR_OWNER_ID`] for the
+/// `murmur` scope, else the owner id the stored payload records, else the one its `murmur.lock`
+/// entry records.
+pub(crate) fn stored_owner_expectation(
+    name: &ArtifactName,
+    stored_owner: Option<u64>,
+    lock: Option<&MurmurLock>,
+) -> Option<u64> {
+    if name.scope() == MURMUR_SCOPE {
+        return Some(MURMUR_OWNER_ID);
+    }
+    stored_owner.or_else(|| {
+        lock.and_then(|lock| lock.artifact_for(name.as_str()))
+            .and_then(|entry| entry.owner_id)
+    })
+}
+
+/// Verify, offline, the attestation `store` (named `store_label` in messages) keeps beside
+/// `name@version` against the stored payload's `sha256`, with no repository to compare. Returns the
+/// state and the bundle to keep, `Some` only when it verified; a bundle that does not verify is
+/// `E-REG-016`. A `local/` artifact is never checked.
+pub(crate) fn check_stored_attestation(
+    store: &LocalRegistry,
+    store_label: &str,
+    name: &ArtifactName,
+    version: &str,
+    sha256: &str,
+    stored_owner: Option<u64>,
+    lock: Option<&MurmurLock>,
+) -> Result<(AttestationState, Option<bytes::Bytes>), CliError> {
+    if name.is_local() {
+        return Ok((AttestationState::Absent, None));
+    }
+    let Some(bundle) = store
+        .read_attestation(name, version)
+        .map_err(|error| store_error(error, name.as_str(), version))?
+    else {
+        return Ok((AttestationState::Absent, None));
+    };
+    let root = attestation::trusted_root()?;
+    let expected = Expected {
+        sha256,
+        owner_id: stored_owner_expectation(name, stored_owner, lock),
+        repo: None,
+    };
+    match attestation::assess(Some(&bundle), &expected, root) {
+        Ok(state) => {
+            let keep = matches!(state, AttestationState::Verified { .. }).then_some(bundle);
+            Ok((state, keep))
+        }
+        Err(reason) => Err(attestation::refusal(
+            &format!("{name}@{version}"),
+            store_label,
+            &reason,
+        )),
+    }
+}
+
+/// The `warning[W-REG-005]` and `warning[W-REG-006]` lines, each followed by its link line, for
+/// an install of `name@version` from `origin` whose attestation is `state`, given the `signer`
+/// its `murmur.lock` entry recorded. None for a `local/` artifact.
+pub(crate) fn attestation_warnings(
+    name: &ArtifactName,
+    version: &str,
+    origin: &str,
+    state: &AttestationState,
+    recorded: Option<&str>,
+) -> Vec<String> {
+    if name.is_local() {
+        return Vec::new();
+    }
+    let target = format!("{name}@{version}");
+    let mut lines = Vec::new();
+    let mut warn = |code: &str, text: String| {
+        lines.push(format!("warning[{code}]: {text}"));
+        lines.push(format!(
+            "  \u{2192} {}",
+            murmur_artifact::registry_warning_link(code)
+        ));
+    };
+    match state {
+        AttestationState::Absent => warn(
+            W_REG_005,
+            format!(
+                "{target} from {origin} has no attestation; installed without proof of who \
+                 published it"
+            ),
+        ),
+        AttestationState::Unverifiable(reason) => warn(
+            W_REG_005,
+            format!(
+                "{target} from {origin} has an attestation in a form this mur does not verify \
+                 ({reason}); installed without proof of who published it"
+            ),
+        ),
+        AttestationState::Verified { .. } => {}
+    }
+    match (state, recorded) {
+        (AttestationState::Verified { signer }, Some(recorded)) if signer != recorded => warn(
+            W_REG_006,
+            format!("{target} is attested by {signer}; murmur.lock recorded {recorded}"),
+        ),
+        (AttestationState::Absent | AttestationState::Unverifiable(_), Some(recorded)) => warn(
+            W_REG_006,
+            format!(
+                "{target} has no attestation; murmur.lock recorded it as attested by {recorded}"
+            ),
+        ),
+        _ => {}
+    }
+    lines
+}
+
+/// Print warning lines to stderr.
+pub(crate) fn print_warnings(lines: &[String]) {
+    for line in lines {
+        capsule_runtime::report_eprintln!("{line}");
+    }
+}
+
+/// `, attested by <signer>` for a verified attestation, else nothing: the tail of an `Installed`
+/// line.
+fn attested_suffix(state: &AttestationState) -> String {
+    state
+        .signer()
+        .map(|signer| format!(", attested by {signer}"))
+        .unwrap_or_default()
+}
+
+/// The `signer` `lock_path`'s entry for `name` records, read now.
+fn recorded_signer(lock_path: Option<&Path>, name: &str) -> Result<Option<String>, CliError> {
+    let Some(lock_path) = lock_path else {
+        return Ok(None);
+    };
+    Ok(read_lock_if_any(lock_path)?.and_then(|lock| {
+        lock.artifact_for(name)
+            .and_then(|entry| entry.signer.clone())
+    }))
 }
 
 // ─── source helpers ──────────────────────────────────────────────────────────
@@ -248,18 +395,28 @@ fn install_resolved(
         &resolved.manifest,
         resolved.owner_id,
     );
-    store_and_pin(
+    let recorded = store_and_pin(
         local_registry,
         meta,
         &resolved.bytes,
         &resolved.sha256,
         lock_path,
+        &resolved.attestation,
+        resolved.bundle.as_deref(),
     )?;
     capsule_runtime::report_println!(
-        "Installed {name}@{} from {}",
+        "Installed {name}@{} from {}{}",
         resolved.version,
-        resolved.source
+        resolved.source,
+        attested_suffix(&resolved.attestation)
     );
+    print_warnings(&attestation_warnings(
+        name,
+        &resolved.version,
+        &resolved.source,
+        &resolved.attestation,
+        recorded.as_deref(),
+    ));
     Ok(Stored {
         name: name.to_string(),
         version: resolved.version,
@@ -267,32 +424,45 @@ fn install_resolved(
     })
 }
 
-/// Write `meta`'s payload to `local_registry` and, when `lock_path` is given, pin it there with
-/// the owner id `meta` records. A payload of the version `lock_path` pins whose bytes disagree
-/// with the pin is refused with `E-REG-005` before anything is stored; another version re-pins.
+/// Write `meta`'s payload to `local_registry`, with `bundle` beside it when its attestation
+/// verified, and, when `lock_path` is given, pin it there with the owner id `meta` records and the
+/// signer `attestation` names. A payload of the version `lock_path` pins whose bytes disagree with
+/// the pin is refused with `E-REG-005` before anything is stored; another version re-pins.
+///
+/// Returns the `signer` the lock entry recorded before this pin, for the signer-change warning.
 fn store_and_pin(
     local_registry: &LocalRegistry,
     meta: ArtifactMeta,
     bytes: &[u8],
     sha256: &str,
     lock_path: Option<&Path>,
-) -> Result<(), CliError> {
+    attestation: &AttestationState,
+    bundle: Option<&[u8]>,
+) -> Result<Option<String>, CliError> {
     let pin = LockedSha256::any(sha256);
     let name = meta.name.to_string();
     let version = meta.version.clone();
     let owner_id = meta.owner_id;
+    let recorded = recorded_signer(lock_path, &name)?;
     if let Some(lock_path) = lock_path {
         check_lock_conflict(lock_path, &name, &version, &pin, LockCheck::PinOnly)?;
     }
     local_registry
-        .store_installed_overwrite(meta, bytes, sha256)
+        .store_installed_attested(meta, bytes, sha256, bundle)
         .map_err(|error| store_error(error, &name, &version))?;
     if let Some(lock_path) = lock_path {
-        if let Some(adoption) = upsert_lock_entry(lock_path, &name, &version, pin, owner_id)? {
+        if let Some(adoption) = upsert_lock_entry(
+            lock_path,
+            &name,
+            &version,
+            pin,
+            owner_id,
+            attestation.signer(),
+        )? {
             capsule_runtime::report_println!("{adoption}");
         }
     }
-    Ok(())
+    Ok(recorded)
 }
 
 /// `mur install github:<owner>/<repo>@<tag>`: every `.mur.zip` of that release, each filed under
@@ -361,9 +531,48 @@ fn install_github_release(
             })?;
             let version = manifest.version.clone();
             let sha256 = sha256_hex(&payload.bytes);
+            let bundle_file = format!("{}{}", payload.file, attestation::BUNDLE_SUFFIX);
+            let bundle = match source.fetch(tag, &bundle_file) {
+                Ok(bundle) => Some(bundle),
+                Err(SourceError::NotFound(_)) => None,
+                Err(error) => return Err(unanswered(error)),
+            };
+            let state = match &bundle {
+                None => AttestationState::Absent,
+                Some(bundle) => {
+                    let expected = Expected {
+                        sha256: &sha256,
+                        owner_id: Some(owner_id),
+                        repo: Some(source.repo()),
+                    };
+                    attestation::assess(Some(bundle), &expected, attestation::trusted_root()?)
+                        .map_err(|reason| {
+                            attestation::refusal(&format!("{name}@{version}"), &label, &reason)
+                        })?
+                }
+            };
+            let keep = bundle.filter(|_| matches!(state, AttestationState::Verified { .. }));
             let meta = source_meta(&name, &version, &manifest, owner_id);
-            store_and_pin(store, meta, &payload.bytes, &sha256, lock_path)?;
-            capsule_runtime::report_println!("Installed {name}@{version} from {label}");
+            let recorded = store_and_pin(
+                store,
+                meta,
+                &payload.bytes,
+                &sha256,
+                lock_path,
+                &state,
+                keep.as_deref(),
+            )?;
+            capsule_runtime::report_println!(
+                "Installed {name}@{version} from {label}{}",
+                attested_suffix(&state)
+            );
+            print_warnings(&attestation_warnings(
+                &name,
+                &version,
+                &label,
+                &state,
+                recorded.as_deref(),
+            ));
             Ok(Stored {
                 name: name.to_string(),
                 version,
@@ -798,6 +1007,7 @@ fn install_single(
                         &name,
                         version,
                         resolved,
+                        &global_store,
                         store,
                         lock_path.as_deref(),
                         lock.as_ref(),
@@ -835,12 +1045,14 @@ fn install_single(
     Ok(())
 }
 
-/// Copy `name@version`, which the global store holds as `resolved`, into `store` and pin it. No
-/// source is contacted; the owner id the stored payload records is checked against `lock`.
+/// Copy `name@version`, which `global_store` holds as `resolved`, into `store` with its
+/// attestation and pin it. No source is contacted; the owner id the stored payload records is
+/// checked against `lock`, and the stored attestation is verified offline.
 fn install_from_global_store(
     name: &ArtifactName,
     version: &str,
     resolved: ResolvedArtifact,
+    global_store: &LocalRegistry,
     store: &LocalRegistry,
     lock_path: Option<&Path>,
     lock: Option<&MurmurLock>,
@@ -865,23 +1077,54 @@ fn install_from_global_store(
         )?;
     }
     let owner_id = resolved.meta.owner_id;
+    let (state, bundle) = check_stored_attestation(
+        global_store,
+        "the global store",
+        name,
+        version,
+        &resolved.sha256,
+        owner_id,
+        lock,
+    )?;
+    let recorded = lock
+        .and_then(|lock| lock.artifact_for(name.as_str()))
+        .and_then(|entry| entry.signer.clone());
     store
-        .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
+        .store_installed_attested(
+            resolved.meta,
+            &resolved.bytes,
+            &resolved.sha256,
+            bundle.as_deref(),
+        )
         .map_err(|error| store_error(error, name.as_str(), version))?;
     if let Some(lock_path) = lock_path {
-        if let Some(adoption) = upsert_lock_entry(lock_path, name.as_str(), version, pin, owner_id)?
-        {
+        if let Some(adoption) = upsert_lock_entry(
+            lock_path,
+            name.as_str(),
+            version,
+            pin,
+            owner_id,
+            state.signer(),
+        )? {
             capsule_runtime::report_println!("{adoption}");
         }
     }
 
     let display = store_display(store);
     capsule_runtime::report_println!(
-        "Installed {name}@{version} \u{2192} {display}/{}/{}/{version}/{}-{version}.mur.zip",
+        "Installed {name}@{version} \u{2192} {display}/{}/{}/{version}/{}-{version}.mur.zip{}",
         name.scope(),
         name.name(),
-        name.name()
+        name.name(),
+        attested_suffix(&state)
     );
+    print_warnings(&attestation_warnings(
+        name,
+        version,
+        "the global store",
+        &state,
+        recorded.as_deref(),
+    ));
     Ok(Stored {
         name: name.to_string(),
         version: version.to_string(),
@@ -1054,6 +1297,7 @@ fn install_manifest_deps(
                 &sources,
                 lock.as_ref(),
                 store,
+                &global_store,
                 check,
             );
 
@@ -1120,13 +1364,27 @@ fn install_manifest_deps(
     // manifest moved gets its `Updated` line, judged against the lock as it was read above.
     let mut lock_changes = Vec::new();
     for (_, outcome) in successes.iter().filter(|_| !frozen) {
-        if let Some((name, version, sha256, owner_id)) = &outcome.lock_upsert {
+        if let Some(LockUpsert {
+            name,
+            version,
+            sha256,
+            owner_id,
+            signer,
+        }) = &outcome.lock_upsert
+        {
             let previous = lock
                 .as_ref()
                 .and_then(|lock| lock.artifact_for(name))
                 .map(|entry| entry.resolved_version.as_str())
                 .filter(|previous| previous != version);
-            let adoption = upsert_lock_entry(&lock_path, name, version, sha256.clone(), *owner_id)?;
+            let adoption = upsert_lock_entry(
+                &lock_path,
+                name,
+                version,
+                sha256.clone(),
+                *owner_id,
+                signer.as_deref(),
+            )?;
             if let Some(previous) = previous {
                 lock_changes.push(format!(
                     "Updated murmur.lock: {name} {previous} \u{2192} {version}"
@@ -1176,6 +1434,23 @@ fn install_manifest_deps(
         .sum();
     let cached_n = successes.iter().filter(|(i, _)| cached_flags[*i]).count();
     let summary_tail = install_summary_tail(successes.len(), cached_n, fetched_bytes);
+    // Who published each payload, once the bars are finished: a line per verified attestation,
+    // the warnings to stderr.
+    let attested_lines: Vec<String> = successes
+        .iter()
+        .filter_map(|(i, outcome)| {
+            outcome.attestation.signer().map(|signer| {
+                format!(
+                    "{}@{} attested by {signer}",
+                    full_names[*i], artifacts[*i].version
+                )
+            })
+        })
+        .collect();
+    let attestation_warning_lines: Vec<String> = successes
+        .iter()
+        .flat_map(|(_, outcome)| outcome.warnings.iter().cloned())
+        .collect();
 
     if failures.is_empty() {
         finish_step(
@@ -1183,6 +1458,8 @@ fn install_manifest_deps(
             &done_style,
             format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
         );
+        print_lines(&attested_lines);
+        print_warnings(&attestation_warning_lines);
         print_lock_changes(&lock_changes);
         print_lines(&pinned_lines);
         keep_host_facts(no_precompile, Some(&root));
@@ -1194,6 +1471,8 @@ fn install_manifest_deps(
         &done_style,
         format!("{} ↓ artifacts  failed", style("✗").red().bold()),
     );
+    print_lines(&attested_lines);
+    print_warnings(&attestation_warning_lines);
     print_lock_changes(&lock_changes);
     print_lines(&pinned_lines);
     if !successes.is_empty() {
@@ -1254,14 +1533,61 @@ fn install_summary_tail(count: usize, cached_n: usize, fetched_bytes: u64) -> St
 }
 
 /// Result of a single [`fetch_and_store`] call: the byte length of the installed artifact,
-/// plus the `(name, resolved_version, sha256, owner_id)` to upsert into `murmur.lock` once every
-/// parallel fetch has completed. Set for store-held and source-served artifacts alike so every
-/// install path pins the lockfile.
+/// plus the entry to upsert into `murmur.lock` once every parallel fetch has completed. Set for
+/// store-held and source-served artifacts alike so every install path pins the lockfile.
 struct FetchOutcome {
     bytes_len: u64,
-    lock_upsert: Option<(String, String, LockedSha256, Option<u64>)>,
+    lock_upsert: Option<LockUpsert>,
     /// The payload bytes written to the store, which are the bytes precompiled.
     payload: bytes::Bytes,
+    /// What the payload's attestation proved.
+    attestation: AttestationState,
+    /// The attestation warning lines to print once the progress bars are finished.
+    warnings: Vec<String>,
+}
+
+/// One `murmur.lock` entry a [`fetch_and_store`] pins.
+struct LockUpsert {
+    name: String,
+    version: String,
+    sha256: LockedSha256,
+    owner_id: Option<u64>,
+    /// The signer of a verified attestation; `None` clears the entry's `signer`.
+    signer: Option<String>,
+}
+
+impl FetchOutcome {
+    /// The outcome of pinning `payload` as `name@version` with `attestation`, its warnings judged
+    /// against the signer `lock` records for `name`.
+    #[allow(clippy::too_many_arguments)]
+    fn pinned(
+        name: &ArtifactName,
+        version: &str,
+        sha256: LockedSha256,
+        owner_id: Option<u64>,
+        payload: bytes::Bytes,
+        attestation: AttestationState,
+        origin: &str,
+        lock: Option<&MurmurLock>,
+    ) -> Self {
+        let recorded = lock
+            .and_then(|lock| lock.artifact_for(name.as_str()))
+            .and_then(|entry| entry.signer.as_deref());
+        let warnings = attestation_warnings(name, version, origin, &attestation, recorded);
+        Self {
+            bytes_len: payload.len() as u64,
+            lock_upsert: Some(LockUpsert {
+                name: name.to_string(),
+                version: version.to_string(),
+                sha256,
+                owner_id,
+                signer: attestation.signer().map(str::to_string),
+            }),
+            payload,
+            attestation,
+            warnings,
+        }
+    }
 }
 
 /// Where a declared artifact's payload is: already in the project store, in the global store, or
@@ -1408,6 +1734,7 @@ fn check_fits(
 /// Pin one artifact `store` already holds, or copy it from the global store, or fetch it from its
 /// scope's source, and write it to `store`. Each payload is held to its entry in `lock` as `check`
 /// says before it is stored.
+#[allow(clippy::too_many_arguments)]
 fn fetch_and_store(
     name: &ArtifactName,
     version: &str,
@@ -1415,36 +1742,64 @@ fn fetch_and_store(
     sources: &Sources,
     lock: Option<&MurmurLock>,
     store: &LocalRegistry,
+    global_store: &LocalRegistry,
     check: LockCheck,
 ) -> Result<FetchOutcome, CliError> {
     match held? {
         Held::Project(held) => {
             let pin = LockedSha256::any(&held.sha256);
             check_lock_entry(lock, name.as_str(), version, &pin, check)?;
-            Ok(FetchOutcome {
-                bytes_len: held.bytes.len() as u64,
-                lock_upsert: Some((
-                    name.to_string(),
-                    version.to_string(),
-                    pin,
-                    held.meta.owner_id,
-                )),
-                payload: held.bytes,
-            })
+            let (state, _) = check_stored_attestation(
+                store,
+                "the project store",
+                name,
+                version,
+                &held.sha256,
+                held.meta.owner_id,
+                lock,
+            )?;
+            Ok(FetchOutcome::pinned(
+                name,
+                version,
+                pin,
+                held.meta.owner_id,
+                held.bytes,
+                state,
+                "the project store",
+                lock,
+            ))
         }
         Held::Global(resolved) => {
             let pin = LockedSha256::any(&resolved.sha256);
             check_lock_entry(lock, name.as_str(), version, &pin, check)?;
-            let len = resolved.bytes.len() as u64;
             let owner_id = resolved.meta.owner_id;
+            let (state, bundle) = check_stored_attestation(
+                global_store,
+                "the global store",
+                name,
+                version,
+                &resolved.sha256,
+                owner_id,
+                lock,
+            )?;
             store
-                .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
+                .store_installed_attested(
+                    resolved.meta,
+                    &resolved.bytes,
+                    &resolved.sha256,
+                    bundle.as_deref(),
+                )
                 .map_err(|error| store_error(error, name.as_str(), version))?;
-            Ok(FetchOutcome {
-                bytes_len: len,
-                lock_upsert: Some((name.to_string(), version.to_string(), pin, owner_id)),
-                payload: resolved.bytes,
-            })
+            Ok(FetchOutcome::pinned(
+                name,
+                version,
+                pin,
+                owner_id,
+                resolved.bytes,
+                state,
+                "the global store",
+                lock,
+            ))
         }
         Held::Source => {
             let source = sources.source_for(name, Some(version))?;
@@ -1460,18 +1815,23 @@ fn fetch_and_store(
             let pin = LockedSha256::any(&resolved.sha256);
             check_lock_entry(lock, name.as_str(), version, &pin, check)?;
             store
-                .store_installed_overwrite(meta, &resolved.bytes, &resolved.sha256)
+                .store_installed_attested(
+                    meta,
+                    &resolved.bytes,
+                    &resolved.sha256,
+                    resolved.bundle.as_deref(),
+                )
                 .map_err(|error| store_error(error, name.as_str(), version))?;
-            Ok(FetchOutcome {
-                bytes_len: resolved.bytes.len() as u64,
-                lock_upsert: Some((
-                    name.to_string(),
-                    version.to_string(),
-                    pin,
-                    Some(resolved.owner_id),
-                )),
-                payload: resolved.bytes,
-            })
+            Ok(FetchOutcome::pinned(
+                name,
+                version,
+                pin,
+                Some(resolved.owner_id),
+                resolved.bytes,
+                resolved.attestation,
+                &resolved.source,
+                lock,
+            ))
         }
     }
 }
@@ -1522,7 +1882,7 @@ pub(crate) fn install_from_local_file(
         .map_err(|error| store_error(error, name.as_str(), &manifest.version))?;
     if let Some(lock_path) = lock_path {
         if let Some(adoption) =
-            upsert_lock_entry(lock_path, name.as_str(), &manifest.version, pin, None)?
+            upsert_lock_entry(lock_path, name.as_str(), &manifest.version, pin, None, None)?
         {
             capsule_runtime::report_println!("{adoption}");
         }

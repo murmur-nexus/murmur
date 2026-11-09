@@ -214,6 +214,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
                 owner_id: None,
+                signer: None,
             }],
         },
     )
@@ -689,6 +690,7 @@ fn mark_pulled_at_runtime(project_dir: &Path, pulls: &[(&str, &str)]) {
             session: "ses_stray".to_string(),
         },
         owner_id: None,
+        signer: None,
     });
     write_lockfile_atomic(&lock_path, &lock).unwrap();
 }

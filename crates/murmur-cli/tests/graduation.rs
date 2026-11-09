@@ -282,6 +282,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                     sha256: LockedSha256::any(entry.sha256.clone()),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 })
                 .collect(),
         };

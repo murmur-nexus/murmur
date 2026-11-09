@@ -649,6 +649,7 @@ mod tests {
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
                 owner_id: None,
+                signer: None,
             }],
         }
     }

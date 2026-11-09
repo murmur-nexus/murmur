@@ -15,7 +15,9 @@ use crate::{
         declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes,
         load_manifest_yaml_from_artifact_bytes,
     },
-    artifact_index::{asset_file_name, metadata_file_name, payload_stem, sha256_file_name},
+    artifact_index::{
+        asset_file_name, attestation_file_name, metadata_file_name, payload_stem, sha256_file_name,
+    },
     artifact_name::ArtifactName,
     build::artifact_name_format_error,
     build_info::{build_info_from_artifact_bytes, BUILD_INFO_FILE},
@@ -171,6 +173,31 @@ impl LocalRegistry {
             .join(metadata_file_name(name.name(), version))
     }
 
+    /// Path of the attestation sidecar: the Sigstore bundle the payload was installed with,
+    /// `<name>-<version>.sigstore.json`. Present only for a payload whose bundle verified.
+    #[must_use]
+    pub fn attestation_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
+        self.artifact_dir(name, version)
+            .join(attestation_file_name(name.name(), version))
+    }
+
+    /// The attestation sidecar kept beside `name@version`, or `None` when there is none.
+    pub fn read_attestation(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+    ) -> Result<Option<Bytes>, RegistryError> {
+        let path = self.attestation_path_for(name, version);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(Bytes::from(bytes))),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(RegistryError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
     /// The top-level directories of this store in the flat layout that predates scopes, sorted:
     /// a `<root>/<d>` holding some `<d>/<version>/<d>-<version>*.mur.zip` or `.sha256`. Nothing
     /// reads them; `mur doctor` reports them as safe to delete. A store that does not exist has
@@ -211,8 +238,22 @@ impl LocalRegistry {
         bytes: &[u8],
         expected_sha256: &str,
     ) -> Result<(), RegistryError> {
+        self.store_installed_attested(meta, bytes, expected_sha256, None)
+    }
+
+    /// Store an installed payload, replacing whatever `name@version` held, together with the
+    /// attestation it verified against. `Some` writes `<name>-<version>.sigstore.json` in the same
+    /// commit as the payload; `None` removes a sidecar an earlier install left, so a kept bundle
+    /// always belongs to the bytes beside it.
+    pub fn store_installed_attested(
+        &self,
+        meta: ArtifactMeta,
+        bytes: &[u8],
+        expected_sha256: &str,
+        attestation: Option<&[u8]>,
+    ) -> Result<(), RegistryError> {
         verify_sha256(meta.name.as_str(), &meta.version, bytes, expected_sha256)?;
-        self.write_artifact_set(&meta, bytes, expected_sha256, true)
+        self.write_artifact_set(&meta, bytes, expected_sha256, true, attestation)
     }
 
     fn write_artifact_set(
@@ -221,6 +262,7 @@ impl LocalRegistry {
         bytes: &[u8],
         sha256: &str,
         overwrite: bool,
+        attestation: Option<&[u8]>,
     ) -> Result<(), RegistryError> {
         refuse_native_payload(meta.name.as_str(), bytes)
             .map_err(|error| native_tool_error(meta.name.as_str(), &error))?;
@@ -283,8 +325,13 @@ impl LocalRegistry {
         let artifact_tmp = temp_path(&artifact_path, "zip", seed);
         let hash_tmp = temp_path(&hash_path, "sha", seed);
         let metadata_tmp = temp_path(&metadata_path, "meta", seed);
+        let attestation_path = self.attestation_path_for(&meta.name, &meta.version);
+        let attestation_tmp = temp_path(&attestation_path, "att", seed);
 
         let write_and_commit = (|| {
+            if let Some(attestation) = attestation {
+                write_file_sync(&attestation_tmp, attestation)?;
+            }
             write_file_sync(&artifact_tmp, bytes)?;
             write_file_sync(&hash_tmp, sha256.as_bytes())?;
             write_metadata(&metadata_tmp, &IndexMetadata { meta: meta.clone() }).map_err(
@@ -319,6 +366,28 @@ impl LocalRegistry {
             remove_file_if_exists(&artifact_tmp)?;
             remove_file_if_exists(&hash_tmp)?;
             remove_file_if_exists(&metadata_tmp)?;
+            remove_file_if_exists(&attestation_tmp)?;
+            return Err(error);
+        }
+
+        // The payload set is committed. A sidecar that cannot follow it is removed rather than
+        // left describing other bytes: the payload then reads as unattested.
+        let commit_attestation = match attestation {
+            Some(_) => fs::rename(&attestation_tmp, &attestation_path).map_err(|source| {
+                RegistryError::Io {
+                    path: format!(
+                        "{} -> {}",
+                        attestation_tmp.display(),
+                        attestation_path.display()
+                    ),
+                    source,
+                }
+            }),
+            None => remove_file_if_exists(&attestation_path),
+        };
+        if let Err(error) = commit_attestation {
+            remove_file_if_exists(&attestation_tmp)?;
+            let _ = fs::remove_file(&attestation_path);
             return Err(error);
         }
 
@@ -444,7 +513,7 @@ impl Registry for LocalRegistry {
         validate_version(&meta.version)?;
 
         let sha256 = sha256_hex(bytes);
-        self.write_artifact_set(&meta, bytes, &sha256, false)?;
+        self.write_artifact_set(&meta, bytes, &sha256, false, None)?;
 
         Ok(PublishResult {
             artifact_id: format!("{}@{}", meta.name, meta.version),
@@ -1170,6 +1239,97 @@ mod tests {
         let resolved = registry.resolve(&n("hello"), "0.0.2").unwrap();
         assert_eq!(resolved.bytes, Bytes::from_static(new_bytes));
         assert_eq!(resolved.sha256, new_sha);
+    }
+
+    #[test]
+    fn an_attested_install_keeps_its_bundle_and_a_plain_one_removes_it() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        assert_eq!(
+            registry.read_attestation(&n("hello"), "0.0.2").unwrap(),
+            None
+        );
+
+        let bytes = b"attested-bytes";
+        registry
+            .store_installed_attested(
+                test_meta("hello", "0.0.2"),
+                bytes,
+                &sha256_hex(bytes),
+                Some(b"{\"bundle\":1}"),
+            )
+            .unwrap();
+        let sidecar = registry.attestation_path_for(&n("hello"), "0.0.2");
+        assert_eq!(
+            sidecar,
+            dir.path().join("ana/hello/0.0.2/hello-0.0.2.sigstore.json")
+        );
+        assert_eq!(
+            registry.read_attestation(&n("hello"), "0.0.2").unwrap(),
+            Some(Bytes::from_static(b"{\"bundle\":1}"))
+        );
+
+        let other = b"other-bytes";
+        registry
+            .store_installed_overwrite(test_meta("hello", "0.0.2"), other, &sha256_hex(other))
+            .unwrap();
+        assert!(!sidecar.exists(), "a stale bundle outlived its payload");
+        assert_eq!(
+            registry.read_attestation(&n("hello"), "0.0.2").unwrap(),
+            None
+        );
+        assert_eq!(
+            files_in(&dir.path().join("ana/hello/0.0.2")),
+            vec![
+                "hello-0.0.2.meta.json",
+                "hello-0.0.2.mur.zip",
+                "hello-0.0.2.sha256"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_attested_install_writes_no_bundle() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let error = registry
+            .store_installed_attested(
+                test_meta("hello", "0.0.2"),
+                b"bytes",
+                &sha256_hex(b"other"),
+                Some(b"{}"),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::IntegrityMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(!registry.attestation_path_for(&n("hello"), "0.0.2").exists());
+    }
+
+    #[test]
+    fn store_scans_ignore_the_attestation_sidecar() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = b"a";
+        registry
+            .store_installed_attested(
+                test_meta("a", "1.0.0"),
+                bytes,
+                &sha256_hex(bytes),
+                Some(b"{}"),
+            )
+            .unwrap();
+        // A bundle with no payload beside it is not an artifact.
+        let orphan = dir.path().join("ana/b/1.0.0");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("b-1.0.0.sigstore.json"), b"{}").unwrap();
+
+        let index = registry.list_index().unwrap();
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].name.as_str(), "ana/a");
+        assert_eq!(index[0].description.as_deref(), Some("demo"));
+        assert!(registry.old_layout_entries().unwrap().is_empty());
     }
 
     #[test]

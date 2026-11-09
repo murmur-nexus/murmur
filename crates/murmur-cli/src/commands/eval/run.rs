@@ -1007,6 +1007,7 @@ fn run_one(
                     sha256: super::super::locked_sha256(entry),
                     origin: LockOrigin::Operator,
                     owner_id: None,
+                    signer: None,
                 })
                 .collect(),
         };

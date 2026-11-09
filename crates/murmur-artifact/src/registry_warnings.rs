@@ -31,6 +31,21 @@ pub const W_REG_003: &str = "W-REG-003";
 /// the operator's. `mur doctor` names it with the `mur install` that makes the pin the operator's.
 pub const W_REG_004: &str = "W-REG-004";
 
+/// An artifact installed from a source, or held in a store, with no attestation this `mur`
+/// verified: no `<asset>.sigstore.json` was published or kept beside it, or the one there is in a
+/// form this `mur` does not read.
+///
+/// `mur install` installs it and names it; nothing is refused, because a source is not required to
+/// publish attestations. `mur doctor` reports it for each declared artifact in that state.
+pub const W_REG_005: &str = "W-REG-005";
+
+/// An artifact whose verified signer differs from the `signer` its `murmur.lock` entry records,
+/// or that `murmur.lock` recorded as attested and that came back with no attestation.
+///
+/// The bytes still match whatever the lock pins, so nothing is refused: the warning names the
+/// workflow that published them now and the one recorded before.
+pub const W_REG_006: &str = "W-REG-006";
+
 /// Builds the doc link for a `W-REG-*` code, e.g. `.../diagnostics/#w-reg-001`.
 pub fn registry_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -44,7 +59,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_REG_002, W_REG_003, W_REG_004];
+        let codes = [W_REG_002, W_REG_003, W_REG_004, W_REG_005, W_REG_006];
         for code in codes {
             assert!(code.starts_with("W-REG-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

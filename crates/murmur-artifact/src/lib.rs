@@ -48,11 +48,12 @@ pub use artifact::{
     load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
 };
 pub use artifact_index::{
-    asset_file_name, compare_versions, derived_built_at_level, derived_tags, description_summary,
-    index_directory, index_scope_error, merge_indexes, metadata_file_name, murmur_interfaces,
-    release_tag_error, sha256_file_name, ArtifactIndex, ArtifactIndexError, IndexBuildError,
-    IndexedArtifact, IndexedAsset, IndexedVersion, MergeReport, ARTIFACT_FILE_SUFFIX,
-    ARTIFACT_INDEX_FILE_NAME, ARTIFACT_INDEX_SCHEMA_VERSION, MURMUR_INTERFACE_PREFIX,
+    asset_file_name, attestation_file_name, compare_versions, derived_built_at_level, derived_tags,
+    description_summary, index_directory, index_scope_error, merge_indexes, metadata_file_name,
+    murmur_interfaces, release_tag_error, sha256_file_name, ArtifactIndex, ArtifactIndexError,
+    IndexBuildError, IndexedArtifact, IndexedAsset, IndexedVersion, MergeReport,
+    ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME, ARTIFACT_INDEX_SCHEMA_VERSION,
+    ATTESTATION_FILE_SUFFIX, MURMUR_INTERFACE_PREFIX,
 };
 pub use artifact_name::{
     prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,
@@ -101,7 +102,9 @@ pub use registry::{
     LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
     RESERVED_VERSIONS,
 };
-pub use registry_warnings::{registry_warning_link, W_REG_002, W_REG_003, W_REG_004};
+pub use registry_warnings::{
+    registry_warning_link, W_REG_002, W_REG_003, W_REG_004, W_REG_005, W_REG_006,
+};
 pub use roster::{
     load_roster, member_name_format_error, resolve_roster_path, ReachabilityRule, Roster,
     RosterError, RosterMember, RosterReachability, MAX_MEMBER_NAME_LEN, REACHABILITY_ALL,

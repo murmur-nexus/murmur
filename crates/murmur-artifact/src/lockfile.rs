@@ -33,6 +33,9 @@ pub struct LockedArtifact {
     pub origin: LockOrigin,
     /// GitHub's numeric id of the scope's owner, written as `owner_id` only when known.
     pub owner_id: Option<u64>,
+    /// The workflow whose verified attestation covers the pinned payload, written as `signer`
+    /// only when one verified. Describes the bytes this entry pins, never an earlier pin.
+    pub signer: Option<String>,
 }
 
 /// Who wrote a lock entry's pin.
@@ -78,6 +81,8 @@ struct RawLockedArtifact {
     session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signer: Option<String>,
 }
 
 impl TryFrom<RawLockedArtifact> for LockedArtifact {
@@ -130,6 +135,7 @@ impl TryFrom<RawLockedArtifact> for LockedArtifact {
             sha256: LockedSha256 { any },
             origin,
             owner_id: raw.owner_id,
+            signer: raw.signer,
         })
     }
 }
@@ -150,6 +156,7 @@ impl From<LockedArtifact> for RawLockedArtifact {
             origin: Some(origin.to_string()),
             session,
             owner_id: entry.owner_id,
+            signer: entry.signer,
         }
     }
 }
@@ -198,6 +205,9 @@ impl LockedArtifact {
     pub fn pin(&mut self, resolved_version: &str, sha256: LockedSha256, origin: LockOrigin) {
         if origin == LockOrigin::Operator {
             self.origin = LockOrigin::Operator;
+        }
+        if self.sha256 != sha256 {
+            self.signer = None;
         }
         self.sha256 = sha256;
         self.resolved_version = resolved_version.to_string();
@@ -291,6 +301,7 @@ impl MurmurLock {
                 sha256,
                 origin,
                 owner_id: None,
+                signer: None,
             });
             None
         }
@@ -302,6 +313,18 @@ impl MurmurLock {
         match self.artifacts.iter_mut().find(|entry| entry.name == name) {
             Some(entry) => {
                 entry.owner_id = Some(owner_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record `signer` on `name`'s entry, or clear it with `None`. Returns `false`, changing
+    /// nothing, when there is no such entry.
+    pub fn set_signer(&mut self, name: &str, signer: Option<String>) -> bool {
+        match self.artifacts.iter_mut().find(|entry| entry.name == name) {
+            Some(entry) => {
+                entry.signer = signer;
                 true
             }
             None => false,
@@ -352,6 +375,16 @@ impl MurmurLock {
                 )));
             }
             entry.sha256.validate(&entry.name)?;
+            if entry
+                .signer
+                .as_deref()
+                .is_some_and(|signer| signer.trim().is_empty())
+            {
+                return Err(LockfileError::Invalid(format!(
+                    "artifact '{}' has an empty signer",
+                    entry.name
+                )));
+            }
             if let LockOrigin::Runtime { session } = &entry.origin {
                 if session.trim().is_empty() {
                     return Err(LockfileError::Invalid(format!(
@@ -480,6 +513,7 @@ mod tests {
             sha256,
             origin: LockOrigin::Operator,
             owner_id: None,
+            signer: None,
         }
     }
 
@@ -788,6 +822,73 @@ mod tests {
         assert_eq!(raw.matches("owner_id: 12345").count(), 1, "{raw}");
         assert_eq!(raw.matches("owner_id").count(), 1, "{raw}");
         assert_eq!(read_lockfile(&path).unwrap(), lock);
+    }
+
+    #[test]
+    fn lockfile_signer_is_kept_when_present_and_omitted_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 3\nartifacts:\n  - name: ana/tool-x\n    resolved_version: 1.0.0\n    sha256:\n      any: abc\n    origin: operator\n    owner_id: 12345\n    signer: https://github.com/ana/artifacts/.github/workflows/release.yml\n  - name: ana/tool-y\n    resolved_version: 1.0.0\n    sha256:\n      any: def\n",
+        )
+        .unwrap();
+
+        let mut lock = read_lockfile(&path).unwrap();
+        assert_eq!(LOCK_VERSION, 3);
+        assert_eq!(
+            lock.artifact_for("ana/tool-x").unwrap().signer.as_deref(),
+            Some("https://github.com/ana/artifacts/.github/workflows/release.yml")
+        );
+        assert_eq!(lock.artifact_for("ana/tool-y").unwrap().signer, None);
+
+        assert!(lock.set_signer(
+            "ana/tool-y",
+            Some("https://github.com/ana/artifacts/.github/workflows/other.yml".to_string())
+        ));
+        assert!(!lock.set_signer("ana/absent", Some("x".to_string())));
+        write_lockfile_atomic(&path, &lock).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("signer:").count(), 2, "{raw}");
+        assert_eq!(read_lockfile(&path).unwrap(), lock);
+
+        assert!(lock.set_signer("ana/tool-x", None));
+        assert!(lock.set_signer("ana/tool-y", None));
+        write_lockfile_atomic(&path, &lock).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("signer"), "{raw}");
+        assert!(raw.starts_with("lock_version: 3\n"), "{raw}");
+    }
+
+    #[test]
+    fn an_empty_signer_is_refused() {
+        let mut lock = lock_with(vec![entry("ana/tool-x", "1.0.0", LockedSha256::any("abc"))]);
+        lock.set_signer("ana/tool-x", Some("  ".to_string()));
+        let error = lock.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("artifact 'ana/tool-x' has an empty signer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_new_pin_drops_the_signer_of_the_bytes_it_replaced() {
+        let mut lock = lock_with(vec![entry("ana/tool-x", "1.0.0", LockedSha256::any("abc"))]);
+        lock.set_signer("ana/tool-x", Some("https://example/wf.yml".to_string()));
+        lock.upsert(
+            "ana/tool-x",
+            "1.0.0",
+            LockedSha256::any("abc"),
+            LockOrigin::Operator,
+        );
+        assert!(lock.artifact_for("ana/tool-x").unwrap().signer.is_some());
+        lock.upsert(
+            "ana/tool-x",
+            "1.1.0",
+            LockedSha256::any("def"),
+            LockOrigin::Operator,
+        );
+        assert_eq!(lock.artifact_for("ana/tool-x").unwrap().signer, None);
     }
 
     #[test]
