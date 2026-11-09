@@ -18,7 +18,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `runtime` | string | yes | The artifact's role. When `execution` is absent, `skill` packages as `static` and every other role packages as `wasm`. |
 | `implementation` | `wasm` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. A tool is a WASM component: `native` is refused with [`E-BLD-007`](diagnostics.md#e-bld-007), and any other value is an invalid-type error. |
 | `execution` | `wasm \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime`. Case-insensitive. `native` is refused with [`E-BLD-007`](diagnostics.md#e-bld-007); any other value is a parse error. |
-| `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A skill ships supporting files by listing them here (`references/forms.md`); a skill folder with no `murmur.yaml` instead packs every file in it — see [`mur build` skill packaging](cli.md#skill-packaging-skill). A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
+| `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: empty. A skill has no `murmur.yaml` of its own and no `requires_files`: `mur build` packs every file in its folder — see [`mur build` skill packaging](cli.md#skill-packaging-skill). A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 | `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
 | `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens` and `vision`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
@@ -945,14 +945,14 @@ opts in: edit the file, relaunch the capsule, and the change is live — no buil
 
 ```yaml
 artifacts:
-  # source points directly at a skill.md file — skill defaults local_source to true
-  - name: house-style
-    source: ./skills/house-style/skill.md
-    runtime: skill
-
-  # source points at a skill folder: skill.md (any casing) and its supporting files
+  # source points at a skill folder: SKILL.md and its supporting files — skill defaults local_source to true
   - name: review-conventions
     source: ./skills/review-conventions/
+    runtime: skill
+
+  # source points directly at a SKILL.md file
+  - name: house-style
+    source: ./skills/house-style/SKILL.md
     runtime: skill
 
   # a non-skill role must opt in explicitly
@@ -977,18 +977,27 @@ Rules:
 - **A relative path resolves against the manifest**: the folder holding `murmur.yaml`, or the
   installed package of a capsule run by name — see
   [Paths a manifest names](#manifest-relative-paths). Absolute paths are used as-is.
-- **For a skill, `source` may point at a `skill.md` file or at a skill folder.**
+- **For a skill, `source` may point at a skill folder or at a `SKILL.md` file**, on the host or
+  inside an installed capsule package.
 
-    | `source` | Installed under `tools/<name>/` |
-    |---|---|
-    | A file | That file as `skill.md`, read regardless of its name |
-    | A folder | Its `skill.md`, found case-insensitively (`SKILL.md`, `Skill.md`, … all match) and installed as lowercase `skill.md`, and every supporting file at its relative path, chosen by the rules [`mur build`](cli.md#skill-packaging-skill) packs a skill folder with. The folder's own `murmur.yaml` is not installed. |
+    | `source` | Installed under `tools/<name>/` | Folder the front block `name` must equal |
+    |---|---|---|
+    | A folder | Its `SKILL.md` and every supporting file at its relative path, chosen by the rules [`mur build`](cli.md#skill-packaging-skill) packs a skill folder with | The folder |
+    | A file | That file alone, as `SKILL.md`. The file must be named `SKILL.md` | The folder holding the file. A `SKILL.md` at an installed package's root has none and is refused |
+
+    Beside them the runtime writes a generated `murmur.yaml`: the entry's name, its version,
+    `runtime: skill`, and the front block's `description`, which the tool inventory and
+    `MURMUR.md` show.
+
+- **`SKILL.md` is checked at launch** by the [skill packaging](cli.md#skill-packaging-skill) rules
+  of `mur build`, except `metadata.version`, which is not needed and not read. The entry's `name`
+  is the tool name and is not compared with the front block's `name`.
 
 - Everything downstream is identical to a registry skill: the files are installed under
   `tools/<name>/` in the session's [runtime directory](workdir.md#runtime-directory) and the skill
   is listed under `## Installed Skills` in `MURMUR.md`.
 - A non-skill artifact declaring `local_source: true` passes manifest validation, but only a
-  skill-shaped local payload — a `skill.md` file, or a directory containing one — resolves at
+  skill-shaped local payload — a `SKILL.md` file, or a folder holding one — resolves at
   launch.
 
 Failure modes (all exit non-zero before the workdir is created):
@@ -997,8 +1006,9 @@ Failure modes (all exit non-zero before the workdir is created):
 |---|---|---|
 | `source` declared without `local_source: true` | `E-MAN-003` | `artifact '<name>' declares 'source:' but does not declare 'local_source: true' (runtime: <role>)` |
 | `source` path does not exist | `E-IO-001` | `skill source path not found: <path>` |
-| `source` directory has no `skill.md` | `E-IO-001` | `skill source directory '<path>' contains no skill.md` |
-| `source` directory holds a symlink, both `SKILL.md` and `skill.md`, or a root `murmur-build.json` | `E-BLD-002` | `skill source refused: <what and where>` |
+| `source` directory has no `SKILL.md` | `E-IO-001` | `skill source directory '<path>' contains no SKILL.md` |
+| `source` directory holds a symlink or a root `murmur-build.json` | `E-BLD-002` | `skill source refused: <what and where>` |
+| `SKILL.md` breaks a front block rule, the skill's file is named `skill.md` in another casing, or a `murmur.yaml` sits beside `SKILL.md` | [`E-BLD-009`](diagnostics.md#e-bld-009) | `<path>: <rule>` |
 
 Local-source artifacts are never written to `murmur.lock` and are skipped by `mur install` — they
 are resolved fresh from disk on every `mur run`.
@@ -1006,7 +1016,9 @@ are resolved fresh from disk on every `mur run`.
 ##### `inference.system_prompt_artifact` { #inference-system-prompt-artifact }
 
 Names an artifact declared in `artifacts:`, by its entry's `name` as written, whose content is
-read once at launch and bound as the system prompt, instead of being called on demand. The named artifact must declare
+read once at launch and bound as the system prompt, instead of being called on demand. For a
+skill, the content is the body of its `SKILL.md`: the text after the front block's closing `---`
+line, with leading blank lines removed. The named artifact must declare
 `prompt_payload: true`, or default to it as `runtime: skill` does; naming an artifact where
 `prompt_payload` is `false` fails with `E-MAN-003`. A skill bound this
 way is excluded from the callable tool inventory, because it is already in the system prompt. See
@@ -1057,7 +1069,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory; a capsule that declares nothing is not offered it. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
-| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that a pull — `manage.pull`, or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool — may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md`, plus any supporting files packed beside it, which install read-only and not executable under `tools/<name>/`. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` and `remove-artifact` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
+| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that a pull — `manage.pull`, or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool — may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `SKILL.md`, plus any supporting files packed beside it, which install read-only and not executable under `tools/<name>/`. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` and `remove-artifact` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
 | `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools that a pull may install, as [install entries](#install-entries). A pulled tool joins the dispatch allowlist. The same entries let a removal uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
 | `capabilities.install.from` | `[stores] \| [stores, sources]` | no | Where a pull finds what it installs. Default: `[stores]`, the project store then the global store. `[stores, sources]` (in either order) also fetches a version no store holds from the GitHub source of the artifact's scope; the runtime fetches it, records the owner id in `murmur.lock` and writes it to no store. An empty list, a list without `stores`, a duplicate and any other value are refused with `E-MAN-003`. `mur run --explain-scope` and `mur doctor` report it as `install from`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_from`. A spawned child declaring `sources` under a parent without it is refused. |
 | `capabilities.spawn.allow` | list<string> | no | Full names, `<scope>/<name>`, of the capsules this capsule may spawn as sub-capsules. A bare name is refused with `E-MAN-003`, and so are two entries with the same bare part, because `delegate-task` offers each capsule to the model by its bare part. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with the bare part of each name as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
@@ -1184,7 +1196,7 @@ capabilities:
 
 | Key | Admits |
 |---|---|
-| `skill` | Artifacts whose payload is a `skill.md`, declared `runtime: skill` |
+| `skill` | Artifacts whose payload is a `SKILL.md`, declared `runtime: skill` |
 | `tool` | Artifacts whose payload is a WASM component, declared `runtime: tool` |
 
 An artifact matches only the list for its own kind: `skill: ["*"]` admits no tool. A `driver` or
@@ -2073,7 +2085,7 @@ What the model can do with an artifact once it is offered depends on its runtime
 
 | Pulled artifact | Offered | Callable |
 |---|---|---|
-| `runtime: skill` | Yes, with no input parameters | Yes: calling it returns its `skill.md` |
+| `runtime: skill` | Yes, with no input parameters | Yes: calling it returns the body of its `SKILL.md` |
 | The skill named by [`inference.system_prompt_artifact`](#inference-system-prompt-artifact) | No | — |
 | A tool not declared in `artifacts:` | Yes | Yes: a pulled tool joins the dispatch allowlist |
 | `runtime: driver` or `runtime: hook` | No | — |

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use murmur_artifact::{skill_md_description, ArtifactRuntime, PACKED_MANIFEST_ENTRY};
+use murmur_artifact::{ArtifactRuntime, PACKED_MANIFEST_ENTRY, SKILL_MD_ENTRY};
 use serde_norway::Value;
 
 use crate::{
@@ -37,8 +37,7 @@ pub(crate) fn formation_member_line(member: &str) -> String {
 
 /// Sanitizes a description string before it is rendered into MURMUR.md.
 ///
-/// A malicious artifact publisher controls `description` (and, for skills without one, the
-/// first line of `skill.md`) — this collapses embedded newlines/tabs to spaces (so a
+/// A malicious artifact publisher controls `description` — this collapses embedded newlines/tabs to spaces (so a
 /// description cannot forge a fake Markdown heading or a new "trusted-looking" section),
 /// drops backticks (so a description cannot prematurely close one of MURMUR.md's own fenced
 /// code blocks) and other control characters, collapses repeated whitespace, and caps the
@@ -494,7 +493,7 @@ fn build_skills_section(
             if !matches!(kind, EntryKind::Directory | EntryKind::Symlink) {
                 continue;
             }
-            let skill_md = format!("tools/{name}/skill.md");
+            let skill_md = format!("tools/{name}/{SKILL_MD_ENTRY}");
             match runtime_root.entry_kind(&skill_md) {
                 Ok(Some(EntryKind::File)) => {}
                 // A link where the runtime staged a file: reading it refuses and latches it, and
@@ -506,7 +505,8 @@ fn build_skills_section(
                 _ => continue,
             }
 
-            // Read description from manifest, fall back to how skill.md describes itself.
+            // Every staged skill manifest carries the SKILL.md front block's description: `mur
+            // build` packs it, and staging writes it for a local source.
             let description = sanitize_description(
                 &runtime_root
                     .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
@@ -517,16 +517,8 @@ fn build_skills_section(
                         v.get("description")
                             .and_then(|d| d.as_str())
                             .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
                     })
-                    .unwrap_or_else(|| {
-                        runtime_root
-                            .read_to_string(&skill_md)
-                            .ok()
-                            .flatten()
-                            .and_then(|text| skill_md_description(&text))
-                            .unwrap_or_default()
-                    }),
+                    .unwrap_or_default(),
             );
 
             let is_system_prompt = system_prompt_artifact == Some(name.as_str());
@@ -551,7 +543,7 @@ fn build_skills_section(
          \n",
     );
     for entry in &skill_entries {
-        let path = runtime_root.host_path(format!("tools/{}/skill.md", entry.name));
+        let path = runtime_root.host_path(format!("tools/{}/{SKILL_MD_ENTRY}", entry.name));
         let path = path.display();
         if entry.is_system_prompt {
             out.push_str(&format!(
@@ -790,44 +782,39 @@ mod tests {
         }
     }
 
-    /// A local-source skill carries no manifest description, so MURMUR.md describes it from its
-    /// `skill.md`: the front block's description, else the first line after the block, else the
-    /// first line of a skill with no block.
+    /// A skill is described from its staged manifest alone; the front block of its `SKILL.md`
+    /// is never read for MURMUR.md, and the listed path is the installed `SKILL.md`.
     #[test]
-    fn skills_section_describes_a_skill_from_its_front_block() {
+    fn skills_section_describes_a_skill_from_its_manifest() {
         let tmp = TempDir::new().unwrap();
-        for (name, skill_md) in [
+        for (name, manifest) in [
             (
-                "fronted",
-                "---\nname: fronted\ndescription: Fill PDF forms.\n---\n# Fronted\n",
+                "pdf-helper",
+                "name: pdf-helper\nversion: 0.0.0\nruntime: skill\ndescription: Fill PDF forms; use when a form must be filled.\n",
             ),
-            (
-                "nameonly",
-                "---\nname: nameonly\n---\n\n# After the block\n",
-            ),
-            ("plain", "\n# Plain skill\nBody.\n"),
+            ("bare", "name: bare\nversion: 0.0.0\nruntime: skill\n"),
         ] {
             let dir = tmp.path().join("tools").join(name);
             fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(PACKED_MANIFEST_ENTRY), manifest).unwrap();
             fs::write(
-                dir.join(PACKED_MANIFEST_ENTRY),
-                format!("name: {name}\nversion: 0.0.0\nruntime: skill\n"),
+                dir.join(SKILL_MD_ENTRY),
+                format!("---\nname: {name}\ndescription: From the front block.\n---\n# Body\n"),
             )
             .unwrap();
-            fs::write(dir.join("skill.md"), skill_md).unwrap();
         }
 
         let section = build_skills_section(&WorkdirRoot::open(tmp.path()).unwrap(), None);
+        let path = tmp.path().join("tools/pdf-helper/SKILL.md");
         assert!(
-            section.contains("**fronted** — Fill PDF forms."),
+            section.contains(&format!(
+                "- **pdf-helper** — Fill PDF forms; use when a form must be filled. *(call by name to load guidance; {})*",
+                path.display()
+            )),
             "{section}"
         );
-        assert!(
-            section.contains("**nameonly** — # After the block"),
-            "{section}"
-        );
-        assert!(section.contains("**plain** — # Plain skill"), "{section}");
-        assert!(!section.contains("— ---"), "{section}");
+        assert!(section.contains("- **bare** —  *("), "{section}");
+        assert!(!section.contains("From the front block"), "{section}");
     }
 
     /// MURMUR.md for the runtime directory `tmp`, from [`test_inputs`] as `edit` leaves them.
@@ -1821,7 +1808,7 @@ mod tests {
         let content = render(&tmp, |_| {});
         assert!(
             !content.contains("## Installed Skills"),
-            "skills section should not appear when no skill.md files are installed"
+            "skills section should not appear when no SKILL.md files are installed"
         );
     }
 
@@ -1836,7 +1823,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            skill_dir.join("skill.md"),
+            skill_dir.join(SKILL_MD_ENTRY),
             "# My Skill\nGuidance content.\n",
         )
         .unwrap();
@@ -1844,7 +1831,7 @@ mod tests {
         let content = render(&tmp, |_| {});
         assert!(
             content.contains("## Installed Skills"),
-            "skills section should appear when skill.md is installed"
+            "skills section should appear when SKILL.md is installed"
         );
         assert!(
             content.contains("**my-skill**"),
@@ -1874,7 +1861,7 @@ mod tests {
             "name: my-skill\nversion: 0.1.0\nruntime: skill\n",
         )
         .unwrap();
-        fs::write(skill_dir.join("skill.md"), "# My Skill\n").unwrap();
+        fs::write(skill_dir.join(SKILL_MD_ENTRY), "# My Skill\n").unwrap();
 
         let content = render(&tmp, |_| {});
         // Skills are now LLM-visible and appear in Installed Tools.
@@ -1902,7 +1889,7 @@ mod tests {
             "name: sys-skill\nversion: 0.1.0\nruntime: skill\ndescription: System instructions\n",
         )
         .unwrap();
-        fs::write(skill_dir.join("skill.md"), "You are an expert.\n").unwrap();
+        fs::write(skill_dir.join(SKILL_MD_ENTRY), "You are an expert.\n").unwrap();
 
         let inference = InferenceConfig {
             transport: "http".into(),
@@ -2073,33 +2060,25 @@ mod tests {
     }
 
     #[test]
-    fn malicious_skill_fallback_description_is_sanitized() {
-        // The fallback only ever uses the first non-empty line of skill.md (`.lines().find(...)`),
-        // so a real embedded-newline attack can't reach it via `\n` — but the first line itself
-        // can still carry a lone `\r` (not a `\n`+`\r` pair, so `str::lines()` doesn't split on
-        // it) and backticks, both of which sanitize_description must still strip.
+    fn malicious_skill_description_is_sanitized() {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join("tools").join("evil-skill");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join(PACKED_MANIFEST_ENTRY),
-            "name: evil-skill\nversion: 0.1.0\nruntime: skill\n",
+            "name: evil-skill\nversion: 0.1.0\nruntime: skill\ndescription: \"first line\\ruses a lone CR and `backticks`\\n## a real second line\"\n",
         )
         .unwrap();
-        fs::write(
-            skill_dir.join("skill.md"),
-            "first line\ruses a lone CR and `backticks`\n## a real second line\n",
-        )
-        .unwrap();
+        fs::write(skill_dir.join(SKILL_MD_ENTRY), "# Evil\n").unwrap();
 
         let content = render(&tmp, |_| {});
         let expected_bullet = format!(
-            "- **evil-skill** — first line uses a lone CR and backticks *(call by name to load \
-             guidance; {})*\n",
-            tmp.path().join("tools/evil-skill/skill.md").display()
+            "- **evil-skill** — first line uses a lone CR and backticks ## a real second line \
+             *(call by name to load guidance; {})*\n",
+            tmp.path().join("tools/evil-skill/SKILL.md").display()
         );
         assert!(content.contains(&expected_bullet), "content: {content}");
-        assert!(!content.contains("a real second line"));
+        assert!(!content.contains("\n## a real second line"));
     }
 
     #[test]

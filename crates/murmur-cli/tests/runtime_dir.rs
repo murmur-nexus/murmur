@@ -25,7 +25,8 @@ use tempfile::TempDir;
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const SKILL: &str = "rd-skill";
-const SKILL_BODY: &str = "# rd skill\n\nThe original guidance of the runtime-directory skill.\n";
+/// The skill's `SKILL.md`: a front block naming the skill after its folder, then the guidance.
+const SKILL_MD: &str = "---\nname: rd-skill\ndescription: Guidance of the runtime-directory skill.\n---\n# rd skill\n\nThe original guidance of the runtime-directory skill.\n";
 const TASK: &str = "Probe the runtime directory and report.";
 const PROBE_TOOL: &str = "runtime-dir-probe";
 const PROBE_ARTIFACT: &str = "local/runtime-dir-probe";
@@ -133,12 +134,12 @@ fn project(endpoint: &str, spec: &Spec<'_>) -> Project {
     let mut artifacts = format!(
         "  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    \
          gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  - name: {SKILL}\n    \
-         source: ./skills/{SKILL}/skill.md\n    runtime: skill\n"
+         source: ./skills/{SKILL}/SKILL.md\n    runtime: skill\n"
     );
     artifacts.push_str(spec.extra_artifacts);
     let skill_dir = project.path().join("skills").join(SKILL);
     fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(skill_dir.join("skill.md"), SKILL_BODY).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), SKILL_MD).unwrap();
 
     let shell = SHELL_ALLOW
         .iter()
@@ -220,7 +221,7 @@ fn attack_script() -> String {
     );
     script.push_str("echo \"RD-TASK|$(cat \"$MURMUR_RUNTIME_DIR/task.md\")\"\n");
     script.push_str(&format!(
-        "echo \"RD-SKILL|$(cat \"$MURMUR_RUNTIME_DIR/tools/{SKILL}/skill.md\" | head -c 40)\"\n"
+        "echo \"RD-SKILL|$(cat \"$MURMUR_RUNTIME_DIR/tools/{SKILL}/SKILL.md\" | head -c 40)\"\n"
     ));
     script.push_str("echo \"RD-MURMUR|$(head -c 40 \"$MURMUR_RUNTIME_DIR/MURMUR.md\")\"\n");
     script.push_str("echo \"RD-MANIFEST|$(wc -c < \"$MURMUR_RUNTIME_DIR/murmur.yaml\")\"\n");
@@ -231,7 +232,7 @@ fn attack_script() -> String {
 /// Every runtime file the attacks aim at, relative to the runtime directory.
 fn runtime_files() -> Vec<(&'static str, String)> {
     vec![
-        ("skill", format!("tools/{SKILL}/skill.md")),
+        ("skill", format!("tools/{SKILL}/SKILL.md")),
         ("manifest", "murmur.yaml".to_string()),
         ("task", "task.md".to_string()),
         ("murmur", "MURMUR.md".to_string()),
@@ -358,7 +359,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
                 .to_string()
         };
         assert_eq!(line("RD-TASK|"), TASK);
-        assert_eq!(line("RD-SKILL|"), SKILL_BODY.lines().next().unwrap());
+        assert_eq!(line("RD-SKILL|"), SKILL_MD.lines().next().unwrap());
         assert!(line("RD-MURMUR|").starts_with("# MURMUR.md"));
         let manifest_len = fs::metadata(&p.manifest).unwrap().len();
         assert_eq!(line("RD-MANIFEST|").trim(), manifest_len.to_string());
@@ -787,7 +788,7 @@ fn murmur_md_names_resolve() {
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
     let entries = format!(
         "  - name: {PROBE_ARTIFACT}\n    version: 0.1.0\n    runtime: tool\n  - name: {BOUND}\n    \
-         source: ./skills/{BOUND}/skill.md\n    runtime: skill\n"
+         source: ./skills/{BOUND}/SKILL.md\n    runtime: skill\n"
     );
     let p = project(
         &server.endpoint,
@@ -800,7 +801,10 @@ fn murmur_md_names_resolve() {
     );
     let bound_dir = p.project.path().join("skills").join(BOUND);
     fs::create_dir_all(&bound_dir).unwrap();
-    fs::write(bound_dir.join("skill.md"), "You are the bound skill.\n").unwrap();
+    fs::write(
+        bound_dir.join("SKILL.md"),
+        "---\nname: rd-bound\ndescription: The bound system prompt.\n---\nYou are the bound skill.\n",
+    ).unwrap();
     let manifest = fs::read_to_string(&p.manifest).unwrap().replace(
         "inference:\n  transport: http\n",
         &format!("inference:\n  transport: http\n  system_prompt_artifact: {BOUND}\n"),

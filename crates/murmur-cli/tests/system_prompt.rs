@@ -336,6 +336,49 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
     assert_eq!(session_start(&records)["system_prompt_source"], "cli");
 }
 
+/// A skill bound by `system_prompt_artifact` prompts the model with its `SKILL.md` body alone:
+/// the front block names and describes the skill and never reaches the model.
+#[test]
+fn a_bound_skill_prompts_with_its_skill_md_body_exactly() {
+    let fixture = CliFixture::new(vec![one_turn_response()]);
+    let manifest_path = create_agent_manifest_full(
+        fixture.project.path(),
+        &fixture.server.endpoint,
+        &format!(
+            "  - name: local/{SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n"
+        ),
+        "",
+        &format!("  system_prompt_artifact: local/{SKILL_NAME}\n"),
+        "trace:\n  capture: content\n",
+    );
+    let skill = common::create_skill_artifact(
+        fixture.artifacts.path(),
+        SKILL_NAME,
+        SKILL_VERSION,
+        SKILL_CONTENT,
+    );
+    fixture.install(&skill);
+    fixture.install_driver();
+
+    let records = fixture.run_ok(&manifest_path, &[]);
+
+    let start = session_start(&records);
+    let sha = start["system_prompt_sha256"].as_str().unwrap();
+    assert_eq!(sha, sha256_hex_of(SKILL_CONTENT));
+    assert_eq!(
+        fs::read_to_string(records.join("blobs").join(sha)).unwrap(),
+        SKILL_CONTENT,
+        "the resolved prompt is the SKILL.md body, byte for byte"
+    );
+    let system_field = fixture.only_system_field();
+    assert!(system_field.contains(SKILL_CONTENT), "{system_field}");
+    assert!(
+        !system_field.contains(&format!("name: {SKILL_NAME}"))
+            && !system_field.contains("metadata:"),
+        "the front block must not reach the model; got:\n{system_field}"
+    );
+}
+
 /// A turn that prints the runtime directory's MURMUR.md, then one that ends.
 fn read_murmur_md_responses() -> Vec<String> {
     vec![

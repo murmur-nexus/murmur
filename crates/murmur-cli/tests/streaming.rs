@@ -856,7 +856,7 @@ fn artifact_frame_of_a_skill_result_carries_no_fence() {
     assert_eq!(
         artifact["content"].as_str(),
         Some(guidance),
-        "the skill.md text must reach the frame verbatim: {artifact}"
+        "the SKILL.md body must reach the frame verbatim: {artifact}"
     );
 
     let events = trace_events(&launched);

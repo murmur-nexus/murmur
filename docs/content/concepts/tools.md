@@ -61,7 +61,7 @@ forks into the background and exits.
 Each tool call is resolved in a fixed precedence order:
 
 1. The shell allowlist
-2. A skill artifact (`tools/<name>/skill.md` in the [runtime directory](../reference/workdir.md#runtime-directory), returned directly)
+2. A skill artifact (the body of `tools/<name>/SKILL.md` in the [runtime directory](../reference/workdir.md#runtime-directory), returned directly)
 3. A WASM-artifact tool
 4. Otherwise, an error
 

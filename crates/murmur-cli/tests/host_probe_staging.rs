@@ -113,12 +113,16 @@ fn staging_twice_in_one_process_takes_one_probe_each() {
 
     let skill_dir = capsule_dir.path().join("skills").join("my-skill");
     fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(skill_dir.join("skill.md"), "# Local Skill\n").unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: A local skill.\n---\n# Local Skill\n",
+    )
+    .unwrap();
 
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(
         &manifest_path,
-        "name: cap\nversion: 0.1.0\nartifacts:\n  - name: my-skill\n    source: ./skills/my-skill/skill.md\n    runtime: skill\n",
+        "name: cap\nversion: 0.1.0\nartifacts:\n  - name: my-skill\n    source: ./skills/my-skill/SKILL.md\n    runtime: skill\n",
     )
     .unwrap();
     let manifest = load_runtime_manifest(&manifest_path).unwrap();

@@ -28,10 +28,11 @@ const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The one tool a plan step in this file calls. A skill, because a skill needs no component and
-/// no host support: the runtime reads `skill.md` and hands the bytes back as the step's output.
+/// no host support: the runtime reads `SKILL.md` and hands its body back as the step's output.
 const SKILL: &str = "notes";
 /// Spelled nowhere else, so finding it in a step's output means it came from the skill file.
-const SKILL_BODY: &str = "# Notes\nNOTES-BODY-7F3Q-PLAN\n";
+const SKILL_MD: &str =
+    "---\nname: notes\ndescription: Notes for a plan step.\n---\n# Notes\nNOTES-BODY-7F3Q-PLAN\n";
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -69,7 +70,7 @@ fn write_project_with(
 ) -> PathBuf {
     let skill_dir = project.join("skills").join(SKILL);
     fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(skill_dir.join("skill.md"), SKILL_BODY).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), SKILL_MD).unwrap();
 
     let plan_block = if plan_grant {
         "  plan:\n    submit: true\n"
@@ -100,7 +101,7 @@ fn write_project_with(
         "name: plan-capsule\nversion: 0.1.0\nartifacts:\n  \
          - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
          \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
-         - name: {SKILL}\n    source: ./skills/{SKILL}/skill.md\n    runtime: skill\n\
+         - name: {SKILL}\n    source: ./skills/{SKILL}/SKILL.md\n    runtime: skill\n\
          capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
          {plan_block}{shell_block}{filesystem_block}\
          inference:\n  transport: http\n  model: test-model\n  \

@@ -84,7 +84,10 @@ fn release_dir() -> TempDir {
         dir.path(),
         "skill-notes-0.1.0.mur.zip",
         "name: skill-notes\nversion: 0.1.0\nruntime: skill\ndescription: Take notes!\n",
-        &[("skill.md", b"# Notes\n")],
+        &[(
+            "SKILL.md",
+            b"---\nname: skill-notes\ndescription: Take notes!\n---\n# Notes\n",
+        )],
     );
     fs::write(dir.path().join("notes.txt"), "not an artifact").unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
@@ -579,7 +582,10 @@ fn a_skill_payload_without_wasm_still_indexes() {
         dir.path(),
         "skill-notes-0.1.0.mur.zip",
         "name: skill-notes\nversion: 0.1.0\nruntime: skill\n",
-        &[("skill.md", b"# Notes\n")],
+        &[(
+            "SKILL.md",
+            b"---\nname: skill-notes\ndescription: Take notes!\n---\n# Notes\n",
+        )],
     );
     let out = TempDir::new().unwrap();
     mur_index(

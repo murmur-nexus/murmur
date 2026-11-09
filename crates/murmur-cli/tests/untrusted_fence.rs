@@ -378,7 +378,7 @@ fn wasm_and_shell_tool_results_carry_the_same_fence() {
 }
 
 /// The one exemption: a skill result is the capsule author's own guidance, read from a
-/// manifest-declared `skill.md` staged at install. It reaches the model verbatim and unmarked,
+/// manifest-declared `SKILL.md` staged at install. Its body reaches the model verbatim and unmarked,
 /// and the trace still records it as a `skill_call` rather than a `tool_call`.
 #[test]
 fn skill_result_reaches_the_model_unfenced() {

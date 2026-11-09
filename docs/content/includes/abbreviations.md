@@ -2,7 +2,7 @@
 
 *[artifacts[].runtime]: tool: tool visible to model · default | driver: inference driver · hidden | hook: lifecycle observer · hidden | skill: guidance file · agent reads voluntarily
 
-*[artifacts[].source]: local path to skill.md or directory · skill artifacts only · bypasses registry
+*[artifacts[].source]: local skill folder or SKILL.md · default on for skills · bypasses registry
 
 *[capabilities.filesystem.allow]: path prefixes the tool may use as a repo root · validated before any git operation
 

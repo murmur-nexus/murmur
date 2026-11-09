@@ -108,7 +108,7 @@ holds.
 
 | Content | Why |
 |---|---|
-| An operator-pinned skill's `skill.md` | The capsule author's own guidance, staged inside the capsule at install. Fencing it as data would make the skill inert. A skill whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule pulled is fenced — see [Artifact origin](../concepts/access-control.md#artifact-origin) |
+| An operator-pinned skill's `SKILL.md` body | The capsule author's own guidance, staged inside the capsule at install. Fencing it as data would make the skill inert. A skill whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule pulled is fenced — see [Artifact origin](../concepts/access-control.md#artifact-origin) |
 | A dispatch failure | The runtime's own text about a call that never reached a tool |
 | The runtime's note after a started [`call-member`](runtime-provided-tools.md#call-member-result) result | The runtime's own text about the call; the result itself stays fenced |
 | A refusal — from [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) or from a hook's decision | The runtime's own text. The call never ran |

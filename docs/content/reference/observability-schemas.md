@@ -459,7 +459,7 @@ A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_cal
 | `turn` | u32 | |
 | `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
 | `skill_name` | string | |
-| `output_bytes` | u64 | Byte length of the returned `skill.md` text. An operator-pinned skill's result carries no [fence](untrusted-fence.md); a runtime-pinned one's does |
+| `output_bytes` | u64 | Byte length of the returned `SKILL.md` body. An operator-pinned skill's result carries no [fence](untrusted-fence.md); a runtime-pinned one's does |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
 | `origin` | string | `"operator"` \| `"runtime"` — the skill's [`murmur.lock` origin](workdir.md#lock-origin). A skill with no lock entry, such as a `source:` skill, is `"operator"`. Always written |

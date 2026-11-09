@@ -9,13 +9,14 @@ section that explains it.
 | Code | Meaning | Details |
 |---|---|---|
 | `E-BLD-001` | Manifest `name:` is not a valid artifact identifier, or carries a scope | [E-BLD-001](#e-bld-001) |
-| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive, or a skill folder holds a symlink, two `skill.md` spellings or a `murmur-build.json` | [E-BLD-002](#e-bld-002) |
+| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive, or a skill folder holds a symlink or a root `murmur-build.json` | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
 | `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
 | `E-BLD-006` | An artifact's `provider_tool:` block is malformed, or declared on a `driver`, `hook` or `skill` artifact | [E-BLD-006](#e-bld-006) |
 | `E-BLD-007` | An artifact's `murmur.yaml` declares `implementation: native` or `execution: native` | [E-BLD-007](#e-bld-007) |
 | `E-BLD-008` | An artifact's `programs:` block names a need by host path, is malformed, or is declared on a `driver`, `hook` or `skill` artifact | [E-BLD-008](#e-bld-008) |
+| `E-BLD-009` | A skill folder does not follow the Agent Skills standard: its `SKILL.md` front block breaks a rule, its file is not named `SKILL.md` exactly, or a `murmur.yaml` sits beside it; or a `murmur.yaml` declaring `runtime: skill` was built | [E-BLD-009](#e-bld-009) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host, or a declared provider tool needs `sealed` and the effective floor is below it | [E-CAP-003](#e-cap-003) |
@@ -84,6 +85,7 @@ section that explains it.
 | `E-REG-014` | A program download a tool pins does not hash to the sha256 the tool pins; nothing was stored | [E-REG-014](#e-reg-014) |
 | `E-REG-015` | A program download a tool pins cannot be unpacked: `run` names no regular file, a symlink or escaping entry, or more than 2 GiB unpacked | [E-REG-015](#e-reg-015) |
 | `E-REG-016` | An attestation published beside a payload, or kept beside it in a store, does not verify against it; nothing was stored | [E-REG-016](#e-reg-016) |
+| `E-REG-017` | A skill artifact holds no root `SKILL.md`: it was built before skills followed the Agent Skills standard; nothing was stored or installed | [E-REG-017](#e-reg-017) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -2282,8 +2284,7 @@ denominator of all three:
 - no leading or trailing `-`
 
 Uppercase letters, spaces, `\` and `_` are rejected by the character rule. A `/` is refused on its
-own, in `name:` and in `mur build --skill <name>` alike, because the scope belongs to the source
-the artifact is installed from — see [Artifact names](../concepts/registry.md#artifact-names):
+own, because the scope belongs to the source the artifact is installed from — see [Artifact names](../concepts/registry.md#artifact-names):
 
 ```text
 error[E-BLD-001]: invalid artifact name 'ana/tool-x': an artifact's own name carries no scope, so it may not contain '/'
@@ -2306,9 +2307,8 @@ error[E-BLD-002]: requires_files entry '<entry>' is a symlink (<path>); declare 
 error[E-BLD-002]: requires_files entries '<a>' and '<b>' both pack as the archive entry '<name>'
 error[E-BLD-002]: requires_files entry 'murmur-build.json' packs as the archive entry 'murmur-build.json', which is reserved for mur build
 error[E-BLD-002]: <path> is a symlink; a skill folder packs regular files only
-error[E-BLD-002]: <folder> holds both SKILL.md and skill.md; a skill has one skill.md
 error[E-BLD-002]: <folder>/murmur-build.json packs as the archive entry 'murmur-build.json', which is reserved for mur build
-error[E-BLD-002]: skill source refused: <one of the three skill-folder messages above>
+error[E-BLD-002]: skill source refused: <one of the two skill-folder messages above>
 ```
 
 Every `requires_files:` entry must be a plain relative path to a real file inside the source
@@ -2324,12 +2324,13 @@ directory, and the entries must not collide once they are inside the archive:
   one silently overwrites the other on unpack.
 
 - **No `murmur-build.json` at the archive root.** `mur build` writes that entry itself, with the
-  artifact's [built-at WIT level](wit-levels.md#built-at-level). The same name in a
-  `mur build --skill` input is refused too.
+  artifact's [built-at WIT level](wit-levels.md#built-at-level). The same name at the root of a
+  skill folder is refused too.
 
-A skill folder built with no `murmur.yaml` (see [`mur build` skill packaging](cli.md#skill-packaging-skill)),
-or installed as a local `source:` directory, follows the same rules over every file it holds: no
-symlink anywhere, one `skill.md` at the root in whichever casing, and no root `murmur-build.json`.
+A skill folder built by [`mur build` skill packaging](cli.md#skill-packaging-skill), or installed
+as a local `source:` directory, follows the same rules over every file it holds: no symlink
+anywhere and no root `murmur-build.json`. What the Agent Skills standard asks of the folder is
+[`E-BLD-009`](#e-bld-009).
 The `skill source refused:` form is `mur run` refusing a local `source:` directory before any
 workdir is created.
 
@@ -2459,6 +2460,67 @@ the value and the reason; the forms are in [`programs:` block](manifest.md#artif
 | The block on a `driver`, `hook` or `skill` artifact | `only valid on an artifact whose runtime is tool` |
 
 A tool packed with such a block some other way is refused at launch with [`E-RUN-062`](#e-run-062).
+
+### E-BLD-009 — a skill folder does not follow the Agent Skills standard { #e-bld-009 }
+
+```text
+error[E-BLD-009]: <path>/SKILL.md: <rule>
+  hint: <what to change>
+```
+
+A skill is a folder that follows the [Agent Skills standard](https://agentskills.io/specification):
+named for the skill, holding `SKILL.md` at its root, which opens with a front block. `mur build`
+checks the folder before writing the `.mur.zip`, and `mur run` checks a local
+[`source:` skill](manifest.md#local-source-skills) the same way before any workdir is created. The
+front block rules are in [Skill packaging](cli.md#skill-packaging-skill).
+
+| Rule in the message | Cause |
+|---|---|
+| `has no front block: …` | The text does not open with a line `---`, or no later line is `---` |
+| `front block is not valid YAML: <error>` | The block does not parse, typically an unquoted value holding `: `. The hint: `quote a value that holds ': ', e.g. description: "Fill forms: use when …"` |
+| `front block is not a YAML mapping of keys to values` | The block parses to something other than a mapping |
+| `front block <key> is not a string` | `name`, `description` or `metadata.version` is a number, list or mapping |
+| `front block has no name` | `name` is absent or empty |
+| `front block name '<name>' may contain only lowercase letters, digits and '-'` | `name` holds another character, such as `PDF-helper` or `pdf_helper` |
+| `front block name '<name>' may not start with '-'`, `… may not end with '-'` | `name` starts or ends with `-` |
+| `front block name '<name>' may not contain '--'` | `name` holds `--` |
+| `front block name '<name>' is <n> characters; a skill name is at most 64` | `name` is longer than 64 characters |
+| `front block name '<name>' differs from the folder name '<folder>'` | `name` is not the folder's name, the last component of its canonical path. The hint: `set name: <folder>, or rename the folder to <name>` |
+| `is not inside a folder, so front block name '<name>' has no folder name to match` | A `source:` names a `SKILL.md` at an installed package's root. The hint: `move SKILL.md into a folder named <name>` |
+| `front block has no description` | `description` is absent, or empty after trimming |
+| `front block description is <n> characters; a description is at most 1024` | `description` is longer than 1024 characters after trimming |
+| `front block has no metadata.version` | `mur build` only: `metadata.version` is absent |
+| `front block metadata.version '<version>' is not a semver version: <error>` | `mur build` only: the version is not semver, such as `1.2` |
+
+The folder itself breaks the standard in three more ways:
+
+```text
+error[E-BLD-009]: <path>/skill.md: a skill's file is named SKILL.md, exactly
+  hint: rename skill.md to SKILL.md
+error[E-BLD-009]: <path>/murmur.yaml: a skill folder holds no murmur.yaml beside SKILL.md
+  hint: a skill's name, description and version go in the SKILL.md front block; delete murmur.yaml
+error[E-BLD-009]: <path>/murmur.yaml declares runtime: skill; a skill is built from a folder holding SKILL.md, not from murmur.yaml
+```
+
+| Message | Cause |
+|---|---|
+| `a skill's file is named SKILL.md, exactly` | A root file whose name lowercases to `skill.md` is not `SKILL.md`, such as `skill.md` or `Skill.md`, including beside a `SKILL.md`; or a `source:` names such a file |
+| `a skill folder holds no murmur.yaml beside SKILL.md` | A `murmur.yaml`, in any casing, sits at the root beside `SKILL.md` |
+| `declares runtime: skill; …` | `mur build` was run on a folder holding a `murmur.yaml` declaring `runtime: skill` and no `SKILL.md` |
+
+A `SKILL.md`, `skill.md` or `murmur.yaml` in a subfolder is a supporting file and is not checked.
+Nothing is written.
+
+**What to do:** follow the hint. A skill's name, description and version live in its front block:
+
+```yaml
+---
+name: pdf-helper
+description: Fill PDF forms. Use when a task hands you a PDF form to complete.
+metadata:
+  version: "1.0.0"
+---
+```
 
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
@@ -3007,6 +3069,27 @@ the others install. A runtime pull through `manage.pull()` is refused the same w
 
 **What to do:** tell the artifact's publisher; the payload or its bundle changed after it was
 built. For a store copy, `mur install <name>@<version>` from the source replaces both.
+
+### E-REG-017 — a skill artifact holds no `SKILL.md` { #e-reg-017 }
+
+```text
+error[E-REG-017]: skill artifact ana/pdf-helper@1.0.0 cannot be stored: it holds skill.md, so it was built before skills followed the Agent Skills standard, which names the file SKILL.md
+  hint: install a newer version, built with mur build from a folder holding SKILL.md
+```
+
+**Fires when** a payload whose packed `murmur.yaml` declares `runtime: skill` holds no `SKILL.md`
+at its root. A skill built by an earlier `mur` release holds a lowercase `skill.md`; a payload with
+neither says `it holds no SKILL.md at its root` instead.
+
+| Where | What happens |
+|---|---|
+| `mur install`, `mur publish` | Refused before anything is stored; neither the store nor `murmur.lock` is written |
+| A launch, for such an artifact already in a store | Refused before any skill file is installed |
+| A runtime pull through `manage.pull()` or [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | A tool error carrying the message; nothing is installed |
+
+**What to do:** install a version of the skill built with `mur build` from a folder holding
+`SKILL.md`, or rebuild it yourself — see
+[Package a skill into an artifact](../how-to/package-skill-artifact.md#step-1-write-the-skill-folder).
 
 ---
 

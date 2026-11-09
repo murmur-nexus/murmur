@@ -298,7 +298,7 @@ fn a_runtime_pinned_skill_is_marked_and_a_declared_one_is_not() {
     let after = &requests[1..];
 
     // The tool array: only the pulled entry changed, and only by the marker in front of the
-    // description it already had — the first non-empty line of its skill.md.
+    // description it already had — the one its murmur.yaml declares.
     assert_eq!(
         tool_entry(before, PULLED_SKILL)["description"],
         "# Pulled style"

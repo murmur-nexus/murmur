@@ -30,6 +30,7 @@ pub const E_REG_013: &str = "E-REG-013"; // a tool's pinned program download cou
 pub const E_REG_014: &str = "E-REG-014"; // a tool's pinned program download does not hash to the sha256 the tool pins
 pub const E_REG_015: &str = "E-REG-015"; // a tool's pinned program download cannot be unpacked into the program store
 pub const E_REG_016: &str = "E-REG-016"; // an attestation published for, or stored with, a payload does not verify against it
+pub const E_REG_017: &str = "E-REG-017"; // a skill payload holds no root SKILL.md (an old lowercase skill.md layout), so the store and the launch refuse it
 
 // WIT levels
 pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves
@@ -165,6 +166,15 @@ const NATIVE_TOOL_BUILD_HINT: &str =
      requires_files:, and remove the native declaration — a program the tool needs to run goes in \
      the capsule's capabilities.shell.allow and is started through murmur:process";
 
+/// The hint on `E-REG-017`.
+pub(crate) const SKILL_LAYOUT_HINT: &str =
+    "install a newer version, built with mur build from a folder holding SKILL.md";
+
+/// The hint on `E-BLD-009` for a `murmur.yaml` declaring `runtime: skill`.
+const SKILL_MANIFEST_HINT: &str =
+    "put the skill in a folder holding SKILL.md, whose front block gives name, description and \
+     metadata.version, delete murmur.yaml, and run mur build <folder>";
+
 /// The hint on `E-REG-012` and `E-RUN-061`.
 const NATIVE_TOOL_INSTALL_HINT: &str =
     "install a release of the artifact built as WASM \u{2014} mur build refuses the same \
@@ -242,6 +252,7 @@ pub const E_BLD_005: &str = "E-BLD-005"; // driver manifest's models: table is m
 pub const E_BLD_006: &str = "E-BLD-006"; // artifact manifest's provider_tool: block is malformed or on a driver, hook or skill
 pub const E_BLD_007: &str = "E-BLD-007"; // artifact manifest declares implementation: native or execution: native
 pub const E_BLD_008: &str = "E-BLD-008"; // artifact manifest's programs: block names a need by host path, is malformed, or is on a driver, hook or skill
+pub const E_BLD_009: &str = "E-BLD-009"; // skill folder does not follow the Agent Skills standard
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -623,7 +634,7 @@ impl From<RuntimeError> for CliError {
             RuntimeError::SystemPromptArtifactRead { name, source } => CliError::new(
                 E_RUN_009,
                 format!(
-                    "inference.system_prompt_artifact '{name}': skill.md not found or unreadable \
+                    "inference.system_prompt_artifact '{name}': SKILL.md not found or unreadable \
                      ({source}); ensure the skill is declared in artifacts: and was staged"
                 ),
             ),
@@ -633,17 +644,23 @@ impl From<RuntimeError> for CliError {
             ),
             RuntimeError::SkillSourceMissingSkillMd { path } => CliError::new(
                 E_IO_001,
-                format!("skill source directory '{path}' contains no skill.md"),
+                format!("skill source directory '{path}' contains no SKILL.md"),
             ),
             RuntimeError::SkillSourceRead { path, source } => CliError::new(
                 E_IO_003,
                 format!("failed to read skill source at {path}: {source}"),
             ),
-            RuntimeError::SkillSourceRefused { message } => CliError::with_hint(
+            RuntimeError::SkillSourceRefused { message, hint } => CliError::with_hint(
                 E_BLD_002,
                 format!("skill source refused: {message}"),
-                "a skill folder holds regular files, one skill.md and no murmur-build.json",
+                hint,
             ),
+            RuntimeError::SkillSourceNotStandard { message, hint } => {
+                CliError::with_hint(E_BLD_009, message, hint)
+            }
+            error @ RuntimeError::SkillArtifactLayout { .. } => {
+                CliError::with_hint(E_REG_017, error.to_string(), SKILL_LAYOUT_HINT)
+            }
             RuntimeError::InvalidNetworkAllowEntry { entry, message } => CliError::new(
                 E_CAP_001,
                 format!("invalid network allow entry '{entry}': {message}"),
@@ -1277,6 +1294,9 @@ impl From<RegistryError> for CliError {
             error @ RegistryError::NativeTool { .. } => {
                 CliError::with_hint(E_REG_012, error.to_string(), NATIVE_TOOL_INSTALL_HINT)
             }
+            error @ RegistryError::SkillLayout { .. } => {
+                CliError::with_hint(E_REG_017, error.to_string(), SKILL_LAYOUT_HINT)
+            }
             RegistryError::IntegrityMismatch { name, version, .. } => CliError::with_hint(
                 E_REG_002,
                 format!("artifact integrity check failed for {name}@{version}"),
@@ -1356,6 +1376,9 @@ impl From<BuildError> for CliError {
                 E_IO_003,
                 format!("zip error while writing {path}: {source}"),
             ),
+            error @ BuildError::SkillManifest { .. } => {
+                CliError::with_hint(E_BLD_009, error.to_string(), SKILL_MANIFEST_HINT)
+            }
             BuildError::MissingRequiredFile { file, path } => CliError::new(
                 E_IO_003,
                 format!("missing required file '{file}' in {path}"),

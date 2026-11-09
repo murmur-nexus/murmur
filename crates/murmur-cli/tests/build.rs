@@ -128,7 +128,8 @@ fn literal_api_key_warns_but_build_succeeds() {
 fn skill_artifact_build_succeeds_with_skill_md() {
     let fixture = fixture_path("skill-happy");
     let dir = tempdir().unwrap();
-    copy_dir_all(&fixture, dir.path());
+    let skill = dir.path().join("skill-happy");
+    copy_dir_all(&fixture, &skill);
 
     let artifact = dir.path().join("out.mur.zip");
 
@@ -136,15 +137,13 @@ fn skill_artifact_build_succeeds_with_skill_md() {
         .unwrap()
         .args([
             "build",
-            dir.path().to_str().unwrap(),
+            skill.to_str().unwrap(),
             "--output",
             artifact.to_str().unwrap(),
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Built artifact:"));
-
-    assert!(artifact.exists());
 
     let file = fs::File::open(&artifact).unwrap();
     let mut archive = ZipArchive::new(file).unwrap();
@@ -153,27 +152,37 @@ fn skill_artifact_build_succeeds_with_skill_md() {
         .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     names.sort();
-
-    assert!(
-        names.contains(&"murmur.yaml".to_string()),
-        "murmur.yaml must be present in skill artifact zip"
-    );
-    assert!(
-        names.contains(&"skill.md".to_string()),
-        "skill.md must be present in skill artifact zip"
-    );
+    assert_eq!(names, ["SKILL.md", "murmur-build.json", "murmur.yaml"]);
 }
 
+/// A `murmur.yaml` declaring `runtime: skill` is never built: a skill is a folder holding
+/// `SKILL.md`.
 #[test]
-fn skill_artifact_build_fails_without_skill_md() {
+fn a_skill_manifest_without_skill_md_is_refused() {
     let fixture = fixture_path("skill-missing-skill-md");
+    let dir = tempdir().unwrap();
+    copy_dir_all(&fixture, dir.path());
 
     Command::cargo_bin("mur")
         .unwrap()
-        .args(["build", fixture.to_str().unwrap()])
+        .current_dir(dir.path())
+        .args(["build", dir.path().to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("skill.md"));
+        .stderr(
+            predicate::str::contains("error[E-BLD-009]:")
+                .and(predicate::str::contains(
+                    "declares runtime: skill; a skill is built from a folder holding SKILL.md",
+                ))
+                .and(predicate::str::contains(
+                    "\n  hint: put the skill in a folder holding SKILL.md",
+                )),
+        );
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["murmur.yaml"]);
 }
 
 /// A wasm artifact whose payload the runtime could not select is a build failure, with the
@@ -442,7 +451,7 @@ fn an_invalid_artifact_name_fails_the_build() {
     let dir = tempdir().unwrap();
     fs::write(
         dir.path().join("murmur.yaml"),
-        "name: My Tool\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n",
+        "name: My Tool\nversion: 0.1.0\nruntime: tool\nrequires_files: []\n",
     )
     .unwrap();
 
