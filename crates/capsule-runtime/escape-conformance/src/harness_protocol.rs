@@ -9,6 +9,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::cases::Route;
+
 /// What `probe-driver --version` prints after `escape-conformance-probe`. The driver's
 /// `describe().tested-versions` must contain it, or every case raises `W-RUN-002`.
 pub const PROBE_HARNESS_VERSION: &str = "1.0.0";
@@ -34,11 +36,40 @@ pub struct ProbeConfig {
     pub case: String,
     /// Absolute path the summary line is written to; the runner grades on that file.
     pub log: String,
+    /// Which route the probe runs through.
+    pub route: ProbeRoute,
+}
+
+/// How `probe-driver` runs the probe: as a bridge tool call, or as its own child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeRoute {
+    /// Call [`ProbeConfig::tool`] over the bridge with the scripts as its commands
+    /// ([`Route::ShellTool`]).
+    ShellTool,
+    /// Run `interpreter script` as the harness's own child in `workdir`, never calling the bridge
+    /// ([`Route::ProcessHarness`]). Both paths are absolute: the harness starts with a cleared
+    /// environment, so there is no `PATH` to find the interpreter on, and its working directory
+    /// is the runtime's choice rather than the case's.
+    ProcessHarness {
+        interpreter: String,
+        workdir: String,
+    },
+}
+
+impl ProbeRoute {
+    /// The registry route this runs.
+    pub fn route(&self) -> Route {
+        match self {
+            ProbeRoute::ShellTool => Route::ShellTool,
+            ProbeRoute::ProcessHarness { .. } => Route::ProcessHarness,
+        }
+    }
 }
 
 impl ProbeConfig {
     /// The config as a JSON object. `script2` is left out when unset rather than written as
-    /// `null`.
+    /// `null`; `route` is always written, and `interpreter` and `workdir` only on the harness
+    /// route.
     pub fn to_json(&self) -> Value {
         let mut object = Map::new();
         object.insert("tool".to_string(), Value::from(self.tool.as_str()));
@@ -48,12 +79,25 @@ impl ProbeConfig {
         }
         object.insert("case".to_string(), Value::from(self.case.as_str()));
         object.insert("log".to_string(), Value::from(self.log.as_str()));
+        object.insert(
+            "route".to_string(),
+            Value::from(self.route.route().as_str()),
+        );
+        if let ProbeRoute::ProcessHarness {
+            interpreter,
+            workdir,
+        } = &self.route
+        {
+            object.insert("interpreter".to_string(), Value::from(interpreter.as_str()));
+            object.insert("workdir".to_string(), Value::from(workdir.as_str()));
+        }
         Value::Object(object)
     }
 
     /// Reads a config out of `text`. Errors name the first required key that is missing or not
-    /// a string; `script2` may be absent, `null` or empty, all meaning no second call. Keys it
-    /// does not know are ignored.
+    /// a string; `script2` may be absent, `null` or empty, all meaning no second call. `route` is
+    /// required, and `"process-harness"` also requires `interpreter` and `workdir`. Keys it does
+    /// not know are ignored.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text)
             .map_err(|err| format!("the probe config is not JSON: {err}"))?;
@@ -73,12 +117,24 @@ impl ProbeConfig {
             Some(Value::String(s)) => Some(s.clone()),
             Some(_) => return Err("the probe config's \"script2\" is not a string".to_string()),
         };
+        let route = match object.get("route") {
+            None => return Err("the probe config has no string \"route\"".to_string()),
+            Some(Value::String(name)) if name == Route::ShellTool.as_str() => ProbeRoute::ShellTool,
+            Some(Value::String(name)) if name == Route::ProcessHarness.as_str() => {
+                ProbeRoute::ProcessHarness {
+                    interpreter: required("interpreter")?,
+                    workdir: required("workdir")?,
+                }
+            }
+            Some(other) => return Err(format!("the probe config names an unknown route {other}")),
+        };
         Ok(ProbeConfig {
             tool: required("tool")?,
             script: required("script")?,
             script2,
             case: required("case")?,
             log: required("log")?,
+            route,
         })
     }
 }
@@ -132,16 +188,54 @@ mod tests {
             script2: script2.map(str::to_string),
             case: "read-etc-shadow".to_string(),
             log: "/tmp/a dir/probe-driver.txt".to_string(),
+            route: ProbeRoute::ShellTool,
+        }
+    }
+
+    fn harness_config() -> ProbeConfig {
+        ProbeConfig {
+            route: ProbeRoute::ProcessHarness {
+                interpreter: "/usr/bin/python3".to_string(),
+                workdir: "/tmp/a dir/wd".to_string(),
+            },
+            ..config(None)
         }
     }
 
     #[test]
     fn probe_config_round_trips_through_json() {
-        for c in [config(None), config(Some("ec-probe2.py"))] {
+        for c in [config(None), config(Some("ec-probe2.py")), harness_config()] {
             let text = c.to_json().to_string();
             assert_eq!(ProbeConfig::from_json(&text).unwrap(), c);
         }
         assert!(!config(None).to_json().to_string().contains("script2"));
+        assert!(!config(None).to_json().to_string().contains("interpreter"));
+    }
+
+    /// The runner always names the route, so a config without one is refused rather than read as
+    /// the shell tool: a harness-route case must never quietly run through the bridge.
+    #[test]
+    fn a_config_without_a_route_is_refused() {
+        let mut value = config(None).to_json();
+        value.as_object_mut().unwrap().remove("route");
+        let err = ProbeConfig::from_json(&value.to_string()).unwrap_err();
+        assert!(err.contains("\"route\""), "{err}");
+    }
+
+    #[test]
+    fn the_harness_route_requires_its_paths_and_an_unknown_route_is_refused() {
+        let mut value = harness_config().to_json();
+        value.as_object_mut().unwrap().remove("interpreter");
+        let err = ProbeConfig::from_json(&value.to_string()).unwrap_err();
+        assert!(err.contains("\"interpreter\""), "{err}");
+
+        let mut value = config(None).to_json();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("route".to_string(), Value::from("wasm-guest"));
+        let err = ProbeConfig::from_json(&value.to_string()).unwrap_err();
+        assert!(err.contains("wasm-guest"), "{err}");
     }
 
     #[test]

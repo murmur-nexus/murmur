@@ -110,8 +110,8 @@ pub fn install_into(mur: &Path, artifact: &Path, project_dir: &Path) -> Result<(
 mod tests {
     use super::*;
     use crate::harness_protocol::{
-        end_line, fail_line, result_line, tool_line, usage_line, ProbeConfig, ENV_BRIDGE_TOKEN,
-        ENV_BRIDGE_URL, ENV_PROBE, PROBE_HARNESS_VERSION,
+        end_line, fail_line, result_line, tool_line, usage_line, ProbeConfig, ProbeRoute,
+        ENV_BRIDGE_TOKEN, ENV_BRIDGE_URL, ENV_PROBE, PROBE_HARNESS_VERSION,
     };
     use capsule_runtime::process_driver::{
         check_required_env, describe_process_driver_wasm, launch_and_parse_process_driver_wasm,
@@ -198,6 +198,7 @@ mod tests {
             script2: Some("ec-probe2.py".to_string()),
             case: "resource-workdir-filler".to_string(),
             log: "/tmp/a work root/probe-driver.txt".to_string(),
+            route: ProbeRoute::ShellTool,
         }
         .to_json()
         .to_string();
@@ -278,6 +279,48 @@ mod tests {
             let (plan, _) = launch_and_parse_process_driver_wasm(DRIVER_WASM, request, Vec::new())
                 .expect("the driver runs");
             assert!(plan.is_err(), "{plan:?}");
+        }
+    }
+
+    /// The process-harness route needs no driver change: the committed driver hands the config,
+    /// interpreter and workdir included, to the harness verbatim, and reads a run with no tool
+    /// lines — the harness ran the probe itself — as a finished turn.
+    #[test]
+    fn committed_driver_forwards_the_harness_route_config_verbatim() {
+        let config = ProbeConfig {
+            tool: "python3".to_string(),
+            script: "ec-probe.py".to_string(),
+            script2: None,
+            case: "read-record-seal-key".to_string(),
+            log: "/tmp/a work root/probe-driver.txt".to_string(),
+            route: ProbeRoute::ProcessHarness {
+                interpreter: "/usr/bin/python3".to_string(),
+                workdir: "/tmp/a work root/wd".to_string(),
+            },
+        }
+        .to_json()
+        .to_string();
+        let summary = "case=read-record-seal-key route=process-harness :: Exit code: 0";
+        let (plan, events) = launch_and_parse_process_driver_wasm(
+            DRIVER_WASM,
+            request(true, Some(config.clone())),
+            vec![usage_line(), end_line(summary)],
+        )
+        .expect("the driver runs");
+        let plan = plan.expect("a launch with a bridge and a config is accepted");
+        assert!(plan
+            .env_set
+            .contains(&(ENV_PROBE.to_string(), config.clone())));
+        assert_eq!(
+            ProbeConfig::from_json(&config).unwrap().route,
+            ProbeRoute::ProcessHarness {
+                interpreter: "/usr/bin/python3".to_string(),
+                workdir: "/tmp/a work root/wd".to_string(),
+            }
+        );
+        match &events[..] {
+            [Event::Usage(_), Event::TurnEnd(text)] => assert_eq!(text, summary),
+            other => panic!("a harness-route run read as {other:?}"),
         }
     }
 }

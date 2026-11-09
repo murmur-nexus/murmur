@@ -1,19 +1,20 @@
-# Hand-run escape-conformance release gate for the containment boundary that
+# Escape-conformance release gate for the containment boundary that
 # `crates/capsule-runtime/src/sandbox.rs` enforces. The procedure is in
 # `docs/content/reference/containment.md`, under "The escape-conformance harness".
 #
 # A member of the root workspace, so its contract tests — the generated manifest against the
 # parser `mur run` uses, and the committed driver against this runtime's process interface — run
-# with `cargo test --workspace` and in CI. The gate itself stays hand-run: nothing in CI executes
-# the `escape-conformance` binary, and `cargo test` never runs a `[[bin]]` target. No CI runner
-# can back `scoped`, so a CI-run gate would refuse or skip its way to green and certify nothing.
+# with `cargo test --workspace`. The gate itself is the `escape-conformance` binary, which
+# `cargo test` never runs: the `contained` job in `.github/workflows/ci.yml` builds it and runs it
+# at `scoped` and `sealed` on a runner it has made able to install both, and a person runs it on a
+# bare host for a citable record.
 [package]
 name = "escape-conformance"
 version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Hand-run escape-conformance release gate for the capsule-runtime containment boundary"
+description = "Escape-conformance release gate for the capsule-runtime containment boundary"
 
 # The gate itself: parses `--class`, refuses when the host cannot back it, runs the case
 # registry, writes the dated record. No tests of its own; `test = false` keeps it from adding a

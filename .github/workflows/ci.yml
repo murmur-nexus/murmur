@@ -135,9 +135,10 @@ jobs:
     # AppArmor and systemd, and an image change should be a deliberate edit here.
     runs-on: ubuntu-24.04
     # cargo-test's 35 minutes plus the host preparation and tier assertions, and the tests that
-    # skip on cargo-test's host and run here, `sealed` variants included. A cold cache is the case
-    # to clear: this job has its own cache, saved only when the job succeeds.
-    timeout-minutes: 60
+    # skip on cargo-test's host and run here, `sealed` variants included, plus the two
+    # escape-conformance runs. A cold cache is the case to clear: this job has its own cache, saved
+    # only when the job succeeds.
+    timeout-minutes: 100
     # cargo-test runs the suite on a stock runner, where every test that needs to isolate a capsule
     # prints `[SKIP-HOST]` and returns. This job first makes the runner a host that installs
     # `scoped` and `sealed`, proves it did before building or running any test, then runs the same
@@ -237,6 +238,45 @@ jobs:
           path: |
             target/nextest/ci/junit.xml
             target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+      - name: Build escape-conformance
+        # The containment gate and its probe-driver harness. After the suite and run whatever its
+        # result, so a red gate never hides the suite's own report, or the other way round.
+        if: ${{ !cancelled() }}
+        run: cargo build -p escape-conformance --bins
+      - name: "Escape conformance: scoped"
+        # Every case through the shell tool at `scoped`, and the process-harness cases through the
+        # harness, against target/debug/mur. The work root is on the filesystem that holds /etc
+        # and /var/tmp, so the link and rename cases measure the boundary rather than EXDEV. This
+        # runner is a VM, so the record is stamped NOT W-SEC-005 EVIDENCE; the exit code still
+        # gates: 2 refused, 3 a boundary crossed, 4 a ceiling gave way, 5 a known gap changed.
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes --
+          target/debug/escape-conformance --class scoped --mur target/debug/mur
+          --record-dir escape-conformance-records
+          --work-root "$RUNNER_TEMP/escape-conformance-work-scoped"
+      - name: "Escape conformance: sealed"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes --
+          target/debug/escape-conformance --class sealed --mur target/debug/mur
+          --record-dir escape-conformance-records
+          --work-root "$RUNNER_TEMP/escape-conformance-work-sealed"
+      - name: Upload the escape-conformance records
+        # The dated record of each run, and per case the manifest, mur's output and the driver's
+        # summary, so a failed case can be read without re-running it.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: escape-conformance-records
+          path: |
+            escape-conformance-records/
+            ${{ runner.temp }}/escape-conformance-work-*/*/murmur.yaml
+            ${{ runner.temp }}/escape-conformance-work-*/*/*.txt
+            ${{ runner.temp }}/escape-conformance-work-*/*/wd/__ec.probe
           if-no-files-found: warn
 
   lint:

@@ -36,6 +36,14 @@
 //!
 //! `--version` as the first argument prints the version and exits before reading any of them.
 //!
+//! # Two routes
+//!
+//! On the shell-tool route (the default) the harness calls the bridge as described above. On the
+//! process-harness route ([`ProbeRoute::ProcessHarness`]) it never touches the bridge: it runs the
+//! staged probe as its own child, with the interpreter and working directory the config names, and
+//! so measures what any process-transport harness can reach. The runtime contains the harness no
+//! further than a cleared environment, so whatever the probe can do here, a harness can.
+//!
 //! # Output
 //!
 //! stdout carries the `harness_protocol` lines the driver's `parse` reads: a `tool` line before
@@ -48,13 +56,23 @@
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::ExitCode;
-use std::time::Duration;
+use std::process::{Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use escape_conformance::harness_protocol::{
-    end_line, fail_line, result_line, tool_line, usage_line, ProbeConfig, ENV_BRIDGE_TOKEN,
-    ENV_BRIDGE_URL, ENV_PROBE, PROBE_HARNESS_VERSION,
+    end_line, fail_line, result_line, tool_line, usage_line, ProbeConfig, ProbeRoute,
+    ENV_BRIDGE_TOKEN, ENV_BRIDGE_URL, ENV_PROBE, PROBE_HARNESS_VERSION,
 };
+
+/// Wall-clock ceiling for a probe run as the harness's own child. Below the runner's default
+/// per-case ceiling, so a hung probe is killed and reported here, with its output, rather than
+/// taken down with `mur` and leaving nothing.
+const SELF_PROBE_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// How much of the probe's stdout and stderr the summary keeps. The verdict comes from the probe
+/// file; this is only for a reader working out why there is none.
+const SELF_PROBE_OUTPUT_LIMIT: usize = 2000;
 
 /// Bridge coordinates, read out of the environment the launch plan set.
 struct Bridge {
@@ -145,6 +163,94 @@ fn emit(line: &str) {
 }
 
 fn run(config: &ProbeConfig) -> Result<String, String> {
+    match &config.route {
+        ProbeRoute::ShellTool => run_over_bridge(config),
+        ProbeRoute::ProcessHarness {
+            interpreter,
+            workdir,
+        } => run_in_harness(config, interpreter, workdir),
+    }
+}
+
+/// The process-harness route: `interpreter script` as this process's child in `workdir`, with this
+/// process's own environment, and no bridge call at all. Rendered like a shell tool result, with
+/// `Exit code:` first, so the runner reads both routes' summaries the same way.
+fn run_in_harness(
+    config: &ProbeConfig,
+    interpreter: &str,
+    workdir: &str,
+) -> Result<String, String> {
+    let mut child = Command::new(interpreter)
+        .arg(&config.script)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "could not run `{interpreter} {}` in {workdir}: {err}",
+                config.script
+            )
+        })?;
+
+    // Drained on threads of their own, so a probe that writes more than a pipe buffer cannot
+    // block on a full pipe while this waits for it to exit.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut text = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut text);
+            }
+            String::from_utf8_lossy(&text).into_owned()
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+
+    let started = Instant::now();
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().map(|c| c.to_string()),
+            Ok(None) if started.elapsed() >= SELF_PROBE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("could not wait for the probe: {err}")),
+        }
+    };
+    let clip = |text: String| -> String {
+        let text = text.trim().replace('\n', " ");
+        match text.char_indices().nth(SELF_PROBE_OUTPUT_LIMIT) {
+            Some((at, _)) => format!("{}…", &text[..at]),
+            None => text,
+        }
+    };
+    let stdout = clip(stdout.join().unwrap_or_default());
+    let stderr = clip(stderr.join().unwrap_or_default());
+    let exit =
+        exit.unwrap_or_else(|| format!("none (killed after {}s)", SELF_PROBE_TIMEOUT.as_secs()));
+    Ok(format!(
+        "case={} route=process-harness interpreter={interpreter} :: isError=false :: Exit code: \
+         {exit} Stdout: {stdout} Stderr: {stderr}",
+        config.case
+    ))
+}
+
+/// The shell-tool route: the scripts as `tool` calls over the bridge.
+fn run_over_bridge(config: &ProbeConfig) -> Result<String, String> {
     let bridge = read_bridge()?;
     let ProbeConfig {
         tool, case, script, ..

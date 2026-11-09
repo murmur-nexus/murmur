@@ -10,6 +10,11 @@
 //! is that removing it changes a count assertion, so the deletion cannot land without appearing
 //! in a diff review. [`PERMANENT_CASE_IDS`] pins the same property by name.
 //!
+//! The routes and the known gaps are held the same way: [`PROCESS_HARNESS_CASE_COUNT`] counts the
+//! cases that also run on [`Route::ProcessHarness`], and [`KNOWN_GAP_EXPECTATION_COUNT`] counts
+//! every [`Expectation::KnownGap`] in the registry, so neither a route nor a known gap can leave a
+//! case without a count assertion changing in the same diff.
+//!
 //! `--only` exists on the CLI for iterating on one case by hand, but a `--only` run is stamped
 //! `PARTIAL RUN` in the record and cannot be cited as evidence — see `record.rs`.
 //!
@@ -46,6 +51,18 @@
 //!   a composed root, so its `sealed` expectation is [`Expectation::NotAsserted`] until a real run
 //!   records one.
 //!
+//! # Routes, and asserting a gap rather than leaving it unmeasured
+//!
+//! Every case runs on [`Route::ShellTool`], graded on the three class columns. A case whose
+//! [`Case::harness`] names an expectation also runs on [`Route::ProcessHarness`], where the probe
+//! runs as the harness's own child. While the runtime spawns a harness with no containment beyond
+//! a cleared environment, an expectation there is an [`Expectation::KnownGap`] at the verdict a
+//! run measures:
+//! it gates like `Must`, so a change that closes the gap fails the suite until the expectation
+//! flips in the same change, but it is counted as known-gap drift, never as a boundary crossing.
+//! A class column may carry a `KnownGap` too, for a route the class does not contain; its
+//! attribution says `KNOWN GAP` and why.
+//!
 //! # Adding a fourth containment class
 //!
 //! Give it its own field and its own column, and start it at [`Expectation::Documented`] — record
@@ -56,7 +73,7 @@
 use crate::verdict::{Category, Expectation, Verdict};
 use murmur_artifact::ContainmentClass;
 
-use Expectation::{Must, NotAsserted};
+use Expectation::{KnownGap, Must, NotAsserted};
 use Verdict::{Allowed, Contained, Refused, Succeeded};
 
 /// Work the harness performs on the host, before `mur run`, to set a case up.
@@ -82,6 +99,36 @@ pub enum Prepare {
     /// key, into the case workdir as `dest`. The capsule's `$HOME` is synthetic, so the probe
     /// cannot compute the host's path itself.
     WriteSealKeyPath { dest: &'static str },
+}
+
+/// A path from a capsule's code to the host, which a case's probe body can be run through.
+///
+/// One case, one body, several routes: the same probe run through each route a capsule has, so
+/// the record shows per route whether the boundary holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// A shell-tool command: `probe-driver` calls the capsule's `python3` tool over the tool
+    /// bridge, and the runtime runs the probe under the declared class's enforcement. Every case
+    /// runs on it, graded on the `advisory`/`scoped`/`sealed` columns.
+    ShellTool,
+    /// The process harness itself: `probe-driver` runs the probe as its own child instead of
+    /// calling the bridge, as any process-transport harness can run anything. The runtime spawns
+    /// a harness with a cleared environment and no other containment at every class, so a case
+    /// on this route is graded on [`Case::harness`], one expectation whatever the class.
+    ProcessHarness,
+}
+
+impl Route {
+    /// Every route, in the order a case runs them.
+    pub const ALL: [Route; 2] = [Route::ShellTool, Route::ProcessHarness];
+
+    /// The route's name in `--list-cases`, the stdout lines and the record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Route::ShellTool => "shell-tool",
+            Route::ProcessHarness => "process-harness",
+        }
+    }
 }
 
 /// Where a case's verdict is read from once the capsule has run.
@@ -132,6 +179,14 @@ pub struct Case {
     pub advisory: Expectation,
     pub scoped: Expectation,
     pub sealed: Expectation,
+    /// The expectation on [`Route::ProcessHarness`], the same at every class because the harness
+    /// is spawned the same way at every class. `None`: the case does not run on that route.
+    ///
+    /// Only a boundary case graded on its probe file can run there: the harness route has no
+    /// shell tool, so no tool result for [`Evidence::ShellExit`] or
+    /// [`Evidence::SecondSpawnRefused`] to read, no resource ceilings to bound a resource case on
+    /// the host, and no `mur` launch of its own for [`Prepare::LeakFdIntoMur`] to wrap.
+    pub harness: Option<Expectation>,
     pub prepare: Prepare,
     pub evidence: Evidence,
     pub profile: Profile,
@@ -152,6 +207,24 @@ impl Case {
             }
         }
     }
+
+    /// The routes this case runs on, in run order: the shell tool always, the process harness
+    /// when [`Self::harness`] names an expectation.
+    pub fn routes(&self) -> impl Iterator<Item = Route> {
+        let on_harness = self.harness.is_some();
+        Route::ALL.into_iter().filter(move |route| match route {
+            Route::ShellTool => true,
+            Route::ProcessHarness => on_harness,
+        })
+    }
+
+    /// This case's expectation on `route` under `class`, `None` when it does not run there.
+    pub fn expectation_on(&self, route: Route, class: ContainmentClass) -> Option<Expectation> {
+        match route {
+            Route::ShellTool => Some(self.expectation(class)),
+            Route::ProcessHarness => self.harness,
+        }
+    }
 }
 
 /// A trivial capsule run, used only to answer "can a probe start at all on this host?".
@@ -167,20 +240,21 @@ impl Case {
 pub const PREFLIGHT: Case = Case {
     id: "preflight",
     category: Category::Boundary,
-    summary: "starts the interpreter inside a capsule and confirms a probe can report at all",
-    attribution: "Infrastructure check, not a containment case. It asserts only that the shell \
-                  tool path is live on this host.",
+    summary: "starts the interpreter on a route and confirms a probe can report at all",
+    attribution: "Infrastructure check, not a containment case. It asserts only that the route it \
+                  runs on — the shell tool, or the process harness — can run a probe on this host.",
     advisory: Must(Succeeded),
     scoped: Must(Succeeded),
     sealed: Must(Succeeded),
+    harness: Some(Must(Succeeded)),
     prepare: Prepare::None,
     evidence: Evidence::ProbeFile,
     profile: Profile::Boundary,
     body: r#"
 def main():
-    verdict("SUCCESS", "python3 started inside the capsule as uid %d in %s -- the shell tool path "
-                       "is live, so a case that reports nothing is reporting about containment "
-                       "and not about this harness" % (os.geteuid(), os.getcwd()))
+    verdict("SUCCESS", "python3 started as uid %d in %s -- this route can run a probe, so a case "
+                       "that reports nothing is reporting about containment and not about this "
+                       "harness" % (os.geteuid(), os.getcwd()))
 "#,
 };
 
@@ -192,6 +266,12 @@ pub const PERMANENT_CASE_IDS: &[&str] = &["exec-renamed-disallowed-binary"];
 pub const BOUNDARY_CASE_COUNT: usize = 24;
 /// Minimum case set: 5 resource-exhaustion cases.
 pub const RESOURCE_CASE_COUNT: usize = 5;
+/// Cases that also run on [`Route::ProcessHarness`]. Held by the tests like the counts above, so a
+/// route cannot be dropped from a case without the diff saying so.
+pub const PROCESS_HARNESS_CASE_COUNT: usize = 2;
+/// Expectations, across every route and class column, that assert a known gap. Held by the tests
+/// for the same reason: a known gap cannot quietly become `NotAsserted` or leave the registry.
+pub const KNOWN_GAP_EXPECTATION_COUNT: usize = 2;
 
 /// Every case, boundary first. Order is the order they run and the order they are reported.
 pub const REGISTRY: &[Case] = &[
@@ -215,6 +295,7 @@ pub const REGISTRY: &[Case] = &[
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -251,10 +332,15 @@ def main():
                       composed root reproduces no `~/.murmur/keys`, so the path does not exist \
                       for the command at all. NOT ASSERTED AT `advisory`: `advisory` and \
                       `unconfined` reach the key by design, which is why only the `mur` process \
-                      signs and a record sealed under those tiers proves less.",
+                      signs and a record sealed under those tiers proves less. \
+                      KNOWN GAP ON `process-harness`: the runtime spawns a process harness with \
+                      a cleared environment and no containment at any class, so the harness \
+                      opens the key as the operator. Asserted ALLOWED until the harness runs \
+                      under the declared class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: Some(KnownGap(Allowed)),
         prepare: Prepare::WriteSealKeyPath {
             dest: "seal-key-path.txt",
         },
@@ -298,6 +384,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: NotAsserted,
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -333,6 +420,7 @@ def main():
         advisory: Must(Succeeded),
         scoped: Must(Succeeded),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -358,10 +446,11 @@ def main():
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
                       is never mistaken for a contained read.\
-                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding. KNOWN GAP ON `process-harness`: the harness runs with no containment at any class, so it reads `/etc/passwd` through the link whatever the class declares. Asserted ALLOWED until the harness runs under the declared class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
+        harness: Some(KnownGap(Allowed)),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -422,6 +511,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: NotAsserted,
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -482,6 +572,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: NotAsserted,
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -536,6 +627,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -587,6 +679,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -626,6 +719,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -673,6 +767,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::LeakFdIntoMur {
             fd: 7,
             path: "/etc/hostname",
@@ -727,6 +822,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -779,6 +875,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::CopyBinaryAs {
             // First readable wins. All three are outside `shell.allow`, so each is a disallowed
             // identity wearing an allowlisted basename once copied.
@@ -836,6 +933,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -898,6 +996,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -998,6 +1097,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1039,6 +1139,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1084,6 +1185,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1130,6 +1232,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1158,6 +1261,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1190,6 +1294,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1218,6 +1323,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1246,6 +1352,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1278,6 +1385,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1309,6 +1417,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Contained),
         sealed: Must(Contained),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1385,6 +1494,7 @@ def main():
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1439,6 +1549,7 @@ def main():
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::SecondSpawnRefused("workdir_max_bytes"),
         profile: Profile::TightResources,
@@ -1489,6 +1600,7 @@ def main():
         advisory: NotAsserted,
         scoped: Must(Contained),
         sealed: Must(Contained),
+        harness: None,
         prepare: Prepare::None,
         // Graded on the exit code, not a probe file: a cgroup OOM kill is a SIGKILL, so a probe
         // that lived to write a verdict would be evidence the ceiling did *not* bite. 137 is
@@ -1536,6 +1648,7 @@ def main():
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
+        harness: None,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1687,7 +1800,7 @@ mod tests {
                      attribution, or promote it to Must(_) from a real measurement",
                     case.id
                 ),
-                Must(_) => {}
+                Must(_) | KnownGap(_) => {}
             }
         }
         // The other direction, so the exemption list cannot outlive the cases it names.
@@ -1738,6 +1851,96 @@ mod tests {
                 case.id
             );
         }
+    }
+
+    /// The route count guard: the harness route cannot be added to or dropped from a case without
+    /// changing [`PROCESS_HARNESS_CASE_COUNT`], and only a case whose shape fits the route runs
+    /// there — see [`Case::harness`].
+    #[test]
+    fn process_harness_route_is_counted_and_only_on_cases_it_can_grade() {
+        let on_harness: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|case| case.harness.is_some())
+            .map(|case| case.id)
+            .collect();
+        assert_eq!(
+            on_harness.len(),
+            PROCESS_HARNESS_CASE_COUNT,
+            "cases on the process-harness route: {on_harness:?}"
+        );
+        for case in REGISTRY.iter().filter(|case| case.harness.is_some()) {
+            let id = case.id;
+            assert_eq!(case.category, Category::Boundary, "{id}");
+            assert_eq!(case.evidence, Evidence::ProbeFile, "{id}");
+            assert_eq!(case.profile, Profile::Boundary, "{id}");
+            assert!(
+                !matches!(case.prepare, Prepare::LeakFdIntoMur { .. }),
+                "{id}: the harness route has no launching shell to leak a descriptor from"
+            );
+            assert_eq!(
+                case.routes().collect::<Vec<_>>(),
+                [Route::ShellTool, Route::ProcessHarness],
+                "{id}"
+            );
+        }
+        for case in REGISTRY.iter().filter(|case| case.harness.is_none()) {
+            assert_eq!(case.routes().collect::<Vec<_>>(), [Route::ShellTool]);
+            assert_eq!(
+                case.expectation_on(Route::ProcessHarness, ContainmentClass::Scoped),
+                None
+            );
+        }
+        // The preflight runs on both routes, so a host where the harness cannot start a probe is
+        // refused rather than graded.
+        assert_eq!(PREFLIGHT.harness, Some(Must(Succeeded)));
+    }
+
+    /// The known-gap count guard: a known gap cannot be dropped, demoted to `NotAsserted` or
+    /// quietly promoted without changing [`KNOWN_GAP_EXPECTATION_COUNT`], and every case that
+    /// asserts one says so in its attribution.
+    #[test]
+    fn known_gaps_are_counted_and_named_in_their_attribution() {
+        let mut gaps = Vec::new();
+        for case in REGISTRY {
+            let expectations = [
+                ("advisory", Some(case.advisory)),
+                ("scoped", Some(case.scoped)),
+                ("sealed", Some(case.sealed)),
+                (Route::ProcessHarness.as_str(), case.harness),
+            ];
+            for (column, expectation) in expectations {
+                if expectation.is_some_and(Expectation::is_known_gap) {
+                    gaps.push(format!("{} {column}", case.id));
+                    assert!(
+                        case.attribution.contains("KNOWN GAP"),
+                        "{}: a case asserting a known gap must say so in its attribution",
+                        case.id
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            gaps.len(),
+            KNOWN_GAP_EXPECTATION_COUNT,
+            "known gaps: {gaps:?}"
+        );
+        assert!(
+            !PREFLIGHT
+                .harness
+                .into_iter()
+                .chain([PREFLIGHT.advisory, PREFLIGHT.scoped, PREFLIGHT.sealed])
+                .any(Expectation::is_known_gap),
+            "the preflight asserts that a probe can run, never a gap"
+        );
+    }
+
+    #[test]
+    fn route_names_are_distinct_and_kebab_case() {
+        let names: HashSet<&str> = Route::ALL.iter().map(|route| route.as_str()).collect();
+        assert_eq!(names.len(), Route::ALL.len());
+        assert!(names
+            .iter()
+            .all(|name| name.chars().all(|c| c.is_ascii_lowercase() || c == '-')));
     }
 
     /// Resource-exhaustion cases must never be gradable as boundary findings, and every one of
