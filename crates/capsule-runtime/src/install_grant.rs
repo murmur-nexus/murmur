@@ -43,7 +43,7 @@ impl InstallTier {
     /// The tier of a resolved artifact, or `None` when it is not pullable at all.
     ///
     /// Keyed on the payload type, because that is what the pull extracts and so what can
-    /// execute: a static payload yields `skill.md` and the files it points at, installed
+    /// execute: a static payload yields `SKILL.md` and the files it points at, installed
     /// read-only and not executable; a WASM payload yields code. The declared role
     /// must agree with it. A `driver` or `hook`, or a role that disagrees with its payload, is
     /// never pullable.
@@ -360,13 +360,13 @@ mod tests {
             self.registry.publish(meta, &bytes).unwrap().sha256
         }
 
-        /// Publishes skill `name` (a full name; its bare part is packed) whose `skill.md` is
+        /// Publishes skill `name` (a full name; its bare part is packed) whose `SKILL.md` is
         /// `text`, returning its sha256.
         pub(crate) fn publish_skill(&self, name: &str, text: &str) -> String {
             self.publish_skill_at(name, VERSION, text)
         }
 
-        /// Publishes skill `name` at `version` whose `skill.md` is `text`, returning its sha256.
+        /// Publishes skill `name` at `version` whose `SKILL.md` is `text`, returning its sha256.
         pub(crate) fn publish_skill_at(&self, name: &str, version: &str, text: &str) -> String {
             let packed = tool_name_of(name);
             self.publish_at(
@@ -379,7 +379,7 @@ mod tests {
                         PACKED_MANIFEST_ENTRY,
                         format!("name: {packed}\nversion: {version}\nruntime: skill\n").as_bytes(),
                     ),
-                    ("skill.md", text.as_bytes()),
+                    ("SKILL.md", text.as_bytes()),
                 ]),
             )
         }
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(summary.name, "local/my-skill");
         assert_eq!(summary.version, VERSION);
         assert_eq!(
-            fs::read_to_string(project.installed("local/my-skill").join("skill.md")).unwrap(),
+            fs::read_to_string(project.installed("local/my-skill").join("SKILL.md")).unwrap(),
             "# guidance"
         );
         let lock = read_lockfile(&project.lock_path).unwrap();
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(summary.name, "ana/tool-x");
         let dir = project.workdir.join("tools").join("tool-x");
         assert!(
-            dir.join("skill.md").is_file(),
+            dir.join("SKILL.md").is_file(),
             "{:?}",
             tree(&project.workdir)
         );

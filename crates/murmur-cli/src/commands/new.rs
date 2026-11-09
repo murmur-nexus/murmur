@@ -280,7 +280,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         manifest_file: Some(manifest_file),
     };
 
-    // Stage the session (creates workdir, installs artifacts including skill.md).
+    // Stage the session (creates workdir, installs artifacts including SKILL.md).
     let staged = stage_session(Arc::new(local_registry), stage_request)
         .map_err(crate::wit_level::staging_error)?;
     let accessible_root = staged.accessible_root.clone();

@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn a_static_artifact_may_ship_sources_without_a_warning() {
         let warnings = lint(
-            "name: sample-skill\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - skill.md\n  - examples/demo.rs\n",
-            &[("skill.md", b"# skill"), ("examples/demo.rs", b"fn main(){}")],
+            "name: sample-skill\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - notes.md\n  - examples/demo.rs\n",
+            &[("notes.md", b"# notes"), ("examples/demo.rs", b"fn main(){}")],
         );
         assert!(
             warnings.is_empty(),

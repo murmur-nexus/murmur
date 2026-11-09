@@ -234,7 +234,7 @@ fn murmur_md_shows_visible_tools_not_drivers() {
     );
 }
 
-/// Test 4: skill artifact installs skill.md to tools/<name>/skill.md.
+/// Test 4: skill artifact installs SKILL.md to tools/<name>/SKILL.md, byte for byte.
 #[test]
 fn skill_artifact_installed_to_tools_dir() {
     let home = TempDir::new().unwrap();
@@ -268,16 +268,20 @@ fn skill_artifact_installed_to_tools_dir() {
         .runtime_dir
         .join("tools")
         .join("my-test-skill")
-        .join("skill.md");
+        .join("SKILL.md");
     assert!(
         skill_path.exists(),
-        "skill.md should exist at tools/my-test-skill/skill.md"
+        "SKILL.md should exist at tools/my-test-skill/SKILL.md"
     );
 
     let installed = fs::read_to_string(&skill_path).unwrap();
     assert_eq!(
-        installed, skill_content,
-        "installed skill.md content should match original"
+        installed,
+        format!(
+            "{}{skill_content}",
+            common::skill_front_block("my-test-skill", "0.1.0", skill_content)
+        ),
+        "installed SKILL.md content should match the packed file"
     );
 }
 
@@ -325,7 +329,7 @@ fn murmur_md_includes_skills_section_when_skill_installed() {
     );
     let skill_path = staged
         .runtime_dir
-        .join("tools/my-guide-skill/skill.md")
+        .join("tools/my-guide-skill/SKILL.md")
         .display()
         .to_string();
     assert!(

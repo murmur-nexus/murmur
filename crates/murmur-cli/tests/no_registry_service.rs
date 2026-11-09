@@ -240,10 +240,8 @@ fn doctor_refuses_a_registry_block() {
 #[test]
 fn build_refuses_a_registry_block() {
     let home = TempDir::new().unwrap();
-    let source = project_with(
-        "name: my-skill\nversion: 0.1.0\nruntime: skill\nregistry:\n  default: local\n",
-    );
-    fs::write(source.path().join("skill.md"), "# Skill\n").unwrap();
+    let source =
+        project_with("name: my-tool\nversion: 0.1.0\nruntime: tool\nregistry:\n  default: local\n");
     let out = TempDir::new().unwrap();
     assert_registry_block_refused(
         mur(&home, source.path())

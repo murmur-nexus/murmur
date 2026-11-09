@@ -14,6 +14,9 @@ use zip::{write::SimpleFileOptions, ZipWriter};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
+const CONTRACT_SKILL_MD: &[u8] =
+    b"---\nname: contract-skill\ndescription: Guidance.\nmetadata:\n  version: \"0.1.0\"\n---\n# guidance";
+
 fn fixture_bytes(relative: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -194,7 +197,7 @@ fn payloads_with_no_component_omit_the_key() {
                 "0.1.0",
                 "skill",
                 "static",
-                &[("skill.md", b"# guidance")],
+                &[("SKILL.md", CONTRACT_SKILL_MD)],
             ),
         ),
         (
@@ -286,7 +289,7 @@ fn store_with_three_artifacts() -> TempDir {
             "0.1.0",
             "skill",
             "static",
-            &[("skill.md", b"# guidance")],
+            &[("SKILL.md", CONTRACT_SKILL_MD)],
         ),
     )
     .success();

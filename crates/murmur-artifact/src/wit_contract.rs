@@ -481,7 +481,7 @@ mod tests {
         assert!(wit_contracts_from_artifact_bytes(b"not-a-zip-at-all").is_none());
         assert!(wit_contracts_from_artifact_bytes(&zip_with(&[("tool.wasm", b"\0asm")])).is_none());
         assert!(
-            wit_contracts_from_artifact_bytes(&zip_with(&[("skill.md", b"# guidance")])).is_none()
+            wit_contracts_from_artifact_bytes(&zip_with(&[("SKILL.md", b"# guidance")])).is_none()
         );
         assert!(
             wit_contracts_from_artifact_bytes(&zip_with(&[("bin/demo", b"\x7fELF")])).is_none()
@@ -511,7 +511,7 @@ mod tests {
             Err(ComponentReadError::NotAZip(_))
         ));
         assert_eq!(
-            read_component_contracts(&zip_with(&[("skill.md", b"# guidance")])),
+            read_component_contracts(&zip_with(&[("SKILL.md", b"# guidance")])),
             Err(ComponentReadError::NoRootWasm)
         );
         assert_eq!(

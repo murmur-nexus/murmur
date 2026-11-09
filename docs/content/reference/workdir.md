@@ -141,7 +141,7 @@ directory outside the work folder:
     │   ├── murmur.yaml                   the launched manifest, under its own name
     │   ├── plans/plan-<n>.json
     │   ├── delegations/<delegation-id>.txt
-    │   └── tools/<name>/murmur.yaml | <name> | skill.md
+    │   └── tools/<name>/murmur.yaml | <name> | SKILL.md and supporting files
     ├── sealed-etc/passwd, sealed-etc/group
     └── harness/<run-id>/
 ```
@@ -151,11 +151,12 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 
 | Path | Holds |
 |---|---|
-| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, the network allowlist, the limits, the runtime directory's entries, installed tools and skills, shell access. See [`MURMUR.md`](../concepts/session-loop.md#murmur-md). Agent sessions only. Written at staging, rewritten once the capsule's port is bound, and rewritten after every pull or removal that commits |
+| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, the network allowlist, the limits, the runtime directory's entries, installed tools and skills, shell access. Each skill is listed as `**<name>** — <description>`, the description taken from its `tools/<name>/murmur.yaml`, with the path of its `SKILL.md`. See [`MURMUR.md`](../concepts/session-loop.md#murmur-md). Agent sessions only. Written at staging, rewritten once the capsule's port is bound, and rewritten after every pull or removal that commits |
 | `runtime/task.md` | The task. See [Task input](#task-input) |
 | `runtime/<manifest file>` | A copy of the manifest file the launch read — `--manifest`, or the project's `murmur.yaml` — under its own name. A capsule launched by name with `--capsule` read none and has none |
 | `runtime/tools/<name>/murmur.yaml` | A staged or pulled artifact's manifest. `<name>` is the artifact's bare name, the part of its full name after the `/`, which is also its tool name |
-| `runtime/tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
+| `runtime/tools/<name>/SKILL.md` | A staged skill's file, byte for byte as packed or as its local `source:` holds it. Calling the skill returns its body, the text after the front block |
+| `runtime/tools/<name>/<path>` | A staged skill's supporting files, at their paths in the skill folder, such as `references/forms.md`. Read-only and not executable |
 | `runtime/plans/plan-<n>.json` | One submitted plan per file, numbered by this session's own counter, and read back when the plan runs |
 | `runtime/delegations/<delegation-id>.txt` | The whole answer of a sub-capsule whose answer was cut at 64 KiB in what this session was handed — a [`delegate-task` outcome](roost-api.md#how-the-outcome-arrives) or a plan `capsule` step's output. Present only for a cut answer; the cut line names it |
 | `sealed-etc/` | The `passwd` and `group` a `sealed` capsule's composed root binds at `/etc/passwd` and `/etc/group` |

@@ -762,8 +762,73 @@ pub fn create_hook_artifact(dir: &Path, name: &str, version: &str, wasm_path: &P
     artifact_path
 }
 
-/// Create a skill artifact .mur.zip with a murmur.yaml and skill.md guidance file.
+/// The description [`create_skill_artifact`] gives a skill whose guidance is `skill_content`: its
+/// first non-empty line, trimmed, single-quoted for YAML.
+fn skill_description(name: &str, skill_content: &str) -> String {
+    let line = skill_content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map_or_else(
+            || format!("Guidance from the {name} skill."),
+            str::to_string,
+        );
+    format!("'{}'", line.replace('\'', "''"))
+}
+
+/// The standard Agent Skills front block [`create_skill_artifact`] puts before `skill_content`:
+/// a skill call and a bound system prompt hand the model only what follows it.
+pub fn skill_front_block(name: &str, version: &str, skill_content: &str) -> String {
+    let name = murmur_artifact::tool_name_of(name);
+    format!(
+        "---\nname: {name}\ndescription: {}\nmetadata:\n  version: \"{version}\"\n---\n",
+        skill_description(name, skill_content)
+    )
+}
+
+/// Create a skill artifact .mur.zip as `mur build` packs one: a `murmur.yaml` and a `SKILL.md`
+/// holding [`skill_front_block`] followed by `skill_content`, which is exactly what a call to the
+/// skill returns. Both describe the skill by the first line of `skill_content`.
 pub fn create_skill_artifact(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    skill_content: &str,
+) -> PathBuf {
+    let skill_md = format!(
+        "{}{skill_content}",
+        skill_front_block(name, version, skill_content)
+    );
+    let name = murmur_artifact::tool_name_of(name);
+    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
+    let file = fs::File::create(&artifact_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("murmur.yaml", options).unwrap();
+    writeln!(zip, "name: {name}").unwrap();
+    writeln!(zip, "version: {version}").unwrap();
+    writeln!(zip, "runtime: skill").unwrap();
+    writeln!(
+        zip,
+        "description: {}",
+        skill_description(name, skill_content)
+    )
+    .unwrap();
+
+    zip.start_file(murmur_artifact::SKILL_MD_ENTRY, options)
+        .unwrap();
+    zip.write_all(skill_md.as_bytes()).unwrap();
+
+    zip.finish().unwrap();
+    artifact_path
+}
+
+/// Create a skill artifact .mur.zip in the layout `mur build` wrote before skills followed the
+/// Agent Skills standard: a `murmur.yaml` and a lowercase `skill.md`, which every store write and
+/// every launch refuses.
+pub fn create_old_layout_skill_artifact(
     dir: &Path,
     name: &str,
     version: &str,

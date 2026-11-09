@@ -625,7 +625,7 @@ mod tests {
     const RUNTIME_DIR_WRITES: &[(&str, &str)] = &[
         (
             "tools",
-            "Every staged and pulled artifact's manifest and `skill.md`, and every \
+            "Every staged and pulled artifact's manifest and `SKILL.md`, and every \
              runtime-provided tool's manifest.",
         ),
         (

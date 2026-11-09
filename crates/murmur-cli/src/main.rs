@@ -215,30 +215,14 @@ enum Commands {
     },
     /// Build a .mur.zip artifact from a source directory
     Build {
-        /// Source directory containing murmur.yaml, a skill folder with SKILL.md and no
-        /// murmur.yaml, or the input path/zip for --skill
+        /// Source directory: a folder holding murmur.yaml, or an Agent Skills folder holding
+        /// SKILL.md
         #[arg(default_value = ".")]
         source: PathBuf,
 
         /// Output file path (or directory). Skill builds default to the current directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
-
-        /// Package an external skill (SKILL.md) into a .mur.zip artifact.
-        /// Optional value sets the artifact name; omit to infer from the directory or filename.
-        #[arg(long = "skill", value_name = "NAME", num_args = 0..=1)]
-        skill: Option<Option<String>>,
-
-        /// Artifact version for the generated manifest (skill builds only: --skill, or a folder
-        /// with SKILL.md and no murmur.yaml; default: 0.1.0)
-        #[arg(long, value_name = "VERSION")]
-        version: Option<String>,
-
-        /// One-line description written into the manifest (skill builds only; overrides the
-        /// SKILL.md front block's description).
-        /// Appears as the skill's summary in the tool inventory and mur list output.
-        #[arg(long, value_name = "TEXT")]
-        summary: Option<String>,
     },
     /// Publish an existing .mur.zip artifact into the global store (~/.murmur/artifacts/)
     Publish {
@@ -800,19 +784,7 @@ fn main() {
             Ok(())
         }
         Commands::Doctor { bind, json } => run_doctor(&bind, json),
-        Commands::Build {
-            source,
-            output,
-            skill,
-            version,
-            summary,
-        } => run_build(
-            &source,
-            output.as_deref(),
-            skill,
-            version.as_deref(),
-            summary.as_deref(),
-        ),
+        Commands::Build { source, output } => run_build(&source, output.as_deref()),
         Commands::Publish { artifact_path } => run_publish(artifact_path.as_deref()),
         Commands::Install {
             artifact,

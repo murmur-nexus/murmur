@@ -2862,16 +2862,16 @@ pub fn stage_session(
     let mut process_driver: Option<(String, String, Component)> = None;
 
     for artifact in &request.artifacts {
-        // Local-source skill: resolve skill.md directly from the filesystem and skip the
+        // Local-source skill: resolve SKILL.md directly from the filesystem and skip the
         // registry/lock pipeline entirely. Validated as skill-only at manifest parse time.
         if let Some(source) = &artifact.source {
-            let files = load_local_skill_files(&manifest_files, source)?;
-            skill_files.push((artifact.name.clone(), files));
+            let skill = load_local_skill_files(&manifest_files, source)?;
+            skill_files.push((artifact.name.clone(), skill.files));
             // The manifest a published skill carries in its package, so the skill is in the
             // model's tool list, and MURMUR.md names it, on the same terms.
             installed_manifests.push((
                 artifact.name.clone(),
-                local_skill_manifest_yaml(&artifact.name, &artifact.version),
+                local_skill_manifest_yaml(&artifact.name, &artifact.version, &skill.description),
             ));
             installed_artifacts.push(InstalledArtifactSummary {
                 name: artifact.name.clone(),
@@ -3128,8 +3128,7 @@ pub fn stage_session(
                 });
             }
             ArtifactRuntime::Skill => {
-                let files =
-                    extract_skill_files(&artifact.name, &resolved_version, &resolved.bytes)?;
+                let files = extract_skill_files(&full_name, &resolved_version, &resolved.bytes)?;
                 skill_files.push((artifact.name.clone(), files));
             }
         }
@@ -6901,7 +6900,8 @@ fn read_system_prompt_file(files: &ManifestFiles, path: &str) -> Result<String, 
 
 /// The capsule's system prompt: `inference.system_prompt`, else the file
 /// `inference.system_prompt_file` names, read relative to the manifest (`files`), else the
-/// `skill.md` of the staged `inference.system_prompt_artifact`.
+/// body of the staged `inference.system_prompt_artifact`'s `SKILL.md`
+/// ([`murmur_artifact::skill_md_body`]).
 fn resolve_system_prompt(
     files: &ManifestFiles,
     runtime_root: &WorkdirRoot,
@@ -6920,8 +6920,8 @@ fn resolve_system_prompt(
             name: art_name.clone(),
             source,
         };
-        return match runtime_root.read_to_string(format!("tools/{art_name}/skill.md")) {
-            Ok(Some(text)) => Ok(Some(text)),
+        return match runtime_root.read_to_string(format!("tools/{art_name}/{SKILL_MD_ENTRY}")) {
+            Ok(Some(text)) => Ok(Some(murmur_artifact::skill_md_body(&text).to_string())),
             Ok(None) => Err(unreadable(std::io::ErrorKind::NotFound.into())),
             Err(error) => Err(RuntimeError::from_workdir(error, |_, source| {
                 unreadable(source)
@@ -10227,12 +10227,12 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
 /// and the runtime has no notion of a trusted tool, so the rule for them needs no judgement: all
 /// of them are fenced under `tool:<name>`, unconditionally.
 ///
-/// A skill result is `skill.md`, read off disk from inside the capsule and fixed for the whole
-/// run. Whether it is fenced follows from `origin`, the skill's `murmur.lock` origin: a skill the
-/// operator pinned is the capsule author's own guidance, whose entire purpose is to be followed as
-/// instruction, so it is left unfenced; a skill whose pin a running capsule fetched was never
-/// vetted by the operator, so its guidance is fenced under `skill:<name>` like any other content
-/// from outside, on every call.
+/// A skill result is the body of `SKILL.md`, read off disk from inside the capsule and fixed for
+/// the whole run. Whether it is fenced follows from `origin`, the skill's `murmur.lock` origin: a
+/// skill the operator pinned is the capsule author's own guidance, whose entire purpose is to be
+/// followed as instruction, so it is left unfenced; a skill whose pin a running capsule fetched
+/// was never vetted by the operator, so its guidance is fenced under `skill:<name>` like any
+/// other content from outside, on every call.
 ///
 /// The label is set here rather than by a caller inspecting the text, which is what makes
 /// [`DispatchOutcome::fence_source`] a statement about this outcome rather than a guess: it is
@@ -10857,23 +10857,27 @@ impl CapsuleStoreState {
         }
 
         // A name a removal took out of the session. Without this, the skill branch
-        // would serve a `skill.md` a failed deletion left behind, and the WASM branch would
+        // would serve a `SKILL.md` a failed deletion left behind, and the WASM branch would
         // answer with a not-found error.
         if self.removed_artifacts.contains(name) {
             return Err(crate::artifact_removal::called_after_removal(name));
         }
 
-        // Skill artifact: return skill.md content as the tool result (no WASM dispatch).
-        // Works in capsules with no shell/file capabilities — the runtime reads the file.
-        let skill_md = format!("tools/{name}/skill.md");
+        // Skill artifact: return the body of SKILL.md as the tool result (no WASM dispatch).
+        // Works in capsules with no shell/file capabilities — the runtime reads the file. The
+        // front block is stripped from the text handed over; the installed file is untouched.
+        let skill_md = format!("tools/{name}/{SKILL_MD_ENTRY}");
         if !matches!(self.runtime_root.entry_kind(&skill_md), Ok(None)) {
-            // A link where the skill's `skill.md` was staged is refused here, latched, and fails
+            // A link where the skill's `SKILL.md` was staged is refused here, latched, and fails
             // the task at the checkpoint after this call.
-            let mut content = self
+            let text = self
                 .runtime_root
                 .read_to_string(&skill_md)
                 .map_err(|e| format!("failed to read skill '{name}': {e}"))?
-                .ok_or_else(|| format!("failed to read skill '{name}': skill.md is gone"))?;
+                .ok_or_else(|| {
+                    format!("failed to read skill '{name}': {SKILL_MD_ENTRY} is gone")
+                })?;
+            let mut content = murmur_artifact::skill_md_body(&text).to_string();
             content.push_str(&skill_supporting_files_trailer(&self.runtime_root, name));
             return Ok(DispatchOutcome::skill(murmur::tool::run::ToolResult {
                 status: murmur::tool::run::Status::Passed,
@@ -12737,9 +12741,9 @@ fn manifest_file_name(manifest_file: &Path) -> Option<String> {
 /// How many supporting files a skill call's result lists before it summarises the rest.
 const SKILL_SUPPORTING_FILES_LISTED: usize = 50;
 
-/// What a skill call appends to its `skill.md` text: where the skill's supporting files are and
+/// What a skill call appends to its `SKILL.md` body: where the skill's supporting files are and
 /// which they are, so a capsule with file access can read them. Empty for a skill that installed
-/// only `skill.md`, and when the listing fails — the guidance itself is still the answer.
+/// only `SKILL.md`, and when the listing fails — the guidance itself is still the answer.
 fn skill_supporting_files_trailer(runtime_root: &WorkdirRoot, name: &str) -> String {
     let dir = format!("tools/{name}");
     let mut files = Vec::new();
@@ -12767,7 +12771,7 @@ fn skill_supporting_files_trailer(runtime_root: &WorkdirRoot, name: &str) -> Str
 }
 
 /// The regular files under `dir/relative`, as `/`-separated paths relative to `dir`, skipping
-/// the root `skill.md` and `murmur.yaml` and never following a link.
+/// the root `SKILL.md` and `murmur.yaml` and never following a link.
 fn collect_skill_supporting_files(
     runtime_root: &WorkdirRoot,
     dir: &str,
@@ -12799,19 +12803,20 @@ fn collect_skill_supporting_files(
     Ok(())
 }
 
-/// Resolve and read a local-source skill's files: each as its `/`-separated path under
-/// `tools/<name>/` and its bytes, `skill.md` first.
+/// Resolve, check and read a local-source skill (see [`ManifestFiles::read_skill_source`]).
 ///
 /// `source` may be a relative or absolute path; a relative one resolves against the manifest
 /// (`files`). It may name:
-///   - a file (assumed to be `skill.md` itself), installed alone, or
+///   - a file named `SKILL.md`, installed alone, or
 ///   - a folder, walked by the rules of [`murmur_artifact::collect_skill_folder`] — the walk
-///     `mur build` packs a manifest-less skill folder with. Its `skill.md` (any casing) installs
-///     as `skill.md` and every supporting file at its relative path; its own `murmur.yaml` is
-///     never installed, since staging writes the skill's manifest there.
+///     `mur build` packs a skill folder with. Its `SKILL.md` and every supporting file install
+///     at their relative paths.
 ///
 /// Errors before the workdir is created so that failures exit non-zero with no side effects.
-fn load_local_skill_files(files: &ManifestFiles, source: &str) -> Result<SkillFiles, RuntimeError> {
+fn load_local_skill_files(
+    files: &ManifestFiles,
+    source: &str,
+) -> Result<crate::manifest_files::LocalSkill, RuntimeError> {
     files.read_skill_source(source)
 }
 
@@ -13218,10 +13223,15 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
 }
 
 /// The `murmur.yaml` staged for a skill declared with `source:`, which has no package to carry
-/// one. With no `description`, its tool description is the first line of its `skill.md`.
-fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
+/// one: the entry's name and version, and the `SKILL.md` front block's description.
+fn local_skill_manifest_yaml(name: &str, version: &str, description: &str) -> String {
     let mut manifest = serde_norway::Mapping::new();
-    for (key, value) in [("name", name), ("version", version), ("runtime", "skill")] {
+    for (key, value) in [
+        ("name", name),
+        ("version", version),
+        ("runtime", "skill"),
+        ("description", description),
+    ] {
         manifest.insert(
             Value::String(key.to_string()),
             Value::String(value.to_string()),
@@ -16633,7 +16643,7 @@ inference:
         }
     }
 
-    /// The artifact branch reads the staged skill's `skill.md` out of the *workdir*, not the
+    /// The artifact branch reads the staged skill's `SKILL.md` out of the *workdir*, not the
     /// manifest directory — it is a resolved artifact, not a file the author wrote beside
     /// murmur.yaml.
     #[test]
@@ -16642,7 +16652,11 @@ inference:
         let workdir = TempDir::new().unwrap();
         let skill_dir = workdir.path().join("tools").join("house-style");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("skill.md"), "# House style\nBe terse.").unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: house-style\ndescription: How we write.\nmetadata:\n  version: \"1.0.0\"\n---\n\n# House style\nBe terse.",
+        )
+        .unwrap();
 
         let inference = murmur_artifact::InferenceConfig {
             system_prompt_artifact: Some("house-style".to_string()),
@@ -16930,19 +16944,21 @@ inference:
 
     #[test]
     fn load_local_skill_files_reads_a_folder_from_an_installed_package() {
+        let skill_md = local_skill_md("house", "# House skill");
         let files = package_files(&[
-            ("skills/house/SKILL.md", "# House skill"),
+            ("skills/house/SKILL.md", skill_md.as_str()),
             ("skills/house/references/a.md", "reference a"),
             ("skills/house/.hidden", "hidden"),
         ]);
         let skill = load_local_skill_files(&files, "./skills/house").unwrap();
         assert_eq!(
-            skill,
+            skill.files,
             [
-                ("skill.md".to_string(), b"# House skill".to_vec()),
+                ("SKILL.md".to_string(), skill_md.into_bytes()),
                 ("references/a.md".to_string(), b"reference a".to_vec()),
             ]
         );
+        assert_eq!(skill.description, "The house skill.");
     }
 
     #[test]
@@ -17482,28 +17498,44 @@ inference:
 
     // ── local-source skill resolution ──────────────────────────────────────
 
+    /// A standard local-source `SKILL.md` for the folder `name`: no `metadata.version`.
+    fn local_skill_md(name: &str, body: &str) -> String {
+        format!("---\nname: {name}\ndescription: The {name} skill.\n---\n{body}")
+    }
+
     #[test]
     fn load_local_skill_files_reads_file_path() {
         let dir = tempfile::tempdir().unwrap();
-        let skill = dir.path().join("skill.md");
-        fs::write(&skill, b"# hi from file").unwrap();
-        let files = load_local_skill_files(&dir_files(dir.path()), "skill.md").unwrap();
+        let skill_dir = dir.path().join("hi");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = local_skill_md("hi", "# hi from file");
+        fs::write(skill_dir.join("SKILL.md"), &skill_md).unwrap();
+        let skill = load_local_skill_files(&dir_files(dir.path()), "hi/SKILL.md").unwrap();
         assert_eq!(
-            files,
-            [("skill.md".to_string(), b"# hi from file".to_vec())]
+            skill.files,
+            [("SKILL.md".to_string(), skill_md.into_bytes())]
         );
     }
 
     #[test]
-    fn load_local_skill_files_finds_skill_md_in_directory_case_insensitive() {
+    fn load_local_skill_files_refuses_a_misspelled_skill_md() {
         let manifest_dir = tempfile::tempdir().unwrap();
         let skill_dir = manifest_dir.path().join("skills").join("my-skill");
         fs::create_dir_all(&skill_dir).unwrap();
-        // Uppercase filename — must still be found.
-        fs::write(skill_dir.join("SKILL.MD"), b"# upper").unwrap();
-        let files =
-            load_local_skill_files(&dir_files(manifest_dir.path()), "skills/my-skill").unwrap();
-        assert_eq!(files, [("skill.md".to_string(), b"# upper".to_vec())]);
+        fs::write(
+            skill_dir.join("SKILL.MD"),
+            local_skill_md("my-skill", "# upper"),
+        )
+        .unwrap();
+        let err =
+            load_local_skill_files(&dir_files(manifest_dir.path()), "skills/my-skill").unwrap_err();
+        match err {
+            RuntimeError::SkillSourceNotStandard { message, hint } => {
+                assert!(message.ends_with("SKILL.MD: a skill's file is named SKILL.md, exactly"));
+                assert_eq!(hint, "rename SKILL.MD to SKILL.md");
+            }
+            other => panic!("expected SkillSourceNotStandard, got {other:?}"),
+        }
     }
 
     #[test]
@@ -17536,29 +17568,31 @@ inference:
     fn load_local_skill_files_absolute_path_ignores_manifest_dir() {
         let manifest_dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        let skill = elsewhere.path().join("skill.md");
-        fs::write(&skill, b"# absolute").unwrap();
-        let files =
+        let skill_dir = elsewhere.path().join("absolute");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill = skill_dir.join("SKILL.md");
+        fs::write(&skill, local_skill_md("absolute", "# absolute")).unwrap();
+        let loaded =
             load_local_skill_files(&dir_files(manifest_dir.path()), &skill.to_string_lossy())
                 .unwrap();
-        assert_eq!(files, [("skill.md".to_string(), b"# absolute".to_vec())]);
+        assert_eq!(loaded.description, "The absolute skill.");
     }
 
     #[test]
-    fn load_local_skill_files_installs_the_whole_folder_but_its_manifest() {
+    fn load_local_skill_files_installs_the_whole_folder_but_dot_entries() {
         let manifest_dir = tempfile::tempdir().unwrap();
         let skill_dir = manifest_dir.path().join("pdf");
         fs::create_dir_all(skill_dir.join("references")).unwrap();
         fs::create_dir_all(skill_dir.join(".git")).unwrap();
-        fs::write(skill_dir.join("SKILL.md"), b"# pdf").unwrap();
-        fs::write(skill_dir.join("murmur.yaml"), b"name: authored").unwrap();
+        let skill_md = local_skill_md("pdf", "# pdf");
+        fs::write(skill_dir.join("SKILL.md"), &skill_md).unwrap();
         fs::write(skill_dir.join("references/forms.md"), b"# Forms").unwrap();
         fs::write(skill_dir.join(".git/HEAD"), b"ref").unwrap();
-        let files = load_local_skill_files(&dir_files(manifest_dir.path()), "pdf").unwrap();
+        let skill = load_local_skill_files(&dir_files(manifest_dir.path()), "pdf").unwrap();
         assert_eq!(
-            files,
+            skill.files,
             [
-                ("skill.md".to_string(), b"# pdf".to_vec()),
+                ("SKILL.md".to_string(), skill_md.into_bytes()),
                 ("references/forms.md".to_string(), b"# Forms".to_vec()),
             ]
         );
@@ -17570,11 +17604,11 @@ inference:
         let manifest_dir = tempfile::tempdir().unwrap();
         let skill_dir = manifest_dir.path().join("pdf");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("SKILL.md"), b"# pdf").unwrap();
+        fs::write(skill_dir.join("SKILL.md"), local_skill_md("pdf", "# pdf")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", skill_dir.join("passwd")).unwrap();
         let err = load_local_skill_files(&dir_files(manifest_dir.path()), "pdf").unwrap_err();
         match err {
-            RuntimeError::SkillSourceRefused { message } => {
+            RuntimeError::SkillSourceRefused { message, .. } => {
                 assert!(message.contains("passwd"), "message was: {message}");
                 assert!(message.contains("symlink"), "message was: {message}");
             }
@@ -17698,7 +17732,11 @@ inference:
 
         let skill_dir = project.join("skills").join("my-skill");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("skill.md"), b"# my local skill").unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            b"---\nname: my-skill\ndescription: My local skill.\n---\n# my local skill",
+        )
+        .unwrap();
 
         let inference = InferenceConfig {
             transport: "http".into(),
@@ -17799,13 +17837,21 @@ inference:
             .runtime_dir
             .join("tools")
             .join("my-skill")
-            .join("skill.md");
+            .join("SKILL.md");
         assert!(
             installed.exists(),
-            "skill.md not installed at {}",
+            "SKILL.md not installed at {}",
             installed.display()
         );
-        assert_eq!(fs::read(&installed).unwrap(), b"# my local skill");
+        assert_eq!(
+            fs::read(&installed).unwrap(),
+            b"---\nname: my-skill\ndescription: My local skill.\n---\n# my local skill"
+        );
+        let manifest = fs::read_to_string(installed.with_file_name(PACKED_MANIFEST_ENTRY)).unwrap();
+        assert!(
+            manifest.contains("description: My local skill."),
+            "{manifest}"
+        );
         // No lock artifact recorded for a local-source skill.
         assert!(staged.resolved_lock_artifacts.is_empty());
         assert_eq!(staged.installed_artifacts.len(), 1);
@@ -17814,7 +17860,7 @@ inference:
         let murmur_md = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
         assert!(!staged.accessible_workdir.join("MURMUR.md").exists());
         assert!(
-            murmur_md.contains("**my-skill**"),
+            murmur_md.contains("**my-skill** — My local skill."),
             "MURMUR.md missing skill listing:\n{murmur_md}"
         );
         assert!(
@@ -18101,7 +18147,7 @@ inference:
                 PACKED_MANIFEST_ENTRY,
                 b"name: some-skill\nversion: 1.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# guidance"),
+            ("SKILL.md", b"# guidance"),
         ]));
         let sha256 = registry.sha256.clone();
         let project = tempfile::tempdir().unwrap();
@@ -18312,7 +18358,7 @@ inference:
                     format!("name: {PULLED_SKILL_TOOL}\nversion: 1.0.0\nruntime: skill\n")
                         .as_bytes(),
                 ),
-                ("skill.md", PULLED_SKILL_MD.as_bytes()),
+                ("SKILL.md", PULLED_SKILL_MD.as_bytes()),
             ]);
             let sha256 = registry
                 .publish(
@@ -18430,6 +18476,47 @@ inference:
         let outcome = call_skill(&state, PULLED_SKILL_TOOL);
         assert_eq!(outcome.fence_source, None);
         assert_eq!(outcome.result.data.as_deref(), Some(PULLED_SKILL_MD));
+    }
+
+    /// A skill an older mur stored in the old layout (a root `skill.md`, no `SKILL.md`) fails a
+    /// mid-session pull as a tool error carrying the refusal, and nothing is installed.
+    #[test]
+    fn a_pull_of_an_old_layout_skill_fails_as_a_tool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let root = dir.path().join("registry");
+        let bytes = zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                format!("name: {PULLED_SKILL_TOOL}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+            ),
+            ("skill.md", PULLED_SKILL_MD.as_bytes()),
+        ]);
+        let version_dir = root.join(PULLED_SKILL).join("1.0.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("pulled-style-1.0.0.mur.zip"), &bytes).unwrap();
+        fs::write(
+            version_dir.join("pulled-style-1.0.0.sha256"),
+            murmur_artifact::sha256_hex(&bytes),
+        )
+        .unwrap();
+        let registry = Arc::new(murmur_artifact::LocalRegistry::new(root));
+        let mut state = build_test_state(registry, workdir, dir.path().join("murmur.lock"));
+        grant_install(&mut state, &[PULLED_SKILL], &[]);
+
+        let error = pull_skill(&mut state).unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "skill artifact {PULLED_SKILL}@1.0.0 cannot be installed: it holds skill.md, so it \
+                 was built before skills followed the Agent Skills standard"
+            )),
+            "{error}"
+        );
+        assert!(!state
+            .runtime_root
+            .host_path(format!("tools/{PULLED_SKILL_TOOL}"))
+            .exists());
     }
 
     /// A refused pull and a failed one buffer nothing.
@@ -18647,7 +18734,7 @@ inference:
                 PACKED_MANIFEST_ENTRY,
                 b"name: pulled-refs\nversion: 1.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# Refs\nSee references/forms.md.\n"),
+            ("SKILL.md", b"# Refs\nSee references/forms.md.\n"),
             ("references/forms.md", b"# Forms\n"),
             (
                 murmur_artifact::BUILD_INFO_FILE,
@@ -18681,7 +18768,7 @@ inference:
 
         let tool_dir = project.workdir.join("tools/pulled-refs");
         assert_eq!(
-            fs::read(tool_dir.join("skill.md")).unwrap(),
+            fs::read(tool_dir.join("SKILL.md")).unwrap(),
             b"# Refs\nSee references/forms.md.\n"
         );
         assert_eq!(
@@ -18721,7 +18808,7 @@ inference:
         .unwrap();
     }
 
-    /// A skill with supporting files answers with its `skill.md` and then the block naming
+    /// A skill with supporting files answers with its `SKILL.md` and then the block naming
     /// where they are; status and summary are a plain skill's.
     #[test]
     fn skill_call_names_the_supporting_files_after_the_guidance() {
@@ -18731,7 +18818,7 @@ inference:
             &project,
             "pdf-helper",
             &[
-                ("skill.md", "# PDF helper\nSee references/forms.md.\n"),
+                ("SKILL.md", "# PDF helper\nSee references/forms.md.\n"),
                 ("references/forms.md", "# Forms\n"),
             ],
         );
@@ -18760,8 +18847,8 @@ inference:
         );
     }
 
-    /// A skill whose directory holds only `skill.md`, its manifest and a link answers with its
-    /// `skill.md` byte for byte: the link is never listed.
+    /// A skill whose directory holds only `SKILL.md`, its manifest and a link answers with its
+    /// `SKILL.md` byte for byte: the link is never listed.
     #[test]
     fn skill_call_without_supporting_files_is_its_skill_md_exactly() {
         let project = RuntimeOriginProject::new();
@@ -18770,7 +18857,7 @@ inference:
             &project,
             "plain",
             &[
-                ("skill.md", "# Plain\nNo references.\n"),
+                ("SKILL.md", "# Plain\nNo references.\n"),
                 (
                     PACKED_MANIFEST_ENTRY,
                     "name: plain\nversion: 0.0.0\nruntime: skill\n",
@@ -18794,7 +18881,7 @@ inference:
         let project = RuntimeOriginProject::new();
         let state = project.session();
         let names: Vec<String> = (0..51).map(|i| format!("refs/file-{i:02}.md")).collect();
-        let mut files = vec![("skill.md", "# Many\n")];
+        let mut files = vec![("SKILL.md", "# Many\n")];
         files.extend(names.iter().map(|name| (name.as_str(), "x")));
         install_operator_skill(&project, "many", &files);
 
@@ -18818,7 +18905,7 @@ inference:
             &crate::workdir_fs::WorkdirRoot::open(&project.workdir).unwrap(),
             vec![(
                 "house-style".to_string(),
-                vec![("skill.md".to_string(), b"Be terse.".to_vec())],
+                vec![("SKILL.md".to_string(), b"Be terse.".to_vec())],
             )],
         )
         .unwrap();
@@ -19318,7 +19405,7 @@ inference:
                 PACKED_MANIFEST_ENTRY,
                 b"name: my-skill\nversion: 1.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# guidance"),
+            ("SKILL.md", b"# guidance"),
         ]);
         let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
         let expected_sha256 = registry.sha256.clone();
@@ -19340,7 +19427,7 @@ inference:
         assert_eq!(summary.name, "local/my-skill");
         assert_eq!(summary.version, "1.0.0");
 
-        let installed_skill_md = workdir.join("tools").join("my-skill").join("skill.md");
+        let installed_skill_md = workdir.join("tools").join("my-skill").join("SKILL.md");
         assert!(installed_skill_md.exists());
         assert_eq!(fs::read(&installed_skill_md).unwrap(), b"# guidance");
 
@@ -19366,7 +19453,7 @@ inference:
                 PACKED_MANIFEST_ENTRY,
                 b"name: aaa-late-skill\nversion: 1.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# guidance"),
+            ("SKILL.md", b"# guidance"),
         ]);
         let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
 
@@ -20061,7 +20148,7 @@ inference:
             "name: launch-skill\nversion: 1.0.0\nruntime: skill\n",
         )
         .unwrap();
-        fs::write(skill.join("skill.md"), "# launch guidance").unwrap();
+        fs::write(skill.join("SKILL.md"), "# launch guidance").unwrap();
         let state = build_test_state(
             Arc::new(FakeSkillRegistry::new(Vec::new())),
             workdir.clone(),
@@ -20514,7 +20601,7 @@ inference:
                 PACKED_MANIFEST_ENTRY,
                 b"name: my-skill\nversion: 2.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# guidance v2"),
+            ("SKILL.md", b"# guidance v2"),
         ]);
         let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
 
@@ -20557,7 +20644,7 @@ inference:
         assert!(!workdir
             .join("tools")
             .join("my-skill")
-            .join("skill.md")
+            .join("SKILL.md")
             .exists());
         assert!(state.installed_artifacts.is_empty());
 
@@ -20579,7 +20666,7 @@ inference:
                 )
                 .as_bytes(),
             ),
-            ("skill.md", b"# guidance"),
+            ("SKILL.md", b"# guidance"),
         ]))
     }
 
@@ -22978,7 +23065,7 @@ inference:
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join("tools").join("quick-skill");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("skill.md"), "# quick\n").unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# quick\n").unwrap();
 
         let mut state = build_test_state(
             Arc::new(FakeSkillRegistry::new(Vec::new())),
@@ -28066,14 +28153,14 @@ inference:
         assert!(run.result.is_ok(), "{:?}", run.result);
     }
 
-    /// The `skill.md`-and-manifest artifact the pull scenarios below publish.
+    /// The `SKILL.md`-and-manifest artifact the pull scenarios below publish.
     fn my_skill_artifact() -> Vec<u8> {
         zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
                 b"name: my-skill\nversion: 1.0.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# guidance"),
+            ("SKILL.md", b"# guidance"),
         ])
     }
 
@@ -28085,7 +28172,7 @@ inference:
         for (link, refused_at) in [
             ("tools", "tools"),
             ("tools/my-skill", "tools/my-skill"),
-            ("tools/my-skill/skill.md", "tools/my-skill/skill.md"),
+            ("tools/my-skill/SKILL.md", "tools/my-skill/SKILL.md"),
             ("tools/my-skill/murmur.yaml", "tools/my-skill/murmur.yaml"),
         ] {
             let planted = Planted::new();
@@ -28390,7 +28477,7 @@ inference:
         );
     }
 
-    /// A staged `skill.md` that is a link to a secret is left out of `MURMUR.md`.
+    /// A staged `SKILL.md` that is a link to a secret is left out of `MURMUR.md`.
     #[test]
     fn workdir_path_refused_read_of_a_skill_into_murmur_md() {
         let planted = Planted::new();
@@ -28401,14 +28488,14 @@ inference:
             "name: x\nversion: 0.1.0\nruntime: skill\n",
         )
         .unwrap();
-        planted.link(&planted.sentinel, "tools/x/skill.md");
+        planted.link(&planted.sentinel, "tools/x/SKILL.md");
         let state = planted.state();
 
         crate::murmur_md::write_murmur_md(&state.runtime_root, &crate::murmur_md::test_inputs());
 
         let murmur_md = fs::read_to_string(planted.workdir.join("MURMUR.md")).unwrap();
         assert!(!murmur_md.contains("SECRET-TOKEN"));
-        assert_eq!(only_refusal(&state).refused_at, "tools/x/skill.md");
+        assert_eq!(only_refusal(&state).refused_at, "tools/x/SKILL.md");
     }
 
     /// No `task.md` and no `input.txt` read as an empty task, with nothing refused.

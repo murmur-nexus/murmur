@@ -52,6 +52,10 @@ pub enum BuildError {
     InvalidOutputExtension(String),
     #[error("missing required file '{file}' in {path}")]
     MissingRequiredFile { file: String, path: String },
+    /// A `murmur.yaml` declaring `runtime: skill`: a skill's name, description and version live
+    /// in its `SKILL.md` front block, so a skill is never built from a manifest.
+    #[error("{path} declares runtime: skill; a skill is built from a folder holding SKILL.md, not from murmur.yaml")]
+    SkillManifest { path: String },
     #[error("failed to create output file at {path}: {source}")]
     CreateOutput {
         path: String,
@@ -168,10 +172,22 @@ pub struct BuiltArtifact {
     pub built_at_level: Option<u64>,
 }
 
+/// Refuse a manifest declaring `runtime: skill`: a skill is built from a folder holding
+/// `SKILL.md`, never by the manifest path of `mur build`.
+pub fn refuse_skill_manifest(manifest: &Manifest, manifest_path: &Path) -> Result<(), BuildError> {
+    if manifest.runtime == "skill" {
+        return Err(BuildError::SkillManifest {
+            path: manifest_path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Pack `source_dir`'s manifest and `requires_files:` into `output_path`, then append
 /// [`BUILD_INFO_FILE`] naming the newest of `levels` the payload's `murmur:*` interfaces fit.
+/// Refuses a manifest declaring `runtime: skill` ([`refuse_skill_manifest`]).
 ///
-/// A payload with no component (a skill, a core module) names no `murmur:*`
+/// A payload with no component (a core module, a static payload) names no `murmur:*`
 /// interface and so fits every level. Every authored entry is packed byte for byte.
 #[must_use = "artifact path is needed for caller output and follow-up actions"]
 pub fn build_artifact(
@@ -181,6 +197,7 @@ pub fn build_artifact(
 ) -> Result<BuiltArtifact, BuildError> {
     let manifest_path = resolve_manifest_path(source_dir);
     let manifest = load_manifest(&manifest_path)?;
+    refuse_skill_manifest(&manifest, &manifest_path)?;
     let manifest_yaml =
         fs::read_to_string(&manifest_path).map_err(|source| BuildError::ReadSource {
             path: manifest_path.display().to_string(),
@@ -293,8 +310,7 @@ pub(crate) fn plan_packed_entries(
     validate_artifact_name(&manifest.name)?;
 
     // Which companion files an artifact needs is the artifact's own declaration
-    // (`requires_files:`), not something this function infers from the role. `runtime: skill`
-    // still requires `skill.md` because that is what the field defaults to when absent.
+    // (`requires_files:`), not something this function infers from the role.
     for required in &manifest.requires_files {
         check_declared_entry(source_dir, required)?;
     }
@@ -500,48 +516,27 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload_shape::SKILL_MD_ENTRY;
     use tempfile::tempdir;
     use zip::ZipArchive;
 
     #[test]
-    fn skill_artifact_build_succeeds_with_skill_md() {
+    fn a_skill_manifest_is_refused_before_anything_is_written() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
             "name: test-skill\nversion: 0.1.0\nruntime: skill\n",
         )
         .unwrap();
-        fs::write(dir.path().join("skill.md"), "# Skill\nGuidance.\n").unwrap();
-
-        let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out, &[]).unwrap();
-
-        let file = std::fs::File::open(&out).unwrap();
-        let mut archive = ZipArchive::new(file).unwrap();
-        let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
-            .collect();
-
-        assert!(names.contains(&"murmur.yaml".to_string()));
-        assert!(names.contains(&"skill.md".to_string()));
-    }
-
-    #[test]
-    fn skill_artifact_build_fails_without_skill_md() {
-        let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join(MANIFEST_FILENAME),
-            "name: test-skill\nversion: 0.1.0\nruntime: skill\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join(SKILL_MD_ENTRY), "# Skill\nGuidance.\n").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
         let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
-
-        let msg = err.to_string();
+        assert!(matches!(err, BuildError::SkillManifest { .. }), "{err}");
         assert!(
-            msg.contains("skill.md"),
-            "error should name the missing file; got: {msg}"
+            err.to_string()
+                .ends_with("declares runtime: skill; a skill is built from a folder holding SKILL.md, not from murmur.yaml"),
+            "{err}"
         );
         assert!(!out.exists(), "no zip should be created on failure");
     }
@@ -567,20 +562,6 @@ mod tests {
         fs::write(dir.path().join("config.json"), "{}\n").unwrap();
         build_artifact(dir.path(), &out, &[])
             .expect("build succeeds once the declared file exists");
-    }
-
-    #[test]
-    fn empty_requires_files_lets_a_skill_skip_the_skill_md_check() {
-        let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join(MANIFEST_FILENAME),
-            "name: test-skill\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n",
-        )
-        .unwrap();
-
-        let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out, &[])
-            .expect("explicit empty requires_files overrides default");
     }
 
     /// Names every entry in a built archive, in the order the packer wrote them.
@@ -851,7 +832,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            format!("name: {name}\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n"),
+            format!("name: {name}\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files: []\n"),
         )
         .unwrap();
 
@@ -924,7 +905,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(
             source.join(MANIFEST_FILENAME),
-            "name: traversal\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - ../secret.txt\n",
+            "name: traversal\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - ../secret.txt\n",
         )
         .unwrap();
 
@@ -943,7 +924,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: absolute\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - /etc/hosts\n",
+            "name: absolute\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - /etc/hosts\n",
         )
         .unwrap();
 
@@ -966,7 +947,7 @@ mod tests {
             .unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: symlinked\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - link.txt\n",
+            "name: symlinked\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - link.txt\n",
         )
         .unwrap();
 
@@ -993,7 +974,7 @@ mod tests {
         fs::write(dir.path().join("sub\\payload.bin"), "flat").unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: collision\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - sub/payload.bin\n  - sub\\payload.bin\n",
+            "name: collision\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - sub/payload.bin\n  - sub\\payload.bin\n",
         )
         .unwrap();
 
@@ -1194,14 +1175,14 @@ mod tests {
     }
 
     #[test]
-    fn build_labels_a_skill_with_the_newest_level() {
+    fn build_labels_a_static_payload_with_the_newest_level() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: test-skill\nversion: 0.1.0\nruntime: skill\n",
+            "name: test-notes\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - notes.md\n",
         )
         .unwrap();
-        fs::write(dir.path().join("skill.md"), "# Skill\n").unwrap();
+        fs::write(dir.path().join("notes.md"), "# Notes\n").unwrap();
         let out = dir.path().join("artifact.mur.zip");
         let built = build_artifact(dir.path(), &out, &tool_levels()).unwrap();
         assert_eq!(built.built_at_level, Some(2));
@@ -1216,10 +1197,10 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: test-skill\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - skill.md\n  - murmur-build.json\n",
+            "name: test-skill\nversion: 0.1.0\nruntime: tool\nexecution: static\nrequires_files:\n  - notes.md\n  - murmur-build.json\n",
         )
         .unwrap();
-        fs::write(dir.path().join("skill.md"), "# Skill\n").unwrap();
+        fs::write(dir.path().join("notes.md"), "# Notes\n").unwrap();
         fs::write(
             dir.path().join("murmur-build.json"),
             "{\"built_at_level\":9}",

@@ -1,6 +1,8 @@
 use std::io::Cursor;
 
-use murmur_artifact::payload_shape::{select_root_wasm_in_archive, SKILL_MD_ENTRY};
+use murmur_artifact::payload_shape::{
+    check_skill_payload_entries, select_root_wasm_in_archive, SkillPayloadError, SKILL_MD_ENTRY,
+};
 use murmur_artifact::zip_guard;
 use murmur_artifact::{BUILD_INFO_FILE, PACKED_MANIFEST_ENTRY};
 use zip::ZipArchive;
@@ -85,20 +87,22 @@ fn extract_root_wasm_capped(
 }
 
 /// One skill's installable files: each as its `/`-separated path under `tools/<name>/` and its
-/// bytes, `skill.md` first.
+/// bytes, `SKILL.md` first.
 pub type SkillFiles = Vec<(String, Vec<u8>)>;
 
 /// The files of a skill artifact's `.mur.zip` that install under `tools/<name>/`: each as its
-/// `/`-separated path inside the archive and its bytes, `skill.md` first.
+/// `/`-separated path inside the archive and its bytes, `SKILL.md` first.
 ///
 /// Skill artifact layout:
 ///   murmur.yaml        — artifact manifest at zip root (not returned; staging writes its own)
-///   skill.md           — guidance content at zip root (required)
+///   SKILL.md           — guidance content at zip root (required), installed byte for byte
 ///   murmur-build.json  — build record at zip root (not returned)
 ///   anything else      — supporting files the guidance points at, at their packed paths
 ///
-/// An entry name that escapes the archive fails the extraction, and so does a total past the
-/// artifact decompression ceiling.
+/// An archive whose root holds `skill.md` in another casing and no `SKILL.md`, the layout an
+/// older `mur build` wrote, is refused with [`RuntimeError::SkillArtifactLayout`]. An entry name
+/// that escapes the archive fails the extraction, and so does a total past the artifact
+/// decompression ceiling.
 pub fn extract_skill_files(
     artifact_name: &str,
     artifact_version: &str,
@@ -126,6 +130,15 @@ fn extract_skill_files_capped(
     let cursor = std::io::Cursor::new(artifact_bytes);
     let mut archive = ZipArchive::new(cursor).map_err(|err| archive_error(err.to_string()))?;
 
+    if let Err(reason @ SkillPayloadError::BuiltBeforeStandard) =
+        check_skill_payload_entries(archive.file_names().filter_map(Result::ok))
+    {
+        return Err(RuntimeError::SkillArtifactLayout {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            reason,
+        });
+    }
     let skill_md = zip_guard::read_zip_entry_capped(&mut archive, SKILL_MD_ENTRY, max_bytes)
         .map_err(|err| {
             archive_error(format!(
@@ -603,7 +616,7 @@ mod tests {
     #[test]
     fn extract_skill_files_rejects_entry_past_ceiling() {
         let big = vec![b'a'; 1024];
-        let archive = archive_with_files(&[("skill.md", &big)]);
+        let archive = archive_with_files(&[("SKILL.md", &big)]);
 
         let err = extract_skill_files_capped("demo", "0.0.1", &archive, 16).unwrap_err();
         match err {
@@ -617,7 +630,7 @@ mod tests {
     #[test]
     fn extract_skill_files_rejects_a_total_past_ceiling() {
         let archive =
-            archive_with_files(&[("skill.md", &[b'a'; 10]), ("references/a.md", &[b'b'; 10])]);
+            archive_with_files(&[("SKILL.md", &[b'a'; 10]), ("references/a.md", &[b'b'; 10])]);
 
         let err = extract_skill_files_capped("demo", "0.0.1", &archive, 16).unwrap_err();
         match err {
@@ -634,7 +647,7 @@ mod tests {
         let archive = archive_with_files(&[
             (PACKED_MANIFEST_ENTRY, b"name: demo"),
             ("references/forms.md", b"# Forms\n"),
-            ("skill.md", b"# Demo\n"),
+            ("SKILL.md", b"# Demo\n"),
             (BUILD_INFO_FILE, b"{}"),
             ("scripts/fill.py", b"print(1)\n"),
         ]);
@@ -643,7 +656,7 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                ("skill.md".to_string(), b"# Demo\n".to_vec()),
+                ("SKILL.md".to_string(), b"# Demo\n".to_vec()),
                 ("references/forms.md".to_string(), b"# Forms\n".to_vec()),
                 ("scripts/fill.py".to_string(), b"print(1)\n".to_vec()),
             ]
@@ -658,7 +671,7 @@ mod tests {
         match err {
             RuntimeError::ArtifactArchive { message, .. } => {
                 assert!(
-                    message.contains("skill.md not found or unreadable at archive root"),
+                    message.contains("SKILL.md not found or unreadable at archive root"),
                     "{message}"
                 );
             }
@@ -667,8 +680,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_skill_files_refuses_an_archive_built_before_the_standard() {
+        let archive = archive_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: demo\nversion: 0.0.1\nruntime: skill\n",
+            ),
+            ("skill.md", b"# Demo\n"),
+        ]);
+
+        let err = extract_skill_files("local/demo", "0.0.1", &archive).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RuntimeError::SkillArtifactLayout { name, version, reason: SkillPayloadError::BuiltBeforeStandard }
+                    if name == "local/demo" && version == "0.0.1"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "skill artifact local/demo@0.0.1 cannot be installed: it holds skill.md, so it was \
+             built before skills followed the Agent Skills standard, which names the file SKILL.md"
+        );
+    }
+
+    #[test]
     fn extract_skill_files_refuses_an_escaping_entry() {
-        let archive = archive_with_files(&[("skill.md", b"# s"), ("../escape.md", b"x")]);
+        let archive = archive_with_files(&[("SKILL.md", b"# s"), ("../escape.md", b"x")]);
 
         let err = extract_skill_files("demo", "0.0.1", &archive).unwrap_err();
         match err {

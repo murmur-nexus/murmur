@@ -178,7 +178,7 @@ pub enum RuntimeError {
     },
 
     #[error(
-        "inference.system_prompt_artifact '{name}': skill.md not found or unreadable; \
+        "inference.system_prompt_artifact '{name}': SKILL.md not found or unreadable; \
          ensure the skill is declared in artifacts: and the capsule was staged"
     )]
     SystemPromptArtifactRead {
@@ -190,7 +190,7 @@ pub enum RuntimeError {
     #[error("skill source path not found: {path}")]
     SkillSourceNotFound { path: String },
 
-    #[error("skill source directory '{path}' contains no skill.md")]
+    #[error("skill source directory '{path}' contains no SKILL.md")]
     SkillSourceMissingSkillMd { path: String },
 
     #[error("failed to read skill source at {path}: {source}")]
@@ -200,10 +200,24 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
-    /// A local skill source directory holds what `mur build` refuses to pack: a symlink, two
-    /// spellings of `skill.md`, or a root `murmur-build.json`.
+    /// A local skill source directory holds what `mur build` refuses to pack: a symlink or a
+    /// root `murmur-build.json`. `hint` says what to change.
     #[error("skill source refused: {message}")]
-    SkillSourceRefused { message: String },
+    SkillSourceRefused { message: String, hint: String },
+
+    /// A local skill source breaks the Agent Skills standard: a `SKILL.md` spelled otherwise, a
+    /// `murmur.yaml` beside it, or a front-block rule. `message` names the file and the rule;
+    /// `hint` says what to change.
+    #[error("{message}")]
+    SkillSourceNotStandard { message: String, hint: String },
+
+    /// A staged skill archive holds no root `SKILL.md`: an older mur stored it.
+    #[error("skill artifact {name}@{version} cannot be installed: {reason}")]
+    SkillArtifactLayout {
+        name: String,
+        version: String,
+        reason: murmur_artifact::SkillPayloadError,
+    },
 
     #[error("invalid network capability allow entry '{entry}': {message}")]
     InvalidNetworkAllowEntry { entry: String, message: String },

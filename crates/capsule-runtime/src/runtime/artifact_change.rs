@@ -303,7 +303,7 @@ impl CapsuleStoreState {
         self.removed_artifacts.insert(tool.clone());
         self.installed_generation += 1;
 
-        // 3. The files: manifest, `skill.md`.
+        // 3. The files: manifest, `SKILL.md`.
         // Removed by descriptor beneath the runtime directory: a link at `tools` or at the tool's
         // directory is refused, never followed into what it names.
         let rel = format!("tools/{tool}");
@@ -872,6 +872,15 @@ impl CapsuleStoreState {
         let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
             .map_err(|err| err.to_string())?;
         self.admit_provider_tool(&tool, &format!("{name}@{version}"), &manifest_yaml)?;
+        // A skill archive is read whole before its manifest is written, so one an older mur
+        // stored without a root SKILL.md leaves nothing behind.
+        let skill_files = match resolved.meta.runtime {
+            RuntimeType::Static => Some(
+                extract_skill_files(&name, &version, &resolved.bytes)
+                    .map_err(|err| err.to_string())?,
+            ),
+            RuntimeType::Wasm => None,
+        };
         write_tool_manifest(&self.runtime_root, &tool, &manifest_yaml)
             .map_err(|err| err.to_string())?;
 
@@ -886,8 +895,7 @@ impl CapsuleStoreState {
                 (ArtifactRuntime::Tool, Some(component))
             }
             RuntimeType::Static => {
-                let files = extract_skill_files(&name, &version, &resolved.bytes)
-                    .map_err(|err| err.to_string())?;
+                let files = skill_files.unwrap_or_default();
                 install_skill_files(&self.runtime_root, vec![(tool.clone(), files)])
                     .map_err(|err| err.to_string())?;
                 (ArtifactRuntime::Skill, None)

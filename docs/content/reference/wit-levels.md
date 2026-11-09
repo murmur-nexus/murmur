@@ -56,8 +56,8 @@ Where fit is decided:
 | Installed artifact | `.meta.json` → `meta.built_at_level` | Read from the archive on every install or publish. Absent when the archive packs no `murmur-build.json` |
 | Artifact index | `versions[].built_at_level` | `mur index`, from the files' `murmur-build.json`, or derived ([Artifact Index](artifact-index.md)) |
 
-`murmur-build.json` is reserved: a `requires_files:` entry, or a file in a `mur build --skill`
-input, that packs under that name is refused with [`E-BLD-002`](diagnostics.md#e-bld-002). An
+`murmur-build.json` is reserved: a `requires_files:` entry, or a file at the root of a skill
+folder, that packs under that name is refused with [`E-BLD-002`](diagnostics.md#e-bld-002). An
 archive whose `murmur-build.json` does not hold a non-negative integer `built_at_level` is refused
 on install with `E-IO-003`.
 

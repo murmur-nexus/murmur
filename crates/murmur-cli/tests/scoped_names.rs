@@ -240,7 +240,11 @@ fn a_source_skill_named_with_a_scope_is_told_to_drop_it() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("skills/style")).unwrap();
-    fs::write(project.path().join("skills/style/skill.md"), "# Style\n").unwrap();
+    fs::write(
+        project.path().join("skills/style/SKILL.md"),
+        "---\nname: style\ndescription: House style.\n---\n# Style\n",
+    )
+    .unwrap();
     agent_manifest(
         project.path(),
         "  - name: ana/style\n    runtime: skill\n    source: ./skills/style\n",
@@ -879,7 +883,11 @@ fn a_source_skill_and_a_resolved_artifact_sharing_a_tool_name_are_refused() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("skills/editor")).unwrap();
-    fs::write(project.path().join("skills/editor/skill.md"), "# Editor\n").unwrap();
+    fs::write(
+        project.path().join("skills/editor/SKILL.md"),
+        "---\nname: editor\ndescription: Edits files.\n---\n# Editor\n",
+    )
+    .unwrap();
     agent_manifest(
         project.path(),
         &format!(
@@ -1055,11 +1063,26 @@ fn build_refuses_a_scoped_name_and_packs_a_bare_one() {
     let packed = murmur_artifact::load_manifest_from_artifact(&built).unwrap();
     assert_eq!(packed.name, "tool-x");
 
-    let skill = tempfile::tempdir().unwrap();
-    fs::write(skill.path().join("SKILL.md"), "# A skill\n").unwrap();
-    let assert = mur(&home, skill.path(), &SilentSource::new().api_base)
-        .args(["build", "--skill", "ana/x", skill.path().to_str().unwrap()])
+    // A skill is named by its SKILL.md front block, whose name rule has no room for a scope.
+    let skill_base = tempfile::tempdir().unwrap();
+    let skill = skill_base.path().join("x");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: ana/x\ndescription: A skill.\nmetadata:\n  version: \"0.1.0\"\n---\n# A skill\n",
+    )
+    .unwrap();
+    let assert = mur(&home, skill_base.path(), &SilentSource::new().api_base)
+        .args(["build", skill.to_str().unwrap()])
         .assert()
         .failure();
-    assert!(stderr_of(&assert).contains("the scope belongs to the source"));
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("error[E-BLD-009]"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "front block name 'ana/x' may contain only lowercase letters, digits and '-'"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_dir(skill_base.path()).unwrap().count(), 1);
 }

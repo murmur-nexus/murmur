@@ -256,9 +256,9 @@ An `untrusted` artifact reaches the model marked on every surface it can reach i
 | Surface | `operator` artifact | `runtime` artifact |
 |---|---|---|
 | Its tool-array entry, on both transports | The artifact's own description | The description opens with the marker below, then one space and the artifact's own description; the marker alone when it has none |
-| A skill call's result | `skill.md` verbatim | `skill.md` inside the [untrusted fence](#threat-model), source `skill:<name>`, on every call |
+| A skill call's result | The `SKILL.md` body verbatim | The `SKILL.md` body inside the [untrusted fence](#threat-model), source `skill:<name>`, on every call |
 | A tool call's result | Fenced, source `tool:<name>` | Fenced, source `tool:<name>` |
-| `inference.system_prompt_artifact` | Its `skill.md` is the system prompt | Refused at launch with [`E-RUN-043`](../reference/diagnostics.md#e-run-043) |
+| `inference.system_prompt_artifact` | Its `SKILL.md` body is the system prompt | Refused at launch with [`E-RUN-043`](../reference/diagnostics.md#e-run-043) |
 
 The marker:
 
@@ -299,8 +299,8 @@ available, and permanently open elsewhere.
     |---|---|
     | A tool result — from a WASM tool, a shell binary, or one of the runtime's own peer-handoff tools | Yes |
     | A task whose [trust class](#task-origin-and-trust-class) is `untrusted` | Yes |
-    | A skill's `skill.md`, when a running capsule pulled the skill's pin | Yes. See [Artifact origin](#artifact-origin) |
-    | An operator-pinned skill's `skill.md` | No. It is the capsule author's own guidance, staged inside the capsule at install; fencing it as data would make the skill inert |
+    | A skill's `SKILL.md` body, when a running capsule pulled the skill's pin | Yes. See [Artifact origin](#artifact-origin) |
+    | An operator-pinned skill's `SKILL.md` body | No. It is the capsule author's own guidance, staged inside the capsule at install; fencing it as data would make the skill inert |
     | A `user` or `schedule` task | No. It is the operator instructing their own capsule, for the same reason |
 
     Fenced content arrives between a pair of markers naming where it came from. A marker found

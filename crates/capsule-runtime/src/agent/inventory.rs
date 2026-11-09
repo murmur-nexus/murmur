@@ -102,28 +102,13 @@ pub(crate) fn build_tool_inventory(
             continue;
         }
 
-        // Description: manifest field, or fall back to how skill.md describes itself.
-        let description = {
-            let from_manifest = value
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            from_manifest.unwrap_or_else(|| {
-                if matches!(runtime, ArtifactRuntime::Skill) {
-                    runtime_root
-                        .read_to_string(format!("tools/{name}/skill.md"))
-                        .ok()
-                        .flatten()
-                        .and_then(|text| murmur_artifact::skill_md_description(&text))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            })
-        };
+        // A skill's staged manifest carries its SKILL.md front block's description, as every
+        // tool's carries its own.
+        let description = value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
 
         // Skills take no input payload — use empty schema. Tools keep their declared schema.
         let parameters = if matches!(runtime, ArtifactRuntime::Skill) {
@@ -325,7 +310,7 @@ pub(crate) fn tool_names(tools: &[Value]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use murmur_artifact::LockOrigin;
+    use murmur_artifact::{LockOrigin, SKILL_MD_ENTRY};
 
     use super::*;
     use std::{fs, path::Path};
@@ -385,50 +370,33 @@ mod tests {
         );
     }
 
-    /// A skill with no manifest description is described from its `skill.md`: the front
-    /// block's description, else the first line after the block, else its first line.
+    /// A skill is described from its staged manifest alone; its `SKILL.md` front block is
+    /// never read for the inventory.
     #[test]
-    fn skill_description_falls_back_to_the_front_block() {
+    fn a_skill_is_described_from_its_manifest_alone() {
         let workdir = tempfile::tempdir().unwrap();
-        for (name, skill_md) in [
+        for (name, manifest) in [
             (
                 "fronted",
-                "---\nname: fronted\ndescription: Fill PDF forms.\n---\n# Fronted\n",
+                "name: fronted\nversion: 0.0.0\nruntime: skill\ndescription: Fill PDF forms.\n",
             ),
-            (
-                "nameonly",
-                "---\nname: nameonly\n---\n\n# After the block\n",
-            ),
-            ("plain", "\n# Plain skill\nBody.\n"),
+            ("plain", "name: plain\nversion: 0.0.0\nruntime: skill\n"),
         ] {
             let dir = workdir.path().join("tools").join(name);
             fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(PACKED_MANIFEST_ENTRY), manifest).unwrap();
             fs::write(
-                dir.join(PACKED_MANIFEST_ENTRY),
-                format!("name: {name}\nversion: 0.0.0\nruntime: skill\n"),
+                dir.join(SKILL_MD_ENTRY),
+                format!("---\nname: {name}\ndescription: From the front block.\n---\n# Body\n"),
             )
             .unwrap();
-            fs::write(dir.join("skill.md"), skill_md).unwrap();
         }
 
-        let descriptions: Vec<(String, String)> =
-            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])
-                .iter()
-                .map(|t| {
-                    (
-                        t["name"].as_str().unwrap().to_string(),
-                        t["description"].as_str().unwrap().to_string(),
-                    )
-                })
-                .collect();
-        assert_eq!(
-            descriptions,
-            [
-                ("fronted".to_string(), "Fill PDF forms.".to_string()),
-                ("nameonly".to_string(), "# After the block".to_string()),
-                ("plain".to_string(), "# Plain skill".to_string()),
-            ]
-        );
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        assert_eq!(tools[0]["name"], "fronted");
+        assert_eq!(tools[0]["description"], "Fill PDF forms.");
+        assert_eq!(tools[1]["name"], "plain");
+        assert!(tools[1].get("description").is_none(), "{}", tools[1]);
     }
 
     /// Tool order is sorted regardless of the order the directories were created in, because
@@ -501,8 +469,7 @@ mod tests {
         }
     }
 
-    /// A workdir holding a described tool, a described skill and a skill whose only description
-    /// is the first line of its `skill.md`.
+    /// A workdir holding a described tool and two described skills.
     fn mixed_workdir() -> tempfile::TempDir {
         let workdir = tempfile::tempdir().unwrap();
         let tools_dir = workdir.path().join("tools");
@@ -519,11 +486,11 @@ mod tests {
         write_manifest(
             &tools_dir,
             "pulled-style",
-            "name: pulled-style\nversion: 1.0.0\nruntime: skill\n",
+            "name: pulled-style\nversion: 1.0.0\nruntime: skill\ndescription: Pulled style\n",
         );
         fs::write(
-            tools_dir.join("pulled-style").join("skill.md"),
-            "\n# Pulled style\nMore guidance.\n",
+            tools_dir.join("pulled-style").join(SKILL_MD_ENTRY),
+            "---\nname: pulled-style\ndescription: Pulled style\n---\n# Pulled style\n",
         )
         .unwrap();
         workdir
@@ -585,8 +552,8 @@ mod tests {
         }
     }
 
-    /// The marker applies to a skill whose description comes from `skill.md`, and to a runtime
-    /// skill with no description at all, which then carries the marker alone.
+    /// The marker applies to a described skill, and to a runtime skill with no description at
+    /// all, which then carries the marker alone.
     #[test]
     fn runtime_origin_inventory_marks_a_skill_with_no_description_with_the_marker_alone() {
         let workdir = tempfile::tempdir().unwrap();
@@ -631,7 +598,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             entry["description"],
-            format!("{RUNTIME_ORIGIN_MARKER} # Pulled style")
+            format!("{RUNTIME_ORIGIN_MARKER} Pulled style")
         );
     }
 

@@ -58,7 +58,47 @@ impl Installed {
         )
         .unwrap();
         fs::write(source.path().join("instructions.md"), PACKAGE_TEXT).unwrap();
+        Self::build_and_publish(name, home, staging, source, server)
+    }
 
+    /// A capsule whose package carries the skill folder `skills/pdf-helper/` (`SKILL.md` holding
+    /// `skill_md`, and `references/forms.md`) and declares it as a `source:` skill.
+    fn with_skill(name: &'static str, responses: Vec<String>, skill_md: &str) -> Self {
+        let home = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let server = ScriptedServer::start(responses);
+        let endpoint = &server.endpoint;
+        fs::write(
+            source.path().join("murmur.yaml"),
+            format!(
+                "name: {name}\nversion: {VERSION}\nruntime: capsule\nexecution: static\n\
+                 requires_files:\n  - skills/pdf-helper/SKILL.md\n  - skills/pdf-helper/references/forms.md\n\
+                 artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
+                 runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
+                 \x20 - name: pdf-helper\n    runtime: skill\n    source: ./skills/pdf-helper\n\
+                 capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
+                 inference:\n  transport: http\n  model: test-model\n  \
+                 driver:\n    artifact: {DRIVER_NAME}\n"
+            ),
+        )
+        .unwrap();
+        let skill = source.path().join("skills/pdf-helper");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("SKILL.md"), skill_md).unwrap();
+        fs::write(skill.join("references/forms.md"), "# Forms\n").unwrap();
+        Self::build_and_publish(name, home, staging, source, server)
+    }
+
+    /// `mur build` of `source` into `staging`, published with the driver into `home`'s global
+    /// store.
+    fn build_and_publish(
+        name: &'static str,
+        home: TempDir,
+        staging: TempDir,
+        source: TempDir,
+        server: ScriptedServer,
+    ) -> Self {
         let driver = common::create_driver_artifact(
             staging.path(),
             DRIVER_NAME,
@@ -421,4 +461,72 @@ fn system_prompt_override_drops_the_file_row() {
     let system = installed.first_system();
     assert!(system.contains("CLI prompt"), "{system}");
     assert!(!system.contains("PACKAGE-MARKER-5d1e"), "{system}");
+}
+
+/// The S1 skill's `SKILL.md` without its `metadata` block: a `source:` skill reads no version.
+const PDF_HELPER_SKILL_MD: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms; use when a form must be filled.\n---\n# PDF helper\nSee references/forms.md.\n";
+
+/// A `source:` skill inside an installed package follows the Agent Skills standard as one beside
+/// a manifest does: a call returns the `SKILL.md` body and names the supporting files.
+#[test]
+fn an_installed_capsule_loads_a_standard_skill_from_its_package() {
+    if common::skip_without_host_support(
+        "an_installed_capsule_loads_a_standard_skill_from_its_package",
+    ) {
+        return;
+    }
+    let installed = Installed::with_skill(
+        "imf-skill",
+        vec![
+            common::tool_use_response("toolu_skill", "pdf-helper", json!({})),
+            one_turn(),
+        ],
+        PDF_HELPER_SKILL_MD,
+    );
+    let workdir = TempDir::new().unwrap();
+
+    installed.launch(workdir.path(), &[]);
+
+    let text = common::tool_result_text(&installed.server.requests(), "toolu_skill")
+        .expect("the skill call has a result");
+    assert!(
+        text.starts_with("# PDF helper\nSee references/forms.md.\n"),
+        "{text}"
+    );
+    assert!(!text.contains("name: pdf-helper"), "{text}");
+    assert!(
+        text.ends_with("/tools/pdf-helper:\n- references/forms.md\n"),
+        "{text}"
+    );
+}
+
+/// The same rule a `source:` skill beside a manifest is held to refuses one inside an installed
+/// package, before the provider is called or the workdir is touched.
+#[test]
+fn an_installed_capsule_refuses_a_package_skill_named_unlike_its_folder() {
+    let installed = Installed::with_skill(
+        "imf-skill-bad",
+        Vec::new(),
+        &PDF_HELPER_SKILL_MD.replace("name: pdf-helper", "name: other-name"),
+    );
+    let workdir = TempDir::new().unwrap();
+
+    let assert = installed
+        .run(workdir.path(), &["--task", "Say hello."])
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    println!("── stderr\n{stderr}");
+
+    assert!(stderr.contains("error[E-BLD-009]"), "{stderr}");
+    assert!(stderr.contains("skills/pdf-helper"), "{stderr}");
+    assert!(
+        stderr.contains("front block name 'other-name' differs from the folder name 'pdf-helper'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("set name: pdf-helper, or rename the folder to other-name"),
+        "{stderr}"
+    );
+    assert!(installed.server.requests().is_empty());
+    assert!(files_under(workdir.path()).is_empty(), "nothing is staged");
 }

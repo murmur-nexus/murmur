@@ -16,9 +16,7 @@ pub struct Manifest {
     /// from `runtime:`.
     pub execution: Option<RuntimeType>,
     /// Companion files that must sit beside this manifest for `build_artifact` to succeed.
-    /// Declared via `requires_files:`; when absent it defaults to `["skill.md"]` for
-    /// `runtime: skill` and to an empty list for every other role. An explicit value — including
-    /// an empty list — always wins over that default.
+    /// Declared via `requires_files:`; empty when absent.
     pub requires_files: Vec<String>,
     /// The packed `description:` text as written, block scalars included; `None` when the
     /// manifest has no string `description:`.
@@ -140,8 +138,7 @@ impl Manifest {
         let runtime = required_string(root, "runtime")?;
         refuse_unknown_implementation(root)?;
         let execution = optional_runtime_type(root, "execution")?;
-        let requires_files = optional_string_seq(root, "requires_files")?
-            .unwrap_or_else(|| default_requires_files(&runtime));
+        let requires_files = optional_string_seq(root, "requires_files")?.unwrap_or_default();
         let description = optional_string(root, "description");
 
         Ok(Self {
@@ -212,17 +209,6 @@ fn refuse_unknown_implementation(root: &serde_norway::Mapping) -> Result<(), Man
             expected: "wasm".to_string(),
             got: other.map_or_else(|| yaml_type_name(value), str::to_string),
         }),
-    }
-}
-
-/// The companion files a role requires when `requires_files:` is not declared. Reproduces the
-/// hardcoded `skill.md` check `build_artifact` used to apply to `runtime: skill`, so a manifest
-/// that says nothing about `requires_files:` builds exactly as it did before.
-fn default_requires_files(runtime: &str) -> Vec<String> {
-    if runtime == "skill" {
-        vec!["skill.md".to_string()]
-    } else {
-        Vec::new()
     }
 }
 
@@ -1525,10 +1511,10 @@ mod tests {
     }
 
     #[test]
-    fn requires_files_defaults_to_skill_md_for_skill_role() {
+    fn requires_files_defaults_to_empty_for_a_skill() {
         let manifest =
             Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\n").unwrap();
-        assert_eq!(manifest.requires_files, vec!["skill.md".to_string()]);
+        assert!(manifest.requires_files.is_empty());
     }
 
     #[test]
@@ -1544,15 +1530,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.requires_files, vec!["config.json".to_string()]);
-    }
-
-    #[test]
-    fn explicit_empty_requires_files_overrides_skill_default() {
-        let manifest = Manifest::from_yaml_str(
-            "name: s\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n",
-        )
-        .unwrap();
-        assert!(manifest.requires_files.is_empty());
     }
 
     #[test]

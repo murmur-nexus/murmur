@@ -8,7 +8,7 @@ The relevant manifest options are:
 |---|---|
 | [inference.system_prompt](../reference/manifest.md#inference-system-prompt) | Inline text injected as the system prompt on every turn |
 | [inference.system_prompt_file](../reference/manifest.md#inference-system-prompt) | Path to a file whose content is used as the system prompt |
-| [inference.system_prompt_artifact](../reference/manifest.md#inference-system-prompt) | Name of a skill artifact whose `skill.md` is read at launch and used as the system prompt |
+| [inference.system_prompt_artifact](../reference/manifest.md#inference-system-prompt) | Name of a skill artifact whose `SKILL.md` body is read at launch and used as the system prompt |
 
 ---
 
@@ -158,22 +158,22 @@ inference:
   system_prompt_artifact: local/code-review-conventions
 ```
 
-At launch, the runtime reads the skill's `skill.md` from the session's
-[runtime directory](../reference/workdir.md#runtime-directory) and uses that content as the system prompt for every inference turn. The skill is **not** added to the callable tool inventory — it is already in context and would double-inject if called.
+At launch, the runtime reads the skill's `SKILL.md` from the session's
+[runtime directory](../reference/workdir.md#runtime-directory) and uses its body, the text after the front block, as the system prompt for every inference turn. The skill is **not** added to the callable tool inventory — it is already in context and would double-inject if called.
 
 `MURMUR.md` notes the binding so the agent is aware:
 
 ```markdown
 ## Installed Skills
 
-- **code-review-conventions** — Project PR review conventions *(bound as system prompt — already in context, not separately callable; /home/you/.murmur/sessions/ses_…/runtime/tools/code-review-conventions/skill.md)*
+- **code-review-conventions** — Project PR review conventions. Use when reviewing a pull request. *(bound as system prompt — already in context, not separately callable; /home/you/.murmur/sessions/ses_…/runtime/tools/code-review-conventions/SKILL.md)*
 ```
 
 Validation happens at parse time:
 
 - The named artifact must be declared in `artifacts:` — if not, `mur run` exits with a clear error before starting.
 - It must declare `prompt_payload: true` — `runtime: skill` defaults to this, so skills work with no extra declaration; a `tool`, `driver`, or `hook` artifact must set `prompt_payload: true` explicitly to be eligible, and one that doesn't is a manifest error. See [`inference.system_prompt_artifact`](../reference/manifest.md#inference-system-prompt-artifact).
-- The skill's `skill.md` must be readable at launch — a missing file exits with `error[E-RUN-009]`.
+- The skill's `SKILL.md` must be readable at launch — a missing file exits with `error[E-RUN-009]`.
 
 ---
 
@@ -284,9 +284,9 @@ On a capsule with no `inference:` block there is no prompt to override, and the 
 |---|---|
 | `inference.system_prompt: \|` | Inline text; injected verbatim on every inference turn |
 | `inference.system_prompt_file: path.md` | File content; read once at launch; path is [relative to the manifest](../reference/manifest.md#manifest-relative-paths), installed or not |
-| `inference.system_prompt_artifact: name` | Skill artifact's `skill.md` read at launch and used as system prompt; skill not separately callable |
+| `inference.system_prompt_artifact: name` | Body of the skill artifact's `SKILL.md` read at launch and used as system prompt; skill not separately callable |
 | More than one field set simultaneously | Parse error `error[E-MAN-003]` |
-| File or skill.md missing or unreadable | Launch error `error[E-RUN-009]` — session never starts |
+| File or `SKILL.md` missing or unreadable | Launch error `error[E-RUN-009]` — session never starts |
 | No field set | No `system` parameter is sent; model receives no system prompt |
 | `mur run --system-prompt "text"` | Replaces whichever field the manifest set, for that run only; value is trimmed; empty value clears the prompt; `murmur.yaml` untouched |
 | `mur run --system-prompt` on a manifest with no `inference:` | CLI error `error[E-IO-003]` — nothing is staged |

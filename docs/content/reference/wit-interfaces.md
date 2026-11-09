@@ -502,7 +502,7 @@ A removal deletes the artifact from every place `pull` put it:
 
 | Place | After `remove` |
 |---|---|
-| `tools/<name>/` in the [runtime directory](workdir.md#runtime-directory), `<name>` being the bare part | Deleted: the manifest, `skill.md` and the component |
+| `tools/<name>/` in the [runtime directory](workdir.md#runtime-directory), `<name>` being the bare part | Deleted: the manifest, a skill's `SKILL.md` and supporting files, and the component |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
 | `invoke()` | The name leaves the dispatch allowlist. A call to it returns `tool '<name>' was removed from this session; it can no longer be called` |

@@ -347,7 +347,7 @@ mod tests {
                 "murmur.yaml",
                 b"name: demo-skill\nversion: 0.1.0\nruntime: skill\n",
             ),
-            ("skill.md", b"# Demo\n"),
+            ("SKILL.md", b"# Demo\n"),
         ]);
         let capsule = payload(&[
             (

@@ -210,8 +210,8 @@ pub struct LifecycleOverride {
 ///   lifecycle points; behavioral contract (binding, execution_mode, commit_policy) is declared
 ///   in the artifact's own murmur.yaml. Hidden from the LLM.
 /// - `Skill`: documentation artifact; no executable binary. Visible in the LLM tool inventory.
-///   Invoking a skill by name returns its `skill.md` content as the tool result (just-in-time
-///   injection). No WASM dispatch occurs. A skill bound via
+///   Invoking a skill by name returns the body of its `SKILL.md` (the text after the front
+///   block) as the tool result (just-in-time injection). No WASM dispatch occurs. A skill bound via
 ///   `inference.system_prompt_artifact` is excluded from the callable inventory because it is
 ///   already part of the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1057,7 +1057,7 @@ pub struct RuntimeArtifact {
     pub runtime: ArtifactRuntime,
     /// Optional local source path. When set, the runtime resolves the artifact directly from
     /// this path instead of from the registry — no `.mur.zip`, no publish. For a skill the path
-    /// points at a `skill.md` file or at a directory containing one (case-insensitive).
+    /// names a `SKILL.md` file or a directory holding one, spelled exactly so.
     /// Relative paths resolve against the directory containing `murmur.yaml`.
     /// Only permitted when `local_source` is true.
     pub source: Option<String>,
@@ -1224,8 +1224,8 @@ pub struct InferenceConfig {
     pub compaction: Option<CompactionConfig>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<String>,
-    /// Name of a skill artifact declared in `artifacts:` whose `skill.md` is used as the system
-    /// prompt. Mutually exclusive with `system_prompt` and `system_prompt_file`. The skill is
+    /// Name of a skill artifact declared in `artifacts:` whose `SKILL.md` body is used as the
+    /// system prompt. Mutually exclusive with `system_prompt` and `system_prompt_file`. The skill is
     /// excluded from the callable tool inventory (it's already in the system prompt).
     pub system_prompt_artifact: Option<String>,
     /// `inference.instruction_files`: work-folder files appended to the system prompt at launch,
@@ -1592,7 +1592,7 @@ pub struct PlanCapabilities {
 /// nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCapabilities {
-    /// Entries admitting skill artifacts (`skill.md`, no executable payload).
+    /// Entries admitting skill artifacts (`SKILL.md`, no executable payload).
     pub skill: Vec<String>,
     /// Entries admitting tool artifacts.
     pub tool: Vec<String>,
@@ -10470,7 +10470,7 @@ name: cap
 version: 0.0.1
 artifacts:
   - name: my-skill
-    source: ./skills/my-skill/skill.md
+    source: ./skills/my-skill/SKILL.md
     runtime: skill
 "#,
         )
@@ -10481,7 +10481,7 @@ artifacts:
         assert_eq!(artifact.runtime, ArtifactRuntime::Skill);
         assert_eq!(
             artifact.source.as_deref(),
-            Some("./skills/my-skill/skill.md")
+            Some("./skills/my-skill/SKILL.md")
         );
         assert_eq!(artifact.version, "local");
     }
@@ -10516,7 +10516,7 @@ name: cap
 version: 0.0.1
 artifacts:
   - name: my-skill
-    source: ./skills/my-skill/skill.md
+    source: ./skills/my-skill/SKILL.md
     version: 9.9.9
     runtime: skill
 "#,

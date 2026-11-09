@@ -503,7 +503,11 @@ fn doctor_skips_local_source_skills() {
     let project = tempfile::tempdir().unwrap();
 
     fs::create_dir_all(project.path().join("skills")).unwrap();
-    fs::write(project.path().join("skills/skill.md"), "# local\n").unwrap();
+    fs::write(
+        project.path().join("skills/SKILL.md"),
+        "---\nname: skills\ndescription: A local skill.\n---\n# local\n",
+    )
+    .unwrap();
     create_project(
         project.path(),
         "  - name: local-skill\n    version: 0.1.0\n    runtime: skill\n    source: ./skills\n",
@@ -986,7 +990,11 @@ fn doctor_exempts_local_source_skills_from_lock_checks() {
 
     // Add a local-source skill the lock knows nothing about.
     fs::create_dir_all(project.path().join("skills")).unwrap();
-    fs::write(project.path().join("skills/skill.md"), "# local\n").unwrap();
+    fs::write(
+        project.path().join("skills/SKILL.md"),
+        "---\nname: skills\ndescription: A local skill.\n---\n# local\n",
+    )
+    .unwrap();
     create_project(
         project.path(),
         "  - name: local/pinned-dep\n    version: 0.1.0\n    runtime: skill\n\

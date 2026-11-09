@@ -27,7 +27,7 @@ pub(crate) struct DispatchOutcome {
     /// to the background. The two are never both `Some`: a demoted command has no exit code yet,
     /// which is exactly why `HookEvent::Shell` does not fire for one.
     pub detached: Option<crate::detached::DetachedDispatchInfo>,
-    /// True when the dispatch was served by reading a skill.md file rather than running
+    /// True when the dispatch was served by reading a SKILL.md file rather than running
     /// a binary or WASM component. Used by the agent loop to write a `skill_call` trace
     /// event instead of a `tool_call` event.
     pub is_skill: bool,
@@ -117,7 +117,7 @@ pub struct ArtifactRequest {
     pub version: String,
     pub runtime: ArtifactRuntime,
     /// Optional local source path (skill artifacts only). When set, the runtime resolves the
-    /// skill's `skill.md` directly from this path and skips registry resolution entirely.
+    /// skill's `SKILL.md` directly from this path and skips registry resolution entirely.
     /// Relative paths resolve against the manifest: `StageRequest::manifest_dir`, or the
     /// installed package of `StageRequest::capsule_artifact`.
     pub source: Option<String>,

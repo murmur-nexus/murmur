@@ -17,8 +17,8 @@ use std::path::{Component, Path, PathBuf};
 use bytes::Bytes;
 use murmur_artifact::payload_shape::SKILL_MD_ENTRY;
 use murmur_artifact::{
-    classify_skill_folder_root_file, skill_folder_skips, zip_guard, SkillFolderError,
-    SkillFolderRootFile,
+    check_skill_md, classify_skill_folder_root_file, skill_folder_root_refusal, skill_folder_skips,
+    zip_guard, SkillFolderError, SkillFolderRootFile, SkillVersionRule,
 };
 use serde::Serialize;
 use zip::ZipArchive;
@@ -162,14 +162,15 @@ impl ManifestFiles {
         result.map_err(|source| (shown, source))
     }
 
-    /// A local-source skill's files: each as its `/`-separated path under `tools/<name>/` and its
-    /// bytes, `skill.md` first.
+    /// A local-source skill: its files and its front block's description.
     ///
-    /// `source` may name a file, installed alone as `skill.md`, or a folder, whose `skill.md`
-    /// (any casing) and supporting files install by the rules
+    /// `source` may name a file, which must be named `SKILL.md` and installs alone, or a folder,
+    /// whose `SKILL.md` and supporting files install by the rules
     /// [`murmur_artifact::collect_skill_folder`] applies to a folder on disk. A package folder is
-    /// every entry under `<source>/`.
-    pub fn read_skill_source(&self, source: &str) -> Result<SkillFiles, RuntimeError> {
+    /// every entry under `<source>/`. `SKILL.md` must pass [`check_skill_md`] without
+    /// `metadata.version`, its `name` equal to the name of the folder holding it. Every refusal
+    /// happens here, before anything is staged.
+    pub fn read_skill_source(&self, source: &str) -> Result<LocalSkill, RuntimeError> {
         let (location, shown, _) = self.locate(source);
         match (location, self) {
             (Location::Host(path), _) => read_host_skill_source(&path),
@@ -184,6 +185,37 @@ impl ManifestFiles {
             }
         }
     }
+}
+
+/// A local-source skill as [`ManifestFiles::read_skill_source`] read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSkill {
+    /// Each file as its `/`-separated path under `tools/<name>/` and its bytes, `SKILL.md`
+    /// first.
+    pub files: SkillFiles,
+    /// The `SKILL.md` front block's `description`.
+    pub description: String,
+}
+
+/// Check `skill_md` (`files[0]`), shown as `path`, and pair the files with its description.
+fn checked_local_skill(
+    path: &Path,
+    folder: Option<&str>,
+    files: SkillFiles,
+) -> Result<LocalSkill, RuntimeError> {
+    let front =
+        check_skill_md(path, &files[0].1, folder, SkillVersionRule::NotRead).map_err(refused)?;
+    Ok(LocalSkill {
+        files,
+        description: front.description,
+    })
+}
+
+/// The last `/`-separated component of `path`, and the one before it.
+fn last_two_components(path: &str) -> (&str, Option<&str>) {
+    let mut parts = path.rsplit('/');
+    let last = parts.next().unwrap_or_default();
+    (last, parts.next().filter(|parent| !parent.is_empty()))
 }
 
 /// A declared relative path as a package entry name: its normal components joined by `/`. `None`
@@ -281,7 +313,7 @@ fn read_package_skill_source(
     package: &[u8],
     prefix: &str,
     shown: &str,
-) -> Result<SkillFiles, RuntimeError> {
+) -> Result<LocalSkill, RuntimeError> {
     let unreadable = |source| RuntimeError::SkillSourceRead {
         path: shown.to_string(),
         source,
@@ -297,8 +329,18 @@ fn read_package_skill_source(
     let max_bytes = zip_guard::max_artifact_decompressed_bytes();
 
     if let Some(file) = entries.iter().find(|entry| entry.name == prefix) {
+        let (file_name, folder) = last_two_components(prefix);
+        if file_name != SKILL_MD_ENTRY {
+            return Err(refused(SkillFolderError::MisspelledSkillMd {
+                path: PathBuf::from(shown),
+            }));
+        }
         let bytes = read_capped(&mut archive, &file.raw, max_bytes).map_err(unreadable)?;
-        return Ok(vec![(SKILL_MD_ENTRY.to_string(), bytes)]);
+        return checked_local_skill(
+            Path::new(shown),
+            folder,
+            vec![(SKILL_MD_ENTRY.to_string(), bytes)],
+        );
     }
 
     let folder = PathBuf::from(shown);
@@ -323,26 +365,13 @@ fn read_package_skill_source(
             supporting.push((relative.to_string(), entry));
             continue;
         }
-        match classify_skill_folder_root_file(relative) {
-            SkillFolderRootFile::SkillMd => {
-                if let Some(first) = skill_md {
-                    let first_name = first.name.rsplit('/').next().unwrap_or_default();
-                    return Err(refused(SkillFolderError::DuplicateSkillMd {
-                        dir: folder.clone(),
-                        first: first_name.to_string(),
-                        second: relative.to_string(),
-                    }));
-                }
-                skill_md = Some(entry);
-            }
-            // The skill's own manifest is never installed: staging writes one there.
-            SkillFolderRootFile::Manifest => {}
-            SkillFolderRootFile::ReservedBuildInfo => {
-                return Err(refused(SkillFolderError::ReservedBuildInfo {
-                    path: folder.join(relative),
-                }));
-            }
-            SkillFolderRootFile::Supporting => supporting.push((relative.to_string(), entry)),
+        let class = classify_skill_folder_root_file(relative);
+        if let Some(refusal) = skill_folder_root_refusal(class, folder.join(relative)) {
+            return Err(refused(refusal));
+        }
+        match class {
+            SkillFolderRootFile::SkillMd => skill_md = Some(entry),
+            _ => supporting.push((relative.to_string(), entry)),
         }
     }
     if !found_any {
@@ -373,18 +402,38 @@ fn read_package_skill_source(
         total += bytes.len() as u64;
         files.push((relative, bytes));
     }
-    Ok(files)
+    let (folder_name, _) = last_two_components(prefix);
+    checked_local_skill(&folder.join(SKILL_MD_ENTRY), Some(folder_name), files)
 }
 
+/// The launch error for a skill source the walk or the front-block check refuses:
+/// `E-BLD-009` for a break with the Agent Skills standard, `E-BLD-002` for what no artifact
+/// packs.
 fn refused(error: SkillFolderError) -> RuntimeError {
-    RuntimeError::SkillSourceRefused {
-        message: error.to_string(),
+    match error {
+        SkillFolderError::MissingSkillMd { dir } => RuntimeError::SkillSourceMissingSkillMd {
+            path: dir.display().to_string(),
+        },
+        SkillFolderError::Io { path, source } => RuntimeError::SkillSourceRead {
+            path: path.display().to_string(),
+            source,
+        },
+        error => {
+            let message = error.to_string();
+            let hint = error.hint().unwrap_or_default();
+            if error.breaks_standard() {
+                RuntimeError::SkillSourceNotStandard { message, hint }
+            } else {
+                RuntimeError::SkillSourceRefused { message, hint }
+            }
+        }
     }
 }
 
-/// A skill source on the host: a file, installed alone as `skill.md`, or a folder walked by
-/// [`murmur_artifact::collect_skill_folder`].
-fn read_host_skill_source(path: &Path) -> Result<SkillFiles, RuntimeError> {
+/// A skill source on the host: a `SKILL.md` file, installed alone, or a folder walked by
+/// [`murmur_artifact::collect_skill_folder`]. The folder the front block's `name` must equal is
+/// the last component of the folder's canonical path, or of the file's parent's.
+fn read_host_skill_source(path: &Path) -> Result<LocalSkill, RuntimeError> {
     if !path.exists() {
         return Err(RuntimeError::SkillSourceNotFound {
             path: path.display().to_string(),
@@ -398,26 +447,33 @@ fn read_host_skill_source(path: &Path) -> Result<SkillFiles, RuntimeError> {
         })
     };
     if !path.is_dir() {
-        return Ok(vec![(SKILL_MD_ENTRY.to_string(), read(path)?)]);
+        if path.file_name().is_none_or(|name| name != SKILL_MD_ENTRY) {
+            return Err(refused(SkillFolderError::MisspelledSkillMd {
+                path: path.to_path_buf(),
+            }));
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let canonical =
+            fs::canonicalize(parent).map_err(|source| RuntimeError::SkillSourceRead {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        let folder = canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let files = vec![(SKILL_MD_ENTRY.to_string(), read(path)?)];
+        return checked_local_skill(path, folder.as_deref(), files);
     }
 
-    let folder = murmur_artifact::collect_skill_folder(path).map_err(|error| match error {
-        SkillFolderError::MissingSkillMd { .. } => RuntimeError::SkillSourceMissingSkillMd {
-            path: path.display().to_string(),
-        },
-        SkillFolderError::Io { path, source } => RuntimeError::SkillSourceRead {
-            path: path.display().to_string(),
-            source,
-        },
-        refused => RuntimeError::SkillSourceRefused {
-            message: refused.to_string(),
-        },
-    })?;
+    let folder = murmur_artifact::collect_skill_folder(path).map_err(refused)?;
     let mut files = vec![(SKILL_MD_ENTRY.to_string(), read(&folder.skill_md)?)];
     for (relative, file) in &folder.supporting_files {
         files.push((relative.clone(), read(file)?));
     }
-    Ok(files)
+    checked_local_skill(&folder.skill_md, folder.folder_name.as_deref(), files)
 }
 
 /// One row per path the manifest names, in the order `inference.system_prompt_file`,
@@ -504,21 +560,37 @@ mod tests {
         }
     }
 
+    const HOUSE_SKILL_MD: &[u8] =
+        b"---\nname: house\ndescription: How the house works.\n---\n# House skill\n";
+
     fn house() -> ManifestFiles {
         ManifestFiles::Package(package(&[
             ("murmur.yaml", b"name: house\n"),
             ("compaction.md", b"Summarise tersely."),
             ("./instructions.md", b"Package instructions."),
-            ("skills/house/SKILL.md", b"# House skill"),
+            ("SKILL.md", HOUSE_SKILL_MD),
+            ("skills/house/SKILL.md", HOUSE_SKILL_MD),
             ("skills/house/references/a.md", b"reference a"),
+            ("skills/house/references/murmur.yaml", b"nested is a file"),
             ("skills/house/.hidden", b"hidden"),
-            ("skills/house/murmur.yaml", b"name: inner\n"),
+            ("skills/manifest/SKILL.md", HOUSE_SKILL_MD),
+            ("skills/manifest/murmur.yaml", b"name: inner\n"),
             ("skills/twice/SKILL.md", b"one"),
             ("skills/twice/skill.md", b"two"),
+            ("skills/lower/skill.md", HOUSE_SKILL_MD),
+            ("skills/other/SKILL.md", HOUSE_SKILL_MD),
             ("skills/bare/notes.md", b"no skill"),
-            ("skills/built/skill.md", b"built"),
+            ("skills/built/SKILL.md", b"built"),
             ("skills/built/murmur-build.json", b"{}"),
         ]))
+    }
+
+    /// The `(message, hint)` of a `SkillSourceNotStandard` refusal.
+    fn not_standard(result: Result<LocalSkill, RuntimeError>) -> (String, String) {
+        match result {
+            Err(RuntimeError::SkillSourceNotStandard { message, hint }) => (message, hint),
+            other => panic!("expected SkillSourceNotStandard, got {other:?}"),
+        }
     }
 
     #[test]
@@ -592,41 +664,182 @@ mod tests {
     }
 
     #[test]
-    fn a_package_file_source_installs_as_skill_md() {
-        let files = house().read_skill_source("./compaction.md").unwrap();
+    fn a_package_file_source_installs_that_skill_md_alone() {
+        let skill = house()
+            .read_skill_source("./skills/house/SKILL.md")
+            .unwrap();
         assert_eq!(
-            files,
-            vec![("skill.md".to_string(), b"Summarise tersely.".to_vec())]
+            skill,
+            LocalSkill {
+                files: vec![("SKILL.md".to_string(), HOUSE_SKILL_MD.to_vec())],
+                description: "How the house works.".to_string(),
+            }
         );
     }
 
     #[test]
-    fn a_package_folder_source_installs_skill_md_and_supporting_files() {
-        let files = house().read_skill_source("skills/house/").unwrap();
-        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["skill.md", "references/a.md"]);
-        assert_eq!(files[0].1, b"# House skill");
+    fn a_package_file_source_not_named_skill_md_is_refused() {
+        for source in ["./compaction.md", "skills/lower/skill.md"] {
+            let (message, hint) = not_standard(house().read_skill_source(source));
+            assert!(
+                message.ends_with("a skill's file is named SKILL.md, exactly"),
+                "{message}"
+            );
+            assert!(hint.starts_with("rename "), "{hint}");
+        }
     }
 
     #[test]
-    fn a_package_folder_with_two_skill_mds_is_refused() {
-        match house().read_skill_source("skills/twice") {
-            Err(RuntimeError::SkillSourceRefused { message }) => {
+    fn a_skill_md_at_the_package_root_has_no_folder_and_is_refused() {
+        let (message, hint) = not_standard(house().read_skill_source("SKILL.md"));
+        assert_eq!(
+            message,
+            "local/house@0.1.0!/SKILL.md: is not inside a folder, so front block name 'house' \
+             has no folder name to match"
+        );
+        assert_eq!(hint, "move SKILL.md into a folder named house");
+    }
+
+    #[test]
+    fn a_package_folder_source_installs_skill_md_and_supporting_files() {
+        let skill = house().read_skill_source("skills/house/").unwrap();
+        let names: Vec<&str> = skill.files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["SKILL.md", "references/a.md", "references/murmur.yaml"]
+        );
+        assert_eq!(skill.files[0].1, HOUSE_SKILL_MD);
+        assert_eq!(skill.description, "How the house works.");
+    }
+
+    #[test]
+    fn a_package_folder_breaking_the_standard_is_refused_by_rule() {
+        let (message, hint) = not_standard(house().read_skill_source("skills/manifest"));
+        assert_eq!(
+            message,
+            "local/house@0.1.0!/skills/manifest/murmur.yaml: a skill folder holds no murmur.yaml \
+             beside SKILL.md"
+        );
+        assert!(hint.ends_with("delete murmur.yaml"), "{hint}");
+
+        let (message, hint) = not_standard(house().read_skill_source("skills/twice"));
+        assert_eq!(
+            message,
+            "local/house@0.1.0!/skills/twice/skill.md: a skill's file is named SKILL.md, exactly"
+        );
+        assert_eq!(hint, "rename skill.md to SKILL.md");
+
+        let (message, _) = not_standard(house().read_skill_source("skills/other"));
+        assert_eq!(
+            message,
+            "local/house@0.1.0!/skills/other/SKILL.md: front block name 'house' differs from \
+             the folder name 'other'"
+        );
+    }
+
+    #[test]
+    fn a_package_folder_with_build_info_is_refused() {
+        match house().read_skill_source("skills/built") {
+            Err(RuntimeError::SkillSourceRefused { message, hint }) => {
+                assert!(message.contains("reserved for mur build"), "{message}");
                 assert!(
-                    message.contains("local/house@0.1.0!/skills/twice"),
-                    "{message}"
+                    hint.contains("mur build writes murmur-build.json"),
+                    "{hint}"
                 );
             }
             other => panic!("expected SkillSourceRefused, got {other:?}"),
         }
     }
 
+    fn host_skill(base: &Path, folder: &str, skill_md: &str) -> PathBuf {
+        let dir = base.join(folder);
+        fs::create_dir_all(dir.join("references")).unwrap();
+        fs::write(dir.join("SKILL.md"), skill_md).unwrap();
+        fs::write(dir.join("references/forms.md"), "# Forms\n").unwrap();
+        dir
+    }
+
+    const PDF_HELPER: &str = "---\nname: pdf-helper\ndescription: Fill PDF forms; use when a form must be filled.\n---\n# PDF helper\n";
+
     #[test]
-    fn a_package_folder_with_build_info_is_refused() {
-        assert!(matches!(
-            house().read_skill_source("skills/built"),
-            Err(RuntimeError::SkillSourceRefused { .. })
-        ));
+    fn a_host_folder_source_needs_no_version_and_carries_its_description() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = host_skill(base.path(), "pdf-helper", PDF_HELPER);
+        let files = ManifestFiles::Directory(base.path().to_path_buf());
+        let skill = files.read_skill_source("./pdf-helper").unwrap();
+        let names: Vec<&str> = skill.files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["SKILL.md", "references/forms.md"]);
+        assert_eq!(
+            skill.description,
+            "Fill PDF forms; use when a form must be filled."
+        );
+
+        let file = files.read_skill_source("./pdf-helper/SKILL.md").unwrap();
+        assert_eq!(
+            file.files,
+            vec![("SKILL.md".to_string(), PDF_HELPER.as_bytes().to_vec())]
+        );
+        let absolute = dir.join("SKILL.md");
+        let file = files.read_skill_source(absolute.to_str().unwrap()).unwrap();
+        assert_eq!(file.files.len(), 1);
+    }
+
+    #[test]
+    fn a_host_source_breaking_the_standard_is_refused_by_rule() {
+        let base = tempfile::tempdir().unwrap();
+        let files = ManifestFiles::Directory(base.path().to_path_buf());
+
+        let dir = host_skill(
+            base.path(),
+            "lower",
+            &PDF_HELPER.replace("pdf-helper", "lower"),
+        );
+        fs::rename(dir.join("SKILL.md"), dir.join("skill.md")).unwrap();
+        let (message, hint) = not_standard(files.read_skill_source("./lower"));
+        assert!(
+            message.ends_with("lower/skill.md: a skill's file is named SKILL.md, exactly"),
+            "{message}"
+        );
+        assert_eq!(hint, "rename skill.md to SKILL.md");
+        let (message, _) = not_standard(files.read_skill_source("./lower/skill.md"));
+        assert!(
+            message.ends_with("a skill's file is named SKILL.md, exactly"),
+            "{message}"
+        );
+
+        let dir = host_skill(
+            base.path(),
+            "manifest",
+            &PDF_HELPER.replace("pdf-helper", "manifest"),
+        );
+        fs::write(dir.join("murmur.yaml"), "name: manifest\n").unwrap();
+        let (message, _) = not_standard(files.read_skill_source("./manifest"));
+        assert!(
+            message.ends_with("a skill folder holds no murmur.yaml beside SKILL.md"),
+            "{message}"
+        );
+
+        host_skill(
+            base.path(),
+            "pdf-helper",
+            &PDF_HELPER.replace("name: pdf-helper", "name: other-name"),
+        );
+        let (message, hint) = not_standard(files.read_skill_source("./pdf-helper"));
+        assert!(
+            message.ends_with(
+                "SKILL.md: front block name 'other-name' differs from the folder name 'pdf-helper'"
+            ),
+            "{message}"
+        );
+        assert_eq!(
+            hint,
+            "set name: pdf-helper, or rename the folder to other-name"
+        );
+        let (message, _) = not_standard(files.read_skill_source("./pdf-helper/SKILL.md"));
+        assert!(
+            message.contains("differs from the folder name 'pdf-helper'"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -690,7 +903,10 @@ mod tests {
         let rows = manifest_file_reports(
             &house(),
             Some(&inference),
-            [("house", "skills/house"), ("abs", "/opt/skill.md")],
+            [
+                ("house", "skills/house"),
+                ("abs", "/opt/pdf-helper/SKILL.md"),
+            ],
         );
         assert_eq!(
             rows,
@@ -715,8 +931,8 @@ mod tests {
                 },
                 ManifestFileReport {
                     key: "artifacts[abs].source".to_string(),
-                    declared: "/opt/skill.md".to_string(),
-                    resolved: "/opt/skill.md".to_string(),
+                    declared: "/opt/pdf-helper/SKILL.md".to_string(),
+                    resolved: "/opt/pdf-helper/SKILL.md".to_string(),
                     base: BASE_HOST_PATH,
                 },
             ]

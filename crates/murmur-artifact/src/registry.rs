@@ -277,6 +277,14 @@ impl LocalRegistry {
                     packed: packed.name,
                 });
             }
+            // The launch refuses a skill archive without a root SKILL.md, so none is stored.
+            if packed.runtime == "skill" {
+                refuse_skill_layout(bytes).map_err(|reason| RegistryError::SkillLayout {
+                    name: meta.name.to_string(),
+                    version: meta.version.clone(),
+                    reason,
+                })?;
+            }
             // The launch refuses the same table with E-RUN-052, so a payload carrying one is
             // never stored.
             if let Ok(yaml) = load_manifest_yaml_from_artifact_bytes(bytes) {
@@ -681,6 +689,14 @@ pub enum RegistryError {
     /// `<scope>/<name>`.
     #[error("{}", crate::manifest::native_tool_message(.name, .field))]
     NativeTool { name: String, field: String },
+    /// The payload's packed `murmur.yaml` declares `runtime: skill` and its root holds no
+    /// [`crate::SKILL_MD_ENTRY`].
+    #[error("skill artifact {name}@{version} cannot be stored: {reason}")]
+    SkillLayout {
+        name: String,
+        version: String,
+        reason: crate::SkillPayloadError,
+    },
     /// The payload's packed `murmur.yaml` declares a different name than the bare part of the
     /// full name it was to be filed under.
     #[error(
@@ -933,6 +949,15 @@ fn read_metadata(path: &Path) -> Result<StoredMetadata, io::Error> {
         meta: metadata.meta,
         native,
     })
+}
+
+/// The [`crate::check_skill_payload_entries`] verdict on the archive `bytes`; an archive that
+/// does not open is left to the readers that report it.
+fn refuse_skill_layout(bytes: &[u8]) -> Result<(), crate::SkillPayloadError> {
+    let Ok(archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return Ok(());
+    };
+    crate::check_skill_payload_entries(archive.file_names().filter_map(Result::ok))
 }
 
 /// The registry form of a [`crate::ManifestError::NativeTool`] refusal; any other manifest error
@@ -1492,7 +1517,7 @@ mod tests {
         });
 
         registry
-            .publish(meta, &zip_with(&[("skill.md", b"# guidance")]))
+            .publish(meta, &zip_with(&[("SKILL.md", b"# guidance")]))
             .unwrap();
 
         assert!(registry
@@ -1507,7 +1532,7 @@ mod tests {
     fn payloads_with_nothing_to_extract_omit_the_key_entirely() {
         let module = wat::parse_str(r#"(module (func (export "f")))"#).unwrap();
         let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("skill", zip_with(&[("skill.md", b"# guidance")])),
+            ("skill", zip_with(&[("SKILL.md", b"# guidance")])),
             ("stub", zip_with(&[("tool.wasm", b"\0asm")])),
             ("module", zip_with(&[("tool.wasm", &module)])),
             (
@@ -1534,6 +1559,50 @@ mod tests {
                 .wit_contracts
                 .is_none());
         }
+    }
+
+    // ── skill payloads ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_skill_payload_built_before_the_standard_is_never_stored() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let manifest = b"name: old-skill\nversion: 0.1.0\nruntime: skill\n";
+        let old = zip_with(&[("murmur.yaml", manifest), ("skill.md", b"# guidance")]);
+        let error = registry
+            .publish(test_meta("old-skill", "0.1.0"), &old)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RegistryError::SkillLayout {
+                    reason: crate::SkillPayloadError::BuiltBeforeStandard,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "skill artifact ana/old-skill@0.1.0 cannot be stored: it holds skill.md, so it was \
+             built before skills followed the Agent Skills standard, which names the file SKILL.md"
+        );
+        let bare = zip_with(&[("murmur.yaml", manifest), ("references/a.md", b"a")]);
+        let error = registry
+            .publish(test_meta("old-skill", "0.1.0"), &bare)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .ends_with("it holds no SKILL.md at its root"),
+            "{error}"
+        );
+        assert!(!dir.path().join("ana/old-skill").exists());
+
+        let new = zip_with(&[("murmur.yaml", manifest), ("SKILL.md", b"# guidance")]);
+        registry
+            .publish(test_meta("old-skill", "0.1.0"), &new)
+            .unwrap();
     }
 
     // ── native payloads ───────────────────────────────────────────────────────

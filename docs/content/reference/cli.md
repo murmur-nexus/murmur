@@ -595,14 +595,13 @@ See the `mur new` how-to guide for a full walkthrough.
 
 ## `mur build`
 
-Build a `.mur.zip` artifact. Two modes: standard build from a source directory with a `murmur.yaml`, or skill packaging from a skill folder or zip.
+Build a `.mur.zip` artifact from a source folder.
 
 | `mur build <source>` with | Mode |
 |---|---|
-| `<source>/murmur.yaml` | [Standard build](#standard-build) |
-| No `murmur.yaml`, and a root `SKILL.md` / `skill.md` (any casing) | [Skill packaging](#skill-packaging-skill), as if `--skill` were given |
+| A root file whose name lowercases to `skill.md` | [Skill packaging](#skill-packaging-skill) |
+| `<source>/murmur.yaml` and no such file | [Standard build](#standard-build) |
 | Neither | Fails with `E-IO-001` `murmur.yaml not found at …` |
-| `--skill` | [Skill packaging](#skill-packaging-skill) |
 
 ### Standard build
 
@@ -645,94 +644,70 @@ mur build .
 | ` (WIT level <N>)` | `murmur-build.json` records level `<N>` |
 | ` (fits no WIT level this mur knows)` | The payload fits no level, and no `murmur-build.json` is packed |
 
-A skill build writes the same entry and the same line; a skill fits every level.
+A `murmur.yaml` declaring `runtime: skill` is refused with
+[`E-BLD-009`](diagnostics.md#e-bld-009): a skill is built from a folder holding `SKILL.md`. A skill
+build writes the same `murmur-build.json` entry and the same line; a skill fits every level.
 
-### Skill packaging (`--skill`)
+### Skill packaging { #skill-packaging-skill }
 
-Package a skill — a folder or `.zip` containing `SKILL.md`, such as a skill made for Claude Code, Codex or pi — into a `.mur.zip` artifact without authoring a `murmur.yaml` first. A folder with no `murmur.yaml` builds this way without `--skill`.
+Package a skill folder that follows the [Agent Skills standard](https://agentskills.io/specification) — a folder named for the skill, holding `SKILL.md` and the files its body points at — into a `.mur.zip` artifact.
 
 ```bash
-mur build <folder> [--output <path-or-dir>] [--version <version>] [--summary <text>]
-mur build --skill [<name>] <path> [--output <path-or-dir>] [--version <version>] [--summary <text>]
+mur build <folder> [--output <path-or-dir>]
 ```
 
-| Argument / Flag | Description |
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<folder>` | `.` | The skill folder. Its name, the last component of its canonical path, is the name the front block's `name` must equal |
+| `--output` | `./<name>-<version>.mur.zip` | Output directory (receives `<name>-<version>.mur.zip`) or output file |
+
+**Front block** — `SKILL.md` opens with a line `---`, a YAML mapping, and a closing line `---`. An optional UTF-8 BOM before it is allowed.
+
+| Key | Required | Rule |
+|---|---:|---|
+| `name` | yes | A string of 1–64 ASCII lowercase letters, digits and `-`, with no `-` at the start or end and no `--`. Equal to the folder's name |
+| `description` | yes | A string, non-empty after trimming, at most 1024 characters after trimming |
+| `metadata.version` | yes | A string semver accepts, such as `"1.2.0"` |
+
+Every other key (`license`, `compatibility`, `allowed-tools`, other `metadata` entries, harness keys such as `when_to_use`) is not read. A block that is not valid YAML is refused with the YAML error; quote a value that holds `: `. Each broken rule is [`E-BLD-009`](diagnostics.md#e-bld-009).
+
+**Generated manifest** — the archive's `murmur.yaml` is generated from the front block:
+
+| Field | Value |
 |---|---|
-| `--skill` | Enable skill-packaging mode |
-| `<name>` | Optional explicit artifact name. Omit to take the front block's `name`, else infer from the folder or filename. |
-| `<path>` | Path to a folder or `.zip` containing `SKILL.md` (case-insensitive). Defaults to `.` |
-| `--output` | Output directory (receives `<name>-<version>.mur.zip`) or output file. Default: the current directory |
-| `--version` | Artifact version for the generated manifest. Default: `0.1.0` |
-| `--summary` | `description:` for the manifest. Default: the front block's `description` |
+| `name` | `name` |
+| `version` | `metadata.version` |
+| `runtime` | `skill` |
+| `description` | `description` |
 
-**Front block** — when the folder has no `murmur.yaml`, the `name` and `description` keys of the `---`-fenced block at the top of `SKILL.md` name and describe the artifact; other keys are ignored. A block that is not valid YAML, such as an unquoted `description: Fill forms: use when …`, is read line by line: the text after the first `:` of a top-level `name:` or `description:` line, with one pair of surrounding quotes removed.
-
-| Generated field | First that is set |
-|---|---|
-| `name` | `<name>`, the front block's `name`, the inferred name |
-| `description` | `--summary`, the front block's `description` |
-| `version` | `--version`, `0.1.0` |
-
-**Name inference** — when neither `<name>` nor a front-block `name` is given, the artifact name is derived from the last path component:
-
-1. Strip trailing `/` so `foo/` resolves to `foo`
-2. Strip `.zip` extension (case-insensitive)
-3. Lowercase
-4. Replace any non-ASCII-alphanumeric, non-hyphen character with `_`
-5. Collapse consecutive underscores to one
-6. Strip leading/trailing `_` and `-`
-
-Examples: `my-coding-skill/` → `my-coding-skill`; `My Skill.zip` → `my_skill`, which is refused with `E-BLD-001` because an artifact name holds no `_`
-
-**`<name>` vs `<path>` disambiguation** — if the value immediately following `--skill` contains `/`, `\`, or starts with `.`, it is treated as the input path (name inferred); otherwise it is the explicit artifact name and `<path>` is the next positional argument. A value with a `/` that is no existing path, such as `ana/x`, is read as a scoped name and refused with `E-BLD-001`: the name is bare.
-
-**`murmur.yaml` handling:**
-
-- **Absent** — a manifest is generated: `name`, `version`, `runtime: skill`, and `description` when one is set
-- **Present** (only with `--skill`) — packed unchanged, and the front block is not read; `--summary` sets `description` in the packed copy. The `runtime` field must be `skill` or the build fails with `E-MAN-003`
-
-**Packed files** — from a folder, every regular file at any depth, at its path relative to the folder, with the root `SKILL.md` stored as `skill.md`:
+**Packed files** — every regular file at any depth, at its path relative to the folder:
 
 | Entry | Result |
 |---|---|
+| Root `SKILL.md` | Packed byte for byte |
+| A `SKILL.md`, `skill.md` or `murmur.yaml` in a subfolder | Packed as a supporting file |
 | A name starting with `.`, at any depth (`.git/`, `.DS_Store`) | Skipped |
 | A file ending `.mur.zip`, and the output file | Skipped |
-| Root `murmur.yaml` | Packed as the manifest |
+| A root file whose name lowercases to `skill.md` and is not `SKILL.md` | Refused, `E-BLD-009` |
+| A root `murmur.yaml`, in any casing | Refused, `E-BLD-009` |
 | A symlink anywhere | Refused, `E-BLD-002` |
-| Both `SKILL.md` and `skill.md` at the root | Refused, `E-BLD-002` |
 | Root `murmur-build.json` | Refused, `E-BLD-002` |
 
-From a `.zip`, only root entries are packed.
+The archive holds `murmur.yaml`, `SKILL.md`, every supporting file and `murmur-build.json`.
 
 **Output location** — the current directory unless `--output` is given (not the source directory). Written atomically via a temp file + rename, so a failed write never leaves a partial zip.
 
 ```bash
-# Skill folder with a front block naming it pdf-helper, no murmur.yaml
-cd /tmp && mur build "Some Folder"
-# Built artifact: /tmp/pdf-helper-0.1.0.mur.zip (WIT level 1)
-
-# Infer name from folder
-cd /tmp && mur build --skill my-skill/
-# Built artifact: /tmp/my-skill-0.1.0.mur.zip
-
-# Explicit name and version
-mur build --skill wrapped-skill --version 1.2.0 my-skill/
-# Built artifact: ./wrapped-skill-1.2.0.mur.zip
-
-# Zip input
-mur build --skill external-skill.zip
-# Built artifact: ./external-skill-0.1.0.mur.zip
+cd /tmp && mur build ~/skills/pdf-helper
+# Built artifact: /tmp/pdf-helper-1.2.0.mur.zip (WIT level 5)
 ```
 
 **Error cases:**
 
 | Code | Meaning |
 |---|---|
-| `E-BLD-001` | The artifact name contains `/`, or is not lowercase letters, digits and inner hyphens — including a front-block `name`; pass `--skill <name>` to override it |
-| `E-BLD-002` | The folder holds a symlink, both `SKILL.md` and `skill.md`, or a root `murmur-build.json` |
-| `E-IO-001` | `SKILL.md` not found in the input folder or zip (case-insensitive search found no match) |
-| `E-MAN-002` | `murmur.yaml` present but YAML is malformed |
-| `E-MAN-003` | `murmur.yaml` present but `runtime` is not `skill` |
+| `E-BLD-002` | The folder holds a symlink or a root `murmur-build.json` |
+| `E-BLD-009` | The folder or its `SKILL.md` front block does not follow the Agent Skills standard |
 
 See also: [Package a skill into an artifact](../how-to/package-skill-artifact.md), [mur publish](#mur-publish), [mur install](#mur-install)
 
@@ -749,6 +724,7 @@ mur publish [artifact_path]
 - If `artifact_path` is omitted, CLI infers `<name>-<version>.mur.zip` from local `murmur.yaml`
 - `--registry` is refused with exit status 2 and a hint naming the global store
 - A payload whose `murmur.yaml` declares `implementation: native` or `execution: native` is refused with [`E-REG-012`](diagnostics.md#e-reg-012), and nothing is stored
+- A payload whose `murmur.yaml` declares `runtime: skill` and that holds no root `SKILL.md` is refused with [`E-REG-017`](diagnostics.md#e-reg-017), and nothing is stored
 
 Example:
 
@@ -1804,7 +1780,7 @@ Current runtime constraints:
 - `mur run` accepts all four artifact runtimes: `tool`, `driver`, `hook`, and `skill`
 - `tool` artifacts are exposed as model-callable tools; `driver`, `hook`, and `skill` artifacts are staged for runtime use but are hidden from the model's tool inventory
 - `tool` artifacts are offered to the model under their bare name, the part after the `/`: `murmur/tool-git` is the tool `tool-git`. Two declared artifacts with one bare name are refused with [`E-CAP-020`](diagnostics.md#e-cap-020)
-- `skill` artifacts install `skill.md` to `tools/<name>/skill.md` in the session's [runtime directory](workdir.md#runtime-directory), `<name>` being the bare name; the agent reads them by calling the skill, or at `$MURMUR_RUNTIME_DIR/tools/<name>/skill.md`
+- `skill` artifacts install `SKILL.md` to `tools/<name>/SKILL.md` in the session's [runtime directory](workdir.md#runtime-directory), `<name>` being the bare name, beside their supporting files and `murmur.yaml`; the agent receives the body of `SKILL.md` by calling the skill, or reads the file at `$MURMUR_RUNTIME_DIR/tools/<name>/SKILL.md`
 - Capsule component discovery:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
