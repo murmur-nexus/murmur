@@ -517,6 +517,23 @@ pub fn resolve_host_paths(
                 }
             }
         }
+        if let Some(murmur_home) = murmur_home.as_deref() {
+            let keys = crate::record_seal::keys_dir(murmur_home);
+            if path.starts_with(&keys) || keys.starts_with(&path) {
+                return Err(refuse(
+                    Some(path.clone()),
+                    format!(
+                        "is or contains {}, which holds the record-seal key that signs every \
+                         session's records; no capsule may reach it, at any access. Name a \
+                         folder that does not contain it, such as {}",
+                        keys.display(),
+                        murmur_home
+                            .join(crate::records_dir::RECORDS_DIR_NAME)
+                            .display()
+                    ),
+                ));
+            }
+        }
         if path.starts_with(&workdir) {
             return Err(refuse(
                 Some(path.clone()),
@@ -865,18 +882,62 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let workdir = root.join("project/workdir");
 
+        std::fs::create_dir_all(murmur_home.join("records")).unwrap();
         let resolved = resolve_one(
-            &murmur_home,
+            &murmur_home.join("records"),
             HostPathAccess::Read,
             Some(&murmur_home),
             &workdir,
         )
         .unwrap();
-        assert_eq!(resolved[0].path, murmur_home);
+        assert_eq!(resolved[0].path, murmur_home.join("records"));
 
         let resolved = resolve_one(&link, HostPathAccess::ReadWrite, None, &workdir).unwrap();
         assert_eq!(resolved[0].path, target);
         assert_eq!(resolved[0].declared, link.display().to_string());
+    }
+
+    /// The record-seal key's folder, and every folder containing it, is refused at any access;
+    /// a sibling under murmur's home at `read` is not.
+    #[test]
+    fn host_paths_an_entry_reaching_the_record_seal_key_is_refused_at_any_access() {
+        let dir = scratch();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let murmur_home = home.join(".murmur");
+        std::fs::create_dir_all(murmur_home.join("keys")).unwrap();
+        std::fs::create_dir_all(murmur_home.join("records")).unwrap();
+        let workdir = root.join("project/workdir");
+        for (path, access) in [
+            (murmur_home.clone(), HostPathAccess::Read),
+            (murmur_home.join("keys"), HostPathAccess::Read),
+            (home.clone(), HostPathAccess::Read),
+        ] {
+            let error = resolve_one(&path, access, Some(&murmur_home), &workdir)
+                .expect_err(&format!("{} should be refused", path.display()));
+            let text = error.to_string();
+            assert!(text.contains("record-seal key"), "{text}");
+            assert!(
+                text.contains(&murmur_home.join("keys").display().to_string()),
+                "{text}"
+            );
+        }
+        // `read-write` beneath murmur's home is refused by the rule that came first.
+        assert!(resolve_one(
+            &murmur_home.join("keys"),
+            HostPathAccess::ReadWrite,
+            Some(&murmur_home),
+            &workdir
+        )
+        .is_err());
+        let resolved = resolve_one(
+            &murmur_home.join("records"),
+            HostPathAccess::Read,
+            Some(&murmur_home),
+            &workdir,
+        )
+        .unwrap();
+        assert_eq!(resolved[0].path, murmur_home.join("records"));
     }
 
     #[test]

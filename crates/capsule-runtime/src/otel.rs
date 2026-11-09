@@ -28,6 +28,38 @@ pub(crate) struct OtelEmitter {
     /// Set to true after the first emit_session_end so the error-path fallback
     /// (`emit_session_end_if_not_ended`) does not double-post the root span.
     session_ended: bool,
+    /// Whether `capsule.session` waits for [`Self::flush_session_end`] instead of posting at
+    /// [`Self::emit_session_end`]: the agent path's span carries the head of the trace's chain
+    /// at `session_end`, which is written after the task that ends the span.
+    defer_session_span: bool,
+    /// The span [`Self::emit_session_end`] built and has not posted.
+    pending_session: Option<PendingSession>,
+}
+
+/// A `capsule.session` span built and held for [`OtelEmitter::flush_session_end`].
+struct PendingSession {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    start_ns: u64,
+    end_ns: u64,
+    exit_status: String,
+}
+
+/// The `murmur.record.*` attributes of a `capsule.session` span: the trace's chain head, its line
+/// number, and the id of the key that sealed it, when one did.
+fn record_attrs(head: Option<&crate::record_seal::SealedHead>) -> Vec<serde_json::Value> {
+    let Some(head) = head else {
+        return Vec::new();
+    };
+    let mut attrs = vec![
+        kv_str("murmur.record.head", &head.head),
+        kv_str("murmur.record.lines", &head.lines.to_string()),
+    ];
+    if let Some(key_id) = &head.key_id {
+        attrs.push(kv_str("murmur.record.key_id", key_id));
+    }
+    attrs
 }
 
 impl OtelEmitter {
@@ -48,7 +80,16 @@ impl OtelEmitter {
             session_start_ns: now_ns(),
             parent_span_id: None,
             session_ended: false,
+            defer_session_span: false,
+            pending_session: None,
         }
+    }
+
+    /// Holds every `capsule.session` span until [`Self::flush_session_end`], which passes the
+    /// trace's chain head. The agent path sets this; a script capsule's span is posted with its
+    /// head at once ([`Self::emit_session_end_sealed`]).
+    pub(crate) fn defer_session_span(&mut self) {
+        self.defer_session_span = true;
     }
 
     /// Called once before each agent-loop iteration.
@@ -83,11 +124,41 @@ impl OtelEmitter {
 
     /// Emit the root `capsule.session` span.
     /// Call at every session exit path (ok / failed / max_turns_reached).
+    ///
+    /// With [`Self::defer_session_span`] set the span is built here, ending now, and posted by
+    /// [`Self::flush_session_end`].
     pub(crate) async fn emit_session_end(&mut self, exit_status: &str) {
         if self.endpoint.is_none() {
             return;
         }
+        if self.defer_session_span {
+            self.pending_session = Some(PendingSession {
+                trace_id: self.trace_id.clone(),
+                span_id: self.session_span_id.clone(),
+                parent_span_id: self.parent_span_id.clone(),
+                start_ns: self.session_start_ns,
+                end_ns: now_ns(),
+                exit_status: exit_status.to_string(),
+            });
+            self.session_ended = true;
+            return;
+        }
+        self.emit_session_end_sealed(exit_status, None).await;
+    }
+
+    /// [`Self::emit_session_end`], posted at once with the `murmur.record.*` attributes of
+    /// `head`: the seal written after `session_end`.
+    pub(crate) async fn emit_session_end_sealed(
+        &mut self,
+        exit_status: &str,
+        head: Option<&crate::record_seal::SealedHead>,
+    ) {
+        if self.endpoint.is_none() {
+            return;
+        }
         let end_ns = now_ns();
+        let mut attrs = vec![kv_str("exit_status", exit_status)];
+        attrs.extend(record_attrs(head));
         let span = span_obj(
             &self.trace_id,
             &self.session_span_id,
@@ -95,10 +166,34 @@ impl OtelEmitter {
             "capsule.session",
             self.session_start_ns,
             end_ns,
-            vec![kv_str("exit_status", exit_status)],
+            attrs,
         );
         self.post_spans(vec![span]).await;
         self.session_ended = true;
+    }
+
+    /// Posts the `capsule.session` span [`Self::emit_session_end`] held, carrying `head`: the
+    /// seal written after `session_end` at teardown, or the chain's head so far when the next
+    /// task begins. A no-op when nothing is held.
+    pub(crate) async fn flush_session_end(
+        &mut self,
+        head: Option<&crate::record_seal::SealedHead>,
+    ) {
+        let Some(pending) = self.pending_session.take() else {
+            return;
+        };
+        let mut attrs = vec![kv_str("exit_status", &pending.exit_status)];
+        attrs.extend(record_attrs(head));
+        let span = span_obj(
+            &pending.trace_id,
+            &pending.span_id,
+            pending.parent_span_id.as_deref(),
+            "capsule.session",
+            pending.start_ns,
+            pending.end_ns,
+            attrs,
+        );
+        self.post_spans(vec![span]).await;
     }
 
     /// Idempotent fallback for error exit paths that bypass the normal return sites.

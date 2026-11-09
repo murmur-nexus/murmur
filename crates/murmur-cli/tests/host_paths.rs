@@ -352,6 +352,27 @@ fn a_root_or_missing_host_path_refuses_the_run_and_explain_scope_naming_it() {
     }
 }
 
+/// An entry that is, or contains, `~/.murmur/keys` is refused at any access before anything is
+/// staged, naming the record-seal key; `~/.murmur/records` beside it is not.
+#[test]
+fn a_host_path_reaching_the_record_seal_key_is_refused_before_staging() {
+    let capsule = Capsule::new(false);
+    fs::create_dir_all(capsule.home.join(".murmur/keys")).unwrap();
+    for entry in ["~/.murmur", "~/.murmur/keys", "\"~\""] {
+        capsule.global_config(&format!("  - path: {entry}\n    access: read\n"));
+        let (run, _) = capsule.run(Vec::new(), &[]);
+        assert!(!run.status.success());
+        let text = format!("{}{}", stdout(&run), stderr(&run));
+        assert!(text.contains("E-CFG-004"), "{text}");
+        assert!(text.contains("record-seal key"), "{text}");
+        assert!(
+            text.contains(&capsule.home.join(".murmur/keys").display().to_string()),
+            "{text}"
+        );
+        assert_eq!(capsule.records_entries(), 0, "nothing is staged");
+    }
+}
+
 // ── credential locations warn ──────────────────────────────────────────────────────────
 
 #[test]
@@ -606,8 +627,10 @@ fn sealed_host_paths_are_bound_at_their_own_path() {
     );
 }
 
-/// The test `HOME` itself lent `read`, with the project (and so the workdir) inside it: the run
-/// writes its workdir and is refused a write into its own records directory.
+/// The project (and so the workdir) and `~/.murmur/records` lent `read`: the run writes its
+/// workdir and is refused a write into its own records directory. The whole `HOME` cannot be
+/// lent, since it holds the record-seal key
+/// (`a_host_path_reaching_the_record_seal_key_is_refused_before_staging`).
 fn home_lent_read_on(test: &str, containment: &str, tier: &str) {
     if capsule_runtime::skip_without_egress_namespace(test) {
         return;
@@ -618,7 +641,17 @@ fn home_lent_read_on(test: &str, containment: &str, tier: &str) {
     let capsule = Capsule::new(true).with(&format!(
         "  containment: {containment}\n  shell:\n    allow: [bash]\n"
     ));
-    capsule.global_config("  - path: \"~\"\n    access: read\n");
+    let records = capsule.home.join(".murmur/records");
+    fs::create_dir_all(&records).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [capsule.home.join(".murmur"), records] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    capsule.global_config(
+        "  - path: ~/project\n    access: read\n  - path: ~/.murmur/records\n    access: read\n",
+    );
     report_tier(&capsule, test, tier);
     let (output, requests) = capsule.run(
         vec![

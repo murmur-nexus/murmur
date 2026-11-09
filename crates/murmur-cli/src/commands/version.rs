@@ -31,6 +31,7 @@ pub(crate) const MACHINE_COMMANDS: &[(&str, u32)] = &[
     ("token", 1),
     ("trace list --json", 1),
     ("trace rm --json", 1),
+    ("trace verify --json", 1),
     ("version --json", 1),
 ];
 

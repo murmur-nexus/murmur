@@ -224,6 +224,7 @@ mod tests {
         ),
         ("runtime_dir.rs", include_str!("runtime_dir.rs")),
         ("sandbox.rs", include_str!("sandbox.rs")),
+        ("record_seal.rs", include_str!("record_seal.rs")),
         ("sealed.rs", include_str!("sealed.rs")),
         ("shell.rs", include_str!("shell.rs")),
         ("session_check.rs", include_str!("session_check.rs")),
@@ -249,6 +250,8 @@ mod tests {
             crate::runtime::LEGACY_TASK_INPUT_FILE,
         ),
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
+        ("TRACE_STREAM", crate::record_seal::TRACE_STREAM),
+        ("EVAL_STREAM", crate::record_seal::EVAL_STREAM),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
         ("DELEGATIONS_SUBDIR", crate::runtime_dir::DELEGATIONS_SUBDIR),
         ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
@@ -281,6 +284,14 @@ mod tests {
     /// `workdir.join(...)` calls whose argument is not a literal or a named constant, each with
     /// the reason no entry name can be resolved from the source text.
     const DYNAMIC_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "record_seal.rs",
+            "format!(\"{stream_file}{SEAL_SUFFIX}\")",
+            "A stream's seal, `<stream>.seal` beside the stream it seals: `trace.jsonl.seal`, \
+             `hooks/eval.jsonl.seal` and `completion.json.seal` through `records_root`, each \
+             declared in RECORDS_DIR_WRITES, and `conversation.jsonl.seal` in a conversation \
+             record's own directory under `~/.murmur/conversations`, outside every work folder.",
+        ),
         (
             "protected_paths.rs",
             "&rule.relative",
@@ -335,11 +346,12 @@ mod tests {
              own.",
         ),
         (
-            "trace.rs",
-            "trace",
-            "A resumed trace's `trace.jsonl`, in the directory `mur run --resume` named it in \
-             (`ResumeRequest::trace_dir`): the prior session's records directory, or the folder \
-             its trace was copied to. Only `shell_lost` markers are appended.",
+            "record_seal.rs",
+            "rel",
+            "`InlineChain::open`'s file: a session's `trace.jsonl` through `records_root`, or a \
+             resumed trace's `trace.jsonl` in the directory `mur run --resume` named it in \
+             (`ResumeRequest::trace_dir`), the prior session's records directory or the folder \
+             its trace was copied to, where only `shell_lost` markers are appended.",
         ),
         (
             "runtime.rs",
@@ -506,6 +518,20 @@ mod tests {
         (
             "blobs",
             "Trace bodies too large to inline, by their sha256.",
+        ),
+        (
+            "trace.jsonl.seal",
+            "The trace's seal: its chain head signed with the host's record-seal key, written by \
+             `mur` at `session_end`, at teardown, and by a resumed session's reseal.",
+        ),
+        (
+            "hooks/eval.jsonl.seal",
+            "The scoring hook's `eval.jsonl` sealed by `mur` at teardown: every line's hash, \
+             signed.",
+        ),
+        (
+            "completion.json.seal",
+            "`completion.json` sealed by `mur` after every write of it.",
         ),
         (
             "logs",
@@ -972,6 +998,32 @@ mod tests {
     /// A row covers every listed call in that function. Anything a capsule's commands can reach
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "record_seal.rs",
+            "create_seed",
+            "Creates `~/.murmur/keys/record-seal.key` under a temporary name opened with \
+             `O_NOFOLLOW | O_EXCL` and links it into place: the murmur home's key folder, outside \
+             every work folder and records directory.",
+        ),
+        (
+            "record_seal.rs",
+            "read_seed",
+            "Opens `~/.murmur/keys/record-seal.key` with `O_NOFOLLOW` and checks its type, owner and \
+             mode before reading it: outside every work folder.",
+        ),
+        (
+            "record_seal.rs",
+            "load_or_create_uncached",
+            "Creates `~/.murmur/keys` and writes `record-seal.pub` beside the key: the murmur home, \
+             outside every work folder.",
+        ),
+        (
+            "record_seal.rs",
+            "load",
+            "Reads a record-seal public key file the operator named (`mur trace verify \
+             --public-key`, or `~/.murmur/keys/record-seal.pub`): a key, never a workdir path, \
+             and only read.",
+        ),
         (
             "session_check.rs",
             "copy_tree_into",

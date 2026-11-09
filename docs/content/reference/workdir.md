@@ -248,11 +248,12 @@ session ends:
     ├── evr_<32 hex>.json                         0600, one per mur eval run whose baseline ran here
     └── <session-id>/                             0700, created at staging, kept after the session
         ├── trace.jsonl
+        ├── trace.jsonl.seal
         ├── blobs/<sha256>
         ├── logs/bootstrap.log | otel.log | hook-<hook-name>.log
         ├── logs/shell-<timestamp>.log | <work-id>.log | check.log
-        ├── completion.json
-        ├── hooks/
+        ├── completion.json | completion.json.seal
+        ├── hooks/                                eval.jsonl.seal beside a scoring hook's eval.jsonl
         ├── out/result.txt | result_<task-id>.txt | compaction-summaries.jsonl
         ├── tmp/                                  0700, created at staging
         ├── home/                                 0700, created at staging
@@ -275,6 +276,7 @@ stays under the old path.
 | Path | Holds | Written by |
 |---|---|---|
 | `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md#session-trace-tracejsonl) | The runtime |
+| `trace.jsonl.seal`, `hooks/eval.jsonl.seal`, `completion.json.seal` | The [seal](observability-schemas.md#sealed-records) of each stream beside it: its chain head signed with the host's record-seal key, written when the session ends, at teardown, and after every write of `completion.json` | The runtime |
 | `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Trace blobs](observability-schemas.md#trace-blobs) | The runtime |
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) | The runtime |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics | The runtime |
@@ -293,6 +295,16 @@ stays under the old path.
 
 `tmp/` and `home/` count with the work folder against
 [`capabilities.resources.workdir_max_bytes`](#work-folder-ceiling).
+
+### Sealed records { #sealed-records }
+
+`trace.jsonl`, `hooks/eval.jsonl`, `completion.json` and the session's
+[conversation record](#the-conversation-record) are sealed with the host's record-seal key in
+`~/.murmur/keys` ([modes](config.md#murmur-home-permissions)), so [`mur trace verify`](cli.md#mur-trace-verify)
+can say whether any of them changed, given only the public key. The format, the verdicts, when
+each seal is written and what is not sealed are under
+[Sealed records](observability-schemas.md#sealed-records). No capsule command reaches
+`~/.murmur/keys` at `scoped` or `sealed` ([containment](containment.md#record-seal-key)).
 
 Beside the session directories, a group holds one [eval-run record](observability-schemas.md#eval-run-record),
 `evr_<32 hex>.json`, for each `mur eval run` whose baseline capsule's workdir root it is.

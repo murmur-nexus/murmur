@@ -158,6 +158,9 @@ section that explains it.
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. A full session id is refused when no records group under `~/.murmur/records` holds it, or when the workdir's group does not and several other records groups do. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to, and a literal path given to `mur trace rm` | [`mur trace`](cli.md#mur-trace), [Session addresses](cli.md#session-addresses), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace rm`](cli.md#mur-trace-rm) |
+| `E-TRC-003` | `mur trace verify`: a stream of the session's record changed since it was sealed | [E-TRC-003](#e-trc-003) |
+| `E-TRC-004` | `mur trace verify`: a stream of the session's record is not covered by a seal | [E-TRC-004](#e-trc-004) |
+| `E-TRC-005` | `mur trace verify`: the session's record cannot be checked with the key given | [E-TRC-005](#e-trc-005) |
 | `E-WIT-LEVEL-001` | A driver a launch stages, an artifact version `mur install` names, or a version a runtime pull resolves, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
@@ -867,6 +870,52 @@ The message ends with the path and the operating system's error.
 |---|---|
 | `File exists`, `Not a directory` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
+
+### E-TRC-003 — a record changed since it was sealed { #e-trc-003 }
+
+[`mur trace verify`](cli.md#mur-trace-verify) found a stream whose verdict is `changed`: a line no
+longer hashes to what the [chain or the seal](observability-schemas.md#sealed-records) recorded, a
+line lost its `prev_hash`, or the seal's head, line count or signature does not match. The message
+names the stream and the first bad line:
+
+```text
+error[E-TRC-003]: the record of session ses_01a1… has changed: trace.jsonl line 3: line 3 changed, or line 4's prev_hash did: line 4 names a hash line 3 no longer has
+```
+
+Raised before [`E-TRC-004`](#e-trc-004) and [`E-TRC-005`](#e-trc-005) when several streams fail.
+Compare the line against a copy of the record held elsewhere, or against the
+`murmur.record.head` an [OTel collector](observability-schemas.md#otel-span-emission) received.
+
+### E-TRC-004 — a record is not covered by a seal { #e-trc-004 }
+
+A stream's chain is intact but no seal covers exactly the lines it holds:
+
+| Cause | Message ends |
+|---|---|
+| The runtime was killed, or the host crashed, before the session ended | `the session ended without a seal; no seal; the chain is intact through line <n>` |
+| Lines were cut off the end | `the seal covers <s> lines but the stream holds <n>: lines were cut off; …` |
+| Lines were appended after the seal | `the seal covers lines 1-<s>; <k> line(s) were appended after it; …` |
+| The session is still running | `…; the session is still running` |
+| The record-seal key could not be used when the session ended | `no seal; …`, after a line on the run's stderr naming the key file and why |
+
+```text
+error[E-TRC-004]: the record of session ses_01a1… is not sealed: trace.jsonl: the session ended without a seal; no seal; the chain is intact through line 41
+```
+
+### E-TRC-005 — a record cannot be checked { #e-trc-005 }
+
+| Cause | Message ends |
+|---|---|
+| The record was written before records were sealed | `written before records were sealed: line 1 carries no prev_hash` |
+| No public key: `~/.murmur/keys/record-seal.pub` does not exist and `--public-key` was not given | `no public key is available to check the seal (sealed by key <id>)` |
+| Another host's key sealed it | `sealed by key <id>, not by the key given (<id>)` |
+| `--public-key` names a file that cannot be read or holds no 64-hex key | `--public-key cannot be used: <path>: <reason>` |
+
+```text
+error[E-TRC-005]: the record of session ses_01a1… cannot be verified: trace.jsonl: sealed by key 9c2e41d07a5b3f18, not by the key given (1508dc0fd94150e8)
+```
+
+Pass the sealing host's `record-seal.pub` with `--public-key`.
 
 ### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
 
@@ -2482,12 +2531,13 @@ error[E-CFG-004]: ~/.murmur/config.yaml: host_paths[1] (~/tools, resolved to /ho
 | Message names | Why it is refused | Fix |
 |---|---|---|
 | `<cwd>/.murmur/config.yaml sets host_paths:` | Only the operator's global config lends a host folder; a project file holding the key at all, `host_paths: []` included, is refused by every command that reads the config | Move the entries to `~/.murmur/config.yaml` |
-| `the entry has no path`, `access is required`, `access '…' is neither` | Every entry needs both keys, and `access` has no default. An unquoted `path: ~` is YAML's null, so it reads as no path | Write `path:` (`"~"` quoted for the home folder itself) and `access: read` or `access: read-write` |
+| `the entry has no path`, `access is required`, `access '…' is neither` | Every entry needs both keys, and `access` has no default. An unquoted `path: ~` is YAML's null, so it reads as no path | Write `path:` (a bare `~` must be quoted, `"~"`) and `access: read` or `access: read-write` |
 | `is relative` | Only `/…`, `~` and `~/…` are understood; `~user` and `$VAR` are not expanded | Write the absolute path |
 | `names /`, `resolves to /` | The whole host filesystem is not a folder | Name the folder the capsule needs |
 | `does not exist`, `is not a directory` | An entry names an existing folder | Create the folder, or fix the path |
 | `lies under /usr` (or `/bin`, `/sbin`, `/lib*`, `/etc`, `/proc`, `/sys`, `/dev`, `/tmp`) | A composed root carries its own copy of these or replaces them, and the private `/tmp` replaces `/tmp`, so the entry would not reach the host's folder on every tier | Name a folder outside them |
-| `is read-write over murmur's own home` | `~/.murmur` holds this file, whose `host_paths` and `containment` grant every later session, and every session's records; a capsule that could write it would widen what the next capsule gets | Use `access: read`, or name a folder that does not contain `~/.murmur` |
+| `is read-write over murmur's own home` | `~/.murmur` holds this file, whose `host_paths` and `containment` grant every later session, and every session's records; a capsule that could write it would widen what the next capsule gets | Name a folder that does not contain `~/.murmur`, or use `access: read` on a folder beneath it that does not contain `~/.murmur/keys`, such as `~/.murmur/records` |
+| `is or contains …/.murmur/keys, which holds the record-seal key` | `~/.murmur/keys` holds the [record-seal key](containment.md#record-seal-key) that signs every session's records; no capsule may reach it at any access, so `~/.murmur` itself and the whole home folder are refused too | Name a narrower folder that does not contain it, such as `~/.murmur/records` or a project folder |
 | `lies inside the work folder` | The capsule already reaches its work folder read-write, so a `read` entry there would not be read-only | Remove the entry |
 | `names the same directory as`, `resolves to the same directory as` | One directory, one entry | Keep one entry |
 | `is read-write inside …, a folder this session may run … from` | On `sealed` the folder's read-only bind would hide the entry; on `scoped` the capsule could write a file there and run it | Name a folder outside it, or use `access: read` |

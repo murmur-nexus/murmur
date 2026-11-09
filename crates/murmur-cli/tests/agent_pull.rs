@@ -1283,12 +1283,13 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
         "{home_added:?}"
     );
     // Every session keeps a conversation record, a running record and its records directory
-    // under the home, and its runtime directory under `sessions/` while it runs; the pull adds
-    // only its compiled form.
+    // under the home, its runtime directory under `sessions/` while it runs, and the record-seal
+    // key under `keys/` that its first seal creates; the pull adds only its compiled form.
     for path in &home_added {
         assert!(
             path.starts_with(".murmur/compiled")
                 || path.starts_with(".murmur/conversations")
+                || path.starts_with(".murmur/keys")
                 || path.starts_with(".murmur/records")
                 || path.starts_with(".murmur/running")
                 || path.starts_with(".murmur/sessions"),

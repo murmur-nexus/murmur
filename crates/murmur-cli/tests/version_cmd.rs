@@ -107,6 +107,7 @@ fn version_json_is_one_object_naming_the_same_level_and_packages() {
         "    \"token\": 1,\n",
         "    \"trace list --json\": 1,\n",
         "    \"trace rm --json\": 1,\n",
+        "    \"trace verify --json\": 1,\n",
         "    \"version --json\": 1\n",
         "  }\n",
         "}\n",

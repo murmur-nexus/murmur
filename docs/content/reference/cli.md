@@ -34,6 +34,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace report` | Aggregate statistics across a set of sessions |
 | `mur trace list` | List the sessions of one workdir root, newest first |
 | `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
+| `mur trace verify` | Check a session's sealed records with the host's public key alone, naming the first line that changed |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions, or with `--run` the arms of one `mur eval run` |
 | `mur eval run` | Drive a multi-case dataset against a capsule, and optionally a variant, and judge each run by the case's check |
@@ -100,6 +101,7 @@ loses its key.
 | `token` | 1 | [`mur token`](#mur-token): standard output is the token |
 | `trace list --json` | 1 | [`mur trace list`](#mur-trace-list) |
 | `trace rm --json` | 1 | [`mur trace rm`](#mur-trace-rm) |
+| `trace verify --json` | 1 | [`mur trace verify`](#mur-trace-verify) |
 | `version --json` | 1 | [`mur version`](#mur-version) |
 
 ---
@@ -3123,8 +3125,9 @@ The second line is printed only when a blob was removed. A record already at or 
 
 ## `mur trace`
 
-Read and analyze `trace.jsonl` files produced by `mur run`, and remove ended sessions. Every command
-but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies no file and launches no capsule.
+Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`, and
+remove ended sessions. Every command but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies
+no file and launches no capsule.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -3153,6 +3156,16 @@ the lines it has, and the command exits `0`:
 | `status:` | `ended without a session_end (last event: <event type> at <RFC 3339 UTC time>)` |
 | `duration:` | From the first line's timestamp to the last line's, followed by `(first to last event)` |
 | `totals:` | `counted from the events recorded; no session_end recorded the session's own`. The turn, token, tool-call and shell-call totals below are counted from the trace's `inference`, `tool_call`, `shell` and `shell_detached` lines |
+
+`mur trace show` checks the session's records as [`mur trace verify`](#mur-trace-verify) does,
+with this host's public key, and prints a `record:` line after its summary, before the Tasks
+section, for every verdict but `verified`:
+
+| Verdict | `record:` line |
+|---|---|
+| `changed` | `record:        changed: trace.jsonl line 3: line 3 changed, or line 4's prev_hash did: …` |
+| `unsealed` | `record:        unsealed: trace.jsonl: the session ended without a seal; no seal; the chain is intact through line 41`, or `…; the session is still running` |
+| `unverifiable` | `record:        unverifiable: trace.jsonl: written before records were sealed: line 1 carries no prev_hash`, or the key that sealed it and the key it was checked with |
 
 A final line that is not valid JSON — what a process killed mid-write leaves — is skipped, and the
 `status:` line ends with `line <n>, the last, is not valid JSON and was skipped`. A malformed line
@@ -3944,6 +3957,76 @@ a consumer ignores keys it does not know.
 | `1` | `E-IO-003`: a removal failed for another reason, or the root cannot be made absolute |
 
 A failure prints nothing on stdout.
+
+### `mur trace verify` { #mur-trace-verify }
+
+Check that a session's records are unchanged since the host [sealed](observability-schemas.md#sealed-records)
+them, with the host's public key and nothing else.
+
+```bash
+mur trace verify [<session>] [--workdir <dir>] [--public-key <file>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), a records directory, or a `trace.jsonl` path. A copied record is checked where it lies |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read, as under [`mur trace show`](#mur-trace-show) |
+| `--public-key` | `~/.murmur/keys/record-seal.pub` | The record-seal public key to check against: 64 hex characters. Pass the `record-seal.pub` of the host that ran the session to verify its record anywhere |
+| `--json` | off | Print one JSON object, the stable interface below, instead of the table |
+
+It checks every stream of the session: `trace.jsonl`, `hooks/eval.jsonl` and `completion.json`
+beside it, and the conversation record its `trace.jsonl.seal` names, looked up under this host's
+`~/.murmur/conversations`. A stream that is not there reads `absent` and does not count, and so
+does a conversation record of that name sealed by another key than the trace: on another host it
+is that host's own record, not the one the session appended to. A record copied to another
+machine is therefore checked without its conversation record.
+
+Without `--json` it prints one row per stream, then the key it used:
+
+```text
+stream                              verdict        lines  detail
+trace.jsonl                         changed           14  line 3 changed, or line 4's prev_hash did: line 4 names a hash line 3 no longer has
+hooks/eval.jsonl                    verified           1  1 line(s) sealed by key 1508dc0fd94150e8
+completion.json                     absent             -  no such stream
+conversation:my-capsule/ctx-1       verified           4  4 line(s) sealed by key 1508dc0fd94150e8
+record: changed, checked with key 1508dc0fd94150e8 (/home/me/.murmur/keys/record-seal.pub)
+error[E-TRC-003]: the record of session ses_01a1… has changed: trace.jsonl line 3: line 3 changed, or line 4's prev_hash did: …
+```
+
+With `--json` it prints one pretty-printed JSON object on stdout whatever the verdict, and the exit
+status still follows it:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema` | integer | `1` |
+| `session_id` | string or `null` | The session line 1 of `trace.jsonl` names |
+| `records_dir` | string | The directory checked |
+| `public_key` | object | `path` (string or `null`) and `key_id` (string or `null`) of the key used; both `null` when no key was available |
+| `verdict` | string | The worst stream verdict: `verified`, `unverifiable`, `unsealed` or `changed`; `absent` when no stream exists |
+| `streams` | array | One object per stream, below |
+
+| Stream key | Type | Meaning |
+|---|---|---|
+| `stream` | string | `trace.jsonl`, `hooks/eval.jsonl`, `completion.json` or `conversation:<record>/<context-id>` |
+| `verdict` | string | `verified`, `unverifiable`, `unsealed`, `changed` or `absent` |
+| `lines` | integer | Complete lines the stream holds; `1` for `completion.json` |
+| `sealed_lines` | integer or `null` | Lines the seal covers; `null` with no seal |
+| `chain_intact_through` | integer or `null` | The last line through which the chain, or the seal's listed hashes, hold |
+| `first_bad_line` | integer or `null` | For `changed`: the first line that no longer hashes to what was recorded |
+| `key_id` | string or `null` | The `key_id` the seal names |
+| `detail` | string | One sentence saying why |
+| `notes` | array of strings | Findings that change nothing, such as a torn line the chain still covers |
+
+These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
+a consumer ignores keys it does not know.
+
+| Exit | When |
+|---|---|
+| `0` | Every stream that exists is `verified` |
+| `1` | [`E-TRC-003`](diagnostics.md#e-trc-003): a stream is `changed` |
+| `1` | [`E-TRC-004`](diagnostics.md#e-trc-004): a stream is `unsealed`, and none is changed |
+| `1` | [`E-TRC-005`](diagnostics.md#e-trc-005): a stream is `unverifiable`, and none is changed or unsealed; also a `--public-key` file that cannot be read |
+| `1` | `E-TRC-001`: the directory holds no `trace.jsonl`; `E-TRC-002`: the address names no session |
 
 ---
 

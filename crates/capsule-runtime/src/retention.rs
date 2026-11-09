@@ -466,6 +466,10 @@ pub fn truncate_record(path: &Path, keep: u32, capsule: &str) -> Result<Truncati
         }),
         Some((staged, mut outcome)) => {
             staged.commit()?;
+            // The rewrite dropped lines a seal covered; the record is sealed again at once.
+            if let Some(dir) = path.parent() {
+                crate::record_seal::seal_conversation(dir, crate::record_seal::CLI_SEALER);
+            }
             outcome.blobs_removed = sweep_orphan_blobs(path);
             Ok(outcome)
         }
@@ -1353,6 +1357,43 @@ mod tests {
         assert!(blobs.join(&shared).exists(), "a kept line still names it");
         assert!(blobs.join(&new).exists());
         assert!(blobs.join("notes.txt").exists());
+    }
+
+    /// A truncation reseals the record at once: it verifies afterwards, and the lines it kept
+    /// are byte for byte the lines it had.
+    #[test]
+    fn truncation_reseals_the_record() {
+        use crate::record_seal::{self, PublicKey, Verdict};
+        let home = tempfile::tempdir().unwrap();
+        record_seal::set_test_seal_home(Some(home.path().to_path_buf()));
+        let dir = tempfile::tempdir().unwrap();
+        let context = dir.path().join("capsule/ctx_1");
+        std::fs::create_dir_all(&context).unwrap();
+        let path = write_record(&context, Some("capsule"), 5);
+        let before = std::fs::read_to_string(&path).unwrap();
+        truncate_record(&path, 2, "capsule").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        for kept in after
+            .lines()
+            .filter(|line| parse_message_line(line).is_some())
+        {
+            assert!(before.lines().any(|line| line == kept), "{kept}");
+        }
+        let root = crate::workdir_fs::WorkdirRoot::open(&context).unwrap();
+        let seal = record_seal::read_seal(&root, crate::conversation::RECORD_FILE_NAME)
+            .unwrap()
+            .expect("the truncation sealed the record");
+        assert_eq!(seal.stream, "conversation:capsule/ctx_1");
+        let key = PublicKey::load(&record_seal::public_key_path(home.path())).unwrap();
+        let report = record_seal::verify_listed(
+            &seal.stream,
+            after.as_bytes(),
+            false,
+            Some(&seal),
+            Some(&key),
+            None,
+        );
+        assert_eq!(report.verdict, Verdict::Verified, "{report:#?}");
     }
 
     /// A record with no `blobs/` truncates exactly as before and removes nothing.

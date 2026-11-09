@@ -607,6 +607,10 @@ pub fn read_completion(records_root: &WorkdirRoot) -> Option<DelegationOutcome> 
 /// records the delegation's outcome as `unknown`. The rename makes every reader see either the
 /// whole previous content or the whole new content; [`WorkdirRoot::write_file`]'s temporary name
 /// is unique, because the child and the watcher behind it can both reach this function.
+///
+/// `completion.json.seal` is written beside it after every write
+/// ([`crate::record_seal::seal_listed`]); a seal that cannot be written leaves the file reading
+/// as unsealed and does not fail the write.
 pub fn write_completion(
     records_root: &WorkdirRoot,
     outcome: &DelegationOutcome,
@@ -619,7 +623,18 @@ pub fn write_completion(
             format!("{body}\n").as_bytes(),
             DEFAULT_FILE_MODE,
         )
-        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))
+        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))?;
+    // Every write is sealed, the delivered rewrite and a watcher's write for a child that could
+    // not report included, for the child's own session.
+    crate::record_seal::seal_listed(
+        records_root,
+        COMPLETION_FILE,
+        crate::record_seal::COMPLETION_STREAM,
+        &outcome.session_id,
+        true,
+        DEFAULT_FILE_MODE,
+    );
+    Ok(())
 }
 
 /// Post one completion to the parent's A2A door.
@@ -1425,5 +1440,45 @@ mod tests {
             .filter(|name| name != COMPLETION_FILE)
             .collect();
         assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
+    }
+
+    /// Every write of `completion.json`, the delivered rewrite included, leaves a seal that
+    /// verifies; a changed byte reads `changed`, naming the file.
+    #[test]
+    fn every_completion_write_is_sealed_and_a_changed_byte_reads_changed() {
+        use crate::record_seal::{self, PublicKey, Verdict};
+        let home = tempfile::tempdir().unwrap();
+        record_seal::set_test_seal_home(Some(home.path().to_path_buf()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(dir.path()).unwrap();
+        let key = || PublicKey::load(&record_seal::public_key_path(home.path())).unwrap();
+        let completion = |key: &PublicKey| {
+            record_seal::verify_session_records(dir.path(), Some(key), None)
+                .streams
+                .into_iter()
+                .find(|stream| stream.stream == COMPLETION_FILE)
+                .unwrap()
+        };
+
+        let mut record = outcome();
+        write_completion(&root, &record).unwrap();
+        assert_eq!(completion(&key()).verdict, Verdict::Verified);
+        record.delivered = true;
+        write_completion(&root, &record).unwrap();
+        assert_eq!(completion(&key()).verdict, Verdict::Verified);
+        let seal = record_seal::read_seal(&root, COMPLETION_FILE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seal.session_id, record.session_id);
+        assert_eq!(seal.lines, 1);
+
+        let path = dir.path().join(COMPLETION_FILE);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replacen("true", "fals", 1);
+        std::fs::write(&path, text).unwrap();
+        let report = completion(&key());
+        assert_eq!(report.verdict, Verdict::Changed);
+        assert!(report.detail.contains(COMPLETION_FILE), "{}", report.detail);
     }
 }

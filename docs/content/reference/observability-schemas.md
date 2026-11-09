@@ -25,6 +25,10 @@ five fields, in this order, before its own payload:
 | `session_id` | string | Identical on every line in a session, and the name of the session directory |
 | `timestamp` | u64 | Unix milliseconds |
 
+Every line also **ends** with `prev_hash`, the hash of the line before it (`"genesis"` on line
+1), which chains the file so a changed, inserted or removed line is detectable. A reader that
+parses lines as JSON objects ignores it; [Sealed records](#sealed-records) has the format.
+
 **The event tree.** `parent_id` makes the file walkable: every non-null `parent_id` names an
 `event_id` that appears earlier in the same file, and following them upward from any line
 terminates at `session_start`. The tree is session → task → turn → the turn's own events:
@@ -1814,6 +1818,112 @@ failed early. A `"canceled"` run settles every step, so its counts sum to `steps
 
 ---
 
+## Sealed records { #sealed-records }
+
+A session's records can be checked by anyone holding the host's public key and nothing else. The
+`mur` process, never the capsule, chains every stream as it is written and signs each stream's
+chain head with the host's Ed25519 record-seal key when the session ends. `mur trace verify`
+([CLI](cli.md#mur-trace-verify)) checks a session with the public key alone. The formats below are
+**stable**: a check capsule can implement them without `mur`.
+
+| Stream | Where | Chain |
+|---|---|---|
+| `trace.jsonl` | The records directory | Inline: every line ends with `prev_hash` |
+| `hooks/eval.jsonl` | The records directory, written by a scoring hook | Listed in the seal |
+| `completion.json` | A delegated child's records directory | Listed in the seal, the whole file as one line |
+| `conversation:<record>/<context-id>` | `~/.murmur/conversations/<record>/<context-id>/conversation.jsonl` | Listed in the seal |
+
+The three listed streams keep their bytes exactly as written: a scoring hook writes
+`eval.jsonl`, `completion.json` is replaced whole, and a conversation record's lines are read
+back as model messages, so none of them gains a field.
+
+**Line hash.** `"sha256:"` followed by the lowercase hex SHA-256 of the line's bytes without its
+trailing newline. `completion.json` is hashed as one line: every byte of the file.
+
+**Inline chain.** Every `trace.jsonl` line is a JSON object whose last key is `prev_hash`:
+`"genesis"` on line 1, otherwise the line hash of the line before. The writer inserts it before
+the object's closing `}`. Every runtime writer of the file shares one chain, so lines from the
+agent loop, the resource plane, a plan run and a resumed session's `shell_lost` markers all link.
+
+**Seal file.** `<stream>.seal` beside the stream (`trace.jsonl.seal`, `hooks/eval.jsonl.seal`,
+`completion.json.seal`, `conversation.jsonl.seal`): one JSON object, written to a temporary name
+and renamed into place.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `format` | string | `"murmur.seal/1"` |
+| `stream` | string | `"trace.jsonl"`, `"hooks/eval.jsonl"`, `"completion.json"`, or `"conversation:<record>/<context-id>"` |
+| `chain` | string | `"inline"` for `trace.jsonl`, `"listed"` for the other three |
+| `session_id` | string | The session whose runtime sealed it: the record's own session for the trace, eval and completion; for a conversation, the session that appended to it, or `"mur conversation"` after a truncation from the command line |
+| `lines` | integer | Lines covered, from line 1 |
+| `line_hashes` | array of strings | `"listed"` only: the line hash of each covered line, in order |
+| `head` | string | `"inline"`: the line hash of line `lines` (`"genesis"` when `lines` is 0). `"listed"`: `"sha256:"` and the hex SHA-256 of `line_hashes` joined by `\n` |
+| `sealed_at` | integer | Milliseconds since the epoch. Not signed |
+| `key_id` | string | The first 16 hex characters of the SHA-256 of the raw 32-byte public key |
+| `algorithm` | string | `"ed25519"` |
+| `signature` | string | 128 hex characters: Ed25519 over the UTF-8 bytes `murmur.seal/1\n<stream>\n<session_id>\n<lines>\n<head>\n` |
+| `conversation` | object | `trace.jsonl.seal` only, and only when the session appended to a conversation record: `{"record": …, "context_id": …}`. Not signed; it tells a verifier where to look |
+
+**When each seal is written.**
+
+| Seal | Written |
+|---|---|
+| `trace.jsonl.seal` | Right after `session_end`, and again at teardown when a line landed after it (a resource read served after `session_end`). A resumed session that appends `shell_lost` markers to the prior session's trace seals it again, for that session |
+| `hooks/eval.jsonl.seal` | At teardown, once every hook has drained |
+| `completion.json.seal` | After every write of `completion.json`: the child's own, the rewrite after delivery, and the parent launcher's for a child that could not report |
+| `conversation.jsonl.seal` | At teardown, for every record the session appended to; and right after a truncation (at launch, or by `mur conversation truncate`) or a header adoption rewrites the record |
+
+A seal that cannot be written, for instance because the key cannot be used, never fails the
+session: `mur` prints one line naming the key file and the reason, and the record reads as
+`unsealed`.
+
+**Verdicts.** Each stream, and the record as a whole, reads as one of these; the worst wins, in
+this order:
+
+| Verdict | Meaning |
+|---|---|
+| `changed` | A line no longer hashes to what the chain or the seal recorded, a line is missing its `prev_hash`, a listed hash differs, the seal's `head` or `lines` does not match, or the signature fails under a key whose `key_id` matches. Names the first bad line |
+| `unsealed` | The chain is intact but no seal covers it, or the seal covers fewer lines than the stream holds (lines appended after it) or more (lines cut off). Says where the chain stops and what the seal covers, and that the session ended without a seal or is still running |
+| `unverifiable` | Written before records were sealed (no `prev_hash` on line 1), no public key available, or sealed by a different `key_id` than the key given, naming both |
+| `verified` | The chain is intact, a seal covers every line, and its signature is valid under the given key |
+
+A stream that does not exist is `absent` and does not count. A line that is not a JSON object,
+which a writer killed mid-line leaves, does not break the chain when the next line names its
+hash: it is reported as a note. For a changed byte on line *k*, the first bad line is *k*: line
+*k*+1's `prev_hash`, or the seal's `head` for the last line, no longer matches it. A changed
+`prev_hash` on line *k* reads as "line *k*-1 changed, or line *k*'s prev_hash did". A chain
+recomputed forward by someone without the key keeps its links and fails the seal's `head`.
+
+**The host key.**
+
+| File | Contents | Mode |
+|---|---|---|
+| `~/.murmur/keys/` | | `0700` |
+| `~/.murmur/keys/record-seal.key` | The 32-byte Ed25519 seed as 64 hex characters and a newline | `0600` |
+| `~/.murmur/keys/record-seal.pub` | The 32-byte public key as 64 hex characters and a newline | `0644` |
+
+Both are created by the first launch that needs them. A launch refuses to use a key file that is
+a link, not a regular file, owned by another user, or readable by group or others. A missing
+`record-seal.pub` beside a valid key is written again. Copy `record-seal.pub` beside a record to
+verify it on another machine.
+
+**What is not covered.** The records directory's `home/`, `tmp/`, `logs/` and `out/` are not
+sealed streams, nor is `blobs/` (each blob is named by its own sha256, which the trace records).
+Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.seal`'s
+`conversation` pointer is not signed, so removing it drops the conversation record from the check.
+
+**Who can re-seal.** A seal proves a record unchanged by anything that cannot read
+`record-seal.key`:
+
+| Who | Can read the key |
+|---|---|
+| A capsule's commands at `scoped` or `sealed` | No ([containment](containment.md#record-seal-key)) |
+| A capsule's commands at `advisory` or `unconfined` | Yes: a record sealed under those tiers proves only that `mur` or the capsule wrote it |
+| Any other process running as your user | Yes: it can change a record and seal it again |
+
+To keep a copy of each session's head that nothing on the host can rewrite, export spans to an
+OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-span-emission).
+
 ## Task stream `artifact` frame { #task-stream-artifact-frame }
 
 The `artifact` frame on a capsule's event stream, and every other frame, is listed in
@@ -1985,7 +2095,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 
 | Span name | Source event | Attributes |
 |---|---|---|
-| `capsule.session` | One per task; one per launch for a script capsule | `exit_status` |
+| `capsule.session` | One per task; one per launch for a script capsule | `exit_status`; `murmur.record.head`, `murmur.record.lines` and `murmur.record.key_id` (below) |
 | `capsule.inference` | `inference` | `turn`, `input_tokens` and `output_tokens` (each when the turn was counted at all), `decision`, `stop_reason` (the provider's own reason, on every agent-loop turn), `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens`, `cache_write_tokens` and `thinking_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
@@ -1998,14 +2108,26 @@ their own — they appear in `trace.jsonl` alone.
 A `capsule.session` span covers one task, under its own trace id. A launch that handles three
 queued tasks therefore posts three of them, where `trace.jsonl` holds a single
 `session_start`/`session_end` pair around three `task_start`/`task_end` pairs. Correlate the two
-by task, not by session. A script capsule posts one `capsule.session` span for its run, with a
-`capsule.tool_call` child for each `invoke`, and stamps its outgoing `murmur:message/send`
-requests, and their `a2a_send.traceparent`, with that session span.
+by task, not by session.
+
+The `capsule.session` span is a copy of the trace's chain head that the host cannot later
+rewrite, held wherever the spans are exported:
+
+| Attribute | Value |
+|---|---|
+| `murmur.record.head` | The line hash of the last `trace.jsonl` line when the span was posted: the `session_end` line for the session's last span, the seal's `head` |
+| `murmur.record.lines` | That line's number, as a string |
+| `murmur.record.key_id` | The `key_id` of the key that sealed it. Absent on a span posted before `session_end`, and when no key was usable |
+
+An agent session posts each task's `capsule.session` span when the next task begins, and the last
+one at teardown, after `session_end` is sealed. A script capsule posts one `capsule.session` span
+for its run, with a `capsule.tool_call` child for each `invoke`, and stamps its outgoing
+`murmur:message/send` requests, and their `a2a_send.traceparent`, with that session span.
 
 **Non-obvious behaviour:**
 
-- Each span is POSTed as its event happens, over a connection the agent loop waits on, so a slow
-  endpoint slows the session down.
+- Each span except an agent session's `capsule.session` is POSTed as its event happens, over a
+  connection the agent loop waits on, so a slow endpoint slows the session down.
 - `trace.jsonl` is written whether or not `observability.otel_endpoint` is set, and whether or not
   the endpoint is reachable.
 - A session that belongs to a [formation](cli.md#mur-run-formation) hands its formation id to every

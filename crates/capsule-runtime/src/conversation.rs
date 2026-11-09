@@ -336,7 +336,10 @@ impl ConversationRecord {
 
         let mut file = open_record_file(&self.path(), false)?;
         file.write_all(line.as_bytes())
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        // The session seals every record it appended to at its teardown.
+        crate::record_seal::note_conversation_append(self.workdir.path(), &self.dir);
+        Ok(())
     }
 
     fn ensure_dirs(&self) -> Result<(), String> {
@@ -402,6 +405,16 @@ impl ConversationRecord {
                 Some(RECORD_FILE_MODE),
             )?
             .commit()?;
+            // The adoption rewrote every line's position; the record is sealed again at once,
+            // for the session whose records directory reported it.
+            let sealed_by = self
+                .workdir
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(crate::record_seal::CLI_SEALER)
+                .to_string();
+            crate::record_seal::seal_conversation(&self.dir, &sealed_by);
         }
         self.header_ensured = true;
         Ok(())

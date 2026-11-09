@@ -446,9 +446,10 @@ fn ceiling_below_first_call_sends_nothing() {
 /// count of the payload carrying it, is the same in each.
 const ESTIMATE_CONTEXT: &str = "ctx-estimates";
 
-/// Keys a trace line carries that differ from run to run whatever the estimate: clocks, durations
-/// and the ids each launch mints.
+/// Keys a trace line carries that differ from run to run whatever the estimate: clocks, durations,
+/// the ids each launch mints, and `prev_hash`, which hashes the line before with all of those.
 const VOLATILE_KEYS: &[&str] = &[
+    "prev_hash",
     "ts",
     "timestamp",
     "duration_ms",

@@ -66,7 +66,7 @@ use commands::{
     token::run_token,
     trace::{
         run_trace_diff, run_trace_list, run_trace_report, run_trace_rm, run_trace_show,
-        run_trace_steps, TraceCommand,
+        run_trace_steps, run_trace_verify, TraceCommand,
     },
     version::run_version,
     watch::run_watch,
@@ -949,6 +949,12 @@ fn main() {
                 workdir,
             } => run_trace_report(sessions, last, since, workdir),
             TraceCommand::List { workdir, json } => run_trace_list(workdir, json),
+            TraceCommand::Verify {
+                session,
+                workdir,
+                public_key,
+                json,
+            } => run_trace_verify(session, workdir, public_key, json),
             TraceCommand::Rm {
                 session,
                 workdir,
