@@ -699,7 +699,7 @@ The archive holds `murmur.yaml`, `SKILL.md`, every supporting file and `murmur-b
 
 ```bash
 cd /tmp && mur build ~/skills/pdf-helper
-# Built artifact: /tmp/pdf-helper-1.2.0.mur.zip (WIT level 1)
+# Built artifact: /tmp/pdf-helper-1.2.0.mur.zip (WIT level 5)
 ```
 
 **Error cases:**

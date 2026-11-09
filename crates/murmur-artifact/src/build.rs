@@ -172,11 +172,8 @@ pub struct BuiltArtifact {
     pub built_at_level: Option<u64>,
 }
 
-/// Pack `source_dir`'s manifest and `requires_files:` into `output_path`, then append
-/// [`BUILD_INFO_FILE`] naming the newest of `levels` the payload's `murmur:*` interfaces fit.
-///
-/// Refuses a manifest declaring `runtime: skill`, which the manifest path of `mur build` never
-/// builds.
+/// Refuse a manifest declaring `runtime: skill`: a skill is built from a folder holding
+/// `SKILL.md`, never by the manifest path of `mur build`.
 pub fn refuse_skill_manifest(manifest: &Manifest, manifest_path: &Path) -> Result<(), BuildError> {
     if manifest.runtime == "skill" {
         return Err(BuildError::SkillManifest {
@@ -186,7 +183,11 @@ pub fn refuse_skill_manifest(manifest: &Manifest, manifest_path: &Path) -> Resul
     Ok(())
 }
 
-/// A payload with no component (a skill, a core module) names no `murmur:*`
+/// Pack `source_dir`'s manifest and `requires_files:` into `output_path`, then append
+/// [`BUILD_INFO_FILE`] naming the newest of `levels` the payload's `murmur:*` interfaces fit.
+/// Refuses a manifest declaring `runtime: skill` ([`refuse_skill_manifest`]).
+///
+/// A payload with no component (a core module, a static payload) names no `murmur:*`
 /// interface and so fits every level. Every authored entry is packed byte for byte.
 #[must_use = "artifact path is needed for caller output and follow-up actions"]
 pub fn build_artifact(

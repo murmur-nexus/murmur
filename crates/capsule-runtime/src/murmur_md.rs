@@ -37,11 +37,12 @@ pub(crate) fn formation_member_line(member: &str) -> String {
 
 /// Sanitizes a description string before it is rendered into MURMUR.md.
 ///
-/// A malicious artifact publisher controls `description` — this collapses embedded newlines/tabs to spaces (so a
-/// description cannot forge a fake Markdown heading or a new "trusted-looking" section),
-/// drops backticks (so a description cannot prematurely close one of MURMUR.md's own fenced
-/// code blocks) and other control characters, collapses repeated whitespace, and caps the
-/// result at `MAX_DESCRIPTION_LEN` characters with a trailing `…` if truncated.
+/// A malicious artifact publisher controls `description` — this collapses embedded
+/// newlines/tabs to spaces (so a description cannot forge a fake Markdown heading or a new
+/// "trusted-looking" section), drops backticks (so a description cannot prematurely close one of
+/// MURMUR.md's own fenced code blocks) and other control characters, collapses repeated
+/// whitespace, and caps the result at `MAX_DESCRIPTION_LEN` characters with a trailing `…` if
+/// truncated.
 pub(crate) fn sanitize_description(raw: &str) -> String {
     let mut collapsed = String::with_capacity(raw.len());
     for c in raw.chars() {

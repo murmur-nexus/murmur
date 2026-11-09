@@ -237,6 +237,8 @@ artifacts:
 
 For a local `runtime: skill`, `local_source` defaults to enabled. Do not add a meaningless registry `version` beside `source:`; local-source versions are ignored.
 
+The folder is an [Agent Skills](https://docs.murmur.nexus/how-to/package-skill-artifact/#step-1-write-the-skill-folder) folder: a root `SKILL.md`, named exactly so, whose front block gives `name` (equal to the folder's name) and `description`, and no `murmur.yaml`. Anything else is refused at launch with [`E-BLD-009`](https://docs.murmur.nexus/reference/diagnostics/#e-bld-009).
+
 ### 3. Decide inference architecture
 
 #### No model

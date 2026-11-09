@@ -10227,12 +10227,12 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
 /// and the runtime has no notion of a trusted tool, so the rule for them needs no judgement: all
 /// of them are fenced under `tool:<name>`, unconditionally.
 ///
-/// A skill result is the body of `SKILL.md`, read off disk from inside the capsule and fixed for the whole
-/// run. Whether it is fenced follows from `origin`, the skill's `murmur.lock` origin: a skill the
-/// operator pinned is the capsule author's own guidance, whose entire purpose is to be followed as
-/// instruction, so it is left unfenced; a skill whose pin a running capsule fetched was never
-/// vetted by the operator, so its guidance is fenced under `skill:<name>` like any other content
-/// from outside, on every call.
+/// A skill result is the body of `SKILL.md`, read off disk from inside the capsule and fixed for
+/// the whole run. Whether it is fenced follows from `origin`, the skill's `murmur.lock` origin: a
+/// skill the operator pinned is the capsule author's own guidance, whose entire purpose is to be
+/// followed as instruction, so it is left unfenced; a skill whose pin a running capsule fetched
+/// was never vetted by the operator, so its guidance is fenced under `skill:<name>` like any
+/// other content from outside, on every call.
 ///
 /// The label is set here rather than by a caller inspecting the text, which is what makes
 /// [`DispatchOutcome::fence_source`] a statement about this outcome rather than a guess: it is

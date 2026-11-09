@@ -130,7 +130,7 @@ Report each finding as: file · line · what · why.
 | Front block key | Rule | Used for |
 |---|---|---|
 | `name` | 1–64 lowercase letters, digits and `-`; no `-` at the start or end, no `--`; equal to the folder's name | The artifact name |
-| `description` | Non-empty, at most 1024 characters | The skill's summary in the tool inventory, `MURMUR.md` and `mur list` |
+| `description` | Non-empty, at most 1024 characters | The skill's summary in the tool inventory and `MURMUR.md` |
 | `metadata.version` | A semver string, such as `"1.0.0"`; quote it | The artifact version. Needed by `mur build` only |
 
 Every other key (`license`, `compatibility`, `allowed-tools`, other `metadata` entries, Claude Code's `when_to_use`) is not read and stays in `SKILL.md` unchanged. The front block is YAML: quote a value that holds `: `, such as `description: "Fill forms: use when …"`, or the build refuses the block as invalid YAML.
@@ -148,7 +148,7 @@ mur build code-review-conventions/
 ```
 
 ```text
-Built artifact: /home/you/work/code-review-conventions-1.0.0.mur.zip (WIT level 1)
+Built artifact: /home/you/work/code-review-conventions-1.0.0.mur.zip (WIT level 5)
 ```
 
 `mur build` packs a skill when the folder's root holds `SKILL.md`. The artifact is written to the current directory as `<name>-<version>.mur.zip`. Pass `--output` to choose another place: a directory receives `<name>-<version>.mur.zip`, any other path is the output file.

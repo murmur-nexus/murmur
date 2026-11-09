@@ -3078,14 +3078,12 @@ error[E-REG-017]: skill artifact ana/pdf-helper@1.0.0 cannot be stored: it holds
 ```
 
 **Fires when** a payload whose packed `murmur.yaml` declares `runtime: skill` holds no `SKILL.md`
-at its root. A skill built by an earlier `mur` release holds a lowercase `skill.md`; a payload with
-neither says `it holds no SKILL.md at its root` instead.
-At a launch the message reads `skill artifact <scope>/<name>@<version> cannot be installed: …`.
+at its root. A skill built by an earlier `mur` release holds a lowercase `skill.md`.
 
 | Where | What happens |
 |---|---|
-| `mur install`, `mur publish` | Refused before anything is stored; neither the store nor `murmur.lock` is written |
-| A launch, for such an artifact already in a store | Refused before any skill file is installed |
+| `mur install`, `mur publish` | Refused before anything is stored; neither the store nor `murmur.lock` is written. A payload with no `skill.md` either says `it holds no SKILL.md at its root` |
+| A launch, for a skill holding `skill.md` already in a store | Refused before any skill file is installed, with `skill artifact <scope>/<name>@<version> cannot be installed: …` |
 | A runtime pull through `manage.pull()` or [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | A tool error carrying the message; nothing is installed |
 
 **What to do:** install a version of the skill built with `mur build` from a folder holding
