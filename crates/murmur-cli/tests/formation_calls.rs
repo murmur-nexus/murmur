@@ -1562,6 +1562,9 @@ const PROCESS_DRIVER: &str = "local/fixture-process-driver";
 /// line that every call has ended.
 #[test]
 fn a_process_lead_gets_the_answer_in_its_resumed_session() {
+    if common::skip_without_host_support("a_process_lead_gets_the_answer_in_its_resumed_session") {
+        return;
+    }
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let answer = format!("WORKER-{nonce}");
     let worker = Model::new({

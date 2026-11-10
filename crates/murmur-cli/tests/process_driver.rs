@@ -224,6 +224,9 @@ fn fixture_describes_itself() {
 /// covers.
 #[test]
 fn a_loadable_driver_reaches_the_binary_it_names() {
+    if common::skip_without_host_support("a_loadable_driver_reaches_the_binary_it_names") {
+        return;
+    }
     let capsule = Capsule::process(
         DRIVER,
         &fixture_wasm(),
@@ -238,6 +241,9 @@ fn a_loadable_driver_reaches_the_binary_it_names() {
 
 #[test]
 fn missing_required_env_is_refused() {
+    if common::skip_without_host_support("missing_required_env_is_refused") {
+        return;
+    }
     let capsule = Capsule::process(DRIVER, &fixture_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     assert!(text.contains("E-CAP-019"), "{text}");
@@ -248,6 +254,9 @@ fn missing_required_env_is_refused() {
 
 #[test]
 fn http_driver_under_process_is_refused() {
+    if common::skip_without_host_support("http_driver_under_process_is_refused") {
+        return;
+    }
     let name = "local/murmur-driver-anthropic";
     let capsule = Capsule::process(name, &anthropic_wasm(), &["HOME"]);
     let text = capsule.run_refused();
@@ -261,6 +270,9 @@ fn http_driver_under_process_is_refused() {
 /// it was built from, so this stays testable after every later bump.
 #[test]
 fn a_driver_built_against_the_retired_version_is_refused() {
+    if common::skip_without_host_support("a_driver_built_against_the_retired_version_is_refused") {
+        return;
+    }
     let name = "local/retired-process-driver";
     let capsule = Capsule::process(name, &retired_wasm(), &["HOME"]);
     let text = capsule.run_refused();
@@ -276,6 +288,11 @@ fn a_driver_built_against_the_retired_version_is_refused() {
 /// release built against the version the host accepts, installed with `mur install`.
 #[test]
 fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
+    if common::skip_without_host_support(
+        "a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it",
+    ) {
+        return;
+    }
     let name = "local/previous-process-driver";
     let capsule = Capsule::process(name, &previous_wasm(), &["HOME"]);
     let text = capsule.run_refused();
@@ -294,6 +311,11 @@ fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
 /// with the install that fixes it. Its component is the frozen copy under `process-driver-v3/`.
 #[test]
 fn a_driver_built_against_0_3_0_is_refused_with_the_install_that_fixes_it() {
+    if common::skip_without_host_support(
+        "a_driver_built_against_0_3_0_is_refused_with_the_install_that_fixes_it",
+    ) {
+        return;
+    }
     let name = "local/v3-process-driver";
     let capsule = Capsule::process(name, &v3_wasm(), &["HOME"]);
     let text = capsule.run_refused();
@@ -316,6 +338,11 @@ fn a_driver_built_against_0_3_0_is_refused_with_the_install_that_fixes_it() {
 /// `process-driver-v4/`.
 #[test]
 fn a_driver_built_against_0_4_0_is_refused_with_the_install_that_fixes_it() {
+    if common::skip_without_host_support(
+        "a_driver_built_against_0_4_0_is_refused_with_the_install_that_fixes_it",
+    ) {
+        return;
+    }
     let name = "local/v4-process-driver";
     let capsule = Capsule::process(name, &v4_wasm(), &["HOME"]);
     let text = capsule.run_refused();
@@ -338,6 +365,11 @@ fn a_driver_built_against_0_4_0_is_refused_with_the_install_that_fixes_it() {
 /// `process-driver-v5/`.
 #[test]
 fn a_driver_built_against_0_5_0_is_refused_with_the_install_that_fixes_it() {
+    if common::skip_without_host_support(
+        "a_driver_built_against_0_5_0_is_refused_with_the_install_that_fixes_it",
+    ) {
+        return;
+    }
     let name = "local/v5-process-driver";
     let capsule = Capsule::process(name, &v5_wasm(), &["HOME"]);
     let text = capsule.run_refused();

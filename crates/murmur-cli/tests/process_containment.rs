@@ -585,6 +585,9 @@ fn assert_refused_naming(run: &Run, named: &[&str]) {
 /// spawned. `--explain-scope` exits 0 and shows each need refused.
 #[test]
 fn a_missing_grant_refuses_the_launch_naming_it() {
+    if common::skip_without_host_support("a_missing_grant_refuses_the_launch_naming_it") {
+        return;
+    }
     // (a) No capabilities.harness.paths and no network.allow.
     let none = Built::new("happy").driver(Driver::Needs).build();
     fs::create_dir_all(none.home().join("fake-harness-sessions")).unwrap();
@@ -695,6 +698,9 @@ fn a_parent_grant_reaches_only_the_declared_path() {
 /// it is refused, never granted at the link's target.
 #[test]
 fn a_symlinked_need_outside_its_entry_is_refused() {
+    if common::skip_without_host_support("a_symlinked_need_outside_its_entry_is_refused") {
+        return;
+    }
     let capsule = Built::new("parent-write")
         .driver(Driver::NeedsParent)
         .harness_path("~/fixture-harness-parent", "read-write")

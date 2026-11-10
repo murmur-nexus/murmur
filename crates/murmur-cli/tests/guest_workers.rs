@@ -753,6 +753,11 @@ fn killing_the_hooks_worker_fails_the_task_and_ends_the_records() {
 /// task `failed` with `E-RUN-065`: the harness is never left to carry on from a tool error.
 #[test]
 fn killing_the_tools_worker_under_a_bridged_call_fails_the_task() {
+    if common::skip_without_host_support(
+        "killing_the_tools_worker_under_a_bridged_call_fails_the_task",
+    ) {
+        return;
+    }
     let home = Home::new();
     let project = TempDir::new().unwrap();
     let harness = common::write_fake_harness(

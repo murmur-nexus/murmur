@@ -716,6 +716,11 @@ fn record_files(root: &Path) -> Vec<PathBuf> {
 /// The whole point: the second message is answered from what the first one said.
 #[test]
 fn a_second_message_in_one_context_resumes_the_harness_session() {
+    if common::skip_without_host_support(
+        "a_second_message_in_one_context_resumes_the_harness_session",
+    ) {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
     live.send("m1", "ctx_thread", SECRET_TASK, 1);
@@ -748,6 +753,11 @@ fn a_second_message_in_one_context_resumes_the_harness_session() {
 /// so both harness runs of one session are handed the same bytes.
 #[test]
 fn instruction_files_reach_the_process_driver_identically_on_every_run() {
+    if common::skip_without_host_support(
+        "instruction_files_reach_the_process_driver_identically_on_every_run",
+    ) {
+        return;
+    }
     let capsule = Built::new()
         .queueing()
         .inference_extra("  system_prompt: \"MANIFEST PROMPT\"\n  instruction_files: [AGENTS.md]\n")
@@ -797,6 +807,9 @@ fn instruction_files_reach_the_process_driver_identically_on_every_run() {
 
 #[test]
 fn two_contexts_get_two_sessions_and_two_map_files() {
+    if common::skip_without_host_support("two_contexts_get_two_sessions_and_two_map_files") {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
     live.send("m1", "ctx_one", SECRET_TASK, 1);
@@ -821,6 +834,9 @@ fn two_contexts_get_two_sessions_and_two_map_files() {
 
 #[test]
 fn a_restarted_capsule_continues_the_same_context() {
+    if common::skip_without_host_support("a_restarted_capsule_continues_the_same_context") {
+        return;
+    }
     let capsule = Built::new().build();
 
     let first = capsule
@@ -870,6 +886,9 @@ fn a_restarted_capsule_continues_the_same_context() {
 
 #[test]
 fn stateless_starts_a_new_conversation_every_task() {
+    if common::skip_without_host_support("stateless_starts_a_new_conversation_every_task") {
+        return;
+    }
     let capsule = Built::new().stateless().build();
 
     let first = capsule.task("memory", "ctx_flat", SECRET_TASK).succeeded();
@@ -896,6 +915,11 @@ fn stateless_starts_a_new_conversation_every_task() {
 
 #[test]
 fn a_session_the_harness_lost_fails_the_turn_and_keeps_failing() {
+    if common::skip_without_host_support(
+        "a_session_the_harness_lost_fails_the_turn_and_keeps_failing",
+    ) {
+        return;
+    }
     let capsule = Built::new().build();
     capsule.task("memory", "ctx_lost", SECRET_TASK).succeeded();
     let established = capsule.stored_session("ctx_lost");
@@ -946,6 +970,10 @@ fn a_session_the_harness_lost_fails_the_turn_and_keeps_failing() {
 
 #[test]
 fn the_id_the_harness_reports_is_the_one_that_is_remembered() {
+    if common::skip_without_host_support("the_id_the_harness_reports_is_the_one_that_is_remembered")
+    {
+        return;
+    }
     let capsule = Built::new().build();
 
     let first = capsule
@@ -974,6 +1002,11 @@ fn the_id_the_harness_reports_is_the_one_that_is_remembered() {
 
 #[test]
 fn resume_continues_the_harness_session_and_compact_is_refused() {
+    if common::skip_without_host_support(
+        "resume_continues_the_harness_session_and_compact_is_refused",
+    ) {
+        return;
+    }
     let capsule = Built::new().build();
     capsule
         .task("memory", "ctx_resume", SECRET_TASK)
@@ -1030,6 +1063,11 @@ fn resume_continues_the_harness_session_and_compact_is_refused() {
 
 #[test]
 fn record_off_threads_inside_one_life_and_forgets_on_restart() {
+    if common::skip_without_host_support(
+        "record_off_threads_inside_one_life_and_forgets_on_restart",
+    ) {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().record_off().build(), "memory");
 
     live.send("m1", "ctx_off", SECRET_TASK, 1);
@@ -1077,6 +1115,9 @@ fn record_off_threads_inside_one_life_and_forgets_on_restart() {
 /// the harness.
 #[test]
 fn the_conversation_record_stays_inert_under_process() {
+    if common::skip_without_host_support("the_conversation_record_stays_inert_under_process") {
+        return;
+    }
     use common::hook_wat::{
         conversation_reading_task_end_hook_wasm, create_hook_zip, seed_hook_wasm,
     };
@@ -1149,6 +1190,11 @@ fn the_conversation_record_stays_inert_under_process() {
 /// establishes no conversation, so the next task in that context starts one that works.
 #[test]
 fn a_cancel_before_any_output_leaves_the_context_with_no_session() {
+    if common::skip_without_host_support(
+        "a_cancel_before_any_output_leaves_the_context_with_no_session",
+    ) {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory-silent");
 
     let task = live.send_only("m1", "ctx_silent", SECRET_TASK, &[]);
@@ -1180,18 +1226,29 @@ fn a_cancel_before_any_output_leaves_the_context_with_no_session() {
 /// session, and the next task in that context continues it.
 #[test]
 fn a_cancel_after_output_keeps_the_session_and_the_next_task_resumes_it() {
+    if common::skip_without_host_support(
+        "a_cancel_after_output_keeps_the_session_and_the_next_task_resumes_it",
+    ) {
+        return;
+    }
     resumes_after_a_cancel("memory-slow", "ctx_slow", "text");
 }
 
 /// A thought is output too: nothing here reads what the harness said, only that it said something.
 #[test]
 fn a_cancel_after_thinking_alone_keeps_the_session() {
+    if common::skip_without_host_support("a_cancel_after_thinking_alone_keeps_the_session") {
+        return;
+    }
     resumes_after_a_cancel("memory-thinking-only", "ctx_thinking", "thinking");
 }
 
 /// So is a tool call, which is a turn the harness opened and a conversation it is holding.
 #[test]
 fn a_cancel_after_a_tool_call_alone_keeps_the_session() {
+    if common::skip_without_host_support("a_cancel_after_a_tool_call_alone_keeps_the_session") {
+        return;
+    }
     resumes_after_a_cancel("memory-tool-only", "ctx_tool", "tool call");
 }
 
@@ -1233,6 +1290,11 @@ fn resumes_after_a_cancel(profile: &str, context: &str, produced: &str) {
 /// kind, and it leaves no session behind for a later task to try to resume.
 #[test]
 fn a_refusal_before_any_output_stays_a_refusal_and_remembers_nothing() {
+    if common::skip_without_host_support(
+        "a_refusal_before_any_output_stays_a_refusal_and_remembers_nothing",
+    ) {
+        return;
+    }
     let capsule = Built::new().build();
     for (profile, kind, context) in [
         ("fail-auth", "auth", "ctx_auth"),
@@ -1269,6 +1331,9 @@ fn brick_the_harness(capsule: &Capsule) {
 
 #[test]
 fn forget_session_recovers_a_bricked_context_from_the_cli() {
+    if common::skip_without_host_support("forget_session_recovers_a_bricked_context_from_the_cli") {
+        return;
+    }
     let capsule = Built::new().build();
     capsule
         .task("memory", "ctx_forget", SECRET_TASK)
@@ -1337,6 +1402,10 @@ fn forget_session_recovers_a_bricked_context_from_the_cli() {
 
 #[test]
 fn forget_session_recovers_a_bricked_context_over_the_door() {
+    if common::skip_without_host_support("forget_session_recovers_a_bricked_context_over_the_door")
+    {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
     live.send("m1", "ctx_door", SECRET_TASK, 1);
@@ -1387,6 +1456,9 @@ fn forget_session_recovers_a_bricked_context_over_the_door() {
 /// what the forgetting one established.
 #[test]
 fn a_forget_over_the_door_applies_to_one_task_only() {
+    if common::skip_without_host_support("a_forget_over_the_door_applies_to_one_task_only") {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
     live.send_forgetting("m1", "ctx_once", SECRET_TASK, 1);
@@ -1407,6 +1479,9 @@ fn a_forget_over_the_door_applies_to_one_task_only() {
 /// on resumes the session its context established.
 #[test]
 fn the_forget_header_is_no_longer_read() {
+    if common::skip_without_host_support("the_forget_header_is_no_longer_read") {
+        return;
+    }
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
     live.send("m1", "ctx_header", SECRET_TASK, 1);
@@ -1570,6 +1645,11 @@ fn forget_session_needs_a_context_and_refuses_a_resume() {
 /// header and no messages.
 #[test]
 fn conversation_show_reports_the_harness_session_of_a_process_context() {
+    if common::skip_without_host_support(
+        "conversation_show_reports_the_harness_session_of_a_process_context",
+    ) {
+        return;
+    }
     let capsule = Built::new().build();
     capsule.task("memory", "ctx-show", SECRET_TASK).succeeded();
     let entry = capsule.map_entry("ctx-show");

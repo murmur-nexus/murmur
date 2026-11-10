@@ -1501,6 +1501,9 @@ fn no_usage_driver_wasm() -> PathBuf {
 /// harness, which sleeps for a minute after its terminal event, is killed rather than waited on.
 #[test]
 fn process_session_ceiling_stops_the_run() {
+    if common::skip_without_host_support("process_session_ceiling_stops_the_run") {
+        return;
+    }
     println!("S13 process_session_ceiling_stops_the_run");
     let home = TempDir::new().unwrap();
     let capsule = process_capsule(
@@ -1544,6 +1547,9 @@ fn process_session_ceiling_stops_the_run() {
 /// a run under an already-exhausted ceiling is stopped by them.
 #[test]
 fn process_machine_ceiling_counts_and_stops() {
+    if common::skip_without_host_support("process_machine_ceiling_counts_and_stops") {
+        return;
+    }
     println!("S13 process_machine_ceiling_counts_and_stops");
     let home = TempDir::new().unwrap();
     set_machine_ceiling(&home, 1_000_000);
@@ -1592,6 +1598,10 @@ fn process_machine_ceiling_counts_and_stops() {
 /// could ever reach would let the run go on for ever beneath it.
 #[test]
 fn process_ceiling_against_an_unreporting_driver_is_refused() {
+    if common::skip_without_host_support("process_ceiling_against_an_unreporting_driver_is_refused")
+    {
+        return;
+    }
     println!("S13 process_ceiling_against_an_unreporting_driver_is_refused");
     for (label, config, extra) in [
         ("session", None, "  max_session_tokens: 1000\n"),

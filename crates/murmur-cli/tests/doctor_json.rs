@@ -463,6 +463,9 @@ fn a_harness_that_does_not_resolve_is_refused() {
 /// reaches either output form.
 #[test]
 fn a_logged_out_harness_is_refused() {
+    if common::skip_without_host_support("a_logged_out_harness_is_refused") {
+        return;
+    }
     let capsule = ProcessProject::new();
 
     let output = capsule.doctor(true, "logged-out");
@@ -534,6 +537,9 @@ fn login_logged_in_adds_no_finding() {
 /// `ready`.
 #[test]
 fn login_not_checked_without_a_login_command_is_a_warning() {
+    if common::skip_without_host_support("login_not_checked_without_a_login_command_is_a_warning") {
+        return;
+    }
     let capsule = ProcessProject::with_driver(
         "process-driver/tool/process-driver-no-login-check.wasm",
         None,
@@ -560,6 +566,9 @@ fn login_not_checked_without_a_login_command_is_a_warning() {
 /// S6: an answer the driver cannot read is a `W-RUN-013` warning.
 #[test]
 fn login_unreadable_is_a_warning() {
+    if common::skip_without_host_support("login_unreadable_is_a_warning") {
+        return;
+    }
     let capsule = ProcessProject::new();
     let output = capsule.doctor(true, "login-unreadable");
     let report = document(&output);
@@ -579,6 +588,9 @@ fn login_unreadable_is_a_warning() {
 /// check that passes.
 #[test]
 fn login_checked_beside_an_untested_version_warning() {
+    if common::skip_without_host_support("login_checked_beside_an_untested_version_warning") {
+        return;
+    }
     let capsule = ProcessProject::new();
     let output = capsule.doctor(true, "old-version");
     let report = document(&output);
@@ -606,6 +618,11 @@ fn login_checked_beside_an_untested_version_warning() {
 /// own.
 #[test]
 fn a_level_4_driver_fails_the_checklist_and_the_harness_is_not_checked() {
+    if common::skip_without_host_support(
+        "a_level_4_driver_fails_the_checklist_and_the_harness_is_not_checked",
+    ) {
+        return;
+    }
     let capsule =
         ProcessProject::with_driver("process-driver-v4/tool/process-driver-v4.wasm", None);
     let output = capsule.doctor(true, "happy");

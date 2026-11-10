@@ -621,6 +621,11 @@ fn cancel_now(url: &str, task_id: &str) -> Duration {
 /// is still resumable by the next task.
 #[test]
 fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
+    if common::skip_without_host_support(
+        "s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives",
+    ) {
+        return;
+    }
     println!("S1: a stdin-message interrupt stops the harness and leaves the context resumable");
     let capsule = Built::new("process-cancel-honours", "interrupt-honours").launch();
     let context = "ctx-cancel-1";
@@ -696,6 +701,11 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
 /// person reads afterwards says a kill was needed.
 #[test]
 fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
+    if common::skip_without_host_support(
+        "s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace",
+    ) {
+        return;
+    }
     println!("S2: an ignored interrupt costs the harness the grace and then its life");
     let capsule = Built::new("process-cancel-ignores", "interrupt-ignores").launch();
 
@@ -741,6 +751,9 @@ fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
 /// its task, because `mur trace show` renders a finished session.
 #[test]
 fn s2_mur_trace_show_prints_the_interrupt_under_harness() {
+    if common::skip_without_host_support("s2_mur_trace_show_prints_the_interrupt_under_harness") {
+        return;
+    }
     println!("S2: `mur trace show` prints the interrupt line under ── Harness ──");
     let capsule = Built::new("process-cancel-shown", "interrupt-ignores")
         .ends_with_its_task()
@@ -769,6 +782,9 @@ fn s2_mur_trace_show_prints_the_interrupt_under_harness() {
 /// one stops well inside the grace.
 #[test]
 fn s3_a_harness_interrupted_by_sigint_stops() {
+    if common::skip_without_host_support("s3_a_harness_interrupted_by_sigint_stops") {
+        return;
+    }
     println!("S3: a signal-int driver's harness is stopped with SIGINT");
     let capsule = Built::new("process-cancel-signal", "interrupt-signal")
         .driver(Interrupt::SignalInt)
@@ -809,6 +825,11 @@ fn s3_a_harness_interrupted_by_sigint_stops() {
 /// the harness is killed at once.
 #[test]
 fn s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once() {
+    if common::skip_without_host_support(
+        "s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once",
+    ) {
+        return;
+    }
     println!("S4: an unsupported interrupt-method kills the harness immediately");
     let capsule = Built::new("process-cancel-unsupported", "interrupt-ignores")
         .driver(Interrupt::Unsupported)
@@ -855,6 +876,9 @@ fn s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once() {
 /// attempt's is `canceled` — never a `completed` or `failed` alongside it.
 #[test]
 fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
+    if common::skip_without_host_support("s5_a_cancelled_task_writes_exactly_one_terminal_status") {
+        return;
+    }
     println!("S5: a cancelled process task closes its stream with one canceled status");
     let capsule = Built::new("process-cancel-stream", "interrupt-honours").launch();
     let context = "ctx-cancel-5";
@@ -882,6 +906,9 @@ fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
 /// Every process driver capsule's door lists `CancelTask`, because every one can be stopped.
 #[test]
 fn s6_a_process_capsule_advertises_cancellation() {
+    if common::skip_without_host_support("s6_a_process_capsule_advertises_cancellation") {
+        return;
+    }
     println!("S6: a process capsule's card lists CancelTask");
     let capsule = Built::new("process-cancel-card", "happy").launch();
     let card = http_get(&capsule.url, "/.well-known/agent-card.json");
@@ -903,6 +930,11 @@ fn s6_a_process_capsule_advertises_cancellation() {
 /// `canceled`, and the `task_canceled` record still names the harness phase.
 #[test]
 fn s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records() {
+    if common::skip_without_host_support(
+        "s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records",
+    ) {
+        return;
+    }
     println!("S8: a cancel that beats the spawn leaves no harness on record");
     let capsule = Built::new("process-cancel-prespawn", "interrupt-ignores")
         .stalls_the_version_probe(Duration::from_secs(6))
@@ -943,6 +975,10 @@ fn s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records() {
 /// a failed one.
 #[test]
 fn s9_an_interrupted_run_hands_the_driver_interrupted_true() {
+    if common::skip_without_host_support("s9_an_interrupted_run_hands_the_driver_interrupted_true")
+    {
+        return;
+    }
     println!("S9: an interrupted run's exit is classified with interrupted: true");
     let capsule = Built::new("process-cancel-classify", "interrupt-ignores").launch();
 

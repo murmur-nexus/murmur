@@ -165,6 +165,11 @@ fn sidecar(home: &Path, full: &str, version: &str) -> Value {
 
 #[test]
 fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
+    if common::skip_without_host_support(
+        "a_launch_names_the_newest_version_of_the_driver_that_fits",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
@@ -207,6 +212,9 @@ fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
 
 #[test]
 fn a_launch_says_when_no_version_in_the_index_fits() {
+    if common::skip_without_host_support("a_launch_says_when_no_version_in_the_index_fits") {
+        return;
+    }
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
@@ -236,6 +244,9 @@ fn a_launch_says_when_no_version_in_the_index_fits() {
 
 #[test]
 fn a_launch_says_when_the_index_cannot_be_read() {
+    if common::skip_without_host_support("a_launch_says_when_the_index_cannot_be_read") {
+        return;
+    }
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
@@ -264,6 +275,11 @@ fn a_launch_says_when_the_index_cannot_be_read() {
 
 #[test]
 fn a_launch_of_a_driver_installed_from_a_file_asks_no_source() {
+    if common::skip_without_host_support(
+        "a_launch_of_a_driver_installed_from_a_file_asks_no_source",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
@@ -297,6 +313,9 @@ fn a_launch_of_a_driver_installed_from_a_file_asks_no_source() {
 
 #[test]
 fn a_launch_says_when_no_source_serves_the_scope() {
+    if common::skip_without_host_support("a_launch_says_when_no_source_serves_the_scope") {
+        return;
+    }
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();

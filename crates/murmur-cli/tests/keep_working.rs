@@ -742,6 +742,9 @@ fn a_person_s_cancel_ends_a_kept_working_task_canceled() {
 /// harness answers it from the conversation the task began.
 #[test]
 fn a_process_task_is_kept_working_in_its_harness_session() {
+    if common::skip_without_host_support("a_process_task_is_kept_working_in_its_harness_session") {
+        return;
+    }
     // The `memory` profile keeps its session in `~/fake-harness-sessions`, which the needs build
     // declares and the manifest grants.
     let home = common::harness_needs_home();

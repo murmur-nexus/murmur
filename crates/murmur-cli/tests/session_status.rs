@@ -541,6 +541,9 @@ fn bridged_text(workdir: &Path, name: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn session_status_through_the_process_bridge() {
+    if common::skip_without_host_support("session_status_through_the_process_bridge") {
+        return;
+    }
     // The notice falls due 30 seconds after `mur run` starts. The first two calls come right after
     // staging, the third 28 seconds later, so the notice lands on the third unless staging alone
     // took the whole 30.
@@ -649,6 +652,9 @@ fn merged_quota(trace: &[Value], at: usize) -> Vec<Value> {
 #[cfg(unix)]
 #[test]
 fn session_status_reports_the_harness_quota_windows() {
+    if common::skip_without_host_support("session_status_reports_the_harness_quota_windows") {
+        return;
+    }
     let (home, project) = process_project("quota", 0, "");
     let run = run(&home, &project, &[]);
     assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
@@ -1037,6 +1043,9 @@ fn the_deadline_ends_a_session_in_a_foreground_command() {
 #[cfg(unix)]
 #[test]
 fn the_deadline_ends_a_process_session_and_its_harness() {
+    if common::skip_without_host_support("the_deadline_ends_a_process_session_and_its_harness") {
+        return;
+    }
     let (home, project) = process_project("silent", 0, "");
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
     assert_ended_by_the_deadline(&run);
