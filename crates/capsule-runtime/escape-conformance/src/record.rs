@@ -459,6 +459,14 @@ impl Record<'_> {
             );
         }
         let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Boundary cases graded on their probe file that do not run on the `wasm-guest` route:\n"
+        );
+        for (id, reason) in crate::cases::NOT_ON_WASM_GUEST {
+            let _ = writeln!(out, "- `{id}`: {reason}");
+        }
+        let _ = writeln!(out);
 
         out
     }
@@ -609,6 +617,21 @@ mod tests {
             .find("| enforcement tier | `landlock+seccomp` |\n")
             .expect("the enforcement tier row");
         assert!(achieved < tier, "{rendered}");
+    }
+
+    /// A boundary case kept off the `wasm-guest` route is named in the record with its reason,
+    /// so a reader of the record alone can see why that route has no verdict for it.
+    #[test]
+    fn the_record_says_why_a_case_does_not_run_on_the_wasm_guest_route() {
+        let host = host(bare_readings());
+        let rendered = record(&host, &[]).render();
+        assert!(!cases::NOT_ON_WASM_GUEST.is_empty());
+        for (id, reason) in cases::NOT_ON_WASM_GUEST {
+            assert!(
+                rendered.contains(&format!("- `{id}`: {reason}\n")),
+                "{id}: {rendered}"
+            );
+        }
     }
 
     /// Only a full bare-host run with a same-filesystem work root is citable.

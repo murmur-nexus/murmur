@@ -1922,10 +1922,9 @@ cargo build --release -p escape-conformance
 ./target/release/escape-conformance --class sealed --mur target/debug/mur
 ```
 
-`escape-probe` gives a guest worker the host side the `wasm-guest` route needs (below). It compiles
-only in a profile with debug assertions: a release build with it fails, and the `escape-probe-absent`
-job in `.github/workflows/ci.yml` checks that the released `mur` and `mur-roost` carry none of it.
-A `mur` without the feature is refused at the `wasm-guest` route's preflight.
+`escape-probe` lets a guest worker run the case the probe tool names, which the `wasm-guest` route
+(below) needs. It compiles only in a debug build; a release build with it fails. A run that includes
+the `wasm-guest` route is refused at that route's preflight when `mur` lacks the feature.
 
 `--class` takes `advisory`, `scoped` or `sealed` and is what the run is graded against.
 `--route` runs one route's cases only and can be repeated; a run narrowed by `--route` or `--only`
@@ -1943,7 +1942,7 @@ the record:
 |---|---|---|
 | `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
 | `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime spawns under the session's class like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
-| `wasm-guest` | In the `tools` [guest worker](../concepts/guest-workers.md), as if a guest had escaped Wasmtime: the probe guest, a WASM tool, asks its worker to run the case, and the worker's host side makes the probe's host syscalls itself, under the enforcement the worker was spawned with. Every boundary case graded on its probe file runs on it, except `proc-self-cwd-reopen` (a worker's working directory is `/`, not the work folder) | The `advisory`, `scoped` and `sealed` expectations, as on `shell-tool` |
+| `wasm-guest` | In the `tools` [guest worker](../concepts/guest-workers.md), as if WASM code had escaped its sandbox: the probe tool, `escape-conformance-probe-guest`, asks its worker to run the case, and the worker makes the probe's system calls itself, under the enforcement it was started with. Every boundary case graded on its probe file runs on it, except `proc-self-cwd-reopen` (a worker's working directory is `/`, not the work folder) | The `advisory`, `scoped` and `sealed` expectations, as on `shell-tool` |
 
 An expectation is one of:
 
@@ -1977,7 +1976,7 @@ The run needs:
   `systemd-run --user --scope --property=Delegate=yes` by default to get one.
 
 It needs no registry access, model or API key: the harness carries its own process driver,
-`escape-conformance-driver`, and the probe guest, `escape-conformance-probe-guest`, and installs
+`escape-conformance-driver`, and its probe tool, `escape-conformance-probe-guest`, and installs
 them into each case's project with `mur install`.
 
 The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) of the `HOME` the

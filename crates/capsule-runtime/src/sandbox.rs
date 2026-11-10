@@ -5130,7 +5130,7 @@ mod linux_enforce {
     /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
     /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
     /// so every spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
-    /// now fails rather than silently running without fd hygiene. That is deliberate and it is
+    /// fails rather than silently running without fd hygiene. That is deliberate and it is
     /// this module's established fail-closed discipline (`drop_all_capabilities`,
     /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
     /// error rather than degrade), but it is a real, user-visible narrowing of the supported

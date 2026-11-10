@@ -208,26 +208,7 @@ fn en(error: &io::Error) -> String {
     let Some(code) = error.raw_os_error() else {
         return error.to_string();
     };
-    let name = match code {
-        libc::EPERM => "EPERM",
-        libc::ENOENT => "ENOENT",
-        libc::EBADF => "EBADF",
-        libc::EACCES => "EACCES",
-        libc::EFAULT => "EFAULT",
-        libc::EEXIST => "EEXIST",
-        libc::EXDEV => "EXDEV",
-        libc::ENOTDIR => "ENOTDIR",
-        libc::EINVAL => "EINVAL",
-        libc::EROFS => "EROFS",
-        libc::ENOSYS => "ENOSYS",
-        libc::ELOOP => "ELOOP",
-        libc::EAFNOSUPPORT => "EAFNOSUPPORT",
-        libc::ENETUNREACH => "ENETUNREACH",
-        libc::ECONNREFUSED => "ECONNREFUSED",
-        libc::ETIMEDOUT => "ETIMEDOUT",
-        libc::EHOSTUNREACH => "EHOSTUNREACH",
-        _ => "E?",
-    };
+    let name = crate::network_namespace::errno_name(code).unwrap_or("E?");
     format!("{name}({code})")
 }
 
@@ -720,8 +701,11 @@ fn connect_unlisted_tcp_host() -> (&'static str, String) {
     }
 }
 
-/// Whether this process's network namespace is not the initial one: the session's namespace has
-/// no route out, so an unreachable network there is the boundary, not a host without a route.
+/// Whether this process's network namespace differs from that of pid 1 in the `/proc` it sees:
+/// the session's namespace has no route out, so an unreachable network there is the boundary,
+/// not a host without a route. Under a private `/proc`, pid 1 is the session PID namespace's own
+/// init; where that shares the session's network namespace this is `false`, and an unreachable
+/// network reads as `INCONCLUSIVE`, which fails the gate rather than passing it.
 fn in_own_network_namespace() -> bool {
     match (
         fs::read_link("/proc/self/ns/net"),

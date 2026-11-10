@@ -80,7 +80,7 @@ See [E-RUN-065](../reference/diagnostics.md#e-run-065) and
 ## Run under the containment class
 
 Each worker is started the way a shell command is, under the capsule's containment class, and
-reaches only the folders its guests are granted:
+reaches only the folders its artifacts are granted:
 
 | Worker | Reaches beyond the work folder |
 |---|---|
@@ -90,7 +90,7 @@ reaches only the folders its guests are granted:
 
 | Class | A worker runs under |
 |---|---|
-| `scoped` | the session's network and process namespaces, seccomp, Landlock over the folders above, the cgroup scope and the rlimits |
+| `scoped` | the session's network and process namespaces, seccomp, Landlock over the folders above, the cgroup scope, and the open-file, file-size and core-dump rlimits |
 | `sealed` | all of `scoped`, inside the composed root |
 | `advisory` | what a shell command gets on the host |
 | `unconfined` | nothing: it runs as you |
@@ -105,15 +105,15 @@ namespace ([E-CAP-005](../reference/diagnostics.md#e-cap-005)) and cgroup scope
 ([E-RUN-012](../reference/containment.md#cgroup-scope)), as a shell capsule does, and is refused
 before any worker starts on a host that cannot give it them.
 
-The class therefore holds a guest even if it escapes its WASM sandbox: whatever it then does in
-its worker, the kernel refuses past the worker's grants. The `wasm-guest` route of the
+The class therefore holds WASM code even if it escapes its WASM sandbox: whatever it then does
+in its worker, the kernel refuses past the worker's grants. The `wasm-guest` route of the
 [escape-conformance harness](../reference/containment.md#the-escape-conformance-harness) measures
-exactly that. What the class does not hold is what `mur` itself reads on a guest's behalf, which
+exactly that. What the class does not hold is what `mur` itself reads on an artifact's behalf, which
 `mur` checks against the work folder instead: a tool result's `data-path` and attachments, and the
 files a capsule exports. Nor does any class hold a flaw in the kernel every process shares.
 
-A worker is not limited by the memory, process-count or CPU-time rlimits: its guest runtime
-reserves several GiB of address space for each guest, and the session's cgroup scope and each
+A worker is not limited by the memory, process-count or CPU-time rlimits: the WASM runtime
+reserves several GiB of address space for each artifact it loads, and the session's cgroup scope and each
 call's own limits bound it instead.
 
 The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` shows the

@@ -495,12 +495,23 @@ fn kernel_cause(step: Option<CreationStep>, errno: Option<i32>) -> &'static str 
     }
 }
 
-/// The symbolic name of the `errno` values a namespace creation can leave.
+/// The symbolic name of the `errno` values a namespace creation, a file open or a socket call can
+/// leave.
 pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
     Some(match errno {
         libc::EPERM => "EPERM",
         libc::ENOENT => "ENOENT",
+        libc::EBADF => "EBADF",
         libc::EACCES => "EACCES",
+        libc::EFAULT => "EFAULT",
+        libc::EEXIST => "EEXIST",
+        libc::EXDEV => "EXDEV",
+        libc::ELOOP => "ELOOP",
+        libc::EAFNOSUPPORT => "EAFNOSUPPORT",
+        libc::ENETUNREACH => "ENETUNREACH",
+        libc::ECONNREFUSED => "ECONNREFUSED",
+        libc::ETIMEDOUT => "ETIMEDOUT",
+        libc::EHOSTUNREACH => "EHOSTUNREACH",
         libc::EINVAL => "EINVAL",
         libc::ENOSPC => "ENOSPC",
         libc::ENOSYS => "ENOSYS",
