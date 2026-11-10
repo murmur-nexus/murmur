@@ -1,7 +1,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 
 use capsule_runtime::launch_session;
 use serde_json::{json, Value};
@@ -11,6 +15,25 @@ const DRIVER_VERSION: &str = "0.1.7";
 /// The WASM tool the grants fixture declares, so its route table has a tool on it.
 const GRANTS_TOOL_NAME: &str = "local/jsonl-line-count";
 const GRANTS_TOOL_VERSION: &str = "0.1.0";
+/// The grants fixture's tool under a name of its own, for the two tests whose tool carries a
+/// `programs:` block. Every test in this binary publishes into the one process `HOME`, whose
+/// store keeps the first manifest published under a name and version, so two tests with
+/// different `programs:` blocks must not share one.
+const NEEDS_TOOL_NAME: &str = "local/jsonl-line-count-needs";
+const PINNED_TOOL_NAME: &str = "local/jsonl-line-count-pinned";
+
+/// Every test here stages under one process `HOME`, so they share its `~/.murmur/host_facts`.
+/// A test that stages with `shell.allow` writes entries there and holds this shared; the test
+/// that deletes the directory and counts its entries holds it exclusive.
+static SHARED_HOST_FACTS: RwLock<()> = RwLock::new(());
+
+fn shares_host_facts() -> RwLockReadGuard<'static, ()> {
+    SHARED_HOST_FACTS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn owns_host_facts() -> RwLockWriteGuard<'static, ()> {
+    SHARED_HOST_FACTS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 // ── Response builders ────────────────────────────────────────────────────────
 
@@ -158,6 +181,7 @@ fn trace_two_turn_session_all_event_types() {
     if common::skip_without_host_support("trace_two_turn_session_all_event_types") {
         return;
     }
+    let _host_facts = shares_host_facts();
     let server = common::ScriptedServer::start(vec![
         tool_call_response("bash", json!({"command": "echo hello"})),
         end_turn_response(),
@@ -461,6 +485,7 @@ fn trace_written_without_hook_artifacts() {
     if common::skip_without_host_support("trace_written_without_hook_artifacts") {
         return;
     }
+    let _host_facts = shares_host_facts();
     let server = common::ScriptedServer::start(vec![end_turn_response()]);
 
     let home = tempfile::tempdir().unwrap();
@@ -500,6 +525,7 @@ fn trace_session_end_written_on_failed_exit() {
     if common::skip_without_host_support("trace_session_end_written_on_failed_exit") {
         return;
     }
+    let _host_facts = shares_host_facts();
     // Script one successful response (tool_call turn 0).
     // The server thread exits after serving one response; turn 1's driver call
     // will fail to connect, causing the driver WASM to return a non-passed
@@ -586,6 +612,7 @@ fn trace_session_id_matches_staged_session() {
     if common::skip_without_host_support("trace_session_id_matches_staged_session") {
         return;
     }
+    let _host_facts = shares_host_facts();
     let server = common::ScriptedServer::start(vec![end_turn_response()]);
 
     let home = tempfile::tempdir().unwrap();
@@ -626,6 +653,15 @@ fn trace_session_id_matches_staged_session() {
 /// session_start_records_the_whole_scope_report_as_effective_grants` in `capsule-runtime`, which
 /// needs no kernel at all.
 fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> PathBuf {
+    create_grants_manifest_for(project_dir, endpoint, GRANTS_TOOL_NAME)
+}
+
+/// [`create_grants_manifest`] declaring the tool under `tool_name`.
+fn create_grants_manifest_for(
+    project_dir: &std::path::Path,
+    endpoint: &str,
+    tool_name: &str,
+) -> PathBuf {
     let manifest = format!(
         concat!(
             "name: trace-grants-test\n",
@@ -662,7 +698,7 @@ fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> Path
         ),
         driver_name = DRIVER_NAME,
         driver_version = DRIVER_VERSION,
-        tool_name = GRANTS_TOOL_NAME,
+        tool_name = tool_name,
         tool_version = GRANTS_TOOL_VERSION,
         endpoint = endpoint,
     );
@@ -922,6 +958,7 @@ fn session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants() 
         println!("[SKIP] no python3 on PATH");
         return;
     }
+    let _host_facts = owns_host_facts();
     let server = common::ScriptedServer::start(vec![end_turn_response(), end_turn_response()]);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -1128,6 +1165,7 @@ fn session_start_declared_needs_match_explain_scope_json() {
     if capsule_runtime::skip_without_egress_namespace(test) {
         return;
     }
+    let _host_facts = shares_host_facts();
     let server = common::ScriptedServer::start(vec![end_turn_response()]);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -1135,14 +1173,15 @@ fn session_start_declared_needs_match_explain_scope_json() {
     setup_driver(&home, &artifact_dir);
     let tool = common::create_tool_artifact_with_auth(
         artifact_dir.path(),
-        GRANTS_TOOL_NAME,
+        NEEDS_TOOL_NAME,
         GRANTS_TOOL_VERSION,
         &common::fixture_path("graduation/tool/jsonl-line-count.wasm"),
         "programs:\n  cat:\n    needs:\n      - library: libm.so.6\n      - file: libc.so.6\n        \
          beside: libm.so.6\n      - program_folder: .\n      - system: fonts\n",
     );
     common::publish_local(&home, &tool).success();
-    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+    let manifest_path =
+        create_grants_manifest_for(project.path(), &server.endpoint, NEEDS_TOOL_NAME);
     let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
         "capabilities:\n",
         "capabilities:\n  shell:\n    allow:\n      - cat\n",
@@ -1195,7 +1234,7 @@ fn session_start_declared_needs_match_explain_scope_json() {
         .expect("a completed session must have written session_start");
     let needs = &session_start["effective_grants"]["declared_needs"];
     println!("session_start.effective_grants.declared_needs: {needs}");
-    assert_eq!(needs[0]["artifact"], GRANTS_TOOL_NAME, "{needs}");
+    assert_eq!(needs[0]["artifact"], NEEDS_TOOL_NAME, "{needs}");
     assert_eq!(needs[0]["program"], "cat", "{needs}");
     assert_eq!(
         needs[0]["granted"][0]["need"], "library libm.so.6",
@@ -1220,6 +1259,7 @@ fn session_start_pinned_programs_match_explain_scope_json() {
         eprintln!("SKIP — PROVES NOTHING: this host has no download platform");
         return;
     };
+    let _host_facts = shares_host_facts();
     let program = "murmur-pinned-trace-fixture";
     let process_home = common::process_home();
 
@@ -1255,7 +1295,7 @@ fn session_start_pinned_programs_match_explain_scope_json() {
     setup_driver(&home, &artifact_dir);
     let tool = common::create_tool_artifact_with_auth(
         artifact_dir.path(),
-        GRANTS_TOOL_NAME,
+        PINNED_TOOL_NAME,
         GRANTS_TOOL_VERSION,
         &common::fixture_path("graduation/tool/jsonl-line-count.wasm"),
         &format!(
@@ -1265,7 +1305,8 @@ fn session_start_pinned_programs_match_explain_scope_json() {
         ),
     );
     common::publish_local(&home, &tool).success();
-    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+    let manifest_path =
+        create_grants_manifest_for(project.path(), &server.endpoint, PINNED_TOOL_NAME);
     let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
         "capabilities:\n",
         &format!("capabilities:\n  shell:\n    allow:\n      - {program}\n"),
@@ -1316,7 +1357,7 @@ fn session_start_pinned_programs_match_explain_scope_json() {
     assert_eq!(
         pinned,
         &json!([{
-            "artifact": GRANTS_TOOL_NAME,
+            "artifact": PINNED_TOOL_NAME,
             "program": program,
             "platform": platform,
             "source": "pinned",
