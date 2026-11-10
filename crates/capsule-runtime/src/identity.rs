@@ -2732,7 +2732,7 @@ fn handle_tasks_list(
 /// `CancelTask`: stop one task and report what is still running.
 ///
 /// Runs on the connection task and never waits for the agent loop: it takes the registry lock,
-/// records the cancellation, snapshots the two work registries and answers. Whether the loop has
+/// snapshots the two work registries, records the cancellation and answers. Whether the loop has
 /// noticed yet is not the caller's question — the recorded state is already `canceled`.
 ///
 /// A live task is answered with its `canceled` state and the residue. A task that had already
@@ -2759,6 +2759,11 @@ fn handle_tasks_cancel(
         .into_http_response();
     };
 
+    // Read before the cancellation is recorded. Recording it wakes the task loop on another
+    // thread, which ends the task's delegations and drops them from the registry, so a snapshot
+    // read afterwards can find them already gone and answer that nothing was running.
+    let residue = Residue::snapshot(detached, live_delegations);
+
     let (outcome, task) = {
         let mut reg = task_registry.lock().unwrap();
         if !visible_to(&reg, &task_id, caller) {
@@ -2781,11 +2786,7 @@ fn handle_tasks_cancel(
             .into_http_response()
         }
         (CancelOutcome::Accepted, Some(mut task)) => {
-            // Read after the state is recorded, so nothing this snapshot names can have been
-            // started by the cancelled task afterwards.
-            task.artifacts = Residue::snapshot(detached, live_delegations)
-                .into_artifact()
-                .map(|artifact| vec![artifact]);
+            task.artifacts = residue.into_artifact().map(|artifact| vec![artifact]);
             JsonRpcResponse::ok(id, task).into_http_response()
         }
     }
