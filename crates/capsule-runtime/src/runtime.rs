@@ -2528,9 +2528,7 @@ fn stage_process_driver(
     request: &StageRequest,
     workdir: &Path,
     call_deadlines: CallDeadlines,
-    name: String,
-    version: String,
-    component: Component,
+    (name, version, component): (String, String, Component),
 ) -> Result<Arc<StagedProcessDriver>, RuntimeError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3767,9 +3765,7 @@ pub fn stage_session(
             &request,
             &runtime_dir_placement.workdir,
             call_deadlines.clone(),
-            name,
-            version,
-            component,
+            (name, version, component),
         )?),
         None => None,
     };

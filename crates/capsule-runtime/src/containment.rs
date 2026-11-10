@@ -2584,7 +2584,6 @@ impl Route {
             | Self::WasmTools
             | Self::Drivers
             | Self::Hooks => None,
-            ),
         }
     }
 }
@@ -5803,7 +5802,7 @@ mod tests {
     #[test]
     fn the_uncovered_route_warning_reaches_the_bootstrap_log() {
         let temp = tempfile::tempdir().unwrap();
-        let routes = route_table(
+        let mut routes = route_table(
             &RouteInputs {
                 drivers: vec!["d".to_string()],
                 process_transport: true,
@@ -5811,6 +5810,13 @@ mod tests {
             },
             "landlock+seccomp",
         );
+        // Every route is under the class today, so stand in an uncovered one to carry the
+        // warning through the emitter.
+        let harness = routes
+            .iter_mut()
+            .find(|row| row.route == Route::ProcessHarness)
+            .unwrap();
+        harness.under_class = false;
         warn_on_uncovered_routes(
             ContainmentClass::Sealed,
             &routes,
