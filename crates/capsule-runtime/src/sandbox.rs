@@ -12972,8 +12972,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         .expect("the command runs");
         assert_eq!(started.exit_code, 0, "stderr: {}", started.stderr);
         // The pid files hold pids in the session's PID namespace.
-        let sleeper = host_pid(pid_in(temp.path(), "sleeper.pid"));
-        let server = host_pid(pid_in(temp.path(), "server.pid"));
+        let sleeper = host_pid(&enforcement, pid_in(temp.path(), "sleeper.pid"));
+        let server = host_pid(&enforcement, pid_in(temp.path(), "server.pid"));
         assert!(process_exists(sleeper), "the setsid sleeper is running");
         assert!(process_exists(server), "the background server is running");
 
@@ -14218,18 +14218,51 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert!(pid > 1 && pid < 100, "a namespace pid: {}", parent.stdout);
     }
 
-    /// The host pid of `namespace_pid` in this test process's sessions, polled briefly: the pid
+    /// The host pid of `namespace_pid` in `session`'s own PID namespace, polled briefly: the pid
     /// file is written before the process it names is guaranteed to be visible.
-    fn host_pid(namespace_pid: i32) -> i32 {
+    ///
+    /// Not `host_pid_in_session`, which looks in every session this test process holds and
+    /// answers with the first match: tests run in parallel and number their processes alike, so
+    /// that can be another test's process.
+    fn host_pid(session: &ShellEnforcement, namespace_pid: i32) -> i32 {
+        let join = session
+            .session_netns
+            .establish(
+                &session.egress_tcp_ports,
+                crate::egress_proxy::EgressPolicy::new(
+                    session.network_allow_rules.clone(),
+                    session.network_allow_ips.clone(),
+                ),
+                session.observed_held_ports(),
+            )
+            .expect("the session's namespace is established");
+        let pid_ns = std::fs::read_link(format!("/proc/self/fd/{}", join.pid_ns_fd()))
+            .expect("the session's PID namespace handle is readable");
+        let wanted = namespace_pid.to_string();
         for _ in 0..100 {
-            if let Some(pid) =
-                crate::network_namespace::host_pid_in_session(std::process::id(), namespace_pid)
-            {
+            let found = std::fs::read_dir("/proc")
+                .expect("/proc is readable")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                .find(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                        .is_ok_and(|namespace| namespace == pid_ns)
+                        && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(
+                            |status| {
+                                status
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("NSpid:"))
+                                    .and_then(|fields| fields.split_whitespace().last())
+                                    == Some(wanted.as_str())
+                            },
+                        )
+                });
+            if let Some(pid) = found {
                 return pid;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        panic!("no process of this test's sessions is pid {namespace_pid} in its namespace");
+        panic!("no process of this session is pid {namespace_pid} in its namespace");
     }
 
     /// A server a command backgrounds survives into the next command, which sees it in the
@@ -14251,8 +14284,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         );
         assert_eq!(started.exit_code, 0, "{}", started.stderr);
         let namespace_pid = pid_in(&work, "sleeper.pid");
-        let sleeper = host_pid(namespace_pid);
-        let holder = host_pid(1);
+        let sleeper = host_pid(&enforcement, namespace_pid);
+        let holder = host_pid(&enforcement, 1);
         assert_ne!(sleeper, namespace_pid, "the pid file holds a namespace pid");
         let seen = run_bash_in(
             &work,
@@ -14291,8 +14324,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &enforcement,
         );
         assert_eq!(started.exit_code, 0, "{}", started.stderr);
-        let sleeper = host_pid(pid_in(&work, "sleeper.pid"));
-        let holder = host_pid(1);
+        let sleeper = host_pid(&enforcement, pid_in(&work, "sleeper.pid"));
+        let holder = host_pid(&enforcement, 1);
         drop(enforcement);
         assert!(
             process_gone_within(holder, SESSION_END_KILL_WAIT),
@@ -14333,7 +14366,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let command_pid = host_pid(pid_in(&work, "command.pid"));
+        let command_pid = host_pid(&enforcement, pid_in(&work, "command.pid"));
         assert_ne!(
             command_pid,
             relay.id() as i32,
@@ -14379,7 +14412,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let command_pid = host_pid(pid_in(&work, "command.pid"));
+        let command_pid = host_pid(&enforcement, pid_in(&work, "command.pid"));
         let sent_at = std::time::Instant::now();
         assert!(crate::formation_launch::signal_group(
             i64::from(relay.id()),

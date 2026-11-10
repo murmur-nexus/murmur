@@ -10,8 +10,14 @@ fn registry(allow: &[&str]) -> (Arc<SessionProcesses>, tempfile::TempDir) {
         shell_allow: allow.iter().map(|name| (*name).to_string()).collect(),
         ..CapabilityPolicy::default()
     };
+    let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
+    // With no cgroup scope, a spawn's `RLIMIT_NPROC` is the uid's thread count at that spawn plus
+    // `max_processes` (128 by default), and the uid is every thread on the host. Thousands of
+    // tests starting threads in parallel use that up within milliseconds, and a program that
+    // forks then dies with "Cannot fork". These tests are not about the bound.
+    enforcement.resource_limits.max_processes = u64::MAX;
     let registry = SessionProcesses::new(
-        ShellEnforcement::environment_only().with_test_session_dirs(),
+        enforcement,
         policy,
         WorkdirRoot::open(workdir.path()).unwrap(),
         Vec::new(),
@@ -548,7 +554,17 @@ async fn a_program_that_exits_takes_what_it_forked_with_it() {
         view.status(started.handle.clone()).await,
         Ok(wit::State::Exited(0))
     ));
-    let output = view.read(started.handle.clone(), 4096).await.unwrap();
+    // The pump that moves the leader's pipe into its output ring runs on a thread of its own, so
+    // a read straight after the exit can come before its first chunk. Read until the line the
+    // program printed has arrived.
+    let printed_by = Instant::now() + Duration::from_secs(5);
+    let output = loop {
+        let output = view.read(started.handle.clone(), 4096).await.unwrap();
+        if !output.stdout.is_empty() || Instant::now() >= printed_by {
+            break output;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     let forked = printed_pid(&output.stdout);
     assert!(
         dies(forked).await,
