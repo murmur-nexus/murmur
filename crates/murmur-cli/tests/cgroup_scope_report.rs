@@ -524,8 +524,8 @@ fn uncovered_warnings(stderr: &str) -> Vec<&str> {
 /// neither `mur doctor` nor its launch prints `W-SEC-034`, and the routes say the tier holds them.
 /// An `advisory` capsule gets none either.
 #[test]
-fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
-    let test = "a_sealed_capsule_is_told_which_routes_its_class_does_not_confine";
+fn a_sealed_wasm_capsule_gets_no_uncovered_route_warning() {
+    let test = "a_sealed_wasm_capsule_gets_no_uncovered_route_warning";
     let home = TempDir::new().unwrap();
     publish_agent_artifacts(&home);
 
@@ -668,7 +668,8 @@ fn a_process_transport_capsule_reports_the_harness_routes() {
 /// A capsule whose only route is a WASM tool and a driver (no `shell.allow`, no `spawn.allow`)
 /// runs them in guest worker processes, so it needs a cgroup scope exactly as a shell capsule
 /// does: inside the read-only construction its report says the scope is required and refused,
-/// and its launch is refused with `E-RUN-012`.
+/// and its launch is refused with `E-RUN-012` before any session folder exists, so before any
+/// worker could be started (workers start once the work folder and records exist).
 #[test]
 fn worker_only_capsule_needs_cgroup() {
     let test = "worker_only_capsule_needs_cgroup";
@@ -715,4 +716,22 @@ fn worker_only_capsule_needs_cgroup() {
         "{}",
         launch.all()
     );
+    assert!(
+        !project.path().join("workdir").exists(),
+        "a refused launch creates no work folder: {}",
+        launch.all()
+    );
+    for folder in ["sessions", "records"] {
+        let path = home.path().join(".murmur").join(folder);
+        let entries = fs::read_dir(&path)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            entries,
+            0,
+            "a refused launch creates nothing under {}: {}",
+            path.display(),
+            launch.all()
+        );
+    }
 }

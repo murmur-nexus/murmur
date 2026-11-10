@@ -34,7 +34,7 @@ A worker starts only when the capsule has an artifact of its kind:
 `mur` starts the workers during staging, once the session's work folder and runtime folder exist.
 Each worker runs in its own process group with `/` as its working directory. Under a class with
 a process namespace, `mur`'s child is a relay outside the namespace and the worker is the relay's
-child inside it. Each worker moves with `mur` into the session's cgroup scope. It dies with `mur`.
+child inside it. Each worker is started inside the cgroup scope `mur` runs in. It dies with `mur`.
 
 ## What never enters a worker
 
@@ -95,12 +95,22 @@ reaches only the folders its guests are granted:
 | `advisory` | what a shell command gets on the host |
 | `unconfined` | nothing: it runs as you |
 
-No folder a worker reaches can run a program, and no worker reaches the records directory, apart
-from `hooks/` for a hook granted it. A worker reaches the network only through the egress proxy,
-and the credential key stays in `mur`, which adds it to a driver's outgoing request. Because a
+No folder a worker reaches can run a program. No worker reaches the records directory, apart
+from `hooks/` for a hook granted it and, on `sealed`, the session's own `/tmp` and home folders
+kept there, which the composed root mounts for every process in it. A worker's network requests
+go to `mur`, which applies `capabilities.network.allow`; a socket the worker opens itself is
+inside the session's network namespace, where only the egress proxy is reachable. Because a
 worker is a subprocess, a capsule with any tool, driver or hook needs the session's network
 namespace ([E-CAP-005](../reference/diagnostics.md#e-cap-005)) and cgroup scope
-([E-RUN-012](../reference/containment.md#cgroup-scope)), as a shell capsule does.
+([E-RUN-012](../reference/containment.md#cgroup-scope)), as a shell capsule does, and is refused
+before any worker starts on a host that cannot give it them.
+
+The class therefore holds a guest even if it escapes its WASM sandbox: whatever it then does in
+its worker, the kernel refuses past the worker's grants. The `wasm-guest` route of the
+[escape-conformance harness](../reference/containment.md#the-escape-conformance-harness) measures
+exactly that. What the class does not hold is what `mur` itself reads on a guest's behalf, which
+`mur` checks against the work folder instead: a tool result's `data-path` and attachments, and the
+files a capsule exports. Nor does any class hold a flaw in the kernel every process shares.
 
 A worker is not limited by the memory, process-count or CPU-time rlimits: its guest runtime
 reserves several GiB of address space for each guest, and the session's cgroup scope and each

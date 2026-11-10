@@ -1137,9 +1137,10 @@ fn a_hello_naming_another_pid_is_refused() {
 /// no process is started.
 #[test]
 fn a_confined_worker_is_spawned_through_prepare_enforcement() {
+    let workdir = tempfile::tempdir().unwrap();
     let sandbox = super::launch::WorkerSandbox {
         enforcement: crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
-        workdir: tempfile::tempdir().unwrap().keep(),
+        workdir: workdir.path().to_path_buf(),
     };
     crate::sandbox::FORCE_PREPARE_FAILURE.with(|flag| flag.set(true));
     let started = super::launch::start_worker(

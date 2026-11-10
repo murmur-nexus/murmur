@@ -85,6 +85,9 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Builds the `mur-alloc-bench` measurement binary and the runtime module it times.
 alloc-bench = ["capsule-runtime/alloc-bench"]
+# Test-only: the escape-conformance gate's `wasm-guest` route needs a `mur` built with it. A
+# release profile refuses to compile it (see `capsule-runtime`'s feature of the same name).
+escape-probe = ["capsule-runtime/escape-probe"]
 
 # `build.rs` reads the commit out of a source package's `.cargo_vcs_info.json`.
 [build-dependencies]

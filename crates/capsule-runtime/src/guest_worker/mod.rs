@@ -15,6 +15,11 @@
 //! The wire format is in [`wire`]: `u32` little-endian length-prefixed `postcard` frames over one
 //! Unix socket, which a worker process holds as fd 3.
 
+// Raw syscalls are what the probe bodies are for; every `unsafe` block in it carries its SAFETY
+// note.
+#[cfg(all(feature = "escape-probe", target_os = "linux"))]
+#[allow(unsafe_code)]
+mod escape_probe;
 mod http;
 mod launch;
 mod remote;

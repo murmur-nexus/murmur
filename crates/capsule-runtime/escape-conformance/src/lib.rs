@@ -53,6 +53,7 @@ pub mod driver_artifact;
 pub mod harness_protocol;
 pub mod host;
 pub mod probe;
+pub mod probe_guest;
 pub mod record;
 pub mod runner;
 pub mod verdict;

@@ -74,20 +74,35 @@ jobs:
         # `--timings` records each crate's build time.
         run: |
           cargo test --workspace --no-run --timings --features beta-all
+      - name: Give capsules a network namespace and a cgroup scope
+        # A capsule with a WASM tool, driver or hook runs its guests in worker processes spawned
+        # under its containment class, so, like a shell capsule, it needs the session's network
+        # namespace (E-CAP-005) and a delegated cgroup scope (E-RUN-012). A stock runner gives
+        # neither, which would refuse nearly every agent capsule the suite launches. The same
+        # host preparation as `contained`, with the restriction lifted host-wide because test
+        # processes create namespaces themselves; unlike `contained`, a [SKIP-HOST] line here is
+        # reported, not failed.
+        timeout-minutes: 10
+        run: |
+          .github/scripts/prepare-contained-runner.sh
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run the workspace test suite
         # nextest runs the tests of every binary in parallel, each in its own process, rather
         # than one binary after another. The `ci` profile in .config/nextest.toml retries a
         # failure twice and reports a test that then passes as FLAKY, terminates a test still
         # running after five minutes, does not stop at the first failure, and writes the JUnit
         # report the next steps read. The workspace has no doctests, which nextest does not run.
-        run: |
+        # Inside a delegated scope, so the capsules the tests launch can create their own.
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes -p TasksMax=infinity --
           cargo nextest run --profile ci --workspace --features beta-all
       - name: Test the build releases ship
         # Release builds pass no features, and every step above passes `beta-all`, so this is the
         # only step that compiles the featureless `murmur-cli`. It runs `new_roster`, whose
         # `the_default_build_has_only_the_roster_form` is compiled only without `beta-mur-new`. Its
         # profile is `ci`'s under another name, so its JUnit report does not replace the full run's.
-        run: |
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes -p TasksMax=infinity --
           cargo nextest run --profile ci-default-build -p murmur-cli --test new_roster
       - name: Upload the test report and build timings
         if: always()
@@ -121,12 +136,9 @@ jobs:
             echo "| Host cannot isolate a capsule (\`[SKIP-HOST]\`) | $host_skips |"
             echo "| A local fixture or checkout this runner does not have (\`[SKIP]\`) | $other_skips |"
             echo
-            echo "A capsule that spawns native subprocesses needs both a delegated cgroup v2 scope and"
-            echo "its own network namespace. GitHub's runners refuse \`unshare(CLONE_NEWUSER | CLONE_NEWNET)\`"
-            echo "under the AppArmor unprivileged-userns restriction, so the launch is refused here."
-            echo "Those $host_skips tests are covered by the manual procedure in"
-            echo "\`docs/content/reference/resource-limits-manual-verification.md\`, which must be run by"
-            echo "hand on a real uncontainerised Linux host."
+            echo "This job prepares its runner for a network namespace and a delegated cgroup scope, as"
+            echo "\`contained\` does, so a host skip here is a host preparation that fell short. The"
+            echo "\`contained\` job runs the same suite and fails on any \`[SKIP-HOST]\` line."
           } >> "$GITHUB_STEP_SUMMARY"
 
   contained:
@@ -240,13 +252,29 @@ jobs:
             target/cargo-timings/cargo-timing.html
           if-no-files-found: warn
       - name: Build escape-conformance
-        # The containment gate and its probe-driver harness. After the suite and run whatever its
-        # result, so a red gate never hides the suite's own report, or the other way round.
+        # The containment gate and its probe-driver harness, and target/debug/mur rebuilt with the
+        # test-only `escape-probe` feature, which the gate's wasm-guest route needs: a guest
+        # worker that runs the case its probe guest names. A debug build only; a release profile
+        # refuses the feature. After the suite and run whatever its result, so a red gate never
+        # hides the suite's own report, or the other way round.
         if: ${{ !cancelled() }}
-        run: cargo build -p escape-conformance --bins
+        run: |
+          cargo build -p escape-conformance --bins
+          cargo build -p murmur-cli --bin mur --features "beta-all escape-probe"
+      - name: "Escape probe: a guest worker cannot read the key or the records"
+        # The probe guest in the tools worker reads its own environment, the manifest holding the
+        # gateway key, the records directory and the session's trace, at scoped and sealed.
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: >-
+          systemd-run --user --scope --quiet --collect -p Delegate=yes -p TasksMax=infinity --
+          cargo nextest run --profile ci-default-build -p murmur-cli
+          --features "beta-all escape-probe" --test guest_workers
+          -E 'test(probe_cannot_read_key_or_records)'
       - name: "Escape conformance: scoped"
-        # Every case through the shell tool at `scoped`, and the process-harness cases through the
-        # harness, against target/debug/mur. The work root is on the filesystem that holds /etc
+        # Every case through the shell tool at `scoped`, the process-harness cases through the
+        # harness, and the boundary cases through a guest worker (wasm-guest), against
+        # target/debug/mur. The work root is on the filesystem that holds /etc
         # and /var/tmp, so the link and rename cases measure the boundary rather than EXDEV. This
         # runner is a VM, so the record is stamped NOT W-SEC-005 EVIDENCE; the exit code still
         # gates: 2 refused, 3 a boundary crossed, 4 a ceiling gave way, 5 a known gap changed.
@@ -278,6 +306,30 @@ jobs:
             ${{ runner.temp }}/escape-conformance-work-*/*/*.txt
             ${{ runner.temp }}/escape-conformance-work-*/*/wd/__ec.probe
           if-no-files-found: warn
+
+  escape-probe-absent:
+    name: escape-probe-absent
+    runs-on: ubuntu-latest
+    # A fat-LTO release build of mur and mur-roost from cold, then a release-profile check of
+    # capsule-runtime.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libseccomp
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Build the release binaries
+        # What release.yml builds, without a target triple.
+        run: cargo build -p murmur-cli -p mur-roost --release
+      - name: No escape probe in a release
+        # The released binaries carry none of the test-only `escape-probe` feature's markers, and
+        # a release-profile build with the feature is refused by its compile_error!.
+        run: |
+          scripts/check-no-escape-probe.sh target/release/mur target/release/mur-roost
+          scripts/check-no-escape-probe.sh --feature-refused
 
   lint:
     name: cargo-clippy + cargo-fmt

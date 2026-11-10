@@ -1531,10 +1531,6 @@ fn reap(pid: u32, workers: Option<Arc<GuestWorkers>>) -> Option<std::process::Ex
     }
 }
 
-/// Exchanges `Hello` and `Init` with a just-started worker. Returns its pid and the writer half.
-/// A worker process is known by the pid it was spawned as: a hello naming any other pid is
-/// refused, so the supervisor never signals a process it did not start. A thread worker, which
-/// has no child, is taken at its word.
 /// How the supervisor knows a just-started worker's pid.
 #[derive(Debug, Clone, Copy)]
 enum KnownPid {
@@ -1545,6 +1541,12 @@ enum KnownPid {
     Relay(Option<u32>),
 }
 
+/// Exchanges `Hello` and `Init` with a just-started worker. Returns its pid and the writer half.
+/// A worker process spawned directly is known by the pid it was spawned as: a hello naming any
+/// other pid is refused, so the supervisor never signals a process it did not start. A worker
+/// behind a relay names its namespace-local pid, which is not compared: its host pid is read as
+/// the relay's one child ([`relayed_worker_pid`]), and is the relay's own when that read fails. A
+/// thread worker, which has no child, is taken at its word.
 fn handshake(
     kind: WorkerKind,
     stream: &UnixStream,

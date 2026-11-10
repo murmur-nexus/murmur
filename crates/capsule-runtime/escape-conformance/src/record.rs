@@ -428,17 +428,19 @@ impl Record<'_> {
              `not-asserted` in the `advisory` column means something different — a class with no \
              mechanism — and the two must not be read as one. The three class columns are the \
              shell-tool route; the `process-harness` column is that route's expectation at \
-             `scoped` / `sealed`, and `—` there means the case does not run on it.\n"
+             `scoped` / `sealed`; the `wasm-guest` route is graded on the shell-tool column of the \
+             class under test, and `—` in either of the last two columns means the case does not \
+             run on that route.\n"
         );
         let _ = writeln!(
             out,
-            "| case | category | advisory | scoped | sealed | process-harness |"
+            "| case | category | advisory | scoped | sealed | process-harness | wasm-guest |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|");
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|");
         for case in crate::cases::all_cases() {
             let _ = writeln!(
                 out,
-                "| `{}` | {} | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} |",
                 case.id,
                 case.category,
                 case.advisory.as_str(),
@@ -448,7 +450,12 @@ impl Record<'_> {
                     .map(|harness| {
                         format!("{} / {}", harness.scoped.as_str(), harness.sealed.as_str())
                     })
-                    .unwrap_or_else(|| "—".to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                if case.runs_in_guest_worker() {
+                    "as shell-tool"
+                } else {
+                    "—"
+                }
             );
         }
         let _ = writeln!(out);

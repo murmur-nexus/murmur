@@ -361,6 +361,11 @@ pub(crate) fn serve(kind: WorkerKind, stream: UnixStream) -> i32 {
                                 .await
                             }
                         };
+                        #[cfg(all(feature = "escape-probe", target_os = "linux"))]
+                        let result = result.map(|mut result| {
+                            super::escape_probe::answer(&spec, &mut result);
+                            result
+                        });
                         Reply::Tool {
                             result,
                             deadlines: deadlines.take(),

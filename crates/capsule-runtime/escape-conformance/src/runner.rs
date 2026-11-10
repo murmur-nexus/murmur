@@ -31,8 +31,10 @@
 //! A case runs once per route it lists ([`Case::routes`]). On [`Route::ShellTool`] the probe is a
 //! tool call, as above. On [`Route::ProcessHarness`] the same manifest shape is launched, but the
 //! driver config tells `probe-driver` to run the staged probe as its own child instead of calling
-//! the bridge, so the verdict says what a process-transport harness can reach. Each route stages
-//! its own case directory, so neither grades the other's probe file.
+//! the bridge, so the verdict says what a process-transport harness can reach. On
+//! [`Route::WasmGuest`] the manifest also lists the probe guest, and `probe-driver` calls it with
+//! the case id: the guest worker's host side runs the case in the worker process and writes the
+//! same probe file. Each route stages its own case directory, so none grades another's probe file.
 //!
 //! # Scratch is removed after each case
 //!
@@ -59,6 +61,7 @@ use crate::cases::{Case, Evidence, Prepare, Profile, Route};
 use crate::driver_artifact;
 use crate::harness_protocol::{ProbeConfig, ProbeRoute};
 use crate::probe;
+use crate::probe_guest;
 use crate::verdict::{Expectation, Grade, Verdict};
 
 /// Everything a run needs that is not the case itself.
@@ -70,6 +73,10 @@ pub struct RunnerConfig {
     /// The `escape-conformance-driver` artifact `driver_artifact::build_artifact` packed for this
     /// run, installed into every case's project store before its `mur run`.
     pub driver_artifact: PathBuf,
+    /// The probe guest `probe_guest::build_artifact` packed for this run, installed into the
+    /// project store of every case run on [`Route::WasmGuest`]. `None` when the run uses no such
+    /// route; a case staged on it without one is not staged.
+    pub probe_guest_artifact: Option<PathBuf>,
     /// Root under which each case gets its own directory, as
     /// `crate::work_root::prepare_work_root` returned it: empty but for its marker when the run
     /// starts. Kept after the run: it holds the generated manifest, the probe source, `mur`'s
@@ -178,7 +185,10 @@ pub fn probe_config(
     case_dir: &Path,
 ) -> ProbeConfig {
     ProbeConfig {
-        tool: "python3".to_string(),
+        tool: match route {
+            Route::WasmGuest => probe_guest::PROBE_GUEST_NAME.to_string(),
+            _ => "python3".to_string(),
+        },
         script: probe::PROBE_SCRIPT.to_string(),
         script2: match case.evidence {
             Evidence::SecondSpawnRefused(_) => Some(probe::SECOND_SCRIPT.to_string()),
@@ -192,12 +202,14 @@ pub fn probe_config(
                 interpreter: config.harness_interpreter.display().to_string(),
                 workdir: workdir_in(case_dir).display().to_string(),
             },
+            Route::WasmGuest => ProbeRoute::WasmGuest,
         },
     }
 }
 
-/// The manifest one case runs under on `route`, staged in `case_dir`. Both routes declare the
-/// same capabilities: only the driver config differs, so the class under test is the same.
+/// The manifest one case runs under on `route`, staged in `case_dir`. Every route declares the
+/// same capabilities: only the driver config differs, and on [`Route::WasmGuest`] the probe guest
+/// is one more artifact, so the class under test is the same.
 ///
 /// Declares `capabilities.containment: <class>` explicitly. Without this, every case would run at
 /// the manifest default (`advisory`), and on a `sealed`-capable host `applied_tier` would still
@@ -226,7 +238,19 @@ pub fn manifest_yaml(
         "    version: {}\n",
         driver_artifact::DRIVER_VERSION
     ));
-    yaml.push_str("    runtime: driver\n\n");
+    yaml.push_str("    runtime: driver\n");
+    if route == Route::WasmGuest {
+        yaml.push_str(&format!(
+            "  - name: {}\n",
+            probe_guest::PROBE_GUEST_ARTIFACT
+        ));
+        yaml.push_str(&format!(
+            "    version: {}\n",
+            probe_guest::PROBE_GUEST_VERSION
+        ));
+        yaml.push_str("    runtime: tool\n");
+    }
+    yaml.push('\n');
     yaml.push_str("capabilities:\n");
     yaml.push_str(&format!("  containment: {class}\n"));
     yaml.push_str("  shell:\n");
@@ -318,6 +342,12 @@ fn stage(
     // `mur run --manifest` resolves its artifacts from that same project's store.
     driver_artifact::install_into(&config.mur, &config.driver_artifact, case_dir)
         .map_err(io::Error::other)?;
+    if route == Route::WasmGuest {
+        let guest = config.probe_guest_artifact.as_deref().ok_or_else(|| {
+            io::Error::other("this run packed no probe guest, so the wasm-guest route cannot run")
+        })?;
+        driver_artifact::install_into(&config.mur, guest, case_dir).map_err(io::Error::other)?;
+    }
 
     match case.prepare {
         Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
@@ -732,6 +762,9 @@ pub enum PreflightCheck {
     InterpreterExec,
     /// The tool call ran, and the probe left no `SUCCESS` verdict in `probe::PROBE_FILE`.
     ProbeFile,
+    /// On [`Route::WasmGuest`], the probe guest ran and its request came back unanswered: the
+    /// `mur` under test was built without the `escape-probe` feature.
+    ProbeGuestUnanswered,
 }
 
 impl PreflightCheck {
@@ -743,6 +776,7 @@ impl PreflightCheck {
             PreflightCheck::Harness { .. } => "harness",
             PreflightCheck::InterpreterExec => "interpreter exec",
             PreflightCheck::ProbeFile => "probe file",
+            PreflightCheck::ProbeGuestUnanswered => "probe guest",
         }
     }
 }
@@ -754,6 +788,9 @@ const HARNESS_CODES: [&str; 4] = ["E-RUN-006", "E-RUN-033", "E-RUN-034", "E-RUN-
 
 /// How the kernel's `EACCES` reads in a tool result: `io::Error`'s rendering of errno 13.
 const EXEC_DENIED: &str = "Permission denied (os error 13)";
+
+/// The probe guest's own summary, which a guest worker built with `escape-probe` replaces.
+const PROBE_GUEST_UNANSWERED: &str = "escape-probe request not answered";
 
 /// Which preflight check `outcome` failed. Meaningful only for an outcome that did not report
 /// `SUCCESS`; one that did classifies as [`PreflightCheck::ProbeFile`].
@@ -770,6 +807,12 @@ pub fn classify_preflight(outcome: &CaseOutcome) -> PreflightCheck {
             tool_result,
         } => (*timed_out, refusal_code, tool_result),
     };
+    if tool_result
+        .as_deref()
+        .is_some_and(|result| result.contains(PROBE_GUEST_UNANSWERED))
+    {
+        return PreflightCheck::ProbeGuestUnanswered;
+    }
     if tool_result
         .as_deref()
         .is_some_and(|result| result.contains(EXEC_DENIED))
@@ -863,6 +906,14 @@ pub fn preflight_hint(check: &PreflightCheck) -> String {
              traceback means the probe script failed, an exit code with no output means it was \
              killed before writing.",
             probe_file = probe::PROBE_FILE
+        ),
+        PreflightCheck::ProbeGuestUnanswered => format!(
+            "Failed check: {name}. The probe guest ran in the tools worker, but its request came \
+             back unanswered: the `mur` under test was built without the test-only \
+             `escape-probe` feature, which only a debug build may carry. Build one with \
+             `cargo build -p murmur-cli --bin mur --features escape-probe` and pass it as \
+             `--mur`, or leave the route out with `--route shell-tool --route process-harness` \
+             (the record is then stamped PARTIAL RUN)."
         ),
     }
 }
@@ -1100,6 +1151,7 @@ mod tests {
             mur: PathBuf::from("/nonexistent/mur"),
             probe_driver: PathBuf::from("/nonexistent/probe-driver"),
             driver_artifact: PathBuf::from("/nonexistent/escape-conformance-driver-0.1.0.mur.zip"),
+            probe_guest_artifact: None,
             work_root: PathBuf::from("/tmp/escape-conformance-test"),
             timeout: Duration::from_secs(1),
             harness_interpreter: PathBuf::from("/usr/bin/python3"),
@@ -1275,6 +1327,22 @@ mod tests {
                 ),
                 PreflightCheck::ProbeFile,
             ),
+            (
+                preflight_outcome(
+                    "the probe wrote no verdict file; the tool call reported: case=preflight \
+                     tool=escape-conformance-probe-guest :: isError=false :: escape-probe request \
+                     not answered",
+                    ran(
+                        false,
+                        None,
+                        Some(
+                            "case=preflight tool=escape-conformance-probe-guest :: \
+                             isError=false :: escape-probe request not answered",
+                        ),
+                    ),
+                ),
+                PreflightCheck::ProbeGuestUnanswered,
+            ),
         ];
 
         for (outcome, expected) in &table {
@@ -1424,7 +1492,7 @@ mod tests {
         config.probe_driver = PathBuf::from("/opt/a build: tree/probe-driver");
 
         let mut profiles_seen = (false, false);
-        let mut routes_seen = (false, false);
+        let mut routes_seen = (false, false, false);
         let cases = std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases());
         for (case, route) in cases.flat_map(|case| case.routes().map(move |route| (case, route))) {
             match case.profile {
@@ -1434,6 +1502,7 @@ mod tests {
             match route {
                 Route::ShellTool => routes_seen.0 = true,
                 Route::ProcessHarness => routes_seen.1 = true,
+                Route::WasmGuest => routes_seen.2 = true,
             }
             let case_dir = case_dir(&config, case, route);
             let driver_log = driver_log_path(&case_dir);
@@ -1482,6 +1551,18 @@ mod tests {
                             && matches!(a.runtime, ArtifactRuntime::Driver)),
                     "case {id} at class {class}: the driver is not declared under artifacts:"
                 );
+                let guest_declared = manifest.artifacts.iter().any(|a| {
+                    a.name == probe_guest::PROBE_GUEST_ARTIFACT
+                        && a.version == probe_guest::PROBE_GUEST_VERSION
+                        && matches!(a.runtime, ArtifactRuntime::Tool)
+                });
+                assert_eq!(
+                    guest_declared,
+                    route == Route::WasmGuest,
+                    "case {id} at class {class} on {}: the probe guest is declared on the \
+                     wasm-guest route and only there",
+                    route.as_str()
+                );
 
                 let probe = ProbeConfig::from_json(
                     driver
@@ -1491,7 +1572,11 @@ mod tests {
                 )
                 .unwrap_or_else(|err| panic!("case {id} at class {class}: {err}"));
                 assert_eq!(probe.case, id);
-                assert_eq!(probe.tool, "python3");
+                let tool = match route {
+                    Route::WasmGuest => probe_guest::PROBE_GUEST_NAME,
+                    _ => "python3",
+                };
+                assert_eq!(probe.tool, tool);
                 assert_eq!(probe.script, probe::PROBE_SCRIPT);
                 assert_eq!(probe.log, driver_log.display().to_string());
                 assert_eq!(
@@ -1521,8 +1606,8 @@ mod tests {
         );
         assert_eq!(
             routes_seen,
-            (true, true),
-            "both routes must be generated, or one driver config goes unchecked"
+            (true, true, true),
+            "every route must be generated, or one driver config goes unchecked"
         );
     }
 

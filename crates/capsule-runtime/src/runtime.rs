@@ -2376,13 +2376,11 @@ fn refuse_undeclarable_runtime_pin(
     }
 }
 
-/// Resolves and verifies all artifacts, compiles components, and prepares session state.
-///
-/// This function is intentionally separate from `launch_session` so policy/capability
-/// checks can be layered in the seam between stage and launch without mixing concerns.
 /// The guest workers a capsule with `artifacts` starts at staging, one per guest kind it stages:
 /// tools for a staged WASM tool, driver for any `runtime: driver` artifact (the process driver
-/// included) or a script component, hooks for any hook. A skill runs no guest.
+/// included) or a script component, hooks for any hook. A skill runs no guest. The policy-side
+/// spelling of the same rule, over the manifest, is `CapabilityPolicy::guest_workers`
+/// (`capability_policy_from_runtime_manifest`); a change to one changes the other.
 fn guest_worker_kinds(
     artifacts: &[ArtifactRequest],
     has_script_component: bool,
@@ -2404,6 +2402,198 @@ fn guest_worker_kinds(
         }
     }
     kinds
+}
+
+/// The session's enforcement for its shell commands: the one staging resolved to spawn the guest
+/// workers, so the commands join the namespaces the workers run in, or a fresh one when staging
+/// started none, bounded by the session's cgroup scope and workdir guard and owning its runtime
+/// directory.
+///
+/// Its own frame, never inlined into `launch`: the intermediate enforcements this builds would
+/// otherwise stay on `launch`'s frame under the whole session, on an in-process launch's 2 MiB
+/// thread stack.
+#[inline(never)]
+fn session_enforcement(
+    staged: &mut StagedSession,
+    cgroup_scope: Option<Arc<cgroup::CgroupScope>>,
+    workdir_guard: Option<Arc<resources::WorkdirGuard>>,
+    runtime_dir_owner: &crate::runtime_dir::SharedRuntimeDir,
+) -> Result<sandbox::ShellEnforcement, RuntimeError> {
+    let resolved = match staged.staged_enforcement.take() {
+        Some(enforcement) => *enforcement,
+        None => sandbox::ShellEnforcement::resolve(
+            &staged.capability_policy,
+            &staged.containment,
+            staged.host_probe.clone(),
+        )
+        .map_err(RuntimeError::Runtime)?,
+    };
+    Ok(resolved
+        .with_host_bounding(cgroup_scope, workdir_guard)
+        .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()))
+        .with_temp_mapping(staged.temp_mapping))
+}
+
+/// What [`start_guest_workers`] reads out of staging besides the request: the staged grants and
+/// hooks each worker's closure is derived from, the worker kinds to start, and the inference
+/// driver to preload.
+struct WorkerStaging<'a> {
+    artifact_grants: &'a HashMap<String, ToolCapabilityGrant>,
+    hook_components: &'a [StagedHookArtifact],
+    has_script_component: bool,
+    kinds: &'a [crate::guest_worker::WorkerKind],
+    inference_driver: Option<(&'a str, &'a str)>,
+    tool_components: &'a HashMap<String, Component>,
+}
+
+/// Every guest worker this capsule needs, spawned through the enforcement every shell command
+/// takes, narrowed to the folders its guests are granted: the work folder, granted state stores,
+/// the runtime directory and `host_paths` roots for the tools worker (a script root's runtime
+/// directory for the driver worker), a hook's records `hooks/` folder for the hooks worker. Every
+/// kind is confined before any starts, so one started later in the session (the tools worker at a
+/// pulled tool's first call) is confined the same way. Returns the session's enforcement, which
+/// `launch_session` reuses for the shell commands.
+///
+/// Its own frame, never inlined into [`stage_session`]: an in-process launch stages on a thread
+/// whose stack is the default 2 MiB, which `stage_session` already comes close to.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn start_guest_workers(
+    workers: &Arc<crate::guest_worker::GuestWorkers>,
+    request: &StageRequest,
+    containment: &ContainmentDecision,
+    host_probe: &sandbox::HostProbe,
+    runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
+    temp_mapping: crate::temp_dir::TempMapping,
+    accessible_workdir: &Path,
+    staging: WorkerStaging<'_>,
+) -> Result<sandbox::ShellEnforcement, RuntimeError> {
+    let session_enforcement = sandbox::ShellEnforcement::resolve(
+        &request.capability_policy,
+        containment,
+        host_probe.clone(),
+    )
+    .map_err(RuntimeError::Runtime)?
+    .with_runtime_dir(runtime_dirs, None)
+    .with_temp_mapping(temp_mapping);
+    let worker_image = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| {
+            RuntimeError::GuestWorkerStart(format!(
+                "the guest workers could not be started: this program's own path is \
+                 unreadable: {error}"
+            ))
+        })?;
+    for (kind, closure) in worker_grant_closures(
+        &request.artifacts,
+        staging.artifact_grants,
+        staging.hook_components,
+        staging.has_script_component,
+    ) {
+        workers.confine(
+            kind,
+            crate::guest_worker::WorkerSandbox {
+                enforcement: session_enforcement.for_guest_worker(&closure, &worker_image),
+                workdir: accessible_workdir.to_path_buf(),
+            },
+        );
+    }
+    for kind in staging.kinds {
+        workers.start(*kind);
+    }
+    // Every worker started above has said hello, or the launch is refused.
+    workers.ready()?;
+    // The inference driver's first call is the launch's first model request: hand it to its
+    // worker now, beside the rest of the launch, rather than on that call.
+    if let Some(("http", driver)) = staging.inference_driver {
+        if let Some(component) = staging.tool_components.get(driver) {
+            workers.preload(crate::guest_worker::WorkerKind::Driver, driver, component);
+        }
+    }
+    Ok(session_enforcement)
+}
+
+/// The `transport: process` driver, described in its worker and checked: its required
+/// environment against `env.allow`, and its harness binary resolved, so a harness that is not
+/// installed refuses the launch before any hook or task runs rather than at the first turn. A
+/// refusal here removes the session's runtime directory and keeps its records directory, as every
+/// staging refusal past their creation does.
+///
+/// Its own frame, never inlined into [`stage_session`], and its describe future boxed, for the
+/// stack reason [`start_guest_workers`] gives.
+#[inline(never)]
+fn stage_process_driver(
+    guest_workers: Option<&Arc<crate::guest_worker::GuestWorkers>>,
+    engine: &Engine,
+    request: &StageRequest,
+    workdir: &Path,
+    call_deadlines: CallDeadlines,
+    name: String,
+    version: String,
+    component: Component,
+) -> Result<Arc<StagedProcessDriver>, RuntimeError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
+        })?;
+    let description = rt.block_on(Box::pin(async {
+        let mut driver = ProcessDriver::open(
+            guest_workers,
+            engine,
+            &component,
+            &name,
+            &version,
+            call_deadlines,
+        )
+        .await?;
+        driver.describe().await
+    }))?;
+    check_required_env(
+        &name,
+        &version,
+        &description,
+        &request.capability_policy.env_allow,
+    )?;
+    let (binary, binary_source) = resolve_harness_binary(
+        request
+            .inference
+            .as_ref()
+            .and_then(|inference| inference.command.as_deref()),
+        &description.binary,
+    )?;
+    // The harness's declared needs, resolved against the manifest and this host, right after
+    // `check_required_env` and before any session directory or spawn. A need the manifest does
+    // not allow refuses the launch with `E-CAP-021`, naming every one.
+    let resolved = crate::harness_needs::resolve_capsule_harness(
+        &format!("{name}@{version}"),
+        &description,
+        Some(&binary),
+        &request.capability_policy,
+        workdir,
+    );
+    let grants = resolved.grants;
+    let exec_files = resolved
+        .binary
+        .map(|info| info.exec_files())
+        .unwrap_or_else(|| vec![binary.clone()]);
+    if let Some(refusal) = grants.refusal {
+        return Err(refusal);
+    }
+    Ok(Arc::new(StagedProcessDriver {
+        name,
+        version,
+        component,
+        description,
+        binary,
+        binary_source,
+        harness_report: grants.report,
+        harness_grants: crate::sandbox::HarnessEnforcementGrants {
+            granted_paths: grants.granted_paths,
+            exec_files,
+        },
+    }))
 }
 
 /// Each guest worker kind's filesystem reach beyond the work folder: the union of the preopens
@@ -2475,6 +2665,10 @@ fn worker_grant_closures(
     ]
 }
 
+/// Resolves and verifies all artifacts, compiles components, and prepares session state.
+///
+/// This function is intentionally separate from `launch_session` so policy/capability
+/// checks can be layered in the seam between stage and launch without mixing concerns.
 pub fn stage_session(
     registry: Arc<dyn Registry>,
     mut request: StageRequest,
@@ -3408,6 +3602,14 @@ pub fn stage_session(
         )?;
     }
 
+    // A capsule that needs a cgroup scope is refused here, before any session folder is created
+    // or any guest worker is forked, on a host that cannot delegate one. Past this point this
+    // process is in the cgroup it stays in, so every child forked below is created in it.
+    if cgroup::requires_process_bounding(&request.capability_policy) {
+        cgroup::await_delegated_base()
+            .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+    }
+
     let accessible_workdir = if let Some(ref user_dir) = request.workdir {
         let user_dir = if user_dir.is_absolute() {
             user_dir.clone()
@@ -3538,133 +3740,43 @@ pub fn stage_session(
     // hooks worker. Every kind is confined before any starts, so one started later in the
     // session (the tools worker at a pulled tool's first call) is confined the same way.
     let staged_enforcement = match &guest_workers {
-        Some(workers) => {
-            let session_enforcement = sandbox::ShellEnforcement::resolve(
-                &request.capability_policy,
-                &containment,
-                host_probe.clone(),
-            )
-            .map_err(RuntimeError::Runtime)?
-            .with_runtime_dir(runtime_dirs.clone(), None)
-            .with_temp_mapping(temp_mapping);
-            let worker_image = std::env::current_exe()
-                .and_then(std::fs::canonicalize)
-                .map_err(|error| {
-                    RuntimeError::GuestWorkerStart(format!(
-                        "the guest workers could not be started: this program's own path is \
-                         unreadable: {error}"
-                    ))
-                })?;
-            for (kind, closure) in worker_grant_closures(
-                &request.artifacts,
-                &artifact_grants,
-                &hook_components,
+        Some(workers) => Some(Box::new(start_guest_workers(
+            workers,
+            &request,
+            &containment,
+            &host_probe,
+            runtime_dirs.clone(),
+            temp_mapping,
+            &accessible_workdir,
+            WorkerStaging {
+                artifact_grants: &artifact_grants,
+                hook_components: &hook_components,
                 has_script_component,
-            ) {
-                workers.confine(
-                    kind,
-                    crate::guest_worker::WorkerSandbox {
-                        enforcement: session_enforcement.for_guest_worker(&closure, &worker_image),
-                        workdir: accessible_workdir.clone(),
-                    },
-                );
-            }
-            // This process has moved into its scope before anything is forked, so the workers,
-            // their relays and the session namespace's holders are created in it.
-            if cgroup::requires_process_bounding(&request.capability_policy) {
-                cgroup::await_delegated_base();
-            }
-            for kind in &staged_worker_kinds {
-                workers.start(*kind);
-            }
-            // Every worker started above has said hello, or the launch is refused.
-            workers.ready()?;
-            // The inference driver's first call is the launch's first model request: hand it to
-            // its worker now, beside the rest of the launch, rather than on that call.
-            if let Some(("http", driver)) = inference_driver {
-                if let Some(component) = tool_components.get(driver) {
-                    workers.preload(crate::guest_worker::WorkerKind::Driver, driver, component);
-                }
-            }
-            Some(session_enforcement)
-        }
+                kinds: &staged_worker_kinds,
+                inference_driver,
+                tool_components: &tool_components,
+            },
+        )?)),
         None => None,
     };
 
     let staged_process_driver = match process_driver {
-        Some((name, version, component)) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
-                })?;
-            let description = rt.block_on(async {
-                let mut driver = ProcessDriver::open(
-                    guest_workers.as_ref(),
-                    &engine,
-                    &component,
-                    &name,
-                    &version,
-                    call_deadlines.clone(),
-                )
-                .await?;
-                driver.describe().await
-            })?;
-            check_required_env(
-                &name,
-                &version,
-                &description,
-                &request.capability_policy.env_allow,
-            )?;
-            // Resolved here rather than at the first run: a harness that is not installed is a
-            // launch the operator should be told about before any session directory exists.
-            let (binary, binary_source) = resolve_harness_binary(
-                request
-                    .inference
-                    .as_ref()
-                    .and_then(|inference| inference.command.as_deref()),
-                &description.binary,
-            )?;
-            // The harness's declared needs, resolved against the manifest and this host, right
-            // after `check_required_env` and before any session directory or spawn. A need the
-            // manifest does not allow refuses the launch with `E-CAP-021`, naming every one.
-            let resolved = crate::harness_needs::resolve_capsule_harness(
-                &format!("{name}@{version}"),
-                &description,
-                Some(&binary),
-                &request.capability_policy,
-                &runtime_dir_placement.workdir,
-            );
-            let grants = resolved.grants;
-            let exec_files = resolved
-                .binary
-                .map(|info| info.exec_files())
-                .unwrap_or_else(|| vec![binary.clone()]);
-            if let Some(refusal) = grants.refusal {
-                return Err(refusal);
-            }
-            Some(Arc::new(StagedProcessDriver {
-                name,
-                version,
-                component,
-                description,
-                binary,
-                binary_source,
-                harness_report: grants.report,
-                harness_grants: crate::sandbox::HarnessEnforcementGrants {
-                    granted_paths: grants.granted_paths,
-                    exec_files,
-                },
-            }))
-        }
+        Some((name, version, component)) => Some(stage_process_driver(
+            guest_workers.as_ref(),
+            &engine,
+            &request,
+            &runtime_dir_placement.workdir,
+            call_deadlines.clone(),
+            name,
+            version,
+            component,
+        )?),
         None => None,
     };
 
-    // Before `dispatch_stage` runs any on-stage hook: a
-    // machine ceiling that cannot be kept, or an artifact with a `gateway:` that does not say how
-    // its upstream takes the key (it could only be run by handing it the key), refuses the launch
-    // here rather than at its first call.
+    // Before `dispatch_stage` runs any on-stage hook: a machine ceiling that cannot be kept, or an
+    // artifact with a `gateway:` that does not say how its upstream takes the key (it could only
+    // be run by handing it the key), refuses the launch here rather than at its first call.
     if let Some(driver) = staged_process_driver.as_ref() {
         check_driver_meters_ceilings(
             driver,
@@ -4173,18 +4285,8 @@ fn launch(
             )
         });
 
-    let shell_enforcement = match staged.staged_enforcement.take() {
-        Some(enforcement) => enforcement,
-        None => sandbox::ShellEnforcement::resolve(
-            &staged.capability_policy,
-            &staged.containment,
-            staged.host_probe.clone(),
-        )
-        .map_err(RuntimeError::Runtime)?,
-    }
-    .with_host_bounding(cgroup_scope, workdir_guard)
-    .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()))
-    .with_temp_mapping(staged.temp_mapping);
+    let shell_enforcement =
+        session_enforcement(&mut staged, cgroup_scope, workdir_guard, &runtime_dir_owner)?;
     // The harness runs under the session's class plus its own granted paths and binary. Derived
     // once here, from the session's enforcement; a shell command keeps `shell_enforcement`
     // without these grants. A read-write grant overlapping the harness's own folder on a Landlock

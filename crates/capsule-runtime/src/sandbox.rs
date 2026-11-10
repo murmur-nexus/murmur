@@ -3621,9 +3621,10 @@ impl ShellEnforcement {
     ///   session; a guest call is bounded by its fuel, epoch deadline and wall bound instead, and
     ///   the worker by the session's cgroup scope. `RLIMIT_NOFILE`, `RLIMIT_FSIZE` and
     ///   `RLIMIT_CORE` apply as to a command.
-    /// - No cgroup join of its own: the worker's pid moves with `mur` into its scope
-    ///   (`cgroup::resolve_delegated_base_in_background_with`), no held-port observation, and no
-    ///   ownership of the runtime directory.
+    /// - No cgroup join of its own: staging forks the worker after `cgroup::await_delegated_base`
+    ///   has put `mur` in the cgroup it stays in, so the worker, its relay and the session
+    ///   namespace's holders inherit that cgroup. No held-port observation, and no ownership of
+    ///   the runtime directory.
     pub(crate) fn for_guest_worker(
         &self,
         closure: &WorkerGrantClosure,
@@ -5083,29 +5084,6 @@ mod linux_enforce {
         }
     }
 
-    /// Marks every file descriptor at or above [`super::FD_HYGIENE_FIRST_FD`] close-on-exec, so
-    /// the only descriptors that survive into the exec'd program are the ones the runtime
-    /// deliberately set up (stdio) rather than whatever happened to be open.
-    ///
-    /// `CLOSE_RANGE_CLOEXEC` sets the flag rather than closing the descriptors outright. That is
-    /// the required semantics here, not a softer variant of it: several fds in this range are
-    /// still needed *inside* this `pre_exec` window — the diagnostic pipe a failure further down
-    /// writes to, and the Landlock grant fds `apply_landlock_scope` builds rules from. Closing
-    /// them here would break the very enforcement setup that follows; flagging them means they
-    /// keep working until `execve`, which then closes them for us.
-    ///
-    /// The range starts at 3, never 0 — see [`super::FD_HYGIENE_FIRST_FD`] for the recorded
-    /// stdio decision and its reasoning.
-    ///
-    /// **Kernel range narrowing:** `close_range(2)` landed in Linux 5.9 and
-    /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
-    /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
-    /// so every spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
-    /// now fails rather than silently running without fd hygiene. That is deliberate and it is
-    /// this module's established fail-closed discipline (`drop_all_capabilities`,
-    /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
-    /// error rather than degrade), but it is a real, user-visible narrowing of the supported
-    /// kernel range for kernel-enforcement tiers.
     /// [`mark_inherited_fds_cloexec`] without `close_range`: `fcntl(F_SETFD, FD_CLOEXEC)` on every
     /// open descriptor from [`super::FD_HYGIENE_FIRST_FD`] below the soft `RLIMIT_NOFILE`, the
     /// highest number a descriptor can have. The same end state, one syscall pair per number.
@@ -5134,6 +5112,30 @@ mod linux_enforce {
         Ok(())
     }
 
+    /// Marks every file descriptor at or above [`super::FD_HYGIENE_FIRST_FD`] close-on-exec, so
+    /// the only descriptors that survive into the exec'd program are the ones the runtime
+    /// deliberately set up (stdio) rather than whatever happened to be open.
+    ///
+    /// `CLOSE_RANGE_CLOEXEC` sets the flag rather than closing the descriptors outright. That is
+    /// the required semantics here, not a softer variant of it: several fds in this range are
+    /// still needed *inside* this `pre_exec` window — the diagnostic pipe a failure further down
+    /// writes to, and the Landlock grant fds `apply_landlock_scope` builds rules from. Closing
+    /// them here would break the very enforcement setup that follows; flagging them means they
+    /// keep working until `execve`, which then closes them for us.
+    ///
+    /// The range starts at 3, never 0 — see [`super::FD_HYGIENE_FIRST_FD`] for the recorded
+    /// stdio decision and its reasoning.
+    ///
+    /// **Kernel range narrowing:** `close_range(2)` landed in Linux 5.9 and
+    /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
+    /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
+    /// so every spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
+    /// now fails rather than silently running without fd hygiene. That is deliberate and it is
+    /// this module's established fail-closed discipline (`drop_all_capabilities`,
+    /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
+    /// error rather than degrade), but it is a real, user-visible narrowing of the supported
+    /// kernel range for kernel-enforcement tiers. A guest worker's spawn falls back to
+    /// [`mark_inherited_fds_cloexec_one_by_one`] there instead.
     pub(super) fn mark_inherited_fds_cloexec() -> io::Result<()> {
         // SAFETY: this issues the `close_range` syscall directly through `libc::syscall`. The
         // three variadic arguments are all `c_uint` scalars and the kernel dereferences none of

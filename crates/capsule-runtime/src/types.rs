@@ -802,8 +802,9 @@ pub struct StagedSession {
     pub(crate) temp_mapping: crate::temp_dir::TempMapping,
     /// The session's enforcement as staging resolved it to spawn the guest workers, `None` when
     /// it started none. `launch_session` takes it instead of resolving another, so every command
-    /// joins the network and PID namespaces the workers already run in.
-    pub(crate) staged_enforcement: Option<crate::sandbox::ShellEnforcement>,
+    /// joins the network and PID namespaces the workers already run in. Boxed: a staged session
+    /// is moved by value through frames that an in-process launch keeps on a 2 MiB stack.
+    pub(crate) staged_enforcement: Option<Box<crate::sandbox::ShellEnforcement>>,
     /// The declared read-only surface, lowered and validated by `stage_session` — a malformed
     /// entry refuses the launch there rather than surfacing at the first call. Empty for every
     /// capsule that declared no `capabilities.filesystem.read_only`.
@@ -1083,6 +1084,8 @@ pub fn capability_policy_from_runtime_manifest(
 
     let resources = crate::resources::resolve(caps.and_then(|c| c.resources.as_ref()));
 
+    // The rule `runtime::guest_worker_kinds` applies to the staged artifacts, over the manifest
+    // (plus a pulled tool, which starts the tools worker at its first call); keep the two in step.
     let guest_workers = !install_tool.is_empty()
         || manifest.artifacts.iter().any(|artifact| {
             artifact.source.is_none()

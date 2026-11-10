@@ -1849,8 +1849,8 @@ This applies to **every** Linux capsule that can spawn a subprocess, including o
 unrestricted egress rather than none. There is no path that continues at reduced enforcement.
 
 A capsule can spawn a subprocess when `capabilities.shell.allow` or `capabilities.spawn.allow` is
-non-empty; a WASM tool runs programs through `murmur:process` only from `capabilities.shell.allow`.
-`mur run` checks at staging, before any artifact is pulled.
+non-empty, or when it has a WASM tool, driver or hook — any `runtime: tool`, `runtime: driver` or `runtime: hook` artifact, or a non-empty `capabilities.install.tool` — because each runs in a [guest worker](../concepts/guest-workers.md) process. Every agent capsule has a driver, so every agent
+capsule needs the namespace. `mur run` checks at staging, before any artifact is pulled.
 
 `mur run` and `mur doctor` print the same reason; for a capsule that can spawn a subprocess,
 `mur doctor` prints it as this error and exits `1`. `mur doctor` reports the answer as the
@@ -3933,7 +3933,7 @@ carries no host-layout coupling and fires no `W-SEC-009`.
 ### W-SEC-010 — No aggregate bound on the subprocess tree { #w-sec-010 }
 
 **Fires when:** the capsule can spawn a subprocess by any route
-(`capabilities.shell.allow` or `capabilities.spawn.allow`) and
+(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a WASM tool, driver or hook — any `runtime: tool`, `runtime: driver` or `runtime: hook` artifact, or a non-empty `capabilities.install.tool` — because each runs in a [guest worker](../concepts/guest-workers.md) process) and
 the host is not Linux — so no cgroup v2 scope can exist for its process tree.
 
 **Why it matters:** `capabilities.resources` bounds subprocesses with two independent mechanisms,

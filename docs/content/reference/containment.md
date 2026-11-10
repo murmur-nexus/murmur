@@ -185,8 +185,10 @@ launch records only `delegated` or `not-required`, because a refused launch writ
 report closes with the line saying `mur run` would refuse to launch with `E-RUN-012`.
 
 `mur doctor` prints a `Cgroup scope` block with the host's answer for every project, and fails the
-check — no `All checks passed.`, a `Fix:` line and exit status `1` — when the capsule declares
-`capabilities.shell.allow` or `capabilities.spawn.allow`, and the answer is `unavailable`.
+check — no `All checks passed.`, a `Fix:` line and exit status `1` — when the capsule can run a
+subprocess (`capabilities.shell.allow`, `capabilities.spawn.allow`, or any WASM tool, driver or
+hook, which runs in a [guest worker](../concepts/guest-workers.md) process) and the answer is
+`unavailable`.
 
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
@@ -1911,16 +1913,24 @@ which containment class a tier achieves, that a zero limit value is rejected.
 
 [`crates/capsule-runtime/escape-conformance`](https://github.com/murmur-nexus/murmur/tree/main/crates/capsule-runtime/escape-conformance)
 drives a real capsule through a registry of escape probes and grades each verdict against what the
-declared class promises. Build it with `mur` and run it from the repository root:
+declared class promises. Build it with a `mur` that carries the test-only `escape-probe` feature,
+and run it from the repository root:
 
 ```bash
-cargo build --release -p murmur-cli -p escape-conformance
-./target/release/escape-conformance --class sealed
+cargo build -p murmur-cli --bin mur --features escape-probe
+cargo build --release -p escape-conformance
+./target/release/escape-conformance --class sealed --mur target/debug/mur
 ```
 
+`escape-probe` gives a guest worker the host side the `wasm-guest` route needs (below). It compiles
+only in a profile with debug assertions: a release build with it fails, and the `escape-probe-absent`
+job in `.github/workflows/ci.yml` checks that the released `mur` and `mur-roost` carry none of it.
+A `mur` without the feature is refused at the `wasm-guest` route's preflight.
+
 `--class` takes `advisory`, `scoped` or `sealed` and is what the run is graded against.
-`--list-cases` prints the registry with each case's expectation per route, and `--help` lists the
-remaining options.
+`--route` runs one route's cases only and can be repeated; a run narrowed by `--route` or `--only`
+is stamped `PARTIAL RUN` and is not citable. `--list-cases` prints the registry with each case's
+expectation per route, and `--help` lists the remaining options.
 
 The `contained` job in `.github/workflows/ci.yml` runs it at `scoped` and at `sealed` on every pull
 request, after asserting that its runner reaches both classes, and uploads each record as the
@@ -1933,6 +1943,7 @@ the record:
 |---|---|---|
 | `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
 | `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime spawns under the session's class like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
+| `wasm-guest` | In the `tools` [guest worker](../concepts/guest-workers.md), as if a guest had escaped Wasmtime: the probe guest, a WASM tool, asks its worker to run the case, and the worker's host side makes the probe's host syscalls itself, under the enforcement the worker was spawned with. Every boundary case graded on its probe file runs on it, except `proc-self-cwd-reopen` (a worker's working directory is `/`, not the work folder) | The `advisory`, `scoped` and `sealed` expectations, as on `shell-tool` |
 
 An expectation is one of:
 
@@ -1960,13 +1971,14 @@ consulted, and the record is stamped not citable.
 
 The run needs:
 
-- a built `mur` binary;
+- a `mur` binary built with `--features escape-probe`;
 - `python3`;
 - a delegated cgroup v2 subtree — the harness wraps each capsule in
   `systemd-run --user --scope --property=Delegate=yes` by default to get one.
 
 It needs no registry access, model or API key: the harness carries its own process driver,
-`escape-conformance-driver`, and installs it into each case's project with `mur install`.
+`escape-conformance-driver`, and the probe guest, `escape-conformance-probe-guest`, and installs
+them into each case's project with `mur install`.
 
 The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) of the `HOME` the
 harness runs with: the harness resolves `~/.murmur/keys/record-seal.key` there, creating the key

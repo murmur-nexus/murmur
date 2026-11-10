@@ -77,6 +77,11 @@ zbus = { version = "6", default-features = false, features = ["default-rt"] }
 # allocators. Off by default: a normal build compiles neither the module nor the second
 # binary in `murmur-cli` that calls it.
 alloc-bench = []
+# Test-only: a guest worker answers the escape-conformance probe guest by running the case its
+# request names in the worker process (`src/guest_worker/escape_probe.rs`), which the gate's
+# `wasm-guest` route grades. Never in a release build: `src/lib.rs` refuses to compile it without
+# debug assertions, and `scripts/check-no-escape-probe.sh` checks the released binaries.
+escape-probe = []
 
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
