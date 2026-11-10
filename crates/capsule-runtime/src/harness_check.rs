@@ -318,6 +318,35 @@ mod tests {
         "/../murmur-cli/tests/fixtures/process-driver/tool/process-driver-no-login-check.wasm"
     ));
 
+    /// Sets process environment variables and puts each one back as it was when dropped, also
+    /// when the test panics.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl RestoreEnv {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(name, value)| {
+                    let old = std::env::var_os(name);
+                    std::env::set_var(name, value);
+                    (*name, old)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (name, old) in self.0.drain(..).rev() {
+                match old {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     fn policy() -> CapabilityPolicy {
         CapabilityPolicy {
             env_allow: vec!["HOME".to_string(), "FIXTURE_HARNESS_PROFILE".to_string()],
@@ -356,25 +385,34 @@ mod tests {
     /// a variable this process holds but the policy does not declare.
     #[test]
     fn harness_check_probes_run_with_the_harness_base_env() {
-        std::env::set_var("HOME", "/home/harness-check");
-        std::env::set_var("FIXTURE_HARNESS_PROFILE", "declared");
-        std::env::set_var("MURMUR_TEST_HARNESS_CHECK_UNDECLARED", "leak");
-        let env = harness_base_env(
-            &policy(),
-            &HostAccountEnv::from_pairs(&[("USER", "alice"), ("LOGNAME", "alice-login")]),
-        );
+        // The process environment is shared by every test thread, and `HOME` is read by many
+        // of them, so this test never changes it: the harness has to see the `HOME` this process
+        // already has. The other two names are read by no other test, and are put back once the
+        // map is built.
+        let home = std::env::var("HOME").expect("the test process has a HOME");
+        let env = {
+            let _restore = RestoreEnv::set(&[
+                ("FIXTURE_HARNESS_PROFILE", "declared"),
+                ("MURMUR_TEST_HARNESS_CHECK_UNDECLARED", "leak"),
+            ]);
+            harness_base_env(
+                &policy(),
+                &HostAccountEnv::from_pairs(&[("USER", "alice"), ("LOGNAME", "alice-login")]),
+            )
+        };
         let dir = TempDir::new().unwrap();
         let binary = harness(
             &dir,
-            r#"ok=no
+            &r#"ok=no
 if [ "${USER:-}" = alice ] && [ "${LOGNAME:-}" = alice-login ] \
-   && [ "${FIXTURE_HARNESS_PROFILE:-}" = declared ] && [ "${HOME:-}" = /home/harness-check ] \
+   && [ "${FIXTURE_HARNESS_PROFILE:-}" = declared ] && [ "${HOME:-}" = '@HOME@' ] \
    && [ -z "${MURMUR_TEST_HARNESS_CHECK_UNDECLARED:-}" ]; then ok=yes; fi
 if [ "$1" = auth ] && [ "$2" = status ]; then
   if [ $ok = yes ]; then echo '{"loggedIn": true}'; else echo '{"loggedIn": false}'; fi
   exit 0
 fi
-if [ $ok = yes ]; then echo "fixture-harness 1.0.0"; else echo "fixture-harness 0.0.1"; fi"#,
+if [ $ok = yes ]; then echo "fixture-harness 1.0.0"; else echo "fixture-harness 0.0.1"; fi"#
+                .replace("@HOME@", &home),
         );
 
         let found = check(DRIVER, &binary, &env, dir.path());
