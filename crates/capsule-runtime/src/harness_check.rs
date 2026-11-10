@@ -24,40 +24,6 @@ use crate::types::CapabilityPolicy;
 /// The longest reason, in characters, a [`HarnessLogin`] carries.
 pub const LOGIN_REASON_MAX_CHARS: usize = 200;
 
-/// The `PATH` a harness `#!` interpreter is resolved on, for the doctor and explain-scope checks:
-/// the runtime's own, as a real run resolves it.
-fn harness_path_env() -> String {
-    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
-}
-
-/// Owns the paths a [`crate::host_paths::HostPathContext`] borrows for a harness-needs check off a
-/// session: the `HOME` `mur` runs with, murmur's own home, and the work folder.
-struct HarnessContextHome {
-    home: Option<PathBuf>,
-    murmur_home: Option<PathBuf>,
-    workdir: PathBuf,
-}
-
-impl HarnessContextHome {
-    fn read(workdir: &Path) -> Self {
-        Self {
-            home: std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from),
-            murmur_home: crate::murmur_home::home_path().ok(),
-            workdir: workdir.to_path_buf(),
-        }
-    }
-
-    fn context(&self) -> crate::host_paths::HostPathContext<'_> {
-        crate::host_paths::HostPathContext {
-            home: self.home.as_deref(),
-            murmur_home: self.murmur_home.as_deref(),
-            workdir: &self.workdir,
-        }
-    }
-}
-
 /// The `harness` report `mur run --explain-scope` prints and `session_start.effective_grants`
 /// carries: the harness's needs resolved against the manifest and this host, read-only, with every
 /// need's status. A need the manifest does not allow is `refused` in the report rather than
@@ -105,23 +71,17 @@ pub fn harness_needs_report(
             Ok(description) => description,
             Err(error) => return unresolved(error.to_string()),
         };
-        let binary_info = crate::runtime::resolve_harness_binary(command, &description.binary)
+        let binary = crate::runtime::resolve_harness_binary(command, &description.binary)
             .ok()
-            .map(|(path, _)| crate::harness_needs::HarnessBinaryInfo {
-                interpreter: crate::harness_needs::resolve_interpreter(&path, &harness_path_env()),
-                path,
-            });
-        let context_home = HarnessContextHome::read(workdir);
-        crate::harness_needs::resolve_harness_grants(
+            .map(|(path, _)| path);
+        crate::harness_needs::resolve_capsule_harness(
             &driver_ref,
-            &description.harness_needs,
-            &policy.harness_paths,
-            &policy.network_allow,
-            &description.required_env,
-            &policy.env_allow,
-            binary_info.as_ref(),
-            &context_home.context(),
+            &description,
+            binary.as_deref(),
+            policy,
+            workdir,
         )
+        .grants
         .report
     })
 }
@@ -239,28 +199,14 @@ fn check_process_harness_wasm(
         // staging checks them — so `mur doctor` reports a disallowed need with `E-CAP-021` before
         // any probe runs. Resolved whether or not the binary did, since a need refusal does not
         // depend on the binary.
-        let binary_info =
-            resolved
-                .as_ref()
-                .ok()
-                .map(|(path, _)| crate::harness_needs::HarnessBinaryInfo {
-                    path: path.clone(),
-                    interpreter: crate::harness_needs::resolve_interpreter(
-                        path,
-                        &harness_path_env(),
-                    ),
-                });
-        let context_home = HarnessContextHome::read(cwd);
-        let grants = crate::harness_needs::resolve_harness_grants(
+        let grants = crate::harness_needs::resolve_capsule_harness(
             &format!("{name}@{version}"),
-            &description.harness_needs,
-            &policy.harness_paths,
-            &policy.network_allow,
-            &description.required_env,
-            &policy.env_allow,
-            binary_info.as_ref(),
-            &context_home.context(),
-        );
+            &description,
+            resolved.as_ref().ok().map(|(path, _)| path.as_path()),
+            policy,
+            cwd,
+        )
+        .grants;
         if let Some(refusal) = grants.refusal {
             return Err(refusal);
         }

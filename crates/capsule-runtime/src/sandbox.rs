@@ -2523,14 +2523,17 @@ pub(crate) struct ShellEnforcement {
 }
 
 /// What a `transport: process` harness is granted beyond every command: the host paths the
-/// manifest allowed its driver's needs, and the resolved harness binary (and `#!` interpreter).
-/// Passed to [`ShellEnforcement::with_harness_grants`], which derives the harness's enforcement.
+/// manifest allowed its driver's needs, and the files its `exec` runs — the resolved harness
+/// binary and, for a `#!` script, the program its first line names (and `<name>` of
+/// `#!/usr/bin/env <name>`). Passed to [`ShellEnforcement::with_harness_grants`], which derives the
+/// harness's enforcement.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct HarnessEnforcementGrants {
     pub(crate) granted_paths: Vec<crate::host_paths::HostPath>,
-    pub(crate) binary: PathBuf,
-    pub(crate) interpreter: Option<PathBuf>,
+    /// The binary first, then its `#!` launcher and interpreter
+    /// ([`crate::harness_needs::HarnessBinaryInfo::exec_files`]).
+    pub(crate) exec_files: Vec<PathBuf>,
 }
 
 impl ShellEnforcement {
@@ -2689,10 +2692,18 @@ impl ShellEnforcement {
         self.runtime_dir.as_ref().map(|roots| roots.runtime.path())
     }
 
-    /// The session's network namespace, shared, for the tool bridge to open its in-namespace
-    /// listener on.
-    pub(crate) fn session_netns(&self) -> Arc<crate::network_namespace::SessionNetns> {
-        Arc::clone(&self.session_netns)
+    /// The session's network namespace, shared, when a command spawned under this enforcement
+    /// runs inside it — every Linux kernel tier — for the tool bridge to serve the listener the
+    /// namespace creator opened there. `None` on `Unconfined` and `EnvironmentOnly`, where the
+    /// bridge binds the host loopback.
+    pub(crate) fn bridge_netns(&self) -> Option<Arc<crate::network_namespace::SessionNetns>> {
+        matches!(
+            self.tier,
+            EnforcementTier::KernelSealed
+                | EnforcementTier::KernelFull
+                | EnforcementTier::KernelSeccompOnly
+        )
+        .then(|| Arc::clone(&self.session_netns))
     }
 
     /// The session's records directory, held. `None` for an enforcement held outside a session.
@@ -2843,13 +2854,11 @@ impl ShellEnforcement {
             .extend(grants.granted_paths.iter().cloned());
         // The harness binary (and its `#!` interpreter) granted exactly as a `shell.allow` binary:
         // its file and `DT_NEEDED` closure as non-listable executable Landlock rules.
-        let exec_paths: Vec<PathBuf> = std::iter::once(grants.binary.clone())
-            .chain(grants.interpreter.clone())
-            .collect();
-        let closure = resolve_landlock_grants(&exec_paths);
+        let exec_paths = &grants.exec_files;
+        let closure = resolve_landlock_grants(exec_paths);
         // The sealed binds for the harness binary's and interpreter's own folders, so the
         // composed root carries them.
-        for file in &exec_paths {
+        for file in exec_paths {
             if let Some(dir) = file.parent() {
                 push_sealed_bind_dir(&mut enforcement.sealed_bind_dirs, dir.to_path_buf());
             }
@@ -11126,6 +11135,114 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             unix_sockets_allowed: policy.unix_sockets_allowed,
             landlock_grants,
             ..host_bounding_base()
+        }
+    }
+
+    /// The harness's enforcement is the session's plus exactly its grants: each granted path as a
+    /// host path (never executable), the binary and its `#!` interpreter as executable Landlock
+    /// grants with their folders in the sealed binds. The session's own enforcement, which every
+    /// shell command keeps, is unchanged.
+    #[test]
+    fn with_harness_grants_adds_the_paths_and_the_exec_files_and_nothing_else() {
+        let session = kernel_full_enforcement(EnforcementTier::KernelFull, &allow_only(&[]));
+        let granted = crate::host_paths::HostPath {
+            declared: "~/harness-state".to_string(),
+            path: PathBuf::from("/srv/harness-state"),
+            access: crate::host_paths::HostPathAccess::ReadWrite,
+            credential_locations: Vec::new(),
+        };
+        let bash = std::fs::canonicalize("/bin/bash").expect("bash is installed");
+        // A harness script outside the runtime paths every composed root already holds, so its
+        // folder is one the sealed root must bind.
+        let scratch =
+            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+                .unwrap();
+        let script = std::fs::canonicalize(scratch.path())
+            .unwrap()
+            .join("harness.sh");
+        std::fs::write(&script, "#!/bin/bash\n").unwrap();
+        let grants = HarnessEnforcementGrants {
+            granted_paths: vec![granted.clone()],
+            exec_files: vec![script.clone(), bash.clone()],
+        };
+        let harness = session.with_harness_grants(&grants).expect("no overlap");
+
+        assert_eq!(harness.host_paths.len(), session.host_paths.len() + 1);
+        assert_eq!(harness.host_paths.last(), Some(&granted));
+        let added: Vec<&LandlockGrant> = harness
+            .landlock_grants
+            .iter()
+            .skip(session.landlock_grants.len())
+            .collect();
+        assert!(
+            added
+                .iter()
+                .any(|grant| grant.path == bash && grant.executable),
+            "the harness binary is an executable grant: {added:?}"
+        );
+        assert!(
+            added.iter().all(|grant| !grant.list_dir),
+            "every exec grant is a non-listable file: {added:?}"
+        );
+        assert!(
+            added.iter().all(|grant| grant.path != granted.path),
+            "a granted path is never an executable Landlock grant: {added:?}"
+        );
+        assert!(
+            added
+                .iter()
+                .any(|grant| grant.path == script && grant.executable),
+            "the harness script is an executable grant: {added:?}"
+        );
+        assert!(
+            harness
+                .sealed_bind_dirs
+                .iter()
+                .any(|dir| Some(dir.as_path()) == script.parent()),
+            "{:?}",
+            harness.sealed_bind_dirs
+        );
+
+        // The session's enforcement — what every shell command gets — is untouched.
+        assert!(session.host_paths.iter().all(|path| path != &granted));
+        assert!(session
+            .landlock_grants
+            .iter()
+            .all(|grant| grant.path != bash));
+    }
+
+    /// No Landlock domain, nothing to add: an unconfined or environment-only harness gets the
+    /// session's enforcement as it is.
+    #[test]
+    fn with_harness_grants_adds_nothing_without_a_landlock_domain() {
+        let grants = HarnessEnforcementGrants {
+            granted_paths: vec![crate::host_paths::HostPath {
+                declared: "/srv/x".to_string(),
+                path: PathBuf::from("/srv/x"),
+                access: crate::host_paths::HostPathAccess::Read,
+                credential_locations: Vec::new(),
+            }],
+            exec_files: vec![PathBuf::from("/bin/sh")],
+        };
+        for tier in [
+            EnforcementTier::Unconfined,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            let session = ShellEnforcement {
+                tier,
+                ..host_bounding_base()
+            };
+            let harness = session.with_harness_grants(&grants).unwrap();
+            assert_eq!(
+                harness.host_paths.len(),
+                session.host_paths.len(),
+                "{tier:?}"
+            );
+            assert_eq!(
+                harness.landlock_grants.len(),
+                session.landlock_grants.len(),
+                "{tier:?}"
+            );
         }
     }
 

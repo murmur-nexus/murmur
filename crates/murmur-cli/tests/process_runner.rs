@@ -100,6 +100,9 @@ struct Built {
     shell: Vec<String>,
     /// `lifecycle.shell_grace_secs`.
     shell_grace_secs: Option<u64>,
+    /// A `HOME` outside `/tmp`, so the run's files directory under it is at its host path for a
+    /// harness on a contained class, whose `/tmp` is private.
+    home_off_tmp: bool,
 }
 
 impl Built {
@@ -115,6 +118,7 @@ impl Built {
             driver_wasm: fixture_wasm(),
             shell: Vec::new(),
             shell_grace_secs: None,
+            home_off_tmp: false,
         }
     }
 
@@ -145,6 +149,11 @@ impl Built {
         self
     }
 
+    fn home_off_tmp(mut self) -> Self {
+        self.home_off_tmp = true;
+        self
+    }
+
     fn shell_grace_secs(mut self, secs: u64) -> Self {
         self.shell_grace_secs = Some(secs);
         self
@@ -161,7 +170,11 @@ impl Built {
     }
 
     fn build(self) -> Capsule {
-        let home = TempDir::new().unwrap();
+        let home = if self.home_off_tmp {
+            common::scratch_off_tmp()
+        } else {
+            TempDir::new().unwrap()
+        };
         let artifacts = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
 
@@ -404,11 +417,13 @@ impl Run {
         found.remove(0)
     }
 
-    /// The pid a profile wrote for a test that has to prove it dead.
-    fn harness_pid(&self) -> i32 {
-        let path = common::find_file(&self.workdir, "harness.pid")
+    /// Panics unless the harness, which wrote its pid, and everything it started are gone within
+    /// `limit`. The pid was written from inside the session's PID namespace, so the proof is read
+    /// on the host: nothing runs in the harness's working directory any more.
+    fn assert_harness_dead_within(&self, limit: Duration) {
+        common::find_file(&self.workdir, "harness.pid")
             .unwrap_or_else(|| panic!("the profile wrote no harness.pid under {:?}", self.workdir));
-        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        common::assert_nothing_runs_in_within(&self.workdir, limit);
     }
 }
 
@@ -664,7 +679,7 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
         started.elapsed()
     );
     assert!(run.text.contains("E-RUN-035"), "{}", run.text);
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "inactivity");
     assert_eq!(exit["killed"], true);
@@ -702,7 +717,7 @@ fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
         "the grace kill should have ended it, took {:?}",
         started.elapsed()
     );
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "terminal");
     assert_eq!(exit["killed"], true);
@@ -781,7 +796,7 @@ fn late_lines_after_the_grace_are_never_read() {
     let capsule = Built::new().build();
     let run = capsule.run("late-after-grace", &[]).succeeded();
     assert_eq!(run.result(), "GRACE-RESULT");
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "terminal");
     assert_eq!(exit["killed"], true);
@@ -882,9 +897,12 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     println!("S7: the harness environment is the allowlist plus the plan's env-set, nothing else");
     // The `env` profile execs `env | cut | sort | tr` and `ls`; under the class the harness runs
     // them only when `capabilities.shell.allow` grants them.
+    // The harness lists its files directory under `HOME`, which on a contained class is reached
+    // at its host path only off `/tmp`.
     let capsule = Built::new()
         .with_tool()
         .shell(&["env", "cut", "sort", "tr", "ls"])
+        .home_off_tmp()
         .build();
     let run = capsule
         .run(
@@ -1014,7 +1032,7 @@ fn s9_a_turn_past_max_turns_kills_the_harness() {
     assert_eq!(failed["source"], "runtime");
     assert_eq!(run.of_type("inference").len(), 2);
     assert_eq!(run.one("harness_exit")["cause"], "max_turns");
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
 
     // The attempt's `Err` is named in the trace, before the task it ended.
     let task_failed = run.one("task_failed");

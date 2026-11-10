@@ -281,9 +281,14 @@ pub fn manifest_yaml(
     yaml
 }
 
+/// The file `probe-driver` writes its summary line to, in the capsule workdir: `probe-driver` is
+/// the capsule's harness and runs under the class under test, which lets it write the workdir and
+/// nothing else of the case directory.
+const DRIVER_LOG: &str = "probe-driver.txt";
+
 /// Where `probe-driver` writes its summary line for the case staged in `case_dir`.
 fn driver_log_path(case_dir: &Path) -> PathBuf {
-    case_dir.join("probe-driver.txt")
+    workdir_in(case_dir).join(DRIVER_LOG)
 }
 
 /// Stages one case's directory for `route` and returns `(capsule_workdir, manifest_path)`.
@@ -342,10 +347,11 @@ fn stage(
     Ok((workdir, manifest))
 }
 
-/// The workdir entries the harness staged for `case`, which the scratch cleanup keeps: the probe,
-/// its verdict file, the follow-up script and whatever [`Prepare`] wrote.
+/// The workdir entries the harness staged for `case` or grades it on, which the scratch cleanup
+/// keeps: the probe, its verdict file, the driver's summary, the follow-up script and whatever
+/// [`Prepare`] wrote.
 fn staged_names(case: &Case) -> Vec<&'static str> {
-    let mut names = vec![probe::PROBE_SCRIPT, probe::PROBE_FILE];
+    let mut names = vec![probe::PROBE_SCRIPT, probe::PROBE_FILE, DRIVER_LOG];
     if let Evidence::SecondSpawnRefused(_) = case.evidence {
         names.push(probe::SECOND_SCRIPT);
     }
@@ -834,8 +840,8 @@ pub fn preflight_hint(check: &PreflightCheck) -> String {
             format!(
                 "Failed check: {name}. The `probe-driver` harness never reported a tool result: \
                  {cause}. Check that `--probe-driver` names this build's `probe-driver`, read \
-                 `mur-stderr.txt` and `probe-driver.txt` in the case directory, and on a loaded \
-                 host raise `--timeout-secs`."
+                 `mur-stderr.txt` and `wd/probe-driver.txt` in the case directory, and on a \
+                 loaded host raise `--timeout-secs`."
             )
         }
         PreflightCheck::InterpreterExec => format!(

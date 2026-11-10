@@ -755,20 +755,11 @@ fn killing_the_hooks_worker_fails_the_task_and_ends_the_records() {
 fn killing_the_tools_worker_under_a_bridged_call_fails_the_task() {
     let home = Home::new();
     let project = TempDir::new().unwrap();
-    let harness = project.path().join("harness.sh");
-    fs::write(
-        &harness,
-        format!(
-            "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=bridge-call\nexport \
-             FIXTURE_BRIDGE_CALL_TOOL='stall-tool'\nexport FIXTURE_BRIDGE_CALL_ARGS='{{}}'\nexec \
-             '{}' \"$@\"\n",
-            common::fixture_path("process-driver/fake-harness").display()
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&harness).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&harness, perms).unwrap();
+    let harness = common::write_fake_harness(
+        &project.path().join("harness.sh"),
+        "export FIXTURE_HARNESS_PROFILE=bridge-call\nexport FIXTURE_BRIDGE_CALL_TOOL='stall-tool'\n\
+         export FIXTURE_BRIDGE_CALL_ARGS='{}'\n",
+    );
     let manifest = project.path().join("murmur.yaml");
     fs::write(
         &manifest,

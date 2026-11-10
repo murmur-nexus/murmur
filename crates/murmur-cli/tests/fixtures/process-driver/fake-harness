@@ -3,7 +3,10 @@
 # driver's toy line format (see ../README.md) and does whatever $FIXTURE_HARNESS_PROFILE says.
 #
 # Its environment is exactly what the capsule's `capabilities.env.allow` declared plus the driver's
-# `env-set`, so tests that use `sleep`, `ls` or `env` have to declare PATH.
+# `env-set`. It runs under the capsule's class, which lets it exec bash (its `#!` interpreter) and
+# whatever `capabilities.shell.allow` grants, so every profile but `env` and `account` uses bash
+# builtins alone; those two run `env`, `ls`, `cut`, `sort` and `tr`, which a test must declare PATH
+# for and allow.
 
 set -u
 
@@ -43,12 +46,23 @@ done
 # Profiles a test must prove dead leave their pid where the test can read it.
 record_pid() { echo $$ > harness.pid; }
 
+# A sleep with no program behind it: `read` times out on a pipe nothing writes to.
+pause() { read -r -t "$1" <> <(:) || true; }
+
+# The store's folder, made only when it is not there: `mkdir` is a program, which a capsule whose
+# test pre-creates the store does not have to allow.
+ensure_store() { [ -d "$SESSION_STORE" ] || mkdir -p "$SESSION_STORE"; }
+
 # The `memory` profiles keep one file per session here — the harness's own store, which is not
 # murmur's map and which a test deletes to make a resume fail.
 SESSION_STORE="${HOME:-.}/fake-harness-sessions"
 
 # Every task line this session has been told, on one line.
-recall() { tr '\n' ' ' < "$SESSION_STORE/$1"; }
+recall() {
+  local lines
+  mapfile -t lines < "$SESSION_STORE/$1"
+  printf '%s ' "${lines[@]}"
+}
 
 # A task that arrived over A2A is fenced, so the payload is several lines rather than one. Read to
 # the closing marker — which is already on stdin, so nothing here waits on the runtime, which keeps
@@ -110,6 +124,32 @@ call_bridge() {
   echo "${request//$'\n'/}"
 }
 
+# Whether a TCP connection to $1:$2 opens, over bash's /dev/tcp, within five seconds: OK, FAIL
+# (refused or unreachable) or TIMEOUT. The attempt runs in a subshell of its own, so a connect that
+# hangs is killed rather than holding the turn.
+try_connect() {
+  local out="connect-$1-$2.out" pid i
+  rm_builtin "$out"
+  ( { exec 3<>"/dev/tcp/$1/$2"; } 2>/dev/null && echo OK > "$out" || echo FAIL > "$out" ) &
+  pid=$!
+  for ((i = 0; i < 50; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    pause 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    echo TIMEOUT
+    return
+  fi
+  wait "$pid" 2>/dev/null
+  local result=""
+  [ -f "$out" ] && result="$(<"$out")"
+  echo "${result:-FAIL}"
+}
+
+# Empties a file with a redirection, `rm` being a program.
+rm_builtin() { : > "$1"; }
+
 # The task arrives as one line on stdin.
 read -r TASK || TASK=""
 
@@ -153,7 +193,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "usage in=5000 out=5000"
     echo "text SPENT"
     echo "end SPENT"
-    sleep 60
+    pause 60
     ;;
   tool)
     echo "started fixture-session-1"
@@ -187,14 +227,14 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
   silent)
     record_pid
     echo "started fixture-session-1"
-    sleep 600
+    pause 600
     ;;
   chatty)
     # Outlives the debug inactivity window several times over, saying something each time.
     echo "started fixture-session-1"
     for i in 1 2 3 4 5 6; do
       echo "note tick $i"
-      sleep 0.5
+      pause 0.5
     done
     echo "end CHATTY-RESULT"
     ;;
@@ -210,7 +250,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # one. Match them: taking the first advertised tool would mislabel the call for any capsule
     # declaring more than one.
     QUALIFIED="${FIXTURE_BRIDGE_TOOLS%%,*}"
-    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+    for candidate in ${FIXTURE_BRIDGE_TOOLS//,/ }; do
       case "$candidate" in
         *"__$CALL_TOOL") QUALIFIED="$candidate"; break ;;
       esac
@@ -235,7 +275,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # one closed turn; the third waits FIXTURE_STATUS_WAIT seconds first.
     echo "started fixture-session-1"
     QUALIFIED=""
-    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+    for candidate in ${FIXTURE_BRIDGE_TOOLS//,/ }; do
       case "$candidate" in
         *__session-status) QUALIFIED="$candidate" ;;
       esac
@@ -243,14 +283,14 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "usage in=40 out=20 cache-read=100 cache-creation=10"
     for i in 1 2 3; do
       if [ "$i" -eq 3 ]; then
-        sleep "${FIXTURE_STATUS_WAIT:-0}"
+        pause "${FIXTURE_STATUS_WAIT:-0}"
       fi
       echo "tool c$i $QUALIFIED {}"
       answer="$(call_bridge session-status '{}')"
       printf '%s\n' "$answer" > "status-$i.answer"
       echo "result c$i ok status $i"
       # The runtime closes the turn on the result line; give it the moment it takes to read it.
-      sleep 1
+      pause 1
       if [ "$i" -eq 1 ]; then
         echo "usage in=100 out=50"
       fi
@@ -276,7 +316,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # is a bash builtin: the shell tool's sandbox does not let it exec `/usr/bin/sleep`.
     echo "started fixture-session-1"
     BASH_TOOL="" ECHO_TOOL=""
-    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+    for candidate in ${FIXTURE_BRIDGE_TOOLS//,/ }; do
       case "$candidate" in
         *__bash) BASH_TOOL="$candidate" ;;
         *__echo-tool) ECHO_TOOL="$candidate" ;;
@@ -284,12 +324,12 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     done
     echo "tool c1 $BASH_TOOL {\"command\":\"read -t 8 <> <(:)\"}"
     ( call_bridge bash '{"command":"read -t 8 <> <(:)"}' > parallel-c1.answer ) &
-    sleep 0.5
+    pause 0.5
     echo "tool c2 $ECHO_TOOL {\"msg\":\"ping-7\"}"
     answer="$(call_bridge)"
     echo "result c2 ok $answer"
     wait
-    echo "result c1 ok $(cat parallel-c1.answer)"
+    echo "result c1 ok $(<parallel-c1.answer)"
     echo "end PARALLEL-RESULT"
     ;;
   bridge-busy)
@@ -298,7 +338,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping-7\"}"
     for i in 1 2 3 4 5 6; do
       answer="$(call_bridge)"
-      sleep 0.5
+      pause 0.5
     done
     echo "result c1 ok $answer"
     echo "end BRIDGE-BUSY-RESULT"
@@ -329,7 +369,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "result c2 ok two"
     record_pid
     echo "text three"
-    sleep 30
+    pause 30
     ;;
   thinking)
     # Thinking and deltas must not open a turn: one turn, one inference record.
@@ -363,7 +403,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
       else
         REPORTED="$SESSION"
       fi
-      mkdir -p "$SESSION_STORE"
+      ensure_store
       printf '%s\n' "$TASK" > "$SESSION_STORE/$REPORTED"
       echo "started $REPORTED"
       echo "end $(recall "$REPORTED")"
@@ -382,7 +422,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # lands after real output, on a session the harness will answer to again.
     record_pid
     unfence_task
-    mkdir -p "$SESSION_STORE"
+    ensure_store
     printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
     echo "started $SESSION"
     echo "text SLOW-PARTIAL"
@@ -394,7 +434,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # produced.
     record_pid
     unfence_task
-    mkdir -p "$SESSION_STORE"
+    ensure_store
     printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
     echo "started $SESSION"
     echo "thinking pondering the secret"
@@ -406,7 +446,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # tool is never reached: what the runtime saw is the call itself.
     record_pid
     unfence_task
-    mkdir -p "$SESSION_STORE"
+    ensure_store
     printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
     echo "started $SESSION"
     echo "tool c1 probe {}"
@@ -434,10 +474,10 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
       echo "end $PROMPT"
     else
       unfence_task
-      mkdir -p "$SESSION_STORE"
+      ensure_store
       echo "started $SESSION"
       QUALIFIED="call-member"
-      for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+      for candidate in ${FIXTURE_BRIDGE_TOOLS//,/ }; do
         case "$candidate" in
           *"__call-member") QUALIFIED="$candidate"; break ;;
         esac
@@ -532,14 +572,14 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # the runtime has to kill it.
     record_pid
     echo "started fixture-session-1"
-    sleep 600
+    pause 600
     ;;
   interrupt-signal)
     # Stops on SIGINT, reporting the turn as canceled before it goes.
     record_pid
     echo "started fixture-session-1"
     trap 'echo "fail canceled interrupted by SIGINT"; kill $SLEEP_PID 2>/dev/null; exit 0' INT
-    sleep 600 &
+    pause 600 &
     SLEEP_PID=$!
     wait $SLEEP_PID
     ;;
@@ -548,7 +588,78 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     record_pid
     echo "started fixture-session-1"
     echo "end LINGER"
-    sleep 60
+    pause 60
+    ;;
+  confinement)
+    # What the kernel says this process runs under, into a work-folder file and the answer:
+    # seccomp mode, no_new_privs, its pid namespace view, and its network and pid namespaces.
+    # `readlink` is a program, so a test running this profile allows it. The listing of
+    # $FIXTURE_UNGRANTED, a folder of the host home no grant names, is a glob: empty when the
+    # folder is absent or cannot be listed.
+    echo "started fixture-session-1"
+    {
+      while IFS= read -r line; do
+        case "$line" in
+          Seccomp:*|NoNewPrivs:*|NSpid:*) echo "$line" ;;
+        esac
+      done < /proc/self/status
+      echo "net $(readlink /proc/self/ns/net)"
+      echo "pid $(readlink /proc/self/ns/pid)"
+      if [ -n "${FIXTURE_UNGRANTED:-}" ]; then
+        listing=$(compgen -G "$FIXTURE_UNGRANTED/*")
+        echo "ungranted-listing ${listing:-<none>}"
+      fi
+    } > confinement.txt
+    answer=""
+    while IFS= read -r line; do answer="$answer$line; "; done < confinement.txt
+    echo "text $answer"
+    echo "end $answer"
+    ;;
+  escape)
+    # A harness doing its own work, with no bridge: reads a file outside the work folder and
+    # every grant (with `cat`, which a test allows), and connects to 1.1.1.1:80 and to a listener
+    # on the host's loopback. Each outcome goes into escape.txt and the answer.
+    echo "started fixture-session-1"
+    if content=$(cat "$FIXTURE_SENTINEL" 2>/dev/null); then
+      read_result="OK $content"
+    else
+      read_result="FAIL"
+    fi
+    {
+      echo "read $read_result"
+      echo "tcp-1.1.1.1 $(try_connect 1.1.1.1 80)"
+      echo "tcp-host $(try_connect 127.0.0.1 "$FIXTURE_HOST_PORT")"
+    } > escape.txt
+    answer=""
+    while IFS= read -r line; do answer="$answer$line; "; done < escape.txt
+    echo "text $answer"
+    echo "end $answer"
+    ;;
+  parent-write)
+    # Writes one file in the declared ~/fixture-harness-parent/sessions and one beside it in the
+    # parent the manifest granted; the answer says which writes held.
+    echo "started fixture-session-1"
+    parent="$HOME/fixture-harness-parent"
+    if { : > "$parent/sessions/written"; } 2>/dev/null; then inside=OK; else inside=FAIL; fi
+    if { : > "$parent/sibling-written"; } 2>/dev/null; then sibling=OK; else sibling=FAIL; fi
+    echo "text sessions=$inside sibling=$sibling"
+    echo "end sessions=$inside sibling=$sibling"
+    ;;
+  bridge-hold)
+    # Records the bridge URL it was handed in bridge-url.txt, makes one bridged call, writes its
+    # answer to bridge-answer.txt, and holds the turn until the test creates `go` in the work
+    # folder (sixty seconds at most), so a test can probe the URL's address from the host while
+    # the bridge is serving.
+    echo "started fixture-session-1"
+    answer="$(call_bridge)"
+    printf '%s' "$answer" > bridge-answer.txt
+    printf '%s' "$FIXTURE_BRIDGE_URL" > bridge-url.txt
+    for ((i = 0; i < 600; i++)); do
+      [ -e go ] && break
+      pause 0.1
+    done
+    echo "text $answer"
+    echo "end $answer"
     ;;
   quota)
     # Two quota reports, each followed by a `session-status` call through the bridge whose answer
@@ -557,7 +668,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # read the report; it is the bash builtin, so no PATH is needed.
     echo "started fixture-session-1"
     QUALIFIED=""
-    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+    for candidate in ${FIXTURE_BRIDGE_TOOLS//,/ }; do
       case "$candidate" in
         *__session-status) QUALIFIED="$candidate" ;;
       esac

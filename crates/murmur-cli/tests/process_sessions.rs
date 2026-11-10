@@ -54,10 +54,10 @@ struct Capsule {
     _artifacts: TempDir,
     bin_dir: PathBuf,
     manifest: PathBuf,
-    /// The file `fixture-cli` reads its profile from. Rewritten between two tasks of one capsule
-    /// life, which is how a cancelled task and the task that recovers from it run different
-    /// profiles against the same door.
-    profile_file: PathBuf,
+    /// `fixture-cli`, the harness script. Rewritten with another profile between two tasks of one
+    /// capsule life, which is how a cancelled task and the task that recovers from it run
+    /// different profiles against the same door.
+    harness: PathBuf,
 }
 
 struct Built {
@@ -115,7 +115,9 @@ impl Built {
     }
 
     fn build(self) -> Capsule {
-        let home = TempDir::new().unwrap();
+        // The fake harness keeps its session memory in `~/fake-harness-sessions`, which the needs
+        // build declares and the manifest grants: a `HOME` off `/tmp`, holding the folder.
+        let home = common::harness_needs_home();
         let artifacts = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
 
@@ -123,33 +125,18 @@ impl Built {
             artifacts.path(),
             DRIVER,
             DRIVER_VERSION,
-            &common::fixture_path("process-driver/tool/process-driver.wasm"),
+            &common::process_driver_needs_wasm(),
             "",
         );
         common::publish_local(&home, &driver).success();
 
         // Only this capsule's `PATH` points here, so `fixture-cli` is the fake harness and
-        // nothing else on the host is. It is a wrapper that reads the profile out of a file and
-        // execs the fixture script, so the profile belongs to this capsule and can change while
-        // it runs.
+        // nothing else on the host is. Its profile is baked in and rewritten by `set_profile`, so
+        // the profile belongs to this capsule and can change while it runs.
         let bin_dir = project.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        let script = project.path().join("fake-harness");
-        fs::copy(common::fixture_path("process-driver/fake-harness"), &script).unwrap();
-        make_executable(&script);
-        let profile_file = project.path().join("profile");
-        fs::write(&profile_file, "happy").unwrap();
-        let wrapper = bin_dir.join("fixture-cli");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=\"$(cat {})\"\nexec {} \"$@\"\n",
-                profile_file.display(),
-                script.display()
-            ),
-        )
-        .unwrap();
-        make_executable(&wrapper);
+        let harness =
+            common::write_fake_harness(&bin_dir.join("fixture-cli"), &harness_exports("happy"));
 
         let acceptance = if self.queue {
             "  task_acceptance: queue\n  after_task: sleep\n"
@@ -174,8 +161,11 @@ impl Built {
                  version: {DRIVER_VERSION}\n    runtime: driver\n{hooks}\
                  lifecycle:\n{acceptance}{conversation}{context}\
                  capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
+                 {grant}  network:\n    allow: [{host}]\n\
                  inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n\
                  {inference_extra}{trailer}",
+                grant = common::HARNESS_NEEDS_PATHS_GRANT,
+                host = common::HARNESS_NEEDS_HOST,
                 hooks = self.hooks,
                 inference_extra = self.inference_extra,
                 trailer = self.trailer,
@@ -189,15 +179,14 @@ impl Built {
             _artifacts: artifacts,
             bin_dir,
             manifest,
-            profile_file,
+            harness,
         }
     }
 }
 
-fn make_executable(path: &Path) {
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(path, perms).unwrap();
+/// The lines baked into `fixture-cli` ahead of the fake harness's body for `profile`.
+fn harness_exports(profile: &str) -> String {
+    format!("export FIXTURE_HARNESS_PROFILE={profile}\n")
 }
 
 /// One `mur run` that ran a task and exited.
@@ -221,7 +210,7 @@ impl Capsule {
 
     /// Which profile the fake harness runs under from here on.
     fn set_profile(&self, profile: &str) {
-        fs::write(&self.profile_file, profile).unwrap();
+        common::write_fake_harness(&self.harness, &harness_exports(profile));
     }
 
     fn mur(&self, profile: &str) -> Command {
@@ -911,12 +900,13 @@ fn a_session_the_harness_lost_fails_the_turn_and_keeps_failing() {
     capsule.task("memory", "ctx_lost", SECRET_TASK).succeeded();
     let established = capsule.stored_session("ctx_lost");
 
-    // The harness's own store, not murmur's map: the conversation is gone, the id is not.
+    // The harness's own store, not murmur's map: the conversation is gone, the id is not. The
+    // folder stays, emptied: it is the granted harness need, which a run grants only while it
+    // exists.
     let store = capsule.harness_store();
     for entry in fs::read_dir(&store).unwrap().filter_map(Result::ok) {
         fs::remove_file(entry.path()).unwrap();
     }
-    fs::remove_dir(&store).unwrap();
 
     let failed = capsule.task("memory", "ctx_lost", RECALL_TASK).failed();
     let map_path = capsule.map_file("ctx_lost").display().to_string();
@@ -940,8 +930,9 @@ fn a_session_the_harness_lost_fails_the_turn_and_keeps_failing() {
         established,
         "the id is left exactly as it was"
     );
-    assert!(
-        !store.exists(),
+    assert_eq!(
+        fs::read_dir(&store).unwrap().count(),
+        0,
         "a failed resume must not quietly start a new conversation"
     );
 
@@ -1267,13 +1258,13 @@ fn a_refusal_before_any_output_stays_a_refusal_and_remembers_nothing() {
 
 // ── S11: forgetting a harness session ─────────────────────────────────────────
 
-/// Delete the harness's own store, leaving murmur's map naming a session nothing answers to.
+/// Empty the harness's own store, leaving murmur's map naming a session nothing answers to. The
+/// folder stays: it is the granted harness need, which a run grants only while it exists.
 fn brick_the_harness(capsule: &Capsule) {
     let store = capsule.harness_store();
     for entry in fs::read_dir(&store).unwrap().filter_map(Result::ok) {
         fs::remove_file(entry.path()).unwrap();
     }
-    fs::remove_dir(&store).unwrap();
 }
 
 #[test]
@@ -1458,8 +1449,7 @@ fn http_capsule() -> Capsule {
 
     let bin_dir = project.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    let profile_file = project.path().join("profile");
-    fs::write(&profile_file, "happy").unwrap();
+    let harness = bin_dir.join("fixture-cli");
 
     let manifest = project.path().join("murmur.yaml");
     fs::write(
@@ -1481,7 +1471,7 @@ fn http_capsule() -> Capsule {
         _artifacts: artifacts,
         bin_dir,
         manifest,
-        profile_file,
+        harness,
     }
 }
 

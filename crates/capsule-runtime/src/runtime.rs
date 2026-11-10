@@ -2322,48 +2322,6 @@ pub(crate) fn resolve_harness_binary(
     Ok((absolute, source.to_string()))
 }
 
-/// The `PATH` a harness `#!` interpreter is resolved on: the runtime's own, since the harness is
-/// spawned with the operator's environment on an unconfined session and an `env.allow`-derived one
-/// otherwise, both of which carry the host `PATH` when the manifest declares it.
-fn harness_path_env() -> String {
-    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
-}
-
-/// The [`crate::host_paths::HostPathContext`] a granted harness path is checked against, on exactly
-/// an operator `host_paths` entry's terms: the `HOME` `mur` runs with, murmur's own home, and the
-/// session's work folder root.
-fn harness_host_path_context(workdir: &Path) -> HarnessHostPathHome<'_> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from);
-    let murmur_home = crate::murmur_home::home_path().ok();
-    HarnessHostPathHome {
-        home,
-        murmur_home,
-        workdir: workdir.to_path_buf(),
-        _marker: std::marker::PhantomData,
-    }
-}
-
-/// Owns the paths a [`crate::host_paths::HostPathContext`] borrows, so the context can be built
-/// from them at the call site.
-struct HarnessHostPathHome<'a> {
-    home: Option<PathBuf>,
-    murmur_home: Option<PathBuf>,
-    workdir: PathBuf,
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-impl HarnessHostPathHome<'_> {
-    fn context(&self) -> crate::host_paths::HostPathContext<'_> {
-        crate::host_paths::HostPathContext {
-            home: self.home.as_deref(),
-            murmur_home: self.murmur_home.as_deref(),
-            workdir: &self.workdir,
-        }
-    }
-}
-
 /// The manifest text that declares a `manage.pull()` pin in a role only an operator-declared pin
 /// may carry — `runtime: hook`, `runtime: driver`, a `gateway:` block, or
 /// `inference.system_prompt_artifact` naming a skill — or `None` when the entry asks only for
@@ -3308,24 +3266,18 @@ pub fn stage_session(
             // The harness's declared needs, resolved against the manifest and this host, right
             // after `check_required_env` and before any session directory or spawn. A need the
             // manifest does not allow refuses the launch with `E-CAP-021`, naming every one.
-            let driver_ref = format!("{name}@{version}");
-            let interpreter =
-                crate::harness_needs::resolve_interpreter(&binary, &harness_path_env());
-            let binary_info = crate::harness_needs::HarnessBinaryInfo {
-                path: binary.clone(),
-                interpreter: interpreter.clone(),
-            };
-            let context_home = harness_host_path_context(&runtime_dir_placement.workdir);
-            let grants = crate::harness_needs::resolve_harness_grants(
-                &driver_ref,
-                &description.harness_needs,
-                &request.capability_policy.harness_paths,
-                &request.capability_policy.network_allow,
-                &description.required_env,
-                &request.capability_policy.env_allow,
-                Some(&binary_info),
-                &context_home.context(),
+            let resolved = crate::harness_needs::resolve_capsule_harness(
+                &format!("{name}@{version}"),
+                &description,
+                Some(&binary),
+                &request.capability_policy,
+                &runtime_dir_placement.workdir,
             );
+            let grants = resolved.grants;
+            let exec_files = resolved
+                .binary
+                .map(|info| info.exec_files())
+                .unwrap_or_else(|| vec![binary.clone()]);
             if let Some(refusal) = grants.refusal {
                 return Err(refusal);
             }
@@ -3339,8 +3291,7 @@ pub fn stage_session(
                 harness_report: grants.report,
                 harness_grants: crate::sandbox::HarnessEnforcementGrants {
                     granted_paths: grants.granted_paths,
-                    binary: binary_info.path,
-                    interpreter,
+                    exec_files,
                 },
             }))
         }
@@ -24262,8 +24213,7 @@ inference:
             ),
             harness_grants: crate::sandbox::HarnessEnforcementGrants {
                 granted_paths: Vec::new(),
-                binary: binary.to_path_buf(),
-                interpreter: None,
+                exec_files: vec![binary.to_path_buf()],
             },
         })
     }

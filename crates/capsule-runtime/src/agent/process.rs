@@ -121,12 +121,12 @@ const FILES_DIR_TOKEN: &str = "{files_dir}";
 /// It carries no `[Capsule]` header, unlike the http transport's
 /// `agent::build_augmented_system_prompt`: on this transport murmur does not render the prompt at
 /// all — it hands the driver one string and the harness frames everything around it. The facts
-/// of a process session carry the per-command limits: the harness runs under the session's
-/// rlimits like every command, and so do the commands it runs itself; the runtime only never
-/// moves one of them to the background on a clock. The value must stay launch-invariant, for the
-/// same prompt caching reason as the
-/// http path: it goes at the head of the prompt, and every provider matches its cache on an exact
-/// prefix, so a per-launch value here would miss the cache on every request.
+/// of a process session carry the per-command limits: the harness and every command it runs
+/// itself run under the session's rlimits. They carry no shell grace, because the runtime never
+/// moves a harness's command to the background on a clock. The value must stay launch-invariant,
+/// for the same prompt caching reason as the http path: it goes at the head of the prompt, and
+/// every provider matches its cache on an exact prefix, so a per-launch value here would miss the
+/// cache on every request.
 pub(super) fn build_process_system_prompt(
     system_prompt: Option<&str>,
     facts: &CapsuleFacts,
@@ -926,7 +926,9 @@ async fn run_attempt(
     // runs one attempt of one task and writes neither.
     otel.begin_session(None);
 
-    let outcome = run_harness(
+    // Boxed: the harness run's future is large, and an in-process launch drives it on whatever
+    // stack the caller's thread has.
+    let outcome = Box::pin(run_harness(
         store_state,
         &staged,
         inference,
@@ -941,7 +943,7 @@ async fn run_attempt(
         a2a,
         continuation,
         carried_session,
-    )
+    ))
     .await;
 
     // The attempt's own terminal outcome, not a coarse ok/failed: a cancelled attempt closes its
@@ -1031,9 +1033,15 @@ async fn run_harness(
     let session_netns = store_state
         .harness_enforcement
         .as_ref()
-        .map(|enforcement| enforcement.session_netns());
-    let bridge =
-        claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory, session_netns.as_deref()).await;
+        .and_then(|enforcement| enforcement.bridge_netns());
+    let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory, session_netns.as_deref())
+        .await
+        .map_err(|reason| {
+            RuntimeError::AgentLoopFailed(format!(
+                "process harness '{}': {reason}",
+                description.harness
+            ))
+        })?;
 
     // A continued attempt's prompt is its continuation alone: the resumed session already holds
     // the task. Otherwise it is the runtime directory's task.md. Either is fenced on the same
@@ -1166,7 +1174,7 @@ async fn run_harness(
         a2a,
         store_state.gateways.clone(),
     );
-    let outcome = drive_harness(
+    let outcome = Box::pin(drive_harness(
         store_state,
         staged,
         bridge.as_ref(),
@@ -1181,7 +1189,7 @@ async fn run_harness(
         trace,
         otel,
         cancel,
-    )
+    ))
     .await;
     *carried_session = sink.finish(trace).await;
     outcome
@@ -2262,14 +2270,15 @@ mod tests {
         let prompt = build_process_system_prompt(None, &facts, Some("murmur.yaml"));
         // A process harness runs under the session's per-command memory, so the facts state it;
         // with no turn or token limit, that is the whole of the limits line.
-        assert!(
-            prompt
-                .lines()
-                .any(|line| line.starts_with("Limits: ") && line.contains("memory per command")),
+        let limits: Vec<&str> = prompt
+            .lines()
+            .filter(|line| line.starts_with("Limits: "))
+            .collect();
+        assert_eq!(
+            limits,
+            ["Limits: 2 GiB memory per command."],
             "got:\n{prompt}"
         );
-        assert!(!prompt.contains("Limits: ."), "got:\n{prompt}");
-        assert!(!prompt.contains("turns"), "got:\n{prompt}");
     }
 
     #[test]
@@ -2608,6 +2617,7 @@ mod tests {
         let inventory = vec![json!({"name": "echo-tool", "parameters": {"type": "object"}})];
         let handle = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory, None)
             .await
+            .expect("the bridge binds")
             .expect("the bridge binds when tools are declared");
         let request = build_launch_request(
             &process_inference("m", None),

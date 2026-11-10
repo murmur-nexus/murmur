@@ -155,10 +155,12 @@ pub enum CreationStep {
     PidNamespace = 9,
     /// Forking the PID namespace's first process, the holder, failed.
     Holder = 10,
+    /// Binding the tool bridge's listener on the namespace's `127.0.0.1` failed.
+    BridgeListener = 11,
 }
 
 impl CreationStep {
-    const ALL: [CreationStep; 10] = [
+    const ALL: [CreationStep; 11] = [
         Self::Unshare,
         Self::IdentityMaps,
         Self::Loopback,
@@ -169,6 +171,7 @@ impl CreationStep {
         Self::HandOff,
         Self::PidNamespace,
         Self::Holder,
+        Self::BridgeListener,
     ];
 
     /// The step a failure record's code names, or `None` for a code no step carries.
@@ -192,6 +195,7 @@ impl CreationStep {
             Self::HandOff => "handing the namespace to the runtime",
             Self::PidNamespace => "unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)",
             Self::Holder => "forking the PID namespace's holder process",
+            Self::BridgeListener => "binding the tool bridge's TCP listener inside the namespace",
         }
     }
 }
@@ -382,6 +386,7 @@ fn step_context(step: CreationStep) -> Option<&'static str> {
         ),
         CreationStep::TcpListener
         | CreationStep::Resolver
+        | CreationStep::BridgeListener
         | CreationStep::NamespaceHandles
         | CreationStep::HandOff => {
             Some("The namespace was created and configured, and handing it to the runtime failed.")
@@ -1318,7 +1323,7 @@ mod linux {
             // never serves it: it is sent after the egress sockets and taken off before them.
             let bridge = bind_bridge_listener();
             if bridge < 0 {
-                let failure = CreationFailure::at(CreationStep::Resolver);
+                let failure = CreationFailure::at(CreationStep::BridgeListener);
                 close_all(&fds[..count]);
                 return Err(failure);
             }

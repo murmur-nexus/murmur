@@ -79,7 +79,7 @@ capabilities:
       - HOME
       - PATH
   resources:
-    memory_bytes: 2147483648   # a Claude Code turn runs under this RLIMIT_AS; 2 GiB is enough
+    memory_bytes: 2147483648   # the RLIMIT_AS the harness runs under; raise it if a turn fails to start
 
 inference:
   transport: process
@@ -92,7 +92,7 @@ lifecycle:
   conversation: threaded
 ```
 
-The harness runs under the capsule's class. A process driver built against `murmur:driver@0.6.0` declares what its harness needs beyond that — Claude Code's install folder, its config and login folder, and its inference host — and the manifest grants the matching directories under [`capabilities.harness.paths`](../reference/manifest.md#capabilities-harness) and the host under `capabilities.network.allow`. The driver release that declares those needs arrives with the next `murmur/driver-claude-code`; until then, pin the version your store holds and run `--containment advisory`, or grant the harness what it asks for once the needs-declaring release is published and `mur run --explain-scope` names each need. Leave `inference.model` out to run on whatever model your subscription defaults to.
+The harness runs under the capsule's class. A process driver built against `murmur:driver@0.6.0` declares what its harness needs beyond that — Claude Code's install folder, its config and login folder, and its inference host — and the manifest grants the matching directories under [`capabilities.harness.paths`](../reference/manifest.md#capabilities-harness) and the host under `capabilities.network.allow`. `mur run` refuses a process driver built against an earlier `murmur:driver` version with [`E-WIT-LEVEL-001`](../reference/diagnostics.md#e-wit-level-001) at every containment class, so install a `murmur/driver-claude-code` release built against `0.6.0`, then run `mur run --explain-scope` to see each need it declares and grant it. Leave `inference.model` out to run on whatever model your subscription defaults to.
 
 Create an `instructions.md` file next to it with the agent's instructions. That file is the whole of what the agent is told about its job.
 

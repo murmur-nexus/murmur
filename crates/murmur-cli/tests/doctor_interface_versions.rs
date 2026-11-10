@@ -220,7 +220,7 @@ fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
     .success();
 
     let built = fs::read_to_string(sidecar_path(&home, "local/built-tool", "0.1.0")).unwrap();
-    assert!(built.contains("\"built_at_level\": 5"), "{built}");
+    assert!(built.contains("\"built_at_level\": 6"), "{built}");
     let derived = fs::read_to_string(sidecar_path(&home, "local/current-tool", "0.1.0")).unwrap();
     assert!(derived.contains("wit_contracts"), "{derived}");
     assert!(!derived.contains("built_at_level"), "{derived}");
@@ -243,10 +243,10 @@ fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
         );
     }
     for (reference, built_at) in [
-        ("local/built-tool@0.1.0", "built at 5 "),
-        ("local/current-tool@0.1.0", "built at 5 (derived)"),
-        ("local/payload-tool@0.1.0", "built at 5 (derived)"),
-        ("local/current-skill@0.1.0", "built at 5 (derived)"),
+        ("local/built-tool@0.1.0", "built at 6 "),
+        ("local/current-tool@0.1.0", "built at 6 (derived)"),
+        ("local/payload-tool@0.1.0", "built at 6 (derived)"),
+        ("local/current-skill@0.1.0", "built at 6 (derived)"),
     ] {
         let entry = installed_entry(&stdout, reference);
         assert!(entry.contains("global"), "{entry}");

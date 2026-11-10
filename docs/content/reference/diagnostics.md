@@ -2225,16 +2225,16 @@ a host by `capabilities.network.allow`. A need the manifest does not allow refus
 naming every such need and the manifest key that would allow it; nothing is spawned.
 
 ```text
-error[E-CAP-021]: process driver 'murmur/driver-claude-code@0.4.0' declares harness needs the capsule manifest does not allow:
-  - ~/.claude (read-write): no capabilities.harness.paths entry names it or an ancestor of it
-  - api.anthropic.com:443: no capabilities.network.allow entry admits it
+error[E-CAP-021]: process driver 'local/the-driver@1.0.0' declares harness needs the capsule manifest does not allow: ~/.claude (read-write): no capabilities.harness.paths entry names it or an ancestor of it; api.anthropic.com:443: no capabilities.network.allow entry admits it
   hint: grant each path under capabilities.harness.paths (on this transport: process capsule) and each host under capabilities.network.allow — the harness reaches only what the manifest also allows, never more than the class gives every command
 ```
 
 The same code refuses a `capabilities.harness` block on a capsule whose `inference.transport` is
 not `process`, since the block reaches the process harness and nothing else, and a granted path
-that resolves to a refused location on this host (a system path, read-write over murmur's home, or
-inside the work folder), on the same terms as an operator `host_paths` entry. A path the manifest
+that resolves to a refused location on this host (a system path, read-write over murmur's home
+`~/.murmur`, or inside the work folder), on the same terms as an operator `host_paths` entry, and a
+granted path that a symlink on its way leads outside the `capabilities.harness.paths` entry that
+allows it. A path the manifest
 allows but that is absent on this host is reported `missing` and the launch continues.
 `mur run --explain-scope` prints each need's status and exits `0`; `mur doctor` reports a
 disallowed need here in its `Process harness` block.

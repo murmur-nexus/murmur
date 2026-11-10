@@ -282,15 +282,23 @@ Rules:
 Use when the capsule intentionally delegates inference to a host CLI such as a supported Claude Code or Codex-compatible command.
 
 ```yaml
+capabilities:
+  harness:
+    paths:
+      - { path: <folder-the-driver-declares>, access: read-write }
+  network:
+    allow: [<host-the-driver-declares>]
 inference:
   transport: process
-  command: <cli-command>
+  driver:
+    artifact: <process-driver-artifact>
+  command: <optional-cli-path>
   model: <optional-model-id>
 ```
 
-Do not add `inference.driver` under `transport: process`, and do not give any `runtime: driver` entry a `gateway:`; both are refused with `E-MAN-003`.
+Do not give any `runtime: driver` entry a `gateway:`; it is refused with `E-MAN-003`.
 
-Treat process inference as a deliberate host-process boundary. Keep the rest of the capsule's shell, filesystem, environment, and resource posture narrow.
+The harness and every program it starts run under the capsule's containment class, like a shell command: each program it starts besides itself must be in `capabilities.shell.allow`, and `capabilities.resources.memory_bytes` bounds its address space. Its process driver declares the folders and hosts the harness needs; grant each under `capabilities.harness.paths` and `capabilities.network.allow`, or the launch is refused with `E-CAP-021`. Run `mur run --explain-scope` to see every need and whether it is granted.
 
 ### 4. Derive capsule-wide capabilities from actual operations
 

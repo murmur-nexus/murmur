@@ -2,14 +2,13 @@
 
 A test-only process driver, and a fake harness for it to drive, for `tests/process_driver.rs`,
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
-`murmur:driver/process@0.5.0` from the `process-driver` world and imports nothing but WASI.
+`murmur:driver/process@0.6.0` from the `process-driver` world and imports nothing but WASI.
 
-Drivers built against the retired `@0.1.0`, `@0.2.0`, `@0.3.0` and `@0.4.0` live next door, in
-`../process-driver-v1/`, `../process-driver-v2/`, `../process-driver-v3/` and
-`../process-driver-v4/`, each with the frozen `.wit` it was built from; they exist only to be
+Drivers built against the retired `@0.1.0` to `@0.5.0` live next door, in
+`../process-driver-v1/` to `../process-driver-v5/`, each with the frozen `.wit` it was built from; they exist only to be
 refused.
 
-Five components are committed under `tool/`, all built from `src/process-driver`:
+Seven components are committed under `tool/`, all built from `src/process-driver`:
 
 | Component | Cargo feature | Differs in |
 | --- | --- | --- |
@@ -18,6 +17,8 @@ Five components are committed under `tool/`, all built from `src/process-driver`
 | `tool/process-driver-unsupported.wasm` | `unsupported` | `describe().interrupt` is `unsupported`, and the plan names no `interrupt-stdin` |
 | `tool/process-driver-no-usage.wasm` | `no-usage` | `describe().reports-usage` is `false`, and `parse` reads no `usage` line |
 | `tool/process-driver-no-login-check.wasm` | `no-login-check` | `describe().login-check` is `unavailable("fixture-harness has no way to report its login without a turn")` |
+| `tool/process-driver-needs.wasm` | `harness-needs` | `describe().harness-needs` declares `~/fake-harness-sessions` (`read-write`) and the host `example.invalid:443` |
+| `tool/process-driver-needs-parent.wasm` | `harness-needs-parent` | `describe().harness-needs` declares `~/fixture-harness-parent/sessions` (`read-write`) |
 
 Every test but the cancel cases and the unreported-usage cases uses the default build.
 `fake-harness` is a committed executable bash script; a test copies it and `chmod 755`es its copy.
@@ -34,6 +35,7 @@ Every test but the cancel cases and the unreported-usage cases uses the default 
 | `tested-versions` | `["1.0.0"]` |
 | `interrupt` | `stdin-message`, `signal-int` or `unsupported` — the build's, per the table above |
 | `required-env` | `["HOME", "FIXTURE_HARNESS_PROFILE"]` |
+| `harness-needs` | empty, and the `harness-needs` / `harness-needs-parent` builds' needs per the table above |
 | `streams-text` | `true` |
 | `reports-usage` | `true`, and `false` in the `no-usage` build |
 | `login-check` | `command(["auth", "status"])`, and `unavailable("fixture-harness has no way to report its login without a turn")` in the `no-login-check` build |
@@ -173,7 +175,7 @@ It answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` 
 | `turns` | Two turns closed by tool results, then a third opened by `text`, then sleeps |
 | `thinking` | `thinking` and `delta` events around one `text`, then `end THINKING-RESULT` |
 | `api-key` | `started fixture-session-1 api-key`, then `end API-KEY-RESULT` |
-| `memory` | Keeps one conversation per session id and answers with everything it holds |
+| `memory` | Keeps one conversation per session id and answers with everything it holds. A test running it under a contained class uses the `harness-needs` build and grants `~/fake-harness-sessions` |
 | `memory-renames` | `memory`, but a new session is reported back under an id of the harness's own |
 | `linger` | `end LINGER`, then ignores stdin closing and sleeps, so the exit grace kills it |
 | `interrupt-honours` | Reads stdin until the driver's `interrupt` line arrives, then `fail canceled interrupted by the runtime` and exit `0` |
@@ -190,13 +192,21 @@ It answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` 
 | `quota-exhausted` | `quota five-hour,used=1,state=exhausted`, then `text` and `end EXHAUSTED-RESULT` |
 | `late-lines` | `usage in=10 out=5`, `text` and `end LATE-RESULT`; then, once stdin closes, a `quota` of two windows, `suggest run the tests next`, a note line, `text LATE-TEXT`, `end LATE-END` and `usage in=9000 out=9000`, and exit `0` inside the exit grace |
 | `late-after-grace` | `end GRACE-RESULT`; then, once stdin closes, waits 5 s — past the exit grace — before a `quota` and a `suggest` line it never gets to print |
+| `confinement` | Writes its `/proc/self/status` `Seccomp`, `NoNewPrivs` and `NSpid` lines and `readlink /proc/self/ns/net` and `/proc/self/ns/pid` to `confinement.txt`, plus a glob listing of `$FIXTURE_UNGRANTED` when set, and answers with them. Needs `readlink` under `capabilities.shell.allow` |
+| `escape` | With no bridge: reads `$FIXTURE_SENTINEL` with `cat`, and opens TCP to `1.1.1.1:80` and `127.0.0.1:$FIXTURE_HOST_PORT` with `/dev/tcp` (five seconds each), writing `read`, `tcp-1.1.1.1` and `tcp-host` outcomes to `escape.txt` and the answer. Needs `cat` under `capabilities.shell.allow` |
+| `parent-write` | Writes a file in `$HOME/fixture-harness-parent/sessions/` and one in `$HOME/fixture-harness-parent/`, answering `sessions=OK\|FAIL sibling=OK\|FAIL` |
+| `bridge-hold` | One bridged echo ping, its answer in `bridge-answer.txt` and the bridge URL in `bridge-url.txt`, then holds the turn until `go` appears in its working directory (60 s at most) |
 
 `silent`, `turns`, `linger`, `late-after-grace`, `usage-spends` and the three `interrupt-*` profiles write their pid to `harness.pid`
 in their working directory, which is how a test proves the harness is dead.
 
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment
-is only what the capsule declared plus the driver's `env-set`, so a test that wants `sleep`, `ls`
-or `env` to resolve has to declare `PATH`.
+is only what the capsule declared plus the driver's `env-set`. The harness runs under the capsule's
+class, which lets it exec bash, its `#!` interpreter, and what `capabilities.shell.allow` grants, so
+its pauses are the bash builtin `read -t <seconds> <> <(:)` and its file reads are redirections; a
+test running `env`, `account`, `confinement` or `escape` declares `PATH` and allows the programs
+those profiles name. A test that bakes a profile into the harness writes one script — the variables,
+then this file's body — rather than a wrapper that `exec`s this file, which the class would refuse.
 
 `call_bridge` takes the tool's **bare** name and its arguments as JSON, and prints the response
 body on one line. Both arguments default to a `{"msg": "ping-7"}` call against `echo-tool`, which

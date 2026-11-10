@@ -1060,6 +1060,7 @@ pub(crate) fn sealed_shortfall(
                 | CreationStep::LocalRoute
                 | CreationStep::TcpListener
                 | CreationStep::Resolver
+                | CreationStep::BridgeListener
                 | CreationStep::NamespaceHandles
                 | CreationStep::HandOff
                 | CreationStep::PidNamespace

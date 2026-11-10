@@ -5603,7 +5603,7 @@ mod tests {
             );
         }
         assert!(notes(Route::Hooks).contains("its own capabilities block declares"));
-        // The process harness and the tools it runs are under the class now, so they have no
+        // The process harness and the tools it runs are under the class, so they have no
         // uncovered-route note.
         assert_eq!(Route::ProcessHarness.note(), None);
         assert_eq!(Route::HarnessTools.note(), None);
@@ -5796,8 +5796,8 @@ mod tests {
             }
         }
 
-        // A process capsule's harness and the tools it runs are under the class now, so
-        // `W-SEC-034` names only its uncovered driver route, never the harness.
+        // A process capsule's harness and the tools it runs are under the class, so `W-SEC-034`
+        // names only its uncovered driver route, never the harness.
         let process = route_table(
             &RouteInputs {
                 process_transport: true,

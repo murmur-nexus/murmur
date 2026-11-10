@@ -427,8 +427,8 @@ impl Record<'_> {
              `write-outside-workdir`, whose `/var/tmp` target has not been measured there. \
              `not-asserted` in the `advisory` column means something different — a class with no \
              mechanism — and the two must not be read as one. The three class columns are the \
-             shell-tool route; the `process-harness` column is that route at every class, and \
-             `—` there means the case does not run on it.\n"
+             shell-tool route; the `process-harness` column is that route's expectation at \
+             `scoped` / `sealed`, and `—` there means the case does not run on it.\n"
         );
         let _ = writeln!(
             out,
@@ -708,8 +708,11 @@ mod tests {
         assert!(rendered.contains("### `read-record-seal-key` — process-harness"));
         assert!(rendered.contains(
             "| `read-record-seal-key` | boundary | not-asserted | REFUSED | REFUSED | \
-             known-gap: ALLOWED |"
+             REFUSED / REFUSED |"
         ));
+        assert!(rendered.contains(
+            "| `symlink-escape` | boundary | not-asserted | REFUSED | ALLOWED | REFUSED / ALLOWED |"
+        ), "{rendered}");
         assert!(rendered
             .contains("| `read-etc-shadow` | boundary | not-asserted | REFUSED | REFUSED | — |"));
     }

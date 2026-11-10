@@ -946,11 +946,12 @@ pub enum RuntimeError {
     /// A process driver's `describe().harness-needs` declares a path or host the capsule manifest
     /// does not allow, or a granted path that resolves to a refused location on this host.
     /// `refusals` names every one, in the order the driver declared them (paths, then hosts), each
-    /// as `<need> (<access>): <reason>` for a path and `<host:port>: <reason>` for a host. Renders
-    /// as `E-CAP-021`.
+    /// as `<need> (<access>): <reason>` for a path and `<host:port>: <reason>` for a host. One
+    /// line, so a report that keeps a message's first line (`mur doctor`) keeps every need.
+    /// Renders as `E-CAP-021`.
     #[error(
-        "process driver '{driver}' declares harness needs the capsule manifest does not allow:\n  - {}",
-        .refusals.join("\n  - ")
+        "process driver '{driver}' declares harness needs the capsule manifest does not allow: {}",
+        .refusals.join("; ")
     )]
     HarnessNeedsNotAllowed {
         /// `name@version`.

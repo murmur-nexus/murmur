@@ -1597,9 +1597,9 @@ pub struct HarnessCapabilities {
     pub paths: Vec<HarnessPathEntry>,
 }
 
-/// One `capabilities.harness.paths` entry: a host directory and what the harness may do there. The
-/// same shape as an operator `host_paths` entry — `~/…` or absolute, `read` or `read-write` — but
-/// declared by the capsule, not the operator, and reaching the harness only.
+/// One `capabilities.harness.paths` entry: a host directory and what the harness may do there — a
+/// folder below `~/` or `/`, `read` or `read-write` — declared by the capsule, not the operator,
+/// and reaching the harness only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessPathEntry {
     /// `~/<rest>` under the home `mur` runs with, or an absolute path. A directory.
@@ -3333,10 +3333,6 @@ impl RawBlock for RawCapabilities {
         }
         if let Some(harness) = &self.harness {
             collect_block(harness, &child_path(path, "harness"), out);
-            let paths = child_path(&child_path(path, "harness"), "paths");
-            for (index, entry) in harness.paths.iter().enumerate() {
-                collect_block(entry, &format!("{paths}[{index}]"), out);
-            }
         }
     }
 }
@@ -3373,6 +3369,12 @@ impl RawBlock for RawHarnessCapabilities {
     const KNOWN_KEYS: &'static [&'static str] = &["paths"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
+    }
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let paths = child_path(path, "paths");
+        for (index, entry) in self.paths.iter().enumerate() {
+            collect_block(entry, &format!("{paths}[{index}]"), out);
+        }
     }
 }
 
@@ -5216,11 +5218,10 @@ fn parse_capabilities(
     }))
 }
 
-/// Lower and validate `capabilities.harness`: every entry a `{path, access}` whose `path` is
-/// `~/…` or absolute and whose `access` is `read` or `read-write`, the same shape rules as an
-/// operator `host_paths` entry. The lexical fold and the host-folder checks happen at staging,
-/// through [`crate::runtime_manifest`]'s consumer; this is the parse-time shape check, matching
-/// the rest of this file's "structurally present but semantically invalid" reporting.
+/// Lower and validate `capabilities.harness`: every entry a `{path, access}` whose `path` is a
+/// directory below `~/` or below `/` ([`harness_path_shape_error`]) and whose `access` is `read`
+/// or `read-write`. The lexical fold and the host-folder checks happen at staging; this is the
+/// parse-time shape check.
 fn parse_harness(raw: RawHarnessCapabilities) -> Result<HarnessCapabilities, RuntimeManifestError> {
     let mut paths = Vec::with_capacity(raw.paths.len());
     for (index, entry) in raw.paths.into_iter().enumerate() {
@@ -5231,13 +5232,10 @@ fn parse_harness(raw: RawHarnessCapabilities) -> Result<HarnessCapabilities, Run
                 message: "must name a host directory (`~/…` or an absolute path)".to_string(),
             }
         })?;
-        if !(path.starts_with("~/") || path == "~" || path.starts_with('/')) {
+        if let Some(reason) = harness_path_shape_error(&path) {
             return Err(RuntimeManifestError::InvalidCapabilities {
                 field: format!("{base}.path"),
-                message: format!(
-                    "'{path}' must be an absolute host path (start with '/') or home-relative \
-                     (`~/…`)"
-                ),
+                message: format!("'{path}' {reason}"),
             });
         }
         let access = match entry.access.as_deref() {
@@ -5258,6 +5256,35 @@ fn parse_harness(raw: RawHarnessCapabilities) -> Result<HarnessCapabilities, Run
         paths.push(HarnessPathEntry { path, access });
     }
     Ok(HarnessCapabilities { paths })
+}
+
+/// Why a `capabilities.harness.paths` path has the wrong shape, or `None` for a directory named
+/// below `~/` or below `/`: no `.` or `..` segment, no empty segment from `//` (a trailing `/` is
+/// allowed), and not `/`, `~` or `~/` alone — the shape a process driver's path need must have.
+fn harness_path_shape_error(path: &str) -> Option<&'static str> {
+    let rest = if path == "~" || path == "~/" {
+        return Some("names the whole home folder; name the folder the harness needs");
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        rest
+    } else if path == "/" {
+        return Some("names /, the whole host filesystem; name the folder the harness needs");
+    } else if let Some(rest) = path.strip_prefix('/') {
+        rest
+    } else {
+        return Some(
+            "is relative: write an absolute path or ~/… (~user and environment variables are not \
+             expanded)",
+        );
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    for segment in rest.split('/') {
+        match segment {
+            "" => return Some("has an empty path segment (//)"),
+            "." | ".." => return Some("has a . or .. segment; write the folder's own path"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Lower `capabilities.spawn.allow`: every entry a full name, no two sharing a bare part —
@@ -8496,6 +8523,97 @@ capabilities:
                 tool: vec!["local/b-*".into()],
                 from: InstallFrom::Stores,
             })
+        );
+    }
+
+    fn manifest_with_harness_paths(entries: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  harness:\n    paths:\n{entries}"
+        )
+    }
+
+    #[test]
+    fn capabilities_harness_paths_parse_in_declaration_order() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_harness_paths(
+            "      - { path: ~/.claude, access: read-write }\n      - { path: /opt/harness/, access: read }\n",
+        ))
+        .expect("a harness block parses");
+        assert_eq!(
+            manifest.capabilities.unwrap().harness,
+            Some(HarnessCapabilities {
+                paths: vec![
+                    HarnessPathEntry {
+                        path: "~/.claude".into(),
+                        access: HarnessPathAccess::ReadWrite,
+                    },
+                    HarnessPathEntry {
+                        path: "/opt/harness/".into(),
+                        access: HarnessPathAccess::Read,
+                    },
+                ],
+            })
+        );
+    }
+
+    /// The shape a process driver's path need must have: a folder below `~/` or `/`. The whole
+    /// home, the whole filesystem, a relative path and a `.`/`..`/`//` segment are refused at
+    /// parse, naming the entry.
+    #[test]
+    fn capabilities_harness_paths_refuse_every_wrong_shape_naming_the_entry() {
+        for (path, expected) in [
+            ("/", "names /, the whole host filesystem"),
+            ("\"~\"", "names the whole home folder"),
+            ("~/", "names the whole home folder"),
+            ("relative/dir", "is relative"),
+            ("./dir", "is relative"),
+            ("~user/dir", "is relative"),
+            ("$HOME/dir", "is relative"),
+            ("/opt/../etc", "has a . or .. segment"),
+            ("~/a/./b", "has a . or .. segment"),
+            ("/opt//x", "has an empty path segment"),
+        ] {
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_harness_paths(&format!(
+                "      - {{ path: {path}, access: read-write }}\n"
+            )))
+            .expect_err("a wrongly shaped harness path is refused");
+            match &err {
+                RuntimeManifestError::InvalidCapabilities { field, message } => {
+                    assert_eq!(field, "capabilities.harness.paths[0].path", "{path}");
+                    assert!(message.contains(expected), "{path}: {message}");
+                }
+                other => panic!("{path}: expected InvalidCapabilities, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capabilities_harness_paths_require_a_known_access() {
+        for (entry, expected) in [
+            ("{ path: ~/x }", "access is required"),
+            ("{ path: ~/x, access: write }", "access 'write' is neither"),
+            ("{ access: read }", "must name a host directory"),
+        ] {
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_harness_paths(&format!(
+                "      - {entry}\n"
+            )))
+            .expect_err("an incomplete entry is refused");
+            assert!(err.to_string().contains(expected), "{entry}: {err}");
+        }
+    }
+
+    #[test]
+    fn capabilities_harness_paths_report_an_unknown_key_inside_an_entry() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_harness_paths(
+            "      - { path: ~/x, access: read, acess: read }\n",
+        ))
+        .expect("an unknown key is reported, not refused");
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .any(|key| key.block_path == "capabilities.harness.paths[0]" && key.key == "acess"),
+            "{:?}",
+            manifest.unknown_keys
         );
     }
 

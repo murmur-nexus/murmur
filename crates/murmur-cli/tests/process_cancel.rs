@@ -122,9 +122,10 @@ struct Capsule {
     records_dir: PathBuf,
     _home: TempDir,
     _project: TempDir,
-    /// The file the harness wrapper reads its profile from, rewritten between two tasks of the
-    /// same capsule.
-    profile_file: PathBuf,
+    /// The harness script, rewritten with another profile between two tasks of the same capsule.
+    harness: PathBuf,
+    /// The lines the harness script carries ahead of its profile's.
+    stall: String,
 }
 
 impl Built {
@@ -171,37 +172,21 @@ impl Built {
         );
         common::publish_local(&home, &artifact).success();
 
-        // The harness the capsule runs is a wrapper that exports the profile and execs the fixture
-        // script, so the profile belongs to this capsule rather than to the test process every
-        // capsule in this binary shares.
-        let harness = project.path().join("fake-harness");
-        fs::copy(
-            common::fixture_path("process-driver/fake-harness"),
-            &harness,
-        )
-        .unwrap();
-        make_executable(&harness);
-        let profile_file = project.path().join("profile");
-        fs::write(&profile_file, &self.profile).unwrap();
-        let wrapper = project.path().join("harness");
+        // The harness the capsule runs is the fixture script with the profile baked in, so the
+        // profile belongs to this capsule rather than to the test process every capsule in this
+        // binary shares.
         let stall = if self.probe_stall.is_zero() {
             String::new()
         } else {
             format!(
-                "if [ \"${{1:-}}\" = \"--version\" ]; then sleep {}; fi\n",
+                "if [ \"${{1:-}}\" = \"--version\" ]; then read -r -t {} <> <(:) || true; fi\n",
                 self.probe_stall.as_secs_f32()
             )
         };
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=\"$(cat {})\"\n{stall}exec {} \"$@\"\n",
-                profile_file.display(),
-                harness.display()
-            ),
-        )
-        .unwrap();
-        make_executable(&wrapper);
+        let wrapper = common::write_fake_harness(
+            &project.path().join("harness"),
+            &format!("export FIXTURE_HARNESS_PROFILE={}\n{stall}", self.profile),
+        );
 
         let manifest = project.path().join("murmur.yaml");
         fs::write(
@@ -236,15 +221,10 @@ impl Built {
             records_dir,
             _home: home,
             _project: project,
-            profile_file,
+            harness: wrapper,
+            stall,
         }
     }
-}
-
-fn make_executable(path: &Path) {
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(path, perms).unwrap();
 }
 
 /// A queue capsule that threads its conversation. `sleeps` keeps it up after the task, which is
@@ -512,7 +492,10 @@ fn only_terminal_status(frames: &[common::stream::Event]) -> Value {
 
 impl Capsule {
     fn set_profile(&self, profile: &str) {
-        fs::write(&self.profile_file, profile).unwrap();
+        common::write_fake_harness(
+            &self.harness,
+            &format!("export FIXTURE_HARNESS_PROFILE={profile}\n{}", self.stall),
+        );
     }
 
     fn events(&self) -> Vec<Value> {
@@ -575,7 +558,8 @@ impl Capsule {
         found.remove(0)
     }
 
-    /// The pid the running harness wrote, once it has written one.
+    /// The host pid of the running harness, once it has written its pid: the harness runs in the
+    /// session's PID namespace, so the pid it wrote is translated while it is alive.
     fn harness_pid(&self) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -583,6 +567,7 @@ impl Capsule {
                 if let Some(pid) = fs::read_to_string(path)
                     .ok()
                     .and_then(|text| text.trim().parse::<i32>().ok())
+                    .and_then(|pid| common::harness_host_pid(&self.workdir, pid))
                 {
                     return pid;
                 }

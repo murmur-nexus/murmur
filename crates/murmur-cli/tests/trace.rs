@@ -856,11 +856,21 @@ fn session_start_effective_grants_match_explain_scope_json() {
     ] {
         assert_eq!(route(name)["present"], present, "{name}: {grants}");
     }
-    for name in ["wasm-tools", "drivers", "process-harness"] {
+    for name in ["wasm-tools", "drivers"] {
         assert_eq!(route(name)["under_class"], false, "{name}");
         assert_eq!(route(name)["mechanism"], "host-process", "{name}");
     }
-    assert_eq!(route("shell")["mechanism"], grants["enforcement_tier"]);
+    // The process harness runs under the class, so its row reads the tier even where it is absent.
+    for name in ["shell", "process-harness"] {
+        assert_eq!(route(name)["under_class"], true, "{name}");
+        assert_eq!(
+            route(name)["mechanism"],
+            grants["enforcement_tier"],
+            "{name}"
+        );
+    }
+    // An http capsule has no process harness to report.
+    assert!(grants["harness"].is_null(), "{grants}");
     assert_eq!(route("wasm-tools")["artifacts"], json!([GRANTS_TOOL_NAME]));
     assert_eq!(route("drivers")["artifacts"], json!([DRIVER_NAME]));
     // No shell or spawn grant: the launch asked for no scope.

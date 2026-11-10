@@ -128,11 +128,26 @@ granted only where the capsule manifest also allows it:
 
 What is granted is the driver's path at the driver's access, never the wider manifest entry, and a
 harness grant reaches the harness **and whatever the harness runs** — not a shell command, whose
-Landlock domain does not change. The harness binary itself is granted as an executable exactly like
-a `capabilities.shell.allow` binary — its file and `DT_NEEDED` closure, and for a `#!` script the
-interpreter its first line names. A need the manifest does not allow refuses the launch with
-[`E-CAP-021`](diagnostics.md#e-cap-021); a path allowed but absent on this host is reported
-`missing` and the launch continues.
+Landlock domain does not change. A path need is checked on this host on an operator `host_paths`
+entry's terms: it is refused when it resolves to a system path, is read-write over murmur's own
+home `~/.murmur`, or lies inside the work folder, and when a symlink on its way leads outside the
+`capabilities.harness.paths` entry that allows it.
+
+The harness binary itself is granted as an executable exactly like a `capabilities.shell.allow`
+binary — its file and `DT_NEEDED` closure:
+
+| The harness binary is | Also granted |
+|---|---|
+| An ELF executable | Nothing more |
+| A `#!` script | The interpreter its first line names |
+| A `#!/usr/bin/env <name>` script | `env` and `<name>`, resolved on the `PATH` |
+
+Every other program the harness starts — `git`, a search tool, a language runtime, a second script a
+wrapper `exec`s — runs only if [`capabilities.shell.allow`](manifest.md#field-capabilities) names
+it, exactly as for a shell command; a wrapper script that `exec`s the real harness by path needs
+that path allowed, or the real harness as the binary. A need the manifest does not allow refuses
+the launch with [`E-CAP-021`](diagnostics.md#e-cap-021); a path allowed but absent on this host is
+reported `missing` and the launch continues.
 
 `mur run --explain-scope` prints a `Process harness` block — the driver, the binary and its
 interpreter, and each path, host and environment need with its status and the manifest entry that
@@ -143,8 +158,8 @@ records the tier the harness ran under.
 **A V8 or JSC harness** — Claude Code, or any Node- or browser-engine-based CLI — maps a large
 virtual address range at startup. The per-command `RLIMIT_AS` the session's
 [`capabilities.resources.memory_bytes`](manifest.md#field-capabilities) sets applies to the harness
-too, so a capsule running such a harness must set a `memory_bytes` a turn fits in (a 2 GiB
-`RLIMIT_AS` is enough for Claude Code), or the harness is killed as it starts.
+too, so a capsule running such a harness must set a `memory_bytes` a turn fits in, or the harness
+fails as it starts.
 
 `mur doctor`'s own version and login probes run **outside** the class: they run outside any session,
 before one is staged, so they are not spawned under its enforcement. The harness a real `mur run`
@@ -1918,7 +1933,7 @@ the record:
 | Route | How the probe runs | Graded on |
 |---|---|---|
 | `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
-| `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime now spawns under the session's class exactly like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
+| `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime spawns under the session's class like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
 
 An expectation is one of:
 
@@ -1958,7 +1973,7 @@ The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) o
 harness runs with: the harness resolves `~/.murmur/keys/record-seal.key` there, creating the key
 when it is missing, and hands the probe its path, never its bytes, since the capsule's own `$HOME`
 is a different folder. It must be refused at `scoped` and `sealed` and is not asserted at
-`advisory`. On the `process-harness` route it is now `REFUSED` at `scoped` and `sealed` too — the
+`advisory`. On the `process-harness` route it is `REFUSED` at `scoped` and `sealed` too — the
 harness runs under the class, so Landlock and the composed root refuse the key exactly as they do
 for a shell command.
 

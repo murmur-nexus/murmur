@@ -1570,7 +1570,7 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
     });
     // Lead's inference runs in the harness; its scripted model is never asked.
     let lead = Model::new(|n| end_turn(n, "unused"));
-    let project = Project::with_manifests(
+    let mut project = Project::with_manifests(
         vec![
             Member {
                 name: "lead",
@@ -1593,11 +1593,13 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
                 format!(
                     "artifacts:\n  - name: {PROCESS_DRIVER}\n    version: {DRIVER_VERSION}\n    \
                      runtime: driver\n\
-                     capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n  \
-                     network:\n    allow: [localhost]\n\
+                     capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
+                     {grant}  network:\n    allow: [localhost, {host}]\n\
                      lifecycle:\n  task_acceptance: single\n  after_task: exit\n\
                      inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n\
-                     network:\n  authentication:\n    scheme: bearer\n"
+                     network:\n  authentication:\n    scheme: bearer\n",
+                    grant = common::HARNESS_NEEDS_PATHS_GRANT,
+                    host = common::HARNESS_NEEDS_HOST,
                 )
             } else {
                 manifest(
@@ -1610,6 +1612,10 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
         },
     );
 
+    // The fake harness keeps the bridged answer in `~/fake-harness-sessions`, which the needs
+    // build declares and lead's manifest grants: a `HOME` off `/tmp` holding the folder, with the
+    // http driver published into it as every project's home has it.
+    project.home = common::door_capsule::driver_home_in(common::harness_needs_home());
     // The process driver beside the http one, and the fake harness as `fixture-cli` on a `PATH`
     // of lead's own.
     let artifacts = tempfile::tempdir().unwrap();
@@ -1617,21 +1623,13 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
         artifacts.path(),
         PROCESS_DRIVER,
         DRIVER_VERSION,
-        &common::fixture_path("process-driver/tool/process-driver.wasm"),
+        &common::process_driver_needs_wasm(),
         "",
     );
     common::publish_local(&project.home, &driver).success();
     let bin_dir = project.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let harness = bin_dir.join("fixture-cli");
-    std::fs::copy(
-        common::fixture_path("process-driver/fake-harness"),
-        &harness,
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&harness).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&harness, perms).unwrap();
+    common::write_fake_harness(&bin_dir.join("fixture-cli"), "");
     let path = format!(
         "{}:{}",
         bin_dir.display(),

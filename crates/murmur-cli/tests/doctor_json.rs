@@ -381,6 +381,48 @@ fn block_findings<'a>(report: &'a Value, block: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+/// A harness need the manifest does not allow is one `E-CAP-021` finding in the `harness` block,
+/// and its message names every need — the path and the host — and the driver, as `mur run`'s
+/// refusal does.
+#[test]
+fn a_disallowed_harness_need_is_one_e_cap_021_finding_naming_every_need() {
+    let capsule =
+        ProcessProject::with_driver("process-driver/tool/process-driver-needs.wasm", None);
+
+    let output = capsule.doctor(true, "happy");
+    let report = document(&output);
+    assert_consistent(&output, &report);
+    assert_eq!(report["verdict"], "refused");
+    assert_eq!(output.status.code(), Some(1), "{report:#}");
+    let harness = block_findings(&report, "harness");
+    assert_eq!(harness.len(), 1, "{report:#}");
+    assert_eq!(harness[0]["code"], "E-CAP-021");
+    assert_eq!(harness[0]["severity"], "error");
+    let message = harness[0]["message"].as_str().unwrap();
+    for named in [
+        &format!("'{DRIVER}@{DRIVER_VERSION}'"),
+        "~/fake-harness-sessions (read-write)",
+        "example.invalid:443",
+    ] {
+        assert!(message.contains(named), "{named}: {message}");
+    }
+    assert!(
+        harness[0]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("capabilities.harness.paths"),
+        "{report:#}"
+    );
+
+    // The person's report beside the document names the same needs.
+    let text = stderr(&output);
+    assert!(text.contains("error[E-CAP-021]"), "{text}");
+    assert!(
+        text.contains("~/fake-harness-sessions (read-write)"),
+        "{text}"
+    );
+}
+
 /// S4: a harness binary that does not resolve is staging's `E-RUN-006`, and no version or login
 /// is asked.
 #[test]

@@ -612,8 +612,9 @@ fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
     }
 }
 
-/// `inference.transport: process` puts the harness and its own tools on the table, outside the
-/// class; at `scoped`, doctor's `W-SEC-034` names both.
+/// `inference.transport: process` puts the harness and its own tools on the table, under the
+/// class at its installed tier; at `scoped`, doctor's `W-SEC-034` names the driver and neither of
+/// them.
 #[test]
 fn a_process_transport_capsule_reports_the_harness_routes() {
     let home = TempDir::new().unwrap();
@@ -649,31 +650,21 @@ fn a_process_transport_capsule_reports_the_harness_routes() {
             .find(|row| row["route"] == name)
             .unwrap_or_else(|| panic!("no {name} row: {report}"));
         assert_eq!(row["present"], true, "{row}");
-        assert_eq!(row["under_class"], false, "{row}");
-        assert_eq!(row["mechanism"], "host-process", "{row}");
-        assert!(row["note"].is_string(), "{row}");
+        assert_eq!(row["under_class"], true, "{row}");
+        assert_eq!(row["mechanism"], report["enforcement_tier"], "{row}");
+        assert_ne!(row["mechanism"], "host-process", "{row}");
+        assert!(row["note"].is_null(), "{row}");
     }
-    let harness = routes
-        .iter()
-        .find(|row| row["route"] == "process-harness")
-        .unwrap();
-    assert!(
-        harness["note"]
-            .as_str()
-            .unwrap()
-            .contains("cleared environment"),
-        "{harness}"
-    );
 
     let doctor = mur(false, home.path(), project.path(), &["doctor"]);
     let warnings = uncovered_warnings(&doctor.stderr);
     assert_eq!(warnings.len(), 1, "{}", doctor.all());
     assert!(
         warnings[0].contains(&format!(
-            "drivers ({PROCESS_DRIVER_NAME}), the process harness and harness tools run outside \
-             the class"
+            "drivers ({PROCESS_DRIVER_NAME}) run outside the class"
         )),
         "{}",
         warnings[0]
     );
+    assert!(!warnings[0].contains("harness"), "{}", warnings[0]);
 }

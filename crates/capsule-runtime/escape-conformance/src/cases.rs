@@ -228,9 +228,9 @@ impl Case {
     }
 }
 
-/// The process-harness route's expectation per class: since the harness now runs under the
-/// session's class exactly as a shell command does, a case's harness verdict at a class is its
-/// shell-tool verdict at that class. Held per class so `symlink-escape`, whose composed root
+/// The process-harness route's expectation per class. The harness runs under the session's class
+/// exactly as a shell command does, so a case's harness verdict at a class is its shell-tool
+/// verdict at that class. Held per class so `symlink-escape`, whose composed root
 /// exposes `/etc/passwd`, can be `REFUSED` at `scoped` and `ALLOWED` at `sealed` on both routes.
 #[derive(Debug, Clone, Copy)]
 pub struct HarnessExpectation {
@@ -368,7 +368,7 @@ def main():
                       for the command at all. NOT ASSERTED AT `advisory`: `advisory` and \
                       `unconfined` reach the key by design, which is why only the `mur` process \
                       signs and a record sealed under those tiers proves less. \
-                      ON `process-harness`: the harness now runs under the session's class \
+                      ON `process-harness`: the harness runs under the session's class \
                       exactly like a shell command, so the open is REFUSED at `scoped` (Landlock) \
                       and at `sealed` (the composed root reproduces no `~/.murmur/keys`), matching \
                       the shell-tool route. NOT ASSERTED at `advisory`, where the harness reaches \
@@ -486,7 +486,7 @@ def main():
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
                       is never mistaken for a contained read.\
-                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding. ON `process-harness`: the harness now runs under the session's class exactly like a shell command, so the read through the link is REFUSED at `scoped` (Landlock resolves the link and refuses the target) and ALLOWED at `sealed` (the composed root exposes `/etc/passwd`), matching the shell-tool route at each class.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding. ON `process-harness`: the harness runs under the session's class exactly like a shell command, so the read through the link is REFUSED at `scoped` (Landlock resolves the link and refuses the target) and ALLOWED at `sealed` (the composed root exposes `/etc/passwd`), matching the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
@@ -1940,6 +1940,49 @@ mod tests {
             .harness
             .expect("preflight runs on the harness route");
         assert_eq!(preflight_harness.all(), [Must(Succeeded); 3]);
+    }
+
+    /// The process harness runs under the session's class, so on every case it runs, its verdict
+    /// at `scoped` and `sealed` is a `Must` and equals the shell-tool route's at that class: no
+    /// harness-route expectation is a known gap, and none differs from what a shell command gets.
+    /// A harness spawned outside the class would read these files and fail them.
+    #[test]
+    fn every_harness_route_expectation_is_the_shell_tool_verdict_at_scoped_and_sealed() {
+        for case in REGISTRY.iter().filter(|case| case.harness.is_some()) {
+            for class in [ContainmentClass::Scoped, ContainmentClass::Sealed] {
+                let harness = case.expectation_on(Route::ProcessHarness, class).unwrap();
+                let shell = case.expectation_on(Route::ShellTool, class).unwrap();
+                assert!(
+                    matches!(harness, Must(_)),
+                    "{} at {class:?}: {harness:?}",
+                    case.id
+                );
+                assert_eq!(harness, shell, "{} at {class:?}", case.id);
+            }
+        }
+        let at = |id: &str, class| {
+            find(id)
+                .unwrap()
+                .expectation_on(Route::ProcessHarness, class)
+                .unwrap()
+        };
+        assert_eq!(
+            at("read-record-seal-key", ContainmentClass::Scoped),
+            Must(Refused)
+        );
+        assert_eq!(
+            at("read-record-seal-key", ContainmentClass::Sealed),
+            Must(Refused)
+        );
+        assert_eq!(
+            at("symlink-escape", ContainmentClass::Scoped),
+            Must(Refused)
+        );
+        // `/etc/passwd` is in the composed root, for a shell command and the harness alike.
+        assert_eq!(
+            at("symlink-escape", ContainmentClass::Sealed),
+            Must(Allowed)
+        );
     }
 
     /// The known-gap count guard: a known gap cannot be dropped, demoted to `NotAsserted` or

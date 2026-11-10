@@ -200,6 +200,54 @@ pub fn assert_dead_within(pid: i32, limit: std::time::Duration) {
     panic!("the harness (pid {pid}) was still alive after {limit:?}");
 }
 
+/// The host pid of the process harness that wrote `pid` (its `$$`) while running in `workdir`:
+/// in the session's PID namespace that is a namespace pid, translated through the process whose
+/// working directory is `workdir`; with no PID namespace it is already the host pid. `None` when no
+/// such process is alive.
+#[allow(dead_code)]
+pub fn harness_host_pid(workdir: &Path, pid: i32) -> Option<i32> {
+    capsule_runtime::network_namespace::host_pid_in_workdir(workdir, pid).or_else(|| {
+        let workdir = fs::canonicalize(workdir).ok()?;
+        fs::read_link(format!("/proc/{pid}/cwd"))
+            .is_ok_and(|cwd| cwd == workdir)
+            .then_some(pid)
+    })
+}
+
+/// Panics unless, within `limit`, no process has `workdir` as its working directory: a process
+/// harness and everything it started run there, so this is the harness and its children all gone,
+/// read on the host rather than through a pid the harness wrote from inside its PID namespace.
+#[allow(dead_code)]
+pub fn assert_nothing_runs_in_within(workdir: &Path, limit: std::time::Duration) {
+    let workdir = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    let in_workdir = || -> Vec<i32> {
+        fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                    .filter(|pid| {
+                        fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd == workdir)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let left = in_workdir();
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            start.elapsed() < limit,
+            "processes {left:?} still run in {} after {limit:?}",
+            workdir.display()
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Write `home/.murmur/config.yaml` with `registry.sources: []`, the config that gives no
 /// third-party scope a source. Only the built-in `murmur` scope still has one, so a miss in any
 /// other scope fails with `E-REG-008` without a request.
@@ -374,6 +422,63 @@ pub fn fixture_path(relative: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(relative)
+}
+
+/// Writes the fixture fake harness to `path` with `exports` (shell lines, each ending in a
+/// newline) ahead of its body, executable: the harness a test points `inference.command` at when
+/// it bakes a profile into the script. One file rather than a wrapper that execs the fixture or
+/// reads a profile file, because the harness runs under the capsule's class, which grants it its
+/// own binary and its `#!` interpreter and nothing else outside the work folder.
+///
+/// Written beside `path` and renamed over it, so a test may call it again to change the profile
+/// between two runs while a harness of the earlier run still reads the old file.
+#[allow(dead_code)]
+pub fn write_fake_harness(path: &Path, exports: &str) -> PathBuf {
+    let fixture = fs::read_to_string(fixture_path("process-driver/fake-harness")).unwrap();
+    let (shebang, body) = fixture.split_once('\n').unwrap();
+    let staged = path.with_extension("staged");
+    fs::write(&staged, format!("{shebang}\n{exports}{body}")).unwrap();
+    let mut perms = fs::metadata(&staged).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&staged, perms).unwrap();
+    fs::rename(&staged, path).unwrap();
+    path.to_path_buf()
+}
+
+/// The fixture process driver's `harness-needs` build: it declares the fake harness's session
+/// memory folder `~/fake-harness-sessions` (read-write) and the host `example.invalid:443`.
+#[allow(dead_code)]
+pub fn process_driver_needs_wasm() -> PathBuf {
+    fixture_path("process-driver/tool/process-driver-needs.wasm")
+}
+
+/// The top-level `capabilities:` lines granting [`process_driver_needs_wasm`]'s path need, for a
+/// capsule whose fake harness keeps a memory: the profiles that remember a session write it under
+/// `$HOME/fake-harness-sessions`. Its host need is [`HARNESS_NEEDS_HOST`].
+#[allow(dead_code)]
+pub const HARNESS_NEEDS_PATHS_GRANT: &str =
+    "  harness:\n    paths:\n      - { path: ~/fake-harness-sessions, access: read-write }\n";
+
+/// The `capabilities.network.allow` entry admitting [`process_driver_needs_wasm`]'s host need.
+#[allow(dead_code)]
+pub const HARNESS_NEEDS_HOST: &str = "example.invalid";
+
+/// A scratch `HOME` outside `/tmp` holding an empty `fake-harness-sessions`, the folder the
+/// needs build's path need names: a granted need is checked at its host path, and one under
+/// `/tmp` would be refused, or reported missing when absent.
+#[allow(dead_code)]
+pub fn harness_needs_home() -> TempDir {
+    let home = scratch_off_tmp();
+    fs::create_dir_all(home.path().join("fake-harness-sessions")).unwrap();
+    home
+}
+
+/// A scratch directory outside `/tmp`, which a contained tier replaces with a private one: for a
+/// test `HOME` a process harness's granted folder lives under, or anything else the harness must
+/// reach at its host path.
+#[allow(dead_code)]
+pub fn scratch_off_tmp() -> TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
 }
 
 /// Point `$HOME` at a scratch directory that lives as long as the test process.
