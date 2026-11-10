@@ -86,6 +86,14 @@ jobs:
         run: |
           .github/scripts/prepare-contained-runner.sh
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install the headless Chrome the browser tests run
+        # As in `contained`: on a host that can contain a capsule, browser_in_capsule runs, and it
+        # looks in Playwright's cache before PATH. Without this it finds the image's full
+        # Chromium, which aborts in a capsule: its process singleton binds an AF_UNIX socket file,
+        # and the runtime withholds that from every capsule command. chrome-headless-shell has no
+        # singleton. 1.58.2 installs build 1208.
+        timeout-minutes: 5
+        run: npx --yes playwright@1.58.2 install chromium-headless-shell
       - name: Run the workspace test suite
         # nextest runs the tests of every binary in parallel, each in its own process, rather
         # than one binary after another. The `ci` profile in .config/nextest.toml retries a
