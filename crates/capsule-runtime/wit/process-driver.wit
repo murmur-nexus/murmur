@@ -1,4 +1,4 @@
-package murmur:driver@0.5.0;
+package murmur:driver@0.6.0;
 
 /// The contract between the runtime and a process driver: an artifact that knows how to drive
 /// one harness CLI. Pure translation; the runtime grants it nothing.
@@ -14,6 +14,31 @@ interface process {
     signal-int,
     /// The harness cannot be interrupted gracefully; the runtime kills it instead.
     unsupported,
+  }
+
+
+  /// What a harness need may do with a host path.
+  enum path-access {
+    /// Read files and list directories.
+    read,
+    /// Read, write and create, as the workdir allows, but never execute.
+    read-write,
+  }
+
+  /// A host directory the harness needs beyond what the capsule's class gives every command.
+  record path-need {
+    /// `~/<rest>`, under the home of the account `mur` runs as, or an absolute path. A directory.
+    path: string,
+    access: path-access,
+  }
+
+  /// What the harness needs beyond the capsule's own grants. Each need is granted only where the
+  /// capsule manifest also allows it; the launch is refused otherwise. `required-env` is the
+  /// environment half.
+  record harness-needs {
+    paths: list<path-need>,
+    /// Hosts the harness connects to, each spelled as a `capabilities.network.allow` entry.
+    hosts: list<string>,
   }
 
   /// What the driver drives, read once when the driver is loaded.
@@ -43,6 +68,11 @@ interface process {
     /// How the runtime asks the harness whether it is signed in for this user, without
     /// spending a turn.
     login-check: login-check,
+    /// What the harness needs beyond the capsule's own grants. Each need must also be allowed by
+    /// the capsule manifest — paths by `capabilities.harness.paths`, hosts by
+    /// `capabilities.network.allow` — or the launch is refused with `E-CAP-021`. A malformed
+    /// need is refused when the driver is loaded (`E-RUN-032`). An empty `harness-needs` is valid.
+    harness-needs: harness-needs,
   }
 
   /// How the runtime asks the harness whether it is signed in for this user, without spending

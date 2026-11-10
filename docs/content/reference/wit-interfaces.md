@@ -448,7 +448,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-edit@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 5, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 5` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 6, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 6` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-edit@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
@@ -1130,7 +1130,7 @@ the driver with an empty WASI context and grants it nothing.
 
 | Function | Called | Returns |
 |---|---|---|
-| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, whether it reports token usage, and how to ask whether it is logged in (`login-check`) |
+| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, whether it reports token usage, how to ask whether it is logged in (`login-check`), and what it needs beyond its class (`harness-needs`) |
 | `launch` | Once per run | The arguments, environment, files and stdin to run the harness with, or an error |
 | `parse` | For each batch of complete stdout lines, including those printed [after the terminal event](#process-after-terminal) | The events those lines describe |
 | `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
@@ -1297,6 +1297,32 @@ stdin, and a 10-second bound. It hands what the command printed to `read-login` 
 The person sees only the driver's reason, cut to its first line and 200 characters, never what the
 command printed. See [Process harness](cli.md#doctor-process-harness).
 
+### What the harness needs beyond its class { #process-harness-needs }
+
+`description.harness-needs` is a `harness-needs` record naming what the harness needs beyond what
+the capsule's class gives every command — the environment half stays `required-env`:
+
+| Member | Type | Value |
+|---|---|---|
+| `paths` | `list<path-need>` | Host directories the harness reads and writes |
+| `hosts` | `list<string>` | Hosts the harness connects to, each spelled as a `capabilities.network.allow` entry |
+
+Each `path-need` is a directory and what the harness may do there:
+
+| Member | Type | Value |
+|---|---|---|
+| `path` | `string` | `~/<rest>`, under the home the account `mur` runs as, or an absolute path. A directory |
+| `access` | `path-access` | `read` (read files, list directories) or `read-write` (the workdir's rights without `Execute`) |
+
+Each need is granted only where the capsule manifest also allows it: a path by
+[`capabilities.harness.paths`](manifest.md#capabilities-harness), a host by
+`capabilities.network.allow`. A path is granted at the driver's own path and access, never the wider
+manifest entry, and never with `Execute`. A need the manifest does not allow refuses the launch with
+[`E-CAP-021`](diagnostics.md#e-cap-021); a malformed need is refused when the driver loads with
+[`E-RUN-032`](diagnostics.md#e-run-032). An empty `harness-needs` is valid and declares nothing. The
+harness itself runs under the capsule's class — see
+[Containment, the process harness](containment.md#process-harness).
+
 ### Events after the terminal event { #process-after-terminal }
 
 Once the driver has returned `turn-end` or `turn-failed`, the runtime closes the harness's stdin and
@@ -1343,7 +1369,7 @@ serve it.
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
-| `murmur:driver` | `0.5.0` |
+| `murmur:driver` | `0.6.0` |
 
 | Tier | When |
 |---|---|

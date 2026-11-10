@@ -118,16 +118,22 @@
 /// One TCP listener per allowlisted port, plus the single wildcard UDP :53 resolver socket.
 pub(crate) const MAX_NAMESPACE_SOCKETS: usize = crate::egress_proxy::MAX_EGRESS_TCP_PORTS + 1;
 
+/// The one extra listener the creator opens inside the namespace for the tool bridge, on
+/// `127.0.0.1` at an ephemeral port the egress proxy never serves. Sent after the egress sockets
+/// and before the namespace handles, so nothing in the host's namespace can reach it.
+pub(crate) const BRIDGE_SOCKET_COUNT: usize = 1;
+
 /// The namespace handles the creator sends after the sockets: `/proc/self/ns/user`,
 /// `/proc/self/ns/net` and `/proc/self/ns/pid_for_children`.
 pub(crate) const NAMESPACE_HANDLE_COUNT: usize = 3;
 
-/// Every descriptor the creator child sends: the namespace sockets, then the user, network and
-/// PID namespace handles.
+/// Every descriptor the creator child sends: the egress sockets, the bridge listener, then the
+/// user, network and PID namespace handles.
 ///
 /// Bounds the one `SCM_RIGHTS` message, and therefore the fixed stack buffers the creator builds
 /// it in.
-pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + NAMESPACE_HANDLE_COUNT;
+pub(crate) const MAX_SESSION_NETNS_FDS: usize =
+    MAX_NAMESPACE_SOCKETS + BRIDGE_SOCKET_COUNT + NAMESPACE_HANDLE_COUNT;
 
 // ---------------------------------------------------------------- the creation's steps
 
@@ -1013,6 +1019,22 @@ impl SessionNetns {
         }
     }
 
+    /// A `std::net::TcpListener` over a dup of this session's tool-bridge listener — the socket the
+    /// namespace creator opened inside the namespace on `127.0.0.1`. `None` on a session whose
+    /// namespace is not established (unconfined, off Linux, environment-only), where the bridge
+    /// binds the host loopback instead. Each run takes a fresh dup; the session keeps the socket.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bridge_listener_dup(&self) -> Option<std::net::TcpListener> {
+        match &*self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SessionNetnsState::Established(established) => established.bridge_listener_dup().ok(),
+            _ => None,
+        }
+    }
+
     /// Hands one command's bind-notification listener to the session's observer. A session with
     /// no observer — never handed a held-port map, or ended — closes it at once.
     #[cfg(target_os = "linux")]
@@ -1111,8 +1133,8 @@ mod linux {
 
     use super::{
         decode_step_record, encode_step_record, CapsuleNetnsPlan, CreationStep,
-        NamespaceAttemptError, SessionNetnsJoin, MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
-        NAMESPACE_HANDLE_COUNT, STEP_RECORD_LEN,
+        NamespaceAttemptError, SessionNetnsJoin, BRIDGE_SOCKET_COUNT, MAX_NAMESPACE_SOCKETS,
+        MAX_SESSION_NETNS_FDS, NAMESPACE_HANDLE_COUNT, STEP_RECORD_LEN,
     };
 
     // ------------------------------------------------------------ netlink constants
@@ -1290,6 +1312,19 @@ mod linux {
             fds[count] = resolver;
             count += 1;
 
+            // The tool bridge's listener, on this namespace's own `127.0.0.1` at an ephemeral
+            // port. Opened here, inside the namespace, so only a process of the namespace — the
+            // harness — can reach it, and nothing in the host's namespace can. The egress proxy
+            // never serves it: it is sent after the egress sockets and taken off before them.
+            let bridge = bind_bridge_listener();
+            if bridge < 0 {
+                let failure = CreationFailure::at(CreationStep::Resolver);
+                close_all(&fds[..count]);
+                return Err(failure);
+            }
+            fds[count] = bridge;
+            count += 1;
+
             // Opened after the maps are written, so each names a namespace this child now owns.
             // `pid_for_children` is the PID namespace the holder is pid 1 of; this child itself
             // stays in the runtime's.
@@ -1391,6 +1426,9 @@ mod linux {
     /// Dropping it closes the lifeline, which ends the holder and with it the PID namespace.
     pub(crate) struct CreatedNetns {
         sockets: Vec<OwnedFd>,
+        /// The tool bridge's listener, opened on the namespace's `127.0.0.1`. Held by the session,
+        /// never handed to the egress proxy.
+        bridge_listener: OwnedFd,
         user_ns: OwnedFd,
         net_ns: OwnedFd,
         pid_ns: OwnedFd,
@@ -1422,6 +1460,7 @@ mod linux {
                 user_ns: Arc::new(self.user_ns),
                 net_ns: Arc::new(self.net_ns),
                 pid_ns: Arc::new(self.pid_ns),
+                bridge_listener: Arc::new(self.bridge_listener),
                 lifeline: self.lifeline,
                 proxy,
             })
@@ -1438,6 +1477,7 @@ mod linux {
         user_ns: Arc<OwnedFd>,
         net_ns: Arc<OwnedFd>,
         pid_ns: Arc<OwnedFd>,
+        bridge_listener: Arc<OwnedFd>,
         lifeline: OwnedFd,
         proxy: crate::egress_proxy::EgressProxyHandle,
     }
@@ -1449,6 +1489,15 @@ mod linux {
                 net_ns: Arc::clone(&self.net_ns),
                 pid_ns: Arc::clone(&self.pid_ns),
             }
+        }
+
+        /// A fresh `std::net::TcpListener` over a dup of the bridge listener, so each run gets its
+        /// own listener (dropped at the run's end) while the session keeps the socket for its
+        /// life. Dups share the one kernel socket, so `accept` on either reaches the harness's
+        /// connection.
+        pub(super) fn bridge_listener_dup(&self) -> std::io::Result<std::net::TcpListener> {
+            let dup = self.bridge_listener.try_clone()?;
+            Ok(std::net::TcpListener::from(dup))
         }
 
         /// Stops the proxy, closes the holder's lifeline and drops this session's hold on the
@@ -1569,8 +1618,12 @@ mod linux {
                 let pid_ns = fds.pop().expect("the count was checked on receipt");
                 let net_ns = fds.pop().expect("the count was checked on receipt");
                 let user_ns = fds.pop().expect("the count was checked on receipt");
+                // The bridge listener was sent after the egress sockets and before the handles,
+                // so it is the last entry once the three handles are off.
+                let bridge_listener = fds.pop().expect("the count was checked on receipt");
                 Ok(CreatedNetns {
                     sockets: fds,
+                    bridge_listener,
                     user_ns,
                     net_ns,
                     pid_ns,
@@ -1814,6 +1867,39 @@ mod linux {
         }
     }
 
+    /// A TCP listener bound to `127.0.0.1:0` inside the namespace, for the tool bridge, or `-1`.
+    ///
+    /// Loopback, not the wildcard address the egress listeners use: the bridge is reached only
+    /// from inside this namespace, never forwarded, so it binds the namespace's own loopback and
+    /// the kernel picks an ephemeral port the egress listeners did not take.
+    ///
+    /// # Safety
+    /// Post-`fork()`, pre-exec child context only.
+    unsafe fn bind_bridge_listener() -> RawFd {
+        // SAFETY: `address` is a live, zeroed `sockaddr_in`; every failure path closes the fd.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                return -1;
+            }
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = 0u16.to_be();
+            address.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            if libc::bind(
+                fd,
+                std::ptr::addr_of!(address).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ) != 0
+                || libc::listen(fd, 128) != 0
+            {
+                libc::close(fd);
+                return -1;
+            }
+            fd
+        }
+    }
+
     /// A UDP socket bound to `0.0.0.0:53` inside the namespace with `IP_PKTINFO` enabled, or
     /// `-1`.
     ///
@@ -2013,11 +2099,12 @@ mod linux {
             if msg.msg_flags & libc::MSG_CTRUNC != 0 {
                 return Err("the namespace hand-off was truncated".to_string());
             }
-            if count != expected_sockets + NAMESPACE_HANDLE_COUNT {
+            if count != expected_sockets + BRIDGE_SOCKET_COUNT + NAMESPACE_HANDLE_COUNT {
                 return Err(format!(
                     "the namespace creator handed over {count} descriptors; {} were expected \
-                     ({expected_sockets} sockets and {NAMESPACE_HANDLE_COUNT} namespace handles)",
-                    expected_sockets + NAMESPACE_HANDLE_COUNT
+                     ({expected_sockets} egress sockets, {BRIDGE_SOCKET_COUNT} bridge listener \
+                     and {NAMESPACE_HANDLE_COUNT} namespace handles)",
+                    expected_sockets + BRIDGE_SOCKET_COUNT + NAMESPACE_HANDLE_COUNT
                 ));
             }
             Ok(Received::Handles(fds))
@@ -2851,8 +2938,11 @@ mod tests {
             force_pid_namespace_failure: false,
         };
         assert!(plan.socket_count() <= MAX_NAMESPACE_SOCKETS);
-        // The three namespace handles ride in the same message.
-        assert_eq!(MAX_SESSION_NETNS_FDS, MAX_NAMESPACE_SOCKETS + 3);
+        // The bridge listener and the three namespace handles ride in the same message.
+        assert_eq!(
+            MAX_SESSION_NETNS_FDS,
+            MAX_NAMESPACE_SOCKETS + BRIDGE_SOCKET_COUNT + 3
+        );
     }
 
     // ---- the session's namespace ---------------------------------------------------------

@@ -73,7 +73,7 @@
 use crate::verdict::{Category, Expectation, Verdict};
 use murmur_artifact::ContainmentClass;
 
-use Expectation::{KnownGap, Must, NotAsserted};
+use Expectation::{Must, NotAsserted};
 use Verdict::{Allowed, Contained, Refused, Succeeded};
 
 /// Work the harness performs on the host, before `mur run`, to set a case up.
@@ -179,14 +179,15 @@ pub struct Case {
     pub advisory: Expectation,
     pub scoped: Expectation,
     pub sealed: Expectation,
-    /// The expectation on [`Route::ProcessHarness`], the same at every class because the harness
-    /// is spawned the same way at every class. `None`: the case does not run on that route.
+    /// The expectation on [`Route::ProcessHarness`], per class: the harness runs under the
+    /// session's class exactly like a shell command, so its verdict at a class matches the
+    /// shell-tool verdict at that class. `None`: the case does not run on that route.
     ///
     /// Only a boundary case graded on its probe file can run there: the harness route has no
     /// shell tool, so no tool result for [`Evidence::ShellExit`] or
     /// [`Evidence::SecondSpawnRefused`] to read, no resource ceilings to bound a resource case on
     /// the host, and no `mur` launch of its own for [`Prepare::LeakFdIntoMur`] to wrap.
-    pub harness: Option<Expectation>,
+    pub harness: Option<HarnessExpectation>,
     pub prepare: Prepare,
     pub evidence: Evidence,
     pub profile: Profile,
@@ -222,8 +223,38 @@ impl Case {
     pub fn expectation_on(&self, route: Route, class: ContainmentClass) -> Option<Expectation> {
         match route {
             Route::ShellTool => Some(self.expectation(class)),
-            Route::ProcessHarness => self.harness,
+            Route::ProcessHarness => self.harness.map(|harness| harness.at(class)),
         }
+    }
+}
+
+/// The process-harness route's expectation per class: since the harness now runs under the
+/// session's class exactly as a shell command does, a case's harness verdict at a class is its
+/// shell-tool verdict at that class. Held per class so `symlink-escape`, whose composed root
+/// exposes `/etc/passwd`, can be `REFUSED` at `scoped` and `ALLOWED` at `sealed` on both routes.
+#[derive(Debug, Clone, Copy)]
+pub struct HarnessExpectation {
+    pub advisory: Expectation,
+    pub scoped: Expectation,
+    pub sealed: Expectation,
+}
+
+impl HarnessExpectation {
+    /// This expectation under `class`.
+    pub fn at(self, class: ContainmentClass) -> Expectation {
+        match class {
+            ContainmentClass::Advisory => self.advisory,
+            ContainmentClass::Scoped => self.scoped,
+            ContainmentClass::Sealed => self.sealed,
+            ContainmentClass::Unconfined => {
+                unreachable!("the harness runs the declarable classes only")
+            }
+        }
+    }
+
+    /// Every expectation across the three classes, for the known-gap and attribution counts.
+    pub fn all(self) -> [Expectation; 3] {
+        [self.advisory, self.scoped, self.sealed]
     }
 }
 
@@ -246,7 +277,11 @@ pub const PREFLIGHT: Case = Case {
     advisory: Must(Succeeded),
     scoped: Must(Succeeded),
     sealed: Must(Succeeded),
-    harness: Some(Must(Succeeded)),
+    harness: Some(HarnessExpectation {
+        advisory: Must(Succeeded),
+        scoped: Must(Succeeded),
+        sealed: Must(Succeeded),
+    }),
     prepare: Prepare::None,
     evidence: Evidence::ProbeFile,
     profile: Profile::Boundary,
@@ -271,7 +306,7 @@ pub const RESOURCE_CASE_COUNT: usize = 5;
 pub const PROCESS_HARNESS_CASE_COUNT: usize = 2;
 /// Expectations, across every route and class column, that assert a known gap. Held by the tests
 /// for the same reason: a known gap cannot quietly become `NotAsserted` or leave the registry.
-pub const KNOWN_GAP_EXPECTATION_COUNT: usize = 2;
+pub const KNOWN_GAP_EXPECTATION_COUNT: usize = 0;
 
 /// Every case, boundary first. Order is the order they run and the order they are reported.
 pub const REGISTRY: &[Case] = &[
@@ -333,14 +368,19 @@ def main():
                       for the command at all. NOT ASSERTED AT `advisory`: `advisory` and \
                       `unconfined` reach the key by design, which is why only the `mur` process \
                       signs and a record sealed under those tiers proves less. \
-                      KNOWN GAP ON `process-harness`: the runtime spawns a process harness with \
-                      a cleared environment and no containment at any class, so the harness \
-                      opens the key as the operator. Asserted ALLOWED until the harness runs \
-                      under the declared class.",
+                      ON `process-harness`: the harness now runs under the session's class \
+                      exactly like a shell command, so the open is REFUSED at `scoped` (Landlock) \
+                      and at `sealed` (the composed root reproduces no `~/.murmur/keys`), matching \
+                      the shell-tool route. NOT ASSERTED at `advisory`, where the harness reaches \
+                      the key by design, as the shell tool does.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
-        harness: Some(KnownGap(Allowed)),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
         prepare: Prepare::WriteSealKeyPath {
             dest: "seal-key-path.txt",
         },
@@ -446,11 +486,15 @@ def main():
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
                       is never mistaken for a contained read.\
-                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding. KNOWN GAP ON `process-harness`: the harness runs with no containment at any class, so it reads `/etc/passwd` through the link whatever the class declares. Asserted ALLOWED until the harness runs under the declared class.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding. ON `process-harness`: the harness now runs under the session's class exactly like a shell command, so the read through the link is REFUSED at `scoped` (Landlock resolves the link and refuses the target) and ALLOWED at `sealed` (the composed root exposes `/etc/passwd`), matching the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Allowed),
-        harness: Some(KnownGap(Allowed)),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Allowed),
+        }),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1800,7 +1844,7 @@ mod tests {
                      attribution, or promote it to Must(_) from a real measurement",
                     case.id
                 ),
-                Must(_) | KnownGap(_) => {}
+                Must(_) | Expectation::KnownGap(_) => {}
             }
         }
         // The other direction, so the exemption list cannot outlive the cases it names.
@@ -1892,7 +1936,10 @@ mod tests {
         }
         // The preflight runs on both routes, so a host where the harness cannot start a probe is
         // refused rather than graded.
-        assert_eq!(PREFLIGHT.harness, Some(Must(Succeeded)));
+        let preflight_harness = PREFLIGHT
+            .harness
+            .expect("preflight runs on the harness route");
+        assert_eq!(preflight_harness.all(), [Must(Succeeded); 3]);
     }
 
     /// The known-gap count guard: a known gap cannot be dropped, demoted to `NotAsserted` or
@@ -1902,14 +1949,21 @@ mod tests {
     fn known_gaps_are_counted_and_named_in_their_attribution() {
         let mut gaps = Vec::new();
         for case in REGISTRY {
-            let expectations = [
-                ("advisory", Some(case.advisory)),
-                ("scoped", Some(case.scoped)),
-                ("sealed", Some(case.sealed)),
-                (Route::ProcessHarness.as_str(), case.harness),
+            let mut columns: Vec<(&str, Expectation)> = vec![
+                ("advisory", case.advisory),
+                ("scoped", case.scoped),
+                ("sealed", case.sealed),
             ];
-            for (column, expectation) in expectations {
-                if expectation.is_some_and(Expectation::is_known_gap) {
+            if let Some(harness) = case.harness {
+                for (class, expectation) in ["advisory", "scoped", "sealed"]
+                    .into_iter()
+                    .zip(harness.all())
+                {
+                    columns.push((class, expectation));
+                }
+            }
+            for (column, expectation) in columns {
+                if expectation.is_known_gap() {
                     gaps.push(format!("{} {column}", case.id));
                     assert!(
                         case.attribution.contains("KNOWN GAP"),
@@ -1924,12 +1978,15 @@ mod tests {
             KNOWN_GAP_EXPECTATION_COUNT,
             "known gaps: {gaps:?}"
         );
+        let preflight_gap = PREFLIGHT
+            .harness
+            .map(|harness| harness.all().iter().any(|e| e.is_known_gap()))
+            .unwrap_or(false)
+            || [PREFLIGHT.advisory, PREFLIGHT.scoped, PREFLIGHT.sealed]
+                .iter()
+                .any(|e| e.is_known_gap());
         assert!(
-            !PREFLIGHT
-                .harness
-                .into_iter()
-                .chain([PREFLIGHT.advisory, PREFLIGHT.scoped, PREFLIGHT.sealed])
-                .any(Expectation::is_known_gap),
+            !preflight_gap,
             "the preflight asserts that a probe can run, never a gap"
         );
     }

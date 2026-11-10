@@ -92,3 +92,90 @@ pub(crate) fn capsule_writable_trees(workdir_root: &Path) -> Option<Vec<PathBuf>
             .collect(),
     )
 }
+
+/// The `harness` report a launch of a `transport: process` capsule would record, resolved
+/// read-only from the stores for `mur run --explain-scope`: the installed driver's needs against
+/// the manifest and this host, with every need's status. `None` when the capsule's transport is
+/// not `process`. A driver declared with `source:`, or one neither store holds, is an
+/// `unresolved` report naming why — explain-scope exits 0 either way.
+///
+/// `command` is `inference.command`; `workdir` is the launch's work folder root. Read-only:
+/// nothing is pulled, compiled or written beyond describing the driver.
+pub(crate) fn installed_harness_report(
+    runtime_manifest: &murmur_artifact::RuntimeManifest,
+    policy: &capsule_runtime::CapabilityPolicy,
+    project_dir: &Path,
+    lock: Option<&MurmurLock>,
+    workdir: &Path,
+) -> Result<Option<capsule_runtime::HarnessReport>, CliError> {
+    let Some(inference) = runtime_manifest
+        .inference
+        .as_ref()
+        .filter(|inference| inference.transport == "process")
+    else {
+        return Ok(None);
+    };
+    let Some(driver_name) = inference
+        .driver
+        .as_ref()
+        .map(|driver| driver.artifact.clone())
+    else {
+        return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+            "<none>",
+            "the manifest names no inference.driver".to_string(),
+        )));
+    };
+    // The driver's declared entry: a `source:` driver holds no installed bytes.
+    let declared = runtime_manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == driver_name);
+    if declared.is_some_and(|artifact| artifact.source.is_some()) {
+        return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+            &driver_name,
+            format!("driver {driver_name} is a local source, whose bytes are not held here"),
+        )));
+    }
+    let version = match (lock, declared) {
+        (Some(lock), _) => match lock.artifact_for(&driver_name) {
+            Some(entry) => entry.resolved_version.clone(),
+            None => {
+                return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+                    &driver_name,
+                    format!("driver {driver_name} is not pinned in murmur.lock"),
+                )))
+            }
+        },
+        (None, Some(artifact)) => artifact.version.clone(),
+        (None, None) => {
+            return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+                &driver_name,
+                format!("driver {driver_name} is not declared in artifacts:"),
+            )))
+        }
+    };
+    let registry = FallbackRegistry {
+        primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
+        secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
+    };
+    let Ok(name) = ArtifactName::parse(&driver_name) else {
+        return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+            &driver_name,
+            format!("driver {driver_name} is not a valid artifact name"),
+        )));
+    };
+    let Ok(resolved) = registry.resolve(&name, &version) else {
+        return Ok(Some(capsule_runtime::harness_needs::unresolved_report(
+            &driver_name,
+            format!("driver {driver_name}@{version} is not installed"),
+        )));
+    };
+    Ok(Some(capsule_runtime::harness_needs_report(
+        &resolved.bytes,
+        &driver_name,
+        &version,
+        inference.command.as_deref(),
+        policy,
+        workdir,
+    )))
+}

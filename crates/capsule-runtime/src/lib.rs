@@ -49,6 +49,7 @@ pub(crate) mod gateway_credential;
 pub mod guest_roots;
 pub mod guest_worker;
 pub mod harness_check;
+pub mod harness_needs;
 pub(crate) mod harness_session;
 pub(crate) mod held_ports;
 pub(crate) mod hooks;
@@ -349,8 +350,10 @@ pub use workdir_writes::{
 // Whether a `transport: process` capsule's harness is installed, tested and logged in, asked
 // without launching a session.
 pub use harness_check::{
-    check_process_harness, HarnessBinary, HarnessCheck, HarnessLogin, HarnessVersion,
+    check_process_harness, harness_needs_report, HarnessBinary, HarnessCheck, HarnessLogin,
+    HarnessVersion,
 };
+pub use harness_needs::HarnessReport;
 // The served version of each `murmur:*` package, and the WIT levels: the committed, numbered sets
 // of those versions, the newest of which is the one this host serves.
 pub use wit_versions::{served_wit_level, wit_levels, SERVED_WIT_PACKAGES, WIT_LEVELS_FILE};

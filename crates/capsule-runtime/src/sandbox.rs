@@ -2522,6 +2522,17 @@ pub(crate) struct ShellEnforcement {
     pub(crate) host_path_read_only_binds: Vec<PathBuf>,
 }
 
+/// What a `transport: process` harness is granted beyond every command: the host paths the
+/// manifest allowed its driver's needs, and the resolved harness binary (and `#!` interpreter).
+/// Passed to [`ShellEnforcement::with_harness_grants`], which derives the harness's enforcement.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessEnforcementGrants {
+    pub(crate) granted_paths: Vec<crate::host_paths::HostPath>,
+    pub(crate) binary: PathBuf,
+    pub(crate) interpreter: Option<PathBuf>,
+}
+
 impl ShellEnforcement {
     /// Resolves tier + network allowlist + canonical exec allowlist once, at launch time.
     ///
@@ -2678,6 +2689,12 @@ impl ShellEnforcement {
         self.runtime_dir.as_ref().map(|roots| roots.runtime.path())
     }
 
+    /// The session's network namespace, shared, for the tool bridge to open its in-namespace
+    /// listener on.
+    pub(crate) fn session_netns(&self) -> Arc<crate::network_namespace::SessionNetns> {
+        Arc::clone(&self.session_netns)
+    }
+
     /// The session's records directory, held. `None` for an enforcement held outside a session.
     pub(crate) fn records_root(&self) -> Option<&crate::workdir_fs::WorkdirRoot> {
         self.runtime_dir
@@ -2797,6 +2814,68 @@ impl ShellEnforcement {
         self.cgroup_scope = cgroup_scope;
         self.workdir_guard = workdir_guard;
         self
+    }
+
+    /// This session's enforcement plus exactly what a `transport: process` harness gets beyond
+    /// every command: the granted host paths (a Landlock rule each, a bind on `sealed`) and the
+    /// resolved harness binary as an executable grant — its file and `DT_NEEDED` closure, its
+    /// folder bound on `sealed` — exactly like a `capabilities.shell.allow` binary, plus the
+    /// interpreter a `#!` script names. A shell command keeps the session enforcement without any
+    /// of this. On `Unconfined`/`EnvironmentOnly` nothing is added: there is no Landlock domain.
+    ///
+    /// Derived once per staging. Fails closed on a Landlock tier where a granted read-write host
+    /// path overlaps the harness's own executable folder.
+    pub(crate) fn with_harness_grants(
+        &self,
+        grants: &HarnessEnforcementGrants,
+    ) -> Result<Self, String> {
+        let mut enforcement = self.clone();
+        if matches!(
+            self.tier,
+            EnforcementTier::Unconfined | EnforcementTier::EnvironmentOnly
+        ) {
+            return Ok(enforcement);
+        }
+        // The granted paths join the session's host paths: a Landlock rule each on both Landlock
+        // tiers, never executable, and a bind at its own path on `sealed`.
+        enforcement
+            .host_paths
+            .extend(grants.granted_paths.iter().cloned());
+        // The harness binary (and its `#!` interpreter) granted exactly as a `shell.allow` binary:
+        // its file and `DT_NEEDED` closure as non-listable executable Landlock rules.
+        let exec_paths: Vec<PathBuf> = std::iter::once(grants.binary.clone())
+            .chain(grants.interpreter.clone())
+            .collect();
+        let closure = resolve_landlock_grants(&exec_paths);
+        // The sealed binds for the harness binary's and interpreter's own folders, so the
+        // composed root carries them.
+        for file in &exec_paths {
+            if let Some(dir) = file.parent() {
+                push_sealed_bind_dir(&mut enforcement.sealed_bind_dirs, dir.to_path_buf());
+            }
+        }
+        // The execute roots the harness binary adds, for the host-path check: a granted read-write
+        // path overlapping one is refused on `KernelFull` and bound read-only on `KernelSealed`.
+        let harness_exec_roots: Vec<crate::host_paths::ExecuteRoot> = closure
+            .iter()
+            .filter_map(|file| {
+                file.parent().map(|dir| crate::host_paths::ExecuteRoot {
+                    dir: dir.to_path_buf(),
+                    because: file.clone(),
+                })
+            })
+            .collect();
+        let extra_binds = crate::host_paths::check_execute_roots(
+            &enforcement.host_paths,
+            &harness_exec_roots,
+            host_path_mechanism(self.tier),
+        )
+        .map_err(|refusal| refusal.to_string())?;
+        enforcement.host_path_read_only_binds.extend(extra_binds);
+        enforcement
+            .landlock_grants
+            .extend(LandlockGrant::non_listable_files(closure));
+        Ok(enforcement)
     }
 
     /// The `RLIMIT_NPROC` decision for one spawn, made in the parent before its `pre_exec`

@@ -283,6 +283,17 @@ pub struct CapabilityPolicy {
     /// Landlock rule for commands and plan shell steps; on `sealed` also a required
     /// bind at its own path. Never executable. WASM tools' preopens do not include them.
     pub host_paths: Vec<crate::host_paths::HostPath>,
+    /// `capabilities.harness.paths`, verbatim and in declaration order — the host directories this
+    /// `transport: process` capsule grants its harness, beyond what its class gives every command.
+    /// Empty by default, which is deny. A grant here reaches the process harness and what it runs,
+    /// never a shell command. The allow rule, resolution and reporting live in
+    /// [`crate::harness_needs`]; this is only the declared manifest entries.
+    pub harness_paths: Vec<murmur_artifact::HarnessPathEntry>,
+    /// Whether `inference.transport` is `process`. Not a grant: a fact the subprocess-route and
+    /// harness-grant resolution read, so a process capsule needs the network namespace and cgroup
+    /// scope a subprocess capsule needs ([`crate::runtime::has_subprocess_route_at_staging`]) and
+    /// `capabilities.harness.paths` is valid only where it is `true`.
+    pub process_transport: bool,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -603,6 +614,12 @@ pub struct StagedProcessDriver {
     /// Where [`Self::binary`]'s name came from, for diagnostics and the trace: `inference.command`
     /// or the process driver's `describe()`.
     pub(crate) binary_source: String,
+    /// The harness's resolved needs against the manifest ([`crate::harness_needs`]): the report
+    /// `session_start.effective_grants.harness` carries, set on the session's `ScopeReport`.
+    pub(crate) harness_report: crate::harness_needs::HarnessReport,
+    /// What the harness gets beyond every command — the granted host paths and the resolved binary
+    /// and `#!` interpreter — for [`crate::sandbox::ShellEnforcement::with_harness_grants`].
+    pub(crate) harness_grants: crate::sandbox::HarnessEnforcementGrants,
 }
 
 pub struct StagedSession {
@@ -1073,6 +1090,14 @@ pub fn capability_policy_from_runtime_manifest(
         shell_declared_needs: Vec::new(),
         shell_pinned_programs: Vec::new(),
         host_paths: Vec::new(),
+        harness_paths: caps
+            .and_then(|c| c.harness.as_ref())
+            .map(|harness| harness.paths.clone())
+            .unwrap_or_default(),
+        process_transport: manifest
+            .inference
+            .as_ref()
+            .is_some_and(|inference| inference.transport == "process"),
         env_allow,
         limits,
         resources,

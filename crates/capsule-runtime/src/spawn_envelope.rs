@@ -463,6 +463,7 @@ mod tests {
                 conversation: None,
                 plan: None,
                 install: None,
+                harness: None,
                 containment: None,
             };
             let narrowed = ToolCapabilityGrant::derive(Some(&capabilities), &ceiling_rules, "cap")

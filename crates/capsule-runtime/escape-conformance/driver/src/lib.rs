@@ -15,8 +15,9 @@ wit_bindgen::generate!({
 });
 
 use exports::murmur::driver::process::{
-    Description, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan, LaunchRequest,
-    LoginCheck, LoginOutput, LoginState, ToolCallInfo, ToolResultInfo, TurnFailure, Usage,
+    Description, Event, ExitStatus, FailureKind, Guest, HarnessNeeds, InterruptMethod, LaunchPlan,
+    LaunchRequest, LoginCheck, LoginOutput, LoginState, ToolCallInfo, ToolResultInfo, TurnFailure,
+    Usage,
 };
 
 /// The `probe-driver` version this driver reads. `probe-driver --version` prints it as
@@ -46,6 +47,12 @@ impl Guest for ProbeDriver {
             // reported nothing would be refused at staging on any host with a token ceiling.
             reports_usage: true,
             login_check: LoginCheck::Unavailable(NO_LOGIN.to_string()),
+            // The escape harness needs nothing beyond its class: the probe tests denial, so no
+            // grant is declared.
+            harness_needs: HarnessNeeds {
+                paths: Vec::new(),
+                hosts: Vec::new(),
+            },
         }
     }
 

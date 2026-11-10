@@ -5658,6 +5658,7 @@ mod tests {
             conversation: None,
             plan: None,
             install: None,
+            harness: None,
             containment: None,
         };
         HookCapabilityGrant::derive(Some(&caps), "test-capsule").expect("grant is valid")

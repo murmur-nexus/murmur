@@ -142,6 +142,7 @@ pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names
 pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but binds no api_key and does not declare keyless: true
 pub const E_CAP_019: &str = "E-CAP-019"; // a process driver requires a variable capabilities.env.allow does not declare
 pub const E_CAP_020: &str = "E-CAP-020"; // two declared artifacts share a tool name
+pub const E_CAP_021: &str = "E-CAP-021"; // a process driver's harness needs are not allowed by the capsule manifest
 
 /// The hint on every `E-CAP-018` refusal, from the manifest parser and from staging alike.
 pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
@@ -1040,6 +1041,19 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 "add each variable to capabilities.env.allow — the harness sees only variables \
                  the manifest declares",
+            ),
+            error @ RuntimeError::HarnessNeedsNotAllowed { .. } => CliError::with_hint(
+                E_CAP_021,
+                error.to_string(),
+                "grant each path under capabilities.harness.paths (on this transport: process \
+                 capsule) and each host under capabilities.network.allow — the harness reaches \
+                 only what the manifest also allows, never more than the class gives every command",
+            ),
+            error @ RuntimeError::HarnessPathsRequireProcessTransport => CliError::with_hint(
+                E_CAP_021,
+                error.to_string(),
+                "remove capabilities.harness, or set inference.transport: process — the block \
+                 reaches the process harness and nothing else",
             ),
             error @ RuntimeError::HarnessBinaryNotFound { .. } => CliError::with_hint(
                 E_RUN_006,

@@ -650,7 +650,9 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
     println!("S6: the inactivity window kills a silent harness and never a working one");
     let debug = [("MURMUR_DEBUG_PROCESS_INACTIVITY_MS", DEBUG_INACTIVITY_MS)];
 
-    let capsule = Built::new().build();
+    // The `silent`/`chatty`/`bridge-busy` profiles exec `sleep`; under the class the harness runs
+    // it only when `capabilities.shell.allow` grants it.
+    let capsule = Built::new().shell(&["sleep"]).build();
     let started = Instant::now();
     let run = capsule.run("silent", &debug).failed();
     // A hang guard only, far inside the profile's `sleep 600`: a whole debug-build `mur run`
@@ -674,13 +676,13 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
     assert!(failed.get("provider_status").is_none(), "{failed}");
 
     // Three seconds of output, in half-second steps: each line resets the window.
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["sleep"]).build();
     let run = capsule.run("chatty", &debug).succeeded();
     assert_eq!(run.result(), "CHATTY-RESULT");
     assert_eq!(run.one("harness_exit")["cause"], "terminal");
 
     // The same again with nothing on stdout: only bridge traffic keeps it alive.
-    let capsule = Built::new().with_tool().build();
+    let capsule = Built::new().with_tool().shell(&["sleep"]).build();
     let run = capsule.run("bridge-busy", &debug).succeeded();
     assert_eq!(run.result(), "BRIDGE-BUSY-RESULT");
     assert_eq!(run.one("harness_exit")["cause"], "terminal");
@@ -689,7 +691,7 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
 #[test]
 fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
     println!("S6: a harness that ignores stdin closing is killed after the exit grace");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["sleep"]).build();
     let started = Instant::now();
     let run = capsule.run("linger", &[]).succeeded();
     assert_eq!(run.result(), "LINGER");
@@ -878,7 +880,12 @@ fn s7_an_unconfined_harness_inherits_the_operators_environment() {
 #[test]
 fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     println!("S7: the harness environment is the allowlist plus the plan's env-set, nothing else");
-    let capsule = Built::new().with_tool().build();
+    // The `env` profile execs `env | cut | sort | tr` and `ls`; under the class the harness runs
+    // them only when `capabilities.shell.allow` grants them.
+    let capsule = Built::new()
+        .with_tool()
+        .shell(&["env", "cut", "sort", "tr", "ls"])
+        .build();
     let run = capsule
         .run(
             "env",
@@ -902,10 +909,12 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
         .filter(|name| !matches!(*name, "PWD" | "SHLVL" | "_" | "OLDPWD"))
         .collect();
     names.sort_unstable();
+    // On a contained class the harness also carries the session's TMPDIR/TMP/TEMP, like every
+    // command — see the process environment reference.
     assert_eq!(
         names.join(","),
         "FIXTURE_BRIDGE_TOKEN,FIXTURE_BRIDGE_TOOLS,FIXTURE_BRIDGE_URL,FIXTURE_FILES,\
-         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RECORDS_DIR,MURMUR_RUNTIME_DIR,PATH",
+         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RECORDS_DIR,MURMUR_RUNTIME_DIR,PATH,TEMP,TMP,TMPDIR",
         "{env_note}"
     );
     assert!(
@@ -944,7 +953,10 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
             "HOME",
             "MURMUR_RECORDS_DIR",
             "MURMUR_RUNTIME_DIR",
-            "PATH"
+            "PATH",
+            "TEMP",
+            "TMP",
+            "TMPDIR"
         ])
     );
     assert_eq!(start["files"], serde_json::json!(["config.json"]));
@@ -1297,7 +1309,9 @@ fn names(value: &Value) -> Vec<&str> {
 #[test]
 fn s15_the_harness_runs_as_the_hosts_account() {
     println!("S15: the harness gets the host's USER and LOGNAME and no credential");
-    let capsule = Built::new().build();
+    // The `account` profile execs `env | cut | sort | tr`; under the class the harness runs them
+    // only when `capabilities.shell.allow` grants them.
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(
         &capsule,
         &[
@@ -1337,7 +1351,7 @@ fn s15_the_harness_runs_as_the_hosts_account() {
 #[test]
 fn s15_a_host_without_account_names_hands_the_harness_none() {
     println!("S15: a host that sets neither name leaves both unset and the record says so");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(&capsule, &[]);
 
     assert_eq!(account, "account USER=unset LOGNAME=unset");
@@ -1360,7 +1374,7 @@ fn s15_a_host_without_account_names_hands_the_harness_none() {
 #[test]
 fn s15_one_account_name_never_supplies_the_other() {
     println!("S15: a host that sets only USER delivers USER and no LOGNAME");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(&capsule, &[("USER", "murmur-fixture-user")]);
 
     assert_eq!(account, "account USER=murmur-fixture-user LOGNAME=unset");

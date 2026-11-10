@@ -391,6 +391,16 @@ pub fn declare_host_paths(
     Ok(declared)
 }
 
+/// `path` made absolute against `home` (`~` and `~/…`) and folded lexically, without touching the
+/// filesystem, so an ancestor comparison over the result is purely lexical. The shape rules of
+/// [`declare_host_paths`] are not re-checked here: the harness-need path is validated at driver
+/// load. Shared by [`crate::harness_needs`], which compares driver needs and manifest grants.
+pub(crate) fn expand_and_fold(path: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    Ok(crate::protected_paths::normalize_absolute(&expand_home(
+        path, home,
+    )?))
+}
+
 /// `path` made absolute: `~` and `~/…` against `home`; anything else must already be absolute.
 fn expand_home(path: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     let rest = if path == "~" {

@@ -280,7 +280,8 @@ fn list_cases() {
         cases::in_category(Category::ResourceExhaustion).count()
     );
     println!(
-        "  routes: {} (every case, per class), {} ({} cases, the same at every class)\n",
+        "  routes: {} (every case, per class), {} ({} cases, per class — the harness runs under \
+         the session's class exactly like a shell command)\n",
         Route::ShellTool.as_str(),
         Route::ProcessHarness.as_str(),
         cases::all_cases()
@@ -289,7 +290,7 @@ fn list_cases() {
             .count()
     );
     println!(
-        "{:<34} {:<20} {:<20} {:<20} {:<20} PROCESS-HARNESS",
+        "{:<34} {:<20} {:<20} {:<20} {:<20} HARNESS SCOPED/SEALED",
         "CASE", "CATEGORY", "SHELL-TOOL ADVISORY", "SHELL-TOOL SCOPED", "SHELL-TOOL SEALED"
     );
     for case in cases::all_cases() {
@@ -303,16 +304,18 @@ fn list_cases() {
             case.scoped.as_str(),
             case.sealed.as_str(),
             case.harness
-                .map(|e| e.as_str())
+                .map(|harness| {
+                    format!("{} / {}", harness.scoped.as_str(), harness.sealed.as_str())
+                })
                 .unwrap_or_else(|| "—".to_string())
         );
     }
     println!(
-        "\n`known-gap: <VERDICT>` asserts a route that is not contained today, at the verdict it \
-         measurably produces. It gates: a run whose verdict differs fails with exit 5, so a change \
-         that closes the gap flips the expectation in the same change. It is never counted as a \
-         boundary pass or an escape. `—` in the PROCESS-HARNESS column means the case does not \
-         run on that route.\n\n\
+        "\nThe HARNESS column shows the process-harness route's verdict at `scoped` / `sealed`: \
+         the harness runs under the session's class exactly like a shell command, so each matches \
+         the shell-tool verdict at that class. `—` means the case does not run on that route. A \
+         `known-gap: <VERDICT>` expectation, where one is still asserted, gates with exit 5 on \
+         drift.\n\n\
          `not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
          but nothing can pass or fail, because there is no claim to compare the result against. \
          It appears for two different reasons and they must not be conflated.\n\

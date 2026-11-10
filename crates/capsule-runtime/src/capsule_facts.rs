@@ -30,8 +30,9 @@ pub(crate) struct CapsuleFacts {
     pub(crate) max_turns: Option<u32>,
     /// `inference.max_session_tokens`.
     pub(crate) max_session_tokens: Option<u64>,
-    /// The limits on what the runtime itself spawns. `None` on `transport: process`: the harness
-    /// is spawned without the session's rlimits and runs its own commands outside them.
+    /// The limits on what the runtime itself spawns — a WASM guest's command, or a
+    /// `transport: process` harness, which runs under the session's per-command rlimits like
+    /// every command. `None` only when no limit is in force.
     pub(crate) dispatch_limits: Option<DispatchLimits>,
     /// Whether `capabilities.shell.allow` names a shell interpreter. The interpreter's tool runs
     /// its `command` through `-c` with `$MURMUR_RUNTIME_DIR` set, so the variable expands there; a
@@ -69,12 +70,19 @@ impl CapsuleFacts {
     ) -> Self {
         runtime_dir_tools.sort();
         runtime_dir_tools.dedup();
-        let dispatch_limits = (inference.transport != "process").then(|| DispatchLimits {
+        // A process harness runs under the session's rlimits (`memory_bytes`, `cpu_seconds`), like
+        // every command. The runtime never demotes a harness's own commands on a clock, so a
+        // process capsule's facts carry no `shell_grace_secs`.
+        let dispatch_limits = Some(DispatchLimits {
             memory_bytes: policy.resources.memory_bytes,
             cpu_seconds: policy.resources.cpu_seconds,
-            shell_grace_secs: lifecycle
-                .shell_grace_secs
-                .filter(|_| !policy.shell_allow.is_empty()),
+            shell_grace_secs: if inference.transport == "process" {
+                None
+            } else {
+                lifecycle
+                    .shell_grace_secs
+                    .filter(|_| !policy.shell_allow.is_empty())
+            },
         });
         Self {
             read_only_paths: policy.read_only_paths.clone(),
@@ -119,7 +127,7 @@ impl CapsuleFacts {
     }
 
     /// [`Self::limit_parts`] as one sentence, or `none` when the session declares no limit the
-    /// text can state (a `transport: process` capsule with neither turn nor token limit).
+    /// text can state (every per-command limit at its zero default and no turn or token limit).
     pub(crate) fn limits_sentence(&self) -> String {
         let parts = self.limit_parts();
         if parts.is_empty() {
@@ -309,12 +317,18 @@ mod tests {
         );
     }
 
-    /// The harness of a process capsule is spawned without the session's rlimits, and its own
-    /// commands are neither bounded nor demoted by the runtime.
+    /// A process capsule's harness runs under the session's per-command rlimits, like every
+    /// command; the runtime never demotes the harness's own commands on a clock, so its facts
+    /// carry memory and CPU but no shell grace.
     #[test]
-    fn capsule_facts_of_a_process_capsule_carry_turns_and_tokens_only() {
+    fn capsule_facts_of_a_process_capsule_state_the_per_command_limits() {
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                memory_bytes: 1_073_741_824,
+                cpu_seconds: Some(120),
+                ..crate::resources::HostResourceLimits::default()
+            },
             ..CapabilityPolicy::default()
         };
         let inference = InferenceConfig {
@@ -322,17 +336,27 @@ mod tests {
             max_session_tokens: Some(9_000),
             ..test_http_inference()
         };
-        let facts =
-            CapsuleFacts::resolve(&policy, &inference, &LifecycleConfig::default(), Vec::new());
-        assert_eq!(facts.dispatch_limits, None);
+        // A declared `shell_grace_secs` is never applied to a process harness.
+        let lifecycle = LifecycleConfig {
+            shell_grace_secs: Some(30),
+            ..LifecycleConfig::default()
+        };
+        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle, Vec::new());
+        let limits = facts
+            .dispatch_limits
+            .expect("a process capsule states its per-command limits");
+        assert_eq!(limits.memory_bytes, 1_073_741_824);
+        assert_eq!(limits.cpu_seconds, Some(120));
+        assert_eq!(limits.shell_grace_secs, None);
         assert_eq!(
             facts.limits_sentence(),
-            "10 turns per task; 9000 tokens per session."
+            "10 turns per task; 9000 tokens per session; 1 GiB memory and 120 s CPU time per \
+             command."
         );
     }
 
     /// An absent `inference.max_turns` sets no turn limit, so none is stated; a process capsule
-    /// with no turn or token limit states `none` rather than an empty sentence.
+    /// states its per-command memory like every command, with no turn limit in the sentence.
     #[test]
     fn capsule_facts_state_no_turn_limit_when_none_is_set() {
         let http = InferenceConfig {
@@ -357,7 +381,11 @@ mod tests {
             &LifecycleConfig::default(),
             Vec::new(),
         );
-        assert_eq!(facts.limits_sentence(), "none");
+        // The process harness runs under the session's per-command memory, so the facts state it
+        // and no turn limit.
+        let sentence = facts.limits_sentence();
+        assert!(!sentence.contains("turns"), "{sentence}");
+        assert!(sentence.contains("memory per command"), "{sentence}");
     }
 
     #[test]

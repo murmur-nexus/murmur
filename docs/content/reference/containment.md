@@ -65,8 +65,8 @@ present.
 | `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
 | `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
 | `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process tree, in a guest worker held only by the preopens and network grants its own `capabilities:` block declares |
-| `process-harness` | `inference.transport: process` | `false` | A child of `mur` with a cleared environment and nothing else: no Landlock, seccomp, network namespace or rlimits, in a cgroup with no limits |
-| `harness-tools` | `inference.transport: process` | `false` | Run by the harness with the user's authority, kept off only by the arguments the process driver passes |
+| `process-harness` | `inference.transport: process` | `true` | — (under the class, like a shell command — see [The process harness](#process-harness)) |
+| `harness-tools` | `inference.transport: process` | `true` | — (the harness runs its own tools under the same class) |
 
 Each row has these keys:
 
@@ -79,7 +79,8 @@ Each row has these keys:
 | `note` | string or `null` | What an uncovered route runs under, the last column above; `null` when `under_class` is `true`, except on the Unconfined tier |
 | `artifacts` | array of strings | The tool, driver or hook entries on the route, in manifest order; `[]` for a route no artifact names |
 
-On the [Unconfined tier](#unconfined) the `shell`, `plan-shell-steps` and `process-harness`
+On the [Unconfined tier](#unconfined) the `shell`, `plan-shell-steps`, `process-harness` and
+`harness-tools`
 rows read `under_class: true` and `mechanism: unconfined`, with the note
 `Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing
 holds it.` The other four rows are unchanged.
@@ -93,13 +94,61 @@ Routes
   drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
     Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             absent   host process, not confined by the class
-  process harness   absent   host process, not confined by the class
-  harness tools     absent   host process, not confined by the class
+  process harness   absent   landlock+seccomp
+  harness tools     absent   landlock+seccomp
 ```
+
+On a `transport: process` capsule both harness rows read `present` and are under the class; a
+`Process harness` block follows, naming the driver, the harness binary and each need — see
+[The process harness](#process-harness).
 
 A capsule whose declared floor is `scoped` or `sealed` and which has a present route outside the
 class gets one [`W-SEC-034`](diagnostics.md#w-sec-034) naming every such route, at launch and from
-`mur doctor`. Nothing is refused.
+`mur doctor`. Nothing is refused. `W-SEC-034` never names the `process-harness` or `harness-tools`
+route: both run under the class.
+
+### The process harness { #process-harness }
+
+A `transport: process` capsule's harness — and every tool the harness runs on its own — runs under
+the capsule's containment class, through the same enforcement path as a shell command. On `scoped`
+it is in the session's network and PID namespaces behind the egress proxy,
+under seccomp, Landlock, the session cgroup and its limits, and the session rlimits; on `sealed` it
+additionally runs inside the composed root. A driver that turns the harness's built-in tools back
+on, or names a different binary or argument list, gets nothing more than the class allows.
+
+What the harness needs beyond what every command gets is declared by its process driver, in
+`description.harness-needs` (see [`murmur:driver`](wit-interfaces.md#process-harness-needs)), and is
+granted only where the capsule manifest also allows it:
+
+| The driver declares | Granted where | Becomes |
+|---|---|---|
+| A path need (a directory and `read`/`read-write`) | [`capabilities.harness.paths`](manifest.md#capabilities-harness) names that directory or an ancestor, with access at least the need's | One Landlock rule without `Execute`, and a bind at the path's own location on `sealed` — exactly an operator [`host_paths`](config.md) entry's treatment |
+| A host need | `capabilities.network.allow` admits it | Reached through the egress proxy, as every command reaches the network |
+| An environment variable | `capabilities.env.allow` names it | Delivered to the harness's environment |
+
+What is granted is the driver's path at the driver's access, never the wider manifest entry, and a
+harness grant reaches the harness **and whatever the harness runs** — not a shell command, whose
+Landlock domain does not change. The harness binary itself is granted as an executable exactly like
+a `capabilities.shell.allow` binary — its file and `DT_NEEDED` closure, and for a `#!` script the
+interpreter its first line names. A need the manifest does not allow refuses the launch with
+[`E-CAP-021`](diagnostics.md#e-cap-021); a path allowed but absent on this host is reported
+`missing` and the launch continues.
+
+`mur run --explain-scope` prints a `Process harness` block — the driver, the binary and its
+interpreter, and each path, host and environment need with its status and the manifest entry that
+allows it — and `--explain-scope --json` and `session_start.effective_grants` carry it as the
+`harness` key, `null` on a capsule whose transport is not `process`. `harness_start` in the trace
+records the tier the harness ran under.
+
+**A V8 or JSC harness** — Claude Code, or any Node- or browser-engine-based CLI — maps a large
+virtual address range at startup. The per-command `RLIMIT_AS` the session's
+[`capabilities.resources.memory_bytes`](manifest.md#field-capabilities) sets applies to the harness
+too, so a capsule running such a harness must set a `memory_bytes` a turn fits in (a 2 GiB
+`RLIMIT_AS` is enough for Claude Code), or the harness is killed as it starts.
+
+`mur doctor`'s own version and login probes run **outside** the class: they run outside any session,
+before one is staged, so they are not spawned under its enforcement. The harness a real `mur run`
+spawns is under the class; doctor only predicts whether it would start.
 
 ### Whether the launch gets its cgroup scope { #cgroup-scope }
 
@@ -1869,7 +1918,7 @@ the record:
 | Route | How the probe runs | Graded on |
 |---|---|---|
 | `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
-| `process-harness` | As a child of the [process harness](manifest.md#transport-process) itself, which the runtime starts with a cleared environment and no other containment | One expectation for every class |
+| `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime now spawns under the session's class exactly like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
 
 An expectation is one of:
 
@@ -1909,7 +1958,9 @@ The `read-record-seal-key` case probes the [record-seal key](#record-seal-key) o
 harness runs with: the harness resolves `~/.murmur/keys/record-seal.key` there, creating the key
 when it is missing, and hands the probe its path, never its bytes, since the capsule's own `$HOME`
 is a different folder. It must be refused at `scoped` and `sealed` and is not asserted at
-`advisory`. On the `process-harness` route it is `known-gap: ALLOWED`: the harness reads the key.
+`advisory`. On the `process-harness` route it is now `REFUSED` at `scoped` and `sealed` too — the
+harness runs under the class, so Landlock and the composed root refuse the key exactly as they do
+for a shell command.
 
 A host that cannot back the class under test is refused before the first case runs, and a refused
 run writes no record. The record names the environment the run happened in, and only a bare-host

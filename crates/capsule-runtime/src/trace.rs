@@ -1885,6 +1885,10 @@ pub(crate) struct HarnessStart {
     pub driver_version: String,
     /// What the driver said it drives, and the executable actually spawned.
     pub harness: String,
+    /// The enforcement tier the harness ran under, as a stable wire name — the same spelling
+    /// `ScopeReport::enforcement_tier` uses (`landlock+seccomp`, `mountns+pivot_root+landlock+seccomp`,
+    /// `unconfined`, …).
+    pub tier: String,
     /// The absolute path spawned — not the name the manifest or the driver asked for.
     pub binary: String,
     /// `inference.command`, or the process driver's `describe()`.
@@ -9252,6 +9256,7 @@ mod tests {
             driver: "local/fixture-process-driver".to_string(),
             driver_version: "0.1.0".to_string(),
             harness: "fixture".to_string(),
+            tier: "landlock+seccomp".to_string(),
             binary: "/bin/true".to_string(),
             binary_source: "describe".to_string(),
             harness_version: None,

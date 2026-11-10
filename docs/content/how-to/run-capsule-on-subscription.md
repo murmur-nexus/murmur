@@ -27,7 +27,7 @@ Read this before you choose it. Four things are true here that are not true of `
 
 | Cost | What it means |
 |---|---|
-| The harness process is not contained | Unlike a WASM artifact, the `claude` process runs on the host with the host network and your real home directory. Murmur controls the environment it starts with and the tools it is offered, not what the process can reach once running. |
+| The harness runs under the capsule's class | The `claude` process runs under the same containment as a shell command: on `scoped` it is in the session's network and PID namespaces behind the egress proxy, under seccomp, Landlock, the session cgroup and rlimits; on `sealed` it also runs inside the composed root. What it needs beyond that — its install folder, its config and login folder, its inference host — the process driver declares and the manifest grants through [`capabilities.harness`](../reference/manifest.md#capabilities-harness) and `capabilities.network.allow`. See [The process harness](../reference/containment.md#process-harness). |
 | The capsule depends on your machine | It runs on your login and on whichever `claude` version is installed. The manifest pins neither, so the same manifest on two machines is not the same capsule. |
 | Murmur counts what it is told | The harness reaches its provider with its own credentials, so no request passes through Murmur. The token counts in the trace are the harness's own report of what it spent, relayed by the driver — not requests Murmur measured. [inference.max_session_tokens](../reference/manifest.md#inference-max-session-tokens) and `spend.machine_tokens_per_day` are enforced against those reported numbers. |
 | The harness's own configuration does not load | The driver launches the harness with `--setting-sources ""`, so the harness reads none of its own configuration on this machine: its `CLAUDE.md`, its settings and its own hook scripts stay out. The agent's instructions come from the manifest, which can name files in the work folder, such as the repository's `AGENTS.md` or `CLAUDE.md`, through [inference.instruction_files](../reference/manifest.md#inference-instruction-files). The capsule's own `runtime: hook` artifacts run exactly as they do on `transport: http`. |
@@ -78,6 +78,8 @@ capabilities:
     allow:
       - HOME
       - PATH
+  resources:
+    memory_bytes: 2147483648   # a Claude Code turn runs under this RLIMIT_AS; 2 GiB is enough
 
 inference:
   transport: process
@@ -90,7 +92,7 @@ lifecycle:
   conversation: threaded
 ```
 
-Declare no `endpoint`, no `api_key` and no `capabilities.network`: the harness reaches its provider itself. Leave `inference.model` out to run on whatever model your subscription defaults to.
+The harness runs under the capsule's class. A process driver built against `murmur:driver@0.6.0` declares what its harness needs beyond that — Claude Code's install folder, its config and login folder, and its inference host — and the manifest grants the matching directories under [`capabilities.harness.paths`](../reference/manifest.md#capabilities-harness) and the host under `capabilities.network.allow`. The driver release that declares those needs arrives with the next `murmur/driver-claude-code`; until then, pin the version your store holds and run `--containment advisory`, or grant the harness what it asks for once the needs-declaring release is published and `mur run --explain-scope` names each need. Leave `inference.model` out to run on whatever model your subscription defaults to.
 
 Create an `instructions.md` file next to it with the agent's instructions. That file is the whole of what the agent is told about its job.
 

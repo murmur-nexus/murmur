@@ -1072,6 +1072,9 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that a pull — `manage.pull`, or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool — may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `SKILL.md`, plus any supporting files packed beside it, which install read-only and not executable under `tools/<name>/`. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` and `remove-artifact` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
 | `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools that a pull may install, as [install entries](#install-entries). A pulled tool joins the dispatch allowlist. The same entries let a removal uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
 | `capabilities.install.from` | `[stores] \| [stores, sources]` | no | Where a pull finds what it installs. Default: `[stores]`, the project store then the global store. `[stores, sources]` (in either order) also fetches a version no store holds from the GitHub source of the artifact's scope; the runtime fetches it, records the owner id in `murmur.lock` and writes it to no store. An empty list, a list without `stores`, a duplicate and any other value are refused with `E-MAN-003`. `mur run --explain-scope` and `mur doctor` report it as `install from`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_from`. A spawned child declaring `sources` under a parent without it is refused. |
+| `capabilities.harness.paths` | list<grant> | no | `transport: process` only. Host directories this capsule grants its process harness, beyond what its class gives every command — see [`capabilities.harness`](#capabilities-harness). Each entry is a `{path, access}`, the same shape as an operator `host_paths` entry. Default: absent, which grants the harness no path. A grant reaches the process harness and what it runs, never a shell command. Capsule-wide only; declaring it on an `artifacts[]` entry is refused at parse, and declaring it on a capsule whose transport is not `process` is refused at staging with [`E-CAP-021`](diagnostics.md#e-cap-021). `mur run --explain-scope` reports it under `Process harness`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.harness`. |
+| `capabilities.harness.paths[].path` | string | yes | A host directory, `~/<rest>` under the home the account `mur` runs as or an absolute path, the same shape rules as an operator `host_paths` entry. |
+| `capabilities.harness.paths[].access` | `read \| read-write` | yes | What the harness may do there. No default: a capability is never inferred. |
 | `capabilities.spawn.allow` | list<string> | no | Full names, `<scope>/<name>`, of the capsules this capsule may spawn as sub-capsules. A bare name is refused with `E-MAN-003`, and so are two entries with the same bare part, because `delegate-task` offers each capsule to the model by its bare part. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with the bare part of each name as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 | `capabilities.spawn.workdir_snapshot` | list<string> | no | Default: `[]`. Full names from `capabilities.spawn.allow` whose every delegation — from `delegate-task` or a plan `capsule` step — starts the child in a copy of this capsule's work folder as it stands when the delegation is made, instead of an empty folder. The child reads, runs and writes the copy; nothing it writes reaches this capsule's work folder, and this capsule receives only its answer. Each entry is refused with `E-MAN-003` when it is a bare name, is listed twice, or is absent from `capabilities.spawn.allow`. The copy counts against the child's own `capabilities.resources.workdir_max_bytes`: a work folder larger than that fails the delegation before the child starts. See [Workdir snapshot](roost-api.md#workdir-snapshot). `mur run --explain-scope` reports it as `spawn workdir snapshot`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_workdir_snapshot`. |
 
@@ -1231,6 +1234,42 @@ A capsule spawned through [`capabilities.spawn.allow`](#field-capabilities) hold
 `install` block its own manifest declares. `mur-roost` refuses a child whose entries its parent's
 do not cover, or that declares `from: [stores, sources]` under a parent that does not — see
 [Spawn envelope](roost-api.md#spawn-envelope).
+
+#### `capabilities.harness` { #capabilities-harness }
+
+Grants a `transport: process` capsule's harness host directories beyond what its class gives every
+command. A process driver's `describe().harness-needs` (see
+[`murmur:driver`](wit-interfaces.md#process-harness-needs)) names what its harness needs — the
+directories it reads and writes, and the hosts it connects to. The driver declares; the manifest
+allows:
+
+```yaml
+capabilities:
+  harness:
+    paths:
+      - { path: ~/.config/the-harness, access: read }
+      - { path: ~/.local/state/the-harness, access: read-write }
+  network:
+    allow: [api.the-harness.example]
+```
+
+| Need the driver declares | Allowed by |
+|---|---|
+| A path | A `capabilities.harness.paths` entry naming that directory or an ancestor of it, with access at least the need's (`read-write` ≥ `read`) |
+| A host | A `capabilities.network.allow` entry that admits it |
+| An environment variable (`required-env`) | A `capabilities.env.allow` entry ([`E-CAP-019`](diagnostics.md#e-cap-019)) |
+
+What is granted is the driver's path at the driver's access, never the wider manifest entry, and
+never with `Execute`. A granted path goes through the same host-folder checks as an operator
+[`host_paths`](config.md) entry — not a system path, not read-write over murmur's home, not inside
+the work folder — and a path allowed but absent on this host is reported `missing` and the launch
+continues. A need the manifest does not allow refuses the launch with
+[`E-CAP-021`](diagnostics.md#e-cap-021), naming every such need; nothing is spawned.
+
+`capabilities.harness` is capsule-wide only and valid only on `transport: process`: declaring it on
+an `artifacts[]` entry is refused at parse, and declaring it on another transport is refused at
+staging. The harness itself runs under the capsule's class — see
+[Containment, the process harness](containment.md#process-harness).
 
 #### `capabilities.peer_fetch` { #field-peer-fetch }
 

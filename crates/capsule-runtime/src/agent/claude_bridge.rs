@@ -351,21 +351,38 @@ fn inventory_to_mcp_tools(inventory: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Bind the bridge on loopback (ephemeral port) and precompute what the driver is told about it.
-/// Returns `None` when the capsule declares no tools — the harness then runs with none.
-pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<BridgeHandle> {
+/// Bind the bridge and precompute what the driver is told about it. Returns `None` when the
+/// capsule declares no tools — the harness then runs with none.
+///
+/// On a session with a network namespace, the bridge serves the listener the namespace creator
+/// opened inside the namespace on `127.0.0.1` (`netns.bridge_listener_dup()`): reachable from the
+/// harness, from nothing in the host's namespace. On a session without one — unconfined, off
+/// Linux, the environment-only tier — it binds the host loopback as before.
+pub(super) async fn bind_bridge(
+    bind_addr: &str,
+    inventory: &[Value],
+    netns: Option<&crate::network_namespace::SessionNetns>,
+) -> Option<BridgeHandle> {
     let mcp_tools = inventory_to_mcp_tools(inventory);
     if mcp_tools.is_empty() {
         return None;
     }
 
-    // Port 0 = let the OS pick a free ephemeral port.
-    let listener = TcpListener::bind(format!("{bind_addr}:0")).await.ok()?;
-    let port = listener.local_addr().ok()?.port();
-    let host = if bind_addr.is_empty() {
-        "127.0.0.1"
-    } else {
-        bind_addr
+    // The namespace's own bridge listener when the session has a namespace; otherwise the host
+    // loopback on an ephemeral port.
+    let (listener, host, port) = match namespace_bridge_listener(netns) {
+        Some((listener, port)) => (listener, "127.0.0.1", port),
+        None => {
+            // Port 0 = let the OS pick a free ephemeral port.
+            let listener = TcpListener::bind(format!("{bind_addr}:0")).await.ok()?;
+            let port = listener.local_addr().ok()?.port();
+            let host = if bind_addr.is_empty() {
+                "127.0.0.1"
+            } else {
+                bind_addr
+            };
+            (listener, host, port)
+        }
     };
 
     let tool_names = mcp_tools
@@ -383,6 +400,27 @@ pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<
         mcp_tools,
         max_in_flight_calls: MAX_IN_FLIGHT_CALLS,
     })
+}
+
+/// The session's in-namespace bridge listener as a tokio `TcpListener`, with its port, or `None`
+/// on a session without a namespace (unconfined, off Linux, environment-only) or when the dup
+/// could not be made.
+fn namespace_bridge_listener(
+    netns: Option<&crate::network_namespace::SessionNetns>,
+) -> Option<(TcpListener, u16)> {
+    #[cfg(target_os = "linux")]
+    {
+        let std_listener = netns?.bridge_listener_dup()?;
+        std_listener.set_nonblocking(true).ok()?;
+        let port = std_listener.local_addr().ok()?.port();
+        let listener = TcpListener::from_std(std_listener).ok()?;
+        Some((listener, port))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = netns;
+        None
+    }
 }
 
 impl BridgeHandle {
@@ -1212,6 +1250,7 @@ mod tests {
             let handle = bind_bridge(
                 "127.0.0.1",
                 &[json!({"name": "echo-tool", "parameters": {"type": "object"}})],
+                None,
             )
             .await
             .expect("bridge binds");
@@ -1649,7 +1688,7 @@ mod tests {
     #[tokio::test]
     async fn bind_bridge_is_none_without_tools() {
         // No tools declared → no bridge, so the harness runs with no tools.
-        assert!(bind_bridge("127.0.0.1", &[]).await.is_none());
+        assert!(bind_bridge("127.0.0.1", &[], None).await.is_none());
     }
 
     /// The driver is handed bare names and builds whatever its harness needs from them: the
@@ -1657,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn bind_bridge_names_tools_bare() {
         let inventory = vec![json!({"name": "editor", "parameters": {"type": "object"}})];
-        let handle = bind_bridge("127.0.0.1", &inventory)
+        let handle = bind_bridge("127.0.0.1", &inventory, None)
             .await
             .expect("bridge should bind when tools are declared");
         assert_eq!(handle.tool_names, vec!["editor"]);

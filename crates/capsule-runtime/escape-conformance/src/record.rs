@@ -445,7 +445,9 @@ impl Record<'_> {
                 case.scoped.as_str(),
                 case.sealed.as_str(),
                 case.harness
-                    .map(|e| e.as_str())
+                    .map(|harness| {
+                        format!("{} / {}", harness.scoped.as_str(), harness.sealed.as_str())
+                    })
                     .unwrap_or_else(|| "—".to_string())
             );
         }
