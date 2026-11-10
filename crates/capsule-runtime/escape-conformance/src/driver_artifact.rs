@@ -45,23 +45,38 @@ pub fn check_interface() -> Result<(), String> {
 /// with `<mur> build` into `<work_root>/escape-conformance-driver-<version>.mur.zip`, which it
 /// returns. Errors carry `mur`'s stderr.
 pub fn build_artifact(mur: &Path, work_root: &Path) -> Result<PathBuf, String> {
-    let source = work_root.join("driver-artifact");
-    fs::create_dir_all(&source)
+    pack(
+        mur,
+        &work_root.join("driver-artifact"),
+        &work_root.join(format!("{DRIVER_NAME}-{DRIVER_VERSION}.mur.zip")),
+        DRIVER_MANIFEST,
+        DRIVER_WASM_FILE,
+        DRIVER_WASM,
+    )
+}
+
+/// Writes `manifest` and `wasm` (as `wasm_file`) into `source` and packs them with `<mur> build`
+/// into `artifact`. Errors carry `mur`'s stderr.
+pub(crate) fn pack(
+    mur: &Path,
+    source: &Path,
+    artifact: &Path,
+    manifest: &str,
+    wasm_file: &str,
+    wasm: &[u8],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(source)
         .map_err(|err| format!("could not create {}: {err}", source.display()))?;
-    for (name, bytes) in [
-        ("murmur.yaml", DRIVER_MANIFEST.as_bytes()),
-        (DRIVER_WASM_FILE, DRIVER_WASM),
-    ] {
+    for (name, bytes) in [("murmur.yaml", manifest.as_bytes()), (wasm_file, wasm)] {
         let path = source.join(name);
         fs::write(&path, bytes)
             .map_err(|err| format!("could not write {}: {err}", path.display()))?;
     }
-    let artifact = work_root.join(format!("{DRIVER_NAME}-{DRIVER_VERSION}.mur.zip"));
     let output = Command::new(mur)
         .arg("build")
-        .arg(&source)
+        .arg(source)
         .arg("-o")
-        .arg(&artifact)
+        .arg(artifact)
         .output()
         .map_err(|err| format!("could not run `{} build`: {err}", mur.display()))?;
     if !output.status.success() {
@@ -80,7 +95,7 @@ pub fn build_artifact(mur: &Path, work_root: &Path) -> Result<PathBuf, String> {
             artifact.display()
         ));
     }
-    Ok(artifact)
+    Ok(artifact.to_path_buf())
 }
 
 /// Installs `artifact` into `project_dir`'s store with `<mur> install`, run from `project_dir`,

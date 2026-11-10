@@ -27,6 +27,7 @@ use std::time::Duration;
 use escape_conformance::cases::{self, Case, Route};
 use escape_conformance::driver_artifact;
 use escape_conformance::host::{self, WorkRootFilesystem};
+use escape_conformance::probe_guest;
 use escape_conformance::record::{Counts, Record, Stamp};
 use escape_conformance::runner::{self, RunnerConfig};
 use escape_conformance::verdict::{Category, Grade};
@@ -79,9 +80,16 @@ OPTIONS:
                            machine needs no flag: it runs, and its record is stamped the same.
     --only <CASE-ID>       Run one case (repeatable). The record is stamped PARTIAL RUN and
                            cannot be cited. For iterating by hand, never for a release gate.
+    --route <ROUTE>        Run only the cases' runs on this route (repeatable): shell-tool,
+                           process-harness or wasm-guest. Default: every route. The record of a
+                           narrowed run is stamped PARTIAL RUN. The wasm-guest route needs a `mur`
+                           built with the test-only `escape-probe` feature (a debug build:
+                           `cargo build -p murmur-cli --bin mur --features escape-probe`); any
+                           other `mur` is refused at its preflight.
     --list-cases           Print the case registry with each route's expectations (the shell
-                           tool per class, the process harness at every class) and exit. Runs
-                           nothing and writes no record.
+                           tool per class, the process harness at every class, the guest worker
+                           on the shell tool's columns) and exit. Runs nothing and writes no
+                           record.
     -h, --help             This text.
 
 EXIT CODES:
@@ -107,6 +115,7 @@ struct Options {
     systemd_scope: Option<bool>,
     allow_container: bool,
     only: Vec<String>,
+    routes: Vec<Route>,
     list_cases: bool,
 }
 
@@ -122,6 +131,7 @@ impl Default for Options {
             systemd_scope: None,
             allow_container: false,
             only: Vec::new(),
+            routes: Vec::new(),
             list_cases: false,
         }
     }
@@ -179,6 +189,18 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
                     ));
                 }
                 options.only.push(id);
+            }
+            "--route" => {
+                let name = value("--route")?;
+                let route = Route::from_name(&name).ok_or_else(|| {
+                    format!(
+                        "--route: no route named {name:?}; the routes are {}",
+                        Route::ALL.map(Route::as_str).join(", ")
+                    )
+                })?;
+                if !options.routes.contains(&route) {
+                    options.routes.push(route);
+                }
             }
             "--list-cases" => options.list_cases = true,
             "-h" | "--help" => return Err(USAGE.to_string()),
@@ -290,12 +312,25 @@ fn list_cases() {
             .count()
     );
     println!(
-        "{:<34} {:<20} {:<20} {:<20} {:<20} HARNESS SCOPED/SEALED",
-        "CASE", "CATEGORY", "SHELL-TOOL ADVISORY", "SHELL-TOOL SCOPED", "SHELL-TOOL SEALED"
+        "  {}: {} cases, graded on the shell-tool columns\n",
+        Route::WasmGuest.as_str(),
+        cases::all_cases()
+            .iter()
+            .filter(|case| case.runs_in_guest_worker())
+            .count()
+    );
+    println!(
+        "{:<34} {:<20} {:<20} {:<20} {:<20} {:<20} WASM-GUEST",
+        "CASE",
+        "CATEGORY",
+        "SHELL-TOOL ADVISORY",
+        "SHELL-TOOL SCOPED",
+        "SHELL-TOOL SEALED",
+        "HARNESS SCOPED/SEALED"
     );
     for case in cases::all_cases() {
         println!(
-            "{:<34} {:<20} {:<20} {:<20} {:<20} {}",
+            "{:<34} {:<20} {:<20} {:<20} {:<20} {:<20} {}",
             case.id,
             // `as_str`, not the Display impl: a custom Display ignores the width specifier, so
             // the columns would not line up.
@@ -307,15 +342,21 @@ fn list_cases() {
                 .map(|harness| {
                     format!("{} / {}", harness.scoped.as_str(), harness.sealed.as_str())
                 })
-                .unwrap_or_else(|| "—".to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            if case.runs_in_guest_worker() {
+                "as shell-tool"
+            } else {
+                "—"
+            }
         );
     }
     println!(
         "\nThe HARNESS column shows the process-harness route's verdict at `scoped` / `sealed`: \
          the harness runs under the session's class exactly like a shell command, so each matches \
-         the shell-tool verdict at that class. `—` means the case does not run on that route. A \
-         `known-gap: <VERDICT>` expectation, where one is still asserted, gates with exit 5 on \
-         drift.\n\n\
+         the shell-tool verdict at that class. `—` in the HARNESS or WASM-GUEST column means the \
+         case does not run on that route; `as shell-tool` means it is graded on the shell-tool \
+         column of the class under test. A `known-gap: <VERDICT>` expectation, where one is still \
+         asserted, gates with exit 5 on drift.\n\n\
          `not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
          but nothing can pass or fail, because there is no claim to compare the result against. \
          It appears for two different reasons and they must not be conflated.\n\
@@ -511,10 +552,38 @@ fn run() -> Result<u8, String> {
         );
     }
 
+    // Packed only when the run can use the wasm-guest route.
+    let probe_guest_zip = if options.routes.is_empty() || options.routes.contains(&Route::WasmGuest)
+    {
+        match probe_guest::build_artifact(&mur, &work_root) {
+            Ok(path) => {
+                println!(
+                    "  guest:     {}@{} ({})",
+                    probe_guest::PROBE_GUEST_NAME,
+                    probe_guest::PROBE_GUEST_VERSION,
+                    path.display()
+                );
+                Some(path)
+            }
+            Err(err) => {
+                eprintln!(
+                    "\nREFUSED — could not pack the embedded {}@{} probe guest.\n  {err}\n\n\
+                         The wasm-guest route cannot run without it. No record file was written.",
+                    probe_guest::PROBE_GUEST_NAME,
+                    probe_guest::PROBE_GUEST_VERSION
+                );
+                return Ok(EXIT_REFUSED);
+            }
+        }
+    } else {
+        None
+    };
+
     let config = RunnerConfig {
         mur: mur.clone(),
         probe_driver,
         driver_artifact: driver_zip,
+        probe_guest_artifact: probe_guest_zip,
         work_root,
         timeout: options.timeout,
         harness_interpreter,
@@ -533,6 +602,7 @@ fn run() -> Result<u8, String> {
     let runs: Vec<(&'static Case, Route)> = selected
         .iter()
         .flat_map(|case| case.routes().map(move |route| (*case, route)))
+        .filter(|(_, route)| options.routes.is_empty() || options.routes.contains(route))
         .collect();
 
     // Last gate before the first case, once per route the run uses. A host where no probe can
@@ -593,7 +663,7 @@ fn run() -> Result<u8, String> {
         mur_binary: mur.display().to_string(),
         mur_version: mur_version(&mur),
         outcomes: &outcomes,
-        partial: !options.only.is_empty(),
+        partial: !options.only.is_empty() || !options.routes.is_empty(),
         container_override: options.allow_container
             && facts.environment.environment.is_refused_by_default(),
         work_root_fs,

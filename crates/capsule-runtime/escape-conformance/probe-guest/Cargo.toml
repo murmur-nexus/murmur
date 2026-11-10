@@ -1,0 +1,19 @@
+# The probe guest of the escape-conformance gate's `wasm-guest` route: a WASM tool that asks its
+# host side to run a case's probe body. Built to wasm32-wasip2 and committed as
+# `escape_conformance_probe_guest.wasm`; README.md carries the contract and the rebuild command.
+#
+# The empty `[workspace]` keeps it out of the root workspace, as `../driver` is kept out.
+[package]
+name = "escape-conformance-probe-guest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[workspace]

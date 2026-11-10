@@ -371,6 +371,14 @@ pub struct CapabilityPolicy {
     /// above purely so hook calls can apply their own, lower default without mistaking an
     /// explicit `600` for silence. See [`Self::hook_limits`].
     pub declared_deadline_seconds: Option<u64>,
+    /// Whether the capsule runs a WASM guest in a guest worker process: a registry-resolved
+    /// `runtime: tool`, `runtime: driver` or `runtime: hook` entry, a `capabilities.install.tool`
+    /// grant (a pulled tool runs in the tools worker). A worker is a subprocess spawned under the
+    /// session's containment, so this counts as a subprocess route for
+    /// [`crate::runtime::has_subprocess_route_at_staging`]. A script capsule's own component also
+    /// runs in a worker but is not counted: its worker's spawn fails (`E-RUN-066`) where the
+    /// session's namespace cannot be made, rather than running unconfined.
+    pub guest_workers: bool,
 }
 
 impl CapabilityPolicy {
@@ -792,6 +800,11 @@ pub struct StagedSession {
     /// `stage_session` from [`Self::host_probe`]: [`Self::scope_report`]'s `temp_dir` says it and
     /// `launch_session` hands it to the enforcement that installs it.
     pub(crate) temp_mapping: crate::temp_dir::TempMapping,
+    /// The session's enforcement as staging resolved it to spawn the guest workers, `None` when
+    /// it started none. `launch_session` takes it instead of resolving another, so every command
+    /// joins the network and PID namespaces the workers already run in. Boxed: a staged session
+    /// is moved by value through frames that an in-process launch keeps on a 2 MiB stack.
+    pub(crate) staged_enforcement: Option<Box<crate::sandbox::ShellEnforcement>>,
     /// The declared read-only surface, lowered and validated by `stage_session` — a malformed
     /// entry refuses the launch there rather than surfacing at the first call. Empty for every
     /// capsule that declared no `capabilities.filesystem.read_only`.
@@ -1071,6 +1084,14 @@ pub fn capability_policy_from_runtime_manifest(
 
     let resources = crate::resources::resolve(caps.and_then(|c| c.resources.as_ref()));
 
+    // The rule `runtime::guest_worker_kinds` applies to the staged artifacts, over the manifest
+    // (plus a pulled tool, which starts the tools worker at its first call); keep the two in step.
+    let guest_workers = !install_tool.is_empty()
+        || manifest.artifacts.iter().any(|artifact| {
+            artifact.source.is_none()
+                && crate::guest_worker::WorkerKind::for_runtime(artifact.runtime.clone()).is_some()
+        });
+
     CapabilityPolicy {
         network_allow,
         peer_fetch_allow,
@@ -1110,6 +1131,7 @@ pub fn capability_policy_from_runtime_manifest(
         install_tool,
         install_from_sources,
         declared_deadline_seconds,
+        guest_workers,
     }
 }
 

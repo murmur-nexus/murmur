@@ -29,6 +29,9 @@ const STALL_TOOL: &str = "local/stall-tool";
 const ECHO_TOOL: &str = "local/echo-tool";
 const SLEEP_HOOK: &str = "local/sleep-hook";
 const PROCESS_DRIVER: &str = "local/fixture-process-driver";
+/// The escape-conformance probe guest: a WASM tool whose worker, in a `mur` built with the
+/// test-only `escape-probe` feature, runs the probe its input names in the worker process.
+const PROBE_GUEST: &str = "local/escape-conformance-probe-guest";
 const VERSION: &str = "0.1.0";
 const AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 const KEY: &str = "sk-guest-worker-canary-41d9";
@@ -78,6 +81,14 @@ impl Home {
             &common::fixture_path("run/components/echo-tool.wasm"),
         ));
         published.push(sleep_hook_zip(artifacts.path()));
+        published.push(common::create_tool_artifact(
+            artifacts.path(),
+            PROBE_GUEST,
+            VERSION,
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../capsule-runtime/escape-conformance/probe-guest")
+                .join("escape_conformance_probe_guest.wasm"),
+        ));
         published.push(common::create_driver_artifact_with_auth(
             artifacts.path(),
             PROCESS_DRIVER,
@@ -205,14 +216,20 @@ struct Upstream {
 
 impl Upstream {
     fn start(responses: Vec<String>) -> Self {
+        let responses = Mutex::new(responses.into_iter());
+        Self::start_with(move |_| responses.lock().unwrap().next())
+    }
+
+    /// An upstream that answers its `n`th request (from 0) with `reply(n)`, computed when that
+    /// request arrives, and with [`END_TURN`] once `reply` returns `None`.
+    fn start_with(reply: impl Fn(usize) -> Option<String> + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let heads = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let (thread_heads, thread_bodies) = (Arc::clone(&heads), Arc::clone(&bodies));
         thread::spawn(move || {
-            let mut responses = responses.into_iter();
-            for stream in listener.incoming() {
+            for (index, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { break };
                 let mut buffer = Vec::new();
                 let mut chunk = [0u8; 8192];
@@ -250,7 +267,7 @@ impl Upstream {
                 if let Ok(body) = serde_json::from_slice::<Value>(&body) {
                     thread_bodies.lock().unwrap().push(body);
                 }
-                let reply = responses.next().unwrap_or_else(|| END_TURN.to_string());
+                let reply = reply(index).unwrap_or_else(|| END_TURN.to_string());
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
@@ -267,9 +284,12 @@ impl Upstream {
     }
 }
 
-/// The `mur __guest-worker <kind>` children of `pid`: (pid, kind, argv, pgid).
+/// The guest workers `mur` (`pid`) started: its `__guest-worker` children, or, for a worker
+/// forked into the session's PID namespace, its relay's child (the relay is `mur`'s child and
+/// keeps `mur`'s own argv, since it never execs).
 fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
-    let mut found = Vec::new();
+    // (pid, ppid, pgrp, argv) of every process readable here.
+    let mut processes = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
         let Some(child) = entry
             .file_name()
@@ -284,9 +304,10 @@ fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
         // Fields after the parenthesised command: state, ppid, pgrp.
         let after = &stat[stat.rfind(')').unwrap() + 2..];
         let fields: Vec<&str> = after.split(' ').collect();
-        if fields[1].parse::<u32>().ok() != Some(pid) {
+        let (Some(ppid), Ok(pgrp)) = (fields[1].parse::<u32>().ok(), fields[2].parse::<i32>())
+        else {
             continue;
-        }
+        };
         let Ok(cmdline) = fs::read(format!("/proc/{child}/cmdline")) else {
             continue;
         };
@@ -295,9 +316,19 @@ fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect();
-        if argv.get(1).map(String::as_str) == Some("__guest-worker") {
+        processes.push((child, ppid, pgrp, argv));
+    }
+    let children_of_mur: Vec<u32> = processes
+        .iter()
+        .filter(|process| process.1 == pid)
+        .map(|process| process.0)
+        .collect();
+    let mut found = Vec::new();
+    for (child, ppid, pgrp, argv) in processes {
+        let started_by_mur = ppid == pid || children_of_mur.contains(&ppid);
+        if started_by_mur && argv.get(1).map(String::as_str) == Some("__guest-worker") {
             let kind = argv.get(2).cloned().unwrap_or_default();
-            found.push((child, kind, argv, fields[2].parse().unwrap()));
+            found.push((child, kind, argv, pgrp));
         }
     }
     found.sort_by(|a, b| a.1.cmp(&b.1));
@@ -888,4 +919,394 @@ fn traces_under(root: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// The `Name:\tvalue` line `name` of `/proc/<pid>/status`, readable for a non-dumpable process.
+fn status_line(status: &str, name: &str) -> Option<String> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .map(|value| value.trim().to_string())
+}
+
+/// Runs a tool call through a capsule at `containment` held open at its door, and returns what
+/// each worker's `/proc/<pid>/status` and parent say while it is held, with the finished run and
+/// the scratch `HOME` its records are under.
+fn confined_workers(containment: &str) -> (Home, Run, Vec<ConfinedWorker>, u32) {
+    let home = Home::new();
+    let upstream = Upstream::start(vec![
+        common::tool_use_response("toolu_echo", "echo-tool", json!({"text": "ping"})),
+        END_TURN.to_string(),
+    ]);
+    let extra = format!(
+        "  - name: {ECHO_TOOL}\n    version: {VERSION}\n    runtime: tool\ncapabilities:\n  \
+         containment: {containment}\n{}",
+        sleep_lifecycle()
+    );
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+    let child = home.spawn(&capsule);
+    let pid = child.id();
+    // Both model requests answered: the tool ran in the tools worker between them.
+    let started = Instant::now();
+    while upstream.heads.lock().unwrap().len() < 2 && started.elapsed() < WAIT {
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let workers: Vec<ConfinedWorker> = workers_of(pid)
+        .into_iter()
+        .map(|(worker, kind, _, _)| {
+            let status = fs::read_to_string(format!("/proc/{worker}/status")).unwrap_or_default();
+            let stat = fs::read_to_string(format!("/proc/{worker}/stat")).unwrap_or_default();
+            let ppid = stat
+                .rfind(')')
+                .and_then(|end| stat[end + 2..].split(' ').nth(1))
+                .and_then(|field| field.parse().ok())
+                .unwrap_or(0);
+            let ns = |name: &str| {
+                fs::read_link(format!("/proc/{worker}/ns/{name}"))
+                    .map(|link| link.display().to_string())
+                    .unwrap_or_default()
+            };
+            ConfinedWorker {
+                kind,
+                status,
+                ppid,
+                net_ns: ns("net"),
+                pid_ns: ns("pid"),
+                mountinfo: fs::read_to_string(format!("/proc/{worker}/mountinfo"))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    // SAFETY: plain syscall on our own child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let run = finish(child, Duration::from_secs(60));
+    (home, run, workers, pid)
+}
+
+/// What one worker's `/proc` entries say while its session is held open, read from outside: the
+/// worker is non-dumpable, but its user namespace is owned by this uid, so `status`, the
+/// namespace links and `mountinfo` are readable (`environ` is not).
+struct ConfinedWorker {
+    kind: String,
+    status: String,
+    ppid: u32,
+    net_ns: String,
+    pid_ns: String,
+    mountinfo: String,
+}
+
+fn assert_confined(containment: &str, run: &Run, workers: &[ConfinedWorker], mur: u32) {
+    assert_eq!(
+        run.of_type("task_end")
+            .first()
+            .map(|end| end["exit_status"].clone()),
+        Some(json!("ok")),
+        "{containment}: {}",
+        run.context()
+    );
+    let kinds: Vec<&str> = workers.iter().map(|w| w.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["driver", "tools"],
+        "{containment}: {}",
+        run.context()
+    );
+    let own_ns = |name: &str| {
+        fs::read_link(format!("/proc/self/ns/{name}"))
+            .unwrap()
+            .display()
+            .to_string()
+    };
+    for ConfinedWorker {
+        kind,
+        status,
+        ppid,
+        net_ns,
+        pid_ns,
+        ..
+    } in workers
+    {
+        assert!(
+            !net_ns.is_empty() && *net_ns != own_ns("net"),
+            "{containment} {kind}: in the session's network namespace, not this one: {net_ns:?}"
+        );
+        assert!(
+            !pid_ns.is_empty() && *pid_ns != own_ns("pid"),
+            "{containment} {kind}: in the session's PID namespace, not this one: {pid_ns:?}"
+        );
+        assert_eq!(
+            status_line(status, "Seccomp").as_deref(),
+            Some("2"),
+            "{containment} {kind}: {status}"
+        );
+        assert_eq!(
+            status_line(status, "NoNewPrivs").as_deref(),
+            Some("1"),
+            "{containment} {kind}: {status}"
+        );
+        let nspid = status_line(status, "NSpid").unwrap_or_default();
+        assert!(
+            nspid.split_whitespace().count() >= 2,
+            "{containment} {kind}: in the session's PID namespace, NSpid {nspid:?}"
+        );
+        assert_ne!(
+            *ppid, mur,
+            "{containment} {kind}: spawned through its relay"
+        );
+        assert_eq!(
+            status_line(status, "CapEff").as_deref(),
+            Some("0000000000000000"),
+            "{containment} {kind}: {status}"
+        );
+    }
+    let start = &run.of_type("session_start")[0];
+    let grants = &start["effective_grants"];
+    let routes = grants["routes"].as_array().expect("routes");
+    for name in ["wasm-tools", "drivers"] {
+        let row = routes.iter().find(|row| row["route"] == name).unwrap();
+        assert_eq!(row["under_class"], true, "{row}");
+        assert_eq!(row["mechanism"], grants["enforcement_tier"], "{row}");
+        assert!(row["note"].is_null(), "{row}");
+    }
+}
+
+/// At `scoped`, the tools and driver workers run under the session's seccomp filter with
+/// `no_new_privs`, no capability, in the session's PID namespace behind their relays, and the
+/// routes report them under the installed tier.
+#[test]
+fn tools_worker_runs_under_scoped() {
+    if capsule_runtime::skip_without_egress_namespace("tools_worker_runs_under_scoped") {
+        return;
+    }
+    let (_home, run, workers, mur) = confined_workers("scoped");
+    assert_confined("scoped", &run, &workers, mur);
+    let grants = &run.of_type("session_start")[0]["effective_grants"];
+    assert_eq!(grants["enforcement_tier"], "landlock+seccomp", "{grants}");
+}
+
+/// At `sealed`, the same holds, inside the composed root: the session installs the sealed tier
+/// and the routes report the workers under it.
+#[test]
+fn tools_worker_runs_under_sealed() {
+    if capsule_runtime::skip_without_egress_namespace("tools_worker_runs_under_sealed") {
+        return;
+    }
+    let (home, run, workers, mur) = confined_workers("sealed");
+    if run.output.status.code() != Some(0) && run.context().contains("E-CAP-") {
+        eprintln!(
+            "[SKIP-HOST] tools_worker_runs_under_sealed: this host does not reach sealed\n{}",
+            run.context()
+        );
+        return;
+    }
+    assert_confined("sealed", &run, &workers, mur);
+    // Inside the composed root: `/` is a tmpfs of its own, and neither the records directory nor
+    // the session's own records folder (its `trace.jsonl`) is mounted in it; only the session's
+    // `tmp/` and `home/` beneath it are, as for a shell command.
+    let records = home.home.path().join(".murmur/records");
+    let traces = traces_under(&records);
+    let session_records = traces
+        .first()
+        .and_then(|trace| trace.parent())
+        .unwrap_or_else(|| panic!("no trace under {}", records.display()))
+        .to_path_buf();
+    for worker in &workers {
+        let root = worker
+            .mountinfo
+            .lines()
+            .find(|line| line.split(' ').nth(4) == Some("/"))
+            .unwrap_or_else(|| panic!("{}: no `/` mount: {}", worker.kind, worker.mountinfo));
+        assert!(
+            root.contains(" - tmpfs "),
+            "{}: `/` is the composed root's tmpfs: {root}",
+            worker.kind
+        );
+        for unmounted in [&records, &session_records] {
+            assert!(
+                !worker.mountinfo.lines().any(|line| line
+                    .split(' ')
+                    .nth(3)
+                    .is_some_and(|root| root.ends_with(unmounted.to_str().unwrap()))),
+                "{}: {} is not mounted: {}",
+                worker.kind,
+                unmounted.display(),
+                worker.mountinfo
+            );
+        }
+    }
+    let grants = &run.of_type("session_start")[0]["effective_grants"];
+    assert_ne!(grants["enforcement_tier"], "landlock+seccomp", "{grants}");
+}
+
+/// A canary is what an escaped guest could take: the probe guest's worker host side, built with
+/// the test-only `escape-probe` feature, runs in the tools worker and reports its own environment
+/// and command line, the manifest holding the key, the records directory, the session's
+/// `trace.jsonl` and every file in the work folder. At `scoped` and `sealed` the key appears in
+/// none of it, every read outside the work folder is refused, and the driver's requests still
+/// reached the provider with the key the supervisor attached.
+#[cfg(feature = "escape-probe")]
+#[test]
+fn probe_cannot_read_key_or_records() {
+    if capsule_runtime::skip_without_egress_namespace("probe_cannot_read_key_or_records") {
+        return;
+    }
+    for containment in ["scoped", "sealed"] {
+        let home = Home::new();
+        let records = home.home.path().join(".murmur/records");
+        let records_for_reply = records.clone();
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("murmur.yaml");
+        let manifest_for_reply = manifest_path.clone();
+        let config = home.home.path().join(".murmur/config.yaml");
+        // The session's `trace.jsonl` exists by the first model request, so the probe is told
+        // its real path.
+        let upstream = Upstream::start_with(move |index| {
+            (index == 0).then(|| {
+                let trace = traces_under(&records_for_reply)
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                let session_records = trace.parent().unwrap_or(Path::new("/")).to_path_buf();
+                common::tool_use_response(
+                    "toolu_probe",
+                    "escape-conformance-probe-guest",
+                    json!({
+                        "case": "secrets",
+                        "read": [
+                            manifest_for_reply.display().to_string(),
+                            config.display().to_string(),
+                            records_for_reply.display().to_string(),
+                            trace.display().to_string(),
+                        ],
+                        "list": [
+                            records_for_reply.display().to_string(),
+                            session_records.display().to_string(),
+                        ],
+                    }),
+                )
+            })
+        });
+        let extra = format!(
+            "  - name: {PROBE_GUEST}\n    version: {VERSION}\n    runtime: tool\ncapabilities:\n  \
+             containment: {containment}\n"
+        );
+        let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+        fs::copy(&capsule.manifest, &manifest_path).unwrap();
+        let capsule = Capsule {
+            project,
+            manifest: manifest_path.clone(),
+        };
+        let run = home.run(&capsule);
+        if containment == "sealed"
+            && run.output.status.code() != Some(0)
+            && run.context().contains("E-CAP-")
+        {
+            eprintln!(
+                "[SKIP-HOST] probe_cannot_read_key_or_records: this host does not reach sealed\n{}",
+                run.context()
+            );
+            continue;
+        }
+        assert_eq!(
+            run.of_type("task_end")
+                .first()
+                .map(|end| end["exit_status"].clone()),
+            Some(json!("ok")),
+            "{containment}: {}",
+            run.context()
+        );
+        let probe_file = {
+            let mut found = Vec::new();
+            let mut dirs = vec![capsule.project.path().to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in fs::read_dir(&dir).unwrap().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    } else if path.file_name().is_some_and(|name| name == "__ec.probe") {
+                        found.push(path);
+                    }
+                }
+            }
+            assert_eq!(found.len(), 1, "{containment}: probe files {found:?}");
+            fs::read_to_string(&found[0]).unwrap()
+        };
+        assert!(
+            probe_file.starts_with("VERDICT=SUCCESS\n"),
+            "{containment}: the probe ran in the tools worker: {probe_file}"
+        );
+        for form in leak_forms(KEY) {
+            assert!(
+                !probe_file.contains(&form),
+                "{containment}: the probe read the key ({form}): {probe_file}"
+            );
+        }
+        let report: Value = serde_json::from_str(
+            probe_file
+                .lines()
+                .find_map(|line| line.strip_prefix("DETAIL="))
+                .unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{containment}: {error}: {probe_file}"));
+        let trace = traces_under(&records)
+            .first()
+            .unwrap_or_else(|| panic!("{containment}: no trace"))
+            .display()
+            .to_string();
+        let reads = report["reads"].as_object().expect("reads");
+        assert!(reads.contains_key(&trace), "{containment}: {report}");
+        for (path, outcome) in reads {
+            assert!(
+                outcome
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("err:")),
+                "{containment}: {path} was readable from the tools worker: {outcome}"
+            );
+        }
+        // At `scoped` the records directory and the session's own records folder are refused.
+        // At `sealed` their paths can exist in the composed root as the skeleton the session's
+        // `tmp/` and `home/` binds are mounted under, so a listing may succeed there, but the
+        // session's folder never shows its `trace.jsonl` (whose read is refused above).
+        let session_records = Path::new(&trace).parent().unwrap().display().to_string();
+        for listed_path in [records.display().to_string(), session_records.clone()] {
+            let listed = report["lists"][&listed_path]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match listed.strip_prefix("ok:") {
+                None => assert!(listed.starts_with("err:"), "{containment}: {listed}"),
+                Some(names) => {
+                    assert_eq!(
+                        containment, "sealed",
+                        "{listed_path} was listable: {listed}"
+                    );
+                    assert!(
+                        !names.split(',').any(|name| name == "trace.jsonl"),
+                        "{containment}: {listed_path} lists the trace: {listed}"
+                    );
+                }
+            }
+        }
+        assert!(
+            report["lists"][&session_records].is_string(),
+            "{containment}: {report}"
+        );
+        let environ = report["environ"].as_str().unwrap_or_default();
+        assert!(
+            environ == "ok:" || environ.starts_with("err:"),
+            "{containment}: the worker's environment is empty or unreadable: {report}"
+        );
+        let heads = upstream.heads.lock().unwrap().clone();
+        assert!(heads.len() >= 2, "{containment}: {heads:#?}");
+        for head in &heads {
+            assert!(
+                head.lines()
+                    .any(|line| line.eq_ignore_ascii_case(&format!("x-api-key: {KEY}"))),
+                "{containment}: the supervisor attached the key: {head}"
+            );
+        }
+    }
 }

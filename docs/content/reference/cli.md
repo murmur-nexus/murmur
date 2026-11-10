@@ -1431,7 +1431,7 @@ the way a launch does — see [Whether the launch gets its cgroup scope](contain
 
 | Capsule | `cgroup scope:` reads `unavailable` | Otherwise |
 |---|---|---|
-| Declares `capabilities.shell.allow` or `capabilities.spawn.allow` | `refused:` line naming `E-RUN-012`, a `Fix:` line, no `All checks passed.`, exit status `1` | the line alone |
+| Declares `capabilities.shell.allow` or `capabilities.spawn.allow`, or has a WASM tool, driver or hook ([guest worker](../concepts/guest-workers.md)) | `refused:` line naming `E-RUN-012`, a `Fix:` line, no `All checks passed.`, exit status `1` | the line alone |
 | Runs no subprocess | the line, then `this capsule runs no subprocess, so a launch creates no scope for it`; the exit code is unchanged | the same |
 
 ### Runtime directory { #doctor-runtime-directory }

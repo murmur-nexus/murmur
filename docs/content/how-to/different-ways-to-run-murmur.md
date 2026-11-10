@@ -242,12 +242,9 @@ Containment
 Routes
   shell commands    present  landlock+seccomp
   plan shell steps  absent   landlock+seccomp
-  WASM tools        present  host process, not confined by the class (murmur/tool-git)
-    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
-  drivers           present  host process, not confined by the class (murmur/driver-anthropic)
-    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
-  hooks             present  host process, not confined by the class (ana/hook-telemetry)
-    Runs inside the mur process tree, in a guest worker held only by the preopens and network grants its own capabilities block declares.
+  WASM tools        present  landlock+seccomp (murmur/tool-git)
+  drivers           present  landlock+seccomp (murmur/driver-anthropic)
+  hooks             present  landlock+seccomp (ana/hook-telemetry)
   process harness   absent   landlock+seccomp
   harness tools     absent   landlock+seccomp
 
@@ -306,10 +303,10 @@ the composed root; on the same host every other capsule runs on `landlock+seccom
 | `none` | `advisory` | No kernel sandboxing primitive (macOS and every non-Linux target) |
 
 `Routes` names every way this capsule runs code and what holds each. The mechanism confines shell
-commands, shell steps of a submitted plan, and a
-[process harness](../reference/containment.md#process-harness) with every tool it runs. WASM tools,
-drivers and hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree,
-held by their own preopens and network grants. A program a WASM tool runs, such as the `git` that `murmur/tool-git` runs
+commands, shell steps of a submitted plan, a
+[process harness](../reference/containment.md#process-harness) with every tool it runs, and the
+[guest workers](../concepts/guest-workers.md) that run WASM tools, drivers and hooks, each narrowed
+to the folders its guests are granted. A program a WASM tool runs, such as the `git` that `murmur/tool-git` runs
 here because `shell allow:` names it, runs under the mechanism like a shell command. See
 [Routes and what holds each](../reference/containment.md#routes).
 

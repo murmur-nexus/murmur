@@ -106,10 +106,9 @@ Routes
   shell commands    present  unconfined
     Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing holds it.
   plan shell steps  absent   unconfined
-  WASM tools        absent   host process, not confined by the class
-  drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
-    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
-  hooks             absent   host process, not confined by the class
+  WASM tools        absent   unconfined
+  drivers           present  unconfined (local/murmur-driver-anthropic)
+  hooks             absent   unconfined
   process harness   absent   unconfined
   harness tools     absent   unconfined
 

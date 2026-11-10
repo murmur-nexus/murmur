@@ -54,6 +54,10 @@ pub enum ProbeRoute {
         interpreter: String,
         workdir: String,
     },
+    /// Call [`ProbeConfig::tool`], the probe guest, over the bridge with `{"case": <case>}` as
+    /// its input, so the guest worker's host side runs the case ([`Route::WasmGuest`]). The
+    /// scripts are not used.
+    WasmGuest,
 }
 
 impl ProbeRoute {
@@ -62,6 +66,7 @@ impl ProbeRoute {
         match self {
             ProbeRoute::ShellTool => Route::ShellTool,
             ProbeRoute::ProcessHarness { .. } => Route::ProcessHarness,
+            ProbeRoute::WasmGuest => Route::WasmGuest,
         }
     }
 }
@@ -96,8 +101,8 @@ impl ProbeConfig {
 
     /// Reads a config out of `text`. Errors name the first required key that is missing or not
     /// a string; `script2` may be absent, `null` or empty, all meaning no second call. `route` is
-    /// required, and `"process-harness"` also requires `interpreter` and `workdir`. Keys it does
-    /// not know are ignored.
+    /// required (`"shell-tool"`, `"process-harness"` or `"wasm-guest"`), and `"process-harness"`
+    /// also requires `interpreter` and `workdir`. Keys it does not know are ignored.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text)
             .map_err(|err| format!("the probe config is not JSON: {err}"))?;
@@ -126,6 +131,7 @@ impl ProbeConfig {
                     workdir: required("workdir")?,
                 }
             }
+            Some(Value::String(name)) if name == Route::WasmGuest.as_str() => ProbeRoute::WasmGuest,
             Some(other) => return Err(format!("the probe config names an unknown route {other}")),
         };
         Ok(ProbeConfig {
@@ -204,7 +210,17 @@ mod tests {
 
     #[test]
     fn probe_config_round_trips_through_json() {
-        for c in [config(None), config(Some("ec-probe2.py")), harness_config()] {
+        let guest = ProbeConfig {
+            tool: "escape-conformance-probe-guest".to_string(),
+            route: ProbeRoute::WasmGuest,
+            ..config(None)
+        };
+        for c in [
+            config(None),
+            config(Some("ec-probe2.py")),
+            harness_config(),
+            guest,
+        ] {
             let text = c.to_json().to_string();
             assert_eq!(ProbeConfig::from_json(&text).unwrap(), c);
         }
@@ -233,9 +249,9 @@ mod tests {
         value
             .as_object_mut()
             .unwrap()
-            .insert("route".to_string(), Value::from("wasm-guest"));
+            .insert("route".to_string(), Value::from("native-tool"));
         let err = ProbeConfig::from_json(&value.to_string()).unwrap_err();
-        assert!(err.contains("wasm-guest"), "{err}");
+        assert!(err.contains("native-tool"), "{err}");
     }
 
     #[test]

@@ -36,13 +36,15 @@
 //!
 //! `--version` as the first argument prints the version and exits before reading any of them.
 //!
-//! # Two routes
+//! # Three routes
 //!
-//! On the shell-tool route (the default) the harness calls the bridge as described above. On the
+//! On the shell-tool route the harness calls the bridge as described above. On the
 //! process-harness route ([`ProbeRoute::ProcessHarness`]) it never touches the bridge: it runs the
 //! staged probe as its own child, with the interpreter and working directory the config names, and
 //! so measures what any process-transport harness can reach. The runtime contains the harness no
-//! further than a cleared environment, so whatever the probe can do here, a harness can.
+//! further than a cleared environment, so whatever the probe can do here, a harness can. On the
+//! wasm-guest route ([`ProbeRoute::WasmGuest`]) it calls the probe guest over the bridge with the
+//! case id, and the guest worker's host side runs the case in the worker process.
 //!
 //! # Output
 //!
@@ -164,7 +166,7 @@ fn emit(line: &str) {
 
 fn run(config: &ProbeConfig) -> Result<String, String> {
     match &config.route {
-        ProbeRoute::ShellTool => run_over_bridge(config),
+        ProbeRoute::ShellTool | ProbeRoute::WasmGuest => run_over_bridge(config),
         ProbeRoute::ProcessHarness {
             interpreter,
             workdir,
@@ -275,7 +277,13 @@ fn run_over_bridge(config: &ProbeConfig) -> Result<String, String> {
     // non-interpreter binary such as `python3` the value is split into argv words, so the staged
     // probe's filename is the whole argument list.
     let mut summary = format!("case={case} tool={tool}");
-    let first = tool_call(&bridge, 2, "c1", tool, script)?;
+    // On the guest-worker route the probe guest takes the case, and its worker's host side runs
+    // it: the same staged scripts are not run.
+    let arguments = match config.route {
+        ProbeRoute::WasmGuest => serde_json::json!({ "case": case }),
+        _ => serde_json::json!({ "command": script }),
+    };
+    let first = tool_call(&bridge, 2, "c1", tool, arguments)?;
     summary.push_str(&format!(" :: {first}"));
 
     // An optional second call, for the one case that needs a *later* spawn to exist. The workdir
@@ -283,7 +291,13 @@ fn run_over_bridge(config: &ProbeConfig) -> Result<String, String> {
     // subprocess after the periodic check latches a breach, so a case that makes a single tool
     // call gives the latch nothing to refuse and cannot observe the mechanism at all.
     if let Some(second) = &config.script2 {
-        let result = tool_call(&bridge, 3, "c2", tool, second)?;
+        let result = tool_call(
+            &bridge,
+            3,
+            "c2",
+            tool,
+            serde_json::json!({ "command": second }),
+        )?;
         summary.push_str(&format!(" || SECOND-CALL {result}"));
     }
     Ok(summary)
@@ -296,9 +310,8 @@ fn tool_call(
     rpc_id: u32,
     call_id: &str,
     tool: &str,
-    script: &str,
+    arguments: serde_json::Value,
 ) -> Result<String, String> {
-    let arguments = serde_json::json!({ "command": script });
     emit(&tool_line(call_id, tool, &arguments.to_string()));
     let result = call(
         bridge,

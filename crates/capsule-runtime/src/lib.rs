@@ -3,6 +3,14 @@
 // than `forbid`, since `forbid` cannot be overridden by a narrower `allow` anywhere in the crate.
 #![deny(unsafe_code)]
 
+// The escape-conformance probe's host side runs host syscalls a guest asks for. It exists for the
+// gate's debug builds; no release profile may carry it.
+#[cfg(all(feature = "escape-probe", not(debug_assertions)))]
+compile_error!(
+    "the `escape-probe` feature is test-only: it lets a guest run host syscalls in its worker, \
+     and a build without debug assertions (every release profile) must not carry it"
+);
+
 pub(crate) mod a2a;
 #[cfg(test)]
 mod a2a_conformance;

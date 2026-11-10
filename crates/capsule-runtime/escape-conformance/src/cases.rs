@@ -116,20 +116,43 @@ pub enum Route {
     /// a harness with a cleared environment and no other containment at every class, so a case
     /// on this route is graded on [`Case::harness`], one expectation whatever the class.
     ProcessHarness,
+    /// A guest worker, measured as if its guest had escaped Wasmtime: `probe-driver` calls the
+    /// probe guest, a WASM tool in the capsule's tools worker, over the tool bridge, and the
+    /// worker's host side runs the case's probe body in the worker process. Only a `mur` built
+    /// with the test-only `escape-probe` feature answers the probe guest. The worker is spawned
+    /// under the declared class like a shell command, so a case on this route is graded on the
+    /// same class columns as [`Route::ShellTool`]; [`NOT_ON_WASM_GUEST`] names the cases that do
+    /// not run here and why.
+    WasmGuest,
 }
 
 impl Route {
     /// Every route, in the order a case runs them.
-    pub const ALL: [Route; 2] = [Route::ShellTool, Route::ProcessHarness];
+    pub const ALL: [Route; 3] = [Route::ShellTool, Route::ProcessHarness, Route::WasmGuest];
 
-    /// The route's name in `--list-cases`, the stdout lines and the record.
+    /// The route's name in `--list-cases`, `--route`, the stdout lines and the record.
     pub fn as_str(self) -> &'static str {
         match self {
             Route::ShellTool => "shell-tool",
             Route::ProcessHarness => "process-harness",
+            Route::WasmGuest => "wasm-guest",
         }
     }
+
+    /// The route named `name` in [`Self::as_str`]'s spelling.
+    pub fn from_name(name: &str) -> Option<Route> {
+        Route::ALL.into_iter().find(|route| route.as_str() == name)
+    }
 }
+
+/// Boundary cases graded on their probe file that do not run on [`Route::WasmGuest`], each with
+/// the reason. Every other such case does, and none of the resource-exhaustion cases: their
+/// ceilings and evidence are a shell command's.
+pub const NOT_ON_WASM_GUEST: &[(&str, &str)] = &[(
+    "proc-self-cwd-reopen",
+    "a guest worker's working directory is `/`, not the work folder, so there is no walk out of \
+     the work folder through /proc/self/cwd to measure",
+)];
 
 /// Where a case's verdict is read from once the capsule has run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,13 +233,24 @@ impl Case {
     }
 
     /// The routes this case runs on, in run order: the shell tool always, the process harness
-    /// when [`Self::harness`] names an expectation.
+    /// when [`Self::harness`] names an expectation, a guest worker when
+    /// [`Self::runs_in_guest_worker`].
     pub fn routes(&self) -> impl Iterator<Item = Route> {
         let on_harness = self.harness.is_some();
+        let in_guest_worker = self.runs_in_guest_worker();
         Route::ALL.into_iter().filter(move |route| match route {
             Route::ShellTool => true,
             Route::ProcessHarness => on_harness,
+            Route::WasmGuest => in_guest_worker,
         })
+    }
+
+    /// Whether this case runs on [`Route::WasmGuest`]: a boundary case graded on its probe file
+    /// and not in [`NOT_ON_WASM_GUEST`].
+    pub fn runs_in_guest_worker(&self) -> bool {
+        self.category == Category::Boundary
+            && self.evidence == Evidence::ProbeFile
+            && !NOT_ON_WASM_GUEST.iter().any(|(id, _)| *id == self.id)
     }
 
     /// This case's expectation on `route` under `class`, `None` when it does not run there.
@@ -224,6 +258,7 @@ impl Case {
         match route {
             Route::ShellTool => Some(self.expectation(class)),
             Route::ProcessHarness => self.harness.map(|harness| harness.at(class)),
+            Route::WasmGuest => self.runs_in_guest_worker().then(|| self.expectation(class)),
         }
     }
 }
@@ -307,6 +342,8 @@ pub const PROCESS_HARNESS_CASE_COUNT: usize = 2;
 /// Expectations, across every route and class column, that assert a known gap. Held by the tests
 /// for the same reason: a known gap cannot quietly become `NotAsserted` or leave the registry.
 pub const KNOWN_GAP_EXPECTATION_COUNT: usize = 0;
+/// Cases that also run on [`Route::WasmGuest`], held like [`PROCESS_HARNESS_CASE_COUNT`].
+pub const WASM_GUEST_CASE_COUNT: usize = 23;
 
 /// Every case, boundary first. Order is the order they run and the order they are reported.
 pub const REGISTRY: &[Case] = &[
@@ -1922,13 +1959,15 @@ mod tests {
                 "{id}: the harness route has no launching shell to leak a descriptor from"
             );
             assert_eq!(
-                case.routes().collect::<Vec<_>>(),
+                case.routes()
+                    .filter(|route| *route != Route::WasmGuest)
+                    .collect::<Vec<_>>(),
                 [Route::ShellTool, Route::ProcessHarness],
                 "{id}"
             );
         }
         for case in REGISTRY.iter().filter(|case| case.harness.is_none()) {
-            assert_eq!(case.routes().collect::<Vec<_>>(), [Route::ShellTool]);
+            assert!(!case.routes().any(|route| route == Route::ProcessHarness));
             assert_eq!(
                 case.expectation_on(Route::ProcessHarness, ContainmentClass::Scoped),
                 None
@@ -1983,6 +2022,48 @@ mod tests {
             at("symlink-escape", ContainmentClass::Sealed),
             Must(Allowed)
         );
+    }
+
+    /// The guest-worker route count guard: a case cannot join or leave [`Route::WasmGuest`]
+    /// without changing [`WASM_GUEST_CASE_COUNT`]; it is graded on the shell tool's class columns,
+    /// and every case it skips is a boundary case named with a reason.
+    #[test]
+    fn wasm_guest_route_is_counted_and_graded_on_the_class_columns() {
+        let on_guest: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|case| case.routes().any(|route| route == Route::WasmGuest))
+            .map(|case| case.id)
+            .collect();
+        assert_eq!(
+            on_guest.len(),
+            WASM_GUEST_CASE_COUNT,
+            "cases on the wasm-guest route: {on_guest:?}"
+        );
+        for case in REGISTRY {
+            for class in [
+                ContainmentClass::Advisory,
+                ContainmentClass::Scoped,
+                ContainmentClass::Sealed,
+            ] {
+                let expected = case.runs_in_guest_worker().then(|| case.expectation(class));
+                assert_eq!(
+                    case.expectation_on(Route::WasmGuest, class),
+                    expected,
+                    "{}",
+                    case.id
+                );
+            }
+        }
+        for (id, reason) in NOT_ON_WASM_GUEST {
+            let case = find(id).unwrap_or_else(|| panic!("{id} is not in the registry"));
+            assert_eq!(case.category, Category::Boundary, "{id}");
+            assert_eq!(case.evidence, Evidence::ProbeFile, "{id}");
+            assert!(!reason.is_empty(), "{id}");
+        }
+        assert!(PREFLIGHT.runs_in_guest_worker());
+        for route in Route::ALL {
+            assert_eq!(Route::from_name(route.as_str()), Some(route));
+        }
     }
 
     /// The known-gap count guard: a known gap cannot be dropped, demoted to `NotAsserted` or

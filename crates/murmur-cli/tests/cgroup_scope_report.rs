@@ -520,29 +520,22 @@ fn uncovered_warnings(stderr: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A `sealed` capsule whose driver and tool are WASM gets one `W-SEC-034` from `mur doctor` and
-/// one from its launch, naming both routes and their artifacts; the launch also logs it and runs.
-/// An `advisory` capsule gets none.
+/// A `sealed` capsule whose driver and tool are WASM runs both in guest workers under the class:
+/// neither `mur doctor` nor its launch prints `W-SEC-034`, and the routes say the tier holds them.
+/// An `advisory` capsule gets none either.
 #[test]
-fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
-    let test = "a_sealed_capsule_is_told_which_routes_its_class_does_not_confine";
+fn a_sealed_wasm_capsule_gets_no_uncovered_route_warning() {
+    let test = "a_sealed_wasm_capsule_gets_no_uncovered_route_warning";
     let home = TempDir::new().unwrap();
     publish_agent_artifacts(&home);
 
     let project = agent_project("sealed", "http://127.0.0.1:9");
     let doctor = mur(false, home.path(), project.path(), &["doctor"]);
-    let warnings = uncovered_warnings(&doctor.stderr);
-    assert_eq!(warnings.len(), 1, "{}", doctor.all());
-    let warning = warnings[0];
     assert!(
-        warning.contains(&format!(
-            "WASM tools ({TOOL_NAME}) and drivers ({DRIVER_NAME}) run outside the class"
-        )),
-        "{warning}"
+        uncovered_warnings(&doctor.stderr).is_empty(),
+        "{}",
+        doctor.all()
     );
-    assert!(warning.contains("the declared sealed floor"), "{warning}");
-    assert!(warning.contains("nothing is refused"), "{warning}");
-    assert!(warning.trim_end().ends_with("#w-sec-034)"), "{warning}");
     assert!(doctor.stdout.contains("\nRoutes\n"), "{}", doctor.all());
 
     let advisory = agent_project("advisory", "http://127.0.0.1:9");
@@ -566,6 +559,17 @@ fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
         ],
     )
     .json();
+    let routes = report["routes"].as_array().expect("routes");
+    for name in ["wasm-tools", "drivers"] {
+        let row = routes
+            .iter()
+            .find(|row| row["route"] == name)
+            .unwrap_or_else(|| panic!("no {name} row: {report}"));
+        assert_eq!(row["present"], true, "{row}");
+        assert_eq!(row["under_class"], true, "{row}");
+        assert_eq!(row["mechanism"], report["enforcement_tier"], "{row}");
+        assert!(row["note"].is_null(), "{row}");
+    }
     if report["floor_met"] != true {
         eprintln!(
             "[SKIP-HOST] {test}: this host does not reach sealed ({}), so the launch half is not \
@@ -575,7 +579,7 @@ fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
         return;
     }
 
-    for (containment, expected) in [("sealed", 1), ("advisory", 0)] {
+    for (containment, expected) in [("sealed", 0), ("advisory", 0)] {
         let server = common::ScriptedServer::start(vec![end_turn_response()]);
         let project = agent_project(containment, &server.endpoint);
         let run = mur(
@@ -613,8 +617,8 @@ fn a_sealed_capsule_is_told_which_routes_its_class_does_not_confine() {
 }
 
 /// `inference.transport: process` puts the harness and its own tools on the table, under the
-/// class at its installed tier; at `scoped`, doctor's `W-SEC-034` names the driver and neither of
-/// them.
+/// class at its installed tier; the process driver runs in the driver worker under the class too,
+/// so at `scoped` doctor has no `W-SEC-034` to give.
 #[test]
 fn a_process_transport_capsule_reports_the_harness_routes() {
     let home = TempDir::new().unwrap();
@@ -658,13 +662,76 @@ fn a_process_transport_capsule_reports_the_harness_routes() {
 
     let doctor = mur(false, home.path(), project.path(), &["doctor"]);
     let warnings = uncovered_warnings(&doctor.stderr);
-    assert_eq!(warnings.len(), 1, "{}", doctor.all());
-    assert!(
-        warnings[0].contains(&format!(
-            "drivers ({PROCESS_DRIVER_NAME}) run outside the class"
-        )),
-        "{}",
-        warnings[0]
+    assert!(warnings.is_empty(), "{}", doctor.all());
+}
+
+/// A capsule whose only route is a WASM tool and a driver (no `shell.allow`, no `spawn.allow`)
+/// runs them in guest worker processes, so it needs a cgroup scope exactly as a shell capsule
+/// does: inside the read-only construction its report says the scope is required and refused,
+/// and its launch is refused with `E-RUN-012` before any session folder exists, so before any
+/// worker could be started (workers start once the work folder and records exist).
+#[test]
+fn worker_only_capsule_needs_cgroup() {
+    let test = "worker_only_capsule_needs_cgroup";
+    if skip_without_read_only_cgroup(test) {
+        return;
+    }
+    if capsule_runtime::skip_without_egress_namespace(test) {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    publish_agent_artifacts(&home);
+    let project = agent_project("scoped", "http://127.0.0.1:9");
+
+    let report = mur(
+        true,
+        home.path(),
+        project.path(),
+        &[
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--explain-scope",
+            "--json",
+        ],
+    )
+    .json();
+    assert_ne!(report["cgroup_scope"]["status"], "not-required", "{report}");
+
+    let launch = mur(
+        true,
+        home.path(),
+        project.path(),
+        &[
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--task",
+            "Report and stop.",
+        ],
     );
-    assert!(!warnings[0].contains("harness"), "{}", warnings[0]);
+    assert_ne!(launch.code, Some(0), "{}", launch.all());
+    assert!(
+        launch.stderr.contains("error[E-RUN-012]"),
+        "{}",
+        launch.all()
+    );
+    assert!(
+        !project.path().join("workdir").exists(),
+        "a refused launch creates no work folder: {}",
+        launch.all()
+    );
+    for folder in ["sessions", "records"] {
+        let path = home.path().join(".murmur").join(folder);
+        let entries = fs::read_dir(&path)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            entries,
+            0,
+            "a refused launch creates nothing under {}: {}",
+            path.display(),
+            launch.all()
+        );
+    }
 }

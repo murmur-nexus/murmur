@@ -837,3 +837,96 @@ fn reason_of(stderr: &str) -> String {
         .map_or(stderr.len(), |offset| end + offset);
     stderr[start..line_end].to_string()
 }
+
+/// A capsule whose only route is a WASM driver and a WASM tool (no `shell.allow`, no
+/// `spawn.allow`) runs them in guest worker processes spawned under its class, so on a host that
+/// cannot create the session's network namespace it is refused with `E-CAP-005` exactly as a shell
+/// capsule is: no model request is made, and no session folder exists for a worker to have been
+/// started in.
+#[test]
+fn worker_only_capsule_needs_namespace() {
+    let test = "worker_only_capsule_needs_namespace";
+    let construction = Construction::UserNamespacesExhausted;
+    let scratch = Scratch::new();
+    if skip(test, construction, &scratch) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![end_turn("msg_1", "Done.")]);
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    for artifact in [
+        common::create_driver_artifact(
+            artifacts.path(),
+            DRIVER_NAME,
+            DRIVER_VERSION,
+            &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        ),
+        common::create_tool_artifact(
+            artifacts.path(),
+            "local/jsonl-line-count",
+            "0.1.0",
+            &common::fixture_path("graduation/tool/jsonl-line-count.wasm"),
+        ),
+    ] {
+        common::publish_local(&home, &artifact).success();
+    }
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        format!(
+            "name: worker-only-capsule\n\
+             version: 0.1.0\n\
+             artifacts:\n\
+             \x20 - name: {DRIVER_NAME}\n\
+             \x20   version: {DRIVER_VERSION}\n\
+             \x20   runtime: driver\n\
+             \x20   gateway:\n\
+             \x20     endpoint: {endpoint}\n\
+             \x20     api_key: test-key\n\
+             \x20 - name: local/jsonl-line-count\n\
+             \x20   version: 0.1.0\n\
+             \x20   runtime: tool\n\
+             capabilities:\n\
+             \x20 containment: scoped\n\
+             \x20 network:\n\
+             \x20   allow:\n\
+             \x20     - {endpoint}\n\
+             inference:\n\
+             \x20 transport: http\n\
+             \x20 model: test-model\n\
+             \x20 driver:\n\
+             \x20   artifact: {DRIVER_NAME}\n",
+            endpoint = server.endpoint
+        ),
+    )
+    .unwrap();
+
+    let run = Run::of(
+        construction
+            .command(
+                &scratch,
+                project.path(),
+                &mur_path(),
+                &["run", "--manifest", "murmur.yaml", "--task", "Say done."],
+            )
+            .env("HOME", home.path())
+            .output()
+            .unwrap(),
+    );
+    assert!(!run.success, "{}", run.all());
+    assert!(run.stderr.contains("error[E-CAP-005]"), "{}", run.all());
+    assert!(
+        run.stderr.contains("ENOSPC"),
+        "the refusal names the failed unshare: {}",
+        run.all()
+    );
+    assert!(server.requests().is_empty(), "no model request was made");
+    assert!(
+        !project.path().join("workdir").exists(),
+        "no work folder was created, so no worker was started"
+    );
+    assert!(
+        !home.path().join(".murmur/sessions").exists(),
+        "no session runtime directory was created"
+    );
+}

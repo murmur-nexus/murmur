@@ -1086,6 +1086,7 @@ fn a_worker_inherits_no_descriptor_past_its_connection() {
             program: program.clone(),
         },
         WorkerKind::Tools,
+        None,
     )
     .expect("the worker starts");
     let mut child = child.expect("a worker process");
@@ -1129,4 +1130,27 @@ fn a_hello_naming_another_pid_is_refused() {
         error.contains("said hello as pid 1") && error.contains("started as pid 4000000"),
         "{error}"
     );
+}
+
+/// A worker process with a sandbox is spawned through `sandbox::prepare_enforcement`, the path
+/// every shell command takes: a failure of that step (forced) is the worker's start failure, and
+/// no process is started.
+#[test]
+fn a_confined_worker_is_spawned_through_prepare_enforcement() {
+    let workdir = tempfile::tempdir().unwrap();
+    let sandbox = super::launch::WorkerSandbox {
+        enforcement: crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs(),
+        workdir: workdir.path().to_path_buf(),
+    };
+    crate::sandbox::FORCE_PREPARE_FAILURE.with(|flag| flag.set(true));
+    let started = super::launch::start_worker(
+        &Launcher::Process {
+            program: std::path::PathBuf::from("/bin/true"),
+        },
+        WorkerKind::Tools,
+        Some(&sandbox),
+    );
+    crate::sandbox::FORCE_PREPARE_FAILURE.with(|flag| flag.set(false));
+    let error = started.expect_err("the forced enforcement failure refuses the start");
+    assert!(error.contains("forced by test seam"), "{error}");
 }

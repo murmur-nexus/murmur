@@ -2139,6 +2139,25 @@ fn companion_pids() -> Vec<u32> {
         .clone()
 }
 
+/// Waits for the delegated-base resolution [`resolve_delegated_base_in_background_with`] started,
+/// or runs it here, and returns its refusal: the reason [`prepare_scope`] would refuse the
+/// session's scope with, for `E-RUN-012`. Once this returns `Ok`, this process is in the cgroup it
+/// will stay in (its own transient scope, or the delegated root's supervisor leaf), so a child
+/// forked after it is created there. Staging calls it for a capsule that needs a scope before it
+/// creates any session folder or forks a guest worker, whose spawn also forks the session
+/// namespace's holder processes. Off Linux there is nothing to wait for.
+pub(crate) fn await_delegated_base() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
+            return Err("forced: delegation refused by the test seam".to_string());
+        }
+        delegated_base()?;
+    }
+    Ok(())
+}
+
 /// The delegated-base resolution described above, with `companions` (this session's guest-worker
 /// pids, children of this process forked before this call) moving wherever this process moves.
 pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {

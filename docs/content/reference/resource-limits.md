@@ -118,15 +118,17 @@ counts against `cgroup_pids_max`, or against `max_processes` where no scope boun
 
 ### Platform behavior { #platform-behavior }
 
-**Linux.** A capsule that can spawn any subprocess — through `capabilities.shell.allow` or
-`capabilities.spawn.allow` — refuses to launch with
-`E-RUN-012` when the host cannot delegate a cgroup, rather than running that tree with no aggregate
-ceiling. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
+**Linux.** A capsule that can spawn any subprocess refuses to launch with `E-RUN-012` when the
+host cannot delegate a cgroup, rather than running that tree with no aggregate ceiling. A capsule
+can spawn a subprocess when it declares `capabilities.shell.allow` or `capabilities.spawn.allow`,
+or has any `runtime: tool`, `runtime: driver` or `runtime: hook` artifact or a non-empty
+`capabilities.install.tool`, each of which runs in a [guest worker](../concepts/guest-workers.md)
+process. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
 the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any
 setup. When no systemd user session is reachable, it falls back to whatever cgroup it already
 inherited, which must itself carry `Delegate=yes` for `memory pids cpu io` (for example, by running
 under a unit configured that way, or via `systemd-run --user --scope --property=Delegate=yes`). A
-capsule that declares no subprocess capability is never blocked. See
+capsule with none of these, such as one made only of skills, is never blocked. See
 [Verification](containment.md#verification) for how these bounds are checked by hand.
 
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone

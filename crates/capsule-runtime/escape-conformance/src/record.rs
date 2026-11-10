@@ -428,17 +428,19 @@ impl Record<'_> {
              `not-asserted` in the `advisory` column means something different — a class with no \
              mechanism — and the two must not be read as one. The three class columns are the \
              shell-tool route; the `process-harness` column is that route's expectation at \
-             `scoped` / `sealed`, and `—` there means the case does not run on it.\n"
+             `scoped` / `sealed`; the `wasm-guest` route is graded on the shell-tool column of the \
+             class under test, and `—` in either of the last two columns means the case does not \
+             run on that route.\n"
         );
         let _ = writeln!(
             out,
-            "| case | category | advisory | scoped | sealed | process-harness |"
+            "| case | category | advisory | scoped | sealed | process-harness | wasm-guest |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|");
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|");
         for case in crate::cases::all_cases() {
             let _ = writeln!(
                 out,
-                "| `{}` | {} | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} |",
                 case.id,
                 case.category,
                 case.advisory.as_str(),
@@ -448,8 +450,21 @@ impl Record<'_> {
                     .map(|harness| {
                         format!("{} / {}", harness.scoped.as_str(), harness.sealed.as_str())
                     })
-                    .unwrap_or_else(|| "—".to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                if case.runs_in_guest_worker() {
+                    "as shell-tool"
+                } else {
+                    "—"
+                }
             );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Boundary cases graded on their probe file that do not run on the `wasm-guest` route:\n"
+        );
+        for (id, reason) in crate::cases::NOT_ON_WASM_GUEST {
+            let _ = writeln!(out, "- `{id}`: {reason}");
         }
         let _ = writeln!(out);
 
@@ -602,6 +617,21 @@ mod tests {
             .find("| enforcement tier | `landlock+seccomp` |\n")
             .expect("the enforcement tier row");
         assert!(achieved < tier, "{rendered}");
+    }
+
+    /// A boundary case kept off the `wasm-guest` route is named in the record with its reason,
+    /// so a reader of the record alone can see why that route has no verdict for it.
+    #[test]
+    fn the_record_says_why_a_case_does_not_run_on_the_wasm_guest_route() {
+        let host = host(bare_readings());
+        let rendered = record(&host, &[]).render();
+        assert!(!cases::NOT_ON_WASM_GUEST.is_empty());
+        for (id, reason) in cases::NOT_ON_WASM_GUEST {
+            assert!(
+                rendered.contains(&format!("- `{id}`: {reason}\n")),
+                "{id}: {rendered}"
+            );
+        }
     }
 
     /// Only a full bare-host run with a same-filesystem work root is citable.

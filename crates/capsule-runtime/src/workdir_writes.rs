@@ -957,11 +957,15 @@ mod tests {
                 if path.extension().is_some_and(|extension| extension == "rs") {
                     checked += 1;
                     // This module's own prose and failure messages quote the patterns being
-                    // searched for, and `workdir_fs.rs` is the helper itself.
-                    if path
-                        .file_name()
-                        .is_some_and(|name| name == "workdir_writes.rs" || name == "workdir_fs.rs")
-                    {
+                    // searched for, and `workdir_fs.rs` is the helper itself. `escape_probe.rs`
+                    // is compiled only with the test-only `escape-probe` feature, which no
+                    // release carries: it writes into the work folder the way an escaped guest
+                    // would, to measure the boundary, so it is never a runtime write to declare.
+                    if path.file_name().is_some_and(|name| {
+                        name == "workdir_writes.rs"
+                            || name == "workdir_fs.rs"
+                            || name == "escape_probe.rs"
+                    }) {
                         continue;
                     }
                     let source = std::fs::read_to_string(&path).unwrap();

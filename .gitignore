@@ -34,3 +34,5 @@ murmur.yaml
 # …except test fixtures, whose manifests are part of the test input. Without this the CLI
 # integration suite silently depends on untracked files and cannot run from a clean checkout.
 !crates/*/tests/fixtures/**/murmur.yaml
+# …and the escape-conformance artifacts' manifests, which the gate embeds with `include_str!`.
+!crates/capsule-runtime/escape-conformance/*/murmur.yaml

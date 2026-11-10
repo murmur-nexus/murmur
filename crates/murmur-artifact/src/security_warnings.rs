@@ -305,10 +305,11 @@ pub const W_SEC_032: &str = "W-SEC-032";
 pub const W_SEC_033: &str = "W-SEC-033";
 
 /// A capsule declares a `scoped` or `sealed` floor and runs code on a route that class does not
-/// confine: WASM tools, drivers and hooks run in guest workers in the `mur` process tree, and the
-/// `inference.transport: process` harness and its own tools run as children outside the class.
-/// One warning names every such route present, and the artifacts on it. Never a refusal. Fires
-/// once per launch, from `mur run` (stderr and the bootstrap log) and from `mur doctor`.
+/// confine: the `inference.transport: process` harness and its own tools, which run as children
+/// outside the class. WASM tools, drivers and hooks run in guest workers under the class and are
+/// never named. One warning names every such route present, and the artifacts on it. Never a
+/// refusal. Fires once per launch, from `mur run` (stderr and the bootstrap log) and from
+/// `mur doctor`.
 pub const W_SEC_034: &str = "W-SEC-034";
 
 /// A `host_paths` entry in `~/.murmur/config.yaml` is, lies under, or contains a credential

@@ -92,7 +92,9 @@ probe at launch and refuses with `E-RUN-012` naming what is missing.
 ### What the runtime does with the delegation
 
 At launch, before any WASM is instantiated, if the capsule can spawn a subprocess
-(`capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty) the runtime:
+(`capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty, or it has a WASM tool,
+driver or hook, each of which runs in a [guest worker](../concepts/guest-workers.md) process) the
+runtime:
 
 1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
    `Delegate=yes` and moves itself into it — the same mechanism rootless Podman and Docker use —
@@ -242,7 +244,7 @@ sed 's/^    memory_bytes: .*/    memory_bytes: 4294967296/' murmur.yaml > murmur
 | Variant | Change from `murmur.yaml` | Scenario |
 |---|---|---|
 | `murmur-defaults.yaml` | No `resources:` block | [0](#scenario-0) |
-| `murmur-wasm-only.yaml` | No `capabilities:` block, so no `shell.allow` or `spawn.allow` makes the capsule subprocess-capable | [7b](#scenario-7) |
+| `murmur-wasm-only.yaml` | No `capabilities:` block: its only subprocesses are the guest workers that run its driver and `murmur/tool-git` | [7b](#scenario-7) |
 | `murmur-cgroup-memory.yaml` | `memory_bytes: 4294967296` (4 GiB), so the cgroup's 256 MiB is the first memory bound a process meets | [3](#scenario-3) |
 
 Before each scenario, in another terminal, keep an eye on the host:
@@ -587,19 +589,19 @@ Confirm no shell subprocess ran at all: the newest session `mur trace list --wor
 lists is the refused launch, and its [records directory](workdir.md#records-directory) holds no
 `trace.jsonl`, so no `shell` event was recorded.
 
-**7b — WASM-only capsule, no delegation → launch proceeds.** Run
+**7b — WASM-only capsule, no delegation → refuse.** Run
 [`murmur-wasm-only.yaml`](#the-test-capsule), keeping delegation removed. It has no
-`capabilities:` block, so nothing in it can start a subprocess, and `murmur/tool-git` runs inside
-the `mur` process:
+`capabilities:` block, but its driver and `murmur/tool-git` run in
+[guest worker](../concepts/guest-workers.md) processes, which need the cgroup scope as a shell
+command does:
 
 ```bash
 env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
   mur run --manifest murmur-wasm-only.yaml --task 'echo hello'
 ```
 
-**Expected:** the capsule runs normally. There is no process tree to bound, so requiring host
-configuration here would be a disproportionate regression for WASM-only capsules. If this refuses
-to launch, the condition is scoped too broadly.
+**Expected:** the launch is refused with the same `E-RUN-012` as 7a, and no model request is
+made. If it runs, a guest worker ran with no cgroup scope around it.
 
 Restore the delegation drop-in afterwards.
 

@@ -70,6 +70,7 @@ truncation-driver           crates/capsule-runtime/wit/guest                    
 usage-driver                crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/usage-driver/src/usage-driver                  -            crates/murmur-cli/tests/fixtures/usage-driver/tool/usage-driver.wasm
 wire-digest-driver          crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/wire-digest-driver/src/wire-digest-driver      -            crates/murmur-cli/tests/fixtures/wire-digest-driver/tool/wire-digest-driver.wasm
 escape-conformance-driver   crates/capsule-runtime/wit/process-driver               crates/capsule-runtime/escape-conformance/driver                                -            crates/capsule-runtime/escape-conformance/driver/escape_conformance_driver.wasm
+escape-conformance-probe-guest crates/capsule-runtime/wit/guest                        crates/capsule-runtime/escape-conformance/probe-guest                           -            crates/capsule-runtime/escape-conformance/probe-guest/escape_conformance_probe_guest.wasm
 
 # Frozen.
 process-driver-v1           crates/murmur-cli/tests/fixtures/process-driver-v1/wit  crates/murmur-cli/tests/fixtures/process-driver-v1/src/process-driver-v1        -            crates/murmur-cli/tests/fixtures/process-driver-v1/tool/process-driver-v1.wasm  frozen: built against its own frozen wit/ at the retired murmur:driver/process@0.1.0 so the refusal stays testable; never rebuild it to follow an interface change

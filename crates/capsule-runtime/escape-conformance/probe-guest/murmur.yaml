@@ -1,0 +1,9 @@
+name: escape-conformance-probe-guest
+version: 0.1.0
+runtime: tool
+description: >-
+  The escape-conformance gate's probe guest. It asks its host side to run the probe body its input
+  names, which only a `mur` built with the test-only `escape-probe` feature does; any other `mur`
+  returns the request unanswered. It is granted nothing.
+requires_files:
+  - escape_conformance_probe_guest.wasm

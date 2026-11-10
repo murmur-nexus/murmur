@@ -495,12 +495,23 @@ fn kernel_cause(step: Option<CreationStep>, errno: Option<i32>) -> &'static str 
     }
 }
 
-/// The symbolic name of the `errno` values a namespace creation can leave.
+/// The symbolic name of the `errno` values a namespace creation, a file open or a socket call can
+/// leave.
 pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
     Some(match errno {
         libc::EPERM => "EPERM",
         libc::ENOENT => "ENOENT",
+        libc::EBADF => "EBADF",
         libc::EACCES => "EACCES",
+        libc::EFAULT => "EFAULT",
+        libc::EEXIST => "EEXIST",
+        libc::EXDEV => "EXDEV",
+        libc::ELOOP => "ELOOP",
+        libc::EAFNOSUPPORT => "EAFNOSUPPORT",
+        libc::ENETUNREACH => "ENETUNREACH",
+        libc::ECONNREFUSED => "ECONNREFUSED",
+        libc::ETIMEDOUT => "ETIMEDOUT",
+        libc::EHOSTUNREACH => "EHOSTUNREACH",
         libc::EINVAL => "EINVAL",
         libc::ENOSPC => "ENOSPC",
         libc::ENOSYS => "ENOSYS",
@@ -2286,6 +2297,77 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert_eq!(detect_egress_namespace_failure(), None);
+    }
+
+    /// A capsule whose only route is a WASM guest (a tool, a driver, a hook, or a tool it may
+    /// pull) runs it in a guest worker process, so it is refused on a host that cannot make the
+    /// namespace (`E-CAP-005`) and needs a cgroup scope (`E-RUN-012`), as a shell capsule does.
+    /// One with no guest, shell or spawn grant (a skill alone) needs neither.
+    #[test]
+    fn a_worker_only_capsule_needs_the_namespace_and_the_scope() {
+        let policy = |artifacts: &str| {
+            let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.1.0\n{artifacts}"
+            ))
+            .expect("manifest fixture must parse");
+            crate::types::capability_policy_from_runtime_manifest(&manifest)
+        };
+        let failure = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        for (case, artifacts) in [
+            (
+                "tool",
+                "artifacts:\n  - name: local/t\n    version: 0.1.0\n    runtime: tool\n",
+            ),
+            (
+                "driver",
+                "artifacts:\n  - name: local/d\n    version: 0.1.0\n    runtime: driver\n",
+            ),
+            (
+                "hook",
+                "artifacts:\n  - name: local/h\n    version: 0.1.0\n    runtime: hook\n",
+            ),
+            (
+                "pulled tool",
+                "capabilities:\n  install:\n    tool:\n      - local/t-*\n",
+            ),
+        ] {
+            let policy = policy(artifacts);
+            assert!(policy.guest_workers, "{case}");
+            assert!(
+                crate::runtime::has_subprocess_route_at_staging(&policy),
+                "{case}"
+            );
+            assert!(crate::cgroup::requires_process_bounding(&policy), "{case}");
+            assert!(
+                matches!(
+                    check_egress_namespace(
+                        crate::runtime::has_subprocess_route_at_staging(&policy),
+                        Some(&failure)
+                    ),
+                    Err(crate::errors::RuntimeError::EgressNamespaceUnavailable { .. })
+                ),
+                "{case}"
+            );
+        }
+        for (case, artifacts) in [
+            ("nothing", ""),
+            (
+                "skill",
+                "artifacts:\n  - name: local/s\n    version: 0.1.0\n    runtime: skill\n",
+            ),
+        ] {
+            let policy = policy(artifacts);
+            assert!(!policy.guest_workers, "{case}");
+            assert!(
+                !crate::runtime::has_subprocess_route_at_staging(&policy),
+                "{case}"
+            );
+            assert!(!crate::cgroup::requires_process_bounding(&policy), "{case}");
+        }
     }
 
     #[test]

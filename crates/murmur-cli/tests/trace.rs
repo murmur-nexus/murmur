@@ -856,25 +856,24 @@ fn session_start_effective_grants_match_explain_scope_json() {
     ] {
         assert_eq!(route(name)["present"], present, "{name}: {grants}");
     }
-    for name in ["wasm-tools", "drivers"] {
-        assert_eq!(route(name)["under_class"], false, "{name}");
-        assert_eq!(route(name)["mechanism"], "host-process", "{name}");
-    }
-    // The process harness runs under the class, so its row reads the tier even where it is absent.
-    for name in ["shell", "process-harness"] {
+    // Every route runs under the class, so each row reads the tier even where it is absent: the
+    // guest workers, the shell and the process harness.
+    for name in ["wasm-tools", "drivers", "shell", "process-harness"] {
         assert_eq!(route(name)["under_class"], true, "{name}");
         assert_eq!(
             route(name)["mechanism"],
             grants["enforcement_tier"],
             "{name}"
         );
+        assert!(route(name)["note"].is_null(), "{name}");
     }
     // An http capsule has no process harness to report.
     assert!(grants["harness"].is_null(), "{grants}");
     assert_eq!(route("wasm-tools")["artifacts"], json!([GRANTS_TOOL_NAME]));
     assert_eq!(route("drivers")["artifacts"], json!([DRIVER_NAME]));
-    // No shell or spawn grant: the launch asked for no scope.
-    assert_eq!(grants["cgroup_scope"]["status"], "not-required", "{grants}");
+    // No shell or spawn grant, but a WASM tool and driver: their guest workers are a subprocess
+    // route, so the launch asked for a scope.
+    assert_ne!(grants["cgroup_scope"]["status"], "not-required", "{grants}");
     // Nothing declared beyond `advisory`: the class is the applied tier's, which on a
     // Landlock-capable host is `scoped` whatever the host could back.
     match grants["enforcement_tier"].as_str() {

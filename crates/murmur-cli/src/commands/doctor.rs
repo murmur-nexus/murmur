@@ -3674,11 +3674,11 @@ mod tests {
         assert_eq!(egress_namespace_refusal(false, Some(&failure)), None);
     }
 
-    /// An `install.tool` grant alone is no subprocess route for the pre-checklist refusal, as it
-    /// is none for `mur run`: a pulled tool is a WASM component, which starts a program only
-    /// through `murmur:process` and so only one `capabilities.shell.allow` names.
+    /// An `install.tool` grant alone is a subprocess route for the pre-checklist refusal, as it
+    /// is for `mur run`: a pulled tool runs in the tools guest worker, a process spawned under the
+    /// session's containment. An `install.skill` grant alone is none: a skill runs no guest.
     #[test]
-    fn egress_namespace_refusal_ignores_an_install_grant_alone() {
+    fn egress_namespace_refusal_counts_a_tool_install_grant_alone() {
         let policy = |install: &str| {
             capability_policy_from_runtime_manifest(
                 &murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
@@ -3692,7 +3692,7 @@ mod tests {
         let failure = kernel_support_missing();
         assert!(
             egress_namespace_refusal(has_subprocess_route_at_staging(&tool), Some(&failure))
-                .is_none()
+                .is_some()
         );
         assert!(
             egress_namespace_refusal(has_subprocess_route_at_staging(&skill), Some(&failure))
