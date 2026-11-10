@@ -49,10 +49,8 @@ fn next_id() -> u64 {
 #[derive(Debug, Clone)]
 enum Start {
     Starting,
-    /// Forked and exec'd (`child`), or running on a thread (`None`); not yet past the handshake.
-    Spawned {
-        child: Option<u32>,
-    },
+    /// Forked and exec'd, or running on a thread; not yet past the handshake.
+    Spawned,
     Ready {
         pid: u32,
     },
@@ -181,7 +179,7 @@ impl WorkerConn {
             match &*start {
                 Start::Ready { pid } => return Ok(*pid),
                 Start::Failed(reason) => return Err(reason.clone()),
-                Start::Starting | Start::Spawned { .. } => {}
+                Start::Starting | Start::Spawned => {}
             }
             let now = Instant::now();
             if now >= deadline {
@@ -208,7 +206,7 @@ impl WorkerConn {
         {
             Start::Ready { pid } => Some(Ok(*pid)),
             Start::Failed(reason) => Some(Err(reason.clone())),
-            Start::Starting | Start::Spawned { .. } => None,
+            Start::Starting | Start::Spawned => None,
         }
     }
 
@@ -235,28 +233,6 @@ impl WorkerConn {
                 HANDSHAKE_WAIT.as_secs()
             ))
         })
-    }
-
-    /// The worker process's pid once forked, without waiting for its handshake; `None` for a
-    /// thread worker or a start that failed.
-    fn wait_spawned(&self) -> Option<u32> {
-        let mut start = self
-            .start
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            match &*start {
-                Start::Starting => {}
-                Start::Spawned { child } => return *child,
-                Start::Ready { pid } => return Some(*pid).filter(|pid| *pid != std::process::id()),
-                Start::Failed(_) => return None,
-            }
-            start = self
-                .started
-                .wait_timeout(start, Duration::from_secs(5))
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
     }
 
     fn pid(&self) -> Option<u32> {
@@ -667,6 +643,9 @@ type LoadedGuests = HashMap<(WorkerKind, String), Arc<tokio::sync::OnceCell<u64>
 /// The guest workers of one session: at most one per kind, each started on first need.
 pub struct GuestWorkers {
     launcher: Launcher,
+    /// What each kind's worker process is confined by, set by staging before the kind starts.
+    /// A kind with none starts unconfined (a library embedder, an unconfined session's tests).
+    sandboxes: Mutex<HashMap<WorkerKind, Arc<super::launch::WorkerSandbox>>>,
     conns: Mutex<HashMap<WorkerKind, Arc<WorkerConn>>>,
     /// The guests each worker holds, by tool name, with their guest ids.
     loaded: Mutex<LoadedGuests>,
@@ -697,6 +676,7 @@ impl GuestWorkers {
         let handle = runtime.handle().clone();
         Arc::new(Self {
             launcher,
+            sandboxes: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashMap::new()),
             lost: Arc::new(Mutex::new(None)),
@@ -737,6 +717,16 @@ impl GuestWorkers {
             .clone()
     }
 
+    /// Confines every later start of `kind`'s worker process to `sandbox`. Called by staging for
+    /// every kind before the first start, so a worker started later in the session (the tools
+    /// worker at a pulled tool's first call) is confined the same way.
+    pub(crate) fn confine(&self, kind: WorkerKind, sandbox: super::launch::WorkerSandbox) {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(kind, Arc::new(sandbox));
+    }
+
     /// Starts the worker of `kind` unless it is already started. Does not wait for it.
     pub(crate) fn start(self: &Arc<Self>, kind: WorkerKind) -> Arc<WorkerConn> {
         let mut conns = self
@@ -771,6 +761,12 @@ impl GuestWorkers {
     #[allow(unsafe_code)]
     fn launch(self: &Arc<Self>, conn: &Arc<WorkerConn>) {
         let launcher = self.launcher.clone();
+        let sandbox = self
+            .sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&conn.kind)
+            .cloned();
         let conn_thread = Arc::clone(conn);
         let workers = Arc::downgrade(self);
         let spawned = std::thread::Builder::new()
@@ -779,7 +775,7 @@ impl GuestWorkers {
                 let kind = conn_thread.kind;
                 // The worker is spawned from this thread, which lives as long as the connection, so
                 // its parent-death signal is tied to the connection's life.
-                let started = super::launch::start_worker(&launcher, kind);
+                let started = super::launch::start_worker(&launcher, kind, sandbox.as_deref());
                 let (stream, child) = match started {
                     Ok(started) => started,
                     Err(reason) => {
@@ -796,8 +792,7 @@ impl GuestWorkers {
                 *conn_thread
                     .start
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Start::Spawned { child: child_pid };
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Start::Spawned;
                 conn_thread.notify_started();
                 if let (Some(child), Some(workers)) = (child, workers.upgrade()) {
                     workers
@@ -806,7 +801,18 @@ impl GuestWorkers {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(child);
                 }
-                let handshake = handshake(kind, &stream, child_pid);
+                // A worker forked into the session's PID namespace knows itself by a
+                // namespace-local pid; the process `spawn` returned is its relay, whose death
+                // takes the worker with it, so the relay is the pid this supervisor signals.
+                let known_pid = if sandbox
+                    .as_deref()
+                    .is_some_and(super::launch::WorkerSandbox::enters_pid_namespace)
+                {
+                    KnownPid::Relay(child_pid)
+                } else {
+                    KnownPid::Child(child_pid)
+                };
+                let handshake = handshake(kind, &stream, known_pid);
                 let mut reader = stream;
                 match handshake {
                     Err(reason) => {
@@ -861,22 +867,6 @@ impl GuestWorkers {
                 Start::Failed(format!("its connection thread did not start: {error}"));
             conn.notify_started();
         }
-    }
-
-    /// The pids of every started worker process once forked, without waiting for handshakes:
-    /// what moves with this process into its cgroup scope.
-    pub(crate) fn spawned_pids(&self) -> Vec<u32> {
-        let conns: Vec<_> = self
-            .conns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        conns
-            .iter()
-            .filter_map(|conn| conn.wait_spawned())
-            .collect()
     }
 
     /// Waits for every started worker to finish its handshake, or the `E-RUN-066` refusal of
@@ -1545,11 +1535,25 @@ fn reap(pid: u32, workers: Option<Arc<GuestWorkers>>) -> Option<std::process::Ex
 /// A worker process is known by the pid it was spawned as: a hello naming any other pid is
 /// refused, so the supervisor never signals a process it did not start. A thread worker, which
 /// has no child, is taken at its word.
+/// How the supervisor knows a just-started worker's pid.
+#[derive(Debug, Clone, Copy)]
+enum KnownPid {
+    /// The pid `spawn` returned is the worker itself (`None` for a thread worker).
+    Child(Option<u32>),
+    /// The pid `spawn` returned is the relay of a worker forked into the session's PID namespace,
+    /// whose hello names its namespace-local pid.
+    Relay(Option<u32>),
+}
+
 fn handshake(
     kind: WorkerKind,
     stream: &UnixStream,
-    child: Option<u32>,
+    known: KnownPid,
 ) -> Result<(u32, UnixStream), String> {
+    let (child, relay) = match known {
+        KnownPid::Child(child) => (child, None),
+        KnownPid::Relay(relay) => (None, relay),
+    };
     let mut reader = stream
         .try_clone()
         .map_err(|error| format!("its connection could not be shared: {error}"))?;
@@ -1569,14 +1573,18 @@ fn handshake(
                     "it speaks guest-worker protocol {protocol} (mur {version}), not {PROTOCOL_VERSION}"
                 ));
             }
-            match child {
-                Some(child) if child != pid => {
-                    return Err(format!(
-                        "it said hello as pid {pid}, but it was started as pid {child}"
-                    ));
+            if let Some(relay) = relay {
+                relayed_worker_pid(relay).unwrap_or(relay)
+            } else {
+                match child {
+                    Some(child) if child != pid => {
+                        return Err(format!(
+                            "it said hello as pid {pid}, but it was started as pid {child}"
+                        ));
+                    }
+                    Some(child) => child,
+                    None => pid,
                 }
-                Some(child) => child,
-                None => pid,
             }
         }
         other => return Err(format!("its first frame was not a hello: {other:?}")),
@@ -1591,13 +1599,25 @@ fn handshake(
     Ok((pid, writer))
 }
 
+/// The host pid of the worker a relay forked into the session's PID namespace: the relay's one
+/// child, read once the worker has said hello. `None` off Linux or when it cannot be read, and
+/// the relay's own pid is used instead; signalling either ends the worker.
+fn relayed_worker_pid(relay: u32) -> Option<u32> {
+    let children = std::fs::read_to_string(format!("/proc/{relay}/task/{relay}/children")).ok()?;
+    let mut pids = children.split_whitespace().map(str::parse::<u32>);
+    match (pids.next(), pids.next()) {
+        (Some(Ok(worker)), None) => Some(worker),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn handshake_for_test(
     kind: WorkerKind,
     stream: &UnixStream,
     child: Option<u32>,
 ) -> Result<u32, String> {
-    handshake(kind, stream, child).map(|(pid, _)| pid)
+    handshake(kind, stream, KnownPid::Child(child)).map(|(pid, _)| pid)
 }
 
 /// The `E-RUN-066` refusal for a worker of `kind` that did not start, for `reason`.

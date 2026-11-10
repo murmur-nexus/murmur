@@ -2520,6 +2520,14 @@ pub(crate) struct ShellEnforcement {
     /// staging instead.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) host_path_read_only_binds: Vec<PathBuf>,
+    /// Whether the fd-hygiene step falls back to marking each descriptor close-on-exec one at a
+    /// time where `close_range(CLOSE_RANGE_CLOEXEC)` is refused (a kernel before 5.11, or a
+    /// container seccomp profile that does not know the call). `false` for a command, whose spawn
+    /// fails there (see `linux_enforce::mark_inherited_fds_cloexec`); `true` for a guest worker
+    /// ([`Self::for_guest_worker`]), without which no agent capsule could start on such a host.
+    /// Either way every descriptor from 3 up is close-on-exec at `execve`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fd_hygiene_fallback: bool,
 }
 
 /// What a `transport: process` harness is granted beyond every command: the host paths the
@@ -2655,6 +2663,7 @@ impl ShellEnforcement {
             proc_view: crate::proc_view::proc_view(tier, &probe.namespaces),
             host_paths: policy.host_paths.clone(),
             host_path_read_only_binds,
+            fd_hygiene_fallback: false,
         })
     }
 
@@ -2966,6 +2975,7 @@ impl ShellEnforcement {
             proc_view: crate::proc_view::tier_proc_view(EnforcementTier::EnvironmentOnly),
             host_paths: Vec::new(),
             host_path_read_only_binds: Vec::new(),
+            fd_hygiene_fallback: false,
         }
     }
 
@@ -3570,6 +3580,109 @@ fn attach_unconfined_limits(command: &mut std::process::Command, enforcement: &S
     }
 }
 
+/// A guest worker's filesystem reach beyond the work folder, derived by the supervisor from the
+/// grants of the guests the worker may hold and nothing else: the union of their per-call
+/// preopens, because the kernel sandbox is installed once, at the worker's spawn.
+///
+/// The work folder itself is the `accessible_workdir` handed to [`prepare_enforcement`] beside
+/// the worker's enforcement, read-write and never executable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerGrantClosure {
+    /// Folders outside the work folder the guests write: granted `capabilities.state` stores and
+    /// a hook's records `hooks/` folder. Each is a read-write rule without `Execute` on the
+    /// Landlock tiers and a required bind at its own path on `KernelSealed`.
+    pub(crate) read_write: Vec<PathBuf>,
+    /// Whether a guest of the worker preopens the session runtime directory (read-only).
+    pub(crate) runtime_dir: bool,
+    /// Whether a guest of the worker preopens the `host_paths` roots of `~/.murmur/config.yaml`
+    /// (a tool with no filesystem scope), each at its configured access.
+    pub(crate) host_paths: bool,
+}
+
+impl ShellEnforcement {
+    /// The enforcement a guest worker process is spawned under: this session enforcement's tier,
+    /// namespaces, network allowlist and seccomp posture, with the worker's own grant closure in
+    /// place of every rule a shell command gets.
+    ///
+    /// - Landlock: `closure`, the work folder (passed to [`prepare_enforcement`] separately) with
+    ///   [`Self::workdir_exec`] off, and `worker_image`'s own ELF closure, the one grant carrying
+    ///   `Execute`, which the spawn's own `execve` of the worker needs. No guest grant carries
+    ///   `Execute`: a guest execs nothing, and `murmur:process` programs are spawned by the
+    ///   supervisor. No `shell.allow` closure, interpreter, staged runtime, pinned program or
+    ///   declared need.
+    /// - The records directory is dropped from the runtime roots, so neither a rule nor a bind
+    ///   names it. On `KernelSealed` the runtime directory, temporary and home folders stay,
+    ///   because the composed root is built from them; on the other tiers the runtime directory
+    ///   is kept only when `closure.runtime_dir` asks for it, without the temporary and home
+    ///   folders, so no private `/tmp` is mapped.
+    /// - rlimits: `RLIMIT_AS`, the `RLIMIT_NPROC` headroom and `RLIMIT_CPU` are left at the
+    ///   inherited values. Wasmtime reserves several GiB of address space for each linear memory,
+    ///   a worker's threads count against the uid's task total, and a worker lives the whole
+    ///   session; a guest call is bounded by its fuel, epoch deadline and wall bound instead, and
+    ///   the worker by the session's cgroup scope. `RLIMIT_NOFILE`, `RLIMIT_FSIZE` and
+    ///   `RLIMIT_CORE` apply as to a command.
+    /// - No cgroup join of its own: the worker's pid moves with `mur` into its scope
+    ///   (`cgroup::resolve_delegated_base_in_background_with`), no held-port observation, and no
+    ///   ownership of the runtime directory.
+    pub(crate) fn for_guest_worker(
+        &self,
+        closure: &WorkerGrantClosure,
+        worker_image: &Path,
+    ) -> ShellEnforcement {
+        let mut worker = self.clone();
+        worker.landlock_grants = LandlockGrant::non_listable_files(resolve_landlock_grants(&[
+            worker_image.to_path_buf(),
+        ]));
+        worker.sealed_bind_dirs = Vec::new();
+        worker.sealed_need_mirrors = Vec::new();
+        worker.staged_runtime_dirs = Vec::new();
+        worker.pinned_program_dirs = Vec::new();
+        worker.host_path_read_only_binds = Vec::new();
+        worker.fd_hygiene_fallback = true;
+        worker.workdir_exec = false;
+        worker.bind_observation = None;
+        worker.cgroup_scope = None;
+        worker.workdir_guard = None;
+        worker.runtime_dir_owner = None;
+        worker.resource_limits.memory_bytes = u64::MAX;
+        worker.resource_limits.max_processes = u64::MAX;
+        worker.resource_limits.cpu_seconds = None;
+        worker.declared_resources.memory_bytes = None;
+        worker.declared_resources.max_processes = None;
+        worker.declared_resources.cpu_seconds = None;
+        worker.runtime_dir = self.runtime_dir.clone().and_then(|mut roots| {
+            roots.records = None;
+            if self.tier == EnforcementTier::KernelSealed {
+                Some(roots)
+            } else if closure.runtime_dir {
+                roots.temp = None;
+                roots.home = None;
+                Some(roots)
+            } else {
+                None
+            }
+        });
+        let mut host_paths = if closure.host_paths {
+            self.host_paths.clone()
+        } else {
+            Vec::new()
+        };
+        host_paths.extend(
+            closure
+                .read_write
+                .iter()
+                .map(|path| crate::host_paths::HostPath {
+                    declared: path.display().to_string(),
+                    path: path.clone(),
+                    access: crate::host_paths::HostPathAccess::ReadWrite,
+                    credential_locations: Vec::new(),
+                }),
+        );
+        worker.host_paths = host_paths;
+        worker
+    }
+}
+
 /// Lowest file descriptor the fd-hygiene step touches. Everything from here upward is marked
 /// close-on-exec in the forked child; fds 0, 1 and 2 are deliberately left alone.
 ///
@@ -3860,6 +3973,7 @@ pub(crate) fn prepare_enforcement(
     // Copied out before the `move` closure below takes ownership of everything it touches, the
     // same clone-before-move shape `tier` and the Landlock fds already use.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
+    let fd_hygiene_fallback = enforcement.fd_hygiene_fallback;
     // Same clone-before-move shape. `HostResourceLimits` and `NprocBound` are `Copy`, and the
     // `RLIMIT_NPROC` decision is made here because its baseline is a `/proc` walk; the cgroup scope
     // is an `Arc` whose `cgroup.procs` descriptor was opened in the parent at scope-creation time,
@@ -3925,6 +4039,7 @@ pub(crate) fn prepare_enforcement(
                 landlock_fds.as_ref(),
                 unix_sockets_allowed,
                 bind_listener_handoff.as_ref(),
+                fd_hygiene_fallback,
             ) {
                 linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
                 return Err(error);
@@ -4668,6 +4783,7 @@ mod linux_enforce {
         landlock_fds: Option<&LandlockChildFds>,
         unix_sockets_allowed: bool,
         bind_listener: Option<&BindListenerHandoff>,
+        fd_hygiene_fallback: bool,
     ) -> io::Result<()> {
         // FIRST, on every kernel tier: join the session's network namespace. It has to precede
         // everything below it for three separate reasons:
@@ -4802,7 +4918,15 @@ mod linux_enforce {
         // Running it here is also what makes it cover this function's *own* descriptors: the
         // diagnostic pipe and the Landlock grant fds are used below but must never survive the
         // `execve`, and neither may the session's namespace handles, already used above.
-        mark_inherited_fds_cloexec()?;
+        match mark_inherited_fds_cloexec() {
+            Err(error)
+                if fd_hygiene_fallback
+                    && matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) =>
+            {
+                mark_inherited_fds_cloexec_one_by_one()?;
+            }
+            result => result?,
+        }
 
         // Next, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
         // capability model are independent, both-must-allow gates, so narrowing the Landlock
@@ -4982,6 +5106,34 @@ mod linux_enforce {
     /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
     /// error rather than degrade), but it is a real, user-visible narrowing of the supported
     /// kernel range for kernel-enforcement tiers.
+    /// [`mark_inherited_fds_cloexec`] without `close_range`: `fcntl(F_SETFD, FD_CLOEXEC)` on every
+    /// open descriptor from [`super::FD_HYGIENE_FIRST_FD`] below the soft `RLIMIT_NOFILE`, the
+    /// highest number a descriptor can have. The same end state, one syscall pair per number.
+    /// Only a guest worker's spawn takes it ([`super::ShellEnforcement::fd_hygiene_fallback`]).
+    pub(super) fn mark_inherited_fds_cloexec_one_by_one() -> io::Result<()> {
+        // SAFETY: `getrlimit` writes into a stack local; `fcntl` takes integers. All are
+        // async-signal-safe, as this post-fork, pre-exec window requires.
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let end = libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX);
+            let mut fd = super::FD_HYGIENE_FIRST_FD as libc::c_int;
+            while fd < end {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0
+                    && flags & libc::FD_CLOEXEC == 0
+                    && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                fd += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn mark_inherited_fds_cloexec() -> io::Result<()> {
         // SAFETY: this issues the `close_range` syscall directly through `libc::syscall`. The
         // three variadic arguments are all `c_uint` scalars and the kernel dereferences none of
@@ -15100,6 +15252,103 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             assert_eq!(enforcement.tier, tier);
             assert!(enforcement.host_paths.is_empty());
             assert!(enforcement.host_path_read_only_binds.is_empty());
+        }
+    }
+}
+
+// Linux only: the closure the test checks is an ELF reading.
+#[cfg(all(test, target_os = "linux"))]
+mod guest_worker_enforcement_tests {
+    use super::*;
+
+    fn session(tier: EnforcementTier) -> ShellEnforcement {
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
+        enforcement.tier = tier;
+        enforcement.workdir_exec = true;
+        enforcement.landlock_grants = vec![LandlockGrant {
+            path: PathBuf::from("/usr/bin/bash"),
+            list_dir: false,
+            executable: true,
+        }];
+        enforcement.sealed_bind_dirs = vec![PathBuf::from("/usr/bin")];
+        enforcement.host_paths = vec![crate::host_paths::HostPath {
+            declared: "~/lent".to_string(),
+            path: PathBuf::from("/srv/lent"),
+            access: crate::host_paths::HostPathAccess::Read,
+            credential_locations: Vec::new(),
+        }];
+        enforcement
+    }
+
+    /// A worker gets `Execute` on its own image's ELF closure and nothing else, no workdir
+    /// `Execute`, none of the shell's grants or binds, no records directory, and its granted
+    /// folders as read-write host paths.
+    #[test]
+    fn a_worker_enforcement_is_its_grant_closure_without_execute() {
+        let image = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let state = PathBuf::from("/srv/state/notes");
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            let session = session(tier);
+            let tools = session.for_guest_worker(
+                &WorkerGrantClosure {
+                    read_write: vec![state.clone()],
+                    runtime_dir: true,
+                    host_paths: true,
+                },
+                &image,
+            );
+            assert_eq!(tools.tier, tier);
+            assert!(!tools.workdir_exec);
+            assert!(tools.sealed_bind_dirs.is_empty());
+            assert!(tools
+                .landlock_grants
+                .iter()
+                .any(|grant| grant.path == image));
+            for grant in &tools.landlock_grants {
+                assert!(
+                    resolve_landlock_grants(std::slice::from_ref(&image)).contains(&grant.path),
+                    "{tier:?}: only the worker image's closure is granted: {grant:?}"
+                );
+            }
+            assert!(!tools
+                .landlock_grants
+                .iter()
+                .any(|grant| grant.path == Path::new("/usr/bin/bash")));
+            let roots = tools
+                .runtime_dir
+                .as_ref()
+                .expect("the tools worker reads it");
+            assert!(roots.records.is_none(), "{tier:?}: no records directory");
+            assert_eq!(roots.temp.is_some(), tier == EnforcementTier::KernelSealed);
+            let host: Vec<_> = tools
+                .host_paths
+                .iter()
+                .map(|path| (path.path.clone(), path.access))
+                .collect();
+            assert_eq!(
+                host,
+                vec![
+                    (
+                        PathBuf::from("/srv/lent"),
+                        crate::host_paths::HostPathAccess::Read
+                    ),
+                    (state.clone(), crate::host_paths::HostPathAccess::ReadWrite),
+                ]
+            );
+            assert_eq!(tools.resource_limits.memory_bytes, u64::MAX);
+            assert_eq!(tools.resource_limits.max_processes, u64::MAX);
+            assert_eq!(tools.resource_limits.cpu_seconds, None);
+            assert!(tools.cgroup_scope.is_none() && tools.runtime_dir_owner.is_none());
+            assert!(tools.fd_hygiene_fallback && !session.fd_hygiene_fallback);
+
+            let driver = session.for_guest_worker(&WorkerGrantClosure::default(), &image);
+            assert!(driver.host_paths.is_empty(), "{tier:?}");
+            assert_eq!(
+                driver.runtime_dir.is_some(),
+                tier == EnforcementTier::KernelSealed,
+                "{tier:?}: only a composed root needs the runtime directory without a grant"
+            );
+            assert!(Arc::ptr_eq(&driver.session_netns, &session.session_netns));
         }
     }
 }

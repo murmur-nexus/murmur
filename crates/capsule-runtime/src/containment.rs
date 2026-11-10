@@ -2544,14 +2544,21 @@ impl Route {
     }
 
     /// Whether the session's class covers this route: exactly the routes spawned through
-    /// `sandbox::prepare_enforcement`, the one path that installs the session's tier. This follows
-    /// where each route is spawned, not a policy: confining another route means flipping its arm
-    /// here.
+    /// `sandbox::prepare_enforcement`, the one path that installs the session's tier. Shell
+    /// commands and plan shell steps are; so are the process harness and the tools it runs, and
+    /// WASM tools, drivers and hooks, whose guest workers (`guest_worker::launch::spawn_process`)
+    /// are spawned through it under each worker's grant closure. This follows where each route is spawned, not a policy: confining
+    /// another route means flipping its arm here.
     #[must_use]
     pub fn under_class(self) -> bool {
         match self {
-            Self::Shell | Self::PlanShellSteps | Self::ProcessHarness | Self::HarnessTools => true,
-            Self::WasmTools | Self::Drivers | Self::Hooks => false,
+            Self::Shell
+            | Self::PlanShellSteps
+            | Self::ProcessHarness
+            | Self::HarnessTools
+            | Self::WasmTools
+            | Self::Drivers
+            | Self::Hooks => true,
         }
     }
 
@@ -2573,18 +2580,10 @@ impl Route {
             Self::Shell
             | Self::PlanShellSteps
             | Self::ProcessHarness
-            | Self::HarnessTools => None,
-            Self::WasmTools => Some(
-                "Runs inside the mur process tree, in a guest worker held by its WASI preopens and \
-                 the host-side network allowlist only.",
-            ),
-            Self::Drivers => Some(
-                "Runs inside the mur process tree, in a guest worker held by its WASI preopens and \
-                 the host-side network allowlist only.",
-            ),
-            Self::Hooks => Some(
-                "Runs inside the mur process tree, in a guest worker held only by the preopens \
-                 and network grants its own capabilities block declares.",
+            | Self::HarnessTools
+            | Self::WasmTools
+            | Self::Drivers
+            | Self::Hooks => None,
             ),
         }
     }
@@ -2778,7 +2777,8 @@ pub fn uncovered_route_warning(
         "the declared {declared} floor does not confine every route this capsule runs code on: \
          {named} run outside the class, with none of its Landlock, seccomp or network namespace \
          around them (`mur run --explain-scope` lists what holds each under Routes). The class \
-         confines shell commands and plan shell steps; nothing is refused"
+         confines shell commands, plan shell steps and the guest workers that run WASM tools, \
+         drivers and hooks; nothing is refused"
     ))
 }
 
@@ -5201,6 +5201,13 @@ mod tests {
                  workdir size ceiling. A ceiling, not a grant, on exactly `limits`' terms.",
             ),
             (
+                "guest_workers",
+                "Derived from the artifacts and `install.tool` the report already shows as the \
+                 `wasm-tools`, `drivers` and `hooks` route rows, and grants nothing: it only makes \
+                 such a capsule need the namespace and cgroup scope the report's `cgroup_scope` \
+                 states.",
+            ),
+            (
                 "declared_deadline_seconds",
                 "The undefaulted form of `limits.deadline_seconds`, retained only so hook calls \
                  can apply a lower default. Reporting it would report one ceiling twice.",
@@ -5544,9 +5551,9 @@ mod tests {
     }
 
     /// The table over every tier, every declared class and every presence input: one row per
-    /// [`Route::ALL`] entry in the fixed order; the first two covered by the applied tier's
-    /// mechanism and the rest `host-process` with their note, whatever the tier; presence exactly
-    /// as each input implies.
+    /// [`Route::ALL`] entry in the fixed order; shell commands, plan shell steps and the three
+    /// guest-worker routes covered by the applied tier's mechanism, the harness routes
+    /// `host-process` with their note, whatever the tier; presence exactly as each input implies.
     #[test]
     fn the_route_table_holds_its_invariants_on_every_input() {
         for tier in ALL_TIERS {
@@ -5565,14 +5572,17 @@ mod tests {
                         "{case}"
                     );
                     for row in &rows {
-                        // The harness and the tools it runs are under the class too, like a shell
-                        // command — these tiers are all contained (ALL_TIERS has no unconfined).
+                        // Every route is under the class on these tiers (ALL_TIERS has no
+                        // unconfined): the harness and its tools, and the guest workers.
                         let covered = matches!(
                             row.route,
                             Route::Shell
                                 | Route::PlanShellSteps
                                 | Route::ProcessHarness
                                 | Route::HarnessTools
+                                | Route::WasmTools
+                                | Route::Drivers
+                                | Route::Hooks
                         );
                         assert_eq!(row.under_class, covered, "{case}: {row:?}");
                         if covered {
@@ -5593,23 +5603,14 @@ mod tests {
         }
     }
 
-    /// The notes say what each uncovered route does run under.
+    /// Every route is under the class: shell commands and plan steps, the process harness and the
+    /// tools it runs, and the guest workers of WASM tools, drivers and hooks. None has a note.
     #[test]
-    fn each_uncovered_route_names_what_holds_it() {
-        let notes = |route: Route| route.note().unwrap();
-        for route in [Route::WasmTools, Route::Drivers] {
-            assert!(notes(route).contains("inside the mur process"), "{route:?}");
-            assert!(notes(route).contains("WASI preopens"), "{route:?}");
-            assert!(
-                notes(route).contains("host-side network allowlist only"),
-                "{route:?}"
-            );
+    fn every_route_is_under_the_class_with_no_note() {
+        for route in Route::ALL {
+            assert!(route.under_class(), "{route:?}");
+            assert_eq!(route.note(), None, "{route:?}");
         }
-        assert!(notes(Route::Hooks).contains("its own capabilities block declares"));
-        // The process harness and the tools it runs are under the class, so they have no
-        // uncovered-route note.
-        assert_eq!(Route::ProcessHarness.note(), None);
-        assert_eq!(Route::HarnessTools.note(), None);
     }
 
     /// The artifacts on each route come from the preopens by role.
@@ -5736,10 +5737,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains(
-                "  WASM tools        present  host process, not confined by the class (fs-tool)\n    \
-                 Runs inside the mur process"
-            ),
+            rendered.contains("  WASM tools        present  landlock+seccomp (fs-tool)\n"),
             "{rendered}"
         );
         assert!(
@@ -5781,26 +5779,13 @@ mod tests {
             None
         );
 
+        // WASM tools and drivers run in guest workers under the class: nothing to name.
         for declared in [ContainmentClass::Scoped, ContainmentClass::Sealed] {
-            let message = uncovered_route_warning(declared, &routes).expect("fires");
-            assert!(
-                message.contains(&format!("the declared {declared} floor")),
-                "{message}"
-            );
-            assert!(
-                message.contains(
-                    "WASM tools (fs-tool) and drivers (driver-anthropic) run outside the class"
-                ),
-                "{message}"
-            );
-            assert!(message.contains("nothing is refused"), "{message}");
-            for absent in ["hooks", "process harness", "harness tools"] {
-                assert!(!message.contains(absent), "{absent}: {message}");
-            }
+            assert_eq!(uncovered_route_warning(declared, &routes), None);
         }
 
-        // A process capsule's harness and the tools it runs are under the class, so `W-SEC-034`
-        // names only its uncovered driver route, never the harness.
+        // A process capsule's harness, the tools it runs and its driver are all under the class,
+        // so `W-SEC-034` has nothing to name.
         let process = route_table(
             &RouteInputs {
                 process_transport: true,
@@ -5809,13 +5794,9 @@ mod tests {
             },
             "landlock+seccomp",
         );
-        let message = uncovered_route_warning(ContainmentClass::Scoped, &process).unwrap();
-        assert!(
-            message.contains("drivers (driver-claude-code) run outside the class"),
-            "{message}"
-        );
-        assert!(!message.contains("process harness"), "{message}");
-        assert!(!message.contains("harness tools"), "{message}");
+        for declared in [ContainmentClass::Scoped, ContainmentClass::Sealed] {
+            assert_eq!(uncovered_route_warning(declared, &process), None);
+        }
     }
 
     /// The emitter writes the code, the message and the link to the bootstrap log it is handed.
@@ -5825,6 +5806,7 @@ mod tests {
         let routes = route_table(
             &RouteInputs {
                 drivers: vec!["d".to_string()],
+                process_transport: true,
                 ..RouteInputs::default()
             },
             "landlock+seccomp",
@@ -5837,7 +5819,8 @@ mod tests {
         let log = std::fs::read_to_string(temp.path().join("logs").join("bootstrap.log"))
             .unwrap_or_default();
         assert_eq!(log.matches("warning[W-SEC-034]").count(), 1, "{log}");
-        assert!(log.contains("drivers (d)"), "{log}");
+        assert!(log.contains("the process harness"), "{log}");
+        assert!(!log.contains("drivers (d)"), "{log}");
         assert!(log.contains("#w-sec-034"), "{log}");
     }
 

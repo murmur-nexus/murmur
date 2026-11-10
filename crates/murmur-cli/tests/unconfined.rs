@@ -115,9 +115,26 @@ impl Fixture {
     }
 
     /// `mur` with `args`, as uid 0: inside `unshare --user --map-root-user`, which maps this
-    /// user to root in a new user namespace, so `geteuid` in `mur` returns 0.
+    /// user to root in a new user namespace, so `geteuid` in `mur` returns 0. Where a user
+    /// systemd manager runs, inside a transient `Delegate=yes` scope, so a capsule that needs a
+    /// cgroup scope (any guest worker does) gets one there as outside the namespace.
     fn as_root(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut command = Command::new("unshare");
+        let mut command = if delegated_scope_available() {
+            let mut command = Command::new("systemd-run");
+            command.args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "unshare",
+            ]);
+            command
+        } else {
+            Command::new("unshare")
+        };
         command
             .args(["--user", "--map-root-user"])
             .arg(assert_cmd::cargo::cargo_bin("mur"))
@@ -189,6 +206,26 @@ impl Fixture {
             "{case}: left a formation directory"
         );
     }
+}
+
+/// Whether `systemd-run --user --scope -p Delegate=yes` can start a process here.
+fn delegated_scope_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "true",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
 }
 
 /// `true`, after printing `[SKIP-HOST]`, when this host cannot run a process as uid 0 in a user

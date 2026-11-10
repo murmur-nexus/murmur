@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::errors::RuntimeError;
 
 pub(crate) use http::RemoteHttp;
-pub(crate) use launch::Launcher;
+pub(crate) use launch::{Launcher, WorkerSandbox};
 pub(crate) use remote::RemoteProcessDriver;
 pub use supervisor::GuestWorkers;
 pub(crate) use wire::StreamEvent;

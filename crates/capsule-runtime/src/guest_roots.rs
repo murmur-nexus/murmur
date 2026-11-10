@@ -72,8 +72,8 @@ pub fn extra_guest_roots(policy: &CapabilityPolicy) -> Vec<GuestRoot> {
 ///
 /// Unconfined gives the host's `/` alone: a host path nested under it would add nothing, and a
 /// `read` one would narrow the tool, since the longest matching preopen wins. Otherwise each host
-/// path gives one root, in config order, on every contained tier: a WASM tool runs inside `mur`,
-/// which no tier confines, so its preopens are its only fence on every host.
+/// path gives one root, in config order, on every contained tier. The tools guest worker is
+/// granted the same folders at the kernel ([`crate::sandbox::WorkerGrantClosure::host_paths`]).
 #[must_use]
 pub fn extra_guest_roots_for(
     containment_floor: ContainmentClass,

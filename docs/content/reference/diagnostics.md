@@ -4689,30 +4689,24 @@ reports `read_only_to_commands: false` for the directory that lies inside. A `sc
 ### W-SEC-034 — a route this capsule runs code on is outside its class { #w-sec-034 }
 
 **Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present route
-the class does not cover: WASM tools, drivers or hooks. [Routes and what holds each](containment.md#routes) says when each is
-present.
+the class does not cover. Every route is under the class: shell commands, plan shell steps, a
+[process harness](containment.md#process-harness) with every tool it runs, and the
+[guest workers](../concepts/guest-workers.md) that run WASM tools, drivers and hooks. So no route is
+named today, and the warning does not fire. [Routes and what holds each](containment.md#routes) says
+when each route is present.
 
-Every agent capsule has a driver, so every agent capsule at `scoped` or `sealed` gets it. One
-warning names every such route and the artifacts on it:
+One warning names every such route:
 
 | From | When |
 |---|---|
 | `mur run` | Once per launch |
 | `mur doctor` | For the project's declared floor |
 
-```text
-[capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands and plan shell steps; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
-```
-
-**Why it matters:** the class confines shell commands, plan shell steps, and a
-[process harness](containment.md#process-harness) with every tool it runs. WASM tools, drivers and
-hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree, each held by
-its WASI preopens and the network allowlist.
+**Why it matters:** a route outside the class runs with your authority.
 
 **What the runtime does about it:** nothing is refused. The launch runs at the declared class.
 
-**What to do:** read the `Routes` block of `mur run --explain-scope` for what holds each route,
-and give each WASM tool, driver and hook only the `capabilities:` it needs.
+**What to do:** read the `Routes` block of `mur run --explain-scope` for what holds each route.
 
 ### W-SEC-035 — a host path reaches a credential location { #w-sec-035 }
 

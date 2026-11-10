@@ -2139,6 +2139,16 @@ fn companion_pids() -> Vec<u32> {
         .clone()
 }
 
+/// Waits for the delegated-base resolution [`resolve_delegated_base_in_background_with`] started,
+/// or runs it here: once this returns, this process is in the cgroup it will stay in (its own
+/// transient scope, or the delegated root's supervisor leaf), so a child forked after it is
+/// created there. Staging calls it before it forks the guest workers, whose spawn also forks
+/// the session namespace's holder processes. Off Linux there is nothing to wait for.
+pub(crate) fn await_delegated_base() {
+    #[cfg(target_os = "linux")]
+    let _ = delegated_base();
+}
+
 /// The delegated-base resolution described above, with `companions` (this session's guest-worker
 /// pids, children of this process forked before this call) moving wherever this process moves.
 pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {

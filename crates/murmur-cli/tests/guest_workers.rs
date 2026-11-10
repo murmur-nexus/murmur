@@ -267,9 +267,12 @@ impl Upstream {
     }
 }
 
-/// The `mur __guest-worker <kind>` children of `pid`: (pid, kind, argv, pgid).
+/// The guest workers `mur` (`pid`) started: its `__guest-worker` children, or, for a worker
+/// forked into the session's PID namespace, its relay's child (the relay is `mur`'s child and
+/// keeps `mur`'s own argv, since it never execs).
 fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
-    let mut found = Vec::new();
+    // (pid, ppid, pgrp, argv) of every process readable here.
+    let mut processes = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
         let Some(child) = entry
             .file_name()
@@ -284,9 +287,10 @@ fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
         // Fields after the parenthesised command: state, ppid, pgrp.
         let after = &stat[stat.rfind(')').unwrap() + 2..];
         let fields: Vec<&str> = after.split(' ').collect();
-        if fields[1].parse::<u32>().ok() != Some(pid) {
+        let (Some(ppid), Ok(pgrp)) = (fields[1].parse::<u32>().ok(), fields[2].parse::<i32>())
+        else {
             continue;
-        }
+        };
         let Ok(cmdline) = fs::read(format!("/proc/{child}/cmdline")) else {
             continue;
         };
@@ -295,9 +299,19 @@ fn workers_of(pid: u32) -> Vec<(u32, String, Vec<String>, i32)> {
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect();
-        if argv.get(1).map(String::as_str) == Some("__guest-worker") {
+        processes.push((child, ppid, pgrp, argv));
+    }
+    let children_of_mur: Vec<u32> = processes
+        .iter()
+        .filter(|process| process.1 == pid)
+        .map(|process| process.0)
+        .collect();
+    let mut found = Vec::new();
+    for (child, ppid, pgrp, argv) in processes {
+        let started_by_mur = ppid == pid || children_of_mur.contains(&ppid);
+        if started_by_mur && argv.get(1).map(String::as_str) == Some("__guest-worker") {
             let kind = argv.get(2).cloned().unwrap_or_default();
-            found.push((child, kind, argv, fields[2].parse().unwrap()));
+            found.push((child, kind, argv, pgrp));
         }
     }
     found.sort_by(|a, b| a.1.cmp(&b.1));
@@ -888,4 +902,143 @@ fn traces_under(root: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// The `Name:\tvalue` line `name` of `/proc/<pid>/status`, readable for a non-dumpable process.
+fn status_line(status: &str, name: &str) -> Option<String> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .map(|value| value.trim().to_string())
+}
+
+/// Runs a tool call through a capsule at `containment` held open at its door, and returns what
+/// each worker's `/proc/<pid>/status` and parent say while it is held, with the finished run and
+/// the scratch `HOME` its records are under.
+fn confined_workers(containment: &str) -> (Home, Run, Vec<(String, String, u32)>, u32) {
+    let home = Home::new();
+    let upstream = Upstream::start(vec![
+        common::tool_use_response("toolu_echo", "echo-tool", json!({"text": "ping"})),
+        END_TURN.to_string(),
+    ]);
+    let extra = format!(
+        "  - name: {ECHO_TOOL}\n    version: {VERSION}\n    runtime: tool\ncapabilities:\n  \
+         containment: {containment}\n{}",
+        sleep_lifecycle()
+    );
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+    let child = home.spawn(&capsule);
+    let pid = child.id();
+    // Both model requests answered: the tool ran in the tools worker between them.
+    let started = Instant::now();
+    while upstream.heads.lock().unwrap().len() < 2 && started.elapsed() < WAIT {
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let workers: Vec<(String, String, u32)> = workers_of(pid)
+        .into_iter()
+        .map(|(worker, kind, _, _)| {
+            let status = fs::read_to_string(format!("/proc/{worker}/status")).unwrap_or_default();
+            let stat = fs::read_to_string(format!("/proc/{worker}/stat")).unwrap_or_default();
+            let ppid = stat
+                .rfind(')')
+                .and_then(|end| stat[end + 2..].split(' ').nth(1))
+                .and_then(|field| field.parse().ok())
+                .unwrap_or(0);
+            (kind, status, ppid)
+        })
+        .collect();
+    // SAFETY: plain syscall on our own child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let run = finish(child, Duration::from_secs(60));
+    (home, run, workers, pid)
+}
+
+fn assert_confined(containment: &str, run: &Run, workers: &[(String, String, u32)], mur: u32) {
+    assert_eq!(
+        run.of_type("task_end")
+            .first()
+            .map(|end| end["exit_status"].clone()),
+        Some(json!("ok")),
+        "{containment}: {}",
+        run.context()
+    );
+    let kinds: Vec<&str> = workers.iter().map(|w| w.0.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["driver", "tools"],
+        "{containment}: {}",
+        run.context()
+    );
+    for (kind, status, ppid) in workers {
+        assert_eq!(
+            status_line(status, "Seccomp").as_deref(),
+            Some("2"),
+            "{containment} {kind}: {status}"
+        );
+        assert_eq!(
+            status_line(status, "NoNewPrivs").as_deref(),
+            Some("1"),
+            "{containment} {kind}: {status}"
+        );
+        let nspid = status_line(status, "NSpid").unwrap_or_default();
+        assert!(
+            nspid.split_whitespace().count() >= 2,
+            "{containment} {kind}: in the session's PID namespace, NSpid {nspid:?}"
+        );
+        assert_ne!(
+            *ppid, mur,
+            "{containment} {kind}: spawned through its relay"
+        );
+        assert_eq!(
+            status_line(status, "CapEff").as_deref(),
+            Some("0000000000000000"),
+            "{containment} {kind}: {status}"
+        );
+    }
+    let start = &run.of_type("session_start")[0];
+    let grants = &start["effective_grants"];
+    let routes = grants["routes"].as_array().expect("routes");
+    for name in ["wasm-tools", "drivers"] {
+        let row = routes.iter().find(|row| row["route"] == name).unwrap();
+        assert_eq!(row["under_class"], true, "{row}");
+        assert_eq!(row["mechanism"], grants["enforcement_tier"], "{row}");
+        assert!(row["note"].is_null(), "{row}");
+    }
+}
+
+/// At `scoped`, the tools and driver workers run under the session's seccomp filter with
+/// `no_new_privs`, no capability, in the session's PID namespace behind their relays, and the
+/// routes report them under the installed tier.
+#[test]
+fn tools_worker_runs_under_scoped() {
+    if capsule_runtime::skip_without_egress_namespace("tools_worker_runs_under_scoped") {
+        return;
+    }
+    let (_home, run, workers, mur) = confined_workers("scoped");
+    assert_confined("scoped", &run, &workers, mur);
+    let grants = &run.of_type("session_start")[0]["effective_grants"];
+    assert_eq!(grants["enforcement_tier"], "landlock+seccomp", "{grants}");
+}
+
+/// At `sealed`, the same holds, inside the composed root: the session installs the sealed tier
+/// and the routes report the workers under it.
+#[test]
+fn tools_worker_runs_under_sealed() {
+    if capsule_runtime::skip_without_egress_namespace("tools_worker_runs_under_sealed") {
+        return;
+    }
+    let (_home, run, workers, mur) = confined_workers("sealed");
+    if run.output.status.code() != Some(0) && run.context().contains("E-CAP-") {
+        eprintln!(
+            "[SKIP-HOST] tools_worker_runs_under_sealed: this host does not reach sealed\n{}",
+            run.context()
+        );
+        return;
+    }
+    assert_confined("sealed", &run, &workers, mur);
+    let grants = &run.of_type("session_start")[0]["effective_grants"];
+    assert_ne!(grants["enforcement_tier"], "landlock+seccomp", "{grants}");
 }

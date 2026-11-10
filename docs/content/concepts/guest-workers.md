@@ -31,9 +31,10 @@ A worker starts only when the capsule has an artifact of its kind:
 | A driver and `capabilities.install.tool`, before it pulls a tool | `driver`; `tools` starts at the first pulled tool's first call |
 | A script capsule with no tools | `driver` |
 
-`mur` starts the workers as staging begins, so their start overlaps artifact resolution. Each
-worker runs in its own process group with `/` as its working directory. It moves with `mur` into
-the session's cgroup scope. It dies with `mur`.
+`mur` starts the workers during staging, once the session's work folder and runtime folder exist.
+Each worker runs in its own process group with `/` as its working directory. Under a class with
+a process namespace, `mur`'s child is a relay outside the namespace and the worker is the relay's
+child inside it. Each worker moves with `mur` into the session's cgroup scope. It dies with `mur`.
 
 ## What never enters a worker
 
@@ -76,8 +77,34 @@ A worker that cannot be started refuses the launch with `E-RUN-066`.
 See [E-RUN-065](../reference/diagnostics.md#e-run-065) and
 [E-RUN-066](../reference/diagnostics.md#e-run-066).
 
-## Not confined by the containment class
+## Run under the containment class
 
-A worker runs as your user, with the same reach `mur` has. The containment class does not confine
-it. The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` says what
-holds each route.
+Each worker is started the way a shell command is, under the capsule's containment class, and
+reaches only the folders its guests are granted:
+
+| Worker | Reaches beyond the work folder |
+|---|---|
+| `tools` | each tool's state store, the session's runtime folder (read-only) and the `host_paths` folders of `~/.murmur/config.yaml` |
+| `driver` | each driver's state store; a script capsule's runtime folder (read-only) |
+| `hooks` | each hook's state store, and the records `hooks/` folder for a hook that declares `capabilities.filesystem.records: true` |
+
+| Class | A worker runs under |
+|---|---|
+| `scoped` | the session's network and process namespaces, seccomp, Landlock over the folders above, the cgroup scope and the rlimits |
+| `sealed` | all of `scoped`, inside the composed root |
+| `advisory` | what a shell command gets on the host |
+| `unconfined` | nothing: it runs as you |
+
+No folder a worker reaches can run a program, and no worker reaches the records directory, apart
+from `hooks/` for a hook granted it. A worker reaches the network only through the egress proxy,
+and the credential key stays in `mur`, which adds it to a driver's outgoing request. Because a
+worker is a subprocess, a capsule with any tool, driver or hook needs the session's network
+namespace ([E-CAP-005](../reference/diagnostics.md#e-cap-005)) and cgroup scope
+([E-RUN-012](../reference/containment.md#cgroup-scope)), as a shell capsule does.
+
+A worker is not limited by the memory, process-count or CPU-time rlimits: its guest runtime
+reserves several GiB of address space for each guest, and the session's cgroup scope and each
+call's own limits bound it instead.
+
+The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` shows the
+`wasm-tools`, `drivers` and `hooks` routes under the installed tier.

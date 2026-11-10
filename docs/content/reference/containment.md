@@ -62,9 +62,9 @@ present.
 |---|---|---|---|
 | `shell` | `capabilities.shell.allow` is non-empty | `true` | — |
 | `plan-shell-steps` | `capabilities.plan.submit` is `true` and `capabilities.shell.allow` is non-empty | `true` | — |
-| `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
-| `drivers` | any `runtime: driver` entry | `false` | Runs inside the `mur` process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only |
-| `hooks` | any `runtime: hook` entry | `false` | Runs inside the `mur` process tree, in a guest worker held only by the preopens and network grants its own `capabilities:` block declares |
+| `wasm-tools` | any `runtime: tool` entry, or `capabilities.install.tool` is non-empty | `true` | — (the `tools` [guest worker](../concepts/guest-workers.md) runs under the class) |
+| `drivers` | any `runtime: driver` entry | `true` | — (the `driver` guest worker runs under the class) |
+| `hooks` | any `runtime: hook` entry | `true` | — (the `hooks` guest worker runs under the class) |
 | `process-harness` | `inference.transport: process` | `true` | — (under the class, like a shell command — see [The process harness](#process-harness)) |
 | `harness-tools` | `inference.transport: process` | `true` | — (the harness runs its own tools under the same class) |
 
@@ -83,17 +83,16 @@ On the [Unconfined tier](#unconfined) the `shell`, `plan-shell-steps`, `process-
 `harness-tools`
 rows read `under_class: true` and `mechanism: unconfined`, with the note
 `Runs as the operator, with their HOME, whole environment, filesystem, network and sudo; nothing
-holds it.` The other four rows are unchanged.
+holds it.` The `wasm-tools`, `drivers` and `hooks` rows read `mechanism: unconfined` with no note,
+and the two harness rows are unchanged.
 
 ```text
 Routes
   shell commands    present  landlock+seccomp
   plan shell steps  absent   landlock+seccomp
-  WASM tools        present  host process, not confined by the class (local/fs-tool)
-    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
-  drivers           present  host process, not confined by the class (local/murmur-driver-anthropic)
-    Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
-  hooks             absent   host process, not confined by the class
+  WASM tools        present  landlock+seccomp (local/fs-tool)
+  drivers           present  landlock+seccomp (local/murmur-driver-anthropic)
+  hooks             absent   landlock+seccomp
   process harness   absent   landlock+seccomp
   harness tools     absent   landlock+seccomp
 ```
@@ -687,9 +686,9 @@ That entry is the whole of what `report-writer` reaches:
 
 ### Extra roots: host folders a WASM tool reaches { #wasm-extra-roots }
 
-A WASM tool runs in a [guest worker](../concepts/guest-workers.md) in the `mur` process tree, which
-no containment tier confines, so the folders opened for it are its only fence on every host and
-every tier. A `runtime: tool` WASM artifact whose entry
+A WASM tool runs in the `tools` [guest worker](../concepts/guest-workers.md), which the containment
+class confines to the folders opened for its tools, so on every tier those folders are the tool's
+fence. A `runtime: tool` WASM artifact whose entry
 declares no `capabilities.filesystem.scope` is handed:
 
 | Session | Folders the tool is handed |

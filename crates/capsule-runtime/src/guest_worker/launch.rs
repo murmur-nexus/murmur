@@ -7,6 +7,27 @@ use std::process::{Child, Command, Stdio};
 
 use super::{WorkerKind, ENTRY};
 
+/// What a worker process is confined by: the session's enforcement narrowed to the worker's
+/// grant closure ([`crate::sandbox::ShellEnforcement::for_guest_worker`]) and the work folder
+/// [`crate::sandbox::prepare_enforcement`] gives it read-write.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerSandbox {
+    pub(crate) enforcement: crate::sandbox::ShellEnforcement,
+    pub(crate) workdir: PathBuf,
+}
+
+impl WorkerSandbox {
+    /// Whether the worker is forked into the session's PID namespace, where the process `spawn`
+    /// returns is its relay and the worker knows itself by a namespace-local pid.
+    pub(crate) fn enters_pid_namespace(&self) -> bool {
+        !matches!(
+            self.enforcement.tier,
+            crate::sandbox::EnforcementTier::EnvironmentOnly
+                | crate::sandbox::EnforcementTier::Unconfined
+        ) && cfg!(target_os = "linux")
+    }
+}
+
 /// How a session's workers are started.
 #[derive(Clone)]
 pub(crate) enum Launcher {
@@ -40,6 +61,7 @@ impl Launcher {
 pub(crate) fn start_worker(
     launcher: &Launcher,
     kind: WorkerKind,
+    sandbox: Option<&WorkerSandbox>,
 ) -> Result<(UnixStream, Option<Child>), String> {
     let (ours, theirs) =
         UnixStream::pair().map_err(|error| format!("no socket pair for it: {error}"))?;
@@ -69,14 +91,35 @@ pub(crate) fn start_worker(
             Ok((ours, None))
         }
         Launcher::Process { program } => {
-            let child = spawn_process(program, kind, theirs)?;
+            let child = spawn_process(program, kind, theirs, sandbox)?;
             Ok((ours, Some(child)))
         }
     }
 }
 
+/// Spawns `mur __guest-worker <kind>` with its connection on fd 3.
+///
+/// With a `sandbox`, the worker is spawned through [`crate::sandbox::prepare_enforcement`], the
+/// path every shell command takes, and three `pre_exec` closures run in this order:
+///
+/// 1. In the forked child: its own process group, `PR_SET_PDEATHSIG(SIGKILL)` tied to the
+///    connection thread, and the check that the supervisor is still its parent. On a kernel tier
+///    this process becomes the relay, so both carry over to it.
+/// 2. The enforcement: cgroup and namespace joins, the fork into the session's PID namespace
+///    (the forked process continues as the worker, with its own parent-death signal tied to the
+///    relay), the private `/proc` or composed root, the fd-hygiene step, the capability drop,
+///    seccomp, Landlock and the rlimits.
+/// 3. The connection: the socket moved to fd 3 (`dup2`, or its close-on-exec flag cleared when it
+///    is already 3) and every descriptor above 3 marked close-on-exec. This runs after the
+///    fd-hygiene step, which marks every descriptor from 3 up close-on-exec, fd 3 included; it
+///    uses only `dup2`/`fcntl`/`close_range`, which the seccomp baseline admits.
 #[allow(unsafe_code)]
-fn spawn_process(program: &PathBuf, kind: WorkerKind, theirs: UnixStream) -> Result<Child, String> {
+fn spawn_process(
+    program: &PathBuf,
+    kind: WorkerKind,
+    theirs: UnixStream,
+    sandbox: Option<&WorkerSandbox>,
+) -> Result<Child, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -96,8 +139,8 @@ fn spawn_process(program: &PathBuf, kind: WorkerKind, theirs: UnixStream) -> Res
     #[cfg(target_os = "linux")]
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
-    // SAFETY: every call below is async-signal-safe (setpgid, prctl, getppid, fcntl, dup2,
-    // close_range) and touches only integers and this child's own descriptors.
+    // SAFETY: every call below is async-signal-safe (setpgid, prctl, getppid) and touches only
+    // integers.
     unsafe {
         command.pre_exec(move || {
             // Its own process group, so a terminal's SIGINT to mur's group reaches mur alone.
@@ -114,6 +157,21 @@ fn spawn_process(program: &PathBuf, kind: WorkerKind, theirs: UnixStream) -> Res
                     return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
             }
+            Ok(())
+        });
+    }
+    let handle = match sandbox {
+        Some(sandbox) => Some(crate::sandbox::prepare_enforcement(
+            &mut command,
+            &sandbox.enforcement,
+            &sandbox.workdir,
+        )?),
+        None => None,
+    };
+    // SAFETY: every call below is async-signal-safe (fcntl, dup2, close_range) and touches only
+    // this child's own descriptors.
+    unsafe {
+        command.pre_exec(move || {
             if fd == 3 {
                 let flags = libc::fcntl(3, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
@@ -126,9 +184,18 @@ fn spawn_process(program: &PathBuf, kind: WorkerKind, theirs: UnixStream) -> Res
             Ok(())
         });
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("{} did not start: {error}", program.display()))?;
+    let spawned = command.spawn();
+    // The enforcement's `pre_exec` closure holds the parent's copies of the diagnostic pipe's
+    // write end and of the namespace and Landlock descriptors: dropped before the diagnostic read.
+    drop(command);
+    let child = spawned.map_err(|error| {
+        let detail = handle
+            .as_ref()
+            .and_then(crate::sandbox::SupervisorHandle::read_diagnostic)
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        format!("{} did not start: {error}{detail}", program.display())
+    })?;
     drop(theirs);
     Ok(child)
 }
