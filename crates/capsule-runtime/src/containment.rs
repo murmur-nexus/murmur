@@ -1503,6 +1503,7 @@ impl UnconfinedReport {
                 "shell" => "shell commands",
                 "plan-shell-step" => "plan shell steps",
                 "process-harness" => "process harness",
+                "harness-tools" => "harness tools",
                 other => other,
             })
             .collect::<Vec<_>>()
@@ -3527,7 +3528,9 @@ mod tests {
         assert!(rendered.contains("  uid:       "), "{rendered}");
         assert!(rendered.contains("  HOME:      "), "{rendered}");
         assert!(
-            rendered.contains("applies to: shell commands, plan shell steps, process harness"),
+            rendered.contains(
+                "  applies to: shell commands, plan shell steps, process harness, harness tools\n"
+            ),
             "{rendered}"
         );
         assert!(unconfined_warning(unconfined).contains("sudo"));

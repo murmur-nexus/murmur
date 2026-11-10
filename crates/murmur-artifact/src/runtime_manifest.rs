@@ -5258,10 +5258,13 @@ fn parse_harness(raw: RawHarnessCapabilities) -> Result<HarnessCapabilities, Run
     Ok(HarnessCapabilities { paths })
 }
 
-/// Why a `capabilities.harness.paths` path has the wrong shape, or `None` for a directory named
-/// below `~/` or below `/`: no `.` or `..` segment, no empty segment from `//` (a trailing `/` is
-/// allowed), and not `/`, `~` or `~/` alone — the shape a process driver's path need must have.
-fn harness_path_shape_error(path: &str) -> Option<&'static str> {
+/// Why a harness path has the wrong shape, or `None` for a directory named below `~/` or below
+/// `/`: no `.` or `..` segment, no empty segment from `//` (a trailing `/` is allowed), and not
+/// `/`, `~` or `~/` alone. One rule for both sides of a harness grant: a
+/// `capabilities.harness.paths` entry and a process driver's path need. An empty path is the
+/// caller's to refuse.
+#[must_use]
+pub fn harness_path_shape_error(path: &str) -> Option<&'static str> {
     let rest = if path == "~" || path == "~/" {
         return Some("names the whole home folder; name the folder the harness needs");
     } else if let Some(rest) = path.strip_prefix("~/") {

@@ -378,7 +378,7 @@ fn assert_confined(run: &Run) {
     );
 }
 
-/// Scenario 1: at `scoped` the harness runs filtered by seccomp, with no_new_privs, in the
+/// At `scoped` the harness runs filtered by seccomp, with no_new_privs, in the
 /// session's network and PID namespaces, and `harness_start` names the tier.
 #[test]
 fn harness_runs_under_scoped() {
@@ -391,7 +391,7 @@ fn harness_runs_under_scoped() {
     assert_eq!(run.one("harness_start")["tier"], "landlock+seccomp");
 }
 
-/// Scenario 2: at `sealed` the harness runs the same way inside the composed root, where a folder
+/// At `sealed` the harness runs the same way inside the composed root, where a folder
 /// of the host home no grant names cannot be listed.
 #[test]
 fn harness_runs_under_sealed() {
@@ -402,8 +402,8 @@ fn harness_runs_under_sealed() {
     let explain = probe.explain_json();
     if explain["enforcement_tier"] != "mountns+pivot_root+landlock+seccomp" {
         eprintln!(
-            "SKIP — PROVES NOTHING ABOUT SEALED ON THIS HOST: harness_runs_under_sealed needs a \
-             host that reaches the composed root; the tier is {}",
+            "[SKIP-HOST] harness_runs_under_sealed: this host does not reach the composed root; \
+             the sealed tier is {}",
             explain["enforcement_tier"]
         );
         return;
@@ -523,20 +523,20 @@ fn escape_is_refused_at(class: &'static str, test: &str) {
     );
 }
 
-/// Scenario 3: a harness doing its own work at `scoped` cannot read outside the capsule or reach
+/// A harness doing its own work at `scoped` cannot read outside the capsule or reach
 /// an unlisted host or the host's loopback.
 #[test]
 fn escape_from_the_harness_is_refused_at_scoped() {
     escape_is_refused_at("scoped", "escape_from_the_harness_is_refused_at_scoped");
 }
 
-/// Scenario 3 at `sealed`.
+/// The same escape at `sealed`.
 #[test]
 fn escape_from_the_harness_is_refused_at_sealed() {
     escape_is_refused_at("sealed", "escape_from_the_harness_is_refused_at_sealed");
 }
 
-/// Scenario 3's control: unconfined, the same harness reads the sentinel and reaches the host's
+/// The escape's control: unconfined, the same harness reads the sentinel and reaches the host's
 /// listener, so the refusals above are the class at work. Whether 1.1.1.1 answers depends on the
 /// host's own network and is not asserted.
 #[test]
@@ -580,7 +580,7 @@ fn assert_refused_naming(run: &Run, named: &[&str]) {
     );
 }
 
-/// Scenario 4: the needs build with no grant, a grant at too low an access, and the path granted
+/// The needs build with no grant, a grant at too low an access, and the path granted
 /// with the host left out are each refused naming what is missing and the key to add; nothing is
 /// spawned. `--explain-scope` exits 0 and shows each need refused.
 #[test]
@@ -654,7 +654,7 @@ fn a_missing_grant_refuses_the_launch_naming_it() {
     );
 }
 
-/// Scenario 5: a manifest entry wider than the driver's need grants the need alone — the harness
+/// A manifest entry wider than the driver's need grants the need alone — the harness
 /// writes in the declared folder and not beside it — and `--explain-scope` names the wider entry
 /// as what allowed it.
 #[test]
@@ -691,7 +691,7 @@ fn a_parent_grant_reaches_only_the_declared_path() {
     assert!(!parent.join("sibling-written").exists());
 }
 
-/// Scenario 5's symlink half: a need whose folder a symlink below the allowing entry leads out of
+/// A need whose folder a symlink below the allowing entry leads out of
 /// it is refused, never granted at the link's target.
 #[test]
 fn a_symlinked_need_outside_its_entry_is_refused() {
@@ -721,7 +721,7 @@ fn a_symlinked_need_outside_its_entry_is_refused() {
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
 }
 
-/// Scenario 6: an allowed need absent on this host is reported `missing`, the task still runs,
+/// An allowed need absent on this host is reported `missing`, the task still runs,
 /// and `session_start.effective_grants.harness` is what `--explain-scope --json` printed.
 #[test]
 fn an_absent_allowed_need_is_reported_missing() {
@@ -744,7 +744,7 @@ fn an_absent_allowed_need_is_reported_missing() {
     assert_eq!(start["effective_grants"]["harness"], report["harness"]);
 }
 
-/// Scenario 8: on a granted process capsule both harness routes are under the class at the
+/// On a granted process capsule both harness routes are under the class at the
 /// installed tier with no note, `--explain-scope` prints the `Process harness` block, and
 /// `session_start.effective_grants` is what `--explain-scope --json` printed, byte for byte.
 #[test]
@@ -807,7 +807,7 @@ fn session_start_effective_grants_match_explain_scope_json_on_a_process_capsule(
     assert_eq!(run.one("session_start")["effective_grants"], report);
 }
 
-/// Scenario 10: the bridge the harness is handed listens inside the session's network namespace —
+/// The bridge the harness is handed listens inside the session's network namespace —
 /// the harness's bridged call succeeds, and while it is serving nothing in the host's namespace
 /// reaches its address.
 #[test]

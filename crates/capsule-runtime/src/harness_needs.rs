@@ -215,39 +215,17 @@ pub(crate) fn validate_harness_needs(needs: &HarnessNeeds) -> Result<(), String>
     Ok(())
 }
 
-/// A path need is non-empty, starts with `~/` or `/`, has only normal components after that (no
-/// `.`/`..`, no empty segment from `//` other than a trailing `/`), and is not `/` or `~`/`~/`
-/// alone.
+/// A path need is non-empty and has the shape a `capabilities.harness.paths` entry must have
+/// ([`murmur_artifact::harness_path_shape_error`]), so a need and the entry that allows it are
+/// held to one rule.
 fn validate_need_path(path: &str) -> Result<(), String> {
-    let bad = |reason: &str| Err(format!("names the path need {path:?}, which {reason}"));
     if path.is_empty() {
-        return bad("is empty");
+        return Err(format!("names the path need {path:?}, which is empty"));
     }
-    let rest = if let Some(rest) = path.strip_prefix("~/") {
-        if rest.is_empty() {
-            return bad("is ~/ alone, naming the home folder");
-        }
-        rest
-    } else if path == "~" {
-        return bad("is ~ alone, naming the home folder");
-    } else if let Some(rest) = path.strip_prefix('/') {
-        if rest.is_empty() {
-            return bad("is /, the whole host filesystem");
-        }
-        rest
-    } else {
-        return bad("is relative; write an absolute path or ~/…");
-    };
-    // A trailing `/` is allowed; any other empty segment is a `//`, and `.`/`..` are not normal.
-    let trimmed = rest.strip_suffix('/').unwrap_or(rest);
-    for segment in trimmed.split('/') {
-        match segment {
-            "" => return bad("has an empty path segment (//)"),
-            "." | ".." => return bad("has a . or .. segment"),
-            _ => {}
-        }
+    match murmur_artifact::harness_path_shape_error(path) {
+        Some(reason) => Err(format!("names the path need {path:?}, which {reason}")),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Resolves a session's harness grants: the allow rule against the manifest, then the host-folder
@@ -558,12 +536,14 @@ fn escapes_allowing_entry(
     match std::fs::canonicalize(entry_path) {
         Ok(entry) if host_path.path.starts_with(&entry) => None,
         Ok(entry) => Some(refuse(format!(
-            "resolves to {}, outside {} where the capabilities.harness.paths entry {allowed_by:?}              that allows it resolves; a symlink on the way leads out of the granted folder",
+            "resolves to {}, outside {} where the capabilities.harness.paths entry {allowed_by:?} \
+             that allows it resolves; a symlink on the way leads out of the granted folder",
             host_path.path.display(),
             entry.display(),
         ))),
         Err(error) => Some(refuse(format!(
-            "the capabilities.harness.paths entry {allowed_by:?} that allows it cannot be              resolved on this host: {error}"
+            "the capabilities.harness.paths entry {allowed_by:?} that allows it cannot be \
+             resolved on this host: {error}"
         ))),
     }
 }
@@ -806,16 +786,16 @@ mod tests {
         .is_ok());
     }
 
-    /// Scenario 7: every malformed need is refused naming it, and the driver load turns the reason
+    /// Every malformed need is refused naming it, and the driver load turns the reason
     /// into `E-RUN-032`.
     #[test]
     fn a_malformed_need_is_refused_naming_it() {
         for (path, expected) in [
             ("", "is empty"),
             ("relative/dir", "is relative"),
-            ("~", "is ~ alone"),
-            ("~/", "is ~/ alone"),
-            ("/", "is /, the whole host filesystem"),
+            ("~", "names the whole home folder"),
+            ("~/", "names the whole home folder"),
+            ("/", "names /, the whole host filesystem"),
             ("~/a/../b", "has a . or .. segment"),
             ("/opt/./x", "has a . or .. segment"),
             ("/opt//x", "has an empty path segment"),
@@ -972,6 +952,10 @@ mod tests {
         assert!(
             message.contains("a symlink on the way leads out"),
             "{message}"
+        );
+        assert!(
+            !message.contains("  "),
+            "one space between words: {message}"
         );
         assert!(grants.granted_paths.is_empty());
         let row = &grants.report.paths[0];

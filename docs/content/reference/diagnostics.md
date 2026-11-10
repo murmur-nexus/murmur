@@ -2229,15 +2229,19 @@ error[E-CAP-021]: process driver 'local/the-driver@1.0.0' declares harness needs
   hint: grant each path under capabilities.harness.paths (on this transport: process capsule) and each host under capabilities.network.allow — the harness reaches only what the manifest also allows, never more than the class gives every command
 ```
 
-The same code refuses a `capabilities.harness` block on a capsule whose `inference.transport` is
-not `process`, since the block reaches the process harness and nothing else, and a granted path
-that resolves to a refused location on this host (a system path, read-write over murmur's home
-`~/.murmur`, or inside the work folder), on the same terms as an operator `host_paths` entry, and a
-granted path that a symlink on its way leads outside the `capabilities.harness.paths` entry that
-allows it. A path the manifest
-allows but that is absent on this host is reported `missing` and the launch continues.
-`mur run --explain-scope` prints each need's status and exits `0`; `mur doctor` reports a
-disallowed need here in its `Process harness` block.
+The same code also refuses:
+
+- a `capabilities.harness` block on a capsule whose `inference.transport` is not `process` — the
+  block reaches the process harness and nothing else;
+- an allowed path that resolves to a refused location on this host — a system path, read-write
+  over murmur's home `~/.murmur`, or inside the work folder — on the same terms as an operator
+  `host_paths` entry;
+- an allowed path that a symlink on its way leads outside the `capabilities.harness.paths` entry
+  that allows it.
+
+A path the manifest allows but that is absent on this host is reported `missing` and the launch
+continues. `mur run --explain-scope` prints each need's status and exits `0`; `mur doctor` reports
+a disallowed need here in its `Process harness` block.
 
 ## Conversation record errors
 
@@ -4685,8 +4689,7 @@ reports `read_only_to_commands: false` for the directory that lies inside. A `sc
 ### W-SEC-034 — a route this capsule runs code on is outside its class { #w-sec-034 }
 
 **Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present route
-the class does not cover: WASM tools, drivers, hooks, or the `inference.transport: process`
-harness and its tools. [Routes and what holds each](containment.md#routes) says when each is
+the class does not cover: WASM tools, drivers or hooks. [Routes and what holds each](containment.md#routes) says when each is
 present.
 
 Every agent capsule has a driver, so every agent capsule at `scoped` or `sealed` gets it. One
@@ -4701,10 +4704,10 @@ warning names every such route and the artifacts on it:
 [capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands and plan shell steps; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
 ```
 
-**Why it matters:** the class confines shell commands and plan shell steps. WASM
-tools, drivers and hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process
-tree, each held by its WASI preopens and the network allowlist; the process harness and its tools
-run with your authority.
+**Why it matters:** the class confines shell commands, plan shell steps, and a
+[process harness](containment.md#process-harness) with every tool it runs. WASM tools, drivers and
+hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree, each held by
+its WASI preopens and the network allowlist.
 
 **What the runtime does about it:** nothing is refused. The launch runs at the declared class.
 
