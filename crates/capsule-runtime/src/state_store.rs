@@ -278,6 +278,7 @@ mod tests {
             conversation: None,
             plan: None,
             install: None,
+            harness: None,
             containment: None,
         }
     }

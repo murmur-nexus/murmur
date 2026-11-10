@@ -725,7 +725,20 @@ pub(crate) fn run_run(
                 .map(|inference| inference.transport.as_str()),
         )
         .with_cgroup_scope(scope_probe.cgroup_scope)
-        .with_manifest_files(manifest_file_rows);
+        .with_manifest_files(manifest_file_rows)
+        // The harness's needs resolved against the manifest and this host, the same way staging
+        // resolves them, read-only: `session_start.effective_grants.harness` carries this byte for
+        // byte. `null` off process transport.
+        .with_harness(
+            crate::commands::declared_needs::installed_harness_report(
+                &runtime_manifest,
+                &capability_policy,
+                &project_dir,
+                lock.as_ref(),
+                &launch_workdir,
+            )
+            .map_err(|error| fail(&session_id, &workdir, error, json))?,
+        );
         // The staging check on the tier this report names, so a read-write host path over
         // something the capsule may run refuses here as the launch would.
         capsule_runtime::host_paths::check_policy_execute_roots(

@@ -117,6 +117,9 @@ pub struct HostPathRefusal {
     pub declared: String,
     pub resolved: Option<PathBuf>,
     pub reason: String,
+    /// The entry's directory does not exist on this host. The one refusal a harness need reports
+    /// as `missing` rather than refusing the launch.
+    pub missing: bool,
 }
 
 impl fmt::Display for HostPathRefusal {
@@ -349,6 +352,7 @@ pub fn declare_host_paths(
             declared: written.clone(),
             resolved: None,
             reason,
+            missing: false,
         };
         let Some(path) = entry.path.as_deref().filter(|path| !path.trim().is_empty()) else {
             return Err(refuse(
@@ -389,6 +393,16 @@ pub fn declare_host_paths(
         });
     }
     Ok(declared)
+}
+
+/// `path` made absolute against `home` (`~` and `~/…`) and folded lexically, without touching the
+/// filesystem, so an ancestor comparison over the result is purely lexical. The shape rules of
+/// [`declare_host_paths`] are not re-checked here: the harness-need path is validated at driver
+/// load. Shared by [`crate::harness_needs`], which compares driver needs and manifest grants.
+pub(crate) fn expand_and_fold(path: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    Ok(crate::protected_paths::normalize_absolute(&expand_home(
+        path, home,
+    )?))
 }
 
 /// `path` made absolute: `~` and `~/…` against `home`; anything else must already be absolute.
@@ -433,8 +447,8 @@ fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
 pub struct HostPathContext<'a> {
     /// The `HOME` `mur` runs with: where the credential locations are looked for.
     pub home: Option<&'a Path>,
-    /// Murmur's own home, `~/.murmur` (`murmur_home::home_path()`): a `read-write` entry over it
-    /// is refused.
+    /// Murmur's own home, `$HOME/.murmur` (not `murmur_home::home_path()`, which is `HOME`
+    /// itself): a `read-write` entry over it is refused.
     pub murmur_home: Option<&'a Path>,
     /// The session's work folder root: an entry inside it is refused.
     pub workdir: &'a Path,
@@ -461,14 +475,15 @@ pub fn resolve_host_paths(
             declared: entry.declared.clone(),
             resolved,
             reason,
+            missing: false,
         };
         let path = match std::fs::canonicalize(&entry.expanded) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(refuse(
-                    None,
-                    format!("{} does not exist", entry.expanded.display()),
-                ))
+                return Err(HostPathRefusal {
+                    missing: true,
+                    ..refuse(None, format!("{} does not exist", entry.expanded.display()))
+                })
             }
             Err(error) => {
                 return Err(refuse(
@@ -643,6 +658,7 @@ pub fn check_execute_roots(
                 declared: host_path.declared.clone(),
                 resolved: Some(host_path.path.clone()),
                 reason,
+                missing: false,
             };
             if host_path.path.starts_with(&root.dir) {
                 return Err(refuse(format!(

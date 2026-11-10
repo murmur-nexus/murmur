@@ -504,19 +504,10 @@ fn process_project(profile: &str, wait: u64, lifecycle: &str) -> (TempDir, Proje
     publish_compiled(&home, &driver);
 
     let dir = TempDir::new().unwrap();
-    let harness = dir.path().join("harness.sh");
-    fs::write(
-        &harness,
-        format!(
-            "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE={profile}\nexport \
-             FIXTURE_STATUS_WAIT={wait}\nexec '{}' \"$@\"\n",
-            common::fixture_path("process-driver/fake-harness").display()
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&harness).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&harness, perms).unwrap();
+    let harness = common::write_fake_harness(
+        &dir.path().join("harness.sh"),
+        &format!("export FIXTURE_HARNESS_PROFILE={profile}\nexport FIXTURE_STATUS_WAIT={wait}\n"),
+    );
 
     let manifest = dir.path().join("murmur.yaml");
     fs::write(
@@ -550,6 +541,9 @@ fn bridged_text(workdir: &Path, name: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn session_status_through_the_process_bridge() {
+    if common::skip_without_host_support("session_status_through_the_process_bridge") {
+        return;
+    }
     // The notice falls due 30 seconds after `mur run` starts. The first two calls come right after
     // staging, the third 28 seconds later, so the notice lands on the third unless staging alone
     // took the whole 30.
@@ -658,6 +652,9 @@ fn merged_quota(trace: &[Value], at: usize) -> Vec<Value> {
 #[cfg(unix)]
 #[test]
 fn session_status_reports_the_harness_quota_windows() {
+    if common::skip_without_host_support("session_status_reports_the_harness_quota_windows") {
+        return;
+    }
     let (home, project) = process_project("quota", 0, "");
     let run = run(&home, &project, &[]);
     assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
@@ -1046,20 +1043,19 @@ fn the_deadline_ends_a_session_in_a_foreground_command() {
 #[cfg(unix)]
 #[test]
 fn the_deadline_ends_a_process_session_and_its_harness() {
+    if common::skip_without_host_support("the_deadline_ends_a_process_session_and_its_harness") {
+        return;
+    }
     let (home, project) = process_project("silent", 0, "");
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
     assert_ended_by_the_deadline(&run);
     if events(&run.trace(), "task_start").is_empty() {
         return;
     }
-    let pid = fs::read_to_string(
-        common::find_file(&run.workdir(), "harness.pid").expect("the harness wrote its pid"),
-    )
-    .unwrap()
-    .trim()
-    .parse::<i32>()
-    .unwrap();
-    common::assert_dead_within(pid, Duration::from_secs(5));
+    // The harness wrote its pid from inside the session's PID namespace, so it is proved gone on
+    // the host: nothing runs in its working directory any more.
+    common::find_file(&run.workdir(), "harness.pid").expect("the harness wrote its pid");
+    common::assert_nothing_runs_in_within(&run.workdir(), Duration::from_secs(5));
 }
 
 // ── Inherited deadlines ─────────────────────────────────────────────────────

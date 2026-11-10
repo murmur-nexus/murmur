@@ -1359,6 +1359,7 @@ process exists
 | `driver` | string | Artifact name of the process driver |
 | `driver_version` | string | Its version |
 | `harness` | string | The harness the driver names in its `describe()` |
+| `tier` | string | The enforcement tier the harness ran under, as a wire name — the same spelling [`ScopeReport.enforcement_tier`](containment.md#routes) uses (`landlock+seccomp`, `mountns+pivot_root+landlock+seccomp`, `unconfined`, …). The harness runs under the capsule's class — see [The process harness](containment.md#process-harness) |
 | `binary` | string | Absolute path of the executable spawned |
 | `binary_source` | string | `"inference.command"` or `"the process driver's describe()"` — which named the binary |
 | `harness_version` | string \| null | The line the binary printed for its version arguments. `null` when it could not be read |

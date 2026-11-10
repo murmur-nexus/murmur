@@ -100,6 +100,9 @@ struct Built {
     shell: Vec<String>,
     /// `lifecycle.shell_grace_secs`.
     shell_grace_secs: Option<u64>,
+    /// A `HOME` outside `/tmp`, so the run's files directory under it is at its host path for a
+    /// harness on a contained class, whose `/tmp` is private.
+    home_off_tmp: bool,
 }
 
 impl Built {
@@ -115,6 +118,7 @@ impl Built {
             driver_wasm: fixture_wasm(),
             shell: Vec::new(),
             shell_grace_secs: None,
+            home_off_tmp: false,
         }
     }
 
@@ -145,6 +149,11 @@ impl Built {
         self
     }
 
+    fn home_off_tmp(mut self) -> Self {
+        self.home_off_tmp = true;
+        self
+    }
+
     fn shell_grace_secs(mut self, secs: u64) -> Self {
         self.shell_grace_secs = Some(secs);
         self
@@ -161,7 +170,11 @@ impl Built {
     }
 
     fn build(self) -> Capsule {
-        let home = TempDir::new().unwrap();
+        let home = if self.home_off_tmp {
+            common::scratch_off_tmp()
+        } else {
+            TempDir::new().unwrap()
+        };
         let artifacts = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
 
@@ -404,11 +417,13 @@ impl Run {
         found.remove(0)
     }
 
-    /// The pid a profile wrote for a test that has to prove it dead.
-    fn harness_pid(&self) -> i32 {
-        let path = common::find_file(&self.workdir, "harness.pid")
+    /// Panics unless the harness, which wrote its pid, and everything it started are gone within
+    /// `limit`. The pid was written from inside the session's PID namespace, so the proof is read
+    /// on the host: nothing runs in the harness's working directory any more.
+    fn assert_harness_dead_within(&self, limit: Duration) {
+        common::find_file(&self.workdir, "harness.pid")
             .unwrap_or_else(|| panic!("the profile wrote no harness.pid under {:?}", self.workdir));
-        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        common::assert_nothing_runs_in_within(&self.workdir, limit);
     }
 }
 
@@ -416,6 +431,11 @@ impl Run {
 
 #[test]
 fn s1_a_process_capsule_runs_its_harness_and_records_one_turn() {
+    if common::skip_without_host_support(
+        "s1_a_process_capsule_runs_its_harness_and_records_one_turn",
+    ) {
+        return;
+    }
     println!("S1: `mur run` drives the harness through its driver and records the run");
     let capsule = Built::new().build();
     let run = capsule.run("happy", &[]).succeeded();
@@ -454,6 +474,11 @@ fn s1_a_process_capsule_runs_its_harness_and_records_one_turn() {
 
 #[test]
 fn s2_the_binary_comes_from_describe_when_the_manifest_names_none() {
+    if common::skip_without_host_support(
+        "s2_the_binary_comes_from_describe_when_the_manifest_names_none",
+    ) {
+        return;
+    }
     println!("S2: with no inference.command the driver's describe() binary is found on PATH");
     let capsule = Built::new().binary(HarnessBinary::OnPath).build();
     let run = capsule.run("happy", &[]).succeeded();
@@ -468,6 +493,9 @@ fn s2_the_binary_comes_from_describe_when_the_manifest_names_none() {
 
 #[test]
 fn s2_a_binary_that_is_not_installed_is_refused() {
+    if common::skip_without_host_support("s2_a_binary_that_is_not_installed_is_refused") {
+        return;
+    }
     println!("S2: with nothing named and nothing on PATH the launch is refused at E-RUN-006");
     let capsule = Built::new().binary(HarnessBinary::Missing).build();
     let run = capsule.run("happy", &[]).failed();
@@ -493,6 +521,9 @@ fn s2_a_binary_that_is_not_installed_is_refused() {
 
 #[test]
 fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
+    if common::skip_without_host_support("s3_the_harness_calls_a_capsule_tool_through_the_bridge") {
+        return;
+    }
     println!("S3: a bridged tool call is executed by murmur and recorded under its bare name");
     let capsule = Built::new().with_tool().build();
     let run = capsule.run("tool", &[]).succeeded();
@@ -589,6 +620,9 @@ fn s14_a_long_shell_call_does_not_hold_up_a_second_tool_call() {
 
 #[test]
 fn s4_a_failed_turn_fails_the_run_and_names_its_kind() {
+    if common::skip_without_host_support("s4_a_failed_turn_fails_the_run_and_names_its_kind") {
+        return;
+    }
     println!("S4: each failure-kind the harness reports comes back as E-RUN-033");
     for kind in [
         "auth",
@@ -625,6 +659,11 @@ fn s4_a_failed_turn_fails_the_run_and_names_its_kind() {
 
 #[test]
 fn s5_an_exit_without_a_terminal_event_is_classified_by_the_driver() {
+    if common::skip_without_host_support(
+        "s5_an_exit_without_a_terminal_event_is_classified_by_the_driver",
+    ) {
+        return;
+    }
     println!("S5: EOF with no terminal event is handed to classify-exit");
     let capsule = Built::new().build();
     let run = capsule.run("exit-0", &[]).succeeded();
@@ -647,10 +686,15 @@ const DEBUG_INACTIVITY_MS: &str = "1500";
 
 #[test]
 fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
+    if common::skip_without_host_support("s6_a_silent_harness_is_killed_and_a_busy_one_is_not") {
+        return;
+    }
     println!("S6: the inactivity window kills a silent harness and never a working one");
     let debug = [("MURMUR_DEBUG_PROCESS_INACTIVITY_MS", DEBUG_INACTIVITY_MS)];
 
-    let capsule = Built::new().build();
+    // The `silent`/`chatty`/`bridge-busy` profiles exec `sleep`; under the class the harness runs
+    // it only when `capabilities.shell.allow` grants it.
+    let capsule = Built::new().shell(&["sleep"]).build();
     let started = Instant::now();
     let run = capsule.run("silent", &debug).failed();
     // A hang guard only, far inside the profile's `sleep 600`: a whole debug-build `mur run`
@@ -662,7 +706,7 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
         started.elapsed()
     );
     assert!(run.text.contains("E-RUN-035"), "{}", run.text);
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "inactivity");
     assert_eq!(exit["killed"], true);
@@ -674,13 +718,13 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
     assert!(failed.get("provider_status").is_none(), "{failed}");
 
     // Three seconds of output, in half-second steps: each line resets the window.
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["sleep"]).build();
     let run = capsule.run("chatty", &debug).succeeded();
     assert_eq!(run.result(), "CHATTY-RESULT");
     assert_eq!(run.one("harness_exit")["cause"], "terminal");
 
     // The same again with nothing on stdout: only bridge traffic keeps it alive.
-    let capsule = Built::new().with_tool().build();
+    let capsule = Built::new().with_tool().shell(&["sleep"]).build();
     let run = capsule.run("bridge-busy", &debug).succeeded();
     assert_eq!(run.result(), "BRIDGE-BUSY-RESULT");
     assert_eq!(run.one("harness_exit")["cause"], "terminal");
@@ -688,8 +732,13 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
 
 #[test]
 fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
+    if common::skip_without_host_support(
+        "s6_a_harness_that_lingers_after_its_terminal_event_is_killed",
+    ) {
+        return;
+    }
     println!("S6: a harness that ignores stdin closing is killed after the exit grace");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["sleep"]).build();
     let started = Instant::now();
     let run = capsule.run("linger", &[]).succeeded();
     assert_eq!(run.result(), "LINGER");
@@ -700,7 +749,7 @@ fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
         "the grace kill should have ended it, took {:?}",
         started.elapsed()
     );
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "terminal");
     assert_eq!(exit["killed"], true);
@@ -726,6 +775,11 @@ fn position(events: &[Value], event_type: &str) -> usize {
 
 #[test]
 fn late_lines_printed_while_the_harness_exits_are_read_and_change_nothing() {
+    if common::skip_without_host_support(
+        "late_lines_printed_while_the_harness_exits_are_read_and_change_nothing",
+    ) {
+        return;
+    }
     println!("S5/S6: a quota, a suggestion and a note printed after the result are read in the exit grace; a late text, answer and usage are notes");
     let capsule = Built::new().build();
     let run = capsule.run("late-lines", &[]).succeeded();
@@ -775,11 +829,14 @@ fn late_lines_printed_while_the_harness_exits_are_read_and_change_nothing() {
 
 #[test]
 fn late_lines_after_the_grace_are_never_read() {
+    if common::skip_without_host_support("late_lines_after_the_grace_are_never_read") {
+        return;
+    }
     println!("S7: a harness still running when the 3 s exit grace ends is killed, and what it would have printed later is not recorded");
     let capsule = Built::new().build();
     let run = capsule.run("late-after-grace", &[]).succeeded();
     assert_eq!(run.result(), "GRACE-RESULT");
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "terminal");
     assert_eq!(exit["killed"], true);
@@ -797,6 +854,9 @@ fn late_lines_after_the_grace_are_never_read() {
 
 #[test]
 fn an_exhausted_quota_is_recorded_and_never_acted_on() {
+    if common::skip_without_host_support("an_exhausted_quota_is_recorded_and_never_acted_on") {
+        return;
+    }
     println!("S9: a window reported exhausted is recorded and the turn runs as it would have");
     let capsule = Built::new().build();
     let run = capsule.run("quota-exhausted", &[]).succeeded();
@@ -821,6 +881,9 @@ fn an_exhausted_quota_is_recorded_and_never_acted_on() {
 
 #[test]
 fn trace_show_prints_the_latest_quota_window_per_name() {
+    if common::skip_without_host_support("trace_show_prints_the_latest_quota_window_per_name") {
+        return;
+    }
     println!("S10: `mur trace show` prints one quota line per window name, latest values, under ── Harness ──");
     let capsule = Built::new().build();
     let run = capsule.run("quota", &[]).succeeded();
@@ -877,8 +940,19 @@ fn s7_an_unconfined_harness_inherits_the_operators_environment() {
 
 #[test]
 fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
+    if common::skip_without_host_support("s7_the_harness_sees_exactly_what_was_declared_and_set") {
+        return;
+    }
     println!("S7: the harness environment is the allowlist plus the plan's env-set, nothing else");
-    let capsule = Built::new().with_tool().build();
+    // The `env` profile execs `env | cut | sort | tr` and `ls`; under the class the harness runs
+    // them only when `capabilities.shell.allow` grants them.
+    // The harness lists its files directory under `HOME`, which on a contained class is reached
+    // at its host path only off `/tmp`.
+    let capsule = Built::new()
+        .with_tool()
+        .shell(&["env", "cut", "sort", "tr", "ls"])
+        .home_off_tmp()
+        .build();
     let run = capsule
         .run(
             "env",
@@ -902,10 +976,12 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
         .filter(|name| !matches!(*name, "PWD" | "SHLVL" | "_" | "OLDPWD"))
         .collect();
     names.sort_unstable();
+    // On a contained class the harness also carries the session's TMPDIR/TMP/TEMP, like every
+    // command — see the process environment reference.
     assert_eq!(
         names.join(","),
         "FIXTURE_BRIDGE_TOKEN,FIXTURE_BRIDGE_TOOLS,FIXTURE_BRIDGE_URL,FIXTURE_FILES,\
-         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RECORDS_DIR,MURMUR_RUNTIME_DIR,PATH",
+         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RECORDS_DIR,MURMUR_RUNTIME_DIR,PATH,TEMP,TMP,TMPDIR",
         "{env_note}"
     );
     assert!(
@@ -944,7 +1020,10 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
             "HOME",
             "MURMUR_RECORDS_DIR",
             "MURMUR_RUNTIME_DIR",
-            "PATH"
+            "PATH",
+            "TEMP",
+            "TMP",
+            "TMPDIR"
         ])
     );
     assert_eq!(start["files"], serde_json::json!(["config.json"]));
@@ -967,6 +1046,9 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
 
 #[test]
 fn s8_an_untested_harness_version_warns_and_runs() {
+    if common::skip_without_host_support("s8_an_untested_harness_version_warns_and_runs") {
+        return;
+    }
     println!("S8: an untested harness version is W-RUN-002 and nothing more");
     let capsule = Built::new().build();
     let run = capsule.run("old-version", &[]).succeeded();
@@ -991,6 +1073,9 @@ fn s8_an_untested_harness_version_warns_and_runs() {
 
 #[test]
 fn s9_a_turn_past_max_turns_kills_the_harness() {
+    if common::skip_without_host_support("s9_a_turn_past_max_turns_kills_the_harness") {
+        return;
+    }
     println!("S9: opening a turn past inference.max_turns ends the run at once");
     let capsule = Built::new().max_turns(2).build();
     let run = capsule.run("turns", &[]).failed();
@@ -1002,7 +1087,7 @@ fn s9_a_turn_past_max_turns_kills_the_harness() {
     assert_eq!(failed["source"], "runtime");
     assert_eq!(run.of_type("inference").len(), 2);
     assert_eq!(run.one("harness_exit")["cause"], "max_turns");
-    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    run.assert_harness_dead_within(Duration::from_secs(5));
 
     // The attempt's `Err` is named in the trace, before the task it ended.
     let task_failed = run.one("task_failed");
@@ -1029,6 +1114,9 @@ fn s9_a_turn_past_max_turns_kills_the_harness() {
 
 #[test]
 fn s9_thinking_does_not_spend_a_turn() {
+    if common::skip_without_host_support("s9_thinking_does_not_spend_a_turn") {
+        return;
+    }
     println!("S9: thinking and deltas do not open a turn, so one turn is enough");
     let capsule = Built::new().max_turns(1).build();
     let run = capsule.run("thinking", &[]).succeeded();
@@ -1040,6 +1128,9 @@ fn s9_thinking_does_not_spend_a_turn() {
 
 #[test]
 fn s10_a_non_subscription_harness_session_warns_and_runs() {
+    if common::skip_without_host_support("s10_a_non_subscription_harness_session_warns_and_runs") {
+        return;
+    }
     println!("S10: a harness session that is not a subscription is W-SEC-031 and nothing more");
     let capsule = Built::new().build();
     let run = capsule.run("api-key", &[]).succeeded();
@@ -1099,6 +1190,11 @@ fn s11_a_process_manifest_without_a_driver_is_refused() {
 
 #[test]
 fn s12_a_driver_that_refuses_to_launch_fails_the_run_before_anything_is_spawned() {
+    if common::skip_without_host_support(
+        "s12_a_driver_that_refuses_to_launch_fails_the_run_before_anything_is_spawned",
+    ) {
+        return;
+    }
     println!("S12: a launch the driver refuses is E-RUN-034 and no harness_start");
     let capsule = Built::new().config("refuse-launch").build();
     let run = capsule.run("happy", &[]).failed();
@@ -1119,6 +1215,11 @@ fn s12_a_driver_that_refuses_to_launch_fails_the_run_before_anything_is_spawned(
 
 #[test]
 fn s13_a_reported_turn_carries_the_harness_counts_everywhere() {
+    if common::skip_without_host_support(
+        "s13_a_reported_turn_carries_the_harness_counts_everywhere",
+    ) {
+        return;
+    }
     println!("S13: the trace, the totals and `mur trace show` all carry the harness's numbers");
     let capsule = Built::new().build();
     let run = capsule.run("usage", &[]).succeeded();
@@ -1165,6 +1266,11 @@ fn s13_a_reported_turn_carries_the_harness_counts_everywhere() {
 /// harness that reports spending none writes both, as `0`.
 #[test]
 fn s13_an_unreporting_driver_writes_no_counts_and_a_reported_zero_writes_zero() {
+    if common::skip_without_host_support(
+        "s13_an_unreporting_driver_writes_no_counts_and_a_reported_zero_writes_zero",
+    ) {
+        return;
+    }
     println!("S13: absent is not zero");
     let silent = Built::new().reporting_no_usage().build();
     let run = silent.run("usage", &[]).succeeded();
@@ -1196,6 +1302,9 @@ fn s13_an_unreporting_driver_writes_no_counts_and_a_reported_zero_writes_zero() 
 /// Each report is the run's total, so the second turn is charged the growth alone.
 #[test]
 fn s13_cumulative_reports_are_attributed_turn_by_turn() {
+    if common::skip_without_host_support("s13_cumulative_reports_are_attributed_turn_by_turn") {
+        return;
+    }
     println!("S13: two turns, each charged only what grew");
     let capsule = Built::new().with_tool().build();
     let run = capsule.run("usage-turns", &[]).succeeded();
@@ -1218,6 +1327,9 @@ fn s13_cumulative_reports_are_attributed_turn_by_turn() {
 /// assertion, in both directions.
 #[test]
 fn s13_a_hook_is_handed_the_numbers_the_trace_holds() {
+    if common::skip_without_host_support("s13_a_hook_is_handed_the_numbers_the_trace_holds") {
+        return;
+    }
     println!("S13: on-inference sees the trace's counts, and zero where the trace says nothing");
     let armed = |run: &Run, hook: &str| run.records_dir.join(format!("logs/hook-{hook}.log"));
 
@@ -1296,8 +1408,13 @@ fn names(value: &Value) -> Vec<&str> {
 
 #[test]
 fn s15_the_harness_runs_as_the_hosts_account() {
+    if common::skip_without_host_support("s15_the_harness_runs_as_the_hosts_account") {
+        return;
+    }
     println!("S15: the harness gets the host's USER and LOGNAME and no credential");
-    let capsule = Built::new().build();
+    // The `account` profile execs `env | cut | sort | tr`; under the class the harness runs them
+    // only when `capabilities.shell.allow` grants them.
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(
         &capsule,
         &[
@@ -1336,8 +1453,12 @@ fn s15_the_harness_runs_as_the_hosts_account() {
 
 #[test]
 fn s15_a_host_without_account_names_hands_the_harness_none() {
+    if common::skip_without_host_support("s15_a_host_without_account_names_hands_the_harness_none")
+    {
+        return;
+    }
     println!("S15: a host that sets neither name leaves both unset and the record says so");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(&capsule, &[]);
 
     assert_eq!(account, "account USER=unset LOGNAME=unset");
@@ -1359,8 +1480,11 @@ fn s15_a_host_without_account_names_hands_the_harness_none() {
 
 #[test]
 fn s15_one_account_name_never_supplies_the_other() {
+    if common::skip_without_host_support("s15_one_account_name_never_supplies_the_other") {
+        return;
+    }
     println!("S15: a host that sets only USER delivers USER and no LOGNAME");
-    let capsule = Built::new().build();
+    let capsule = Built::new().shell(&["env", "cut", "sort", "tr"]).build();
     let (account, env_names, run) = account_run(&capsule, &[("USER", "murmur-fixture-user")]);
 
     assert_eq!(account, "account USER=murmur-fixture-user LOGNAME=unset");

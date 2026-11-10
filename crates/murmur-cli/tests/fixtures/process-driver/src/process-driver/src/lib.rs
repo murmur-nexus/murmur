@@ -12,10 +12,10 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 
 use exports::murmur::driver::process::{
-    Description, DriverFile, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
-    LaunchRequest, LoginCheck, LoginOutput, LoginState, QuotaState, QuotaWindow, RetryInfo,
-    SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo,
-    TurnFailure, Usage,
+    Description, DriverFile, Event, ExitStatus, FailureKind, Guest, HarnessNeeds, InterruptMethod,
+    LaunchPlan, LaunchRequest, LoginCheck, LoginOutput, LoginState, PathAccess, PathNeed,
+    QuotaState, QuotaWindow, RetryInfo, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress,
+    ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
 thread_local! {
@@ -39,6 +39,7 @@ impl Guest for Fixture {
             streams_text: true,
             reports_usage: reports_usage(),
             login_check: login_check(),
+            harness_needs: harness_needs(),
         }
     }
 
@@ -136,6 +137,35 @@ fn login_check() -> LoginCheck {
         )
     } else {
         LoginCheck::Command(vec!["auth".to_string(), "status".to_string()])
+    }
+}
+
+/// What this build says the harness needs beyond the capsule's own grants. The default build
+/// needs nothing. The `harness-needs` build needs the fake harness's session memory folder,
+/// `~/fake-harness-sessions`, read-write and the host `example.invalid:443`; the
+/// `harness-needs-parent` build needs `~/fixture-harness-parent/sessions` read-write, so a test can
+/// grant its parent and check that only the declared folder is reached.
+fn harness_needs() -> HarnessNeeds {
+    let path = if cfg!(feature = "harness-needs") {
+        Some("~/fake-harness-sessions")
+    } else if cfg!(feature = "harness-needs-parent") {
+        Some("~/fixture-harness-parent/sessions")
+    } else {
+        None
+    };
+    HarnessNeeds {
+        paths: path
+            .map(|path| PathNeed {
+                path: path.to_string(),
+                access: PathAccess::ReadWrite,
+            })
+            .into_iter()
+            .collect(),
+        hosts: if cfg!(feature = "harness-needs") {
+            vec!["example.invalid:443".to_string()]
+        } else {
+            Vec::new()
+        },
     }
 }
 

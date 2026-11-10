@@ -24,6 +24,68 @@ use crate::types::CapabilityPolicy;
 /// The longest reason, in characters, a [`HarnessLogin`] carries.
 pub const LOGIN_REASON_MAX_CHARS: usize = 200;
 
+/// The `harness` report `mur run --explain-scope` prints and `session_start.effective_grants`
+/// carries: the harness's needs resolved against the manifest and this host, read-only, with every
+/// need's status. A need the manifest does not allow is `refused` in the report rather than
+/// raising — explain-scope exits 0. A driver that cannot be read (missing, unloadable, wrong WIT
+/// level) is an [`crate::harness_needs::HarnessReport`] with `unresolved` naming why and every
+/// list empty.
+///
+/// `driver_bytes` is the driver artifact's `.mur.zip` bytes; `command` is `inference.command`;
+/// `workdir` is the launch's work folder root. Blocks on its own current-thread runtime.
+pub fn harness_needs_report(
+    driver_bytes: &[u8],
+    name: &str,
+    version: &str,
+    command: Option<&str>,
+    policy: &CapabilityPolicy,
+    workdir: &Path,
+) -> crate::harness_needs::HarnessReport {
+    let driver_ref = format!("{name}@{version}");
+    let unresolved = |reason: String| crate::harness_needs::unresolved_report(&driver_ref, reason);
+    let wasm = match crate::artifact::extract_root_wasm(name, version, driver_bytes) {
+        Ok(wasm) => wasm,
+        Err(error) => return unresolved(error.to_string()),
+    };
+    let contracts = murmur_artifact::extract_wit_contracts(&wasm).ok().flatten();
+    if let Err(error) = check_driver_interface(
+        "process",
+        name,
+        version,
+        contracts.as_ref(),
+        crate::served_wit_level(),
+    ) {
+        return unresolved(error.to_string());
+    }
+    let standalone = match StandaloneDriver::compile_named(&wasm, name, version) {
+        Ok(standalone) => standalone,
+        Err(error) => return unresolved(error.to_string()),
+    };
+    standalone.rt.block_on(async {
+        let description = match async {
+            let mut driver = standalone.instantiate().await?;
+            driver.describe().await
+        }
+        .await
+        {
+            Ok(description) => description,
+            Err(error) => return unresolved(error.to_string()),
+        };
+        let binary = crate::runtime::resolve_harness_binary(command, &description.binary)
+            .ok()
+            .map(|(path, _)| path);
+        crate::harness_needs::resolve_capsule_harness(
+            &driver_ref,
+            &description,
+            binary.as_deref(),
+            policy,
+            workdir,
+        )
+        .grants
+        .report
+    })
+}
+
 /// What [`check_process_harness`] found about a process capsule's harness.
 #[derive(Debug)]
 pub struct HarnessCheck {
@@ -132,20 +194,36 @@ fn check_process_harness_wasm(
         let description = driver.describe().await?;
         check_required_env(name, version, &description, &policy.env_allow)?;
         let harness = description.harness.clone();
-        let (path, source) =
-            match crate::runtime::resolve_harness_binary(command, &description.binary) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    return Ok(HarnessCheck {
-                        harness,
-                        binary: HarnessBinary::NotFound(error),
-                        version: None,
-                        login: None,
-                    })
-                }
-            };
+        let resolved = crate::runtime::resolve_harness_binary(command, &description.binary);
+        // The harness's declared needs against the manifest, right after `check_required_env`, as
+        // staging checks them — so `mur doctor` reports a disallowed need with `E-CAP-021` before
+        // any probe runs. Resolved whether or not the binary did, since a need refusal does not
+        // depend on the binary.
+        let grants = crate::harness_needs::resolve_capsule_harness(
+            &format!("{name}@{version}"),
+            &description,
+            resolved.as_ref().ok().map(|(path, _)| path.as_path()),
+            policy,
+            cwd,
+        )
+        .grants;
+        if let Some(refusal) = grants.refusal {
+            return Err(refusal);
+        }
+        let (path, source) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return Ok(HarnessCheck {
+                    harness,
+                    binary: HarnessBinary::NotFound(error),
+                    version: None,
+                    login: None,
+                })
+            }
+        };
 
-        let probe = probe_harness_version(&path, &description.version_args, probe_env, cwd).await;
+        let probe =
+            probe_harness_version(&path, &description.version_args, probe_env, cwd, None).await;
         let version = match &probe {
             VersionProbe::Read(line) if version_is_tested(line, &description.tested_versions) => {
                 HarnessVersion::Tested { line: line.clone() }
@@ -183,7 +261,7 @@ async fn check_login(
         }
         LoginCheck::Command(args) => args,
     };
-    let output = match run_harness_probe(binary, args, probe_env, cwd).await {
+    let output = match run_harness_probe(binary, args, probe_env, cwd, None).await {
         Ok(output) => output,
         Err(reason) => {
             return HarnessLogin::NotChecked {

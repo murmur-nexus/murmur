@@ -205,7 +205,12 @@ pub fn end_turn(n: usize, text: &str) -> String {
 
 /// A scratch `$HOME` with the fixture inference driver published into it.
 pub fn driver_home() -> TempDir {
-    let home = tempfile::tempdir().unwrap();
+    driver_home_in(tempfile::tempdir().unwrap())
+}
+
+/// [`driver_home`] in `home`, for a test whose `HOME` must be somewhere particular.
+#[allow(dead_code)]
+pub fn driver_home_in(home: TempDir) -> TempDir {
     let artifacts = tempfile::tempdir().unwrap();
     let driver = super::create_driver_artifact(
         artifacts.path(),

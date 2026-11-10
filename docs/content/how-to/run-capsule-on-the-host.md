@@ -111,13 +111,13 @@ Routes
     Runs inside the mur process tree, in a guest worker held by its WASI preopens and the host-side network allowlist only.
   hooks             absent   host process, not confined by the class
   process harness   absent   unconfined
-  harness tools     absent   host process, not confined by the class
+  harness tools     absent   unconfined
 
 Unconfined
   user:      ana
   uid:       1000
   HOME:      /home/ana
-  applies to: shell commands, plan shell steps, process harness
+  applies to: shell commands, plan shell steps, process harness, harness tools
   resource limits: none declared
 ```
 

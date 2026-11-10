@@ -1789,8 +1789,11 @@ mod tests {
             content.find("## Limits\n\n").expect("a Limits section") + "## Limits\n\n".len();
         let end = start + content[start..].find("\n\n").unwrap();
         let limits = &content[start..end];
+        // A process capsule runs its harness under the session's per-command memory, so the facts
+        // state it; there is still no turn or token limit.
         assert_eq!(
-            limits, "- Context budget: not set (compaction not configured)",
+            limits,
+            "- 2 GiB memory per command\n- Context budget: not set (compaction not configured)",
             "content: {content}"
         );
         assert!(!content.contains("turns per task"), "content: {content}");

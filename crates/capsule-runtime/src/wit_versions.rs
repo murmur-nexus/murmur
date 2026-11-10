@@ -21,7 +21,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
     ("murmur:conversation", "0.2.0"),
-    ("murmur:driver", "0.5.0"),
+    ("murmur:driver", "0.6.0"),
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),
@@ -151,8 +151,40 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_5() {
-        assert_eq!(served_wit_level().level, 5);
+    fn wit_levels_served_level_is_level_6() {
+        assert_eq!(served_wit_level().level, 6);
+    }
+
+    /// Level 6 moved `murmur:driver` alone, for the harness's declared needs, so an artifact
+    /// built at level 5 whose interfaces name no `murmur:driver` package fits level 6 unchanged,
+    /// and a level-5 process driver does not.
+    #[test]
+    fn wit_levels_level_6_moves_only_the_driver_package() {
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
+        let levels = wit_levels();
+        let (five, six) = (&levels[4], &levels[5]);
+        assert_eq!(five.packages.len(), six.packages.len());
+        let moved: Vec<_> = five
+            .packages
+            .iter()
+            .zip(&six.packages)
+            .filter(|(before, after)| before != after)
+            .collect();
+        let driver = |version: &str| ("murmur:driver".to_string(), version.to_string());
+        assert_eq!(moved, [(&driver("0.5.0"), &driver("0.6.0"))]);
+
+        let contracts = |exports: &[&str], imports: &[&str]| WitContracts {
+            exports: exports.iter().map(|e| e.to_string()).collect(),
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
+        };
+        let driver_at =
+            |version: &str| contracts(&[&format!("murmur:driver/process@{version}")], &[]);
+        assert!(fits(driver_at("0.5.0"), five));
+        assert!(!fits(driver_at("0.5.0"), six));
+        assert!(fits(driver_at("0.6.0"), six));
     }
 
     /// Level 5 moved `murmur:driver` alone, for the login check, so an artifact built at level 4

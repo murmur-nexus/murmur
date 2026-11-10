@@ -738,24 +738,23 @@ fn a_person_s_cancel_ends_a_kept_working_task_canceled() {
 
 // ── S9: process transport ─────────────────────────────────────────────────────
 
-fn make_executable(path: &Path) {
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(path, perms).unwrap();
-}
-
 /// Under `transport: process` the message is the resumed harness session's prompt, so the
 /// harness answers it from the conversation the task began.
 #[test]
 fn a_process_task_is_kept_working_in_its_harness_session() {
-    let home = TempDir::new().unwrap();
+    if common::skip_without_host_support("a_process_task_is_kept_working_in_its_harness_session") {
+        return;
+    }
+    // The `memory` profile keeps its session in `~/fake-harness-sessions`, which the needs build
+    // declares and the manifest grants.
+    let home = common::harness_needs_home();
     let artifacts = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let driver = common::create_driver_artifact_with_auth(
         artifacts.path(),
         PROCESS_DRIVER,
         DRIVER_VERSION,
-        &common::fixture_path("process-driver/tool/process-driver.wasm"),
+        &common::process_driver_needs_wasm(),
         "",
     );
     common::publish_local(&home, &driver).success();
@@ -764,19 +763,10 @@ fn a_process_task_is_kept_working_in_its_harness_session() {
     // `memory` profile: it keeps every prompt its session was given and answers with all of them.
     let bin_dir = project.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    let script = project.path().join("fake-harness");
-    fs::copy(common::fixture_path("process-driver/fake-harness"), &script).unwrap();
-    make_executable(&script);
-    let wrapper = bin_dir.join("fixture-cli");
-    fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=memory\nexec {} \"$@\"\n",
-            script.display()
-        ),
-    )
-    .unwrap();
-    make_executable(&wrapper);
+    common::write_fake_harness(
+        &bin_dir.join("fixture-cli"),
+        "export FIXTURE_HARNESS_PROFILE=memory\n",
+    );
     let manifest = project.path().join("murmur.yaml");
     fs::write(
         &manifest,
@@ -785,8 +775,11 @@ fn a_process_task_is_kept_working_in_its_harness_session() {
              version: {DRIVER_VERSION}\n    runtime: driver\n\
              lifecycle:\n  task_acceptance: single\n  after_task: exit\n  conversation: threaded\n  \
              keep_working:\n    message: \"what is the secret\"\n    limit: 1\n\
-             capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
-             inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n"
+             capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n{grant}  \
+             network:\n    allow: [{host}]\n\
+             inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n",
+            grant = common::HARNESS_NEEDS_PATHS_GRANT,
+            host = common::HARNESS_NEEDS_HOST,
         ),
     )
     .unwrap();

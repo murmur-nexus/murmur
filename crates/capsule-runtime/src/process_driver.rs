@@ -19,10 +19,10 @@ use crate::limits::{
 use crate::ExecutionLimits;
 
 pub use crate::bindings::process_driver::exports::murmur::driver::process::{
-    Bridge, Description, DriverFile, Event, ExitStatus, FailureKind, InterruptMethod, LaunchPlan,
-    LaunchRequest, LoginCheck, LoginOutput, LoginState, QuotaState, QuotaWindow, RetryInfo,
-    Session, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress, ToolCallStart,
-    ToolResultInfo, TurnFailure, Usage,
+    Bridge, Description, DriverFile, Event, ExitStatus, FailureKind, HarnessNeeds, InterruptMethod,
+    LaunchPlan, LaunchRequest, LoginCheck, LoginOutput, LoginState, PathAccess, PathNeed,
+    QuotaState, QuotaWindow, RetryInfo, Session, SessionInfo, SessionMode, ToolCallInfo,
+    ToolCallProgress, ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
 impl QuotaState {
@@ -37,7 +37,7 @@ impl QuotaState {
 }
 
 /// The instance name every process driver exports.
-pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.5.0";
+pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.6.0";
 
 /// Every version of the process interface starts with this, so an export built against another
 /// version is still recognised as a process driver.
@@ -799,6 +799,9 @@ fn validate_description(
                 .to_string(),
         ));
     }
+    if let Err(reason) = crate::harness_needs::validate_harness_needs(&description.harness_needs) {
+        return Err(load_error(format!("describe() {reason}")));
+    }
     Ok(())
 }
 
@@ -1057,7 +1060,7 @@ mod tests {
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(
             message.contains(
-                "it imports murmur:text/chunks@0.1.0, and level 5 has no version of murmur:text"
+                "it imports murmur:text/chunks@0.1.0, and level 6 has no version of murmur:text"
             ),
             "{message}"
         );
@@ -1181,6 +1184,10 @@ mod tests {
             streams_text: false,
             reports_usage: false,
             login_check: LoginCheck::Unavailable("no login".to_string()),
+            harness_needs: HarnessNeeds {
+                paths: Vec::new(),
+                hosts: Vec::new(),
+            },
         }
     }
 

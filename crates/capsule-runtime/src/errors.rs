@@ -943,6 +943,31 @@ pub enum RuntimeError {
         message: String,
     },
 
+    /// A process driver's `describe().harness-needs` declares a path or host the capsule manifest
+    /// does not allow, or a granted path that resolves to a refused location on this host.
+    /// `refusals` names every one, in the order the driver declared them (paths, then hosts), each
+    /// as `<need> (<access>): <reason>` for a path and `<host:port>: <reason>` for a host. One
+    /// line, so a report that keeps a message's first line (`mur doctor`) keeps every need.
+    /// Renders as `E-CAP-021`.
+    #[error(
+        "process driver '{driver}' declares harness needs the capsule manifest does not allow: {}",
+        .refusals.join("; ")
+    )]
+    HarnessNeedsNotAllowed {
+        /// `name@version`.
+        driver: String,
+        refusals: Vec<String>,
+    },
+
+    /// A capsule declares `capabilities.harness` but its `inference.transport` is not `process`,
+    /// so the block grants nothing: only a process harness reaches a `capabilities.harness` path.
+    /// Renders as `E-CAP-021`.
+    #[error(
+        "capabilities.harness is declared, but inference.transport is not `process`, so it \
+         grants nothing — only a process harness reaches a capabilities.harness path"
+    )]
+    HarnessPathsRequireProcessTransport,
+
     /// The executable a process capsule's harness runs as could not be resolved at staging.
     /// `binary_source` names where the name came from, so the operator knows which field to
     /// change: `inference.command`, or the process driver's own `describe()`.

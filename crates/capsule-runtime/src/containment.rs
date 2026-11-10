@@ -1444,6 +1444,13 @@ pub struct ScopeReport {
     /// Who the capsule's subprocesses run as when the session is unconfined; `null` on every
     /// contained session. Always serialized.
     pub unconfined: Option<UnconfinedReport>,
+    /// What a `transport: process` capsule's harness needs beyond its class, and where the manifest
+    /// allows it: the driver, the harness binary and interpreter, and each path, host and env need
+    /// with its status. `null` on every capsule whose transport is not `process`. Always
+    /// serialized. Set through [`Self::with_harness`] by the caller that resolved the driver's
+    /// needs against the manifest; `session_start.effective_grants.harness` carries it byte for
+    /// byte, and `--explain-scope` computes it the same way from the installed driver.
+    pub harness: Option<crate::harness_needs::HarnessReport>,
 }
 
 /// What an unconfined session's subprocesses run as: `ScopeReport::unconfined`.
@@ -1465,7 +1472,12 @@ pub struct UnconfinedReport {
 
 /// The subprocess routes an unconfined session runs as the operator, as
 /// [`UnconfinedReport::applies_to`] names them.
-pub const UNCONFINED_APPLIES_TO: &[&str] = &["shell", "plan-shell-step", "process-harness"];
+pub const UNCONFINED_APPLIES_TO: &[&str] = &[
+    "shell",
+    "plan-shell-step",
+    "process-harness",
+    "harness-tools",
+];
 
 impl UnconfinedReport {
     /// The report for this process: its uid, that uid's account name, its `HOME`, and the fields
@@ -1491,6 +1503,7 @@ impl UnconfinedReport {
                 "shell" => "shell commands",
                 "plan-shell-step" => "plan shell steps",
                 "process-harness" => "process harness",
+                "harness-tools" => "harness tools",
                 other => other,
             })
             .collect::<Vec<_>>()
@@ -1624,6 +1637,11 @@ impl ScopeReport {
 
         out.push('\n');
         out.push_str(&render_routes(&self.routes));
+
+        if let Some(harness) = &self.harness {
+            out.push('\n');
+            out.push_str(&crate::harness_needs::render_harness_block(harness));
+        }
 
         if let Some(unconfined) = &self.unconfined {
             out.push('\n');
@@ -1857,6 +1875,14 @@ impl ScopeReport {
             transport,
         );
         self.routes = route_table(&inputs, self.enforcement_tier);
+        self
+    }
+
+    /// This report with [`Self::harness`] set to `report`, the process harness's resolved needs.
+    /// `None` leaves it `null`, for a capsule whose transport is not `process`.
+    #[must_use]
+    pub fn with_harness(mut self, report: Option<crate::harness_needs::HarnessReport>) -> Self {
+        self.harness = report;
         self
     }
 
@@ -2416,6 +2442,9 @@ pub(crate) fn scope_report_for_tier(
             applied,
         )),
         unconfined,
+        // Filled by `with_harness` once the caller has resolved the driver's needs against the
+        // manifest; `null` for a capsule whose transport is not `process`.
+        harness: None,
     }
 }
 
@@ -2521,12 +2550,8 @@ impl Route {
     #[must_use]
     pub fn under_class(self) -> bool {
         match self {
-            Self::Shell | Self::PlanShellSteps => true,
-            Self::WasmTools
-            | Self::Drivers
-            | Self::Hooks
-            | Self::ProcessHarness
-            | Self::HarnessTools => false,
+            Self::Shell | Self::PlanShellSteps | Self::ProcessHarness | Self::HarnessTools => true,
+            Self::WasmTools | Self::Drivers | Self::Hooks => false,
         }
     }
 
@@ -2535,8 +2560,8 @@ impl Route {
     #[must_use]
     pub fn runs_unconfined(self) -> bool {
         match self {
-            Self::Shell | Self::PlanShellSteps | Self::ProcessHarness => true,
-            Self::WasmTools | Self::Drivers | Self::Hooks | Self::HarnessTools => false,
+            Self::Shell | Self::PlanShellSteps | Self::ProcessHarness | Self::HarnessTools => true,
+            Self::WasmTools | Self::Drivers | Self::Hooks => false,
         }
     }
 
@@ -2545,7 +2570,10 @@ impl Route {
     #[must_use]
     pub fn note(self) -> Option<&'static str> {
         match self {
-            Self::Shell | Self::PlanShellSteps => None,
+            Self::Shell
+            | Self::PlanShellSteps
+            | Self::ProcessHarness
+            | Self::HarnessTools => None,
             Self::WasmTools => Some(
                 "Runs inside the mur process tree, in a guest worker held by its WASI preopens and \
                  the host-side network allowlist only.",
@@ -2557,14 +2585,6 @@ impl Route {
             Self::Hooks => Some(
                 "Runs inside the mur process tree, in a guest worker held only by the preopens \
                  and network grants its own capabilities block declares.",
-            ),
-            Self::ProcessHarness => Some(
-                "A child of mur with a cleared environment and nothing else: no Landlock, \
-                 seccomp, network namespace or rlimits, in a cgroup with no limits.",
-            ),
-            Self::HarnessTools => Some(
-                "Run by the harness with the user's authority, kept off only by the arguments \
-                 the process driver passes.",
             ),
         }
     }
@@ -2795,7 +2815,7 @@ pub fn applied_mechanism(probe: &HostProbe, declared: ContainmentClass) -> &'sta
 
 /// Stable wire name for a tier, so `--explain-scope --json` consumers see the mechanism rather
 /// than a `Debug` rendering that is free to change.
-fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
+pub(crate) fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
     match tier {
         EnforcementTier::KernelSealed => "mountns+pivot_root+landlock+seccomp",
         EnforcementTier::KernelFull => "landlock+seccomp",
@@ -3508,7 +3528,9 @@ mod tests {
         assert!(rendered.contains("  uid:       "), "{rendered}");
         assert!(rendered.contains("  HOME:      "), "{rendered}");
         assert!(
-            rendered.contains("applies to: shell commands, plan shell steps, process harness"),
+            rendered.contains(
+                "  applies to: shell commands, plan shell steps, process harness, harness tools\n"
+            ),
             "{rendered}"
         );
         assert!(unconfined_warning(unconfined).contains("sudo"));
@@ -5184,6 +5206,13 @@ mod tests {
                  can apply a lower default. Reporting it would report one ceiling twice.",
             ),
             (
+                "process_transport",
+                "Records that `inference.transport` is `process`, which decides the subprocess \
+                 route and that `capabilities.harness.paths` is valid. Not a grant: the harness's \
+                 reach is in the `harness` key, whose presence already says the transport is \
+                 process.",
+            ),
+            (
                 "state_declared",
                 "Records that a capsule-wide `capabilities.state` block was declared where \
                  nothing reads it, which `W-SEC-014` says in words. The stores that actually \
@@ -5217,6 +5246,7 @@ mod tests {
             ("shell_declared_needs", "declared_needs"),
             ("shell_pinned_programs", "pinned_programs"),
             ("host_paths", "host_paths"),
+            ("harness_paths", "harness"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),
             ("plan_submit", "plan_submit"),
@@ -5535,7 +5565,15 @@ mod tests {
                         "{case}"
                     );
                     for row in &rows {
-                        let covered = matches!(row.route, Route::Shell | Route::PlanShellSteps);
+                        // The harness and the tools it runs are under the class too, like a shell
+                        // command — these tiers are all contained (ALL_TIERS has no unconfined).
+                        let covered = matches!(
+                            row.route,
+                            Route::Shell
+                                | Route::PlanShellSteps
+                                | Route::ProcessHarness
+                                | Route::HarnessTools
+                        );
                         assert_eq!(row.under_class, covered, "{case}: {row:?}");
                         if covered {
                             assert_eq!(row.mechanism, mechanism, "{case}: {row:?}");
@@ -5568,19 +5606,10 @@ mod tests {
             );
         }
         assert!(notes(Route::Hooks).contains("its own capabilities block declares"));
-        let harness = notes(Route::ProcessHarness);
-        for word in [
-            "cleared environment",
-            "Landlock",
-            "seccomp",
-            "network namespace",
-            "rlimits",
-            "cgroup with no limits",
-        ] {
-            assert!(harness.contains(word), "{word}: {harness}");
-        }
-        assert!(notes(Route::HarnessTools).contains("the user's authority"));
-        assert!(notes(Route::HarnessTools).contains("arguments the process driver passes"));
+        // The process harness and the tools it runs are under the class, so they have no
+        // uncovered-route note.
+        assert_eq!(Route::ProcessHarness.note(), None);
+        assert_eq!(Route::HarnessTools.note(), None);
     }
 
     /// The artifacts on each route come from the preopens by role.
@@ -5637,9 +5666,9 @@ mod tests {
             serde_json::json!({
                 "route": "process-harness",
                 "present": true,
-                "under_class": false,
-                "mechanism": "host-process",
-                "note": Route::ProcessHarness.note(),
+                "under_class": true,
+                "mechanism": "landlock+seccomp",
+                "note": null,
                 "artifacts": [],
             })
         );
@@ -5714,8 +5743,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered
-                .contains("  process harness   absent   host process, not confined by the class\n"),
+            rendered.contains("  process harness   absent   landlock+seccomp\n"),
             "{rendered}"
         );
         assert!(
@@ -5771,6 +5799,8 @@ mod tests {
             }
         }
 
+        // A process capsule's harness and the tools it runs are under the class, so `W-SEC-034`
+        // names only its uncovered driver route, never the harness.
         let process = route_table(
             &RouteInputs {
                 process_transport: true,
@@ -5781,11 +5811,11 @@ mod tests {
         );
         let message = uncovered_route_warning(ContainmentClass::Scoped, &process).unwrap();
         assert!(
-            message.contains(
-                "drivers (driver-claude-code), the process harness and harness tools run"
-            ),
+            message.contains("drivers (driver-claude-code) run outside the class"),
             "{message}"
         );
+        assert!(!message.contains("process harness"), "{message}");
+        assert!(!message.contains("harness tools"), "{message}");
     }
 
     /// The emitter writes the code, the message and the link to the bootstrap log it is handed.

@@ -201,33 +201,20 @@ impl Session {
     }
 }
 
-/// Write the harness wrapper: the fixture script with this scenario's profile and call baked in.
+/// Write the harness: the fixture script with this scenario's profile and call baked in.
 ///
 /// The profile reaches the harness through its own environment rather than the test process's,
 /// which is what lets these cases run in parallel.
 fn write_harness(project: &Path, capsule: &Capsule<'_>) -> PathBuf {
-    let harness = project.join("harness.sh");
-    let mut script = String::from("#!/bin/bash\n");
-    script.push_str(&format!(
-        "export FIXTURE_HARNESS_PROFILE={}\n",
-        capsule.profile
-    ));
-    script.push_str(&format!("export FIXTURE_BRIDGE_CALLS={}\n", capsule.calls));
+    let mut exports = format!("export FIXTURE_HARNESS_PROFILE={}\n", capsule.profile);
+    exports.push_str(&format!("export FIXTURE_BRIDGE_CALLS={}\n", capsule.calls));
     if let Some(tool) = capsule.call_tool {
-        script.push_str(&format!("export FIXTURE_BRIDGE_CALL_TOOL='{tool}'\n"));
+        exports.push_str(&format!("export FIXTURE_BRIDGE_CALL_TOOL='{tool}'\n"));
     }
     if let Some(args) = capsule.call_args {
-        script.push_str(&format!("export FIXTURE_BRIDGE_CALL_ARGS='{args}'\n"));
+        exports.push_str(&format!("export FIXTURE_BRIDGE_CALL_ARGS='{args}'\n"));
     }
-    script.push_str(&format!(
-        "exec '{}' \"$@\"\n",
-        common::fixture_path("process-driver/fake-harness").display()
-    ));
-    fs::write(&harness, script).unwrap();
-    let mut perms = fs::metadata(&harness).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&harness, perms).unwrap();
-    harness
+    common::write_fake_harness(&project.join("harness.sh"), &exports)
 }
 
 fn create_manifest(project: &Path, capsule: &Capsule<'_>, harness: &Path) -> PathBuf {

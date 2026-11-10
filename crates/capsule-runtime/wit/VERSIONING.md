@@ -25,7 +25,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
-| `murmur:driver`          | `0.5.0`  |
+| `murmur:driver`          | `0.6.0`  |
 
 `SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
@@ -463,6 +463,31 @@ committed under `crates/murmur-cli/tests/fixtures/process-driver-v4/`, beside
 the older ones and with its own frozen `.wit`, so that refusal stays testable.
 No other package moved, so an artifact whose interfaces are all outside
 `murmur:driver` fits level 5 exactly when it fits level 4.
+
+`murmur:driver` then went to `0.6.0`, WIT level 6, so a process driver can
+declare what its harness needs beyond what the capsule's class gives every
+command — the directories it reads and writes, the hosts it connects to — which
+the runtime grants only where the capsule manifest also allows it. `description`
+gained a last field, `harness-needs`, a new `harness-needs` record carrying
+`paths: list<path-need>` (each a new `path-need` record of a `path` and a new
+`path-access` enum, `read` or `read-write`) and `hosts: list<string>` (each
+spelled as a `capabilities.network.allow` entry). The environment half stays
+`required-env`. A field appended to a record and new records and an enum are
+breaking under the rule below, so the minor moved. Its instance name is now
+`murmur:driver/process@0.6.0`. A malformed need is refused when the driver loads
+(`E-RUN-032`); a need the manifest does not allow refuses the launch
+(`E-CAP-021`). An empty `harness-needs` is valid and declares nothing.
+
+The cost was paid knowingly. Every installed `@0.5.0` driver is refused at
+launch with `E-WIT-LEVEL-001` the moment `mur` upgrades: it does not fit WIT
+level 6, it exports `murmur:driver/process@0.5.0`, and level 6 has
+`murmur:driver@0.6.0`. Every published process driver, `driver-claude-code`
+among them, must be rebuilt against `0.6.0` — the rebuild that declares Claude
+Code's needs. One `@0.5.0` component stays committed under
+`crates/murmur-cli/tests/fixtures/process-driver-v5/`, beside the older ones and
+with its own frozen `.wit`, so that refusal stays testable. No other package
+moved, so an artifact whose interfaces are all outside `murmur:driver` fits
+level 6 exactly when it fits level 5.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

@@ -83,18 +83,13 @@ impl Session {
 }
 
 fn write_harness(project: &Path, args: &str) -> PathBuf {
-    let harness = project.join("harness.sh");
-    let script = format!(
-        "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=bridge-call\nexport FIXTURE_BRIDGE_CALLS=1\n\
-         export FIXTURE_BRIDGE_CALL_TOOL='{TOOL}'\nexport FIXTURE_BRIDGE_CALL_ARGS='{args}'\n\
-         exec '{}' \"$@\"\n",
-        common::fixture_path("process-driver/fake-harness").display()
-    );
-    fs::write(&harness, script).unwrap();
-    let mut perms = fs::metadata(&harness).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&harness, perms).unwrap();
-    harness
+    common::write_fake_harness(
+        &project.join("harness.sh"),
+        &format!(
+            "export FIXTURE_HARNESS_PROFILE=bridge-call\nexport FIXTURE_BRIDGE_CALLS=1\n\
+             export FIXTURE_BRIDGE_CALL_TOOL='{TOOL}'\nexport FIXTURE_BRIDGE_CALL_ARGS='{args}'\n"
+        ),
+    )
 }
 
 /// Publish the driver and the tool, stage the capsule, run the harness and collect what it left.

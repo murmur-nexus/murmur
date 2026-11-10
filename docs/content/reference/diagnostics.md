@@ -36,6 +36,7 @@ section that explains it.
 | `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
 | `E-CAP-019` | A process driver requires a variable `capabilities.env.allow` does not declare | [E-CAP-019](#e-cap-019) |
 | `E-CAP-020` | Two declared artifacts share a tool name, the part of their names after the `/` | [E-CAP-020](#e-cap-020) |
+| `E-CAP-021` | A process driver's harness needs a path or host the capsule manifest does not allow | [E-CAP-021](#e-cap-021) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -2212,6 +2213,35 @@ error[E-CAP-020]: artifacts 'murmur/tool-edit' and 'ana/tool-edit' share the too
 A `source:` entry counts by its bare name, so `- name: tool-edit` with `source:` beside
 `murmur/tool-edit` is refused the same way. The check runs before any artifact is resolved, so
 nothing is resolved and no session directory is created. Declare one of the two.
+
+### E-CAP-021 — the harness needs a path or host the manifest does not allow { #e-cap-021 }
+
+A `transport: process` capsule's process driver declares what its harness needs beyond what the
+capsule's class gives every command — the host directories it reads and writes, and the hosts it
+connects to — in `description.harness-needs` (see
+[`murmur:driver`](wit-interfaces.md#process-harness-needs)). Each need is granted only where the capsule
+manifest also allows it: a path by [`capabilities.harness.paths`](manifest.md#capabilities-harness),
+a host by `capabilities.network.allow`. A need the manifest does not allow refuses the launch,
+naming every such need and the manifest key that would allow it; nothing is spawned.
+
+```text
+error[E-CAP-021]: process driver 'local/the-driver@1.0.0' declares harness needs the capsule manifest does not allow: ~/.claude (read-write): no capabilities.harness.paths entry names it or an ancestor of it; api.anthropic.com:443: no capabilities.network.allow entry admits it
+  hint: grant each path under capabilities.harness.paths (on this transport: process capsule) and each host under capabilities.network.allow — the harness reaches only what the manifest also allows, never more than the class gives every command
+```
+
+The same code also refuses:
+
+- a `capabilities.harness` block on a capsule whose `inference.transport` is not `process` — the
+  block reaches the process harness and nothing else;
+- an allowed path that resolves to a refused location on this host — a system path, read-write
+  over murmur's home `~/.murmur`, or inside the work folder — on the same terms as an operator
+  `host_paths` entry;
+- an allowed path that a symlink on its way leads outside the `capabilities.harness.paths` entry
+  that allows it.
+
+A path the manifest allows but that is absent on this host is reported `missing` and the launch
+continues. `mur run --explain-scope` prints each need's status and exits `0`; `mur doctor` reports
+a disallowed need here in its `Process harness` block.
 
 ## Conversation record errors
 
@@ -4659,8 +4689,7 @@ reports `read_only_to_commands: false` for the directory that lies inside. A `sc
 ### W-SEC-034 — a route this capsule runs code on is outside its class { #w-sec-034 }
 
 **Fires when:** the declared floor is `scoped` or `sealed` and the capsule has a present route
-the class does not cover: WASM tools, drivers, hooks, or the `inference.transport: process`
-harness and its tools. [Routes and what holds each](containment.md#routes) says when each is
+the class does not cover: WASM tools, drivers or hooks. [Routes and what holds each](containment.md#routes) says when each is
 present.
 
 Every agent capsule has a driver, so every agent capsule at `scoped` or `sealed` gets it. One
@@ -4675,10 +4704,10 @@ warning names every such route and the artifacts on it:
 [capsule-runtime] warning[W-SEC-034]: the declared sealed floor does not confine every route this capsule runs code on: WASM tools (local/fs-tool) and drivers (local/murmur-driver-anthropic) run outside the class, with none of its Landlock, seccomp or network namespace around them (`mur run --explain-scope` lists what holds each under Routes). The class confines shell commands and plan shell steps; nothing is refused (https://docs.murmur.nexus/reference/diagnostics/#w-sec-034)
 ```
 
-**Why it matters:** the class confines shell commands and plan shell steps. WASM
-tools, drivers and hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process
-tree, each held by its WASI preopens and the network allowlist; the process harness and its tools
-run with your authority.
+**Why it matters:** the class confines shell commands, plan shell steps, and a
+[process harness](containment.md#process-harness) with every tool it runs. WASM tools, drivers and
+hooks run in [guest workers](../concepts/guest-workers.md) in the `mur` process tree, each held by
+its WASI preopens and the network allowlist.
 
 **What the runtime does about it:** nothing is refused. The launch runs at the declared class.
 

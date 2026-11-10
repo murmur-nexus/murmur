@@ -3263,6 +3263,24 @@ pub fn stage_session(
                     .and_then(|inference| inference.command.as_deref()),
                 &description.binary,
             )?;
+            // The harness's declared needs, resolved against the manifest and this host, right
+            // after `check_required_env` and before any session directory or spawn. A need the
+            // manifest does not allow refuses the launch with `E-CAP-021`, naming every one.
+            let resolved = crate::harness_needs::resolve_capsule_harness(
+                &format!("{name}@{version}"),
+                &description,
+                Some(&binary),
+                &request.capability_policy,
+                &runtime_dir_placement.workdir,
+            );
+            let grants = resolved.grants;
+            let exec_files = resolved
+                .binary
+                .map(|info| info.exec_files())
+                .unwrap_or_else(|| vec![binary.clone()]);
+            if let Some(refusal) = grants.refusal {
+                return Err(refusal);
+            }
             Some(Arc::new(StagedProcessDriver {
                 name,
                 version,
@@ -3270,6 +3288,11 @@ pub fn stage_session(
                 description,
                 binary,
                 binary_source,
+                harness_report: grants.report,
+                harness_grants: crate::sandbox::HarnessEnforcementGrants {
+                    granted_paths: grants.granted_paths,
+                    exec_files,
+                },
             }))
         }
         None => None,
@@ -3554,7 +3577,12 @@ pub fn stage_session(
                 .map(|inference| inference.transport.as_str()),
         )
         .with_declared_needs(&request.capability_policy.shell_declared_needs)
-        .with_pinned_programs(&request.capability_policy.shell_pinned_programs);
+        .with_pinned_programs(&request.capability_policy.shell_pinned_programs)
+        .with_harness(
+            staged_process_driver
+                .as_ref()
+                .map(|driver| driver.harness_report.clone()),
+        );
     runtime_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
@@ -4047,6 +4075,31 @@ fn launch(
     .with_host_bounding(cgroup_scope, workdir_guard)
     .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()))
     .with_temp_mapping(staged.temp_mapping);
+    // The harness runs under the session's class plus its own granted paths and binary. Derived
+    // once here, from the session's enforcement; a shell command keeps `shell_enforcement`
+    // without these grants. A read-write grant overlapping the harness's own folder on a Landlock
+    // tier refuses the launch here.
+    let harness_enforcement = match staged.process_driver.as_ref() {
+        Some(driver) => {
+            // The harness reads the files its driver asks the runtime to write (its
+            // `{files_dir}`), which live under the session's `harness/` directory, outside the work
+            // folder and every driver-declared need. Grant it read-only to the harness, on top of
+            // the driver's own grants, so the harness can read what its driver wrote for it.
+            let mut grants = driver.harness_grants.clone();
+            grants.granted_paths.push(crate::host_paths::HostPath {
+                declared: "<harness files>".to_string(),
+                path: staged.runtime_dirs.harness.path().to_path_buf(),
+                access: crate::host_paths::HostPathAccess::Read,
+                credential_locations: Vec::new(),
+            });
+            Some(
+                shell_enforcement
+                    .with_harness_grants(&grants)
+                    .map_err(RuntimeError::Runtime)?,
+            )
+        }
+        None => None,
+    };
     // Ends the session on every path out of this function, an error return included: every path
     // that ends normally ends it explicitly first, and a second end is a no-op.
     let _session_end = sandbox::EndSessionOnDrop::new(shell_enforcement.clone());
@@ -4516,6 +4569,7 @@ fn launch(
         let protected_paths = staged.protected_paths.clone();
         let tool_annotations = staged.tool_annotations.clone();
         let shell_enforcement_for_state = shell_enforcement.clone();
+        let harness_enforcement_for_state = harness_enforcement.clone();
         let shell_enforcement_for_teardown = shell_enforcement.clone();
         let otel_endpoint = staged.otel_endpoint;
         let eval_config_json = staged.eval_config_json;
@@ -4890,6 +4944,7 @@ fn launch(
                         protected_paths,
                         tool_annotations,
                         shell_enforcement: shell_enforcement_for_state,
+                        harness_enforcement: harness_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
                         current_task_id: None,
@@ -5967,6 +6022,8 @@ fn launch(
         protected_paths: staged.protected_paths,
         tool_annotations: staged.tool_annotations,
         shell_enforcement: shell_enforcement.clone(),
+        // The script path runs no agent loop and so drives no harness.
+        harness_enforcement: None,
         current_traceparent,
         current_task_provenance: None,
         current_task_id: None,
@@ -7151,12 +7208,13 @@ pub(crate) fn prepare_launch_scope(
         .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
 }
 
-/// Whether the capsule may start a subprocess: a `shell.allow` or a `spawn.allow` grant. A
-/// pulled tool is a WASM component, which starts a program only through `murmur:process` and so
-/// only one `shell.allow` names. `mur doctor` asks the same question before its checklist.
+/// Whether the capsule may start a subprocess: a `shell.allow` or a `spawn.allow` grant, or a
+/// `transport: process` capsule, whose harness is a subprocess the runtime spawns. A pulled tool
+/// is a WASM component, which starts a program only through `murmur:process` and so only one
+/// `shell.allow` names. `mur doctor` asks the same question before its checklist.
 #[must_use]
 pub fn has_subprocess_route_at_staging(policy: &CapabilityPolicy) -> bool {
-    !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty()
+    !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty() || policy.process_transport
 }
 
 /// One credential-shaped entry of `capabilities.env.allow` that reaches every WASM guest.
@@ -8697,6 +8755,12 @@ pub(crate) struct CapsuleStoreState {
     /// session's shell subprocesses. Kept separate from `CapabilityPolicy` (which stays
     /// purely manifest-derived) since this is host-probed data, not manifest data.
     pub(crate) shell_enforcement: sandbox::ShellEnforcement,
+    /// The enforcement a `transport: process` harness is spawned under: the session's
+    /// `shell_enforcement` plus the harness's granted paths and its binary (and `#!` interpreter)
+    /// as executable grants ([`sandbox::ShellEnforcement::with_harness_grants`]). `None` on every
+    /// other transport. Shell commands keep `shell_enforcement`; only the harness and its own
+    /// tools run under this.
+    pub(crate) harness_enforcement: Option<sandbox::ShellEnforcement>,
     /// W3C traceparent for outgoing murmur:message/send calls — set by the runtime loop
     /// after each begin_session so the active session span propagates to peer capsules.
     pub(crate) current_traceparent: Option<String>,
@@ -13998,6 +14062,11 @@ fn validate_capability_policy(policy: &CapabilityPolicy) -> Result<(), RuntimeEr
     if let Some(scope) = policy.filesystem_scope.as_deref() {
         validate_filesystem_scope(scope)?;
     }
+    // `capabilities.harness` reaches the process harness and nothing else, so it is inert on a
+    // capsule whose transport is not `process`. Refuse rather than accept an inert grant.
+    if !policy.harness_paths.is_empty() && !policy.process_transport {
+        return Err(RuntimeError::HarnessPathsRequireProcessTransport);
+    }
 
     Ok(())
 }
@@ -19206,6 +19275,7 @@ inference:
             tool_annotations: ToolAnnotationMap::default(),
             shell_enforcement: sandbox::ShellEnforcement::environment_only()
                 .with_test_session_dirs(),
+            harness_enforcement: None,
             current_traceparent: None,
             current_task_provenance: None,
             current_task_id: None,
@@ -22627,6 +22697,11 @@ inference:
             shell_allow: vec!["bash".to_string()],
             ..tool_grant.clone()
         };
+        // A `transport: process` capsule is a subprocess capsule too, whatever its shell grant.
+        let process_capsule = CapabilityPolicy {
+            process_transport: true,
+            ..tool_grant.clone()
+        };
 
         for policy in [&tool_grant, &skill_grant] {
             assert!(!has_subprocess_route_at_staging(policy), "{policy:?}");
@@ -22636,6 +22711,10 @@ inference:
             )
             .is_ok());
         }
+        assert!(
+            has_subprocess_route_at_staging(&process_capsule),
+            "a process-transport capsule needs the namespace and scope a shell capsule needs"
+        );
         assert!(matches!(
             crate::network_namespace::check_egress_namespace(
                 has_subprocess_route_at_staging(&with_shell),
@@ -23171,6 +23250,7 @@ inference:
             conversation: None,
             plan: None,
             install: None,
+            harness: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling(), "test-capsule")
@@ -23735,6 +23815,7 @@ inference:
                 conversation: None,
                 plan: None,
                 install: None,
+                harness: None,
                 containment: None,
             }),
         };
@@ -23904,6 +23985,7 @@ inference:
                 conversation: None,
                 plan: None,
                 install: None,
+                harness: None,
                 containment: None,
             }),
         };
@@ -23950,6 +24032,7 @@ inference:
             conversation: None,
             plan: None,
             install: None,
+            harness: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 
@@ -23978,6 +24061,7 @@ inference:
             conversation: None,
             plan: None,
             install: None,
+            harness: None,
             containment: None,
         };
         let deadline_only = with_limits(murmur_artifact::ResourceLimits {
@@ -24116,9 +24200,21 @@ inference:
                     "auth".to_string(),
                     "status".to_string(),
                 ]),
+                harness_needs: crate::process_driver::HarnessNeeds {
+                    paths: Vec::new(),
+                    hosts: Vec::new(),
+                },
             },
             binary: binary.to_path_buf(),
             binary_source: "inference.command".to_string(),
+            harness_report: crate::harness_needs::unresolved_report(
+                "fixture-process-driver@0.1.0",
+                "test fixture".to_string(),
+            ),
+            harness_grants: crate::sandbox::HarnessEnforcementGrants {
+                granted_paths: Vec::new(),
+                exec_files: vec![binary.to_path_buf()],
+            },
         })
     }
 

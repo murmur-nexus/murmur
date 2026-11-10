@@ -996,8 +996,10 @@ pub(crate) async fn run_agent_loop(
         };
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.
-        // The HTTP path below is unaffected.
-        return process::run_process_inference_loop(
+        // The HTTP path below is unaffected. Boxed, so the process path's large future lives on
+        // the heap rather than in this function's: an in-process launch polls it on whatever
+        // stack the caller's thread has.
+        return Box::pin(process::run_process_inference_loop(
             store_state,
             inference,
             task_max_turns,
@@ -1016,7 +1018,7 @@ pub(crate) async fn run_agent_loop(
             continuation,
             &mut thread.harness_session,
             &mut thread.ending,
-        )
+        ))
         .await;
     }
 

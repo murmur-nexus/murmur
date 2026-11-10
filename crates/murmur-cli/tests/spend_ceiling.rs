@@ -1501,6 +1501,9 @@ fn no_usage_driver_wasm() -> PathBuf {
 /// harness, which sleeps for a minute after its terminal event, is killed rather than waited on.
 #[test]
 fn process_session_ceiling_stops_the_run() {
+    if common::skip_without_host_support("process_session_ceiling_stops_the_run") {
+        return;
+    }
     println!("S13 process_session_ceiling_stops_the_run");
     let home = TempDir::new().unwrap();
     let capsule = process_capsule(
@@ -1534,20 +1537,19 @@ fn process_session_ceiling_stops_the_run() {
         json!("spend_ceiling")
     );
 
-    let pid: i32 = fs::read_to_string(
-        common::find_file(&run.workdir(), "harness.pid").expect("the profile wrote a pid"),
-    )
-    .unwrap()
-    .trim()
-    .parse()
-    .unwrap();
-    common::assert_dead_within(pid, std::time::Duration::from_secs(5));
+    // The harness wrote its pid from inside the session's PID namespace, so it is proved gone
+    // on the host: nothing runs in its working directory any more.
+    common::find_file(&run.workdir(), "harness.pid").expect("the profile wrote a pid");
+    common::assert_nothing_runs_in_within(&run.workdir(), std::time::Duration::from_secs(5));
 }
 
 /// The machine ledger counts process turns: a passing run appends the harness's own numbers, and
 /// a run under an already-exhausted ceiling is stopped by them.
 #[test]
 fn process_machine_ceiling_counts_and_stops() {
+    if common::skip_without_host_support("process_machine_ceiling_counts_and_stops") {
+        return;
+    }
     println!("S13 process_machine_ceiling_counts_and_stops");
     let home = TempDir::new().unwrap();
     set_machine_ceiling(&home, 1_000_000);
@@ -1596,6 +1598,10 @@ fn process_machine_ceiling_counts_and_stops() {
 /// could ever reach would let the run go on for ever beneath it.
 #[test]
 fn process_ceiling_against_an_unreporting_driver_is_refused() {
+    if common::skip_without_host_support("process_ceiling_against_an_unreporting_driver_is_refused")
+    {
+        return;
+    }
     println!("S13 process_ceiling_against_an_unreporting_driver_is_refused");
     for (label, config, extra) in [
         ("session", None, "  max_session_tokens: 1000\n"),
