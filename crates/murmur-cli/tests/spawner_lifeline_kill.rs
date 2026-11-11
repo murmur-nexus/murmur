@@ -399,6 +399,28 @@ impl Delegation {
     }
 }
 
+/// Wait until the delegated child has started its task.
+///
+/// [`await_delegation`] returns once the child's `session_start` is on disk, which is before the
+/// task has been handed over and begun. A spawner that dies in between leaves the child no task to
+/// cancel, so a test that asserts the child's cancelled task waits for this first. How long the
+/// hand-over takes depends on the load of the host.
+fn await_child_task(delegation: &Delegation) {
+    let deadline = Instant::now() + START_LIMIT;
+    while !delegation
+        .trace()
+        .iter()
+        .any(|event| event["event_type"] == "task_start")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the child never started its task: {:?}",
+            kinds(&delegation.trace())
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Wait for the session whose records directory is `records` to record a `delegation_start`
 /// whose child has written its own `session_start`.
 fn await_delegation(records: &Path) -> Delegation {
@@ -580,6 +602,7 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
         !delegation.processes().is_empty(),
         "the child is not running"
     );
+    await_child_task(&delegation);
 
     let killed = Instant::now();
     parent.proc.kill();
@@ -630,6 +653,8 @@ fn a_grandchild_winds_down_once_its_parent_has() {
     let relay = await_delegation(&parent.records_dir());
     let grandchild = await_delegation(&relay.child_records);
     assert!(!relay.processes().is_empty() && !grandchild.processes().is_empty());
+    await_child_task(&relay);
+    await_child_task(&grandchild);
 
     let killed = Instant::now();
     parent.proc.kill();
@@ -1232,6 +1257,7 @@ fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
         !delegation.processes().is_empty(),
         "the child is not running"
     );
+    await_child_task(&delegation);
 
     let killed = Instant::now();
     parent.proc.kill();
@@ -1333,6 +1359,7 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
         !delegation.processes().is_empty(),
         "the child is not running"
     );
+    await_child_task(&delegation);
     // The child is joined to the formation and has no roster name; the member that delegated has.
     let child_session = delegation.child_session_id.as_str();
     let child_record = await_running_record(&world, child_session);
@@ -1482,6 +1509,7 @@ fn without_close_range_a_child_is_launched_and_still_ends_with_its_parent() {
     });
     parent.submit();
     let delegation = await_delegation(&parent.records_dir());
+    await_child_task(&delegation);
     let (child_pid, _) = delegation.processes()[0].clone();
     let status = std::fs::read_to_string(format!("/proc/{child_pid}/status")).unwrap();
     assert!(

@@ -2681,6 +2681,18 @@ impl HandStarted {
     fn has_exited(&mut self) -> bool {
         self.child.try_wait().unwrap().is_some()
     }
+
+    /// Whether the process exits within `within`, reaped through this test's own handle.
+    fn wait_exited(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while !self.has_exited() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
 }
 
 impl Drop for HandStarted {
@@ -3120,7 +3132,9 @@ fn mur_stop_stops_a_hand_started_member_left_behind_as_one_session() {
     assert_eq!(lines[1], "launcher: none — no running member records one");
     assert_eq!(member_lines(&stopped.stdout).len(), 1, "{}", stopped.stdout);
     assert_stopped_by_hand(&stopped.stdout, &by_hand_session);
-    assert!(by_hand.has_exited());
+    // `mur stop` answers once the session has been told to stop; the process itself may still be
+    // winding down, so wait for it rather than look once.
+    assert!(by_hand.wait_exited(Duration::from_secs(30)));
     let ps = project.ps();
     assert!(!ps.contains(id), "{ps}");
 }
