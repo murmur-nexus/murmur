@@ -1284,3 +1284,123 @@ fn a_shell_command_and_a_session_process_are_contained_alike() {
         failures.join("\n")
     );
 }
+
+/// What `sh -c 'seq 1 20000; seq 1 3000 >&2'` prints on stdout and on stderr.
+fn known_block() -> (String, String) {
+    let lines = |last: u32| (1..=last).map(|n| format!("{n}\n")).collect::<String>();
+    (lines(20000), lines(3000))
+}
+
+/// A tool that polls `status` until `exited` and then reads once gets every byte the program
+/// wrote, with both streams ended, and a second read gets nothing more, on every tier.
+#[test]
+fn a_tool_that_waits_for_the_exit_reads_every_byte() {
+    let name = "a_tool_that_waits_for_the_exit_reads_every_byte";
+    if common::skip_without_host_support(name) {
+        return;
+    }
+    const CALLS: usize = 4;
+    const RUNS_PER_CALL: usize = 50;
+    let (stdout, stderr) = known_block();
+    let fixture = Fixture::new();
+    for tier in common::tiers(name) {
+        let calls = (0..CALLS)
+            .map(|index| {
+                let id: &'static str = ["drain-0", "drain-1", "drain-2", "drain-3"][index];
+                call(
+                    id,
+                    json!({
+                        "op": "drain",
+                        "program": "sh",
+                        "args": ["-c", "seq 1 20000; seq 1 3000 >&2"],
+                        "runs": RUNS_PER_CALL,
+                        "prefix": id,
+                        "expect_stdout_len": stdout.len(),
+                        "expect_stderr_len": stderr.len(),
+                        "timeout_ms": 20_000,
+                    }),
+                )
+            })
+            .collect();
+        let extra = format!(
+            "{}  limits:\n    deadline_seconds: 240\n",
+            shell_allow(&["sh", "seq"])
+        );
+        let run = fixture.run(tier, &extra, calls, false, false);
+        let mut total = 0;
+        for index in 0..CALLS {
+            let result = run.result(&format!("drain-{index}"));
+            assert_eq!(
+                result["misses"],
+                json!([]),
+                "{tier}: call {index}: {result}"
+            );
+            total += result["runs"].as_u64().unwrap();
+            assert!(
+                result["first_stdout_tail"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("19999\n20000\n"),
+                "{tier}: call {index}: {result}"
+            );
+        }
+        assert!(total >= 200, "{tier}: {total} runs");
+        assert!(run.events("process_refused").is_empty(), "{tier}");
+    }
+}
+
+/// A tool built against `murmur:process@0.1.0`, WIT level 6, is refused at staging: level 7 has
+/// `murmur:process@0.2.0`, and the host serves no other version.
+#[test]
+fn a_process_tool_built_for_level_6_is_refused() {
+    let fixture = Fixture::new();
+    let old = common::create_tool_artifact(
+        &fixture.artifacts,
+        "local/process-probe-v1",
+        VERSION,
+        &common::fixture_path("process-probe-v1/tool/process-probe-v1.wasm"),
+    );
+    let driver = common::create_driver_artifact(
+        &fixture.artifacts,
+        DRIVER,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    for artifact in [&driver, &old] {
+        fixture
+            .mur()
+            .args(["publish", artifact.to_str().unwrap()])
+            .assert()
+            .success();
+    }
+    // A project of its own, with no `murmur.lock`, resolving from the global store: the fixture's
+    // project locks the current probe.
+    fixture.write_manifest("http://127.0.0.1:9", "", "", false, false);
+    let manifest = fs::read_to_string(fixture.manifest())
+        .unwrap()
+        .replace(&format!("local/{PROBE}\n"), "local/process-probe-v1\n");
+    let project = fixture.project.with_file_name("old-level-project");
+    fs::create_dir_all(&project).unwrap();
+    let manifest_path = project.join("murmur.yaml");
+    fs::write(&manifest_path, manifest).unwrap();
+    let output = fixture
+        .mur()
+        .current_dir(&project)
+        .args(["run", "--manifest", manifest_path.to_str().unwrap()])
+        .args(["--task", "hi"])
+        .write_stdin("")
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .unwrap();
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "artifact 'local/process-probe-v1@{VERSION}' does not fit WIT level 7, the level this \
+             mur serves: it imports murmur:process/process@0.1.0, and level 7 has \
+             murmur:process@0.2.0"
+        )),
+        "{text}"
+    );
+}

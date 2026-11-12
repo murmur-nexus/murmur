@@ -1060,7 +1060,7 @@ mod tests {
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(
             message.contains(
-                "it imports murmur:text/chunks@0.1.0, and level 6 has no version of murmur:text"
+                "it imports murmur:text/chunks@0.1.0, and level 7 has no version of murmur:text"
             ),
             "{message}"
         );

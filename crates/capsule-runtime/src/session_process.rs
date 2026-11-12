@@ -1,4 +1,4 @@
-//! Programs a WASM tool runs through `murmur:process/process@0.1.0`, under the rules a shell
+//! Programs a WASM tool runs through `murmur:process/process@0.2.0`, under the rules a shell
 //! command obeys.
 //!
 //! A tool's store lives for one call, so nothing a tool starts can be held in it. A session's
@@ -31,7 +31,7 @@ use crate::types::CapabilityPolicy;
 use crate::workdir_fs::WorkdirRoot;
 
 /// The instance name the host registers on every WASM tool's linker.
-pub(crate) const PROCESS_IFACE: &str = "murmur:process/process@0.1.0";
+pub(crate) const PROCESS_IFACE: &str = "murmur:process/process@0.2.0";
 
 /// Live session processes per session, all tools together. An exited process does not count.
 pub(crate) const MAX_SESSION_PROCESSES: usize = 8;
@@ -48,6 +48,15 @@ pub(crate) const HANDLE_PREFIX: &str = "prc_";
 
 /// How long the session's end waits for the reapers of the processes it killed to record them.
 const SESSION_END_REAP_WAIT: Duration = Duration::from_secs(3);
+
+/// How long a session process's reaper waits, after the leader exited and its group was killed,
+/// for both output pumps to reach end-of-file before it reports the exit anyway.
+///
+/// Killing the group closes every write end its members held, so end-of-file normally arrives as
+/// soon as the pump reads the last chunk. Only a program that left the process group (`setsid`)
+/// and still holds stdout or stderr open keeps a pipe from ending; this bounds that case, and that
+/// stream's `-ended` stays false until the holder closes it.
+const OUTPUT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 
 /// How long a finished `run` keeps reading output a killed group's pipes still hold.
 const RUN_DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
@@ -290,12 +299,14 @@ enum Phase {
     Abandoned,
 }
 
-/// The newest [`MAX_PROCESS_OUTPUT_BYTES`] of one stream, and what was pushed out since the last
-/// read.
+/// The newest [`MAX_PROCESS_OUTPUT_BYTES`] of one stream, what was pushed out since the last
+/// read, and whether the stream's pipe has reached end-of-file.
 #[derive(Default)]
 struct OutputRing {
     bytes: VecDeque<u8>,
     dropped: u64,
+    /// Set by the pump, under this ring's lock, after its last push.
+    eof: bool,
 }
 
 impl OutputRing {
@@ -312,6 +323,16 @@ impl OutputRing {
         let count = max.min(self.bytes.len());
         let taken = self.bytes.drain(..count).collect();
         (taken, std::mem::take(&mut self.dropped))
+    }
+
+    fn mark_end_of_file(&mut self) {
+        self.eof = true;
+    }
+
+    /// The pipe reached end-of-file and every byte it delivered has been taken: no later take
+    /// returns anything.
+    fn ended(&self) -> bool {
+        self.eof && self.bytes.is_empty()
     }
 }
 
@@ -951,8 +972,8 @@ impl SessionProcesses {
         *lock(&process.started) = started;
         *lock(&process.stdin) = child.stdin.take();
         process.pid.store(pgid, Ordering::SeqCst);
-        pump_into(child.stdout.take(), Arc::clone(&process.stdout));
-        pump_into(child.stderr.take(), Arc::clone(&process.stderr));
+        let stdout_ended = pump_into(child.stdout.take(), Arc::clone(&process.stdout));
+        let stderr_ended = pump_into(child.stderr.take(), Arc::clone(&process.stderr));
         self.trace_start(
             ctx,
             &process.handle,
@@ -969,7 +990,11 @@ impl SessionProcesses {
             state.ended
         };
 
-        // The reaper: records the exit when it happens, not at the next call.
+        // The reaper: records the exit when it happens, not at the next call, and only once both
+        // output pumps have buffered everything the group wrote, so whoever sees `Exited` can read
+        // all of it. Each pump marks its ring ended under the ring's lock before it signals, and
+        // the phase moves to `Exited` after this wait, so a `read` that follows an observed
+        // `Exited` takes the ring lock after the last push.
         let registry = Arc::clone(self);
         let reaped = Arc::clone(&process);
         tokio::spawn(async move {
@@ -978,12 +1003,18 @@ impl SessionProcesses {
                 wait_and_kill_group(&mut child, pgid, &waited.signals)
             })
             .await;
+            let exited_at = Instant::now();
             drop(cgroup_occupancy);
             let exit_code = match status {
                 Ok(Ok(status)) => crate::shell::exit_code_of(&status),
                 _ => -1,
             };
-            registry.record_exit(&reaped, exit_code).await;
+            let drained = async {
+                let _ = stdout_ended.await;
+                let _ = stderr_ended.await;
+            };
+            let _ = tokio::time::timeout(OUTPUT_DRAIN_LIMIT, drained).await;
+            registry.record_exit(&reaped, exit_code, exited_at).await;
         });
 
         if ended_meanwhile {
@@ -1026,12 +1057,13 @@ impl SessionProcesses {
         .await
     }
 
-    /// Records `process`'s exit once: its `process_exit` line, then its state.
-    async fn record_exit(&self, process: &SessionProcess, exit_code: i32) {
+    /// Records `process`'s exit once: its `process_exit` line, whose `duration_ms` runs from the
+    /// spawn to `exited_at`, then its state.
+    async fn record_exit(&self, process: &SessionProcess, exit_code: i32, exited_at: Instant) {
         if !process.exit_traced.swap(true, Ordering::SeqCst) {
             let reason = *lock(&process.exit_reason);
-            let duration_ms = lock(&process.started)
-                .elapsed()
+            let duration_ms = exited_at
+                .saturating_duration_since(*lock(&process.started))
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX);
@@ -1089,13 +1121,22 @@ impl SessionProcesses {
     ) -> Result<wit::Output, wit::ProcessError> {
         let process = self.lookup(&ctx.tool, handle)?;
         let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let (stdout, stdout_dropped) = lock(&process.stdout).take(max);
-        let (stderr, stderr_dropped) = lock(&process.stderr).take(max);
+        // A stream's `-ended` is read under the same lock as its take, so a pump that pushes and
+        // marks end-of-file between the two cannot make a read report ended with bytes left.
+        let take = |ring: &Mutex<OutputRing>| {
+            let mut ring = lock(ring);
+            let (bytes, dropped) = ring.take(max);
+            (bytes, dropped, ring.ended())
+        };
+        let (stdout, stdout_dropped, stdout_ended) = take(&process.stdout);
+        let (stderr, stderr_dropped, stderr_ended) = take(&process.stderr);
         Ok(wit::Output {
             stdout,
             stderr,
             stdout_dropped,
             stderr_dropped,
+            stdout_ended,
+            stderr_ended,
         })
     }
 
@@ -1195,7 +1236,7 @@ impl SessionProcesses {
             {
                 // The reaper did not get there in time: the line is written here instead, once.
                 let exit_code = 128 + libc::SIGKILL;
-                self.record_exit(process, exit_code).await;
+                self.record_exit(process, exit_code, Instant::now()).await;
             }
         }
     }
@@ -1267,10 +1308,18 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
-/// Reads one pipe on its own thread into `ring` until end-of-file.
-fn pump_into(pipe: Option<impl std::io::Read + Send + 'static>, ring: Arc<Mutex<OutputRing>>) {
+/// Reads one pipe on its own thread into `ring` until end-of-file or a read error, then marks the
+/// ring at end-of-file. The receiver completes once the mark is set (or the thread is gone); with
+/// no pipe the ring is marked at once.
+fn pump_into(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    ring: Arc<Mutex<OutputRing>>,
+) -> oneshot::Receiver<()> {
+    let (ended, on_end) = oneshot::channel();
     let Some(mut pipe) = pipe else {
-        return;
+        lock(&ring).mark_end_of_file();
+        let _ = ended.send(());
+        return on_end;
     };
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -1282,7 +1331,10 @@ fn pump_into(pipe: Option<impl std::io::Read + Send + 'static>, ring: Arc<Mutex<
                 Err(_) => break,
             }
         }
+        lock(&ring).mark_end_of_file();
+        let _ = ended.send(());
     });
+    on_end
 }
 
 /// One `run` stream: the first [`MAX_PROCESS_OUTPUT_BYTES`] kept, the rest read and discarded.
@@ -2097,7 +2149,7 @@ impl RemoteProcessHost {
     }
 }
 
-/// Registers `murmur:process/process@0.1.0` on a tool linker whose store state yields a
+/// Registers `murmur:process/process@0.2.0` on a tool linker whose store state yields a
 /// [`ProcessView`] through `view`.
 pub(crate) fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,

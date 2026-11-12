@@ -7,6 +7,11 @@
 // (`max`), `wait_output` (`contains`, `timeout_ms`), `wait_exit` (`timeout_ms`), `stop`, and
 // `connect` (`port`, `send`, `timeout_ms`). The ops after `start` and `find` take `handle`, or
 // `name` to find it first.
+//
+// `drain` (`program`, `args`, `runs`, `prefix`, `expect_stdout_len`, `expect_stderr_len`,
+// `timeout_ms`) starts the program `runs` times under `{prefix}-{i}`, one after another; for each
+// it polls `status` until `exited`, reads once, then reads again, and reports every run whose
+// first read was short or not ended, or whose second read was not empty and ended.
 wit_bindgen::generate!({
     path: "../../../../../../capsule-runtime/wit/guest",
     world: "tool",
@@ -175,6 +180,8 @@ fn op(request: &Value) -> Value {
                         "stderr": text(&output.stderr),
                         "stdout_dropped": output.stdout_dropped,
                         "stderr_dropped": output.stderr_dropped,
+                        "stdout_ended": output.stdout_ended,
+                        "stderr_ended": output.stderr_ended,
                     }),
                     Err(error) => error_json(error),
                 }
@@ -224,6 +231,7 @@ fn op(request: &Value) -> Value {
             }
             Err(error) => error,
         },
+        "drain" => drain(request),
         "stop" => match handle_of(request) {
             Ok(handle) => process::stop(&handle).map_or_else(error_json, state_json),
             Err(error) => error,
@@ -256,6 +264,90 @@ fn op(request: &Value) -> Value {
         },
         other => json!({"error": {"kind": "unknown-op", "rule": "", "reason": other}}),
     }
+}
+
+/// The `drain` op. `program` is required; `args` defaults to none, `runs` to 1, `prefix` to
+/// `drain`, `timeout_ms` (per run, for the exit) to 10 000; an absent `expect_*_len` is not
+/// checked.
+fn drain(request: &Value) -> Value {
+    let program = request["program"].as_str().unwrap_or_default().to_string();
+    let args = strings(&request["args"]);
+    let runs = request["runs"].as_u64().unwrap_or(1);
+    let prefix = request["prefix"].as_str().unwrap_or("drain");
+    let expect_stdout = request["expect_stdout_len"].as_u64();
+    let expect_stderr = request["expect_stderr_len"].as_u64();
+    let timeout =
+        std::time::Duration::from_millis(request["timeout_ms"].as_u64().unwrap_or(10_000));
+    let mut misses = Vec::new();
+    let mut first_stdout_tail = String::new();
+    for index in 0..runs {
+        let started = match process::start(&process::StartRequest {
+            name: format!("{prefix}-{index}"),
+            program: program.clone(),
+            args: args.clone(),
+            env: Vec::new(),
+        }) {
+            Ok(started) => started,
+            Err(error) => {
+                misses.push(json!({"index": index, "state": error_json(error)}));
+                continue;
+            }
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let state = loop {
+            match process::status(&started.handle) {
+                Ok(process::State::Running) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                }
+                Ok(state) => break state_json(state),
+                Err(error) => break error_json(error),
+            }
+        };
+        if state["state"] != "exited" {
+            misses.push(json!({"index": index, "state": state}));
+            continue;
+        }
+        let (first, after) = match (
+            process::read(&started.handle, 1 << 20),
+            process::read(&started.handle, 1 << 20),
+        ) {
+            (Ok(first), Ok(after)) => (first, after),
+            (Err(error), _) | (_, Err(error)) => {
+                misses.push(json!({"index": index, "state": error_json(error)}));
+                continue;
+            }
+        };
+        if index == 0 {
+            let tail = first.stdout.len().saturating_sub(16);
+            first_stdout_tail = text(&first.stdout[tail..]);
+        }
+        let short = |bytes: &[u8], expected: Option<u64>| {
+            expected.is_some_and(|expected| bytes.len() as u64 != expected)
+        };
+        let first_missed = short(&first.stdout, expect_stdout)
+            || short(&first.stderr, expect_stderr)
+            || !first.stdout_ended
+            || !first.stderr_ended;
+        let after_missed = !after.stdout.is_empty()
+            || !after.stderr.is_empty()
+            || !after.stdout_ended
+            || !after.stderr_ended;
+        if first_missed || after_missed {
+            misses.push(json!({
+                "index": index,
+                "state": state,
+                "stdout_len": first.stdout.len(),
+                "stderr_len": first.stderr.len(),
+                "stdout_ended": first.stdout_ended,
+                "stderr_ended": first.stderr_ended,
+                "after_stdout_len": after.stdout.len(),
+                "after_stderr_len": after.stderr.len(),
+                "after_stdout_ended": after.stdout_ended,
+                "after_stderr_ended": after.stderr_ended,
+            }));
+        }
+    }
+    json!({"runs": runs, "misses": misses, "first_stdout_tail": first_stdout_tail})
 }
 
 export!(ProcessProbe);

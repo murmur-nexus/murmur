@@ -353,6 +353,286 @@ fn the_output_ring_keeps_the_newest_bytes_and_counts_the_rest() {
 }
 
 #[test]
+fn the_output_ring_ends_only_when_drained_after_end_of_file() {
+    let mut ring = OutputRing::default();
+    assert!(!ring.ended());
+    ring.push(b"abc");
+    assert!(!ring.ended());
+    ring.mark_end_of_file();
+    assert!(!ring.ended(), "ended with bytes still buffered");
+    assert_eq!(ring.take(2).0, b"ab");
+    assert!(!ring.ended(), "ended with a byte still buffered");
+    assert_eq!(ring.take(2).0, b"c");
+    assert!(ring.ended());
+    assert!(ring.take(2).0.is_empty());
+    assert!(ring.ended());
+}
+
+/// What `sh -c 'seq 1 20000; seq 1 3000 >&2'` prints: stdout and stderr.
+fn known_block() -> (Vec<u8>, Vec<u8>) {
+    let lines = |last: u32| (1..=last).map(|n| format!("{n}\n")).collect::<String>();
+    (lines(20000).into_bytes(), lines(3000).into_bytes())
+}
+
+const KNOWN_BLOCK: &str = "seq 1 20000; seq 1 3000 >&2";
+
+/// Polls `status` until the process reports `exited`, returning its code, or `None` at `limit`.
+async fn exit_code_within(
+    view: &mut ProcessView<'_>,
+    handle: &str,
+    limit: Duration,
+) -> Option<i32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(wit::State::Exited(code)) = view.status(handle.to_string()).await {
+            return Some(code);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exited_means_every_byte_is_readable() {
+    const TASKS: usize = 6;
+    const RUNS_PER_TASK: usize = 34;
+    let (registry, _workdir) = registry(&["sh"]);
+    let access = Arc::new(ctx(&registry, "probe", GateRoute::Ungated));
+    let (stdout, stderr) = known_block();
+    let (stdout, stderr) = (Arc::new(stdout), Arc::new(stderr));
+    let mut tasks = Vec::new();
+    for task in 0..TASKS {
+        let access = Arc::clone(&access);
+        let (stdout, stderr) = (Arc::clone(&stdout), Arc::clone(&stderr));
+        tasks.push(tokio::spawn(async move {
+            let mut table = ResourceTable::new();
+            let mut view = ProcessView {
+                access: &access,
+                table: &mut table,
+            };
+            let mut misses = Vec::new();
+            for run in 0..RUNS_PER_TASK {
+                let index = task * RUNS_PER_TASK + run;
+                let started = view
+                    .start(start_request(
+                        &format!("drain-{index}"),
+                        "sh",
+                        &["-c", KNOWN_BLOCK],
+                    ))
+                    .await
+                    .unwrap();
+                let code =
+                    exit_code_within(&mut view, &started.handle, Duration::from_secs(30)).await;
+                if code != Some(0) {
+                    misses.push(format!("run {index}: state {code:?}"));
+                    continue;
+                }
+                let first = view.read(started.handle.clone(), 1 << 20).await.unwrap();
+                let second = view.read(started.handle.clone(), 1 << 20).await.unwrap();
+                if first.stdout != *stdout
+                    || first.stderr != *stderr
+                    || !first.stdout_ended
+                    || !first.stderr_ended
+                {
+                    misses.push(format!(
+                        "run {index}: first read {} of {} stdout bytes, {} of {} stderr bytes, \
+                         ended {}/{}",
+                        first.stdout.len(),
+                        stdout.len(),
+                        first.stderr.len(),
+                        stderr.len(),
+                        first.stdout_ended,
+                        first.stderr_ended
+                    ));
+                }
+                if !second.stdout.is_empty()
+                    || !second.stderr.is_empty()
+                    || !second.stdout_ended
+                    || !second.stderr_ended
+                {
+                    misses.push(format!(
+                        "run {index}: second read {} stdout bytes, {} stderr bytes, ended {}/{}",
+                        second.stdout.len(),
+                        second.stderr.len(),
+                        second.stdout_ended,
+                        second.stderr_ended
+                    ));
+                }
+            }
+            misses
+        }));
+    }
+    let mut misses = Vec::new();
+    for task in tasks {
+        misses.extend(task.await.unwrap());
+    }
+    registry.end_session().await;
+    assert!(
+        misses.is_empty(),
+        "{} misses over {} runs:\n{}",
+        misses.len(),
+        TASKS * RUNS_PER_TASK,
+        misses.join("\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_after_the_end_says_the_stream_has_ended() {
+    let (registry, _workdir) = registry(&["cat"]);
+    let access = ctx(&registry, "probe", GateRoute::Ungated);
+    let mut table = ResourceTable::new();
+    let mut view = ProcessView {
+        access: &access,
+        table: &mut table,
+    };
+    let started = view.start(start_request("echo", "cat", &[])).await.unwrap();
+    let handle = started.handle;
+    view.write(handle.clone(), b"ping\n".to_vec())
+        .await
+        .unwrap();
+    let mut echoed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while echoed != b"ping\n" && Instant::now() < deadline {
+        let output = view.read(handle.clone(), 4096).await.unwrap();
+        assert!(!output.stdout_ended && !output.stderr_ended, "{output:?}");
+        echoed.extend(output.stdout);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(echoed, b"ping\n");
+
+    let state = view.stop(handle.clone()).await.unwrap();
+    assert!(matches!(state, wit::State::Exited(_)), "{state:?}");
+    let rest = view.read(handle.clone(), 4096).await.unwrap();
+    assert!(rest.stdout.is_empty() && rest.stderr.is_empty(), "{rest:?}");
+    assert!(rest.stdout_ended && rest.stderr_ended, "{rest:?}");
+    for _ in 0..3 {
+        let later = view.read(handle.clone(), 4096).await.unwrap();
+        assert!(
+            later.stdout.is_empty() && later.stderr.is_empty(),
+            "{later:?}"
+        );
+        assert!(later.stdout_ended && later.stderr_ended, "{later:?}");
+    }
+    registry.end_session().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_returns_exited_with_the_output_drained() {
+    let (registry, _workdir) = registry(&["sh"]);
+    let access = ctx(&registry, "probe", GateRoute::Ungated);
+    let mut table = ResourceTable::new();
+    let mut view = ProcessView {
+        access: &access,
+        table: &mut table,
+    };
+    // `bye` is printed in answer to the stop's SIGTERM, as the program dies of it.
+    let started = view
+        .start(start_request(
+            "bye",
+            "sh",
+            &[
+                "-c",
+                "trap 'echo bye; trap - TERM; kill -TERM $$' TERM; echo ready; \
+                 while :; do sleep 0.1; done",
+            ],
+        ))
+        .await
+        .unwrap();
+    let handle = started.handle;
+    let mut ready = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ready != b"ready\n" && Instant::now() < deadline {
+        let output = view.read(handle.clone(), 4096).await.unwrap();
+        assert!(!output.stdout_ended, "{output:?}");
+        ready.extend(output.stdout);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(ready, b"ready\n");
+
+    let state = view.stop(handle.clone()).await.unwrap();
+    assert!(
+        matches!(state, wit::State::Exited(143 | 137)),
+        "stop returned {state:?}"
+    );
+    let output = view.read(handle.clone(), 4096).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "bye\n");
+    assert!(output.stdout_ended && output.stderr_ended, "{output:?}");
+    registry.end_session().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_held_outside_the_group_does_not_hold_back_the_exit() {
+    let (registry, _workdir) = registry(&["sh"]);
+    let access = ctx(&registry, "probe", GateRoute::Ungated);
+    let mut table = ResourceTable::new();
+    let mut view = ProcessView {
+        access: &access,
+        table: &mut table,
+    };
+    // The leader prints the holder's pid only once the holder runs `sleep`, past its setsid, so
+    // the group kill at the leader's exit cannot reach it.
+    let started_at = Instant::now();
+    let started = view
+        .start(start_request(
+            "held",
+            "sh",
+            &[
+                "-c",
+                "setsid sleep 60 & h=$!; \
+                 until read c < /proc/$h/comm && [ \"$c\" = sleep ]; do :; done; \
+                 echo \"holder $h\"",
+            ],
+        ))
+        .await
+        .unwrap();
+    let handle = started.handle;
+    let code = exit_code_within(
+        &mut view,
+        &handle,
+        OUTPUT_DRAIN_LIMIT + Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        code,
+        Some(0),
+        "not exited {:?} after the start",
+        started_at.elapsed()
+    );
+    let first = view.read(handle.clone(), 4096).await.unwrap();
+    let printed = String::from_utf8_lossy(&first.stdout).into_owned();
+    let holder: i32 = printed
+        .strip_prefix("holder ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("printed {printed:?}"));
+    // The holder ran `setsid`, so it leads a group of its own; this kills it however the test ends.
+    let guard = KillGroupOnDrop(holder, Arc::default());
+    assert!(
+        !first.stdout_ended,
+        "stdout ended while pid {holder} holds it"
+    );
+
+    drop(guard);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ended = loop {
+        let output = view.read(handle.clone(), 4096).await.unwrap();
+        assert!(output.stdout.is_empty(), "{output:?}");
+        if output.stdout_ended || Instant::now() >= deadline {
+            break output.stdout_ended;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(ended, "stdout not ended 5 s after its holder was killed");
+    for _ in 0..3 {
+        let later = view.read(handle.clone(), 4096).await.unwrap();
+        assert!(later.stdout.is_empty() && later.stdout_ended, "{later:?}");
+    }
+    registry.end_session().await;
+}
+
+#[test]
 fn stat_pgrp_reads_past_a_command_name_with_spaces_and_parentheses() {
     assert_eq!(stat_pgrp("42 (a (b) c) S 1 4242 4242 0"), Some(4242));
 }
@@ -554,17 +834,7 @@ async fn a_program_that_exits_takes_what_it_forked_with_it() {
         view.status(started.handle.clone()).await,
         Ok(wit::State::Exited(0))
     ));
-    // The pump that moves the leader's pipe into its output ring runs on a thread of its own, so
-    // a read straight after the exit can come before its first chunk. Read until the line the
-    // program printed has arrived.
-    let printed_by = Instant::now() + Duration::from_secs(5);
-    let output = loop {
-        let output = view.read(started.handle.clone(), 4096).await.unwrap();
-        if !output.stdout.is_empty() || Instant::now() >= printed_by {
-            break output;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let output = view.read(started.handle.clone(), 4096).await.unwrap();
     let forked = printed_pid(&output.stdout);
     assert!(
         dies(forked).await,

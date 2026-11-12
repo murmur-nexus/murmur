@@ -25,7 +25,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),
-    ("murmur:process", "0.1.0"),
+    ("murmur:process", "0.2.0"),
     ("murmur:runtime", "0.4.0"),
     ("murmur:runtime-guest", "0.1.0"),
     ("murmur:shell", "0.1.0"),
@@ -151,8 +151,44 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_6() {
-        assert_eq!(served_wit_level().level, 6);
+    fn wit_levels_served_level_is_level_7() {
+        assert_eq!(served_wit_level().level, 7);
+    }
+
+    /// Level 7 moved `murmur:process` alone, for `output`'s end-of-stream fields, so a level-6
+    /// tool that imports `murmur:process/process@0.1.0` does not fit level 7, and an artifact
+    /// whose interfaces name no `murmur:process` package fits both levels unchanged.
+    #[test]
+    fn wit_levels_level_7_moves_only_the_process_package() {
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
+        let levels = wit_levels();
+        let (six, seven) = (&levels[5], &levels[6]);
+        assert_eq!(six.packages.len(), seven.packages.len());
+        let moved: Vec<_> = six
+            .packages
+            .iter()
+            .zip(&seven.packages)
+            .filter(|(before, after)| before != after)
+            .collect();
+        let process = |version: &str| ("murmur:process".to_string(), version.to_string());
+        assert_eq!(moved, [(&process("0.1.0"), &process("0.2.0"))]);
+
+        let contracts = |imports: &[&str]| WitContracts {
+            exports: vec!["murmur:tool/run@0.2.0".to_string()],
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
+        };
+        let process_tool =
+            |version: &str| contracts(&[&format!("murmur:process/process@{version}")]);
+        assert!(fits(process_tool("0.1.0"), six));
+        assert!(!fits(process_tool("0.1.0"), seven));
+        assert!(fits(process_tool("0.2.0"), seven));
+        assert!(!fits(process_tool("0.2.0"), six));
+        let tool = || contracts(&["murmur:stream/events@0.1.0", "murmur:task/task@0.1.0"]);
+        assert!(fits(tool(), six));
+        assert!(fits(tool(), seven));
     }
 
     /// Level 6 moved `murmur:driver` alone, for the harness's declared needs, so an artifact
