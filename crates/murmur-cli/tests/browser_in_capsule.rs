@@ -11,8 +11,11 @@ mod common;
 
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Output,
+    process::{Child, ExitStatus, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use assert_cmd::Command;
@@ -27,6 +30,20 @@ const MARKER: &str = "murmur-chrome-marker";
 
 /// What Chrome prints when its GPU process dies at start.
 const GPU_EXITED: &str = "GPU process exited unexpectedly";
+
+/// How long the whole test may run: the fixture and every tier's `mur run`. Below the 300 s kill
+/// of nextest's `ci` profile (`.config/nextest.toml`), so a run that overruns is reported by the
+/// test, with the phase it stood in, and not by a `TMT` that prints nothing.
+const TEST_BUDGET: Duration = Duration::from_secs(270);
+
+/// How long one `mur run` may take, within what is left of [`TEST_BUDGET`].
+const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+/// How long a `mur run` past its deadline has to end its session on `SIGTERM` before `SIGKILL`.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a running `mur run` is checked for its exit, its pipes' end and its deadline.
+const POLL: Duration = Duration::from_millis(50);
 
 /// The flags Playwright starts Chrome with that bear on containment, and `--dump-dom`, which
 /// prints the loaded page and exits.
@@ -103,10 +120,13 @@ struct Fixture {
     project: PathBuf,
     /// `PATH` for `mur`: the browser's folder first, so `shell.allow` names it.
     path: std::ffi::OsString,
+    /// When [`TEST_BUDGET`] runs out.
+    deadline: Instant,
 }
 
 impl Fixture {
     fn new(chrome: &Path) -> Self {
+        let deadline = Instant::now() + TEST_BUDGET;
         let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let base = root.path().canonicalize().unwrap();
         let home = base.join("home");
@@ -124,6 +144,7 @@ impl Fixture {
             home,
             project,
             path: std::env::join_paths(dirs).unwrap(),
+            deadline,
         };
         let driver = common::create_driver_artifact(
             &artifacts,
@@ -135,6 +156,7 @@ impl Fixture {
         fixture
             .mur()
             .args(["install", driver.to_str().unwrap(), "--no-precompile"])
+            .timeout(deadline.saturating_duration_since(Instant::now()))
             .assert()
             .success();
         fixture
@@ -168,50 +190,371 @@ impl Fixture {
     }
 
     /// One `mur run` of a capsule at `containment` with `capabilities` lines, in `workdir`, the
-    /// model making each call in order.
-    fn run(&self, containment: &str, capabilities: &str, workdir: &Path, calls: Vec<Call>) -> Run {
+    /// model making each call in order. `marked` is the label of the command that writes
+    /// `<marked>.started` and `<marked>.ended` in `workdir` (see [`chrome_command`]).
+    ///
+    /// A run still going at its deadline is stopped and the test fails with a [`Phase`] report.
+    fn run(
+        &self,
+        containment: &str,
+        capabilities: &str,
+        workdir: &Path,
+        calls: Vec<Call>,
+        marked: &str,
+    ) -> Run {
         let total = calls.len() + 1;
+        let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::default();
         let mut next = 0usize;
-        let server = common::ScriptedServer::start_answering(total, move |_| {
-            let index = next;
-            next += 1;
-            match calls.get(index) {
-                Some(call) => common::tool_use_response(call.id, call.tool, call.input.clone()),
-                None => end_turn(),
+        let server = common::ScriptedServer::start_answering(total, {
+            let arrivals = Arc::clone(&arrivals);
+            move |_| {
+                // Before answering: the server records a request only once it is answered.
+                arrivals.lock().unwrap().push(Instant::now());
+                let index = next;
+                next += 1;
+                match calls.get(index) {
+                    Some(call) => common::tool_use_response(call.id, call.tool, call.input.clone()),
+                    None => end_turn(),
+                }
             }
         });
         let manifest = self.write_manifest(&server.endpoint, containment, capabilities);
-        let output = self
-            .mur()
+        let started = Instant::now();
+        let started_wall = SystemTime::now();
+        let deadline = (started + RUN_LIMIT).min(self.deadline);
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+            .env("HOME", &self.home)
+            .env("PATH", &self.path)
+            .current_dir(&self.project)
             .args(["run", "--manifest", manifest.to_str().unwrap()])
             .args(["--workdir", workdir.to_str().unwrap()])
             .args(["--task", "Run each call once.", "--verbose"])
-            .write_stdin("")
-            .timeout(std::time::Duration::from_secs(300))
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
-        assert!(
-            output.status.success() && stdout(&output).contains("status:  ok"),
-            "the run must finish ok\nstdout: {}\nstderr: {}",
-            stdout(&output),
-            stderr(&output)
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stdout = Captured::read(child.stdout.take().unwrap(), done_tx.clone());
+        let stderr = Captured::read(child.stderr.take().unwrap(), done_tx);
+        let mut exited = false;
+        let mut pipes_open = 2;
+        while !exited || pipes_open > 0 {
+            if Instant::now() >= deadline {
+                let timeline = Timeline::read(
+                    started,
+                    started_wall,
+                    &arrivals.lock().unwrap(),
+                    workdir,
+                    marked,
+                    exited,
+                );
+                let processes = process_report(child.id());
+                // A reaped child's pid may already name another process.
+                if !exited {
+                    stop(&mut child);
+                }
+                panic!(
+                    "{containment}: `mur run` still going after {:.1} s\nphase: {}\n{}\n\
+                     {marked}.err: {}\n{marked}.out: {}\nmur stderr, through its SIGTERM:\n{}\n\
+                     mur stdout, through its SIGTERM:\n{}\nprocesses under mur (pid {}), before \
+                     the SIGTERM:\n{processes}",
+                    started.elapsed().as_secs_f64(),
+                    timeline.phase().name(),
+                    timeline.describe(),
+                    file_or_absent(&workdir.join(format!("{marked}.err"))),
+                    file_or_absent(&workdir.join(format!("{marked}.out"))),
+                    stderr.text(),
+                    stdout.text(),
+                    child.id(),
+                );
+            }
+            if !exited {
+                exited = child.try_wait().unwrap().is_some();
+            }
+            match done_rx.recv_timeout(POLL) {
+                Ok(()) => pipes_open -= 1,
+                // Both readers are done; only the exit is left to poll for.
+                Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(POLL),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        // Returns the status `try_wait` reaped.
+        let status = child.wait().unwrap();
+        let timeline = Timeline::read(
+            started,
+            started_wall,
+            &arrivals.lock().unwrap(),
+            workdir,
+            marked,
+            true,
         );
-        Run {
-            output,
+        let run = Run {
+            status,
+            stdout: stdout.text(),
+            stderr: stderr.text(),
             requests: server.requests(),
+        };
+        eprintln!(
+            "{containment}: `mur run` took {:.2} s\n{}",
+            started.elapsed().as_secs_f64(),
+            timeline.describe()
+        );
+        assert!(
+            run.status.success() && run.stdout.contains("status:  ok"),
+            "the run must finish ok\nstdout: {}\nstderr: {}",
+            run.stdout,
+            run.stderr
+        );
+        run
+    }
+}
+
+/// Everything a child writes to one of its pipes, read on a thread so it can be shown before the
+/// child ends.
+#[derive(Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    /// Reads `pipe` to its end, then sends on `done`.
+    fn read(mut pipe: impl Read + Send + 'static, done: mpsc::Sender<()>) -> Self {
+        let captured = Self::default();
+        let buffer = Arc::clone(&captured.0);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(read @ 1..) = pipe.read(&mut chunk) {
+                buffer.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+            let _ = done.send(());
+        });
+        captured
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// `SIGTERM`, on which `mur` ends its session and the processes in it, then `SIGKILL` if it is
+/// still running after [`TERM_GRACE`].
+fn stop(child: &mut Child) {
+    // Only an unreaped child: its pid cannot yet name another process.
+    common::signal(child.id(), libc::SIGTERM);
+    let grace = Instant::now() + TERM_GRACE;
+    while Instant::now() < grace {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Where a `mur run` that has not finished stands, from the model requests that arrived and the
+/// marked command's marks.
+enum Phase {
+    Launch,
+    Dispatch,
+    Chrome,
+    AfterChrome,
+    Teardown,
+    PipesHeld,
+}
+
+impl Phase {
+    fn name(&self) -> &'static str {
+        match self {
+            Phase::Launch => "capsule launch: no model request yet",
+            Phase::Dispatch => {
+                "tool dispatch: first model request answered, Chrome command not started"
+            }
+            Phase::Chrome => "Chrome running: Chrome command started, no end mark",
+            Phase::AfterChrome => {
+                "runtime after Chrome exited: end mark written, no second model request"
+            }
+            Phase::Teardown => "teardown: second model request answered, mur still running",
+            Phase::PipesHeld => "after mur exited: its stdout or stderr is still held open",
         }
     }
 }
 
+/// The moments a `mur run` passed, in seconds since it started.
+struct Timeline {
+    arrivals: Vec<f64>,
+    started_mark: Option<f64>,
+    ended_mark: Option<f64>,
+    exited: bool,
+    elapsed: f64,
+}
+
+impl Timeline {
+    fn read(
+        started: Instant,
+        started_wall: SystemTime,
+        arrivals: &[Instant],
+        workdir: &Path,
+        marked: &str,
+        exited: bool,
+    ) -> Self {
+        let run_epoch = started_wall
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        // `$EPOCHREALTIME` is seconds since the epoch with a fractional part.
+        let mark = |suffix: &str| {
+            fs::read_to_string(workdir.join(format!("{marked}.{suffix}")))
+                .ok()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .map(|epoch| epoch - run_epoch)
+        };
+        Self {
+            arrivals: arrivals
+                .iter()
+                .map(|at| at.duration_since(started).as_secs_f64())
+                .collect(),
+            started_mark: mark("started"),
+            ended_mark: mark("ended"),
+            exited,
+            elapsed: started.elapsed().as_secs_f64(),
+        }
+    }
+
+    fn phase(&self) -> Phase {
+        match (
+            self.arrivals.len(),
+            self.started_mark,
+            self.ended_mark,
+            self.exited,
+        ) {
+            (_, _, _, true) => Phase::PipesHeld,
+            (0, _, _, _) => Phase::Launch,
+            (1, None, _, _) => Phase::Dispatch,
+            (1, Some(_), None, _) => Phase::Chrome,
+            (1, Some(_), Some(_), _) => Phase::AfterChrome,
+            _ => Phase::Teardown,
+        }
+    }
+
+    /// The arrival count and each phase's time; the last one reached runs to now.
+    fn describe(&self) -> String {
+        let at = |moment: Option<f64>| moment.map_or("-".to_string(), |s| format!("{s:.2} s"));
+        let span = |from: Option<f64>, to: Option<f64>| match (from, to) {
+            (Some(from), Some(to)) => format!("{:.2} s", to - from),
+            (Some(from), None) => format!("{:.2} s, not ended", self.elapsed - from),
+            _ => "-".to_string(),
+        };
+        let first = self.arrivals.first().copied();
+        let second = self.arrivals.get(1).copied();
+        let end = (self.exited).then_some(self.elapsed);
+        format!(
+            "model requests arrived: {} at {:?}\nmarks: started {} ended {}\nphases: launch {} | \
+             dispatch {} | Chrome {} | after Chrome {} | teardown {}",
+            self.arrivals.len(),
+            self.arrivals
+                .iter()
+                .map(|s| format!("{s:.2}"))
+                .collect::<Vec<_>>(),
+            at(self.started_mark),
+            at(self.ended_mark),
+            span(Some(0.0), first),
+            span(first, self.started_mark),
+            span(self.started_mark, self.ended_mark),
+            span(self.ended_mark, second),
+            span(second, end),
+        )
+    }
+}
+
+fn file_or_absent(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|error| format!("<absent: {error}>"))
+}
+
+/// The processes descended from `root`, one per line with its state and command line, each
+/// thread's state, wait channel and current system call, and the limits of any Chrome process.
+/// `stat`, `cmdline` and `limits` are readable for a non-dumpable process too; `wchan` and
+/// `syscall` are not, and read as `0` or an error there.
+fn process_report(root: u32) -> String {
+    let mut parents = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some((_, _, ppid)) = proc_stat(&format!("/proc/{pid}/stat")) {
+            parents.push((pid, ppid));
+        }
+    }
+    let mut report = String::new();
+    let mut stack = vec![(root, 0usize)];
+    while let Some((pid, depth)) = stack.pop() {
+        let (comm, state, _) = proc_stat(&format!("/proc/{pid}/stat")).unwrap_or_default();
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+            .unwrap_or_default();
+        let indent = "  ".repeat(depth);
+        report.push_str(&format!(
+            "{indent}{pid} {state} ({comm}) {}\n",
+            cmdline.trim()
+        ));
+        for task in fs::read_dir(format!("/proc/{pid}/task"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let tid = task.file_name().to_string_lossy().into_owned();
+            let (comm, state, _) =
+                proc_stat(&format!("/proc/{pid}/task/{tid}/stat")).unwrap_or_default();
+            let read = |file: &str| {
+                fs::read_to_string(format!("/proc/{pid}/task/{tid}/{file}"))
+                    .map(|text| text.trim().to_string())
+                    .unwrap_or_else(|error| format!("<{error}>"))
+            };
+            report.push_str(&format!(
+                "{indent}    task {tid} {state} ({comm}) wchan={} syscall={}\n",
+                read("wchan"),
+                read("syscall"),
+            ));
+        }
+        if cmdline.contains("chrome") || comm.contains("chrome") {
+            report.push_str(&format!(
+                "{indent}    limits:\n{}",
+                file_or_absent(Path::new(&format!("/proc/{pid}/limits")))
+            ));
+        }
+        for &(child, _) in parents.iter().filter(|(_, ppid)| *ppid == pid) {
+            stack.push((child, depth + 1));
+        }
+    }
+    report
+}
+
+/// `comm`, state and parent pid from a `/proc/<pid>/stat` file.
+fn proc_stat(path: &str) -> Option<(String, String, u32)> {
+    let text = fs::read_to_string(path).ok()?;
+    // `comm` is in parentheses and may hold spaces and parentheses itself.
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    let mut rest = text[close + 1..].split_whitespace();
+    let state = rest.next()?.to_string();
+    let ppid = rest.next()?.parse().ok()?;
+    Some((text[open + 1..close].to_string(), state, ppid))
+}
+
 struct Run {
-    output: Output,
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
     requests: Vec<Value>,
 }
 
 impl Run {
     fn result_text(&self, id: &str) -> String {
         common::tool_result_text(&self.requests, id)
-            .unwrap_or_else(|| panic!("no tool result for {id}; stderr: {}", stderr(&self.output)))
+            .unwrap_or_else(|| panic!("no tool result for {id}; stderr: {}", self.stderr))
     }
 }
 
@@ -227,14 +570,6 @@ fn end_turn() -> String {
         "usage": {"input_tokens": 1, "output_tokens": 1},
     })
     .to_string()
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// The system library folder. Chrome loads its NSS modules from it with `dlopen`, so they are
@@ -295,11 +630,15 @@ fn workdir_with_page(fixture: &Fixture, label: &str) -> PathBuf {
 }
 
 /// The `bash` command that starts `chrome` on the work folder's page, its output in
-/// `<label>.out` and `<label>.err` in the work folder.
+/// `<label>.out` and `<label>.err` in the work folder. It writes `$EPOCHREALTIME` to
+/// `<label>.started` before Chrome and to `<label>.ended` after it, with builtins only: a
+/// capsule's commands exec nothing outside `shell.allow`.
 fn chrome_command(chrome: &Path, workdir: &Path, label: &str) -> String {
     let name = chrome.file_name().unwrap().to_str().unwrap();
     format!(
-        "{name} {} file://{}/page.html >{label}.out 2>{label}.err; echo chrome-exit=$?",
+        "printf '%s\\n' \"$EPOCHREALTIME\" >{label}.started; {name} {} file://{}/page.html \
+         >{label}.out 2>{label}.err; status=$?; printf '%s\\n' \"$EPOCHREALTIME\" >{label}.ended; \
+         echo chrome-exit=$status",
         CHROME_FLAGS.join(" "),
         workdir.display()
     )
@@ -331,6 +670,7 @@ fn chrome_from_a_shell_command_loads_a_page_in_a_capsule() {
                 tool: "bash",
                 input: json!({"command": chrome_command(&chrome, &workdir, "chrome")}),
             }],
+            "chrome",
         );
         let result = run.result_text("chrome");
         let out = fs::read_to_string(workdir.join("chrome.out")).unwrap_or_default();
@@ -347,5 +687,51 @@ fn chrome_from_a_shell_command_loads_a_page_in_a_capsule() {
             !err.contains(GPU_EXITED),
             "{tier}: the GPU process must stay up\nstderr: {err}"
         );
+    }
+}
+
+/// A hung run's report names the phase its arrivals, marks and exit place it in.
+#[test]
+fn the_phase_report_names_each_phase() {
+    let timeline =
+        |arrivals: &[f64], started: Option<f64>, ended: Option<f64>, exited: bool| Timeline {
+            arrivals: arrivals.to_vec(),
+            started_mark: started,
+            ended_mark: ended,
+            exited,
+            elapsed: 10.0,
+        };
+    let cases = [
+        (
+            timeline(&[], None, None, false),
+            "capsule launch: no model request yet",
+        ),
+        (
+            timeline(&[1.0], None, None, false),
+            "tool dispatch: first model request answered, Chrome command not started",
+        ),
+        (
+            timeline(&[1.0], Some(2.0), None, false),
+            "Chrome running: Chrome command started, no end mark",
+        ),
+        (
+            timeline(&[1.0], Some(2.0), Some(4.0), false),
+            "runtime after Chrome exited: end mark written, no second model request",
+        ),
+        (
+            timeline(&[1.0, 5.0], Some(2.0), Some(4.0), false),
+            "teardown: second model request answered, mur still running",
+        ),
+        (
+            timeline(&[1.0, 5.0], Some(2.0), Some(4.0), true),
+            "after mur exited: its stdout or stderr is still held open",
+        ),
+        (
+            timeline(&[], None, None, true),
+            "after mur exited: its stdout or stderr is still held open",
+        ),
+    ];
+    for (timeline, expected) in cases {
+        assert_eq!(timeline.phase().name(), expected, "{}", timeline.describe());
     }
 }
