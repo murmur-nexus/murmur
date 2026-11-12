@@ -312,7 +312,7 @@ impl Fixture {
 
 /// Everything a child writes to one of its pipes, read on a thread so it can be shown before the
 /// child ends.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Captured {
@@ -338,10 +338,8 @@ impl Captured {
 /// `SIGTERM`, on which `mur` ends its session and the processes in it, then `SIGKILL` if it is
 /// still running after [`TERM_GRACE`].
 fn stop(child: &mut Child) {
-    let pid = libc::pid_t::try_from(child.id()).unwrap();
-    // SAFETY: `kill` takes no pointers; `pid` is this test's own unreaped child, so it names no
-    // other process.
-    unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Only an unreaped child: its pid cannot yet name another process.
+    common::signal(child.id(), libc::SIGTERM);
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
         if child.try_wait().unwrap().is_some() {
@@ -355,7 +353,6 @@ fn stop(child: &mut Child) {
 
 /// Where a `mur run` that has not finished stands, from the model requests that arrived and the
 /// marked command's marks.
-#[derive(Debug, PartialEq)]
 enum Phase {
     Launch,
     Dispatch,
