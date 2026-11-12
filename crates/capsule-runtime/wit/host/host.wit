@@ -10,5 +10,5 @@ world runtime-host {
 /// The interfaces the runtime provides to a WASM tool's own store, beyond the ones registered by
 /// hand in `invoke_tool_component`.
 world tool-host {
-  import murmur:process/process@0.1.0;
+  import murmur:process/process@0.2.0;
 }

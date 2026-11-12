@@ -17,7 +17,7 @@ Current versions:
 | `murmur:artifact-manager`| `0.1.0`  |
 | `murmur:shell`           | `0.1.0`  |
 | `murmur:message`         | `0.1.0`  |
-| `murmur:process`         | `0.1.0`  |
+| `murmur:process`         | `0.2.0`  |
 | `murmur:task`            | `0.1.0`  |
 | `murmur:task-io`         | `0.1.0`  |
 | `murmur:conversation`    | `0.2.0`  |
@@ -488,6 +488,31 @@ Code's needs. One `@0.5.0` component stays committed under
 with its own frozen `.wit`, so that refusal stays testable. No other package
 moved, so an artifact whose interfaces are all outside `murmur:driver` fits
 level 6 exactly when it fits level 5.
+
+`murmur:process` then went to `0.2.0`, WIT level 7, so a tool can tell that a
+session process's output is finished. `output` gained two last fields,
+`stdout-ended` and `stderr-ended`, each true once its stream reached end-of-file
+and every byte of it has been read. A field appended to a record is breaking
+under the rule below, so the minor moved. Its instance name is now
+`murmur:process/process@0.2.0`. The same change made `exited` mean the output is
+complete: the runtime finishes draining a session process's stdout and stderr
+before it reports the exit, waiting at most 2 seconds for a stream a program
+that left the process group still holds open. That guarantee needed no WIT
+change; it is stated in the doc comments on `state`, `status` and `read`, which
+moved with the package. The `tool` world in `murmur:runtime-guest` and the
+`tool-host` world in `murmur:host` are world-only packages whose version is part
+of no instance name, so both stay `0.1.0`, as they did when `murmur:process` was
+added.
+
+The cost was paid knowingly. Every tool that imports
+`murmur:process/process@0.1.0` is refused at staging with `E-WIT-LEVEL-001` the
+moment `mur` upgrades: it does not fit WIT level 7, and level 7 has
+`murmur:process@0.2.0`. That includes default-artifacts 0.38.0's `tool-git`,
+`tool-browser` and `tool-computer`, until default-artifacts publishes builds
+against `0.2.0`. One `@0.1.0` component stays committed under
+`crates/murmur-cli/tests/fixtures/process-probe-v1/`, so the refusal stays
+testable. No other package moved, so an artifact whose interfaces are all
+outside `murmur:process` fits level 7 exactly when it fits level 6.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

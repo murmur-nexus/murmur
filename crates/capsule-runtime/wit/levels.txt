@@ -109,3 +109,20 @@
 6 murmur:task-io@0.1.0
 6 murmur:tool@0.2.0
 6 murmur:tool-registry@0.2.0
+
+7 murmur:artifact-manager@0.1.0
+7 murmur:capsule@0.1.0
+7 murmur:conversation@0.2.0
+7 murmur:driver@0.6.0
+7 murmur:hook@0.9.0
+7 murmur:host@0.1.0
+7 murmur:message@0.1.0
+7 murmur:process@0.2.0
+7 murmur:runtime@0.4.0
+7 murmur:runtime-guest@0.1.0
+7 murmur:shell@0.1.0
+7 murmur:stream@0.1.0
+7 murmur:task@0.1.0
+7 murmur:task-io@0.1.0
+7 murmur:tool@0.2.0
+7 murmur:tool-registry@0.2.0

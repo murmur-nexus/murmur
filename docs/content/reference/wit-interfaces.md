@@ -448,7 +448,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-edit@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 6, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 6` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 7, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 7` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-edit@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
@@ -593,9 +593,9 @@ The interface is served to an agent capsule's tool calls, on `transport: http` a
 | `run(request)` | Runs `program` with `args`, `env` and optional `stdin` bytes (then end-of-file) and returns its exit code and output. The time limit is `timeout-ms`, clamped to what is left of the tool call's [`deadline_seconds`](manifest.md); past it the process group is killed (`SIGKILL`), and the output so far returns with `timed-out` set and exit code `137`. A non-zero exit is data, not an error. Whatever it leaves running in its process group is killed when it exits, so nothing it starts outlives the tool call |
 | `start(request)` | Starts `program` under `name` and returns its handle. A name already running for this tool returns that handle with `already-running` set, before anything is checked or asked: nothing new runs. A name whose process has exited starts a new one |
 | `find(name)` | This tool's latest handle under `name`, running or exited; `none` if it started none |
-| `status(handle)` | `running` or `exited(code)` |
+| `status(handle)` | `running` or `exited(code)`. `exited` is reported once everything the process wrote to stdout and stderr is buffered for `read`, so a `read` after it gets all of it; see [Output after the exit](#process-output-after-exit) for the one exception |
 | `write(handle, bytes)` | Writes all of `bytes` to the process's stdin. `timed-out` at the tool call's deadline, `not-running` once it has exited |
-| `read(handle, max-bytes)` | Up to `max-bytes` of each stream printed since the last read, oldest first; the rest stays buffered. `stdout-dropped` and `stderr-dropped` count bytes pushed out since the last read |
+| `read(handle, max-bytes)` | Up to `max-bytes` of each stream printed since the last read, oldest first; the rest stays buffered. Returns at once, with an empty list for a stream that printed nothing new. `stdout-dropped` and `stderr-dropped` count bytes pushed out since the last read. `stdout-ended` and `stderr-ended` are true once that stream has reached end-of-file and every byte of it has been read, by this read or an earlier one; every later read returns nothing more for it. To get all of a process's output, read until both are true |
 | `stop(handle)` | Sends `SIGTERM` to the process group, `SIGKILL` 2 seconds later, waits up to 3 seconds more, and returns the final state |
 | `connect(handle, port)` | Opens a TCP connection to `port` at loopback, inside the session's network namespace. The `connection` resource's `read` and `write` exchange bytes with it until the tool call returns |
 
@@ -611,6 +611,17 @@ process: any other tool gets `unknown-handle`, and its `find` of the same name r
 When a session process's program exits, whatever it left running in its process group is
 killed, so an exited process holds nothing running. Every session process is killed with its
 process group when the session ends.
+
+### Output after the exit { #process-output-after-exit }
+
+A running process's streams end only if the program closes them. Once the program exits and its
+process group is killed, `status` and `stop` report `exited` only after both streams have
+reached end-of-file, so the output is complete at that moment:
+
+| Case | When `exited` is reported | `stdout-ended` / `stderr-ended` |
+|---|---|---|
+| Nothing outside the process group holds the stream | Once both streams reach end-of-file | True on the read that takes each stream's last byte |
+| A program that left the process group (with `setsid`, for example) still holds the stream open | At most 2 seconds after the program exits | That stream's stays false, and it keeps delivering what the holder writes, until the holder closes it |
 
 `connect` reaches a port only while a process in the handle's process group holds a socket
 listening on it at a loopback or wildcard address, as that process's own network namespace

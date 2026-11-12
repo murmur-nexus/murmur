@@ -1,4 +1,4 @@
-package murmur:process@0.1.0;
+package murmur:process@0.2.0;
 
 /// Programs a WASM tool runs, under exactly the rules a shell command obeys.
 ///
@@ -96,12 +96,20 @@ interface process {
   /// The handle of this tool's latest process under `name`, running or exited.
   find: func(name: string) -> option<handle>;
 
+  /// A session process's state. `exited` is reported only once every byte the process wrote to
+  /// stdout and stderr is buffered for `read`, with one exception: a stream that a program which
+  /// left the process group (with `setsid`, for example) still holds open is waited for at most
+  /// 2 seconds, after which the exit is reported and that stream's `-ended` field in `output`
+  /// stays false until the holder closes it.
   variant state {
     running,
     /// The exit code; a death by signal `n` is `128 + n`.
     exited(s32),
   }
 
+  /// The process's state. Once this returns `exited`, reading until `stdout-ended` and
+  /// `stderr-ended` are both true returns every byte the process wrote, except for a stream held
+  /// open outside the process group, as `state` describes.
   status: func(handle: handle) -> result<state, process-error>;
 
   /// Write all of `bytes` to the process's stdin. `timed-out` at the tool call's deadline,
@@ -115,10 +123,18 @@ interface process {
     stdout-dropped: u64,
     /// Stderr bytes discarded since the last read because more than 1 MiB was waiting.
     stderr-dropped: u64,
+    /// Stdout has reached end-of-file and every byte of it has been read, by this read or an
+    /// earlier one: every later read returns no stdout.
+    stdout-ended: bool,
+    /// The same for stderr.
+    stderr-ended: bool,
   }
 
   /// Up to `max-bytes` of each stream printed since the last read, oldest first; the rest stays
-  /// buffered. Each stream keeps its newest 1 MiB.
+  /// buffered. Each stream keeps its newest 1 MiB. Never waits: a stream with nothing new returns
+  /// an empty list. A tool that wants all of a process's output reads until `stdout-ended` and
+  /// `stderr-ended` are both true; a running process's streams end only if the program closes
+  /// them.
   read: func(handle: handle, max-bytes: u32) -> result<output, process-error>;
 
   /// Send `SIGTERM` to the process group, `SIGKILL` 2 seconds later, and return the final state.
