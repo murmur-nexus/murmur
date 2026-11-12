@@ -689,3 +689,49 @@ fn chrome_from_a_shell_command_loads_a_page_in_a_capsule() {
         );
     }
 }
+
+/// A hung run's report names the phase its arrivals, marks and exit place it in.
+#[test]
+fn the_phase_report_names_each_phase() {
+    let timeline =
+        |arrivals: &[f64], started: Option<f64>, ended: Option<f64>, exited: bool| Timeline {
+            arrivals: arrivals.to_vec(),
+            started_mark: started,
+            ended_mark: ended,
+            exited,
+            elapsed: 10.0,
+        };
+    let cases = [
+        (
+            timeline(&[], None, None, false),
+            "capsule launch: no model request yet",
+        ),
+        (
+            timeline(&[1.0], None, None, false),
+            "tool dispatch: first model request answered, Chrome command not started",
+        ),
+        (
+            timeline(&[1.0], Some(2.0), None, false),
+            "Chrome running: Chrome command started, no end mark",
+        ),
+        (
+            timeline(&[1.0], Some(2.0), Some(4.0), false),
+            "runtime after Chrome exited: end mark written, no second model request",
+        ),
+        (
+            timeline(&[1.0, 5.0], Some(2.0), Some(4.0), false),
+            "teardown: second model request answered, mur still running",
+        ),
+        (
+            timeline(&[1.0, 5.0], Some(2.0), Some(4.0), true),
+            "after mur exited: its stdout or stderr is still held open",
+        ),
+        (
+            timeline(&[], None, None, true),
+            "after mur exited: its stdout or stderr is still held open",
+        ),
+    ];
+    for (timeline, expected) in cases {
+        assert_eq!(timeline.phase().name(), expected, "{}", timeline.describe());
+    }
+}
