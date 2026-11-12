@@ -25,8 +25,9 @@ fn fixture_path(relative: &str) -> PathBuf {
     common::fixture_path(relative)
 }
 
-fn end_turn_server(text: &str) -> common::ScriptedServer {
-    common::ScriptedServer::start(vec![serde_json::json!({
+/// A provider reply that ends the turn with `text`.
+fn end_turn_body(text: &str) -> String {
+    serde_json::json!({
         "id": "msg_1",
         "type": "message",
         "role": "assistant",
@@ -35,7 +36,43 @@ fn end_turn_server(text: &str) -> common::ScriptedServer {
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 1, "output_tokens": 1}
     })
-    .to_string()])
+    .to_string()
+}
+
+/// How long a held-door test waits for the launch to announce its URL, and then for its model
+/// request. A guard against a hang only: a loaded host takes tens of seconds for each.
+const HELD_LAUNCH_LIMIT: Duration = Duration::from_secs(120);
+
+/// Launches `staged` on a thread and returns its door's URL once the session's model request has
+/// arrived at the provider `arrived` belongs to. That request is held, so the launch task is
+/// running and the door stays up until the provider answers.
+///
+/// A launch that ends without announcing a URL is joined, so its own panic is the test's.
+fn launch_with_request_held(
+    staged: capsule_runtime::StagedSession,
+    arrived: &std::sync::mpsc::Receiver<()>,
+) -> (String, thread::JoinHandle<capsule_runtime::LaunchResult>) {
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+    let capsule_url = match url_rx.recv_timeout(HELD_LAUNCH_LIMIT) {
+        Ok(url) => url,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(_) => panic!("the launch ended without announcing its capsule_url"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("timed out waiting for capsule_url")
+        }
+    };
+    arrived
+        .recv_timeout(HELD_LAUNCH_LIMIT)
+        .expect("the provider never saw the launch task's request");
+    (capsule_url, handle)
 }
 
 /// The `MURMUR.md` a session's runtime directory held when the model's first request arrived:
@@ -50,16 +87,7 @@ impl MurmurMdSnapshot {
     /// An `end_turn` server that takes the snapshot as it answers.
     fn server(&self, text: &str) -> common::ScriptedServer {
         let snapshot = self.clone();
-        let reply = serde_json::json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string();
+        let reply = end_turn_body(text);
         common::ScriptedServer::start_answering(1, move |_| {
             if let Some(dir) = snapshot.runtime_dir.lock().unwrap().as_ref() {
                 *snapshot.content.lock().unwrap() = fs::read_to_string(dir.join("MURMUR.md")).ok();
@@ -288,7 +316,7 @@ fn agent_card_served_at_well_known_path() {
     if common::skip_without_host_support("agent_card_served_at_well_known_path") {
         return;
     }
-    let server = end_turn_server("done");
+    let (server, arrived, release) = common::held_provider(end_turn_body("done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
@@ -296,16 +324,7 @@ fn agent_card_served_at_well_known_path() {
 
     fs::write(staged.accessible_workdir.join("task.md"), "Agent card test").unwrap();
 
-    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
-    let handle = std::thread::spawn(move || {
-        launch_session(staged, move |url| {
-            let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
-    });
-    let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("timed out waiting for capsule_url");
+    let (capsule_url, handle) = launch_with_request_held(staged, &arrived);
 
     let card_json = http_get(&capsule_url, "/.well-known/agent-card.json");
     let card: Value = serde_json::from_str(&card_json).expect("agent card should be valid JSON");
@@ -340,6 +359,7 @@ fn agent_card_served_at_well_known_path() {
     assert_eq!(card["securityRequirements"], serde_json::json!([]));
     assert_eq!(card["capabilities"]["extendedAgentCard"], false);
 
+    release.send(()).unwrap();
     let launched = handle.join().expect("launch thread should not panic");
     assert!(
         launched.records_dir.join("out/result.txt").exists(),
@@ -352,26 +372,18 @@ fn agent_card_returns_404_for_unknown_path() {
     if common::skip_without_host_support("agent_card_returns_404_for_unknown_path") {
         return;
     }
-    let server = end_turn_server("done");
+    let (server, arrived, release) = common::held_provider(end_turn_body("done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
     fs::write(staged.accessible_workdir.join("task.md"), "404 test").unwrap();
 
-    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
-    let handle = std::thread::spawn(move || {
-        launch_session(staged, move |url| {
-            let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
-    });
-    let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("timed out waiting for capsule_url");
+    let (capsule_url, handle) = launch_with_request_held(staged, &arrived);
 
     let status = http_get_status(&capsule_url, "/unknown/path");
     assert_eq!(status, 404, "unknown paths should return 404");
 
+    release.send(()).unwrap();
     handle.join().expect("launch thread should not panic");
 }
 
