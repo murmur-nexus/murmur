@@ -39,9 +39,11 @@ retries = 2
 # Flagged SLOW after each minute, terminated after five. The slowest test,
 # `formation_launch::the_entry_members_end_or_the_launchers_signal_ends_the_formation`, takes under
 # three minutes even with unoptimized dependencies on a loaded host. Keep the limit above
-# `LAUNCH_LIMIT` (murmur-cli/tests/common/formation.rs), so a formation launch that gives up fails
-# with its own message rather than being killed first. A test still running at the limit is hung,
-# and stopping it lets the rest of the suite finish inside the job's timeout.
+# `LAUNCH_LIMIT` (murmur-cli/tests/common/formation.rs) and above `TEST_BUDGET` plus `TERM_GRACE`
+# (murmur-cli/tests/browser_in_capsule.rs), so a formation launch that gives up, or a browser run
+# past its deadline, fails with its own message rather than being killed first. A test still
+# running at the limit is hung, and stopping it lets the rest of the suite finish inside the job's
+# timeout.
 slow-timeout = { period = "60s", terminate-after = 5 }
 failure-output = "immediate-final"
 

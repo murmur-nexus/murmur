@@ -14,6 +14,7 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
     StageRequest,
 };
+use common::door_capsule::end_turn;
 use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -23,20 +24,6 @@ const DRIVER_VERSION: &str = "0.1.4";
 
 fn fixture_path(relative: &str) -> PathBuf {
     common::fixture_path(relative)
-}
-
-/// A provider reply that ends the turn with `text`.
-fn end_turn_body(text: &str) -> String {
-    serde_json::json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()
 }
 
 /// How long a held-door test waits for the launch to announce its URL, and then for its model
@@ -87,7 +74,7 @@ impl MurmurMdSnapshot {
     /// An `end_turn` server that takes the snapshot as it answers.
     fn server(&self, text: &str) -> common::ScriptedServer {
         let snapshot = self.clone();
-        let reply = end_turn_body(text);
+        let reply = end_turn(1, text);
         common::ScriptedServer::start_answering(1, move |_| {
             if let Some(dir) = snapshot.runtime_dir.lock().unwrap().as_ref() {
                 *snapshot.content.lock().unwrap() = fs::read_to_string(dir.join("MURMUR.md")).ok();
@@ -316,7 +303,7 @@ fn agent_card_served_at_well_known_path() {
     if common::skip_without_host_support("agent_card_served_at_well_known_path") {
         return;
     }
-    let (server, arrived, release) = common::held_provider(end_turn_body("done"));
+    let (server, arrived, release) = common::held_provider(end_turn(1, "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
@@ -372,7 +359,7 @@ fn agent_card_returns_404_for_unknown_path() {
     if common::skip_without_host_support("agent_card_returns_404_for_unknown_path") {
         return;
     }
-    let (server, arrived, release) = common::held_provider(end_turn_body("done"));
+    let (server, arrived, release) = common::held_provider(end_turn(1, "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
