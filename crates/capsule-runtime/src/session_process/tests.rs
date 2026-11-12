@@ -562,16 +562,6 @@ async fn stop_returns_exited_with_the_output_drained() {
     registry.end_session().await;
 }
 
-/// SIGKILLs the process group a `setsid` process leads when dropped, so a holder outside every
-/// group the registry kills dies with the test, whatever it asserts.
-struct KillHolderOnDrop(i32);
-
-impl Drop for KillHolderOnDrop {
-    fn drop(&mut self) {
-        crate::formation_launch::signal_group(i64::from(self.0), libc::SIGKILL);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_held_outside_the_group_does_not_hold_back_the_exit() {
     let (registry, _workdir) = registry(&["sh"]);
@@ -617,7 +607,8 @@ async fn a_stream_held_outside_the_group_does_not_hold_back_the_exit() {
         .and_then(|rest| rest.strip_suffix('\n'))
         .and_then(|pid| pid.parse().ok())
         .unwrap_or_else(|| panic!("printed {printed:?}"));
-    let guard = KillHolderOnDrop(holder);
+    // The holder ran `setsid`, so it leads a group of its own; this kills it however the test ends.
+    let guard = KillGroupOnDrop(holder, Arc::default());
     assert!(
         !first.stdout_ended,
         "stdout ended while pid {holder} holds it"

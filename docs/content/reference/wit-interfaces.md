@@ -1372,6 +1372,7 @@ serve it.
 | `murmur:artifact-manager` | `0.1.0` |
 | `murmur:shell` | `0.1.0` |
 | `murmur:message` | `0.1.0` |
+| `murmur:process` | `0.2.0` |
 | `murmur:task` | `0.1.0` |
 | `murmur:task-io` | `0.1.0` |
 | `murmur:conversation` | `0.2.0` |
