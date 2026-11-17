@@ -615,6 +615,13 @@ pub enum RuntimeError {
     )]
     CodeModeWithoutGuestWorkers,
 
+    /// An artifact whose `murmur:*` imports name package `murmur:bus`, at any version, that is not
+    /// the `runtime: tool` artifact `code_mode.repl` names. Renders as `E-CAP-022`.
+    #[error(
+        "artifact '{artifact}' imports murmur:bus but is not the artifact code_mode.repl names"
+    )]
+    BusImportRefused { artifact: String },
+
     /// A guest worker died or stopped answering mid-session: the task in flight failed and the
     /// session ended. The text names the worker kind, its pid, the call and how it exited.
     #[error("{0}")]

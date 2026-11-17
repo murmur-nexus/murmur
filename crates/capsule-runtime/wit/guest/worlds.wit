@@ -12,6 +12,14 @@ world tool {
   export murmur:tool/run@0.2.0;
 }
 
+world code-mode {
+  import murmur:task/task@0.1.0;
+  import murmur:%stream/events@0.1.0;
+  import murmur:process/process@0.2.0;
+  import murmur:bus/bus@0.1.0;
+  export murmur:tool/run@0.2.0;
+}
+
 world driver {
   import murmur:%stream/events@0.1.0;
   export murmur:tool/run@0.2.0;

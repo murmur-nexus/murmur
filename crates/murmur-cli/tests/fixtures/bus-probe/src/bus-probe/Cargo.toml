@@ -1,0 +1,17 @@
+[package]
+name = "bus-probe-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Builds `bus-echo`, a plain `tool`-world component, in place of `bus-repl`.
+plain = []
+
+[dependencies]
+wit-bindgen = "0.46"
+serde_json = "1"
+
+[workspace]

@@ -1,6 +1,11 @@
 [advisories]
 unmaintained = "all"
 yanked = "warn"
+ignore = [
+    # chrono is unmaintained and has no replacement release. Moving to jiff or
+    # time is tracked as its own change; drop this entry when chrono is gone.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no safe upgrade; replacement tracked separately" },
+]
 
 [licenses]
 allow = [

@@ -37,6 +37,7 @@ section that explains it.
 | `E-CAP-019` | A process driver requires a variable `capabilities.env.allow` does not declare | [E-CAP-019](#e-cap-019) |
 | `E-CAP-020` | Two declared artifacts share a tool name, the part of their names after the `/` | [E-CAP-020](#e-cap-020) |
 | `E-CAP-021` | A process driver's harness needs a path or host the capsule manifest does not allow | [E-CAP-021](#e-cap-021) |
+| `E-CAP-022` | An artifact imports `murmur:bus` but is not the `runtime: tool` artifact `code_mode.repl` names | [E-CAP-022](#e-cap-022) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -2268,6 +2269,28 @@ The same code also refuses:
 A path the manifest allows but that is absent on this host is reported `missing` and the launch
 continues. `mur run --explain-scope` prints each need's status and exits `0`; `mur doctor` reports
 a disallowed need here in its `Process harness` block.
+
+### E-CAP-022 — an artifact imports `murmur:bus` that `code_mode.repl` does not name { #e-cap-022 }
+
+[`murmur:bus`](wit-interfaces.md#bus) is linked only into the `runtime: tool` artifact
+[`code_mode.repl`](manifest.md#code-mode) names. Any other artifact whose `murmur:*` imports name
+package `murmur:bus`, at any version, is refused — a tool, a driver, a hook or a script capsule's
+own component:
+
+```text
+error[E-CAP-022]: artifact 'local/bus-repl-copy' imports murmur:bus but is not the artifact code_mode.repl names
+  hint: murmur:bus is linked only into the runtime: tool artifact code_mode.repl names — name this artifact in code_mode.repl, or use a build of it that does not import murmur:bus
+```
+
+| Where | What happens |
+|---|---|
+| `mur run` | Refused at launch, before the session starts |
+| `mur doctor` | A coded error finding on the artifact's row in the Artifacts checklist |
+| A mid-session [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | Refused `not-fetched: [E-CAP-022] artifact '<name>' imports murmur:bus but is not the artifact code_mode.repl names`; nothing is installed |
+
+The artifact `code_mode.repl` names, importing a `murmur:bus` version other than `0.1.0`, is
+refused with [`E-WIT-LEVEL-001`](#e-wit-level-001) instead, as any artifact that does not fit the
+served level.
 
 ## Conversation record errors
 

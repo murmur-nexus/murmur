@@ -3108,6 +3108,35 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
                     );
                     continue;
                 }
+                // `mur run` refuses, while staging, an artifact importing `murmur:bus` that is not
+                // the `runtime: tool` artifact `code_mode.repl` names.
+                let repl = runtime_manifest
+                    .code_mode
+                    .as_ref()
+                    .map(|code_mode| code_mode.repl.as_str())
+                    .filter(|_| matches!(artifact.runtime, ArtifactRuntime::Tool));
+                let bus_refusal = resolved
+                    .meta
+                    .wit_contracts
+                    .clone()
+                    .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
+                    .and_then(|contracts| {
+                        capsule_runtime::refuse_bus_import(name, &contracts.imports, repl).err()
+                    });
+                if let Some(refusal) = bus_refusal {
+                    let message = refusal.to_string();
+                    capsule_runtime::report_println!(
+                        "  \u{2717}  {ref_str:<col_width$}   \u{2014} {message}"
+                    );
+                    findings.coded(
+                        crate::error::E_CAP_022,
+                        DoctorBlock::Artifacts,
+                        Some(ref_str.clone()),
+                        &message,
+                        crate::error::E_CAP_022_HINT,
+                    );
+                    continue;
+                }
                 if let Some(yaml) = packed_yaml {
                     installed_manifests.push((name.clone(), ref_str.clone(), yaml));
                 }

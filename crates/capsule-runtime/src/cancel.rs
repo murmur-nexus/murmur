@@ -195,6 +195,9 @@ pub(crate) struct LiveDelegation {
     /// Whether the child's completion has reached the door. An arrived outcome is delivered at the
     /// task's next wake, or closed from its record if the task ends first.
     pub(crate) arrived: bool,
+    /// The code mode tool call whose program made the delegation through `murmur:bus`, written on
+    /// its terminal `delegation` line. `None` for the model's own delegation.
+    pub(crate) repl_call_id: Option<String>,
 }
 
 impl LiveDelegation {
@@ -212,6 +215,7 @@ impl LiveDelegation {
             started: Instant::now(),
             child: None,
             arrived: false,
+            repl_call_id: None,
         }
     }
 }
@@ -657,6 +661,7 @@ mod tests {
             started: Instant::now(),
             child: None,
             arrived: false,
+            repl_call_id: None,
         }
     }
 

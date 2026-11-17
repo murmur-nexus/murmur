@@ -172,6 +172,18 @@ impl RemoteLink {
         }
     }
 
+    /// A `murmur:bus` function of the code mode instance; `Err` when the supervisor answered none.
+    pub(crate) async fn bus(
+        &self,
+        call: crate::bus::BusCall,
+    ) -> Result<crate::bus::BusReply, String> {
+        match self.host(HostRequest::Bus(call)).await {
+            HostReply::Bus(reply) => Ok(reply),
+            HostReply::Refused(reason) => Err(reason),
+            other => Err(format!("unexpected reply {other:?}")),
+        }
+    }
+
     pub(crate) async fn process(&self, call: ProcessCall) -> ProcessReply {
         match self.host(HostRequest::Process(call)).await {
             HostReply::Process(reply) => reply,

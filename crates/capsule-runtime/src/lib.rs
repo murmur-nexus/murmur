@@ -25,6 +25,8 @@ pub(crate) mod artifact_removal;
 pub mod artifact_supply;
 pub mod background_command;
 pub mod bindings;
+pub(crate) mod bus;
+pub use bus::refuse_bus_import;
 pub(crate) mod cancel;
 pub(crate) mod capsule_facts;
 pub(crate) mod cgroup;

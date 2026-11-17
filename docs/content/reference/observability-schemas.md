@@ -438,6 +438,33 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
 | `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
 | `attachments` | array of objects | The images the call [returned](wit-interfaces.md#tool-attachments), in the order it named them. An accepted one is `{"path", "media_type", "bytes", "sha256"}`, where `sha256` names its blob in the conversation's `blobs/`; a refused one is `{"path", "media_type", "refused"}`, where `refused` is the refusal code. Written on both transports; under `transport: process` an accepted entry names no blob, since nothing is stored. Never holds image bytes. Absent when the call returned none |
+| `origin` | string | `"code_mode"` for a call a code mode program made through [`murmur:bus`](wit-interfaces.md#bus). Absent on the model's own calls |
+| `repl_call_id` | string \| null | The `tool_call_id` of the model's call to the code mode tool the program ran in; `null` when that call had none. Present exactly when `origin` is |
+| `refusal` | string | Why the runtime did not run a code mode program's call, one of the [bus refusal reasons](wit-interfaces.md#bus-refusals): `not-listed`, `code-mode-tool`, `not-served`, `input-not-json`, `required-fields`, `capabilities.filesystem.read_only`, `on-tool-call`, `on-shell`, `detached` or `not-answered`. Present only for a refused call |
+
+A call a code mode program made through `murmur:bus` writes exactly the records the model's call to
+that tool writes — `tool_call`, or `skill_call` for a skill; `shell`, and `shell_detached` or
+`shell_detach_unrecorded` when the command moves to the background, for a shell tool — with `origin`, `repl_call_id` and, for a refused call, `refusal` added. No OTel span is
+posted for it. A refused call writes a `tool_call` the model's refused call does not:
+
+| Field | On a refused code mode call |
+|---|---|
+| `tool_call_id` | `null` |
+| `input` | The input as JSON when it parses, else the text as a JSON string |
+| `status` | `"error"` |
+| `error` | The refusal text the program was handed |
+| `refusal` | The reason |
+| `duration_ms` | `0` |
+
+A `required-fields` refusal also writes its [`tool_input_refused`](#tool-input-refused) line and is
+observed by the `on-tool-call` hooks as a failed call, as the model's is; a refusal at the decision
+point also writes its `call_denied` or `protected_path_denied` line. No other refusal reaches an
+observation hook.
+
+A `detached` or `not-answered` refusal is written as a session-level record, hung off the
+session node, with the turn and `task_id` the call was made in (turn `0` for a call made through a
+`transport: process` harness). It is not counted in `session_end.total_tool_calls` or
+`task_end.tool_calls`. Every other code mode `tool_call` parents to its turn node and is counted.
 
 A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_call` for every
 `murmur:tool-registry/invoke` call, a refused one included:
@@ -464,6 +491,9 @@ A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_cal
 | `status` | string | `"ok"` \| `"error"` |
 | `origin` | string | `"operator"` \| `"runtime"` — the skill's [`murmur.lock` origin](workdir.md#lock-origin). A skill with no lock entry, such as a `source:` skill, is `"operator"`. Always written |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin`, in the spelling `task_start.trust` uses. `"untrusted"` means the guidance reached the model fenced under `skill:<skill_name>`. Always written |
+| `call_origin` | string | `"code_mode"` for a skill a code mode program read through [`murmur:bus`](wit-interfaces.md#bus); absent otherwise. Named `call_origin` because `origin` holds the lock origin |
+| `repl_call_id` | string \| null | As on [`tool_call`](#tool-call). Present exactly when `call_origin` is |
+| `refusal` | string | As on `tool_call`. Present only for a refused call |
 
 Skill calls are counted separately from tool calls: they never raise `total_tool_calls` or a
 `task_end`'s `tool_calls`.
@@ -676,7 +706,7 @@ loop has exited, on every exit path
 | `total_turns` | u32 | Equals the count of `inference` lines |
 | `total_input_tokens` | u64 | |
 | `total_output_tokens` | u64 | |
-| `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
+| `total_tool_calls` | u32 | Equals the count of `tool_call` lines, less any code mode refusal with `refusal` `detached` or `not-answered` |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
 | `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` for an agent session, and `"ok"` \| `"trapped"` \| `"deadline_exceeded"` \| `"resource_limit"` \| `"failed"` for a [script capsule](#script-capsule-endings). For an agent session, the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [deadline](cli.md#mur-run-deadline), own or inherited, whether or not a task was running |
@@ -1626,6 +1656,7 @@ and has reported its session id
 | `child_workdir` | string | The child's work folder, absolute: `<this session's records directory>/children/<capsule>-<16 hex>` |
 | `child_records_dir` | string | The child's [records directory](workdir.md#records-directory), absolute, as the child reported it on its readiness line. Its own `trace.jsonl` and `completion.json` are there |
 | `workdir_snapshot` | object \| null | What this session's runtime copied from its work folder into the child's before the child started, for a capsule listed under [`capabilities.spawn.workdir_snapshot`](manifest.md#field-capabilities); `null` for every other child. Keys: `source` (this session's work folder, absolute), `files`, `dirs` (beneath the child's folder), `symlinks`, `repointed_symlinks` (links re-pointed from this folder into the copy), `bytes` (regular-file content copied), `skipped_count`, and `skipped`, at most 20 `{path, reason}` samples with `reason` one of `fifo`, `socket`, `device`, `unreadable` or `runtime-owned`. See [Workdir snapshot](roost-api.md#workdir-snapshot) |
+| `repl_call_id` | string | The `tool_call_id` of the model's code mode call whose program made this delegation through [`murmur:bus`](wit-interfaces.md#bus). Absent for the model's own delegations and a plan step's, and when that code mode call had no id |
 
 Written when the child starts, so a child that then hangs, crashes or is ended is attributable
 from the parent's side whatever happens next. A delegation the daemon refused writes none of these
@@ -1642,6 +1673,7 @@ from the parent's side whatever happens next. A delegation the daemon refused wr
 | `duration_ms` | u64 | How long the child ran, on an outcome; how long the call took, on one that never started |
 | `outcome` | string | How the delegation ended, in one of two vocabularies — see [Which outcome vocabulary applies](#delegation-outcome) |
 | `reason` | string \| null | `null` on `"ok"`, `"error"` and `"completed"`; otherwise one sentence — the sub-capsule's `detail`, the sentence the model was given, or why the delegating task ended the sub-capsule (see [How the outcome arrives](roost-api.md#how-the-outcome-arrives)) |
+| `repl_call_id` | string | As on `delegation_start` |
 
 ### Which outcome vocabulary applies { #delegation-outcome }
 

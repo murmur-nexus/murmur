@@ -491,6 +491,18 @@ impl CodeMode {
         }
     }
 
+    /// The work id `ticket`'s call was moved to the background under, while it still runs there;
+    /// `None` for a call still attached, or one that ended.
+    pub(crate) fn work_id_of(&self, ticket: &CallTicket) -> Option<String> {
+        let inner = self.lock();
+        let running = inner
+            .running
+            .as_ref()
+            .filter(|running| running.token == ticket.token)?;
+        let call = running.detached.as_ref()?;
+        Some(call_work_id(&inner, call))
+    }
+
     /// Whether `work_id` names a call this session moved to the background.
     pub(crate) fn knows(&self, work_id: &str) -> bool {
         self.lock().detached.contains_key(work_id)

@@ -19,6 +19,7 @@ version each one carries.
 | [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
 | [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
 | [`murmur:process/process`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process.wit) | Imported by tool components | Run a program, or keep one running for the session, under the rules a shell command obeys |
+| [`murmur:bus/bus`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/bus.wit) | Imported by the tool `code_mode.repl` names | From a program running in the code mode instance, list the capsule's operations and call one, or several at once, under the checks the model's own call to each meets |
 | [`murmur:stream/events`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-stream/events.wit) | Imported by tool and driver components | Tell the session's stream what a turn is doing while it is still in flight: reply and thinking chunks, and a tool call being written |
 | [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
@@ -35,9 +36,11 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 |---|---|---|---|
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `tool` | `task/task`, `stream/events`, `process/process` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
+| `code-mode` | `task/task`, `stream/events`, `process/process`, `bus/bus` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `stream/events` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read`, `conversation/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `murmur:message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
+| `code-mode-host` | `bus/bus` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 | `process-driver` | — | `driver/process` | [`process-driver/process.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver/process.wit) |
 
 Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
@@ -448,7 +451,7 @@ Past the grant, a refusal opens with one of three further tokens:
 | Token | Refused when | Example |
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-edit@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
-| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 7, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 7` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-edit@2.0.0' does not fit WIT level 8, the level this mur serves: …; murmur/tool-edit@1.0.0 is the newest version in the global store that fits level 8` |
 | `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-edit@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
@@ -646,6 +649,141 @@ A refusal is `refused({ rule, reason })` and nothing ran. Every refusal except `
 `unknown-handle`, `not-running`, `timed-out` and `failed(text)` are errors, not refusals, and
 are not traced as refusals. No `on-shell` observation (the `outcome: some` dispatch a shell
 command gets after it runs) is made for a program run through this interface.
+
+---
+
+## `murmur:bus/bus` { #bus }
+
+A program running in the [code mode](../concepts/tools.md#code-mode) instance calls the capsule's
+tools through this interface: `list` names them, `call` runs one, and `call-batch` runs several at
+once. Each call is checked, run, fenced and recorded as the model's own call to that tool is.
+The interface is defined in
+[`bus.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/bus.wit);
+a component imports it by compiling against the `code-mode` world.
+
+| Function | What it does |
+|---|---|
+| `list()` | The operations the program may call, built at the time of the call. Writes no trace record |
+| `call(name, input)` | Checks and runs one operation. `input` is one JSON value, as JSON text |
+| `call-batch(calls)` | Checks every call in input order, then runs every admitted call at once. Answers when all are done, each answer in its call's input position, refusals in place. No limit on the batch's size or on how many run at once. An empty batch returns `[]` and records nothing |
+
+Which artifacts the bus is linked into:
+
+| Artifact | Outcome |
+|---|---|
+| The `runtime: tool` artifact [`code_mode.repl`](manifest.md#code-mode) names, built against the `code-mode` world | The bus is linked into its code mode instance |
+| The same artifact, importing another `murmur:bus` version | Refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), as any artifact that does not fit the served level |
+| Any other artifact importing `murmur:bus`, at any version | Refused by `mur run` and `mur doctor` with [`E-CAP-022`](diagnostics.md#e-cap-022). A [`pull-artifact`](runtime-provided-tools.md#pull-artifact) of it mid-session is refused `not-fetched: [E-CAP-022] …` |
+
+A capsule without a `code_mode` block links the bus into nothing.
+
+### What `list` returns { #bus-list }
+
+The session's current tool inventory: the array the model's tool list is built from, before
+[`code_mode.tools_visible`](manifest.md#code-mode) limits it, in its order. Each entry:
+
+| `operation` field | Value |
+|---|---|
+| `name` | The tool's name, the one `call` takes |
+| `description` | The description the model's tool array gives it, the [untrusted-origin marker](../concepts/access-control.md#artifact-origin) included when the model's carries it. `""` when the tool has none |
+| `input-schema` | The tool's input JSON Schema, as JSON text |
+
+`list` leaves out the code mode tool itself and three runtime-provided tools, which are not served
+to a program:
+
+| Tool | Why it is not served |
+|---|---|
+| [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | It changes the session's tool set, which needs the session to itself; the code mode call holds it while the program runs |
+| [`remove-artifact`](runtime-provided-tools.md#remove-artifact) | The same as `pull-artifact` |
+| [`submit-plan`](plans.md) | Each of its steps takes the session's decision point, which the bus holds while it serves the batch the plan would run in |
+
+Every other runtime-provided tool the session offers is served, as are WASM tools, shell tools
+and skills.
+
+### The checks on a call { #bus-checks }
+
+Each call meets these checks in order. A refusal at any of them is final: the call does not run,
+and the program gets `call-error::refused` with the text in [Refusals](#bus-refusals).
+
+1. The name is one `list` returns.
+2. The input text parses as JSON.
+3. The input holds every field the tool's `input_schema` requires. A refusal writes a
+   [`tool_input_refused`](observability-schemas.md#tool-input-refused) line, as the model's does.
+4. When the session gates calls — a policy hook bound to `on-tool-call` or `on-shell`, or a
+   [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) list — the session's
+   [decision point](../concepts/hooks.md#policy-hooks) admits it.
+
+No driver [safety checks](#safety-checks) are asked about a program's call.
+
+### What a call returns { #bus-results }
+
+An admitted call runs through the dispatch the model's call to that tool takes, then the same
+[fence](untrusted-fence.md). The program gets the `tool-result` exactly as it stands after the
+fence:
+
+| Field | Value |
+|---|---|
+| `status` | As the tool returned it |
+| `summary` | Empty for a fenced result: the fence folds it into `data` |
+| `data` | The text the model would receive, inside the fence the model's result carries |
+| `data-path`, `truncated`, `metadata` | As the tool returned them |
+| `attachments` | As the tool named them. The runtime neither checks nor stores them |
+
+| Outcome | Returned |
+|---|---|
+| The operation returned a result | `ok(tool-result)` |
+| The dispatch failed before the operation returned | `call-error::failed(text)` |
+| A check, or the bus itself, refused the call | `call-error::refused(text)` |
+
+The [deadline notice](runtime-provided-tools.md#deadline-notice) is never delivered on a bus
+result; it stays the model's. A program a WASM tool starts through
+[`murmur:process`](#process) during a bus call is put to the session's decision point as the
+model's are.
+
+### When the bus answers { #bus-frame }
+
+The bus answers only while the model's own call to the code mode tool runs in the foreground on
+`inference.transport: http`. Every other request is refused:
+
+| The code mode call | `list()` | Each call |
+|---|---|---|
+| The model's, on `transport: http`, in the foreground | Answered | Checked and run |
+| Moved to the background by [`code_mode.detach_after_secs`](manifest.md#code-mode) | Refused | Refused, reason `detached` |
+| A [plan](plans.md) step's | Refused | Refused, reason `not-answered` |
+| Made through a `transport: process` harness | Refused | Refused, reason `not-answered` |
+| The model's, no longer in progress | Refused | Refused, reason `not-answered` |
+
+A detach that falls due while a request is being served takes effect as soon as that request is
+answered; no operation already dispatched is dropped. The instance's per-call deadline,
+[`capabilities.limits.deadline_seconds`](resource-limits.md#execution-limits), keeps running
+during a bus call.
+
+### Refusals { #bus-refusals }
+
+| Reason | Refused because | Text |
+|---|---|---|
+| `not-listed` | The name is not one `list` returns | `'{name}' is not an operation this program may call; list() returns every operation it may call` |
+| `code-mode-tool` | The name is the code mode tool the program runs in | `'{name}' is the code mode tool this program runs in, which a program cannot call` |
+| `not-served` | The name is `pull-artifact`, `remove-artifact` or `submit-plan` | `'{name}' is not served to a code mode program` |
+| `input-not-json` | The input text is not JSON | `the input for '{name}' is not JSON: {parse error}` |
+| `required-fields` | The input lacks a field the tool's `input_schema` requires | The text the model is handed for the same input |
+| `capabilities.filesystem.read_only`, `on-tool-call`, `on-shell` | The rule the reason names refused the call at the decision point | The decision point's own refusal, exactly what the model is handed |
+| `detached` | The code mode call was moved to the background | `'{name}' was not called: the '{tool}' call this program runs in was moved to the background as {work_id}, and the bus answers only while that call is in the foreground` |
+| `not-answered` | The code mode call is not the model's own, in progress, on `transport: http` | `'{name}' was not called: the bus answers only while the model's own '{tool}' call is in progress on inference.transport: http, and this '{tool}' call {why}` |
+
+`{tool}` is the code mode tool's name, and `{why}` is one of:
+
+| The code mode call | `{why}` |
+|---|---|
+| A plan step's | `is a plan step's` |
+| Made through a process-transport harness | `is made through a process-transport harness` |
+| No longer in progress | `is no longer in progress` |
+
+A refused `list()` returns the same sentence without its leading `'{name}' was not called: `.
+
+A call that runs writes the records the model's call to that tool writes; a refused call writes a
+failed `tool_call`. Each is marked with the code mode call it was made in: see
+[`tool_call`](observability-schemas.md#tool-call).
 
 ---
 
@@ -1382,6 +1520,7 @@ serve it.
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
 | `murmur:driver` | `0.6.0` |
+| `murmur:bus` | `0.1.0` |
 
 | Tier | When |
 |---|---|

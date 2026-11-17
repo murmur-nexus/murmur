@@ -26,6 +26,7 @@ Current versions:
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
 | `murmur:driver`          | `0.6.0`  |
+| `murmur:bus`             | `0.1.0`  |
 
 `SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
@@ -513,6 +514,18 @@ against `0.2.0`. One `@0.1.0` component stays committed under
 `crates/murmur-cli/tests/fixtures/process-probe-v1/`, so the refusal stays
 testable. No other package moved, so an artifact whose interfaces are all
 outside `murmur:process` fits level 7 exactly when it fits level 6.
+
+`murmur:bus@0.1.0` was added, WIT level 8: the interface `murmur:bus/bus@0.1.0`,
+through which a program running in the code mode tool's instance lists the capsule's
+operations and calls one, or several at once, under the checks the model's own call to each
+meets. It is a new package under the "wholly new interface" rule below. The new `code-mode`
+world in `murmur:runtime-guest` imports it beside everything the `tool` world imports, and the
+host binds it through a new `code-mode-host` world in `murmur:host`; both are world-only
+packages whose version is part of no instance name, so both stay `0.1.0`. No instance name
+changed and no committed component was rebuilt. An artifact therefore fits level 8 exactly when
+it fits level 7, unless it imports the new package, which fits level 8 only. The host links the
+interface into the one artifact `code_mode.repl` names and refuses any other artifact importing
+it at launch (`E-CAP-022`).
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

@@ -727,6 +727,49 @@ struct ToolCallEvent {
     /// when it returned none. Never holds image bytes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentRecord>,
+    /// `"code_mode"` for a call a code mode program made through `murmur:bus`. Absent for the
+    /// model's own call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'static str>,
+    /// The `tool_call_id` of the code mode tool call the program runs in, `null` when that call
+    /// carried none. Present exactly when `origin` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repl_call_id: Option<Option<String>>,
+    /// Why the runtime did not run a code mode program's call ([`crate::bus::refusal`]). Absent
+    /// for a call that ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<&'static str>,
+}
+
+/// What marks a `tool_call` or `skill_call` record as a call a code mode program made through
+/// `murmur:bus`: the record's `origin`, `repl_call_id` and `refusal` fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CodeModeMark {
+    /// The provider's id of the code mode tool call the program runs in.
+    pub(crate) repl_call_id: Option<String>,
+    /// Set for a call the runtime refused: one of [`crate::bus::refusal`].
+    pub(crate) refusal: Option<&'static str>,
+}
+
+impl CodeModeMark {
+    /// The three record fields: `origin`, `repl_call_id`, `refusal`.
+    #[allow(clippy::type_complexity)]
+    fn fields(
+        mark: Option<&Self>,
+    ) -> (
+        Option<&'static str>,
+        Option<Option<String>>,
+        Option<&'static str>,
+    ) {
+        match mark {
+            None => (None, None, None),
+            Some(mark) => (
+                Some(crate::bus::ORIGIN_CODE_MODE),
+                Some(mark.repl_call_id.clone().filter(|id| !id.is_empty())),
+                mark.refusal,
+            ),
+        }
+    }
 }
 
 /// One image a tool call returned or a task message carried, as the trace records it.
@@ -764,6 +807,16 @@ struct SkillCallEvent {
     /// `"trusted"` for an operator pin, `"untrusted"` for a runtime one, whose guidance reached
     /// the model fenced. Always written, in the spelling `task_start.trust` uses.
     trust: &'static str,
+    /// `"code_mode"` for a skill a code mode program read through `murmur:bus`; absent otherwise.
+    /// `origin` is taken by the lock origin, so this record names it `call_origin`.
+    #[serde(rename = "call_origin", skip_serializing_if = "Option::is_none")]
+    call_origin: Option<&'static str>,
+    /// As on `tool_call`: present exactly when `call_origin` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repl_call_id: Option<Option<String>>,
+    /// As on `tool_call`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2476,6 +2529,10 @@ struct DelegationStartEvent {
     /// `null` for a child not listed under `capabilities.spawn.workdir_snapshot`. Always
     /// serialized.
     workdir_snapshot: Option<crate::workdir_snapshot::WorkdirSnapshot>,
+    /// The `tool_call_id` of the code mode tool call whose program made this delegation through
+    /// `murmur:bus`. Absent for the model's own delegation and a plan step's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repl_call_id: Option<String>,
 }
 
 impl DelegationStartEvent {
@@ -2506,6 +2563,7 @@ impl DelegationStartEvent {
             child_workdir: child_workdir.to_string(),
             child_records_dir: child_records_dir.to_string(),
             workdir_snapshot: workdir_snapshot.cloned(),
+            repl_call_id: None,
         }
     }
 }
@@ -2640,6 +2698,9 @@ struct DelegationEvent {
     /// `null` where nothing needs saying. Otherwise the completion's `detail`, or the same
     /// sentence the model was given.
     reason: Option<String>,
+    /// As on `delegation_start`: absent unless a code mode program made the delegation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repl_call_id: Option<String>,
 }
 
 impl DelegationEvent {
@@ -2670,6 +2731,7 @@ impl DelegationEvent {
             duration_ms,
             outcome: outcome.to_string(),
             reason,
+            repl_call_id: None,
         }
     }
 }
@@ -3392,7 +3454,7 @@ impl TraceWriter {
         turn: u32,
         tool_name: String,
         tool_call_id: Option<String>,
-        mut input: Value,
+        input: Value,
         input_bytes: u64,
         output: &str,
         output_bytes: u64,
@@ -3403,6 +3465,46 @@ impl TraceWriter {
         error: Option<&str>,
         attachments: Vec<AttachmentRecord>,
     ) -> std::io::Result<()> {
+        self.write_tool_call_marked(
+            turn,
+            tool_name,
+            tool_call_id,
+            input,
+            input_bytes,
+            output,
+            output_bytes,
+            duration_ms,
+            status,
+            state_effect,
+            resource_id,
+            error,
+            attachments,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_tool_call_with_attachments`], with `mark` set for a call a code mode program
+    /// made through `murmur:bus`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_tool_call_marked(
+        &mut self,
+        turn: u32,
+        tool_name: String,
+        tool_call_id: Option<String>,
+        mut input: Value,
+        input_bytes: u64,
+        output: &str,
+        output_bytes: u64,
+        duration_ms: u64,
+        status: String,
+        state_effect: Option<String>,
+        resource_id: Option<String>,
+        error: Option<&str>,
+        attachments: Vec<AttachmentRecord>,
+        mark: Option<&CodeModeMark>,
+    ) -> std::io::Result<()> {
+        let (origin, repl_call_id, refusal) = CodeModeMark::fields(mark);
         // A peer handle reaches this event by an ordinary route — it is an argument the model
         // passed to `fetch-peer-file`, and every call's arguments are recorded. It is also a
         // credential, and the trace is durable, so the two must not meet: the `handle_id` goes in
@@ -3437,6 +3539,9 @@ impl TraceWriter {
             state_effect,
             resource_id,
             attachments,
+            origin,
+            repl_call_id,
+            refusal,
         };
         self.write_event(&event).await?;
         self.total_tool_calls = self.total_tool_calls.saturating_add(1);
@@ -3449,6 +3554,7 @@ impl TraceWriter {
     ///
     /// `origin` is the skill's `murmur.lock` origin; the record's `trust` is derived from it
     /// through [`crate::origin::artifact_trust`], the same rule that decides the skill's fence.
+    #[cfg(test)]
     pub(crate) async fn write_skill_call(
         &mut self,
         turn: u32,
@@ -3458,6 +3564,32 @@ impl TraceWriter {
         duration_ms: u64,
         status: String,
     ) -> std::io::Result<()> {
+        self.write_skill_call_marked(
+            turn,
+            skill_name,
+            origin,
+            output_bytes,
+            duration_ms,
+            status,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_skill_call`], with `mark` set for a skill a code mode program read through
+    /// `murmur:bus`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_skill_call_marked(
+        &mut self,
+        turn: u32,
+        skill_name: String,
+        origin: &LockOrigin,
+        output_bytes: u64,
+        duration_ms: u64,
+        status: String,
+        mark: Option<&CodeModeMark>,
+    ) -> std::io::Result<()> {
+        let (call_origin, repl_call_id, refusal) = CodeModeMark::fields(mark);
         let event = SkillCallEvent {
             event_type: "skill_call",
             event_id: new_event_id(),
@@ -3472,6 +3604,9 @@ impl TraceWriter {
             status,
             origin: origin.as_str(),
             trust: crate::origin::artifact_trust(origin).as_str(),
+            call_origin,
+            repl_call_id,
+            refusal,
         };
         self.write_event(&event).await
         // Intentionally does not increment total_tool_calls or task_tool_calls.
@@ -5276,6 +5411,61 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
+    /// Records a call a code mode program made through `murmur:bus` that the runtime refused
+    /// outside the frame that answers the bus: a `tool_call` with `status: "error"`, hung off the
+    /// session node, in turn `turn` of task `task_id`. `text` is the refusal the program was
+    /// handed and `refusal` its reason.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_bus_refusal(
+        &self,
+        turn: u32,
+        task_id: Option<String>,
+        tool_name: &str,
+        mut input: Value,
+        input_bytes: u64,
+        text: &str,
+        refusal: &'static str,
+        repl_call_id: Option<String>,
+    ) {
+        crate::peer_handoff::redact_handles_in_json(&mut input);
+        let mark = CodeModeMark {
+            repl_call_id,
+            refusal: Some(refusal),
+        };
+        let (origin, repl_call_id, refusal) = CodeModeMark::fields(Some(&mark));
+        let event = ToolCallEvent {
+            event_type: "tool_call",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id,
+            tool_name: tool_name.to_string(),
+            tool_call_id: None,
+            input,
+            input_bytes,
+            output: None,
+            output_bytes: text.len() as u64,
+            duration_ms: 0,
+            status: "error".to_string(),
+            error: Some(
+                crate::agent::truncate_on_char_boundary(
+                    &crate::peer_handoff::redact_handle_tokens(text),
+                    MAX_TASK_FAILURE_REASON_BYTES,
+                )
+                .to_string(),
+            ),
+            state_effect: None,
+            resource_id: None,
+            attachments: Vec::new(),
+            origin,
+            repl_call_id,
+            refusal,
+        };
+        self.append(&event).await;
+    }
+
     /// Records a code mode call moved to the background as `work_id`, hung off the session node.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_code_mode_detach(
@@ -5526,8 +5716,9 @@ impl ResourceTraceAppender {
         child_workdir: &str,
         child_records_dir: &str,
         workdir_snapshot: Option<&crate::workdir_snapshot::WorkdirSnapshot>,
+        repl_call_id: Option<&str>,
     ) {
-        let event = DelegationStartEvent::new(
+        let mut event = DelegationStartEvent::new(
             &self.session_id,
             &self.session_event_id,
             delegation_id,
@@ -5538,6 +5729,7 @@ impl ResourceTraceAppender {
             child_records_dir,
             workdir_snapshot,
         );
+        event.repl_call_id = repl_call_id.map(str::to_string);
         self.append(&event).await;
     }
 
@@ -5554,8 +5746,9 @@ impl ResourceTraceAppender {
         duration_ms: u64,
         outcome: &str,
         reason: Option<String>,
+        repl_call_id: Option<&str>,
     ) {
-        let event = DelegationEvent::new(
+        let mut event = DelegationEvent::new(
             &self.session_id,
             &self.session_event_id,
             capsule,
@@ -5566,6 +5759,7 @@ impl ResourceTraceAppender {
             outcome,
             reason,
         );
+        event.repl_call_id = repl_call_id.map(str::to_string);
         self.append(&event).await;
     }
 
@@ -9506,6 +9700,68 @@ mod tests {
         );
     }
 
+    /// A code mode program's `tool_call` has the model's keys plus `origin`, `repl_call_id` and
+    /// `refusal`, and nothing else differs; an unmarked record carries none of the three.
+    #[tokio::test]
+    async fn a_bus_tool_call_adds_only_the_three_code_mode_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let write = |mark: Option<CodeModeMark>| {
+            let id = mark.is_none().then(|| "toolu_1".to_string());
+            (id, mark)
+        };
+        for (id, mark) in [
+            write(None),
+            write(Some(CodeModeMark {
+                repl_call_id: Some("toolu_repl".to_string()),
+                refusal: Some(crate::bus::refusal::NOT_LISTED),
+            })),
+            write(Some(CodeModeMark {
+                repl_call_id: None,
+                refusal: None,
+            })),
+        ] {
+            w.write_tool_call_marked(
+                1,
+                "bus-echo".to_string(),
+                id,
+                serde_json::json!({"tag": "a"}),
+                11,
+                "tag=a",
+                5,
+                3,
+                "ok".to_string(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                mark.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+        w.flush().await.unwrap();
+        let events = read_events(dir.path());
+        let keys = |event: &Value| -> std::collections::BTreeSet<String> {
+            event.as_object().unwrap().keys().cloned().collect()
+        };
+        let model = keys(&events[0]);
+        for key in ["origin", "repl_call_id", "refusal"] {
+            assert!(!model.contains(key), "{key} on the model's record");
+        }
+        let bus = keys(&events[1]);
+        let added: Vec<&String> = bus.difference(&model).collect();
+        assert_eq!(added, ["origin", "refusal", "repl_call_id"]);
+        assert!(model.is_subset(&bus));
+        assert_eq!(events[1]["origin"], "code_mode");
+        assert_eq!(events[1]["repl_call_id"], "toolu_repl");
+        assert_eq!(events[1]["refusal"], "not-listed");
+        // `repl_call_id` is written whenever `origin` is, `null` when the call carried no id.
+        assert!(events[2]["repl_call_id"].is_null());
+        assert!(events[2].as_object().unwrap().contains_key("repl_call_id"));
+        assert!(!events[2].as_object().unwrap().contains_key("refusal"));
+    }
+
     #[tokio::test]
     async fn runtime_origin_skill_call_carries_origin_and_trust() {
         let dir = tempfile::tempdir().unwrap();
@@ -10544,6 +10800,7 @@ mod tests {
             ".murmur/c",
             "/r/ses_child",
             Some(&snapshot),
+            None,
         )
         .await;
         plan.write_delegation(
@@ -10562,6 +10819,7 @@ mod tests {
             Some("ses_child".to_string()),
             42,
             "completed",
+            None,
             None,
         )
         .await;

@@ -20,6 +20,21 @@ pub mod tool_host {
     });
 }
 
+/// The host side of the `code-mode` world's `murmur:bus/bus` import, served by [`crate::bus`] to
+/// the store of the one tool `code_mode.repl` names. `tool-result` is the `murmur:tool/run` type
+/// [`host`] generates.
+pub mod code_mode_host {
+    wasmtime::component::bindgen!({
+        path: "wit/host",
+        world: "code-mode-host",
+        imports: { default: async },
+        additional_derives: [serde::Serialize, serde::Deserialize],
+        with: {
+            "murmur:tool/run": crate::bindings::host::murmur::tool::run,
+        },
+    });
+}
+
 pub mod hook {
     wasmtime::component::bindgen!({
         path: "wit/hook",

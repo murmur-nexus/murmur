@@ -75,6 +75,8 @@ const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001";
 const E_REG_010: &str = "E-REG-010";
 /// The codes a provider tool pull is refused under, as staging renders the same refusals.
 const E_CAP_003: &str = "E-CAP-003";
+/// The code a pull of an artifact importing `murmur:bus` is refused under, as staging renders it.
+const E_CAP_022: &str = "E-CAP-022";
 const E_RUN_057: &str = "E-RUN-057";
 const E_RUN_058: &str = "E-RUN-058";
 
@@ -800,6 +802,19 @@ impl CapsuleStoreState {
         if fit != VersionFit::Fits {
             return Err(fit_refusal(name, version, &fit, &self.fit_hint(name)));
         }
+        if let Some(contracts) = resolved
+            .meta
+            .wit_contracts
+            .clone()
+            .or_else(|| murmur_artifact::wit_contracts_from_artifact_bytes(&resolved.bytes))
+        {
+            let repl = self
+                .code_mode
+                .as_ref()
+                .map(|code_mode| code_mode.artifact());
+            crate::bus::refuse_bus_import(name.as_str(), &contracts.imports, repl)
+                .map_err(|error| format!("{NOT_FETCHED} [{E_CAP_022}] {error}"))?;
+        }
         if let Some(owner_id) = payload.owner_id {
             if let Some(entry) = lock.owner_conflict(name.scope(), owner_id) {
                 return Err(format!(
@@ -958,7 +973,7 @@ impl CapsuleStoreState {
 
     /// The http agent loop's dispatch: `pull-artifact` and `remove-artifact` on this exclusively
     /// held session, fenced like every tool result, and every other name through
-    /// [`Self::dispatch_agent_tool_async`].
+    /// [`Self::dispatch_fenced`].
     ///
     /// The loop awaits each call of a turn before it starts the next, so a call listed before a
     /// `remove-artifact` completes on the artifact as it was, and one listed after it is refused.
@@ -966,20 +981,25 @@ impl CapsuleStoreState {
     /// Both tools run inline on the calling task: they hold the session exclusively, and the turn
     /// waits on them in any case. A pull that reads a source blocks that task for the requests.
     ///
-    /// `cancel` is the attempt's own cancel, handed on to [`Self::dispatch_agent_tool_async`].
+    /// `cancel` is the attempt's own cancel, handed on to [`Self::dispatch_fenced`].
+    ///
+    /// `frame` is the http agent loop's [`crate::bus::BusFrame`] for the model's own call: a call
+    /// to the code mode tool answers its program's `murmur:bus` requests in it. `None` from every
+    /// other caller.
     pub(crate) async fn dispatch_agent_tool_exclusive(
         &mut self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
         cancel: Option<&crate::cancel::CancelSignal>,
+        frame: Option<crate::bus::BusFrame<'_>>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = match name {
             PULL_ARTIFACT_TOOL => self.call_pull_artifact(&input)?,
             REMOVE_ARTIFACT_TOOL => self.call_remove_artifact(&input)?,
             _ => {
                 return self
-                    .dispatch_agent_tool_async(name, input, gate, cancel)
+                    .dispatch_fenced(name, input, gate, None, cancel.cloned(), None, frame)
                     .await
             }
         };
@@ -1320,6 +1340,7 @@ mod tests {
                 input(serde_json::json!({"artifact": EDITOR})),
                 None,
                 None,
+                None,
             )
             .await
             .expect("a granted tool pulls");
@@ -1344,6 +1365,7 @@ mod tests {
                 input(serde_json::json!({"text": "hello"})),
                 None,
                 None,
+                None,
             )
             .await
             .expect("the pulled tool is dispatchable");
@@ -1353,6 +1375,7 @@ mod tests {
             .dispatch_agent_tool_exclusive(
                 REMOVE_ARTIFACT_TOOL,
                 input(serde_json::json!({"artifact": EDITOR_TOOL})),
+                None,
                 None,
                 None,
             )
@@ -1371,7 +1394,13 @@ mod tests {
         assert!(!project.locked(EDITOR));
 
         let err = state
-            .dispatch_agent_tool_exclusive(EDITOR_TOOL, input(serde_json::json!({})), None, None)
+            .dispatch_agent_tool_exclusive(
+                EDITOR_TOOL,
+                input(serde_json::json!({})),
+                None,
+                None,
+                None,
+            )
             .await
             .err()
             .expect("a removed tool is refused");
@@ -1384,6 +1413,7 @@ mod tests {
             .dispatch_agent_tool_exclusive(
                 REMOVE_ARTIFACT_TOOL,
                 input(serde_json::json!({"artifact": EDITOR_TOOL})),
+                None,
                 None,
                 None,
             )
@@ -1407,14 +1437,14 @@ mod tests {
         assert!(
             err.starts_with(
                 "does-not-fit: [E-WIT-LEVEL-001] artifact 'local/tool-editor@2.0.0' does not fit \
-                 WIT level 7, the level this mur serves: it imports \
-                 murmur:tool-registry/invoke@9.9.9, and level 7 has murmur:tool-registry@"
+                 WIT level 8, the level this mur serves: it imports \
+                 murmur:tool-registry/invoke@9.9.9, and level 8 has murmur:tool-registry@"
             ),
             "{err}"
         );
         assert!(
             err.ends_with(
-                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 7"
+                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 8"
             ),
             "{err}"
         );
@@ -1579,7 +1609,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("; no version of local/tool-editor in the store fits level 7"),
+            err.ends_with("; no version of local/tool-editor in the store fits level 8"),
             "{err}"
         );
         assert_eq!(snapshot(&project, &state), before);

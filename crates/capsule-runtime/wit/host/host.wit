@@ -12,3 +12,9 @@ world runtime-host {
 world tool-host {
   import murmur:process/process@0.2.0;
 }
+
+/// The interface the runtime provides to the code mode tool's instance, beyond the `tool-host`
+/// ones, and only to the artifact `code_mode.repl` names.
+world code-mode-host {
+  import murmur:bus/bus@0.1.0;
+}

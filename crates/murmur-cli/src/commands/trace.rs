@@ -491,6 +491,21 @@ struct ToolCallEvent {
     /// which case identity falls back to [`extract_tracked_path`].
     #[serde(default)]
     resource_id: Option<String>,
+    /// The provider's id for this call; a code mode program's calls name the code mode call
+    /// they ran in by it, through `repl_call_id`.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    /// `code_mode` for a call a code mode program made through `murmur:bus`; absent for the
+    /// model's own call.
+    #[serde(default)]
+    origin: Option<String>,
+    /// The `tool_call_id` of the code mode call the program ran in. `null` when that call
+    /// carried none, and absent on every call that is not a code mode program's.
+    #[serde(default)]
+    repl_call_id: Option<String>,
+    /// Why the runtime refused a code mode program's call; absent for a call that ran.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1473,7 +1488,22 @@ struct ToolCallRecord {
     input: Option<serde_json::Value>,
     status: String,
     duration_ms: u64,
+    tool_call_id: Option<String>,
+    /// Set for a call a code mode program made through `murmur:bus`; the Tool calls section
+    /// prints such a call under the code mode call it ran in rather than on the turn line.
+    code_mode: Option<CodeModeCall>,
 }
+
+/// What a code mode program's `tool_call` record adds to a model call's.
+struct CodeModeCall {
+    /// The `tool_call_id` of the code mode call the program ran in; `None` when the record
+    /// names none.
+    repl_call_id: Option<String>,
+    refusal: Option<String>,
+}
+
+/// The `origin` of a call a code mode program made through `murmur:bus`.
+const CODE_MODE_ORIGIN: &str = "code_mode";
 
 /// One `inference` line, kept whole because three sections read different parts of it: the
 /// Tool calls breakdown wants the decision, the Wire section wants the hashes, and `--body`
@@ -2785,12 +2815,19 @@ fn compute_metrics(
                         }
                     }
                 }
+                let code_mode =
+                    (e.origin.as_deref() == Some(CODE_MODE_ORIGIN)).then_some(CodeModeCall {
+                        repl_call_id: e.repl_call_id,
+                        refusal: e.refusal,
+                    });
                 tool_call_records.push(ToolCallRecord {
                     turn: e.turn,
                     tool_name: e.tool_name,
                     input: e.input,
                     status: e.status,
                     duration_ms: e.duration_ms,
+                    tool_call_id: e.tool_call_id,
+                    code_mode,
                 });
             }
             TraceEvent::SkillCall(e) => {
@@ -3564,6 +3601,129 @@ fn capped_line(capped_turns: u32) -> String {
     format!("capped:     {capped_turns} {turns} stopped at the inference.max_tokens output cap")
 }
 
+/// How many `tool_call` records came from a code mode program through `murmur:bus`.
+fn code_mode_call_count(m: &TraceMetrics) -> u32 {
+    m.tool_call_records
+        .iter()
+        .filter(|rec| rec.code_mode.is_some())
+        .count() as u32
+}
+
+/// The tool calls the `── Tool calls ──` section counts. Without code mode calls that is the
+/// session's own total; with them it is every `tool_call` record, since `session_end` counts
+/// only the calls that reached the `on-tool-call` event.
+fn tool_call_total(m: &TraceMetrics) -> u32 {
+    if code_mode_call_count(m) == 0 {
+        m.total_tool_calls
+    } else {
+        m.tool_ok + m.tool_error
+    }
+}
+
+/// The `count:` line of the `── Tool calls ──` section, ending `  code mode: N` when a code
+/// mode program made any of the calls.
+fn tool_call_count_line(m: &TraceMetrics) -> String {
+    let total = tool_call_total(m);
+    if total == 0 {
+        return "count:      0".to_string();
+    }
+    let code_mode = code_mode_call_count(m);
+    let (success, suffix) = if code_mode == 0 {
+        (m.tool_success_rate().unwrap_or(0.0), String::new())
+    } else {
+        (
+            100.0 * m.tool_ok as f64 / total as f64,
+            format!("  code mode: {code_mode}"),
+        )
+    };
+    format!(
+        "count:      {}  ({} ok, {} error)  success {:.1}%{}",
+        total, m.tool_ok, m.tool_error, success, suffix
+    )
+}
+
+/// `read 12ms ✓  {"path":"a"}`: one call as a turn line or a code mode line prints it.
+fn tool_call_part(rec: &ToolCallRecord) -> String {
+    let icon = if rec.status == "ok" { "✓" } else { "✗" };
+    format!(
+        "{} {} {}{}",
+        rec.tool_name,
+        fmt_dur(rec.duration_ms),
+        icon,
+        fmt_input_inline(rec.input.as_ref())
+    )
+}
+
+/// One code mode program's call, four spaces deeper than its turn line. `in_trace` is false
+/// for a call whose code mode call no `tool_call` of the turn names.
+fn code_mode_row(rec: &ToolCallRecord, call: &CodeModeCall, in_trace: bool) -> String {
+    let unmatched = if in_trace {
+        ""
+    } else {
+        "(code mode, call not in trace) "
+    };
+    let refused = call
+        .refusal
+        .as_ref()
+        .map_or(String::new(), |reason| format!("  refused: {reason}"));
+    format!("      ↳ {unmatched}{}{refused}", tool_call_part(rec))
+}
+
+/// The rows below the `── Tool calls ──` section's `latency:` line: one `  turn N` line per
+/// turn listing the model's calls, or the turn's decision when it made none. A code mode
+/// program's calls follow their turn line, grouped under the code mode call they ran in in that
+/// call's turn-line order and in file order within a group; the calls whose code mode call is
+/// not in the turn come last.
+fn tool_call_rows(m: &TraceMetrics) -> Vec<String> {
+    let mut by_turn: BTreeMap<u32, Vec<&ToolCallRecord>> = BTreeMap::new();
+    for rec in &m.tool_call_records {
+        by_turn.entry(rec.turn).or_default().push(rec);
+    }
+    let inference_map: BTreeMap<u32, &str> = m
+        .inference_records
+        .iter()
+        .map(|rec| (rec.turn, rec.decision.as_str()))
+        .collect();
+    let all_turns: BTreeSet<u32> = by_turn
+        .keys()
+        .chain(inference_map.keys())
+        .copied()
+        .collect();
+    let mut rows = Vec::new();
+    for turn in all_turns {
+        let records = by_turn.get(&turn).map(Vec::as_slice).unwrap_or_default();
+        let (bus, model): (Vec<&ToolCallRecord>, Vec<&ToolCallRecord>) = records
+            .iter()
+            .copied()
+            .partition(|rec| rec.code_mode.is_some());
+        if !model.is_empty() {
+            let parts: Vec<String> = model.iter().map(|rec| tool_call_part(rec)).collect();
+            rows.push(format!("  turn {}  {}", turn, parts.join("  ")));
+        } else if let Some(decision) = inference_map.get(&turn) {
+            rows.push(format!("  turn {}  {}", turn, decision));
+        } else if !bus.is_empty() {
+            rows.push(format!("  turn {turn}"));
+        }
+        let mut groups: Vec<Vec<String>> = vec![Vec::new(); model.len()];
+        let mut unmatched = Vec::new();
+        for rec in bus {
+            let Some(call) = &rec.code_mode else { continue };
+            let host = call.repl_call_id.as_deref().and_then(|id| {
+                model
+                    .iter()
+                    .position(|call_rec| call_rec.tool_call_id.as_deref() == Some(id))
+            });
+            match host {
+                Some(index) => groups[index].push(code_mode_row(rec, call, true)),
+                None => unmatched.push(code_mode_row(rec, call, false)),
+            }
+        }
+        rows.extend(groups.into_iter().flatten());
+        rows.extend(unmatched);
+    }
+    rows
+}
+
 fn print_show(m: &TraceMetrics) {
     capsule_runtime::report_println!("── Session ──────────────────────────────────────");
     capsule_runtime::report_println!("session:    {}", m.session_id);
@@ -3816,53 +3976,14 @@ fn print_show(m: &TraceMetrics) {
     }
 
     capsule_runtime::report_println!("── Tool calls ───────────────────────────────────");
-    if m.total_tool_calls == 0 {
-        capsule_runtime::report_println!("count:      0");
-    } else {
-        capsule_runtime::report_println!(
-            "count:      {}  ({} ok, {} error)  success {:.1}%",
-            m.total_tool_calls,
-            m.tool_ok,
-            m.tool_error,
-            m.tool_success_rate().unwrap_or(0.0)
-        );
+    capsule_runtime::report_println!("{}", tool_call_count_line(m));
+    if tool_call_total(m) != 0 {
         capsule_runtime::report_println!(
             "latency:    avg {}",
             fmt_opt_dur(m.avg_tool_latency_ms())
         );
-        let mut by_turn: BTreeMap<u32, Vec<&ToolCallRecord>> = BTreeMap::new();
-        for rec in &m.tool_call_records {
-            by_turn.entry(rec.turn).or_default().push(rec);
-        }
-        let inference_map: BTreeMap<u32, &str> = m
-            .inference_records
-            .iter()
-            .map(|rec| (rec.turn, rec.decision.as_str()))
-            .collect();
-        let all_turns: BTreeSet<u32> = by_turn
-            .keys()
-            .chain(inference_map.keys())
-            .copied()
-            .collect();
-        for turn in all_turns {
-            if let Some(records) = by_turn.get(&turn) {
-                let parts: Vec<String> = records
-                    .iter()
-                    .map(|rec| {
-                        let icon = if rec.status == "ok" { "✓" } else { "✗" };
-                        format!(
-                            "{} {} {}{}",
-                            rec.tool_name,
-                            fmt_dur(rec.duration_ms),
-                            icon,
-                            fmt_input_inline(rec.input.as_ref())
-                        )
-                    })
-                    .collect();
-                capsule_runtime::report_println!("  turn {}  {}", turn, parts.join("  "));
-            } else if let Some(decision) = inference_map.get(&turn) {
-                capsule_runtime::report_println!("  turn {}  {}", turn, decision);
-            }
+        for row in tool_call_rows(m) {
+            capsule_runtime::report_println!("{row}");
         }
     }
     capsule_runtime::report_println!();
@@ -8636,5 +8757,165 @@ mod tests {
              `mur trace show frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b` lists the formation's members \
              and calls"
         );
+    }
+
+    /// A `tool_call` line for the Tool calls tests. `extra` is spliced in verbatim, so it is
+    /// `""` for a model call that names nothing beyond its `tool_call_id`.
+    fn tool_call_line(
+        turn: u32,
+        tool: &str,
+        tool_call_id: Option<&str>,
+        status: &str,
+        duration_ms: u64,
+        extra: &str,
+    ) -> String {
+        let id = tool_call_id.map_or("null".to_string(), |id| format!(r#""{id}""#));
+        format!(
+            r#"{{"event_type":"tool_call","session_id":"ses_child","timestamp":1791000002000,"turn":{turn},"tool_name":"{tool}","tool_call_id":{id},"input":{{"n":{duration_ms}}},"input_bytes":8,"output_bytes":0,"duration_ms":{duration_ms},"status":"{status}"{extra}}}"#
+        )
+    }
+
+    /// The `extra` of a code mode program's call inside the code mode call `repl` names.
+    fn bus(repl: Option<&str>, refusal: Option<&str>) -> String {
+        let repl = repl.map_or("null".to_string(), |id| format!(r#""{id}""#));
+        let refusal = refusal.map_or(String::new(), |r| format!(r#","refusal":"{r}""#));
+        format!(r#","origin":"code_mode","repl_call_id":{repl}{refusal}"#)
+    }
+
+    /// The Tool calls section's `count:` line and rows for a trace of `lines`.
+    fn tool_calls_of(lines: &[String]) -> (String, Vec<String>) {
+        let mut trace = format!("{UNENDED_START}\n");
+        for line in lines {
+            trace.push_str(line);
+            trace.push('\n');
+        }
+        let (_dir, path) = trace_of(&trace);
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        (tool_call_count_line(&metrics), tool_call_rows(&metrics))
+    }
+
+    /// A trace without code mode calls prints the count from `session_end` and one line per
+    /// turn, a turn without calls showing its decision.
+    #[test]
+    fn tool_calls_without_code_mode_print_as_they_always_did() {
+        let (count, rows) = tool_calls_of(&[
+            call_settings_line(0, None, "tool_use", ""),
+            tool_call_line(0, "read", Some("toolu_1"), "ok", 12, ""),
+            tool_call_line(0, "write", None, "error", 1500, ""),
+            call_settings_line(1, None, "end_turn", ""),
+            r#"{"event_type":"session_end","session_id":"ses_child","timestamp":1791000005000,"total_turns":2,"total_input_tokens":20,"total_output_tokens":10,"total_tool_calls":2,"total_shell_calls":0,"duration_ms":5000,"exit_status":"completed"}"#.to_string(),
+        ]);
+        assert_eq!(count, "count:      2  (1 ok, 1 error)  success 50.0%");
+        assert_eq!(
+            rows,
+            [
+                r#"  turn 0  read 12ms ✓  {"n":12}  write 1.5s ✗  {"n":1500}"#,
+                "  turn 1  end_turn",
+            ]
+        );
+    }
+
+    /// A code mode program's calls leave the turn line and follow it, under the code mode call
+    /// they ran in: grouped in turn-line order, in file order within a group, even though each
+    /// code mode call's own record comes after its program's calls.
+    #[test]
+    fn code_mode_calls_nest_under_the_code_mode_call_they_ran_in() {
+        let (count, rows) = tool_calls_of(&[
+            call_settings_line(0, None, "tool_use", ""),
+            tool_call_line(0, "read", None, "ok", 1, &bus(Some("toolu_b"), None)),
+            tool_call_line(0, "grep", None, "ok", 2, &bus(Some("toolu_a"), None)),
+            tool_call_line(0, "list", None, "error", 3, &bus(Some("toolu_a"), None)),
+            tool_call_line(0, "run_code", Some("toolu_a"), "ok", 40, ""),
+            tool_call_line(0, "run_code", Some("toolu_b"), "ok", 50, ""),
+            call_settings_line(1, None, "end_turn", ""),
+        ]);
+        assert_eq!(
+            count,
+            "count:      5  (4 ok, 1 error)  success 80.0%  code mode: 3"
+        );
+        assert_eq!(
+            rows,
+            [
+                r#"  turn 0  run_code 40ms ✓  {"n":40}  run_code 50ms ✓  {"n":50}"#,
+                r#"      ↳ grep 2ms ✓  {"n":2}"#,
+                r#"      ↳ list 3ms ✗  {"n":3}"#,
+                r#"      ↳ read 1ms ✓  {"n":1}"#,
+                "  turn 1  end_turn",
+            ]
+        );
+    }
+
+    /// A refused call carries its refusal after the call.
+    #[test]
+    fn a_refused_code_mode_call_names_its_refusal() {
+        let (_, rows) = tool_calls_of(&[
+            tool_call_line(
+                0,
+                "write",
+                None,
+                "error",
+                0,
+                &bus(Some("toolu_a"), Some("capabilities.filesystem.read_only")),
+            ),
+            tool_call_line(0, "run_code", Some("toolu_a"), "ok", 40, ""),
+        ]);
+        assert_eq!(
+            rows,
+            [
+                r#"  turn 0  run_code 40ms ✓  {"n":40}"#,
+                r#"      ↳ write 0ms ✗  {"n":0}  refused: capabilities.filesystem.read_only"#,
+            ]
+        );
+    }
+
+    /// A call naming a code mode call no `tool_call` of its turn names, or naming none, is
+    /// printed after the turn's nested calls; a code mode call of another turn does not match.
+    #[test]
+    fn code_mode_calls_outside_the_trace_print_after_the_nested_ones() {
+        let (count, rows) = tool_calls_of(&[
+            tool_call_line(0, "run_code", Some("toolu_a"), "ok", 40, ""),
+            tool_call_line(1, "read", None, "ok", 1, &bus(Some("toolu_gone"), None)),
+            tool_call_line(
+                1,
+                "grep",
+                None,
+                "error",
+                2,
+                &bus(None, Some("not-answered")),
+            ),
+            tool_call_line(1, "list", None, "ok", 3, &bus(Some("toolu_b"), None)),
+            tool_call_line(1, "stat", None, "ok", 4, &bus(Some("toolu_a"), None)),
+            tool_call_line(1, "run_code", Some("toolu_b"), "ok", 50, ""),
+        ]);
+        assert_eq!(
+            count,
+            "count:      6  (5 ok, 1 error)  success 83.3%  code mode: 4"
+        );
+        assert_eq!(
+            rows,
+            [
+                r#"  turn 0  run_code 40ms ✓  {"n":40}"#,
+                r#"  turn 1  run_code 50ms ✓  {"n":50}"#,
+                r#"      ↳ list 3ms ✓  {"n":3}"#,
+                r#"      ↳ (code mode, call not in trace) read 1ms ✓  {"n":1}"#,
+                r#"      ↳ (code mode, call not in trace) grep 2ms ✗  {"n":2}  refused: not-answered"#,
+                r#"      ↳ (code mode, call not in trace) stat 4ms ✓  {"n":4}"#,
+            ]
+        );
+    }
+
+    /// `origin` other than `code_mode` leaves a call on its turn line.
+    #[test]
+    fn only_a_code_mode_origin_moves_a_call_off_the_turn_line() {
+        let (count, rows) = tool_calls_of(&[tool_call_line(
+            0,
+            "read",
+            Some("toolu_a"),
+            "ok",
+            1,
+            r#","origin":"something_else""#,
+        )]);
+        assert_eq!(count, "count:      1  (1 ok, 0 error)  success 100.0%");
+        assert_eq!(rows, [r#"  turn 0  read 1ms ✓  {"n":1}"#]);
     }
 }

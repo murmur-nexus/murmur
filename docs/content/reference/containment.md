@@ -650,6 +650,23 @@ never outlives the tool call that made it.
 a port a process in the handle's own process group listens on: see
 [`murmur:process/process`](wit-interfaces.md#process).
 
+## Tools a code mode program calls { #code-mode-bus }
+
+A program running in the code mode instance calls the capsule's tools through
+[`murmur:bus`](wit-interfaces.md#bus). Each operation it calls runs on that operation's own route,
+under that operation's own checks and grants, as the model's call to it would:
+
+| Operation | Runs as |
+|---|---|
+| A shell tool | A shell command of the session: the `shell` route, the session's tier and class |
+| A WASM tool | That tool's own call, with its entry's grants, in the `tools` guest worker; its `murmur:process` programs go to the session's decision point |
+| A skill, a runtime-provided tool | The model's call to it |
+
+The bus adds no route and no grant: nothing a program calls through it reaches further than the
+capsule's grants let the model's call reach. The `capabilities.filesystem.read_only` check and
+every `on-tool-call` and `on-shell` policy hook see each call before it runs, as the
+[checks on a bus call](wit-interfaces.md#bus-checks) list.
+
 ## What bounds a WASM artifact { #artifact-boundary }
 
 A containment class and a WASM artifact's own grants answer different questions:
