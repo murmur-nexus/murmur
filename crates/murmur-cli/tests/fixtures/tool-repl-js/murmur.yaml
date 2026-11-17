@@ -1,0 +1,19 @@
+name: tool-repl-js
+version: 0.1.0
+runtime: tool
+implementation: wasm
+description: |
+  Runs JavaScript with QuickJS in one context that lasts for the session: variables, functions and globalThis properties one call defines are there in later calls, until the instance ends. `code` runs as a script; top-level await is a SyntaxError, and declaring a top-level let, const or class name a second time throws.
+  The result is what print wrote, then `=> ` and the value of the last expression unless it is undefined (a string in JSON quotes), with status passed. A thrown exception returns `Uncaught <name>: <message>`, its stack, then what was printed before it, with status failed; the context keeps its values.
+  Globals: tools() returns [{name, description, inputSchema}] for every operation a program may call. call(name, input) returns {status, summary, data, dataPath, truncated, metadata, attachments}, where data is the text the model would receive inside its untrusted-content fence; it throws an Error whose kind is refused or failed when the call does not run or fails, or error when the tool returns status error, with the result on error.result. callAll([[name, input], ...]) runs the calls at once and returns one entry per pair in the same order: the result, or the Error call would throw. run(program, args, {env, stdin, timeoutMs}) runs a program named in capabilities.shell.allow and returns {exitCode, timedOut, stdout, stdoutTruncated, stderr, stderrTruncated}; it throws an Error with kind and, when refused, rule. print(...values) appends the values separated by spaces and a newline. Every global returns its value directly, never a Promise.
+  There are no modules, no packages and no file or network objects.
+  Limits: output past the artifact config's output_limit_bytes is cut and marked; run keeps the first 1 MiB of each stream; a call that runs past capabilities.limits.deadline_seconds ends the instance and every value in it.
+input_schema:
+  type: object
+  properties:
+    code:
+      type: string
+      description: JavaScript source, run as a script.
+  required: [code]
+requires_files:
+  - tool_repl_js.wasm
