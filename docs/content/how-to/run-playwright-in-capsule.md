@@ -113,7 +113,7 @@ capabilities:
           - path: /sys/devices
             list_dir: true
   resources:
-    memory_bytes: 274877906944
+    memory_bytes: 2199023255552
     cgroup_pids_max: 1024
     cgroup_memory_bytes: 4294967296
 
@@ -135,7 +135,7 @@ What each grant is for:
 | `/etc/fonts` and `/usr/share/fonts` | The fonts Chrome draws pages with |
 | `/usr/lib/x86_64-linux-gnu` | Chrome loads its NSS crypto modules from the system library folder with `dlopen`, so they are not among the libraries the binary names; without them an `https` page stops Chrome. This grant carries execute and draws [`W-SEC-009`](../reference/diagnostics.md#w-sec-009) |
 | `/sys/bus/pci` and `/sys/devices` | With the library folder granted, Chrome's GPU process loads `libpci`, which reads the PCI device tree and exits the process when it is refused; see [A library a grant brings in reach](../reference/containment.md#library-grant-reach) |
-| `memory_bytes: 274877906944` | `memory_bytes` limits address space, and V8 reserves tens of GiB of it in every Chrome and Node process |
+| `memory_bytes: 2199023255552` | `memory_bytes` limits address space, and a Chrome renderer reserves about 1.4 TiB of it, most of it V8's sandbox. Under a lower limit V8 reserves only part of its sandbox, and on a host with 5-level paging (the CPU flag `la57`) it can place that part above 2^48, where the renderer crashes with `SEGV_MAPERR` and the page never loads. 2 TiB is above the whole reservation |
 | `cgroup_pids_max` and `cgroup_memory_bytes` | The real caps on the command tree: Chrome runs dozens of processes per page |
 
 Without the two `/sys` grants, Chrome starts and stops at once, and Playwright reports:

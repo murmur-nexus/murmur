@@ -2038,6 +2038,68 @@ mod tests {
         assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
     }
 
+    /// A program a kernel tier starts runs with `RLIMIT_CORE` at one byte, soft and hard, the one
+    /// value at which a crash hands nothing to a pipe `kernel.core_pattern` program. `ulimit -c`
+    /// counts 1024-byte blocks and prints `0` for it, so the value is read from
+    /// `/proc/self/limits`, which counts bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_kernel_tier_command_gets_the_one_byte_core_limit() {
+        const TEST: &str = "a_kernel_tier_command_gets_the_one_byte_core_limit";
+        if crate::network_namespace::skip_without_egress_namespace(TEST) {
+            return;
+        }
+        if rustix::process::getrlimit(rustix::process::Resource::Core).maximum == Some(0) {
+            crate::runtime_err!(
+                "[SKIP-HOST] {TEST}: this process's hard RLIMIT_CORE is 0, below the one byte"
+            );
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = ShellEnforcement::resolve_declared(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            crate::sandbox::HostProbe::probe(),
+        )
+        .unwrap()
+        .with_runtime_dir(crate::sandbox::test_runtime_dir(temp.path()), None);
+        if enforcement.tier != crate::sandbox::EnforcementTier::KernelFull {
+            crate::runtime_err!(
+                "[SKIP-HOST] {TEST}: this host resolves {:?}, the test needs KernelFull",
+                enforcement.tier
+            );
+            return;
+        }
+
+        let result = execute_shell(
+            "bash",
+            &[
+                "-c",
+                r#"while IFS= read -r line; do case $line in "Max core file size"*) echo "$line";; esac; done </proc/self/limits"#,
+            ],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must start under the limits");
+        println!("{}", result.stdout.trim());
+
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        let fields: Vec<&str> = result.stdout.split_whitespace().collect();
+        assert_eq!(
+            fields,
+            ["Max", "core", "file", "size", "1", "1", "bytes"],
+            "stderr was: {}",
+            result.stderr
+        );
+    }
+
     /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
     /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
     /// rather than exit so every one of them holds a task in the scope until the loop gives up.

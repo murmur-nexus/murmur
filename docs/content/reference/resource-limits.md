@@ -77,7 +77,7 @@ Three mechanisms enforce the block, in descending order of portability:
 
 | Mechanism | Fields | Platforms | Notes |
 |---|---|---|---|
-| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. `cpu_seconds` is the exception: the process gets `SIGXCPU` at `cpu_seconds` and `SIGKILL` one second later, so it can neither raise the bound nor run more than one second past it. With no `cpu_seconds`, `RLIMIT_CPU` is left as `mur` inherited it. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field. `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
+| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. `cpu_seconds` is the exception: the process gets `SIGXCPU` at `cpu_seconds` and `SIGKILL` one second later, so it can neither raise the bound nor run more than one second past it. With no `cpu_seconds`, `RLIMIT_CPU` is left as `mur` inherited it. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field; see [No core dumps](#no-core-dumps). `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
 | A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host. `cgroup_cpu_percent` is the scope's `cpu.max`, written only when declared |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The [work folder](workdir.md#work-folder-ceiling), the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) are walked every 10 seconds and their sizes summed. The cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` — `work folder, $HOME and $TMPDIR together grew to <N> bytes, past the <M> byte ceiling (capabilities.resources.workdir_max_bytes)` — and blocks any further subprocess. The breach's `logs/bootstrap.log` line appends `; measured: <work folder>, <tmp>, <home>` |
 
@@ -96,6 +96,24 @@ JVM fails to start its heap. For those, set `memory_bytes` high —
 `68719476736` (64 GiB) runs `node` — and cap RAM with `cgroup_memory_bytes`. A capsule whose
 `capabilities.shell.allow` names `node` or `nodejs` under a limit below 32 GiB, the 2 GiB default
 included, draws [`W-RUN-010`](diagnostics.md#w-run-010).
+
+### No core dumps { #no-core-dumps }
+
+Every process a capsule spawns runs with `RLIMIT_CORE` at one byte, except under `unconfined`,
+which keeps the limit `mur` inherited. The limit has no manifest field. On Linux that value stops
+a core dump under any `kernel.core_pattern`:
+
+- **A file name, such as `core`:** the crashed process writes no core file, because a dump smaller
+  than one page is never written.
+- **A program, a pattern that starts with `|`, such as Ubuntu's apport or systemd-coredump:** the
+  crashed process is never handed to the program. The kernel ignores `RLIMIT_CORE` for a program,
+  except that at one byte it aborts the dump and logs `RLIMIT_CORE is set to 1, aborting core`.
+
+The crashed process exits at once, and the command that ran it gets its signal status.
+
+The limit is clamped to the hard `RLIMIT_CORE` `mur` inherited. Under an inherited hard limit of
+`0`, a host whose `kernel.core_pattern` names a program still receives the dump, and the crashed
+process waits until that program has read the dump or closed its input.
 
 ### `max_processes` by platform { #max-processes-headroom }
 
