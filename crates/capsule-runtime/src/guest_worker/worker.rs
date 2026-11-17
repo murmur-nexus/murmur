@@ -855,9 +855,8 @@ impl ServerState {
         // cut, and is never entered again.
         if held_tool.in_call {
             self.session_tools().held.remove(&instance);
-            let message = format!(
-                "code mode instance {instance} was cut by a call dropped mid-guest"
-            );
+            let message =
+                format!("code mode instance {instance} was cut by a call dropped mid-guest");
             return (
                 Err(message.clone()),
                 Some(InstanceEnd {

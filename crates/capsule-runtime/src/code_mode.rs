@@ -398,10 +398,9 @@ impl CodeMode {
                 }
             };
             let result = match (&ended, result) {
-                (Some((_, end)), Err(error)) if end.reason != EndReason::WorkerLost => Err(format!(
-                    "{error} {}",
-                    instance_ended_sentence(&self.tool)
-                )),
+                (Some((_, end)), Err(error)) if end.reason != EndReason::WorkerLost => {
+                    Err(format!("{error} {}", instance_ended_sentence(&self.tool)))
+                }
                 (_, result) => result,
             };
             if let Some(call) = &running.detached {
@@ -416,8 +415,13 @@ impl CodeMode {
             if end.reason != EndReason::WorkerLost {
                 self.workers.close_session_tool(instance.id);
             }
-            self.write_end(ticket.task_id.clone(), instance, end.reason, Some(end.message))
-                .await;
+            self.write_end(
+                ticket.task_id.clone(),
+                instance,
+                end.reason,
+                Some(end.message),
+            )
+            .await;
         }
         result
     }
@@ -502,7 +506,9 @@ impl CodeMode {
         let outcome = call.outcome.borrow().clone();
         let (state, elapsed) = match outcome {
             None => (CallState::Running, call.started.elapsed()),
-            Some(CallOutcome::Finished { result, elapsed }) => (CallState::Finished(result), elapsed),
+            Some(CallOutcome::Finished { result, elapsed }) => {
+                (CallState::Finished(result), elapsed)
+            }
             Some(CallOutcome::Stopped { elapsed }) => (CallState::Stopped, elapsed),
         };
         Some(CallSnapshot {
@@ -753,7 +759,10 @@ mod tests {
             })),
             EndReason::ResourceLimit
         );
-        assert_eq!(end(ToolFailureKind::Guest(GuestFailure::Other)), EndReason::Trap);
+        assert_eq!(
+            end(ToolFailureKind::Guest(GuestFailure::Other)),
+            EndReason::Trap
+        );
         assert_eq!(end(ToolFailureKind::Setup), EndReason::Trap);
     }
 

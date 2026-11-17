@@ -10370,8 +10370,7 @@ async fn build_tool_instance(
         ),
     };
 
-    let linker = tool_linker(engine, name, events, input_sink)
-        .map_err(ToolCallFailure::setup)?;
+    let linker = tool_linker(engine, name, events, input_sink).map_err(ToolCallFailure::setup)?;
     let tool_limits = spec.limits;
     let site = match role {
         ComponentRole::Driver => crate::guest_worker::StoreSite::Driver,
@@ -11529,28 +11528,29 @@ impl CapsuleStoreState {
             .code_mode
             .as_ref()
             .filter(|code_mode| code_mode.tool() == name);
-        let component_call = |input: murmur::tool::run::ToolInput, process: ProcessAccess| async move {
-            match code_mode {
-                Some(code_mode) => {
-                    Box::pin(self.dispatch_code_mode(
-                        code_mode, name, input, gateway, process, detachable,
-                    ))
-                    .await
+        let component_call =
+            |input: murmur::tool::run::ToolInput, process: ProcessAccess| async move {
+                match code_mode {
+                    Some(code_mode) => {
+                        Box::pin(self.dispatch_code_mode(
+                            code_mode, name, input, gateway, process, detachable,
+                        ))
+                        .await
+                    }
+                    None => {
+                        self.dispatch_component_with_env(
+                            name,
+                            input,
+                            gateway,
+                            &self.inference_env,
+                            None,
+                            ComponentRole::Tool,
+                            process,
+                        )
+                        .await
+                    }
                 }
-                None => {
-                    self.dispatch_component_with_env(
-                        name,
-                        input,
-                        gateway,
-                        &self.inference_env,
-                        None,
-                        ComponentRole::Tool,
-                        process,
-                    )
-                    .await
-                }
-            }
-        };
+            };
         let Some(registry) = self.session_processes.clone() else {
             return component_call(
                 input,
@@ -16572,25 +16572,36 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let inference = inference_without_prompt();
-        let write = |policy: &CapabilityPolicy, grace, config: Option<&murmur_artifact::CodeModeConfig>| {
-            let dir = TempDir::new().unwrap();
-            super::write_background_command_tool_manifest(
-                &WorkdirRoot::open(dir.path()).unwrap(),
-                Some(&inference),
-                policy,
-                grace,
-                config,
-            )
-            .unwrap();
-            description(dir.path())
-        };
+        let write =
+            |policy: &CapabilityPolicy, grace, config: Option<&murmur_artifact::CodeModeConfig>| {
+                let dir = TempDir::new().unwrap();
+                super::write_background_command_tool_manifest(
+                    &WorkdirRoot::open(dir.path()).unwrap(),
+                    Some(&inference),
+                    policy,
+                    grace,
+                    config,
+                )
+                .unwrap();
+                description(dir.path())
+            };
         assert_eq!(
-            write(&CapabilityPolicy::default(), None, Some(&code_mode(Some(0)))),
-            Some(crate::background_command::description(false, Some("counter-tool")))
+            write(
+                &CapabilityPolicy::default(),
+                None,
+                Some(&code_mode(Some(0)))
+            ),
+            Some(crate::background_command::description(
+                false,
+                Some("counter-tool")
+            ))
         );
         assert_eq!(
             write(&with_shell, Some(10), Some(&code_mode(Some(5)))),
-            Some(crate::background_command::description(true, Some("counter-tool")))
+            Some(crate::background_command::description(
+                true,
+                Some("counter-tool")
+            ))
         );
         assert_eq!(
             write(&with_shell, Some(10), Some(&code_mode(None))),

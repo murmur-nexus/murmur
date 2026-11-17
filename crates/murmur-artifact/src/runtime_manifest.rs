@@ -4320,7 +4320,10 @@ impl RuntimeManifest {
 #[must_use]
 pub fn code_mode_package_refusal(repl: &str, packed_manifest_yaml: &str) -> Option<String> {
     let manifest: serde_norway::Value = serde_norway::from_str(packed_manifest_yaml).ok()?;
-    match manifest.get("runtime").and_then(serde_norway::Value::as_str) {
+    match manifest
+        .get("runtime")
+        .and_then(serde_norway::Value::as_str)
+    {
         None | Some("tool" | "wasm") => None,
         Some("capsule") => Some(format!(
             "'{repl}' is a script capsule's package (its murmur.yaml declares runtime: capsule)"
@@ -4354,33 +4357,32 @@ fn parse_code_mode(
             "a script capsule (no inference:) cannot declare code_mode".to_string(),
         ));
     }
-    let repl = match raw.repl {
-        None => {
-            return Err(invalid(
+    let repl =
+        match raw.repl {
+            None => return Err(invalid(
                 "code_mode.repl",
                 "is required: the full <scope>/<name> of a runtime: tool artifact this manifest \
                  declares in artifacts"
                     .to_string(),
-            ))
-        }
-        Some(serde_norway::Value::String(repl)) if repl.trim().is_empty() => {
-            return Err(invalid(
-                "code_mode.repl",
-                "is blank; it is the full <scope>/<name> of a runtime: tool artifact this \
+            )),
+            Some(serde_norway::Value::String(repl)) if repl.trim().is_empty() => {
+                return Err(invalid(
+                    "code_mode.repl",
+                    "is blank; it is the full <scope>/<name> of a runtime: tool artifact this \
                  manifest declares in artifacts"
-                    .to_string(),
-            ))
-        }
-        Some(serde_norway::Value::String(repl)) => repl,
-        Some(_) => {
-            return Err(invalid(
-                "code_mode.repl",
-                "must be a string: the full <scope>/<name> of a runtime: tool artifact this \
+                        .to_string(),
+                ))
+            }
+            Some(serde_norway::Value::String(repl)) => repl,
+            Some(_) => {
+                return Err(invalid(
+                    "code_mode.repl",
+                    "must be a string: the full <scope>/<name> of a runtime: tool artifact this \
                  manifest declares in artifacts"
-                    .to_string(),
-            ))
-        }
-    };
+                        .to_string(),
+                ))
+            }
+        };
     let detach_after_secs = match raw.detach_after_secs {
         None => None,
         Some(value) => Some(value.as_u64().ok_or_else(|| {
@@ -16222,9 +16224,17 @@ mod code_mode_tests {
     fn code_mode_refuses_each_invalid_key_naming_the_field() {
         for (block, field, says) in [
             ("code_mode: {}\n", "code_mode.repl", "is required"),
-            ("code_mode:\n  repl:\n", "code_mode.repl", "must be a string"),
+            (
+                "code_mode:\n  repl:\n",
+                "code_mode.repl",
+                "must be a string",
+            ),
             ("code_mode:\n  repl: '  '\n", "code_mode.repl", "is blank"),
-            ("code_mode:\n  repl: 7\n", "code_mode.repl", "must be a string"),
+            (
+                "code_mode:\n  repl: 7\n",
+                "code_mode.repl",
+                "must be a string",
+            ),
             (
                 "code_mode:\n  repl: local/counter-tool\n  detach_after_secs: -1\n",
                 "code_mode.detach_after_secs",
@@ -16275,7 +16285,8 @@ mod code_mode_tests {
 
     #[test]
     fn code_mode_refuses_a_driver_repl() {
-        let input = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    \
+        let input =
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    \
                      version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: \
                      https://api.anthropic.com\n      api_key: test-key\ninference:\n  \
                      transport: http\n  model: test-model\n  driver:\n    artifact: \
@@ -16320,7 +16331,9 @@ mod code_mode_tests {
             message,
             "a script capsule (no inference:) cannot declare code_mode"
         );
-        let error = RuntimeManifest::from_yaml_str(input).unwrap_err().to_string();
+        let error = RuntimeManifest::from_yaml_str(input)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             error,
             "murmur.yaml: invalid code_mode config for 'code_mode': a script capsule (no \

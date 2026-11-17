@@ -411,7 +411,8 @@ mod tests {
     /// The description states what each operation does and its limits, and nothing about when or
     /// why to use it.
     /// The text a capsule with shell demotion and no code mode is offered, byte for byte.
-    const SHELL_ONLY_DESCRIPTION: &str = "Reports on, waits for, or stops a shell command that was \
+    const SHELL_ONLY_DESCRIPTION: &str =
+        "Reports on, waits for, or stops a shell command that was \
         moved to the background, named by the work id (wrk_…) its shell call returned. \
         `operation` is `status`, `wait` or `stop`. `status` returns at once. `wait` returns once \
         the command exits or after `wait_secs` seconds, whichever is first; `wait_secs` defaults \
@@ -464,7 +465,10 @@ mod tests {
             }
         }
         assert!(!code_mode.contains("SIGTERM"), "{code_mode}");
-        assert!(code_mode.contains("`wait_secs` defaults to 600"), "{code_mode}");
+        assert!(
+            code_mode.contains("`wait_secs` defaults to 600"),
+            "{code_mode}"
+        );
     }
 
     fn code_mode_snapshot(state: crate::code_mode::CallState) -> crate::code_mode::CallSnapshot {
@@ -519,12 +523,18 @@ mod tests {
         );
 
         let failed = render_code_mode(
-            &code_mode_snapshot(CallState::Finished(Err("tool 'counter-tool' trapped".into()))),
+            &code_mode_snapshot(CallState::Finished(Err(
+                "tool 'counter-tool' trapped".into()
+            ))),
             None,
         );
         assert!(matches!(failed.status, Status::Error));
         assert!(
-            failed.data.as_deref().unwrap().contains("call_status: error\n\ntool"),
+            failed
+                .data
+                .as_deref()
+                .unwrap()
+                .contains("call_status: error\n\ntool"),
             "{failed:?}"
         );
     }

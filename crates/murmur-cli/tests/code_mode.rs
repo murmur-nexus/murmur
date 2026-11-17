@@ -375,11 +375,7 @@ fn a_long_call_detaches_and_wait_returns_its_result() {
         counter("t1", json!({"op": "sleep", "secs": 4})),
         background("t2", "wait", "t1"),
     ]);
-    let run = home.run(&home.project(
-        model.endpoint(),
-        "",
-        &code_mode("  detach_after_secs: 1\n"),
-    ));
+    let run = home.run(&home.project(model.endpoint(), "", &code_mode("  detach_after_secs: 1\n")));
     run.assert_ok();
 
     let detached = model.result("t1");
@@ -442,11 +438,7 @@ fn stop_ends_the_instance_and_the_next_call_starts_a_new_one() {
         background("t3", "stop", "t2"),
         counter("t4", json!({"op": "incr"})),
     ]);
-    let run = home.run(&home.project(
-        model.endpoint(),
-        "",
-        &code_mode("  detach_after_secs: 1\n"),
-    ));
+    let run = home.run(&home.project(model.endpoint(), "", &code_mode("  detach_after_secs: 1\n")));
     run.assert_ok();
     assert_eq!(model.result("t1"), "count=1");
     let stopped = model.result("t3");
@@ -492,11 +484,7 @@ fn a_call_during_a_detached_call_is_refused() {
         background("t3", "wait", "t1"),
         counter("t4", json!({"op": "incr"})),
     ]);
-    let run = home.run(&home.project(
-        model.endpoint(),
-        "",
-        &code_mode("  detach_after_secs: 1\n"),
-    ));
+    let run = home.run(&home.project(model.endpoint(), "", &code_mode("  detach_after_secs: 1\n")));
     run.assert_ok();
     let work_id = work_id_in(&model.requests()[1], "t1");
     let refused = model.result("t2");
@@ -617,11 +605,7 @@ fn stop_interrupts_a_computing_call() {
         background("t2", "stop", "t1"),
         counter("t3", json!({"op": "incr"})),
     ]);
-    let run = home.run(&home.project(
-        model.endpoint(),
-        "",
-        &code_mode("  detach_after_secs: 1\n"),
-    ));
+    let run = home.run(&home.project(model.endpoint(), "", &code_mode("  detach_after_secs: 1\n")));
     run.assert_ok();
     let stopped = model.result("t2");
     assert!(
@@ -683,7 +667,11 @@ fn tools_visible_false_offers_only_the_code_mode_tool() {
     assert_eq!(model.tool_names(0), vec!["counter-tool"]);
 
     let model = Model::start(vec![counter("t1", json!({"op": "incr"}))]);
-    let run = home.run(&home.project(model.endpoint(), &echo, &format!("{shell}{}", code_mode(""))));
+    let run = home.run(&home.project(
+        model.endpoint(),
+        &echo,
+        &format!("{shell}{}", code_mode("")),
+    ));
     run.assert_ok();
     let offered = model.tool_names(0);
     for name in ["cat", "counter-tool", "echo-tool"] {
@@ -719,7 +707,10 @@ fn invalid_blocks_are_refused_by_run_and_doctor() {
             agent("code_mode:\n  repl: local/not-declared\n"),
             "code_mode.repl",
         ),
-        (agent(&format!("code_mode:\n  repl: {ANTHROPIC}\n")), "code_mode.repl"),
+        (
+            agent(&format!("code_mode:\n  repl: {ANTHROPIC}\n")),
+            "code_mode.repl",
+        ),
         (
             home.project_from(&format!(
                 "name: script\nversion: 0.1.0\nartifacts:\n  - name: {COUNTER}\n    version: \
@@ -731,12 +722,25 @@ fn invalid_blocks_are_refused_by_run_and_doctor() {
     ];
     for (project, field) in &cases {
         let manifest = fs::read_to_string(&project.manifest).unwrap();
-        let expected = format!("error[E-MAN-004]: murmur.yaml: invalid code_mode config for '{field}': ");
+        let expected =
+            format!("error[E-MAN-004]: murmur.yaml: invalid code_mode config for '{field}': ");
         let run = home.run(project);
-        assert!(!run.output.status.success(), "{manifest}\n{}", run.context());
-        assert!(run.stderr.contains(&expected), "{manifest}\n{}", run.context());
+        assert!(
+            !run.output.status.success(),
+            "{manifest}\n{}",
+            run.context()
+        );
+        assert!(
+            run.stderr.contains(&expected),
+            "{manifest}\n{}",
+            run.context()
+        );
         let doctor = home.doctor(project);
-        assert!(!doctor.output.status.success(), "{manifest}\n{}", doctor.context());
+        assert!(
+            !doctor.output.status.success(),
+            "{manifest}\n{}",
+            doctor.context()
+        );
         assert!(
             doctor.stderr.contains(&expected) || doctor.stdout.contains(&expected),
             "{manifest}\n{}",
@@ -775,7 +779,11 @@ fn a_script_capsule_package_named_by_repl_is_refused() {
     let run = home.run(&project);
     assert!(!run.output.status.success(), "{}", run.context());
     assert!(run.stderr.contains(&expected), "{}", run.context());
-    assert!(model.requests().is_empty(), "a task ran: {:#?}", model.requests());
+    assert!(
+        model.requests().is_empty(),
+        "a task ran: {:#?}",
+        model.requests()
+    );
 
     let doctor = home.doctor(&project);
     assert_eq!(doctor.output.status.code(), Some(1), "{}", doctor.context());

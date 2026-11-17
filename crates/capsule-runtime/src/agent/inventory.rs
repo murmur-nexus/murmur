@@ -360,7 +360,8 @@ mod tests {
              input_schema:\n  type: object\n  properties:\n    word:\n      type: string\n",
         );
         write_tool(&tools_dir, "plain");
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
+        let tools =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(
             serde_json::to_string(&tools).unwrap(),
             r#"[{"description":"Look a word up.","name":"lookup","parameters":{"properties":{"word":{"type":"string"}},"type":"object"}},{"name":"plain","parameters":{"properties":{},"type":"object"}}]"#
@@ -378,7 +379,8 @@ mod tests {
              provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: 800\n",
         );
         write_tool(&tools_dir, "plain");
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
+        let tools =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(
             tools[0],
             json!({
@@ -416,7 +418,8 @@ mod tests {
             .unwrap();
         }
 
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
+        let tools =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(tools[0]["name"], "fronted");
         assert_eq!(tools[0]["description"], "Fill PDF forms.");
         assert_eq!(tools[1]["name"], "plain");
@@ -448,14 +451,26 @@ mod tests {
     fn code_mode_inventory_offers_only_the_named_tools() {
         let workdir = tempfile::tempdir().unwrap();
         let tools_dir = workdir.path().join("tools");
-        for name in ["zeta", "counter-tool", "background-command", "alpha", "bash"] {
+        for name in [
+            "zeta",
+            "counter-tool",
+            "background-command",
+            "alpha",
+            "bash",
+        ] {
             write_tool(&tools_dir, name);
         }
         let root = WorkdirRoot::open(workdir.path()).unwrap();
         let all = build_tool_inventory(&root, None, &[], None);
         assert_eq!(
             tool_names(&all),
-            vec!["alpha", "background-command", "bash", "counter-tool", "zeta"]
+            vec![
+                "alpha",
+                "background-command",
+                "bash",
+                "counter-tool",
+                "zeta"
+            ]
         );
         for detaches in [true, false] {
             let only = crate::code_mode::offered_only("counter-tool", false, detaches).unwrap();
@@ -475,7 +490,10 @@ mod tests {
                 assert_eq!(names, vec!["counter-tool"]);
             }
         }
-        assert_eq!(crate::code_mode::offered_only("counter-tool", true, true), None);
+        assert_eq!(
+            crate::code_mode::offered_only("counter-tool", true, true),
+            None
+        );
     }
 
     /// The held array is limited on every rebuild as it was at launch.
@@ -487,13 +505,8 @@ mod tests {
             write_tool(&tools_dir, name);
         }
         let root = WorkdirRoot::open(workdir.path()).unwrap();
-        let mut held = HeldInventory::build(
-            &root,
-            None,
-            &[],
-            0,
-            Some(vec!["counter-tool".to_string()]),
-        );
+        let mut held =
+            HeldInventory::build(&root, None, &[], 0, Some(vec!["counter-tool".to_string()]));
         assert_eq!(tool_names(held.tools()), vec!["counter-tool"]);
         write_tool(&tools_dir, "beta");
         let refresh =
@@ -613,7 +626,8 @@ mod tests {
     #[test]
     fn runtime_origin_inventory_prefixes_only_the_runtime_entry() {
         let workdir = mixed_workdir();
-        let unmarked = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
+        let unmarked =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         let marked = build_tool_inventory(
             &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
