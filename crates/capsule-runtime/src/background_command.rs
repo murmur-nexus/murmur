@@ -408,8 +408,6 @@ mod tests {
 
     use serde_json::json;
 
-    /// The description states what each operation does and its limits, and nothing about when or
-    /// why to use it.
     /// The text a capsule with shell demotion and no code mode is offered, byte for byte.
     const SHELL_ONLY_DESCRIPTION: &str =
         "Reports on, waits for, or stops a shell command that was \
@@ -539,6 +537,8 @@ mod tests {
         );
     }
 
+    /// The description states what each operation does and its limits, and nothing about when or
+    /// why to use it.
     #[test]
     fn the_description_states_operations_and_limits_only() {
         let description = description(true, None);

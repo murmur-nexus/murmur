@@ -90,6 +90,11 @@ instance's start, its end with the reason, and each move to the background are
 The tool's grants, the `on-tool-call` hooks and the `tool_call` record apply to each call exactly
 as to any other tool's.
 
+Under `transport: http`, in a capsule with an `on-tool-call` policy hook or a
+[`capabilities.filesystem.read_only`](../reference/manifest.md#read-only-paths) list, a program the
+tool starts through [`murmur:process`](../reference/wit-interfaces.md#process) after its call moved
+to the background is refused: nothing is left to check it against the hook or the list.
+
 ## Tool dispatch
 
 Each tool call is resolved in a fixed precedence order:

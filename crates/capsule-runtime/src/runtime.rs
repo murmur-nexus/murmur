@@ -10284,7 +10284,7 @@ pub(crate) struct ToolInstance {
     yield_budget: Option<Arc<AtomicU64>>,
 }
 
-/// Why a tool call failed, with the text the per-call path has always reported for it.
+/// Why a tool call failed, and the text the call reports for it.
 #[derive(Debug)]
 pub(crate) struct ToolCallFailure {
     pub(crate) kind: ToolFailureKind,
@@ -10501,7 +10501,7 @@ pub(crate) async fn run_tool_instance(
         Err(err) => {
             // Classified rather than folded into the generic "trapped" string, so a
             // deadline or limit trap is distinguishable on a path that reports failures
-            // as plain text. `Other` reproduces the pre-slice wording verbatim.
+            // as plain text. `Other` keeps the generic "trapped" wording.
             let failure = classify_guest_failure(&err, &store.data().limits);
             let message = failure.message(&subject, &err);
             Err(ToolCallFailure {
@@ -10698,6 +10698,22 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
     result.data = Some(crate::fence::wrap_untrusted(source, &text));
 }
 
+/// A code mode call its dispatch still awaits; dropped while armed, the call is dropped with it
+/// and the instance it was cut in ends as `canceled`.
+struct AttachedCodeModeCall<'a> {
+    code_mode: &'a Arc<crate::code_mode::CodeMode>,
+    ticket: &'a crate::code_mode::CallTicket,
+    armed: bool,
+}
+
+impl Drop for AttachedCodeModeCall<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.code_mode.cancel(self.ticket);
+        }
+    }
+}
+
 /// Fence a dispatched outcome and record what it was fenced under, in that order and nowhere
 /// else.
 ///
@@ -10718,22 +10734,6 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
 ///
 /// A [`DispatchOutcome::runtime_note`] is appended after the closing marker, on its own line:
 /// the runtime's words, outside the text the system prompt tells the model to treat as data.
-/// A code mode call its dispatch still awaits; dropped while armed, the call is dropped with it
-/// and the instance it was cut in ends as `canceled`.
-struct AttachedCodeModeCall<'a> {
-    code_mode: &'a Arc<crate::code_mode::CodeMode>,
-    ticket: &'a crate::code_mode::CallTicket,
-    armed: bool,
-}
-
-impl Drop for AttachedCodeModeCall<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.code_mode.cancel(self.ticket);
-        }
-    }
-}
-
 fn fence_and_label(name: &str, origin: &LockOrigin, outcome: &mut DispatchOutcome) {
     let source = if !outcome.is_skill {
         crate::fence::tool_source(name)
