@@ -113,3 +113,9 @@ display. For `make <target>`, `just <recipe>` and `npm run <script>` the runtime
 recipe out of the capsule's workdir and carries its body on `shell-event.recipe`, so a policy
 gating `just build` decides on the text the justfile gives `build`. An absent `recipe` means the
 runtime resolved no body, and says nothing about the call.
+
+A call a code mode program makes through [`murmur:bus`](../reference/wit-interfaces.md#bus) is
+put to the same hooks as the model's call to that tool: the policy dispatch of `on-tool-call` or
+`on-shell` before it runs, and the observation dispatch after. The event is the one the model's
+call would raise, so a hook cannot tell a program's call from the model's. A refusal is handed to
+the program instead of the model.

@@ -1037,6 +1037,49 @@ pub fn inference_output_match_hook_wasm(needle: &str) -> Vec<u8> {
     policy_component("on-inference", HOOK_OUTPUT, needle, &body)
 }
 
+/// An `on-tool-call` hook that returns `deny(reason)` exactly when the event's `tool-name` is
+/// `tool`, byte for byte, and `none` for every other call.
+///
+/// `tool-event` flattens to eleven core values, so `tool-name` arrives as the `$namep`/`$namelen`
+/// parameters [`event_shape`] names. `reason` is laid down at [`REASON_POOL`] with `tool`
+/// directly after it, and the name is compared against those trailing bytes.
+pub fn tool_name_deny_hook_wasm(tool: &str, reason: &str) -> Vec<u8> {
+    let body = format!(
+        r#"      (local $i i32)
+      (if (i32.eq (local.get $namelen) (i32.const {tool_len}))
+        (then
+          (block $miss
+            (loop $next
+              (if (i32.ge_u (local.get $i) (i32.const {tool_len}))
+                (then
+                  (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+                  (i32.store (i32.const {disc}) (i32.const 6))
+                  (i32.store (i32.const {ptr}) (i32.const {REASON_POOL}))
+                  (i32.store (i32.const {slen}) (i32.const {reason_len}))
+                  (return (i32.const {RETURN_AREA}))))
+              (br_if $miss (i32.ne
+                (i32.load8_u (i32.add (local.get $namep) (local.get $i)))
+                (i32.load8_u (i32.add (i32.const {tool_at}) (local.get $i)))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $next)))))
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (i32.store (i32.const {disc}) (i32.const 0))
+      (i32.const {RETURN_AREA})"#,
+        tool_len = tool.len(),
+        reason_len = reason.len(),
+        tool_at = REASON_POOL as usize + reason.len(),
+        disc = RETURN_AREA + 4,
+        ptr = RETURN_AREA + 8,
+        slen = RETURN_AREA + 12,
+    );
+    policy_component(
+        "on-tool-call",
+        HOOK_OUTPUT,
+        &format!("{reason}{tool}"),
+        &body,
+    )
+}
+
 /// A hook whose `fn_name` traps.
 pub fn trap_hook_wasm(fn_name: &str) -> Vec<u8> {
     policy_component(fn_name, HOOK_OUTPUT, "", "      unreachable")

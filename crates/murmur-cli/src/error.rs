@@ -144,6 +144,11 @@ pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but bin
 pub const E_CAP_019: &str = "E-CAP-019"; // a process driver requires a variable capabilities.env.allow does not declare
 pub const E_CAP_020: &str = "E-CAP-020"; // two declared artifacts share a tool name
 pub const E_CAP_021: &str = "E-CAP-021"; // a process driver's harness needs are not allowed by the capsule manifest
+pub const E_CAP_022: &str = "E-CAP-022"; // an artifact imports murmur:bus but is not the artifact code_mode.repl names
+/// The fix `mur run` and `mur doctor` both name for [`E_CAP_022`].
+pub const E_CAP_022_HINT: &str = "murmur:bus is linked only into the runtime: tool artifact \
+                                  code_mode.repl names — name this artifact in code_mode.repl, or \
+                                  use a build of it that does not import murmur:bus";
 
 /// The hint on every `E-CAP-018` refusal, from the manifest parser and from staging alike.
 pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
@@ -1178,6 +1183,9 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::CodeModeWithoutGuestWorkers => {
                 CliError::new(E_IO_003, error.to_string())
             }
+            error @ RuntimeError::BusImportRefused { .. } => {
+                CliError::with_hint(E_CAP_022, error.to_string(), E_CAP_022_HINT)
+            }
             RuntimeError::GuestWorkerLost(message) => CliError::with_hint(
                 E_RUN_065,
                 message,
@@ -1690,6 +1698,26 @@ fn extract_interface_name(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e_cap_022_names_the_artifact_and_code_mode_repl() {
+        let cli = CliError::from(RuntimeError::BusImportRefused {
+            artifact: "local/bus-repl-copy".to_string(),
+        });
+        assert_eq!(cli.code, E_CAP_022);
+        let rendered = cli.to_string();
+        assert!(
+            rendered.starts_with(
+                "error[E-CAP-022]: artifact 'local/bus-repl-copy' imports murmur:bus but is not \
+                 the artifact code_mode.repl names"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("hint: {E_CAP_022_HINT}")),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn e_run_065_names_the_lost_worker_and_links_its_entry() {

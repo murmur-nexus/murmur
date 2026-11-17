@@ -73,6 +73,8 @@ struct CallEntry {
     capsule: Option<Arc<Mutex<CapsuleStoreState>>>,
     /// The response bodies this call is streaming, stopped when the call ends.
     bodies: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Where the code mode instance's `murmur:bus` requests go, for its calls.
+    bus: crate::bus::BusLink,
 }
 
 impl CallEntry {
@@ -104,6 +106,7 @@ impl CallEntry {
             hook: None,
             capsule: None,
             bodies: Mutex::new(Vec::new()),
+            bus: crate::bus::BusLink::none(),
         }
     }
 }
@@ -428,6 +431,10 @@ impl WorkerConn {
         request: HostRequest,
     ) {
         match request {
+            HostRequest::Bus(call) => {
+                let reply = entry.bus.answer(call).await;
+                self.reply_host(host, HostReply::Bus(reply));
+            }
             HostRequest::RequestInput { prompt } => {
                 let answer = entry
                     .input
@@ -1164,6 +1171,7 @@ impl GuestWorkers {
         entry.events = host.events;
         entry.input = host.input;
         entry.process = tokio::sync::Mutex::new(RemoteProcessHost::new(host.process));
+        entry.bus = host.bus;
         // The first call instantiates as well as runs, each phase bounded by the worker.
         let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
         let reply = self

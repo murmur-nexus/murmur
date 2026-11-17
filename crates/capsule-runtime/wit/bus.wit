@@ -1,0 +1,35 @@
+package murmur:bus@0.1.0;
+
+/// The capsule's operations, served to the one WASM tool `code_mode.repl` names.
+interface bus {
+  use murmur:tool/run@0.2.0.{tool-result};
+
+  /// One operation the program may call.
+  record operation {
+    /// The name `call` takes: the name the model's tool array gives it.
+    name: string,
+    /// The description the model's tool array gives it.
+    description: string,
+    /// The JSON Schema the model's tool array gives its input, as JSON text.
+    input-schema: string,
+  }
+
+  /// One call in a batch.
+  record call-request {
+    name: string,
+    /// The call's arguments: one JSON value, as JSON text.
+    input: string,
+  }
+
+  /// A call that returned no tool-result.
+  variant call-error {
+    /// The runtime did not run the call; the text says why.
+    refused(string),
+    /// The runtime ran the call and it failed before the operation returned a result.
+    failed(string),
+  }
+
+  %list: func() -> result<list<operation>, string>;
+  call: func(name: string, input: string) -> result<tool-result, call-error>;
+  call-batch: func(calls: list<call-request>) -> list<result<tool-result, call-error>>;
+}

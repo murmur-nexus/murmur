@@ -2335,6 +2335,15 @@ pub(crate) async fn run_agent_loop(
                     let dispatched = match refused {
                         Some(refusal) => Err(refusal),
                         None => {
+                            // The frame a code mode program's `murmur:bus` requests are
+                            // answered in, while this call runs in the foreground.
+                            let frame = crate::bus::BusFrame {
+                                repl_call_id: Some(tool_call_id.clone())
+                                    .filter(|id| !id.is_empty()),
+                                cancel: cancel.clone(),
+                                system_prompt_artifact: system_prompt_artifact.map(str::to_string),
+                                otel,
+                            };
                             store_state
                                 .dispatch_agent_tool_exclusive(
                                     &tool_name,
@@ -2344,6 +2353,7 @@ pub(crate) async fn run_agent_loop(
                                     },
                                     Some(&mut gate),
                                     cancel.as_ref(),
+                                    Some(frame),
                                 )
                                 .await
                         }
@@ -2408,128 +2418,39 @@ pub(crate) async fn run_agent_loop(
                             if !accepted.images.is_empty() {
                                 images_in_context = true;
                             }
-                            let status = if is_error { "error" } else { "ok" }.to_string();
                             let duration_ms =
                                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-                            let output_bytes = text.len() as u64;
-                            hooks
-                                .emit(
-                                    &records_root,
-                                    HookEvent::ToolCall {
-                                        turn: turn_u32,
-                                        tool_name: tool_name.clone(),
-                                        input_bytes,
-                                        input: input_json,
-                                        output_bytes,
-                                        duration_ms,
-                                        status: status.clone(),
-                                    },
-                                )
-                                .await;
-                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
-                            if let Some(lost) = store_state.guest_worker_lost() {
-                                return Err(lost);
-                            }
-                            if outcome.is_skill {
-                                trace
-                                    .write_skill_call(
-                                        turn_u32,
-                                        tool_name.clone(),
-                                        &store_state.artifact_origin(&tool_name),
-                                        output_bytes,
-                                        duration_ms,
-                                        status.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        RuntimeError::AgentLoopFailed(format!(
-                                            "trace write failed: {e}"
-                                        ))
-                                    })?;
-                            } else {
-                                trace
-                                    .write_tool_call_with_attachments(
-                                        turn_u32,
-                                        tool_name.clone(),
-                                        Some(tool_call_id.clone()),
-                                        input.clone(),
-                                        input_bytes,
-                                        &text,
-                                        output_bytes,
-                                        duration_ms,
-                                        status.clone(),
-                                        state_effect.clone(),
-                                        resource_id.clone(),
-                                        outcome.runtime_error.as_deref(),
-                                        accepted.trace.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        RuntimeError::AgentLoopFailed(format!(
-                                            "trace write failed: {e}"
-                                        ))
-                                    })?;
-                            }
-                            otel.emit_tool_call(
-                                &tool_name,
-                                input_bytes,
-                                output_bytes,
-                                duration_ms,
-                                &status,
-                            )
-                            .await;
                             // Read before the observation is moved into the hook and trace below.
                             let exit_code = outcome.shell.as_ref().map(|shell| shell.exit_code);
-                            if let Some(shell) = outcome.shell {
-                                hooks
-                                    .emit(
-                                        &records_root,
-                                        HookEvent::Shell {
-                                            turn: turn_u32,
-                                            binary: shell.binary.clone(),
-                                            command: shell.command.clone(),
-                                            argv: shell.argv.clone(),
-                                            script: shell.script.clone(),
-                                            recipe: shell.recipe.clone(),
-                                            exit_code: shell.exit_code,
-                                            stdout: shell.stdout.clone(),
-                                            stderr: shell.stderr.clone(),
-                                            stdout_bytes: shell.stdout_bytes,
-                                            stderr_bytes: shell.stderr_bytes,
-                                            duration_ms: shell.duration_ms,
-                                        },
-                                    )
-                                    .await;
-                                flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
-                                if let Some(lost) = store_state.guest_worker_lost() {
-                                    return Err(lost);
-                                }
-                                trace
-                                    .write_shell(
-                                        turn_u32,
-                                        shell.binary.clone(),
-                                        shell.command.clone(),
-                                        shell.exit_code,
-                                        shell.stdout_bytes,
-                                        shell.stderr_bytes,
-                                        shell.duration_ms,
-                                        shell.resource_limit.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        RuntimeError::AgentLoopFailed(format!(
-                                            "trace write failed: {e}"
-                                        ))
-                                    })?;
-                                otel.emit_shell(&shell.command, shell.exit_code, shell.duration_ms)
-                                    .await;
-                            }
-                            // No `HookEvent` fires here. `HookEvent::Shell` carries an exit code
-                            // and a demoted command has none yet; a hook learns about one when
-                            // its completion arrives as a task, like the model does.
-                            if let Some(detached) = outcome.detached {
-                                record_demotion(trace, turn_u32, &detached).await;
-                            }
+                            observe_dispatched_call(
+                                hooks,
+                                trace,
+                                otel,
+                                &records_root,
+                                store_state,
+                                turn_u32,
+                                ObservedCall {
+                                    tool_name: &tool_name,
+                                    tool_call_id: Some(&tool_call_id),
+                                    input: &input,
+                                    input_json: &input_json,
+                                    input_bytes,
+                                    duration_ms,
+                                    mark: None,
+                                    result: ObservedResult::Ran(Box::new(RanCall {
+                                        text: &text,
+                                        is_error,
+                                        is_skill: outcome.is_skill,
+                                        state_effect: state_effect.clone(),
+                                        resource_id: resource_id.clone(),
+                                        runtime_error: outcome.runtime_error.as_deref(),
+                                        attachments: accepted.trace.clone(),
+                                        shell: outcome.shell.take(),
+                                        detached: outcome.detached.take(),
+                                    })),
+                                },
+                            )
+                            .await?;
                             // The door serves each accepted image for the task the frame names.
                             let stream_attachments = index_attachments(
                                 store_state,
@@ -2573,56 +2494,25 @@ pub(crate) async fn run_agent_loop(
                         Err(error) => {
                             let duration_ms =
                                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-                            let output_bytes = error.len() as u64;
-                            hooks
-                                .emit(
-                                    &records_root,
-                                    HookEvent::ToolCall {
-                                        turn: turn_u32,
-                                        tool_name: tool_name.clone(),
-                                        input_bytes,
-                                        input: input_json,
-                                        output_bytes,
-                                        duration_ms,
-                                        status: "error".to_string(),
-                                    },
-                                )
-                                .await;
-                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
-                            if let Some(lost) = store_state.guest_worker_lost() {
-                                return Err(lost);
-                            }
-                            trace
-                                .write_tool_call(
-                                    turn_u32,
-                                    tool_name.clone(),
-                                    Some(tool_call_id.clone()),
-                                    input.clone(),
+                            observe_dispatched_call(
+                                hooks,
+                                trace,
+                                otel,
+                                &records_root,
+                                store_state,
+                                turn_u32,
+                                ObservedCall {
+                                    tool_name: &tool_name,
+                                    tool_call_id: Some(&tool_call_id),
+                                    input: &input,
+                                    input_json: &input_json,
                                     input_bytes,
-                                    &error,
-                                    output_bytes,
                                     duration_ms,
-                                    "error".to_string(),
-                                    // Dispatch failed before any tool result — nothing declared,
-                                    // neither a state effect nor a resource identity.
-                                    None,
-                                    None,
-                                    Some(&error),
-                                )
-                                .await
-                                .map_err(|e| {
-                                    RuntimeError::AgentLoopFailed(format!(
-                                        "trace write failed: {e}"
-                                    ))
-                                })?;
-                            otel.emit_tool_call(
-                                &tool_name,
-                                input_bytes,
-                                output_bytes,
-                                duration_ms,
-                                "error",
+                                    mark: None,
+                                    result: ObservedResult::Failed(&error),
+                                },
                             )
-                            .await;
+                            .await?;
                             // Emit artifact event for error tool call too
                             if let Some(task) = &stream_task {
                                 // The runtime's own text about a call that never reached a
@@ -3615,6 +3505,221 @@ async fn write_hook_inference_record(
     }
 }
 
+/// One dispatched call, as the observation hooks and the trace are shown it once it ran.
+pub(crate) struct ObservedCall<'a> {
+    pub(crate) tool_name: &'a str,
+    /// The provider's id; `None` for a call a code mode program made.
+    pub(crate) tool_call_id: Option<&'a str>,
+    pub(crate) input: &'a Value,
+    pub(crate) input_json: &'a str,
+    pub(crate) input_bytes: u64,
+    pub(crate) duration_ms: u64,
+    /// Set for a call a code mode program made through `murmur:bus`.
+    pub(crate) mark: Option<&'a crate::trace::CodeModeMark>,
+    pub(crate) result: ObservedResult<'a>,
+}
+
+/// How a dispatched call ended.
+pub(crate) enum ObservedResult<'a> {
+    /// The dispatch returned an outcome.
+    Ran(Box<RanCall<'a>>),
+    /// The dispatch failed, or the call was refused, with this text. Observed by the hooks as a
+    /// failed call.
+    Failed(&'a str),
+    /// A code mode program's call the runtime refused before any check that observes a refusal:
+    /// recorded as a failed `tool_call`, shown to no hook.
+    Refused(&'a str),
+}
+
+/// A dispatched call's outcome, reduced to what is observed and recorded.
+pub(crate) struct RanCall<'a> {
+    /// The text the caller reads: the fenced result, with any attachment notes.
+    pub(crate) text: &'a str,
+    pub(crate) is_error: bool,
+    pub(crate) is_skill: bool,
+    pub(crate) state_effect: Option<String>,
+    pub(crate) resource_id: Option<String>,
+    pub(crate) runtime_error: Option<&'a str>,
+    pub(crate) attachments: Vec<crate::trace::AttachmentRecord>,
+    pub(crate) shell: Option<crate::hooks::ShellDispatchInfo>,
+    pub(crate) detached: Option<DetachedDispatchInfo>,
+}
+
+/// The hooks and records every dispatched call gets once it ran, the model's own and a code mode
+/// program's alike: the `on-tool-call` observation, the `tool_call` (or `skill_call`) record,
+/// and for a shell tool the `on-shell` observation, the `shell` record and a demotion's record.
+///
+/// `otel` spans are posted only for the model's own call (`mark` is `None`). `Err` is a lost
+/// guest worker or a trace write that failed, each of which ends the session.
+pub(crate) async fn observe_dispatched_call(
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &OtelEmitter,
+    records_root: &WorkdirRoot,
+    store_state: &CapsuleStoreState,
+    turn: u32,
+    call: ObservedCall<'_>,
+) -> Result<(), RuntimeError> {
+    let trace_failed =
+        |e: std::io::Error| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"));
+    let spans = call.mark.is_none();
+    let (output, status) = match &call.result {
+        ObservedResult::Ran(ran) => (ran.text, if ran.is_error { "error" } else { "ok" }),
+        ObservedResult::Failed(error) | ObservedResult::Refused(error) => (*error, "error"),
+    };
+    let output_bytes = output.len() as u64;
+    if !matches!(call.result, ObservedResult::Refused(_)) {
+        hooks
+            .emit(
+                records_root,
+                HookEvent::ToolCall {
+                    turn,
+                    tool_name: call.tool_name.to_string(),
+                    input_bytes: call.input_bytes,
+                    input: call.input_json.to_string(),
+                    output_bytes,
+                    duration_ms: call.duration_ms,
+                    status: status.to_string(),
+                },
+            )
+            .await;
+        flush_hook_inference_records(hooks, trace, otel, turn).await;
+        if let Some(lost) = store_state.guest_worker_lost() {
+            return Err(lost);
+        }
+    }
+    let ran = match call.result {
+        ObservedResult::Failed(error) | ObservedResult::Refused(error) => {
+            trace
+                .write_tool_call_marked(
+                    turn,
+                    call.tool_name.to_string(),
+                    call.tool_call_id.map(str::to_string),
+                    call.input.clone(),
+                    call.input_bytes,
+                    error,
+                    output_bytes,
+                    call.duration_ms,
+                    "error".to_string(),
+                    // Dispatch failed before any tool result — nothing declared, neither a state
+                    // effect nor a resource identity.
+                    None,
+                    None,
+                    Some(error),
+                    Vec::new(),
+                    call.mark,
+                )
+                .await
+                .map_err(trace_failed)?;
+            if spans {
+                otel.emit_tool_call(
+                    call.tool_name,
+                    call.input_bytes,
+                    output_bytes,
+                    call.duration_ms,
+                    "error",
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        ObservedResult::Ran(ran) => *ran,
+    };
+    if ran.is_skill {
+        trace
+            .write_skill_call_marked(
+                turn,
+                call.tool_name.to_string(),
+                &store_state.artifact_origin(call.tool_name),
+                output_bytes,
+                call.duration_ms,
+                status.to_string(),
+                call.mark,
+            )
+            .await
+            .map_err(trace_failed)?;
+    } else {
+        trace
+            .write_tool_call_marked(
+                turn,
+                call.tool_name.to_string(),
+                call.tool_call_id.map(str::to_string),
+                call.input.clone(),
+                call.input_bytes,
+                ran.text,
+                output_bytes,
+                call.duration_ms,
+                status.to_string(),
+                ran.state_effect,
+                ran.resource_id,
+                ran.runtime_error,
+                ran.attachments,
+                call.mark,
+            )
+            .await
+            .map_err(trace_failed)?;
+    }
+    if spans {
+        otel.emit_tool_call(
+            call.tool_name,
+            call.input_bytes,
+            output_bytes,
+            call.duration_ms,
+            status,
+        )
+        .await;
+    }
+    if let Some(shell) = ran.shell {
+        hooks
+            .emit(
+                records_root,
+                HookEvent::Shell {
+                    turn,
+                    binary: shell.binary.clone(),
+                    command: shell.command.clone(),
+                    argv: shell.argv.clone(),
+                    script: shell.script.clone(),
+                    recipe: shell.recipe.clone(),
+                    exit_code: shell.exit_code,
+                    stdout: shell.stdout.clone(),
+                    stderr: shell.stderr.clone(),
+                    stdout_bytes: shell.stdout_bytes,
+                    stderr_bytes: shell.stderr_bytes,
+                    duration_ms: shell.duration_ms,
+                },
+            )
+            .await;
+        flush_hook_inference_records(hooks, trace, otel, turn).await;
+        if let Some(lost) = store_state.guest_worker_lost() {
+            return Err(lost);
+        }
+        trace
+            .write_shell(
+                turn,
+                shell.binary.clone(),
+                shell.command.clone(),
+                shell.exit_code,
+                shell.stdout_bytes,
+                shell.stderr_bytes,
+                shell.duration_ms,
+                shell.resource_limit.clone(),
+            )
+            .await
+            .map_err(trace_failed)?;
+        if spans {
+            otel.emit_shell(&shell.command, shell.exit_code, shell.duration_ms)
+                .await;
+        }
+    }
+    // No `HookEvent` fires here. `HookEvent::Shell` carries an exit code and a demoted command
+    // has none yet; a hook learns about one when its completion arrives as a task, like the model
+    // does.
+    if let Some(detached) = ran.detached {
+        record_demotion(trace, turn, &detached).await;
+    }
+    Ok(())
+}
+
 /// The session's pre-dispatch decision point, in one place so every route to a call reaches the
 /// same three refusals in the same order.
 ///
@@ -3670,6 +3775,17 @@ impl<'a> CallGate<'a> {
         self.trace
             .write_safety_check(self.turn, tool_call_id, tool, checks, outcome)
             .await
+    }
+
+    /// The turn the gate checks calls in.
+    pub(crate) fn turn(&self) -> u32 {
+        self.turn
+    }
+
+    /// The hooks and the trace writer the gate holds, for a caller that observes and records the
+    /// calls it lets through while it holds the gate: the `murmur:bus` frame.
+    pub(crate) fn parts(&mut self) -> (&mut HookRuntime, &mut TraceWriter, &WorkdirRoot) {
+        (self.hooks, self.trace, self.records_root)
     }
 
     /// Whether [`Self::check`] can refuse a call at all.

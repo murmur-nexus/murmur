@@ -19,6 +19,7 @@ use murmur_artifact::{parse_wit_levels, WitLevel};
 /// with a version bump or fails the build.
 pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
+    ("murmur:bus", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
     ("murmur:conversation", "0.2.0"),
     ("murmur:driver", "0.6.0"),
@@ -113,6 +114,7 @@ mod tests {
             crate::task_io_import::TASK_IO_IFACE_VERSIONED,
             crate::tokens_import::TOKENS_IFACE_VERSIONED,
             crate::session_process::PROCESS_IFACE,
+            crate::bus::BUS_IFACE,
         ];
         let served = served_set();
         for interface in resolved {
@@ -151,8 +153,44 @@ mod tests {
     }
 
     #[test]
-    fn wit_levels_served_level_is_level_7() {
-        assert_eq!(served_wit_level().level, 7);
+    fn wit_levels_served_level_is_level_8() {
+        assert_eq!(served_wit_level().level, 8);
+    }
+
+    /// Level 8 adds `murmur:bus` as a new package and moves nothing else, so an artifact fits
+    /// level 8 exactly when it fits level 7, unless it imports the new package.
+    #[test]
+    fn wit_levels_level_8_only_adds_the_bus_package() {
+        use murmur_artifact::{version_fit, FitSubject, VersionFit, WitContracts};
+        let levels = wit_levels();
+        let (seven, eight) = (&levels[6], &levels[7]);
+        let added: Vec<_> = eight
+            .packages
+            .iter()
+            .filter(|package| !seven.packages.contains(package))
+            .collect();
+        assert_eq!(added, [&("murmur:bus".to_string(), "0.1.0".to_string())]);
+        assert_eq!(eight.packages.len(), seven.packages.len() + 1);
+
+        let contracts = |imports: &[&str]| WitContracts {
+            exports: vec!["murmur:tool/run@0.2.0".to_string()],
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        };
+        let fits = |contracts: WitContracts, level| {
+            version_fit(&FitSubject::component(contracts), level) == VersionFit::Fits
+        };
+        let tool = || {
+            contracts(&[
+                "murmur:stream/events@0.1.0",
+                "murmur:task/task@0.1.0",
+                "murmur:process/process@0.2.0",
+            ])
+        };
+        assert!(fits(tool(), seven));
+        assert!(fits(tool(), eight));
+        let bus_tool = || contracts(&["murmur:bus/bus@0.1.0", "murmur:process/process@0.2.0"]);
+        assert!(!fits(bus_tool(), seven));
+        assert!(fits(bus_tool(), eight));
     }
 
     /// Level 7 moved `murmur:process` alone, for `output`'s end-of-stream fields, so a level-6

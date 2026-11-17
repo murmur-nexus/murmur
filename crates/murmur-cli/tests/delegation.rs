@@ -90,6 +90,8 @@ const READING_PARENT: &str = "reading-delegator";
 /// The WASM tool a parent with no shell reads files with, preopened at `murmur-runtime/` the way
 /// every `runtime: tool` with no `capabilities.filesystem.scope` is.
 const PROBE_TOOL: &str = "runtime-dir-probe";
+/// The code mode tool a parent's program delegates through, over `murmur:bus`.
+const BUS_REPL: &str = "bus-repl";
 /// The parent whose envelope also grants `bash`, so the child it delegates to may run commands.
 const FORGING_PARENT: &str = "forging-delegator";
 /// The sub-capsule whose one command tries to forge its own outcome, and whose task then fails.
@@ -711,6 +713,18 @@ fn suite() -> &'static Suite {
                 "task_acceptance: queue\n  after_task: sleep",
             ),
             None,
+        );
+        // The code mode tool of the parent whose program delegates through `murmur:bus`.
+        common::publish_to_store(
+            &registry,
+            &common::local(BUS_REPL),
+            VERSION,
+            "tool",
+            "runtime: tool\n",
+            Some((
+                "tool.wasm",
+                &common::fixture_path("bus-probe/tool/bus-repl.wasm"),
+            )),
         );
         // The file tool of the parent that has no shell.
         common::publish_to_store(
@@ -3972,4 +3986,173 @@ fn workdir_snapshot_absent_a_plain_reviewer_starts_empty_and_cannot_reach_the_pa
         "{grants}"
     );
     assert_eq!(grants["parent_workdir"], Value::Null, "{grants}");
+}
+
+// ── code mode ────────────────────────────────────────────────────────────────
+
+/// A code mode parent's run, through the real `mur`: code mode needs guest workers, which an
+/// in-process launch does not start.
+struct CodeModeParent {
+    stdout: String,
+    stderr: String,
+    server: QueuedServer,
+}
+
+impl CodeModeParent {
+    /// Runs a parent declaring `bus-repl` as its code mode tool, with the delegating parent's
+    /// name and `capabilities.spawn.allow`, on one task: the model calls `bus-repl` as `tool_id`,
+    /// whose program calls `delegate-task` with `capsule` through the bus, then ends its turn.
+    fn run(tool_id: &str, capsule: &str, task: &str) -> Self {
+        let suite = suite();
+        let server = QueuedServer::start();
+        server.push(tool_use_response(
+            tool_id,
+            BUS_REPL,
+            json!({
+                "op": "call",
+                "name": "delegate-task",
+                "input": {"capsule": capsule, "version": VERSION, "task": task}
+            }),
+        ));
+        server.push(end_turn_response("delegated"));
+        server.push(end_turn_response("noted the outcome"));
+        let project = TempDir::new().unwrap().keep();
+        let manifest = project.join("murmur.yaml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "name: {PARENT}\nversion: {VERSION}\n\
+                 artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+                 \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
+                 \x20 - name: {repl}\n    version: {VERSION}\n    runtime: tool\n\
+                 capabilities:\n  network:\n    allow: [127.0.0.1]\n  \
+                 env:\n    allow: [{PROVIDER_KEY_VAR}]\n{SPAWN_YAML}\
+                 code_mode:\n  repl: {repl}\n\
+                 inference:\n  transport: http\n  model: test-model\n  \
+                 driver:\n    artifact: {DRIVER}\n",
+                endpoint = server.endpoint,
+                repl = common::local(BUS_REPL),
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new(mur_binary())
+            .current_dir(&project)
+            .args(["run", "--manifest", manifest.to_str().unwrap()])
+            .args(["--task", "delegate it from the program", "--verbose"])
+            .output()
+            .unwrap();
+        let _ = &suite.registry;
+        let run = Self {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            server,
+        };
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr
+        );
+        run
+    }
+
+    fn records_dir(&self) -> PathBuf {
+        common::parse_records_from_stdout(&self.stdout)
+    }
+
+    fn events(&self, event_type: &str) -> Vec<Value> {
+        common::read_whole_trace(&self.records_dir().join("trace.jsonl"))
+            .into_iter()
+            .filter(|event| event["event_type"] == event_type)
+            .collect()
+    }
+
+    fn child_dirs(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(self.records_dir().join("children")) else {
+            return Vec::new();
+        };
+        entries.flatten().map(|entry| entry.path()).collect()
+    }
+
+    /// The program's answer: the JSON `bus-repl` returned as tool call `tool_id`'s data.
+    fn answer(&self, tool_id: &str) -> Value {
+        let text = tool_result_text(&self.server.requests(), tool_id)
+            .unwrap_or_else(|| panic!("no result for {tool_id}; stderr:\n{}", self.stderr));
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+}
+
+/// S6 (a): a code mode program's `delegate-task` starts the child under the parent's own spawn
+/// credential, and the delegation's records carry the code mode call it was made in.
+#[test]
+fn a_code_mode_program_delegates_through_the_bus() {
+    if common::skip_without_host_support("a_code_mode_program_delegates_through_the_bus") {
+        return;
+    }
+    let spawns_before = suite().roost.spawn_requests();
+    let parent = CodeModeParent::run("toolu_repl_dlg", WORKER, "answer from below");
+    let answer = parent.answer("toolu_repl_dlg");
+    assert_eq!(answer["ok"]["status"], "passed", "{answer}");
+    assert!(suite().roost.spawn_requests() > spawns_before);
+    assert!(suite()
+        .roost
+        .spawned_names()
+        .contains(&common::local(WORKER)));
+    assert!(suite()
+        .roost
+        .tokens()
+        .iter()
+        .any(|token| token.starts_with(CREDENTIAL_PREFIX)));
+
+    let start = parent.events("delegation_start");
+    assert_eq!(start.len(), 1, "{start:?}");
+    assert_eq!(start[0]["repl_call_id"], "toolu_repl_dlg", "{}", start[0]);
+    assert!(start[0]["delegation_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("dlg_"));
+    assert!(start[0]["child_session_id"].is_string(), "{}", start[0]);
+    let ended = parent.events("delegation");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["repl_call_id"], "toolu_repl_dlg", "{}", ended[0]);
+    assert_eq!(ended[0]["delegation_id"], start[0]["delegation_id"]);
+    let bus: Vec<Value> = parent
+        .events("tool_call")
+        .into_iter()
+        .filter(|event| event["tool_name"] == "delegate-task")
+        .collect();
+    assert_eq!(bus.len(), 1, "{bus:?}");
+    assert_eq!(bus[0]["origin"], "code_mode");
+    assert_eq!(bus[0]["repl_call_id"], "toolu_repl_dlg");
+}
+
+/// S6 (b): a bound refusal reaches the program as the daemon's sentence, unaltered, and the
+/// `delegation` record carries it with the code mode call it was made in.
+#[test]
+fn a_code_mode_program_meets_the_delegation_bounds() {
+    if common::skip_without_host_support("a_code_mode_program_meets_the_delegation_bounds") {
+        return;
+    }
+    let sentence = mur_roost::bounds::BoundRefusal::DepthExhausted {
+        max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+    }
+    .to_string();
+    suite()
+        .roost
+        .refuse_spawns_of(&common::local(DEEP_WORKER), &sentence);
+    let parent = CodeModeParent::run("toolu_repl_deep", DEEP_WORKER, "go deeper");
+    let answer = parent.answer("toolu_repl_deep");
+    assert_eq!(answer["failed"], json!(sentence), "{answer}");
+
+    let events = parent.events("delegation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], "refused", "{}", events[0]);
+    assert_eq!(events[0]["reason"], json!(sentence), "{}", events[0]);
+    assert_eq!(
+        events[0]["repl_call_id"], "toolu_repl_deep",
+        "{}",
+        events[0]
+    );
+    assert!(parent.events("delegation_start").is_empty());
+    assert!(parent.child_dirs().is_empty(), "no child directory exists");
 }

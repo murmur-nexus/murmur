@@ -6509,6 +6509,7 @@ mod tests {
             started: std::time::Instant::now(),
             child: None,
             arrived: false,
+            repl_call_id: None,
         }
     }
 

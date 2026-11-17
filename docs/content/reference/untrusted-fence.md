@@ -72,6 +72,7 @@ anywhere inside a block — including one drawn inside an image — is a forgery
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `tool_call` | In `output`, and counted in `output_bytes` | Unlabelled |
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `skill_call` | Not recorded: the event carries no output | `trust` — `"untrusted"` exactly when the skill's result was fenced under `skill:<skill_name>` |
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | In the message's `content` | Unlabelled. The `message` record has no `fence` field; read the markers |
+| A [`murmur:bus`](wit-interfaces.md#bus-results) result handed to a code mode program | In `tool-result.data`, under the source the model's result to the same call would carry | Unlabelled |
 
 The two labelled surfaces differ: `fenceSource` is on every frame, `null` when `content` is
 unfenced, while a record line's `fence` is absent when unset, like the other envelope keys in the

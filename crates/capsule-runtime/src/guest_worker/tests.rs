@@ -65,6 +65,7 @@ fn spec(name: &str, env: Vec<(String, String)>) -> ToolCallSpec {
                 read_only: false,
             }],
         },
+        bus: false,
     }
 }
 
@@ -693,6 +694,7 @@ fn test_host() -> crate::runtime::ToolCallHost {
         process: crate::session_process::ProcessAccess::Unavailable(
             crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
         ),
+        bus: crate::bus::BusLink::none(),
     }
 }
 

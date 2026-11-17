@@ -11,6 +11,7 @@ use crate::bindings::hook::murmur::conversation::read::MessagePage;
 use crate::bindings::hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse};
 use crate::bindings::hook::murmur::task_io::read::{IoError, TaskInputForm};
 use crate::bindings::host::murmur::tool::run::{ToolInput, ToolResult};
+use crate::bus::{BusCall, BusReply};
 use crate::code_mode::InstanceEnd;
 use crate::hooks::{HookArg, HookSpec};
 use crate::inference_import::HookInferencePurpose;
@@ -233,6 +234,8 @@ pub(crate) enum HostRequest {
     /// A script capsule root's `murmur:tool-registry/invoke`, `murmur:artifact-manager/manage` or
     /// `murmur:message/send` function.
     Capsule(Box<CapsuleCall>),
+    /// The code mode instance's `murmur:bus/bus` function.
+    Bus(BusCall),
 }
 
 /// One `murmur:task-io/read` function.
@@ -264,6 +267,7 @@ pub(crate) enum HostReply {
     Capsule(Box<CapsuleReply>),
     /// Not answered: the call named is not in flight on this connection.
     Refused(String),
+    Bus(BusReply),
 }
 
 /// One `murmur:stream/events` call.

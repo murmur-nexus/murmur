@@ -3216,7 +3216,7 @@ code_mode:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `code_mode.repl` | string | yes | The full `<scope>/<name>` of one `artifacts` entry, exactly as that entry's `name`. The entry is declared with `runtime: tool`, and its installed package's own `murmur.yaml` declares `runtime: tool` (or the older `wasm` spelling, or no `runtime:`). |
+| `code_mode.repl` | string | yes | The full `<scope>/<name>` of one `artifacts` entry, exactly as that entry's `name`. The entry is declared with `runtime: tool`, and its installed package's own `murmur.yaml` declares `runtime: tool` (or the older `wasm` spelling, or no `runtime:`). It is the one artifact [`murmur:bus`](wit-interfaces.md#bus) is linked into, through which its programs call the capsule's other tools; any other artifact importing `murmur:bus` is refused with [`E-CAP-022`](diagnostics.md#e-cap-022). |
 | `code_mode.detach_after_secs` | integer ≥ 0 | no | Default: not set — a call runs until it returns. Seconds a call from the model runs before it moves to the background under a work id. While it is set, the [`background-command`](runtime-provided-tools.md#background-command) tool is offered. |
 | `code_mode.tools_visible` | boolean | no | Default: `true`. With `false`, the model is offered the code mode tool alone, and `background-command` beside it when `detach_after_secs` is set. Every other tool stays callable. |
 

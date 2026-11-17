@@ -3177,7 +3177,7 @@ Output sections, in the order they are printed:
 | Turns | always | Turn count and configured max. When the task continued with the outcomes of work it handed off, a `continued:  <N>  (<A> member answer(s), <D> delegation outcome(s))` line follows, counting its [`task_continued`](observability-schemas.md#task-continued) records. When any turn stopped at the [output cap](manifest.md#inference-max-tokens-reached), a `capped:     <N> turn(s) stopped at the inference.max_tokens output cap` line follows |
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing each reported count — `in`, `out`, `cached`, `cache write`, `thinking` — over the turns that reported it. A count no turn reported is left off the line. Under [`transport: process`](manifest.md#transport-process) the harness's input and output counts are the totals above, so only the cache and thinking counts appear here |
 | Wire | one or more turns carrying content hashes, or one or more [`tools_refreshed`](observability-schemas.md#tools-refreshed) records | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried. Then one `refreshed:  turn <n>  <trigger>  +<added>  -<removed>` row per turn whose tool list changed, and the `--body` command that prints one of the hashes |
-| Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
+| Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call. The calls a [code mode program](wit-interfaces.md#bus) made are nested under the code mode call they ran in — see [Code mode calls](#trace-show-code-mode) |
 | Redundant calls | always | Calls that re-read a resource nothing had changed since. Agent turns and plan steps are scored against one shared history, so either can be named as the call or as the earlier read it duplicates |
 | Skill calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call. The call of a skill whose `skill_call.trust` is `untrusted` ends in ` runtime/untrusted`: `turn 1  pulled-style 2ms ✓ runtime/untrusted` |
 | Pulled at runtime | one or more [`artifact_pulled`](observability-schemas.md#session-trace-tracejsonl) records | One `<name>@<version>  <runtime>  <origin>/<trust>` row per pull, in file order |
@@ -3507,6 +3507,32 @@ refused a shell command or tool call, one line per refusal:
 ```text
 ── Denied calls ─────────────────────────────────
 turn 0  on-shell  /usr/bin/bash  by branch-policy  “protected branch”
+```
+
+#### Code mode calls { #trace-show-code-mode }
+
+A `tool_call` with `origin: "code_mode"`, a call a code mode program made through
+[`murmur:bus`](wit-interfaces.md#bus), leaves the turn line. It is printed directly below it, four
+spaces deeper than `turn`, under the model's code mode call whose `tool_call_id` equals its
+`repl_call_id` in the same turn:
+
+| Part | Printed |
+|---|---|
+| Row | `↳ <tool> <duration> <status>  <input>`: `<status>` is `✓` or `✗`, and the input is printed as on a turn line |
+| Refused call | `  refused: <refusal>` appended |
+| Order | Grouped by code mode call, in turn-line order; in file order within a group |
+| `repl_call_id` `null`, or naming no call of the turn | After the turn's other nested rows, as `↳ (code mode, call not in trace) <tool> …` |
+| `count:` line | Counts every `tool_call` and ends with `  code mode: <N>`, the number of code mode calls among them. With none, it prints `session_end.total_tool_calls` and no suffix |
+
+```text
+── Tool calls ───────────────────────────────────
+count:      4  (3 ok, 1 error)  success 75.0%  code mode: 3
+latency:    avg 811ms
+  turn 1  bus-repl 3.2s ✓  {"op":"batch"}
+      ↳ nope 0ms ✗  {}  refused: not-listed
+      ↳ bus-echo 12ms ✓  {"tag":"b"}
+      ↳ bus-echo 35ms ✓  {"tag":"a"}
+  turn 2  end_turn
 ```
 
 ### `mur trace steps`

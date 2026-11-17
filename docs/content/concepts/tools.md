@@ -95,6 +95,22 @@ Under `transport: http`, in a capsule with an `on-tool-call` policy hook or a
 tool starts through [`murmur:process`](../reference/wit-interfaces.md#process) after its call moved
 to the background is refused: nothing is left to check it against the hook or the list.
 
+### Calling the capsule's tools from a program { #code-mode-bus }
+
+A code mode tool built against the `code-mode` world imports
+[`murmur:bus`](../reference/wit-interfaces.md#bus), through which a program running in its
+instance lists the capsule's tools and calls them, one at a time or several at once. One call from
+the model can then run many tool calls without a model turn for each.
+
+- `list()` names every tool the model could call, `code_mode.tools_visible` aside, except the code
+  mode tool itself, `pull-artifact`, `remove-artifact` and `submit-plan`.
+- Each call meets the checks the model's own call to that tool meets, runs through the same
+  dispatch and the same fence, and writes the same records, marked with the code mode call it ran
+  in. It is put to the `on-tool-call` and `on-shell` hooks as the model's call is.
+- The bus answers only while the model's own call to the code mode tool runs in the foreground on
+  `inference.transport: http`. A plan step's call, a call made through a `transport: process`
+  harness, and a call moved to the background get a refusal for every request.
+
 ## Tool dispatch
 
 Each tool call is resolved in a fixed precedence order:

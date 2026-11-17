@@ -1349,7 +1349,7 @@ fn a_tool_that_waits_for_the_exit_reads_every_byte() {
     }
 }
 
-/// A tool built against `murmur:process@0.1.0`, WIT level 6, is refused at staging: level 7 has
+/// A tool built against `murmur:process@0.1.0`, WIT level 6, is refused at staging: level 8 has
 /// `murmur:process@0.2.0`, and the host serves no other version.
 #[test]
 fn a_process_tool_built_for_level_6_is_refused() {
@@ -1397,8 +1397,8 @@ fn a_process_tool_built_for_level_6_is_refused() {
     assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
     assert!(
         text.contains(&format!(
-            "artifact 'local/process-probe-v1@{VERSION}' does not fit WIT level 7, the level this \
-             mur serves: it imports murmur:process/process@0.1.0, and level 7 has \
+            "artifact 'local/process-probe-v1@{VERSION}' does not fit WIT level 8, the level this \
+             mur serves: it imports murmur:process/process@0.1.0, and level 8 has \
              murmur:process@0.2.0"
         )),
         "{text}"

@@ -25,6 +25,9 @@ pub(crate) mod artifact_removal;
 pub mod artifact_supply;
 pub mod background_command;
 pub mod bindings;
+pub(crate) mod bus;
+/// Whether a component's `murmur:*` import names name `murmur:bus`, for `mur doctor`.
+pub use bus::imports_bus as imports_murmur_bus;
 pub(crate) mod cancel;
 pub(crate) mod capsule_facts;
 pub(crate) mod cgroup;

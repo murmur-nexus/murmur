@@ -34,6 +34,7 @@ use wasmtime_wasi_http::{
 };
 
 mod artifact_change;
+mod bus_frame;
 
 pub(crate) use artifact_change::{
     exclusive_only, PulledArtifact, PULL_ARTIFACT_TOOL, REMOVE_ARTIFACT_TOOL,
@@ -1971,6 +1972,7 @@ async fn write_delegation_end(
             duration_ms,
             outcome,
             reason,
+            delegation.repl_call_id.as_deref(),
         )
         .await;
 }
@@ -3209,6 +3211,8 @@ pub fn stage_session(
 
         let manifest_yaml =
             extract_manifest_yaml(&artifact.name, &resolved_version, &resolved.bytes)?;
+        // The one artifact a `murmur:bus` import is accepted from.
+        let code_mode_repl = request.code_mode.as_ref().map(|c| c.repl.as_str());
 
         // The first point the package `code_mode.repl` names is in hand, ahead of every check the
         // artifact's own runtime arm makes below.
@@ -3244,10 +3248,12 @@ pub fn stage_session(
                     &resolved.bytes,
                     &resolved.sha256,
                 )?;
+                let contracts = murmur_contracts(&engine, &tool_component);
+                crate::bus::refuse_bus_import(&full_name, &contracts.imports, code_mode_repl)?;
                 crate::process_driver::check_component_level(
                     &full_name,
                     &resolved_version,
-                    murmur_contracts(&engine, &tool_component),
+                    contracts,
                     crate::served_wit_level(),
                 )?;
                 tool_components.insert(artifact.name.clone(), tool_component);
@@ -3264,6 +3270,9 @@ pub fn stage_session(
                 let contracts = murmur_artifact::extract_wit_contracts(&driver_wasm)
                     .ok()
                     .flatten();
+                if let Some(contracts) = &contracts {
+                    crate::bus::refuse_bus_import(&full_name, &contracts.imports, None)?;
+                }
                 check_driver_interface(
                     "process",
                     &full_name,
@@ -3304,6 +3313,9 @@ pub fn stage_session(
                 let contracts = murmur_artifact::extract_wit_contracts(&tool_wasm)
                     .ok()
                     .flatten();
+                if let Some(contracts) = &contracts {
+                    crate::bus::refuse_bus_import(&full_name, &contracts.imports, None)?;
+                }
                 // Every driver, not only the inference driver: a `switch_driver` target is
                 // dispatched through the same linker, which serves one stream interface.
                 let stream = check_stream_interface(
@@ -3354,6 +3366,11 @@ pub fn stage_session(
                     &resolved_version,
                     &resolved.bytes,
                     &resolved.sha256,
+                )?;
+                crate::bus::refuse_bus_import(
+                    &full_name,
+                    &murmur_contracts(&engine, &hook_component).imports,
+                    None,
                 )?;
                 // The grant comes from `artifact` — the operator's own manifest entry for
                 // this hook — and never from `manifest_yaml`, the hook's bundled manifest
@@ -3605,13 +3622,16 @@ pub fn stage_session(
             )
         };
     if let Some(component) = &capsule_component {
+        let root = request
+            .capsule_artifact
+            .as_ref()
+            .map_or(&request.capsule_name, |capsule| &capsule.artifact);
+        let contracts = murmur_contracts(&engine, component);
+        crate::bus::refuse_bus_import(root, &contracts.imports, None)?;
         crate::process_driver::check_component_level(
-            request
-                .capsule_artifact
-                .as_ref()
-                .map_or(&request.capsule_name, |capsule| &capsule.artifact),
+            root,
             &request.capsule_version,
-            murmur_contracts(&engine, component),
+            contracts,
             crate::served_wit_level(),
         )?;
     }
@@ -10071,6 +10091,9 @@ pub(crate) struct ToolCallSpec {
     pub(crate) role: ComponentRole,
     pub(crate) limits: crate::limits::ExecutionLimits,
     pub(crate) wasi: WasiPlan,
+    /// Whether the store links `murmur:bus/bus`: set only for the code mode instance's calls, so
+    /// any other component importing it fails to instantiate.
+    pub(crate) bus: bool,
 }
 
 /// The supervisor-held objects one tool or driver call's host imports reach: the network policy
@@ -10081,6 +10104,9 @@ pub(crate) struct ToolCallHost {
     pub(crate) events: StreamEventsTarget,
     pub(crate) input: InputWiring,
     pub(crate) process: crate::session_process::ProcessAccess,
+    /// Where the call's `murmur:bus` requests go: [`crate::bus::BusLink::none`] for every call but
+    /// the code mode instance's.
+    pub(crate) bus: crate::bus::BusLink,
 }
 
 /// What `murmur:task/task#request-input` waits on for one call.
@@ -10212,12 +10238,14 @@ pub(crate) fn prepare_tool_call(
             timeout_secs: input_timeout_secs,
         },
         process,
+        bus: crate::bus::BusLink::none(),
     };
     let spec = ToolCallSpec {
         name: name.to_string(),
         role,
         limits: tool_limits,
         wasi,
+        bus: false,
     };
     Ok((spec, host))
 }
@@ -10352,7 +10380,7 @@ async fn build_tool_instance(
 ) -> Result<ToolInstance, ToolCallFailure> {
     let name = spec.name.as_str();
     let role = spec.role;
-    let (events, input_sink, http_hooks, process) = match side {
+    let (events, input_sink, http_hooks, process, bus) = match side {
         ToolHostSide::Local(host) => {
             let host = *host;
             (
@@ -10360,17 +10388,20 @@ async fn build_tool_instance(
                 InputSink::Local(host.input),
                 ToolHttpHooks::Local(host.http_hooks),
                 host.process,
+                crate::bus::BusSide::Local,
             )
         }
         ToolHostSide::Remote(link) => (
             EventsSink::Remote(Arc::clone(&link)),
             InputSink::Remote(Arc::clone(&link)),
             ToolHttpHooks::Remote(crate::guest_worker::RemoteHttp::new(Arc::clone(&link))),
-            crate::session_process::ProcessAccess::Remote(link),
+            crate::session_process::ProcessAccess::Remote(Arc::clone(&link)),
+            crate::bus::BusSide::Remote(link),
         ),
     };
 
-    let linker = tool_linker(engine, name, events, input_sink).map_err(ToolCallFailure::setup)?;
+    let linker =
+        tool_linker(engine, name, events, input_sink, spec.bus).map_err(ToolCallFailure::setup)?;
     let tool_limits = spec.limits;
     let site = match role {
         ComponentRole::Driver => crate::guest_worker::StoreSite::Driver,
@@ -10389,6 +10420,7 @@ async fn build_tool_instance(
         http: WasiHttpCtx::new(),
         http_hooks,
         process,
+        bus,
     };
 
     let mut store = Store::new(engine, state);
@@ -10513,12 +10545,14 @@ pub(crate) async fn run_tool_instance(
 }
 
 /// The linker every tool-world store is instantiated through: WASI p2, `wasi:http`,
-/// `murmur:stream/events`, `murmur:task/task#request-input` and `murmur:process`.
+/// `murmur:stream/events`, `murmur:task/task#request-input` and `murmur:process`, and
+/// `murmur:bus` when `bus` is set — only for the code mode instance.
 fn tool_linker(
     engine: &Engine,
     name: &str,
     events: EventsSink,
     input_sink: InputSink,
+    bus: bool,
 ) -> Result<Linker<ToolStoreState>, String> {
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -10628,6 +10662,22 @@ fn tool_linker(
             crate::session_process::PROCESS_IFACE
         )
     })?;
+    if bus {
+        crate::bus::add_to_linker(&mut linker, |state: &mut ToolStoreState| {
+            crate::bus::BusView { side: &state.bus }
+        })
+        .map_err(|err| {
+            format!(
+                "failed to register {} for tool '{name}': {err}",
+                crate::bus::BUS_IFACE
+            )
+        })?;
+        // `murmur:bus` takes `tool-result` from `murmur:tool/run`, so a component importing the
+        // bus also imports that interface for its types alone.
+        linker.instance(WIT_TOOL_IFACE_VERSIONED).map_err(|err| {
+            format!("failed to define {WIT_TOOL_IFACE_VERSIONED} types for tool '{name}': {err}")
+        })?;
+    }
     Ok(linker)
 }
 
@@ -10696,6 +10746,12 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
         .or(summary)
         .unwrap_or_else(|| "tool returned no data".to_string());
     result.data = Some(crate::fence::wrap_untrusted(source, &text));
+}
+
+/// A code mode call started on its own task, which settles it with the holder when it returns.
+struct StartedCodeModeCall {
+    ticket: crate::code_mode::CallTicket,
+    call: tokio::task::JoinHandle<Result<murmur::tool::run::ToolResult, String>>,
 }
 
 /// A code mode call its dispatch still awaits; dropped while armed, the call is dropped with it
@@ -10975,6 +11031,7 @@ impl CapsuleStoreState {
     /// The call runs on its own task, so a `detachable` call — the model's own, on either
     /// transport — that outruns `code_mode.detach_after_secs` returns a work id while it keeps
     /// running. A call dropped before that, as a task cancel drops it, ends the instance.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_code_mode(
         &self,
         code_mode: &Arc<crate::code_mode::CodeMode>,
@@ -10983,45 +11040,11 @@ impl CapsuleStoreState {
         gateway: Option<&Arc<CredentialGateway>>,
         process: crate::session_process::ProcessAccess,
         detachable: bool,
+        bus: crate::bus::CodeModeBus,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        let Some(workers) = self.guest_workers.clone() else {
-            return Err(RuntimeError::CodeModeWithoutGuestWorkers.to_string());
-        };
-        let Some(component) = self.tool_components.get(name).cloned() else {
-            return Err(format!("tool '{name}' is not available in this session"));
-        };
-        let (spec, host) = self.prepared_tool_call(
-            name,
-            gateway,
-            &self.inference_env,
-            None,
-            ComponentRole::Tool,
-            process,
-        )?;
-        let task_id = self
-            .session_status
-            .as_ref()
-            .and_then(|status| status.task_id());
-        let ticket = code_mode.begin(task_id).await?;
-        let kind = self.worker_kind_of(name);
-        let call_deadlines = self.call_deadlines.clone();
-        let settle = Arc::clone(code_mode);
-        let call_ticket = ticket.clone();
-        let mut call = tokio::spawn(async move {
-            let reply = workers
-                .run_session_tool(
-                    kind,
-                    &component,
-                    spec,
-                    host,
-                    input,
-                    &call_deadlines,
-                    call_ticket.instance,
-                )
-                .await;
-            settle.finish(&call_ticket, reply).await
-        });
-        code_mode.set_abort(&ticket, call.abort_handle());
+        let StartedCodeModeCall { ticket, mut call } = self
+            .start_code_mode_call(code_mode, name, input, gateway, process, bus)
+            .await?;
         let mut attached = AttachedCodeModeCall {
             code_mode,
             ticket: &ticket,
@@ -11045,6 +11068,65 @@ impl CapsuleStoreState {
         };
         attached.armed = false;
         joined.map_err(|error| format!("tool '{name}' call did not complete: {error}"))?
+    }
+
+    /// Admits a call to the code mode tool `name` to the session's instance and starts it on its
+    /// own task, its store linking `murmur:bus` with requests going where `bus` says.
+    async fn start_code_mode_call(
+        &self,
+        code_mode: &Arc<crate::code_mode::CodeMode>,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        gateway: Option<&Arc<CredentialGateway>>,
+        process: crate::session_process::ProcessAccess,
+        bus: crate::bus::CodeModeBus,
+    ) -> Result<StartedCodeModeCall, String> {
+        let Some(workers) = self.guest_workers.clone() else {
+            return Err(RuntimeError::CodeModeWithoutGuestWorkers.to_string());
+        };
+        let Some(component) = self.tool_components.get(name).cloned() else {
+            return Err(format!("tool '{name}' is not available in this session"));
+        };
+        let (mut spec, mut host) = self.prepared_tool_call(
+            name,
+            gateway,
+            &self.inference_env,
+            None,
+            ComponentRole::Tool,
+            process,
+        )?;
+        let task_id = self
+            .session_status
+            .as_ref()
+            .and_then(|status| status.task_id());
+        let ticket = code_mode.begin(task_id.clone()).await?;
+        spec.bus = true;
+        host.bus = bus.link(
+            Arc::clone(code_mode),
+            ticket.clone(),
+            self.peer_trace.clone(),
+            task_id,
+        );
+        let kind = self.worker_kind_of(name);
+        let call_deadlines = self.call_deadlines.clone();
+        let settle = Arc::clone(code_mode);
+        let call_ticket = ticket.clone();
+        let call = tokio::spawn(async move {
+            let reply = workers
+                .run_session_tool(
+                    kind,
+                    &component,
+                    spec,
+                    host,
+                    input,
+                    &call_deadlines,
+                    call_ticket.instance,
+                )
+                .await;
+            settle.finish(&call_ticket, reply).await
+        });
+        code_mode.set_abort(&ticket, call.abort_handle());
+        Ok(StartedCodeModeCall { ticket, call })
     }
 
     /// The session's lost guest worker, as the error that ends the task and the session.
@@ -11232,6 +11314,7 @@ impl CapsuleStoreState {
     /// `cancel` is the attempt's own cancel — the A2A task's, or on the `task.md` path the
     /// session's termination signal. A foreground shell command is demoted the moment it is
     /// raised, and a shell call made after it starts nothing.
+    #[cfg(test)]
     pub(crate) async fn dispatch_agent_tool_async(
         &self,
         name: &str,
@@ -11239,7 +11322,7 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
         cancel: Option<&crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, gate, None, cancel.cloned(), None)
+        self.dispatch_fenced(name, input, gate, None, cancel.cloned(), None, None)
             .await
     }
 
@@ -11261,10 +11344,19 @@ impl CapsuleStoreState {
         abandon: crate::detached::AbandonSignal,
         process_gate: crate::session_process::GateSender,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, None, Some(abandon), None, Some(process_gate))
-            .await
+        self.dispatch_fenced(
+            name,
+            input,
+            None,
+            Some(abandon),
+            None,
+            Some(process_gate),
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_fenced(
         &self,
         name: &str,
@@ -11273,9 +11365,20 @@ impl CapsuleStoreState {
         abandon: Option<crate::detached::AbandonSignal>,
         canceled: Option<crate::cancel::CancelSignal>,
         process_gate: Option<crate::session_process::GateSender>,
+        frame: Option<crate::bus::BusFrame<'_>>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = self
-            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled, process_gate, true)
+            .dispatch_agent_tool_unfenced(
+                name,
+                input,
+                gate,
+                abandon,
+                canceled,
+                process_gate,
+                true,
+                &crate::bus::CallOrigin::Model,
+                frame,
+            )
             .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         self.deliver_deadline_notice(name, &mut outcome).await;
@@ -11335,7 +11438,15 @@ impl CapsuleStoreState {
     ///
     /// `detachable` reaches the code mode branch only: `true` for the model's own call on either
     /// transport, which `code_mode.detach_after_secs` can move to the background, and `false` for
-    /// a plan step's.
+    /// a plan step's and a code mode program's.
+    ///
+    /// `origin` reaches the `delegate-task` branch only, whose records carry the code mode call a
+    /// program's delegation was made in. [`crate::bus::CallOrigin::Model`] for every caller but
+    /// the bus.
+    ///
+    /// `frame` reaches the code mode branch only: the http agent loop's frame for the model's own
+    /// call, in which the code mode call answers its program's `murmur:bus` requests. `None` for
+    /// every other caller.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_agent_tool_unfenced(
         &self,
@@ -11346,6 +11457,8 @@ impl CapsuleStoreState {
         canceled: Option<crate::cancel::CancelSignal>,
         process_gate: Option<crate::session_process::GateSender>,
         detachable: bool,
+        origin: &crate::bus::CallOrigin,
+        frame: Option<crate::bus::BusFrame<'_>>,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -11365,7 +11478,7 @@ impl CapsuleStoreState {
         }
         if name == DELEGATE_TASK_TOOL {
             return self
-                .dispatch_delegate_task(input)
+                .dispatch_delegate_task(input, origin)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -11498,7 +11611,7 @@ impl CapsuleStoreState {
                 "tool '{name}' is not declared in manifest allowlist"
             ));
         }
-        self.dispatch_agent_wasm_tool(name, input, gate, process_gate, detachable)
+        self.dispatch_agent_wasm_tool(name, input, gate, process_gate, detachable, frame)
             .await
     }
 
@@ -11518,6 +11631,7 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
         process_gate: Option<crate::session_process::GateSender>,
         detachable: bool,
+        frame: Option<crate::bus::BusFrame<'_>>,
     ) -> Result<DispatchOutcome, String> {
         use crate::session_process::{
             GateRoute, GateSender, ProcessAccess, ProcessCallCtx, ProcessGateRequest,
@@ -11528,29 +11642,47 @@ impl CapsuleStoreState {
             .code_mode
             .as_ref()
             .filter(|code_mode| code_mode.tool() == name);
-        let component_call =
-            |input: murmur::tool::run::ToolInput, process: ProcessAccess| async move {
-                match code_mode {
-                    Some(code_mode) => {
-                        Box::pin(self.dispatch_code_mode(
-                            code_mode, name, input, gateway, process, detachable,
-                        ))
-                        .await
-                    }
-                    None => {
-                        self.dispatch_component_with_env(
-                            name,
-                            input,
-                            gateway,
-                            &self.inference_env,
-                            None,
-                            ComponentRole::Tool,
-                            process,
-                        )
-                        .await
-                    }
+        // The model's own code mode call on the http loop answers its program's bus requests in
+        // the frame, which also answers the decision point for its programs.
+        let gate = match (code_mode, frame, gate) {
+            (Some(code_mode), Some(frame), Some(gate)) => {
+                return Box::pin(
+                    self.dispatch_code_mode_framed(code_mode, name, input, gateway, gate, frame),
+                )
+                .await;
+            }
+            (_, _, gate) => gate,
+        };
+        let unanswered = crate::bus::CodeModeBus::Unanswered {
+            why: if detachable {
+                crate::bus::Unanswered::ProcessTransport
+            } else {
+                crate::bus::Unanswered::PlanStep
+            },
+            turn: gate.as_deref().map_or(0, crate::agent::CallGate::turn),
+        };
+        let component_call = |input: murmur::tool::run::ToolInput, process: ProcessAccess| async move {
+            match code_mode {
+                Some(code_mode) => {
+                    Box::pin(self.dispatch_code_mode(
+                        code_mode, name, input, gateway, process, detachable, unanswered,
+                    ))
+                    .await
                 }
-            };
+                None => {
+                    self.dispatch_component_with_env(
+                        name,
+                        input,
+                        gateway,
+                        &self.inference_env,
+                        None,
+                        ComponentRole::Tool,
+                        process,
+                    )
+                    .await
+                }
+            }
+        };
         let Some(registry) = self.session_processes.clone() else {
             return component_call(
                 input,
@@ -11736,7 +11868,11 @@ impl CapsuleStoreState {
     /// plane's own launch callback, rather than here: this write is `async` and its wait can be
     /// cancelled, and a delegation that is up must be nameable — and ended with its task — whether
     /// or not the call that started it ever returned.
-    async fn write_delegation_start(&self, notice: &crate::delegation_plane::DelegationLaunch) {
+    async fn write_delegation_start(
+        &self,
+        notice: &crate::delegation_plane::DelegationLaunch,
+        repl_call_id: Option<&str>,
+    ) {
         if let Some(trace) = &self.peer_trace {
             trace
                 .write_delegation_start(
@@ -11747,6 +11883,7 @@ impl CapsuleStoreState {
                     &notice.child_workdir,
                     &notice.child_records_dir,
                     notice.workdir_snapshot.as_ref(),
+                    repl_call_id,
                 )
                 .await;
         }
@@ -11777,7 +11914,9 @@ impl CapsuleStoreState {
     async fn dispatch_delegate_task(
         &self,
         input: murmur::tool::run::ToolInput,
+        origin: &crate::bus::CallOrigin,
     ) -> Result<murmur::tool::run::ToolResult, String> {
+        let repl_call_id = origin.repl_call_id();
         let args = parse_tool_json_input(DELEGATE_TASK_TOOL, &input)?;
         // The model names a capsule by the bare part `delegate-task`'s schema offers; mur-roost
         // and the trace are asked about the full name it stands for.
@@ -11819,6 +11958,7 @@ impl CapsuleStoreState {
         // loop below to be written at all.
         let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
         let live = Arc::clone(&self.live_delegations);
+        let registered_repl_call_id = repl_call_id.map(str::to_string);
         let origin = crate::delegation_plane::DelegationOrigin {
             context_id: self.current_context_id.clone().unwrap_or_default(),
             launched: Some(Arc::new(
@@ -11827,10 +11967,10 @@ impl CapsuleStoreState {
                     // handed its task, so a child that is up is in the task's set before its outcome
                     // can arrive — including when the wait below is cancelled and the trace write
                     // never happens.
-                    live.register(
-                        notice.delegation_id.clone(),
-                        crate::cancel::LiveDelegation::launched(task_id.clone(), &notice),
-                    );
+                    let mut delegation =
+                        crate::cancel::LiveDelegation::launched(task_id.clone(), &notice);
+                    delegation.repl_call_id = registered_repl_call_id.clone();
+                    live.register(notice.delegation_id.clone(), delegation);
                     let _ = launch_tx.send(notice);
                 },
             )),
@@ -11859,7 +11999,7 @@ impl CapsuleStoreState {
                     // there, which ends the child. A child that came up is in the task's set, so
                     // the cancel's residue names it and the task's end closes its row.
                     while let Ok(notice) = launch_rx.try_recv() {
-                        self.write_delegation_start(&notice).await;
+                        self.write_delegation_start(&notice, repl_call_id).await;
                     }
                     return Err(format!(
                         "'{DELEGATE_TASK_TOOL}' was canceled while the sub-capsule was starting; \
@@ -11868,7 +12008,7 @@ impl CapsuleStoreState {
                     ));
                 }
                 notice = launch_rx.recv(), if notices_open => match notice {
-                    Some(notice) => self.write_delegation_start(&notice).await,
+                    Some(notice) => self.write_delegation_start(&notice, repl_call_id).await,
                     // The sender lives in the blocking closure, so this is that closure ending.
                     None => notices_open = false,
                 },
@@ -11878,7 +12018,7 @@ impl CapsuleStoreState {
         // A launch that finished between the arms being polled leaves its notice behind, and it
         // still has to be recorded.
         while let Ok(notice) = launch_rx.try_recv() {
-            self.write_delegation_start(&notice).await;
+            self.write_delegation_start(&notice, repl_call_id).await;
         }
         let crate::delegation_plane::StartedDelegation { result, child } =
             joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
@@ -11907,6 +12047,7 @@ impl CapsuleStoreState {
                         duration_ms,
                         status.as_str(),
                         Some(result.output.clone()),
+                        repl_call_id,
                     )
                     .await;
             }
@@ -12788,9 +12929,17 @@ impl CapsuleStoreState {
                 // futures are mutually recursive and one of them has to be behind a pointer for
                 // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
                 // recursion is one level deep in practice.
-                let outcome = Box::pin(
-                    self.dispatch_agent_tool_unfenced(&name, input, gate, None, None, None, false),
-                )
+                let outcome = Box::pin(self.dispatch_agent_tool_unfenced(
+                    &name,
+                    input,
+                    gate,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &crate::bus::CallOrigin::Model,
+                    None,
+                ))
                 .await
                 .map(|outcome| outcome.result);
                 let _ = reply.send(outcome);
@@ -13162,6 +13311,8 @@ struct ToolStoreState {
     /// What `murmur:process` serves this call: the session's processes, or the reason it serves
     /// nothing.
     process: crate::session_process::ProcessAccess,
+    /// Where `murmur:bus` is answered, when the linker defines it.
+    bus: crate::bus::BusSide,
 }
 
 impl WasiView for ToolStoreState {
@@ -28900,6 +29051,7 @@ inference:
                     started: std::time::Instant::now(),
                     child: None,
                     arrived: false,
+                    repl_call_id: None,
                 },
             ));
             live.arrive("dlg_1");
@@ -30124,6 +30276,7 @@ mod member_call_tests {
             started: std::time::Instant::now() - ago,
             child: None,
             arrived: false,
+            repl_call_id: None,
         }
     }
 
