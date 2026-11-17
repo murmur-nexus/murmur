@@ -46,6 +46,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Enable context compaction](/how-to/context-compaction.md): Turning on automatic history condensation for sessions that run many turns.
 - [Decompose tasks recursively within a single capsule](/how-to/task-decomposition-single-capsule.md): Using the first turn as a router that identifies steps and dispatches each as a sub-task.
 - [Let a coding capsule pull the tools it needs](/how-to/self-healing-coding-capsule.md): Granting `capabilities.install` so the model lists, pulls, calls and removes tools mid-session with `pull-artifact` and `remove-artifact`.
+- [Use code mode in a capsule](/how-to/use-code-mode.md): Naming a REPL artifact in `code_mode` so the model writes one program that calls the capsule's tools, keeps values between calls and returns only what it prints; a long call moves to the background under a work id.
 
 ### Security & Composition
 

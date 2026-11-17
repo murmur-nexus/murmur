@@ -444,7 +444,7 @@ fn model_call(trace: &[Value], id: &str) -> usize {
     })
 }
 
-/// S2, S3: the switch, the bus and the REPL in one session — five programs, the records they
+/// The switch, the bus and the REPL in one session — five programs, the records they
 /// write, and the page's trace excerpt in the run's `mur trace show`.
 #[test]
 fn code_mode_runs_the_how_to_capsule_end_to_end() {
@@ -521,7 +521,7 @@ fn code_mode_runs_the_how_to_capsule_end_to_end() {
         "{waited}"
     );
 
-    // S3: the records.
+    // The records.
     let trace = run.trace();
     let starts = records_of(&trace, "code_mode_instance_start");
     assert_eq!(starts.len(), 1, "{starts:#?}");
@@ -576,7 +576,7 @@ fn code_mode_runs_the_how_to_capsule_end_to_end() {
     let (t3, t4) = (model_call(&trace, "t3"), model_call(&trace, "t4"));
     assert!(t3 < uname_start && uname_start < uname_exit && uname_exit < t4);
 
-    // S3: `mur trace show` nests the batch's calls under the P3 call, and the page's excerpt is
+    // `mur trace show` nests the batch's calls under the P3 call, and the page's excerpt is
     // that output.
     let show = home.trace_show(&project, &run.session());
     assert!(show.output.status.success(), "{}", show.context());
@@ -625,7 +625,7 @@ fn code_mode_runs_the_how_to_capsule_end_to_end() {
     );
 }
 
-/// S4: the same capsule without `code_mode` is refused at launch, by `mur run` and `mur doctor`,
+/// The same capsule without `code_mode` is refused at launch, by `mur run` and `mur doctor`,
 /// with `E-CAP-022` naming `tool-repl-js`; the model gets no request and no instance starts.
 #[test]
 fn without_code_mode_the_repl_is_refused_at_launch() {
@@ -664,7 +664,7 @@ fn without_code_mode_the_repl_is_refused_at_launch() {
     assert!(all.contains("E-CAP-022") && all.contains(REPL), "{all}");
 }
 
-/// S5: the how-to holds the manifest, the programs and the trace excerpt the end-to-end test runs.
+/// The how-to holds the manifest, the programs and the trace excerpt the end-to-end test runs.
 #[test]
 fn how_to_shows_the_capsule_and_programs_the_test_runs() {
     let page = how_to();
