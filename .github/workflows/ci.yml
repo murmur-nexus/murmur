@@ -28,7 +28,10 @@ jobs:
 
   cargo-test:
     name: cargo-test
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest, as `contained` is: this job runs the same host preparation
+    # and the same pinned Playwright, whose chromium-headless-shell does not install on every
+    # newer image, so an image change should be a deliberate edit here.
+    runs-on: ubuntu-24.04
     # The ceiling covers the whole job -- compile, link and run -- and is here so a hung test
     # fails the job rather than burning the runner's own limit.
     #

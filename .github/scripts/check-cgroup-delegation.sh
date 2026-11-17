@@ -35,9 +35,11 @@ step="create a child cgroup in a delegated scope"
 echo "== ${step}"
 # The inner script reports its own step and exits 10 or more, so a failure of systemd-run itself
 # (no bus, no scope) is told apart from a failure inside the scope.
+# `--expand-environment=no`: systemd 259 expands `$name` in a scope's command line itself, so
+# without it every variable of the inner script reaches bash already replaced by an empty string.
 set +e
 # shellcheck disable=SC2016  # the single-quoted script expands its variables in the inner bash
-systemd-run --user --scope --quiet --collect -p Delegate=yes -- bash -c '
+systemd-run --user --scope --quiet --collect --expand-environment=no -p Delegate=yes -- bash -c '
     set -u
     in_step() { echo "check-cgroup-delegation: step '"'"'$1'"'"' failed: $2" >&2; exit "$3"; }
     rel=$(grep "^0::" /proc/self/cgroup | cut -d: -f3-) \

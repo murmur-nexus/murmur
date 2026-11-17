@@ -73,6 +73,22 @@ pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Default `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling — 2 GiB per subprocess.
 pub const DEFAULT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The `RLIMIT_CORE` of every process spawned at a tier other than `EnforcementTier::Unconfined`:
+/// one byte, the value at which Linux writes no core dump under any `kernel.core_pattern`.
+///
+/// - A file pattern: the kernel skips a dump when the limit is below one page, as it does at `0`.
+/// - A pipe pattern (`|/usr/share/apport/apport …`, `|…/systemd-coredump …`): the kernel ignores
+///   `RLIMIT_CORE`, except that at exactly `1` it aborts the dump and logs `RLIMIT_CORE is set to
+///   1, aborting core`. At `0` it starts the program as root, outside the capsule, and writes the
+///   crashed process's memory to that program's stdin. The crashed process does not exit until
+///   the program has read all of it or closed its stdin, so a program that does neither holds
+///   that process, and the command waiting on it, until the session ends.
+///
+/// [`set_hard_rlimit`] clamps it to the hard limit `mur` inherited, so under an inherited hard
+/// limit of `0` the pipe pattern still receives the dump. On macOS the kernel writes no core
+/// larger than the limit.
+pub(crate) const CORE_DUMP_LIMIT_BYTES: u64 = 1;
+
 /// The address-space limit below which `W-RUN-010` warns for a V8 binary: 32 GiB. V8 reserves
 /// far more address space than it uses, and `node` failed with "Cannot allocate Wasm memory" at
 /// 16 GiB and ran at 32 GiB under `ulimit -v`.
@@ -337,7 +353,7 @@ pub(crate) enum NprocBound {
 /// Sets every [`HostResourceLimits`] rlimit field as a **hard** limit (`rlim_cur == rlim_max`)
 /// except `RLIMIT_CPU`, whose soft slot sits one second below its hard slot
 /// ([`cpu_rlimit_slots`]) and which is left as inherited when `cpu_seconds` is `None`, plus
-/// `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for
+/// `RLIMIT_CORE` at [`CORE_DUMP_LIMIT_BYTES`]. `RLIMIT_NPROC` is set only for
 /// [`NprocBound::Headroom`]; for [`NprocBound::CgroupPidsMax`] no `RLIMIT_NPROC` call is made at
 /// all.
 ///
@@ -345,10 +361,10 @@ pub(crate) enum NprocBound {
 /// async-signal-safe operations: two syscalls per limit and no allocation, no locking, and no
 /// error formatting (errors are returned as bare `io::Error::from_raw_os_error`).
 ///
-/// `RLIMIT_CORE` is fixed at zero with no manifest surface at all — a core dump of a capsule
-/// subprocess writes a potentially multi-gigabyte file, holding whatever was in that process's
-/// memory, into the workdir or the host's core pattern. It belongs to the same category as the
-/// fixed capsule device set in `sandbox.rs`: an invariant, not a setting.
+/// `RLIMIT_CORE` is fixed at [`CORE_DUMP_LIMIT_BYTES`] with no manifest surface at all — a core
+/// dump of a capsule subprocess holds whatever was in that process's memory, and goes into the
+/// workdir or to the host's core-pattern program. It belongs to the same category as the fixed
+/// capsule device set in `sandbox.rs`: an invariant, not a setting.
 ///
 /// A requested value above the inherited hard limit is **clamped down to it** rather than
 /// treated as an error: an unprivileged process cannot raise `rlim_max`, so the inherited value
@@ -505,7 +521,7 @@ pub(crate) fn apply_per_process_rlimits(limits: &HostResourceLimits) -> std::io:
     if let Some(cpu_seconds) = limits.cpu_seconds {
         set_cpu_rlimit(cpu_seconds)?;
     }
-    set_hard_rlimit(libc::RLIMIT_CORE as u32, 0)?;
+    set_hard_rlimit(libc::RLIMIT_CORE as u32, CORE_DUMP_LIMIT_BYTES)?;
 
     // `memory_bytes` maps to `RLIMIT_AS` (total address space) on Linux, where it is enforced
     // and a failure to set it is fatal.
@@ -1419,7 +1435,7 @@ mod tests {
 
     /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
     /// can be raised back by the capsule itself. Asserted against the live process by lowering
-    /// a safely lowerable limit (`RLIMIT_CORE`, which this runtime pins at zero anyway)
+    /// a safely lowerable limit (`RLIMIT_CORE`, which a spawned process gets at one byte anyway)
     /// and reading it back.
     #[cfg(unix)]
     #[test]

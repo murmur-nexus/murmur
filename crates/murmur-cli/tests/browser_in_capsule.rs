@@ -257,8 +257,8 @@ impl Fixture {
                 panic!(
                     "{containment}: `mur run` still going after {:.1} s\nphase: {}\n{}\n\
                      {marked}.err: {}\n{marked}.out: {}\nmur stderr, through its SIGTERM:\n{}\n\
-                     mur stdout, through its SIGTERM:\n{}\nprocesses under mur (pid {}), before \
-                     the SIGTERM:\n{processes}",
+                     mur stdout, through its SIGTERM:\n{}\n{}\nprocesses under mur (pid {}), \
+                     before the SIGTERM:\n{processes}",
                     started.elapsed().as_secs_f64(),
                     timeline.phase().name(),
                     timeline.describe(),
@@ -266,6 +266,7 @@ impl Fixture {
                     file_or_absent(&workdir.join(format!("{marked}.out"))),
                     stderr.text(),
                     stdout.text(),
+                    host_facts(),
                     child.id(),
                 );
             }
@@ -470,10 +471,30 @@ fn file_or_absent(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| format!("<absent: {error}>"))
 }
 
-/// The processes descended from `root`, one per line with its state and command line, each
-/// thread's state, wait channel and current system call, and the limits of any Chrome process.
-/// `stat`, `cmdline` and `limits` are readable for a non-dumpable process too; `wchan` and
-/// `syscall` are not, and read as `0` or an error there.
+/// The host facts a Chrome crash or a stalled crash depends on: `kernel.core_pattern`, which
+/// says whether a crashed process is piped to a program, and the CPU's virtual address width and
+/// `la57` flag, which say whether this host maps user memory above 2^47.
+fn host_facts() -> String {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let address_sizes = cpuinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("address sizes"))
+        .map_or("<absent>", |rest| rest.trim_start_matches([' ', '\t', ':']));
+    let la57 = cpuinfo
+        .lines()
+        .find(|line| line.starts_with("flags"))
+        .is_some_and(|line| line.split_whitespace().any(|flag| flag == "la57"));
+    format!(
+        "kernel.core_pattern: {}\ncpu address sizes: {address_sizes}, la57: {la57}",
+        file_or_absent(Path::new("/proc/sys/kernel/core_pattern")).trim()
+    )
+}
+
+/// The processes descended from `root`, one per line with its state and command line, a line for
+/// a process the kernel is writing a core dump of, each thread's state, wait channel and current
+/// system call, and the limits of any Chrome process. `stat`, `status`, `cmdline` and `limits`
+/// are readable for a non-dumpable process too; `wchan` and `syscall` are not, and read as `0` or
+/// an error there.
 fn process_report(root: u32) -> String {
     let mut parents = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
@@ -500,6 +521,15 @@ fn process_report(root: u32) -> String {
             "{indent}{pid} {state} ({comm}) {}\n",
             cmdline.trim()
         ));
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        if status.lines().any(|line| {
+            line.strip_prefix("CoreDumping:")
+                .is_some_and(|value| value.trim() == "1")
+        }) {
+            report.push_str(&format!(
+                "{indent}    CoreDumping: 1, the kernel is writing its core dump\n"
+            ));
+        }
         for task in fs::read_dir(format!("/proc/{pid}/task"))
             .into_iter()
             .flatten()
@@ -581,6 +611,10 @@ const LIBRARY_FOLDER: &str = "/usr/lib/x86_64-linux-gnu";
 /// device folders its entries link to. Refused, `libpci` exits the GPU process with status 1.
 const PCI_SYSFS: &[&str] = &["/sys/bus/pci", "/sys/devices"];
 
+/// The `memory_bytes` Chrome runs under: 2 TiB, above a renderer's whole reservation, so V8
+/// reserves its whole sandbox.
+const CHROME_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
+
 /// `capabilities:` lines granting `bash` and `chrome` (by file name) to shell commands, with the
 /// grants headless Chrome reads outside the work folder, the library folder, and `resources` V8
 /// runs under.
@@ -608,11 +642,14 @@ fn chrome_capabilities(chrome: &Path) -> String {
             path.display()
         ));
     }
-    // V8 reserves tens of GiB of address space per process; the cgroup caps what it uses.
-    yaml.push_str(
-        "  resources:\n    memory_bytes: 274877906944\n    cgroup_pids_max: 1024\n    \
-         cgroup_memory_bytes: 4294967296\n",
-    );
+    // A renderer reserves about 1.4 TiB of address space, most of it V8's sandbox. Under a lower
+    // `RLIMIT_AS` V8 reserves only part of its sandbox, at a random address drawn from the CPU's
+    // virtual address width, which on a host with 5-level paging can lie above 2^48; a renderer
+    // there crashes with `SEGV_MAPERR`. The cgroup caps what Chrome uses.
+    yaml.push_str(&format!(
+        "  resources:\n    memory_bytes: {CHROME_ADDRESS_SPACE_BYTES}\n    cgroup_pids_max: \
+         1024\n    cgroup_memory_bytes: 4294967296\n"
+    ));
     yaml
 }
 
@@ -677,11 +714,13 @@ fn chrome_from_a_shell_command_loads_a_page_in_a_capsule() {
         let err = fs::read_to_string(workdir.join("chrome.err")).unwrap_or_default();
         assert!(
             result.lines().any(|line| line == "chrome-exit=0"),
-            "{tier}: Chrome must exit 0\nresult: {result}\nstderr: {err}"
+            "{tier}: Chrome must exit 0\nresult: {result}\nstderr: {err}\n{}",
+            host_facts()
         );
         assert!(
             out.lines().any(|line| line == MARKER),
-            "{tier}: the page's marker line must be printed\nstdout: {out}\nstderr: {err}"
+            "{tier}: the page's marker line must be printed\nstdout: {out}\nstderr: {err}\n{}",
+            host_facts()
         );
         assert!(
             !err.contains(GPU_EXITED),
