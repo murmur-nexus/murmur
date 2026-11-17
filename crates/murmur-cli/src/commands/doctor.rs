@@ -3115,19 +3115,16 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
                     .as_ref()
                     .map(|code_mode| code_mode.repl.as_str())
                     .filter(|_| matches!(artifact.runtime, ArtifactRuntime::Tool));
-                let imports_bus = resolved
+                let bus_refusal = resolved
                     .meta
                     .wit_contracts
                     .clone()
                     .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
-                    .is_some_and(|contracts| {
-                        capsule_runtime::imports_murmur_bus(&contracts.imports)
+                    .and_then(|contracts| {
+                        capsule_runtime::refuse_bus_import(name, &contracts.imports, repl).err()
                     });
-                if imports_bus && repl != Some(name.as_str()) {
-                    let message = capsule_runtime::RuntimeError::BusImportRefused {
-                        artifact: name.clone(),
-                    }
-                    .to_string();
+                if let Some(refusal) = bus_refusal {
+                    let message = refusal.to_string();
                     capsule_runtime::report_println!(
                         "  \u{2717}  {ref_str:<col_width$}   \u{2014} {message}"
                     );

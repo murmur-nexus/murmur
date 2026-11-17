@@ -657,44 +657,9 @@ command gets after it runs) is made for a program run through this interface.
 A program running in the [code mode](../concepts/tools.md#code-mode) instance calls the capsule's
 tools through this interface: `list` names them, `call` runs one, and `call-batch` runs several at
 once. Each call is checked, run, fenced and recorded as the model's own call to that tool is.
-
-```wit
-package murmur:bus@0.1.0;
-
-/// The capsule's operations, served to the one WASM tool `code_mode.repl` names.
-interface bus {
-  use murmur:tool/run@0.2.0.{tool-result};
-
-  /// One operation the program may call.
-  record operation {
-    /// The name `call` takes: the name the model's tool array gives it.
-    name: string,
-    /// The description the model's tool array gives it.
-    description: string,
-    /// The JSON Schema the model's tool array gives its input, as JSON text.
-    input-schema: string,
-  }
-
-  /// One call in a batch.
-  record call-request {
-    name: string,
-    /// The call's arguments: one JSON value, as JSON text.
-    input: string,
-  }
-
-  /// A call that returned no tool-result.
-  variant call-error {
-    /// The runtime did not run the call; the text says why.
-    refused(string),
-    /// The runtime ran the call and it failed before the operation returned a result.
-    failed(string),
-  }
-
-  %list: func() -> result<list<operation>, string>;
-  call: func(name: string, input: string) -> result<tool-result, call-error>;
-  call-batch: func(calls: list<call-request>) -> list<result<tool-result, call-error>>;
-}
-```
+The interface is defined in
+[`bus.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/bus.wit);
+a component imports it by compiling against the `code-mode` world.
 
 | Function | What it does |
 |---|---|

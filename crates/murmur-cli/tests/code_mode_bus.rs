@@ -810,3 +810,50 @@ fn refused_at_launch_spares_a_tool_without_the_bus() {
         assert!(call.get(key).is_none(), "{key} in {call}");
     }
 }
+
+/// S7: the driver and hook staging arms refuse a component importing `murmur:bus` with
+/// `E-CAP-022`, as the tool arm does: `bus-repl` published as a `runtime: driver` and as a
+/// `runtime: hook` is refused at launch.
+#[test]
+fn refused_at_launch_is_a_driver_and_a_hook_importing_the_bus() {
+    let packed = TempDir::new().unwrap();
+    let repl = common::fixture_path("bus-probe/tool/bus-repl.wasm");
+    let driver = common::create_driver_artifact_with_auth(
+        packed.path(),
+        "local/bus-driver",
+        VERSION,
+        &repl,
+        &format!("{AUTH}{}", common::FIXTURE_DRIVER_MODELS),
+    );
+    let hook = create_hook_zip(
+        packed.path(),
+        "local/bus-hook",
+        "on-tool-call",
+        "deny",
+        &fs::read(&repl).unwrap(),
+    );
+    let home = Home::with_hooks(&[driver, hook]);
+    let cases = [("local/bus-driver", "driver"), ("local/bus-hook", "hook")];
+    for (artifact, runtime) in cases {
+        let project = home.project(
+            "http://127.0.0.1:9",
+            &format!("  - name: {artifact}\n    version: {VERSION}\n    runtime: {runtime}\n"),
+            "",
+        );
+        let run = home.run(&project);
+        assert!(
+            !run.output.status.success(),
+            "{artifact}: {}",
+            run.context()
+        );
+        let expected = format!(
+            "error[E-CAP-022]: artifact '{artifact}' imports murmur:bus but is not the artifact \
+             code_mode.repl names"
+        );
+        assert!(
+            run.stderr.contains(&expected),
+            "{artifact}: {}",
+            run.context()
+        );
+    }
+}

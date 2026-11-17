@@ -104,7 +104,7 @@ pub(crate) enum BusReply {
 
 /// Whether `imports`, a component's `murmur:*` import names, name package `murmur:bus` at any
 /// version.
-pub fn imports_bus(imports: &[String]) -> bool {
+pub(crate) fn imports_bus(imports: &[String]) -> bool {
     imports.iter().any(|name| {
         name.split_once('/')
             .map_or(name.as_str(), |(package, _)| package)
@@ -117,8 +117,8 @@ pub fn imports_bus(imports: &[String]) -> bool {
 /// Refuses `artifact` when its `imports` name `murmur:bus` and it is not `repl`, the
 /// `runtime: tool` artifact `code_mode.repl` names (`None` without a `code_mode` block). Checked
 /// before the artifact's fit, so the named tool importing another bus version is refused for its
-/// level instead.
-pub(crate) fn refuse_bus_import(
+/// level instead. `mur run` checks it while staging and `mur doctor` on each installed artifact.
+pub fn refuse_bus_import(
     artifact: &str,
     imports: &[String],
     repl: Option<&str>,
@@ -168,8 +168,8 @@ pub(crate) enum Unanswered {
     Ended,
 }
 
-/// The refusal a program's request gets outside a frame, as a `(reason, text after the leading
-/// "'{name}' was not called: ")` pair.
+/// The sentence a request refused outside a frame gets after the leading
+/// `'{name}' was not called: `.
 fn unanswered_tail(tool: &str, why: Unanswered) -> String {
     let whose = match why {
         Unanswered::PlanStep => "is a plan step's",

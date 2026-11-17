@@ -461,7 +461,7 @@ observed by the `on-tool-call` hooks as a failed call, as the model's is; a refu
 point also writes its `call_denied` or `protected_path_denied` line. No other refusal reaches an
 observation hook.
 
-A `detached` or `not-answered` refusal is written by the session's second appender, hung off the
+A `detached` or `not-answered` refusal is written as a session-level record, hung off the
 session node, with the turn and `task_id` the call was made in (turn `0` for a call made through a
 `transport: process` harness). It is not counted in `session_end.total_tool_calls` or
 `task_end.tool_calls`. Every other code mode `tool_call` parents to its turn node and is counted.

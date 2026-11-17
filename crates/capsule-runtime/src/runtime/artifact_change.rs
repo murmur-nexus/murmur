@@ -973,7 +973,7 @@ impl CapsuleStoreState {
 
     /// The http agent loop's dispatch: `pull-artifact` and `remove-artifact` on this exclusively
     /// held session, fenced like every tool result, and every other name through
-    /// [`Self::dispatch_agent_tool_async`].
+    /// [`Self::dispatch_fenced`].
     ///
     /// The loop awaits each call of a turn before it starts the next, so a call listed before a
     /// `remove-artifact` completes on the artifact as it was, and one listed after it is refused.
@@ -981,7 +981,7 @@ impl CapsuleStoreState {
     /// Both tools run inline on the calling task: they hold the session exclusively, and the turn
     /// waits on them in any case. A pull that reads a source blocks that task for the requests.
     ///
-    /// `cancel` is the attempt's own cancel, handed on to [`Self::dispatch_agent_tool_async`].
+    /// `cancel` is the attempt's own cancel, handed on to [`Self::dispatch_fenced`].
     ///
     /// `frame` is the http agent loop's [`crate::bus::BusFrame`] for the model's own call: a call
     /// to the code mode tool answers its program's `murmur:bus` requests in it. `None` from every
@@ -1437,14 +1437,14 @@ mod tests {
         assert!(
             err.starts_with(
                 "does-not-fit: [E-WIT-LEVEL-001] artifact 'local/tool-editor@2.0.0' does not fit \
-                 WIT level 7, the level this mur serves: it imports \
-                 murmur:tool-registry/invoke@9.9.9, and level 7 has murmur:tool-registry@"
+                 WIT level 8, the level this mur serves: it imports \
+                 murmur:tool-registry/invoke@9.9.9, and level 8 has murmur:tool-registry@"
             ),
             "{err}"
         );
         assert!(
             err.ends_with(
-                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 7"
+                "; local/tool-editor@1.0.0 is the newest version in the store that fits level 8"
             ),
             "{err}"
         );
@@ -1609,7 +1609,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("; no version of local/tool-editor in the store fits level 7"),
+            err.ends_with("; no version of local/tool-editor in the store fits level 8"),
             "{err}"
         );
         assert_eq!(snapshot(&project, &state), before);
