@@ -93,3 +93,6 @@
 *[capabilities.resources.memory_bytes]: RLIMIT_AS per command · address space not RAM · default 2 GiB · node needs 32 GiB+
 *[capabilities.resources.cgroup_memory_bytes]: memory.max · whole command tree · real RAM cap · default 4 GiB
 *[lifecycle.done_check]: command run when agent stops · exit 0 ends task · limit: reopens · 0 = record only
+*[code_mode.repl]: scope/name of one runtime: tool artifact · one instance per session · only artifact linked to bus
+*[code_mode.detach_after_secs]: seconds before model's call moves to background · returns work id · unset: runs until return
+*[code_mode.tools_visible]: true: model offered every tool · default | false: code mode tool only · plus background-command

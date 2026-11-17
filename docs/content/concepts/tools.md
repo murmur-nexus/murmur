@@ -58,6 +58,14 @@ forks into the background and exits.
 
 ## Code mode { #code-mode }
 
+Code mode gives the model a REPL artifact, named in the manifest's `code_mode` block, in place of
+calling each tool itself. The programs the model writes there call the capsule's operations through
+[the bus](../reference/wit-interfaces.md#bus), with the same grants, hooks and records as the
+model's own calls, and only what a program prints returns to the model.
+[Use code mode in a capsule](../how-to/use-code-mode.md) sets one up; the
+[manifest block](../reference/manifest.md#code-mode) and the
+[code mode records](../reference/observability-schemas.md#code-mode-records) are in the reference.
+
 A WASM tool runs each call in a fresh instance, so nothing one call leaves in memory reaches the
 next. The one artifact a manifest names in [`code_mode.repl`](../reference/manifest.md#code-mode)
 keeps a single instance instead, for the rest of the session:

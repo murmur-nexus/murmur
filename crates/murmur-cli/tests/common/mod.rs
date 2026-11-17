@@ -848,6 +848,36 @@ pub fn create_tool_artifact_with_auth(
     artifact_path
 }
 
+/// The value of the top-level `key:` line of a `murmur.yaml`, unquoted.
+pub fn manifest_field(manifest_yaml: &str, key: &str) -> String {
+    let prefix = format!("{key}:");
+    manifest_yaml
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .unwrap_or_else(|| panic!("no top-level {key}: in\n{manifest_yaml}"))
+}
+
+/// An artifact built elsewhere and copied into the fixtures, packed as its own source packs it:
+/// `manifest` verbatim as `murmur.yaml` and `payload` under its own file name, which the
+/// manifest's `requires_files` names. Written to `dir` as `<name>-<version>.mur.zip`.
+pub fn create_vendored_artifact(dir: &Path, manifest: &Path, payload: &Path) -> PathBuf {
+    let manifest_yaml = fs::read_to_string(manifest).unwrap();
+    let name = manifest_field(&manifest_yaml, "name");
+    let version = manifest_field(&manifest_yaml, "version");
+    let payload_name = payload.file_name().unwrap().to_str().unwrap();
+    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
+    let mut zip = ZipWriter::new(fs::File::create(&artifact_path).unwrap());
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    zip.write_all(manifest_yaml.as_bytes()).unwrap();
+    zip.start_file(payload_name, options).unwrap();
+    zip.write_all(&fs::read(payload).unwrap()).unwrap();
+    zip.finish().unwrap();
+    artifact_path
+}
+
 pub fn create_hook_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
     let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
