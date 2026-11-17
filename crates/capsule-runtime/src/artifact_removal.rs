@@ -462,6 +462,7 @@ mod tests {
                 &state.runtime_root,
                 None,
                 &state.installed_artifacts,
+                None,
             ))
         };
 

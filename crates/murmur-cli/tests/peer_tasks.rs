@@ -66,6 +66,7 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
             home.path().join(".murmur").join("artifacts"),
         )),
         StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,

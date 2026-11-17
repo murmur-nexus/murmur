@@ -953,6 +953,7 @@ pub(crate) fn run_run(
         })?;
 
     let stage_request = StageRequest {
+        code_mode: runtime_manifest.code_mode.clone(),
         credentials_file: crate::config::mur_config_path().ok(),
         manifest_dir: project_dir.clone(),
         capsule_name: runtime_manifest.name.clone(),

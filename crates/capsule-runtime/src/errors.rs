@@ -601,6 +601,20 @@ pub enum RuntimeError {
     #[error("capsule execution exceeded its configured resource limits: {message}")]
     CapsuleResourceLimit { message: String },
 
+    /// The package `code_mode.repl` resolved to is not a `runtime: tool` artifact's: its packed
+    /// `murmur.yaml` declares another runtime. Refused while staging, ahead of the artifact's other
+    /// checks.
+    #[error("murmur.yaml: invalid code_mode config for 'code_mode.repl': {message}")]
+    InvalidCodeModePackage { message: String },
+
+    /// A capsule declares `code_mode` in a process that runs its guests in this process rather
+    /// than in guest workers, where no tool instance can be held for the session.
+    #[error(
+        "code_mode needs guest workers: this process runs its guests in-process, so no tool \
+         instance can be held for the session"
+    )]
+    CodeModeWithoutGuestWorkers,
+
     /// A guest worker died or stopped answering mid-session: the task in flight failed and the
     /// session ended. The text names the worker kind, its pid, the call and how it exited.
     #[error("{0}")]

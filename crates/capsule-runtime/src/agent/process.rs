@@ -1023,10 +1023,15 @@ async fn run_harness(
         let _ = trace.write_harness_warning(W_RUN_002, &message).await;
     }
 
+    let offered_only = store_state
+        .code_mode
+        .as_ref()
+        .and_then(|code_mode| code_mode.offered_only());
     let inventory = build_tool_inventory(
         &store_state.runtime_root,
         inference.system_prompt_artifact.as_deref(),
         &store_state.installed_artifacts,
+        offered_only.as_deref(),
     );
     // On a session with a network namespace the bridge serves a listener opened inside it, so
     // nothing in the host's namespace can reach it; without one it binds the host loopback.

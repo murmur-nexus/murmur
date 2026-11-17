@@ -112,11 +112,11 @@ pub use roster::{
 };
 pub use roster_warnings::{roster_warning_link, W_ROS_001};
 pub use runtime_manifest::{
-    commit_policy_for_binding, effective_containment_floor, harness_path_shape_error,
+    code_mode_package_refusal, commit_policy_for_binding, effective_containment_floor, harness_path_shape_error,
     load_runtime_manifest, parse_byte_size, parse_duration_secs, parse_hook_config_from_yaml,
     read_hook_config, read_runtime_manifest_text, referenced_env_variables, tool_name_of,
     AfterTask, ApiKeyReference, ArtifactGateway, ArtifactRuntime, AuthenticationScheme,
-    Capabilities, CompactionConfig, ContainmentClass, ContextConfig, ContextImagesConfig,
+    Capabilities, CodeModeConfig, CompactionConfig, ContainmentClass, ContextConfig, ContextImagesConfig,
     ContextRetainConfig, ControlConfig, ControllableSetting, ConversationCapabilities,
     ConversationMode, DeployConfig, DoneCheck, DoorCredential, EnvCapabilities, EvalConfig,
     ExportMode, Exports, FileExport, FilesystemCapabilities, HarnessCapabilities,

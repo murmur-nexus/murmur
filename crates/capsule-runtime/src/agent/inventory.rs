@@ -55,10 +55,16 @@ pub(crate) fn staged_manifest_runtime(manifest: &serde_norway::Value) -> Artifac
 /// followed by one space and its own description, or the marker alone when it has none. Every
 /// other entry, and a name with no summary (a runtime-provided tool), is built exactly as it
 /// would be with `installed` empty.
+///
+/// `only`: the names the array is limited to, for `code_mode.tools_visible: false`
+/// ([`crate::code_mode::CodeMode::offered_only`]); every other entry is left off, in place, so
+/// the array stays sorted. `None` offers every tool. It changes what is offered, not what a call
+/// may reach.
 pub(crate) fn build_tool_inventory(
     runtime_root: &WorkdirRoot,
     system_prompt_artifact: Option<&str>,
     installed: &[InstalledArtifactSummary],
+    only: Option<&[String]>,
 ) -> Vec<Value> {
     let mut tools = Vec::new();
 
@@ -75,6 +81,9 @@ pub(crate) fn build_tool_inventory(
         // A link under `tools/` is read through below, which refuses it and latches the refusal;
         // anything else that is not a directory is not a tool.
         if !matches!(kind, EntryKind::Directory | EntryKind::Symlink) {
+            continue;
+        }
+        if only.is_some_and(|only| !only.contains(&name)) {
             continue;
         }
 
@@ -162,6 +171,8 @@ pub(crate) fn build_tool_inventory(
 pub(crate) struct HeldInventory {
     tools: Vec<Value>,
     generation: u64,
+    /// [`build_tool_inventory`]'s `only`, fixed for the session.
+    only: Option<Vec<String>>,
 }
 
 /// What released a rebuild of the held tool array, as `tools_refreshed.trigger` names it.
@@ -203,16 +214,24 @@ pub(crate) struct InventoryRefresh {
 }
 
 impl HeldInventory {
-    /// The launch build: [`build_tool_inventory`] over `runtime_root`, held as of `generation`.
+    /// The launch build: [`build_tool_inventory`] over `runtime_root`, limited to `only`, held as
+    /// of `generation`. Every rebuild is limited to the same `only`.
     pub(crate) fn build(
         runtime_root: &WorkdirRoot,
         system_prompt_artifact: Option<&str>,
         installed: &[InstalledArtifactSummary],
         generation: u64,
+        only: Option<Vec<String>>,
     ) -> Self {
         Self {
-            tools: build_tool_inventory(runtime_root, system_prompt_artifact, installed),
+            tools: build_tool_inventory(
+                runtime_root,
+                system_prompt_artifact,
+                installed,
+                only.as_deref(),
+            ),
             generation,
+            only,
         }
     }
 
@@ -264,7 +283,12 @@ impl HeldInventory {
             return None;
         };
 
-        let rebuilt = build_tool_inventory(runtime_root, system_prompt_artifact, installed);
+        let rebuilt = build_tool_inventory(
+            runtime_root,
+            system_prompt_artifact,
+            installed,
+            self.only.as_deref(),
+        );
         self.generation = current_generation;
         if serialized(&rebuilt) == serialized(&self.tools) {
             return None;
@@ -336,7 +360,7 @@ mod tests {
              input_schema:\n  type: object\n  properties:\n    word:\n      type: string\n",
         );
         write_tool(&tools_dir, "plain");
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(
             serde_json::to_string(&tools).unwrap(),
             r#"[{"description":"Look a word up.","name":"lookup","parameters":{"properties":{"word":{"type":"string"}},"type":"object"}},{"name":"plain","parameters":{"properties":{},"type":"object"}}]"#
@@ -354,7 +378,7 @@ mod tests {
              provider_tool:\n  kind: computer\n  display_width: 1280\n  display_height: 800\n",
         );
         write_tool(&tools_dir, "plain");
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(
             tools[0],
             json!({
@@ -392,7 +416,7 @@ mod tests {
             .unwrap();
         }
 
-        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        let tools = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         assert_eq!(tools[0]["name"], "fronted");
         assert_eq!(tools[0]["description"], "Fill PDF forms.");
         assert_eq!(tools[1]["name"], "plain");
@@ -410,12 +434,72 @@ mod tests {
         }
 
         let names: Vec<String> =
-            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None)
                 .iter()
                 .map(|t| t["name"].as_str().unwrap().to_string())
                 .collect();
 
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    /// `code_mode.tools_visible: false` limits the array to the names it offers, in the sorted
+    /// order and with the bytes each entry has without the limit; `None` offers every tool.
+    #[test]
+    fn code_mode_inventory_offers_only_the_named_tools() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        for name in ["zeta", "counter-tool", "background-command", "alpha", "bash"] {
+            write_tool(&tools_dir, name);
+        }
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        let all = build_tool_inventory(&root, None, &[], None);
+        assert_eq!(
+            tool_names(&all),
+            vec!["alpha", "background-command", "bash", "counter-tool", "zeta"]
+        );
+        for detaches in [true, false] {
+            let only = crate::code_mode::offered_only("counter-tool", false, detaches).unwrap();
+            let limited = build_tool_inventory(&root, None, &[], Some(&only));
+            let expected: Vec<&Value> = all
+                .iter()
+                .filter(|tool| only.iter().any(|name| tool["name"] == name.as_str()))
+                .collect();
+            assert_eq!(
+                serde_json::to_string(&limited).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+            let names = tool_names(&limited);
+            if detaches {
+                assert_eq!(names, vec!["background-command", "counter-tool"]);
+            } else {
+                assert_eq!(names, vec!["counter-tool"]);
+            }
+        }
+        assert_eq!(crate::code_mode::offered_only("counter-tool", true, true), None);
+    }
+
+    /// The held array is limited on every rebuild as it was at launch.
+    #[test]
+    fn code_mode_held_inventory_keeps_its_limit_across_a_refresh() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        for name in ["counter-tool", "alpha"] {
+            write_tool(&tools_dir, name);
+        }
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        let mut held = HeldInventory::build(
+            &root,
+            None,
+            &[],
+            0,
+            Some(vec!["counter-tool".to_string()]),
+        );
+        assert_eq!(tool_names(held.tools()), vec!["counter-tool"]);
+        write_tool(&tools_dir, "beta");
+        let refresh =
+            held.refresh_before_call(&root, None, &[], ToolRefresh::Immediate, 1, false, false);
+        assert!(refresh.is_none(), "{refresh:?}");
+        assert_eq!(tool_names(held.tools()), vec!["counter-tool"]);
     }
 
     /// Two builds over the same unchanged workdir produce byte-identical JSON: the array a
@@ -432,12 +516,14 @@ mod tests {
             &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
             &[],
+            None,
         ))
         .unwrap();
         let second = serde_json::to_string(&build_tool_inventory(
             &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
             &[],
+            None,
         ))
         .unwrap();
 
@@ -501,6 +587,7 @@ mod tests {
             &WorkdirRoot::open(workdir).unwrap(),
             None,
             installed,
+            None,
         ))
         .unwrap()
     }
@@ -526,7 +613,7 @@ mod tests {
     #[test]
     fn runtime_origin_inventory_prefixes_only_the_runtime_entry() {
         let workdir = mixed_workdir();
-        let unmarked = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
+        let unmarked = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None);
         let marked = build_tool_inventory(
             &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
@@ -534,6 +621,7 @@ mod tests {
                 summary("fetcher", ArtifactRuntime::Tool, pulled_by("ses_puller")),
                 summary("house-style", ArtifactRuntime::Skill, LockOrigin::Operator),
             ],
+            None,
         );
 
         assert_eq!(marked.len(), unmarked.len());
@@ -564,7 +652,7 @@ mod tests {
             "name: bare-skill\nversion: 1.0.0\nruntime: skill\n",
         );
         assert!(
-            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])[0]
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[], None)[0]
                 .get("description")
                 .is_none()
         );
@@ -578,6 +666,7 @@ mod tests {
             &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
             &installed,
+            None,
         );
         assert_eq!(marked[0]["description"], RUNTIME_ORIGIN_MARKER);
 
@@ -591,6 +680,7 @@ mod tests {
             &WorkdirRoot::open(described.path()).unwrap(),
             None,
             &installed,
+            None,
         );
         let entry = marked
             .iter()

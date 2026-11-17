@@ -56,6 +56,40 @@ A session process lives as long as the program `start` ran: when it exits, whate
 running in its process group is killed. Start a server in its foreground mode, not one that
 forks into the background and exits.
 
+## Code mode { #code-mode }
+
+A WASM tool runs each call in a fresh instance, so nothing one call leaves in memory reaches the
+next. The one artifact a manifest names in [`code_mode.repl`](../reference/manifest.md#code-mode)
+keeps a single instance instead, for the rest of the session:
+
+- The instance starts with the first call the model makes to the tool. A session whose model never
+  calls it starts none.
+- It runs one call at a time. A call that arrives while another runs, from the model or from a plan
+  step, is refused with a tool error and starts nothing.
+- With `code_mode.detach_after_secs` set, a call from the model that runs that long returns a work
+  id while it keeps running. The [`background-command`](../reference/runtime-provided-tools.md#background-command)
+  tool reports on it, waits for it or stops it. A plan step's call never moves to the background.
+
+The instance ends in any of these ways, and every value it held is lost:
+
+| Ends when | Next call |
+|---|---|
+| The session ends; a call still running is stopped | — |
+| `background-command stop` names the call running in it | Starts a new instance |
+| The tool crashes | Starts a new instance |
+| A call runs past [`capabilities.limits.deadline_seconds`](../reference/resource-limits.md) | Starts a new instance |
+| The tool grows past a `capabilities.limits` memory or table cap | Starts a new instance |
+| A call is canceled before it moved to the background, as a task cancel cancels it | Starts a new instance |
+| The worker process that holds it is lost, which ends the session too | — |
+
+A call that ended the instance returns its failure followed by the sentence `The code mode instance
+ended; every value it held is lost, and the next call to '<tool>' starts a new instance.` The
+instance's start, its end with the reason, and each move to the background are
+[trace records](../reference/observability-schemas.md#code-mode-records).
+
+The tool's grants, the `on-tool-call` hooks and the `tool_call` record apply to each call exactly
+as to any other tool's.
+
 ## Tool dispatch
 
 Each tool call is resolved in a fixed precedence order:

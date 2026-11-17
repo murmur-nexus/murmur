@@ -28,8 +28,48 @@ pub(crate) const STOP_KILL_WAIT: Duration = Duration::from_secs(3);
 /// `background-command`'s input schema.
 pub const INPUT_SCHEMA: &str = r#"{"type":"object","properties":{"operation":{"type":"string","enum":["status","wait","stop"]},"work_id":{"type":"string"},"wait_secs":{"type":"integer","minimum":0}},"required":["operation","work_id"]}"#;
 
-/// `background-command`'s description, the same on both transports.
-pub fn description() -> String {
+/// `background-command`'s description, the same on both transports, for what the capsule has:
+/// `shell`, shell commands demoted on a clock, and `code_mode_tool`, the code mode tool whose calls
+/// can be moved to the background. A capsule with shell demotion alone is described by
+/// [`shell_description`].
+pub fn description(shell: bool, code_mode_tool: Option<&str>) -> String {
+    match (shell, code_mode_tool) {
+        (_, None) => shell_description(),
+        (false, Some(tool)) => code_mode_description(tool),
+        (true, Some(tool)) => format!(
+            "{} It also reports on, waits for, or stops a call to the '{tool}' tool that was \
+             moved to the background, named by the work id that call returned: `wait` returns \
+             once the call finishes, and `stop` ends the code mode instance the call runs in, \
+             which stops the call; every value the instance holds is lost, and the next call to \
+             '{tool}' starts a new instance. For such a call each operation returns its state \
+             (running, finished or stopped), the seconds since it started and, once finished, \
+             the call's own status and result; a call still running at the session's end is \
+             stopped.",
+            shell_description()
+        ),
+    }
+}
+
+/// The description of a capsule whose calls to the code mode tool `tool` can be moved to the
+/// background, and which demotes no shell command.
+fn code_mode_description(tool: &str) -> String {
+    format!(
+        "Reports on, waits for, or stops a call to the '{tool}' tool that was moved to the \
+         background, named by the work id ({WORK_ID_PREFIX}…) that call returned. `operation` is \
+         `status`, `wait` or `stop`. `status` returns at once. `wait` returns once the call \
+         finishes or after `wait_secs` seconds, whichever is first; `wait_secs` defaults to \
+         {MAX_WAIT_SECS}, which is also the most it can be. `stop` ends the code mode instance \
+         the call runs in, which stops the call; every value the instance holds is lost, and the \
+         next call to '{tool}' starts a new instance. Each operation returns the call's state \
+         (running, finished or stopped) and the seconds since it started; a finished call's \
+         status and result follow. A work id is valid for the rest of the session that issued \
+         it; a call still running at the session's end is stopped."
+    )
+}
+
+/// The description of a capsule whose shell commands are demoted on a clock and which has no
+/// code mode tool.
+fn shell_description() -> String {
     format!(
         "Reports on, waits for, or stops a shell command that was moved to the background, named \
          by the work id ({WORK_ID_PREFIX}…) its shell call returned. `operation` is `status`, \
@@ -248,6 +288,109 @@ pub(crate) fn render(
     (result, (!notes.is_empty()).then(|| notes.join("\n")))
 }
 
+/// The tool result for `snapshot`, a call to the code mode tool moved to the background.
+///
+/// The lines are `work_id`, `tool`, `state`, `elapsed_secs`, `waited_secs` (a `wait` only) and
+/// `call_status` (a finished call only), then a blank line and the call's own data for a finished
+/// call, or the stop sentence for a stopped one. `status` is the call's own for a finished call and
+/// `Passed` otherwise; a finished call's `summary`, `truncated` and `attachments` are carried over.
+pub(crate) fn render_code_mode(
+    snapshot: &crate::code_mode::CallSnapshot,
+    waited: Option<Duration>,
+) -> ToolResult {
+    use crate::code_mode::CallState;
+
+    let mut lines = vec![
+        format!("work_id: {}", snapshot.work_id),
+        format!("tool: {}", snapshot.tool),
+        format!("state: {}", snapshot.state.as_str()),
+        format!("elapsed_secs: {}", snapshot.elapsed.as_secs()),
+    ];
+    if let Some(waited) = waited {
+        lines.push(format!("waited_secs: {}", waited.as_secs()));
+    }
+    let metadata = vec![
+        ("work_id".to_string(), snapshot.work_id.clone()),
+        ("state".to_string(), snapshot.state.as_str().to_string()),
+    ];
+    let running_summary = || format!("{} {}", snapshot.work_id, snapshot.state.as_str());
+    match &snapshot.state {
+        CallState::Running => ToolResult {
+            status: Status::Passed,
+            summary: Some(running_summary()),
+            data: Some(lines.join("\n")),
+            data_path: None,
+            truncated: false,
+            metadata,
+            attachments: Vec::new(),
+        },
+        CallState::Stopped => ToolResult {
+            status: Status::Passed,
+            summary: Some(running_summary()),
+            data: Some(format!(
+                "{}\n\n{}",
+                lines.join("\n"),
+                crate::code_mode::stopped_sentence(&snapshot.tool)
+            )),
+            data_path: None,
+            truncated: false,
+            metadata,
+            attachments: Vec::new(),
+        },
+        CallState::Finished(Ok(result)) => {
+            lines.push(format!("call_status: {}", status_name(&result.status)));
+            let own = result.data.as_deref().or(result.summary.as_deref());
+            let data = match own {
+                Some(own) => format!("{}\n\n{own}", lines.join("\n")),
+                None => lines.join("\n"),
+            };
+            ToolResult {
+                status: result.status,
+                summary: result.summary.clone().or_else(|| Some(running_summary())),
+                data: Some(data),
+                data_path: None,
+                truncated: result.truncated,
+                metadata,
+                attachments: result.attachments.clone(),
+            }
+        }
+        CallState::Finished(Err(error)) => {
+            lines.push("call_status: error".to_string());
+            ToolResult {
+                status: Status::Error,
+                summary: Some(running_summary()),
+                data: Some(format!("{}\n\n{error}", lines.join("\n"))),
+                data_path: None,
+                truncated: false,
+                metadata,
+                attachments: Vec::new(),
+            }
+        }
+    }
+}
+
+/// The bytes of a finished code mode call's own data, as `background_command.output_bytes`
+/// records it; `0` for a call that has not finished.
+pub(crate) fn code_mode_output_bytes(state: &crate::code_mode::CallState) -> u64 {
+    match state {
+        crate::code_mode::CallState::Finished(Ok(result)) => result
+            .data
+            .as_deref()
+            .or(result.summary.as_deref())
+            .map_or(0, |data| data.len() as u64),
+        crate::code_mode::CallState::Finished(Err(error)) => error.len() as u64,
+        crate::code_mode::CallState::Running | crate::code_mode::CallState::Stopped => 0,
+    }
+}
+
+fn status_name(status: &Status) -> &'static str {
+    match status {
+        Status::Passed => "passed",
+        Status::Failed => "failed",
+        Status::Error => "error",
+    }
+}
+
 /// `tail` from its first byte that starts a UTF-8 character: a tail cut from a longer output can
 /// begin inside one.
 fn from_char_boundary(tail: &[u8]) -> &[u8] {
@@ -267,9 +410,128 @@ mod tests {
 
     /// The description states what each operation does and its limits, and nothing about when or
     /// why to use it.
+    /// The text a capsule with shell demotion and no code mode is offered, byte for byte.
+    const SHELL_ONLY_DESCRIPTION: &str = "Reports on, waits for, or stops a shell command that was \
+        moved to the background, named by the work id (wrk_…) its shell call returned. \
+        `operation` is `status`, `wait` or `stop`. `status` returns at once. `wait` returns once \
+        the command exits or after `wait_secs` seconds, whichever is first; `wait_secs` defaults \
+        to 600, which is also the most it can be. `stop` sends SIGTERM to the command and every \
+        process in its process group, SIGKILL 2 seconds later to any still running, and returns \
+        once the command has exited; a process that left the group is not reached and ends with \
+        the session. Each operation returns the command's state (running, exited or stopped), \
+        its exit code once it has one, the seconds since it started, and the last 16384 bytes of \
+        its combined stdout and stderr, with the path of the file in the session's records that \
+        holds all of it. A work id is valid for the rest of the session that issued it; a \
+        command still running at the session's end is killed.";
+
+    #[test]
+    fn background_command_shell_only_description_is_unchanged() {
+        assert_eq!(description(true, None), SHELL_ONLY_DESCRIPTION);
+    }
+
+    #[test]
+    fn background_command_shell_refusals_are_unchanged() {
+        assert_eq!(
+            unknown_work_id("wrk_0a"),
+            "no background command with work id `wrk_0a` in this session"
+        );
+        assert_eq!(
+            not_available(),
+            "'background-command': background commands are not available in this session"
+        );
+    }
+
+    /// The code mode and combined descriptions state what each operation does to a code mode
+    /// call, and nothing about when or why to use it.
+    #[test]
+    fn background_command_code_mode_descriptions_state_facts_only() {
+        let code_mode = description(false, Some("counter-tool"));
+        let combined = description(true, Some("counter-tool"));
+        assert!(combined.starts_with(SHELL_ONLY_DESCRIPTION), "{combined}");
+        for text in [&code_mode, &combined] {
+            for fact in [
+                "'counter-tool'",
+                "`stop` ends the code mode instance",
+                "every value the instance holds is lost",
+                "starts a new instance",
+                "running, finished or stopped",
+            ] {
+                assert!(text.contains(fact), "{fact} missing: {text}");
+            }
+            let lower = text.to_lowercase();
+            for advice in ["when", "should", "call this", "use this"] {
+                assert!(!lower.contains(advice), "{advice}: {text}");
+            }
+        }
+        assert!(!code_mode.contains("SIGTERM"), "{code_mode}");
+        assert!(code_mode.contains("`wait_secs` defaults to 600"), "{code_mode}");
+    }
+
+    fn code_mode_snapshot(state: crate::code_mode::CallState) -> crate::code_mode::CallSnapshot {
+        crate::code_mode::CallSnapshot {
+            work_id: "wrk_0a1b".to_string(),
+            tool: "counter-tool".to_string(),
+            state,
+            elapsed: Duration::from_millis(4_200),
+        }
+    }
+
+    #[test]
+    fn background_command_code_mode_results_render_their_lines() {
+        use crate::code_mode::CallState;
+
+        let running = render_code_mode(&code_mode_snapshot(CallState::Running), None);
+        assert_eq!(
+            running.data.as_deref(),
+            Some("work_id: wrk_0a1b\ntool: counter-tool\nstate: running\nelapsed_secs: 4")
+        );
+        assert!(matches!(running.status, Status::Passed));
+
+        let finished = render_code_mode(
+            &code_mode_snapshot(CallState::Finished(Ok(ToolResult {
+                status: Status::Passed,
+                summary: Some("counted".to_string()),
+                data: Some("count=1".to_string()),
+                data_path: None,
+                truncated: false,
+                metadata: Vec::new(),
+                attachments: Vec::new(),
+            }))),
+            Some(Duration::from_secs(3)),
+        );
+        assert_eq!(
+            finished.data.as_deref(),
+            Some(
+                "work_id: wrk_0a1b\ntool: counter-tool\nstate: finished\nelapsed_secs: 4\n\
+                 waited_secs: 3\ncall_status: passed\n\ncount=1"
+            )
+        );
+        assert_eq!(finished.summary.as_deref(), Some("counted"));
+
+        let stopped = render_code_mode(&code_mode_snapshot(CallState::Stopped), None);
+        assert_eq!(
+            stopped.data.as_deref(),
+            Some(
+                "work_id: wrk_0a1b\ntool: counter-tool\nstate: stopped\nelapsed_secs: 4\n\n\
+                 The call was stopped by ending the code mode instance; every value the instance \
+                 held is lost, and the next call to 'counter-tool' starts a new instance."
+            )
+        );
+
+        let failed = render_code_mode(
+            &code_mode_snapshot(CallState::Finished(Err("tool 'counter-tool' trapped".into()))),
+            None,
+        );
+        assert!(matches!(failed.status, Status::Error));
+        assert!(
+            failed.data.as_deref().unwrap().contains("call_status: error\n\ntool"),
+            "{failed:?}"
+        );
+    }
+
     #[test]
     fn the_description_states_operations_and_limits_only() {
-        let description = description();
+        let description = description(true, None);
         for fact in [
             "`status`",
             "`wait`",

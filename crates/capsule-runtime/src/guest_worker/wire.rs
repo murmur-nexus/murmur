@@ -11,6 +11,7 @@ use crate::bindings::hook::murmur::conversation::read::MessagePage;
 use crate::bindings::hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse};
 use crate::bindings::hook::murmur::task_io::read::{IoError, TaskInputForm};
 use crate::bindings::host::murmur::tool::run::{ToolInput, ToolResult};
+use crate::code_mode::InstanceEnd;
 use crate::hooks::{HookArg, HookSpec};
 use crate::inference_import::HookInferencePurpose;
 use crate::limits::CallDeadline;
@@ -118,6 +119,19 @@ pub(crate) enum ToWorker {
     },
     /// End the worker; no reply.
     Shutdown,
+    /// Run the code mode tool's `run` with `input` on session instance `instance`, first
+    /// instantiating guest `guest` as that instance in a store built from `spec` when the worker
+    /// does not hold it: the WASI plan and the store limits are the first call's. `req` is also
+    /// the call id every host call of this run names. Replied to with [`Reply::SessionTool`].
+    SessionToolCall {
+        req: u64,
+        guest: u64,
+        instance: u64,
+        spec: Box<ToolCallSpec>,
+        input: ToolInput,
+    },
+    /// Drop session instance `instance`, and never open it again; no reply.
+    SessionToolClose { instance: u64 },
 }
 
 /// A message a worker sends the supervisor.
@@ -174,6 +188,13 @@ pub(crate) enum Reply {
         result: Result<(), CapsuleRunError>,
         deadlines: Vec<CallDeadline>,
     },
+    /// A call on a session instance: its result, and why the instance ended when the call ended
+    /// it, in which case the worker no longer holds it.
+    SessionTool {
+        result: Result<ToolResult, String>,
+        ended: Option<InstanceEnd>,
+        deadlines: Vec<CallDeadline>,
+    },
 }
 
 impl Reply {
@@ -185,7 +206,8 @@ impl Reply {
             | Self::HookOpened { deadlines, .. }
             | Self::Hook { deadlines, .. }
             | Self::Driver { deadlines, .. }
-            | Self::Capsule { deadlines, .. } => std::mem::take(deadlines),
+            | Self::Capsule { deadlines, .. }
+            | Self::SessionTool { deadlines, .. } => std::mem::take(deadlines),
         }
     }
 }

@@ -28,6 +28,7 @@ pub mod bindings;
 pub(crate) mod cancel;
 pub(crate) mod capsule_facts;
 pub(crate) mod cgroup;
+pub(crate) mod code_mode;
 pub mod child_launch;
 pub(crate) mod compiled_forms;
 pub mod containment;

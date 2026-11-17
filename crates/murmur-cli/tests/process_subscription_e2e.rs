@@ -765,6 +765,7 @@ fn stage(home: &TempDir, manifest_path: &Path, repo: &Path) -> capsule_runtime::
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,

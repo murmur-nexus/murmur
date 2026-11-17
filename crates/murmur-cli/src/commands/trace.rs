@@ -581,6 +581,36 @@ struct BackgroundCommandEvent {
     exit_code: Option<i32>,
     #[serde(default)]
     waited_ms: Option<u64>,
+    /// The code mode artifact, for a code mode work id.
+    #[serde(default)]
+    artifact: Option<String>,
+}
+
+/// The call that opened a code mode instance.
+#[derive(Debug, Deserialize)]
+struct CodeModeInstanceStartEvent {
+    artifact: String,
+    instance: u64,
+}
+
+/// A code mode instance ended.
+#[derive(Debug, Deserialize)]
+struct CodeModeInstanceEndEvent {
+    artifact: String,
+    instance: u64,
+    reason: String,
+    calls: u64,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// A call to the code mode tool moved to the background.
+#[derive(Debug, Deserialize)]
+struct CodeModeDetachEvent {
+    artifact: String,
+    instance: u64,
+    work_id: String,
+    after_ms: u64,
 }
 
 /// That command still running when the session ended, so its result was lost.
@@ -1361,6 +1391,9 @@ enum TraceEvent {
     ShellAbandoned(ShellAbandonedEvent),
     ShellLost(ShellLostEvent),
     BackgroundCommand(BackgroundCommandEvent),
+    CodeModeInstanceStart(CodeModeInstanceStartEvent),
+    CodeModeInstanceEnd(CodeModeInstanceEndEvent),
+    CodeModeDetach(CodeModeDetachEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
     ContextSeed(ContextSeedEvent),
@@ -1995,7 +2028,8 @@ fn call_settings_rows(records: &[InferenceRecord]) -> Vec<String> {
 }
 
 /// One `background_command` record's row:
-/// `background_command <operation>  <work id>  <state>[  exit <n>][  waited <secs>]`.
+/// `background_command <operation>  <work id>  <state>[  <artifact>][  exit <n>][  waited <secs>]`,
+/// the artifact naming a code mode call's.
 fn background_command_row(e: &BackgroundCommandEvent) -> String {
     let mut row = format!(
         "background_command {}  {}  {}",
@@ -2003,6 +2037,9 @@ fn background_command_row(e: &BackgroundCommandEvent) -> String {
         fmt_id_short(&e.work_id, 12),
         e.state
     );
+    if let Some(artifact) = &e.artifact {
+        row.push_str(&format!("  {artifact}"));
+    }
     if let Some(exit_code) = e.exit_code {
         row.push_str(&format!("  exit {exit_code}"));
     }
@@ -3073,6 +3110,9 @@ fn compute_metrics(
                     .entry(format!("HTTP {}", refused.status))
                     .or_insert(0) += 1;
             }
+            TraceEvent::CodeModeInstanceStart(_)
+            | TraceEvent::CodeModeInstanceEnd(_)
+            | TraceEvent::CodeModeDetach(_) => {}
             TraceEvent::Unknown => {}
         }
     }
@@ -5165,6 +5205,33 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_dur(e.running_ms)
         ),
         TraceEvent::BackgroundCommand(e) => background_command_row(e),
+        TraceEvent::CodeModeInstanceStart(e) => format!(
+            "{}{}  instance {}",
+            kind("code_mode_instance_start"),
+            e.artifact,
+            e.instance
+        ),
+        TraceEvent::CodeModeInstanceEnd(e) => format!(
+            "{}{}  instance {}  {}  {} call{}{}",
+            kind("code_mode_instance_end"),
+            e.artifact,
+            e.instance,
+            e.reason,
+            e.calls,
+            if e.calls == 1 { "" } else { "s" },
+            e.message
+                .as_deref()
+                .map(|message| format!("  {message}"))
+                .unwrap_or_default()
+        ),
+        TraceEvent::CodeModeDetach(e) => format!(
+            "{}{}  instance {}  {}  after {}",
+            kind("code_mode_detach"),
+            e.artifact,
+            e.instance,
+            fmt_id_short(&e.work_id, 12),
+            fmt_dur(e.after_ms)
+        ),
         TraceEvent::ShellLost(e) => format!(
             "{}{}  {}  detached at {}  no result, reported by {}",
             kind("shell_lost"),
@@ -7358,6 +7425,35 @@ mod tests {
         assert_eq!(
             row(line),
             "shell_completed /usr/bin/bash  wrk_0a1b2c3d…  exit 0 ✓  42.0s  /home/test/.murmur/records/work/s/logs/wrk_0a1b2c3d4e5f6a7b.log"
+        );
+    }
+
+    #[test]
+    fn trace_show_renders_the_code_mode_records() {
+        let start = r#"{"event_type":"code_mode_instance_start","event_id":"evt_2","parent_id":"evt_1","session_id":"s","timestamp":2,"task_id":"tsk_1","artifact":"local/counter-tool","tool":"counter-tool","instance":1}"#;
+        assert_eq!(
+            row(start),
+            "code_mode_instance_start local/counter-tool  instance 1"
+        );
+        let end = r#"{"event_type":"code_mode_instance_end","event_id":"evt_3","parent_id":"evt_1","session_id":"s","timestamp":3,"artifact":"local/counter-tool","tool":"counter-tool","instance":1,"reason":"trap","calls":2,"message":"tool 'counter-tool' trapped: wasm trap"}"#;
+        assert_eq!(
+            row(end),
+            "code_mode_instance_end local/counter-tool  instance 1  trap  2 calls  tool 'counter-tool' trapped: wasm trap"
+        );
+        let session_end = r#"{"event_type":"code_mode_instance_end","event_id":"evt_4","parent_id":"evt_1","session_id":"s","timestamp":4,"artifact":"local/counter-tool","tool":"counter-tool","instance":2,"reason":"session_end","calls":1}"#;
+        assert_eq!(
+            row(session_end),
+            "code_mode_instance_end local/counter-tool  instance 2  session_end  1 call"
+        );
+        let detach = r#"{"event_type":"code_mode_detach","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"task_id":"tsk_1","artifact":"local/counter-tool","tool":"counter-tool","instance":1,"work_id":"wrk_0a1b2c3d4e5f6a7b","after_ms":1004}"#;
+        assert_eq!(
+            row(detach),
+            "code_mode_detach local/counter-tool  instance 1  wrk_0a1b2c3d…  after 1.0s"
+        );
+        let wait = r#"{"event_type":"background_command","event_id":"evt_6","parent_id":"evt_1","session_id":"s","timestamp":6,"task_id":"tsk_1","work_id":"wrk_0a1b2c3d4e5f6a7b","operation":"wait","state":"finished","waited_ms":3000,"output_bytes":7,"artifact":"local/counter-tool"}"#;
+        assert_eq!(
+            row(wait),
+            "background_command wait  wrk_0a1b2c3d…  finished  local/counter-tool  waited 3.0s"
         );
     }
 

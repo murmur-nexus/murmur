@@ -61,6 +61,7 @@ fn requested_from(manifest: &RuntimeManifest) -> Vec<ArtifactRequest> {
 
 fn stage_request(capsule_dir: &TempDir, manifest: &RuntimeManifest) -> StageRequest {
     StageRequest {
+        code_mode: None,
         source_supply: None,
         expected_workdir_identity: None,
         parent_workdir_snapshot: None,

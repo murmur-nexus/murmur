@@ -165,6 +165,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -565,6 +566,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,

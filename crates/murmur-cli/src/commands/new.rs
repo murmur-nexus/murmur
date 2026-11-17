@@ -233,6 +233,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     }
 
     let stage_request = StageRequest {
+        code_mode: runtime_manifest.code_mode.clone(),
         credentials_file: None,
         manifest_dir,
         capsule_name: runtime_manifest.name.clone(),

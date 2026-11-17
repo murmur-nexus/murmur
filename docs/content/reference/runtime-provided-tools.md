@@ -26,7 +26,7 @@ Each one appears only when the declaration in the second column is present.
 | `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
 | `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
 | `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
-| `background-command` | An [`inference:`](manifest.md#field-inference) block, a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
+| `background-command` | An [`inference:`](manifest.md#field-inference) block with either a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), or a [`code_mode.detach_after_secs`](manifest.md#code-mode), on both transports | Reports on, waits for or stops a shell command or a code mode call that moved to the background, by its work id — see [`background-command`](#background-command) |
 
 Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. Nothing was fetched, so
 nothing is version-pinned, nothing is hash-verified, and no entry appears for them in
@@ -245,6 +245,60 @@ Under `task_acceptance: queue` with `after_task: sleep`, a command that exits al
 
 A refused call writes no record. Each answered call writes one
 [`background_command`](observability-schemas.md#background-command) record.
+
+### Code mode calls { #background-command-code-mode }
+
+A call to the [code mode](manifest.md#code-mode) tool that runs past
+`code_mode.detach_after_secs` moves to the background and returns, as its result, a work id of the
+same form:
+
+```text
+The call is still running and was moved to the background as wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2. The background-command tool reports on it, waits for it or stops it by that id. Stopping it ends the code mode instance, and every value the instance holds is lost. A call still running when the session ends is stopped.
+```
+
+The tool is offered for as long as `code_mode.detach_after_secs` is set, whether or not a call has
+moved to the background. Its description names what the capsule has: shell commands, code mode
+calls, or both. On a code mode work id the operations behave so:
+
+| `operation` | Behaviour |
+|---|---|
+| `status` | Returns at once |
+| `wait` | Returns when the call finishes or after `wait_secs` seconds, whichever is first, with the same `wait_secs` rules and cancel as for a shell command |
+| `stop` | Ends the code mode instance, which stops the call. A call that already finished is sent nothing |
+
+Each operation returns:
+
+```text
+work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
+tool: js-repl
+state: finished
+elapsed_secs: 41
+waited_secs: 38
+call_status: passed
+
+<the call's own result text>
+```
+
+| Line | Value | Present |
+|---|---|---|
+| `work_id` | The work id | Always |
+| `tool` | The code mode tool's name | Always |
+| `state` | `running`, `finished`, or `stopped` | Always |
+| `elapsed_secs` | Whole seconds from the call's start to now, or to its end | Always |
+| `waited_secs` | Whole seconds this call waited | `wait` only |
+| `call_status` | The call's own status: `passed`, `failed` or `error` | `finished` only |
+
+A finished call's own result text follows a blank line, and its status, summary, attachments and
+truncation are the result's own. A `running` or `stopped` call returns status `passed`. A stopped
+call's lines are followed by:
+
+```text
+The call was stopped by ending the code mode instance; every value the instance held is lost, and the next call to 'js-repl' starts a new instance.
+```
+
+A code mode call that moved to the background keeps running after its task ends. It is not named
+in `runningCommands`, never arrives as a `completion` task, and is stopped when the session ends.
+Each answered call writes one `background_command` record naming the artifact.
 
 ## `switch-driver` { #switch-driver }
 

@@ -40,8 +40,8 @@ use crate::env_requirements::{
 };
 use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
-    E_IO_003, E_REG_002, E_RUN_003, E_RUN_008, E_RUN_012, E_RUN_019, E_RUN_043, E_RUN_064,
-    E_WIT_LEVEL_001,
+    E_IO_003, E_MAN_004, E_REG_002, E_RUN_003, E_RUN_008, E_RUN_012, E_RUN_019, E_RUN_043,
+    E_RUN_064, E_WIT_LEVEL_001,
 };
 use crate::stores::{installed_contracts, interface_label, served_phrase, FallbackRegistry};
 
@@ -3079,9 +3079,36 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
                 total_pass += 1;
             }
             ArtifactPresence::Installed(resolved) => {
-                if let Ok(yaml) =
-                    murmur_artifact::load_manifest_yaml_from_artifact_bytes(&resolved.bytes)
-                {
+                let packed_yaml =
+                    murmur_artifact::load_manifest_yaml_from_artifact_bytes(&resolved.bytes).ok();
+                // The package `code_mode.repl` names is refused by `mur run` while staging, ahead
+                // of the artifact's other checks, when it is not a tool's.
+                let code_mode_refusal = runtime_manifest
+                    .code_mode
+                    .as_ref()
+                    .filter(|code_mode| code_mode.repl == *name)
+                    .zip(packed_yaml.as_deref())
+                    .and_then(|(code_mode, yaml)| {
+                        murmur_artifact::code_mode_package_refusal(&code_mode.repl, yaml)
+                    });
+                if let Some(refusal) = code_mode_refusal {
+                    let message = format!(
+                        "{MANIFEST_FILENAME}: invalid code_mode config for 'code_mode.repl': \
+                         {refusal}"
+                    );
+                    capsule_runtime::report_println!(
+                        "  \u{2717}  {ref_str:<col_width$}   \u{2014} {refusal}"
+                    );
+                    findings.coded(
+                        E_MAN_004,
+                        DoctorBlock::Artifacts,
+                        Some(ref_str.clone()),
+                        &message,
+                        "name a runtime: tool artifact's package in code_mode.repl",
+                    );
+                    continue;
+                }
+                if let Some(yaml) = packed_yaml {
                     installed_manifests.push((name.clone(), ref_str.clone(), yaml));
                 }
                 // No lockfile: presence is the whole check, as it has always been.

@@ -63,6 +63,7 @@ section that explains it.
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) block with a missing or blank `message` or a missing or zero `limit`, a [`lifecycle.done_check`](manifest.md#lifecycle-done-check) block with a missing or blank `command`, a `command` whose program `capabilities.shell.allow` does not list, a missing `limit` or a zero `timeout_secs`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
+| `E-MAN-004` | An invalid [`code_mode`](manifest.md#code-mode) block: a missing, blank or non-string `repl`, a `detach_after_secs` that is not a whole number of seconds, a `tools_visible` that is not `true` or `false`, a `repl` that names no `artifacts` entry or one declared with another runtime, `code_mode` in a script capsule, or a `repl` whose installed package declares a runtime other than `tool` | [E-MAN-004](#e-man-004) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -327,6 +328,31 @@ error[E-MAN-003]: murmur.yaml: 'mur_version' is not a top-level key — the mur 
 ```
 
 See [`deploy`](manifest.md#field-deploy).
+
+### E-MAN-004 — an invalid `code_mode` block { #e-man-004 }
+
+`mur run` and `mur doctor` refuse a [`code_mode`](manifest.md#code-mode) block the runtime cannot
+act on. The message names the field:
+
+| Field | Refused when |
+|---|---|
+| `code_mode.repl` | Missing, blank or not a string; names no `artifacts` entry; names an entry declared with `runtime: driver`, `hook` or `skill` |
+| `code_mode.detach_after_secs` | Not a whole number of seconds, 0 or more |
+| `code_mode.tools_visible` | Not `true` or `false` |
+| `code_mode` | The capsule declares no `inference:` |
+
+```text
+error[E-MAN-004]: murmur.yaml: invalid code_mode config for 'code_mode.repl': 'ana/js-repl' is declared with runtime: skill; code_mode.repl names a runtime: tool artifact
+```
+
+The installed package `repl` names is checked once it is resolved: `mur run` refuses it while
+staging, before any task, and `mur doctor` reports it as an error on the artifact's line. A package
+whose own `murmur.yaml` declares `runtime: tool`, the older `wasm` spelling, or no `runtime:` is a
+tool's:
+
+```text
+error[E-MAN-004]: murmur.yaml: invalid code_mode config for 'code_mode.repl': 'ana/js-repl' is a script capsule's package (its murmur.yaml declares runtime: capsule)
+```
 
 ## Capability errors
 
