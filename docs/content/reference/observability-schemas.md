@@ -43,7 +43,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused`, `code_mode_instance_start`, `code_mode_instance_end`, `code_mode_detach` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -898,15 +898,56 @@ transports. A refused call writes none
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | The task that made the call. Absent outside a task |
-| `work_id` | string | The `shell_detached` line's `work_id` |
+| `work_id` | string | The `shell_detached` line's `work_id`, or the `code_mode_detach` line's |
 | `operation` | string | `"status"` \| `"wait"` \| `"stop"` |
-| `state` | string | `"running"` \| `"exited"` \| `"stopped"`, as the call returned it |
-| `exit_code` | i32 | As on `shell_completed`. Present for `"exited"` and `"stopped"` |
+| `state` | string | `"running"` \| `"exited"` \| `"stopped"` for a shell command, `"running"` \| `"finished"` \| `"stopped"` for a code mode call, as the call returned it |
+| `exit_code` | i32 | As on `shell_completed`. Present for a shell command's `"exited"` and `"stopped"` |
 | `waited_ms` | u64 | How long a `wait` waited. Present on `"wait"` only |
-| `output_bytes` | u64 | Bytes of output in the command's log, as the call returned it |
+| `output_bytes` | u64 | Bytes of output in the command's log, as the call returned it. For a code mode call, the bytes of the call's own result text once it has finished, and `0` before |
+| `artifact` | string | The code mode artifact's full name. Present for a code mode work id only |
 
 ```json
 {"event_type":"background_command","event_id":"evt_01a15992…","parent_id":"evt_01a15991…","session_id":"ses_01a15991…","timestamp":1792504131519,"task_id":"tsk_01a15991…","work_id":"wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2","operation":"wait","state":"exited","exit_code":1,"waited_ms":312004,"output_bytes":48213}
+```
+
+**Code mode records**{ #code-mode-records } — written only by a capsule that declares
+[`code_mode`](manifest.md#code-mode), each hung off the session node with `task_id`, the task of
+the call concerned, absent outside a task. A capsule without the block writes none.
+
+**`code_mode_instance_start`**{ #code-mode-instance-start } — written by the call that starts a
+code mode instance, before that call's `tool_call` line
+
+| Field | Type | Notes |
+|---|---|---|
+| `artifact` | string | The artifact's full `<scope>/<name>`, as `code_mode.repl` names it |
+| `tool` | string | The tool name the model calls it by |
+| `instance` | u64 | `1` for the session's first instance, `2` for the one started after it ended, and so on |
+
+**`code_mode_instance_end`**{ #code-mode-instance-end } — written once per instance, when it ends;
+for `session_end`, before the `session_end` line
+
+| Field | Type | Notes |
+|---|---|---|
+| `artifact` | string | As on `code_mode_instance_start` |
+| `tool` | string | As on `code_mode_instance_start` |
+| `instance` | u64 | As on `code_mode_instance_start` |
+| `reason` | string | `"session_end"` \| `"stopped"` (a `background-command stop`) \| `"trap"` (the tool crashed) \| `"deadline"` (past `capabilities.limits.deadline_seconds`) \| `"resource_limit"` (past a `capabilities.limits` cap) \| `"canceled"` (a call canceled before it moved to the background) \| `"worker_lost"` |
+| `calls` | u64 | The calls this instance answered with a result |
+| `message` | string | The failure text the call returned. Present for `"trap"`, `"deadline"` and `"resource_limit"` |
+
+**`code_mode_detach`**{ #code-mode-detach } — written when a call to the code mode tool moves to
+the background
+
+| Field | Type | Notes |
+|---|---|---|
+| `artifact` | string | As on `code_mode_instance_start` |
+| `tool` | string | As on `code_mode_instance_start` |
+| `instance` | u64 | The instance the call runs in |
+| `work_id` | string | The work id the call returned |
+| `after_ms` | u64 | How long the call had run when it moved |
+
+```json
+{"event_type":"code_mode_detach","event_id":"evt_01a1c0d2…","parent_id":"evt_01a1c0c1…","session_id":"ses_01a1c0c1…","timestamp":1793820031004,"task_id":"tsk_01a1c0c1…","artifact":"ana/js-repl","tool":"js-repl","instance":1,"work_id":"wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2","after_ms":30002}
 ```
 
 **`process_start`**{ #process-start } — written when a program a WASM tool runs through

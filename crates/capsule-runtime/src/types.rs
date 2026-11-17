@@ -516,6 +516,9 @@ pub struct StageRequest {
     pub dataset_id: Option<String>,
     /// Lifecycle config from the manifest (None = use LifecycleConfig::default()).
     pub lifecycle: Option<LifecycleConfig>,
+    /// The manifest's `code_mode:` block. `None` when it declares none: every tool call gets a
+    /// fresh store, and no instance lives for the session.
+    pub code_mode: Option<murmur_artifact::CodeModeConfig>,
     /// Optional override applied on top of lifecycle (e.g. from CLI flags or mur-roost).
     pub lifecycle_override: Option<LifecycleOverride>,
     /// Trace config from the manifest (None = defaults apply: input captured, output not).
@@ -687,6 +690,8 @@ pub struct StagedSession {
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     /// The session's guest workers, when this process runs its guests in worker processes.
     pub(crate) guest_workers: Option<std::sync::Arc<crate::guest_worker::GuestWorkers>>,
+    /// [`StageRequest::code_mode`], staged: its package was resolved and is a tool's.
+    pub(crate) code_mode: Option<murmur_artifact::CodeModeConfig>,
     /// Where staging took the facts about each allowlisted binary it examined, for
     /// `session_start.host_facts`.
     pub(crate) host_facts: Vec<crate::host_facts::HostFactsUse>,

@@ -45,7 +45,7 @@ use murmur_artifact::{
 };
 
 use crate::error::{
-    CliError, E_CAP_018, E_IO_001, E_IO_003, E_MAN_001, E_MAN_002, E_MAN_003, E_RUN_003,
+    CliError, E_CAP_018, E_IO_001, E_IO_003, E_MAN_001, E_MAN_002, E_MAN_003, E_MAN_004, E_RUN_003,
     GATEWAY_WITHOUT_CREDENTIAL_HINT, QUEUE_WITHOUT_ROOM_HINT, TOP_LEVEL_MUR_VERSION_HINT,
 };
 
@@ -172,6 +172,9 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid lifecycle config for '{field}': {message}"),
         ),
+        error @ RuntimeManifestError::InvalidCodeMode { .. } => {
+            CliError::new(E_MAN_004, error.to_string())
+        }
         error @ RuntimeManifestError::GatewayWithoutCredential { .. } => CliError::with_hint(
             E_CAP_018,
             error.to_string(),

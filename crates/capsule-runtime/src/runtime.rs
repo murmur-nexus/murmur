@@ -3039,6 +3039,12 @@ pub fn stage_session(
     // those folders in its grant closure.
     let guest_workers =
         crate::guest_worker::session_launcher().map(crate::guest_worker::GuestWorkers::new);
+    // The code mode instance is held by the tools worker; a process that runs its guests itself
+    // has nowhere to hold it.
+    if request.code_mode.is_some() && guest_workers.is_none() {
+        return Err(RuntimeError::CodeModeWithoutGuestWorkers);
+    }
+    let staged_code_mode = request.code_mode.clone();
     // Past every pre-staging refusal, so a refused launch builds nothing, and past the host
     // probes' forks: a thread growing the heap across `fork()` makes each fork copy more page
     // tables and each later write take a copy-on-write fault.
@@ -3203,6 +3209,16 @@ pub fn stage_session(
 
         let manifest_yaml =
             extract_manifest_yaml(&artifact.name, &resolved_version, &resolved.bytes)?;
+
+        // The first point the package `code_mode.repl` names is in hand, ahead of every check the
+        // artifact's own runtime arm makes below.
+        if let Some(code_mode) = request.code_mode.as_ref().filter(|c| c.repl == full_name) {
+            if let Some(message) =
+                murmur_artifact::code_mode_package_refusal(&code_mode.repl, &manifest_yaml)
+            {
+                return Err(RuntimeError::InvalidCodeModePackage { message });
+            }
+        }
 
         installed_manifests.push((artifact.name.clone(), manifest_yaml.clone()));
 
@@ -3877,6 +3893,7 @@ pub fn stage_session(
             .lifecycle
             .as_ref()
             .and_then(|lifecycle| lifecycle.shell_grace_secs),
+        request.code_mode.as_ref(),
     )?;
 
     // Read once, here, from the manifests just staged: the schema is fixed before the session
@@ -4017,6 +4034,7 @@ pub fn stage_session(
         installed_artifacts,
         host_facts,
         guest_workers,
+        code_mode: staged_code_mode,
         inference: request.inference,
         artifact_full_names: full_names,
         gateways,
@@ -4771,6 +4789,7 @@ fn launch(
         let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
         let guest_workers = staged.guest_workers.clone();
+        let staged_code_mode = staged.code_mode.clone();
         let call_deadlines = staged.call_deadlines.clone();
         let member_requests = staged.member_requests.clone();
         let capability_policy = staged.capability_policy.clone();
@@ -4886,6 +4905,10 @@ fn launch(
                     &runtime_root,
                     inference.system_prompt_artifact.as_deref(),
                     &installed_artifacts,
+                    staged_code_mode
+                        .as_ref()
+                        .and_then(crate::code_mode::offered_only_for)
+                        .as_deref(),
                 ),
             );
             let inference_credential = gateways
@@ -5068,9 +5091,23 @@ fn launch(
                         ));
                     let session_processes_for_teardown = Arc::clone(&session_processes);
 
+                    // Built only for a `code_mode` block, and holding nothing until the model's
+                    // first call to the code mode tool opens the instance.
+                    let code_mode = staged_code_mode.as_ref().and_then(|config| {
+                        guest_workers.clone().map(|workers| {
+                            Arc::new(crate::code_mode::CodeMode::new(
+                                config,
+                                workers,
+                                resource_trace.clone(),
+                            ))
+                        })
+                    });
+                    let code_mode_for_teardown = code_mode.clone();
+
                     // Build CapsuleStoreState ONCE — reused across all task iterations
                     let mut state = CapsuleStoreState {
                         guest_workers: guest_workers.clone(),
+                        code_mode,
                         // Agent capsules have no WASM component of their own, so this state
                         // never backs a `Store` and this limiter is never registered. It is
                         // the per-tool limiters built in `dispatch_tool_async` (from
@@ -5906,6 +5943,11 @@ fn launch(
                     // commands' groups are killed by the registry first, which reaches them on a
                     // host with no cgroup scope too.
                     detached.kill_running();
+                    // The code mode instance, with any call still running in it, recorded as
+                    // ended by the session before `session_end` is written.
+                    if let Some(code_mode) = &code_mode_for_teardown {
+                        code_mode.end_session().await;
+                    }
                     // The WASM tools' session processes, with their process groups, each
                     // recorded as ended by the session before `session_end` is written.
                     session_processes_for_teardown.end_session().await;
@@ -6245,6 +6287,7 @@ fn launch(
         // foreground.
         detached: None,
         session_processes: None,
+        code_mode: None,
         shell_grace_secs: None,
         background_results_delivered: false,
         a2a_task_registry: None,
@@ -9019,6 +9062,9 @@ pub(crate) struct CapsuleStoreState {
     /// The processes this session's WASM tools started through `murmur:process`, killed at the
     /// session's end. `None` for a script capsule and every store that is not an agent session's.
     pub(crate) session_processes: Option<Arc<crate::session_process::SessionProcesses>>,
+    /// The session's code mode: the one tool whose instance lives for the session, and its
+    /// background calls. `None` for a manifest without a `code_mode` block.
+    pub(crate) code_mode: Option<Arc<crate::code_mode::CodeMode>>,
     /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
     /// is demoted. Read from the resolved lifecycle once per launch. `None` demotes no command on
     /// a clock, and the session offers no `background-command`.
@@ -10215,6 +10261,95 @@ pub(crate) async fn execute_tool_call(
     component: &Component,
     input: murmur::tool::run::ToolInput,
 ) -> Result<murmur::tool::run::ToolResult, String> {
+    let mut instance = build_tool_instance(engine, spec, side, call_deadlines, component)
+        .await
+        .map_err(ToolCallFailure::into_message)?;
+    run_tool_instance(&mut instance, spec, call_deadlines, input)
+        .await
+        .map_err(ToolCallFailure::into_message)
+}
+
+/// An instantiated tool-world component in its own store, with its `run` export resolved.
+///
+/// A per-call store is built, run once and dropped by [`execute_tool_call`]. The code mode
+/// instance is built by [`open_session_tool`] and run once per call for the rest of the session.
+pub(crate) struct ToolInstance {
+    store: Store<ToolStoreState>,
+    run: wasmtime::component::TypedFunc<
+        (murmur::tool::run::ToolInput,),
+        (murmur::tool::run::ToolResult,),
+    >,
+    /// The epoch ticks the running call has left, read by the store's epoch callback. Set only on
+    /// the code mode instance, whose store yields at each tick while ticks remain.
+    yield_budget: Option<Arc<AtomicU64>>,
+}
+
+/// Why a tool call failed, and the text the call reports for it.
+#[derive(Debug)]
+pub(crate) struct ToolCallFailure {
+    pub(crate) kind: ToolFailureKind,
+    pub(crate) message: String,
+}
+
+/// What stopped a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolFailureKind {
+    /// The store could not be built, or the component does not export a usable `run`.
+    Setup,
+    /// The wall-clock bound fired while the call waited on the host.
+    WallDeadline,
+    /// The guest failed while instantiating or running.
+    Guest(GuestFailure),
+}
+
+impl ToolCallFailure {
+    fn setup(message: String) -> Self {
+        Self {
+            kind: ToolFailureKind::Setup,
+            message,
+        }
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
+    }
+}
+
+/// [`build_tool_instance`] for the code mode instance: the store is then given an epoch callback
+/// that yields to the worker's executor at each tick while the running call's budget lasts and
+/// interrupts the guest once it is spent, so a stop or a cancel reaches a computing guest within
+/// about one tick. The trap it raises is [`wasmtime::Trap::Interrupt`], the epoch deadline's own.
+pub(crate) async fn open_session_tool(
+    engine: &Engine,
+    spec: &ToolCallSpec,
+    side: ToolHostSide,
+    call_deadlines: &CallDeadlines,
+    component: &Component,
+) -> Result<ToolInstance, ToolCallFailure> {
+    let mut instance = build_tool_instance(engine, spec, side, call_deadlines, component).await?;
+    let budget = Arc::new(AtomicU64::new(0));
+    let ticks = Arc::clone(&budget);
+    instance.store.epoch_deadline_callback(move |_| {
+        let left = ticks.load(Ordering::SeqCst);
+        if left == 0 {
+            return Ok(wasmtime::UpdateDeadline::Interrupt);
+        }
+        ticks.store(left - 1, Ordering::SeqCst);
+        Ok(wasmtime::UpdateDeadline::Yield(1))
+    });
+    instance.yield_budget = Some(budget);
+    Ok(instance)
+}
+
+/// Builds the store for `spec` with every host import wired to `side`, and instantiates
+/// `component` in it under the wall-clock bound.
+async fn build_tool_instance(
+    engine: &Engine,
+    spec: &ToolCallSpec,
+    side: ToolHostSide,
+    call_deadlines: &CallDeadlines,
+    component: &Component,
+) -> Result<ToolInstance, ToolCallFailure> {
     let name = spec.name.as_str();
     let role = spec.role;
     let (events, input_sink, http_hooks, process) = match side {
@@ -10235,6 +10370,156 @@ pub(crate) async fn execute_tool_call(
         ),
     };
 
+    let linker = tool_linker(engine, name, events, input_sink).map_err(ToolCallFailure::setup)?;
+    let tool_limits = spec.limits;
+    let site = match role {
+        ComponentRole::Driver => crate::guest_worker::StoreSite::Driver,
+        _ => crate::guest_worker::StoreSite::Tool,
+    };
+    crate::guest_worker::check_store_placement(site)
+        .map_err(|err| ToolCallFailure::setup(err.to_string()))?;
+    let state = ToolStoreState {
+        limits: tool_limits.limiter(),
+        table: ResourceTable::new(),
+        wasi: apply_wasi_plan(&spec.wasi).map_err(|err| {
+            ToolCallFailure::setup(format!(
+                "failed to build WASI context for tool '{name}': {err}"
+            ))
+        })?,
+        http: WasiHttpCtx::new(),
+        http_hooks,
+        process,
+    };
+
+    let mut store = Store::new(engine, state);
+    // Registered before instantiation — see the capsule store for why.
+    store.limiter(|state| &mut state.limits);
+
+    let subject = format!("tool '{name}'");
+    let stopped = |_| ToolCallFailure {
+        kind: ToolFailureKind::WallDeadline,
+        message: wall_deadline_message(&subject, tool_limits.deadline_seconds),
+    };
+    store.set_epoch_deadline(tool_limits.deadline_ticks());
+    let instance = match call_deadlines
+        .bound(
+            name,
+            role,
+            "instantiate",
+            &tool_limits,
+            linker.instantiate_async(&mut store, component),
+        )
+        .await
+        .map_err(stopped)?
+    {
+        Ok(instance) => instance,
+        Err(err) => {
+            return Err(ToolCallFailure {
+                kind: ToolFailureKind::Guest(classify_guest_failure(&err, &store.data().limits)),
+                message: format!("failed to instantiate tool '{name}': {err}"),
+            })
+        }
+    };
+
+    let missing = || {
+        ToolCallFailure::setup(
+            RuntimeError::ToolExportMissing {
+                name: name.to_string(),
+            }
+            .to_string(),
+        )
+    };
+    let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
+        .ok_or_else(missing)?;
+    let tool_run = instance
+        .get_export_index(&mut store, Some(&tool_iface), "run")
+        .and_then(|idx| instance.get_func(&mut store, idx))
+        .ok_or_else(missing)?;
+
+    let run = tool_run
+        .typed::<(murmur::tool::run::ToolInput,), (murmur::tool::run::ToolResult,)>(&store)
+        .map_err(|err| {
+            ToolCallFailure::setup(format!(
+                "failed to type-check tool '{name}' run export: {err}"
+            ))
+        })?;
+    Ok(ToolInstance {
+        store,
+        run,
+        yield_budget: None,
+    })
+}
+
+/// Runs `instance`'s `run` with `input` under the call's deadline: a fresh epoch budget, so the
+/// instantiation or an earlier call cannot eat into it, the `murmur:process` deadline clock, and
+/// the wall-clock bound.
+pub(crate) async fn run_tool_instance(
+    instance: &mut ToolInstance,
+    spec: &ToolCallSpec,
+    call_deadlines: &CallDeadlines,
+    input: murmur::tool::run::ToolInput,
+) -> Result<murmur::tool::run::ToolResult, ToolCallFailure> {
+    let name = spec.name.as_str();
+    let role = spec.role;
+    let tool_limits = spec.limits;
+    let subject = format!("tool '{name}'");
+    let ToolInstance {
+        store,
+        run,
+        yield_budget,
+    } = instance;
+    // This is also the driver path (`agent.rs` dispatches the inference driver through here).
+    match yield_budget {
+        Some(budget) => {
+            budget.store(
+                tool_limits.deadline_ticks().saturating_sub(1),
+                Ordering::SeqCst,
+            );
+            store.set_epoch_deadline(1);
+        }
+        None => store.set_epoch_deadline(tool_limits.deadline_ticks()),
+    }
+    store
+        .data_mut()
+        .process
+        .begin_call(std::time::Duration::from_secs(tool_limits.deadline_seconds));
+    let called = call_deadlines
+        .bound(
+            name,
+            role,
+            "run",
+            &tool_limits,
+            run.call_async(&mut *store, (input,)),
+        )
+        .await
+        .map_err(|_| ToolCallFailure {
+            kind: ToolFailureKind::WallDeadline,
+            message: wall_deadline_message(&subject, tool_limits.deadline_seconds),
+        })?;
+    match called {
+        Ok((result,)) => Ok(result),
+        Err(err) => {
+            // Classified rather than folded into the generic "trapped" string, so a
+            // deadline or limit trap is distinguishable on a path that reports failures
+            // as plain text. `Other` keeps the generic "trapped" wording.
+            let failure = classify_guest_failure(&err, &store.data().limits);
+            let message = failure.message(&subject, &err);
+            Err(ToolCallFailure {
+                kind: ToolFailureKind::Guest(failure),
+                message,
+            })
+        }
+    }
+}
+
+/// The linker every tool-world store is instantiated through: WASI p2, `wasi:http`,
+/// `murmur:stream/events`, `murmur:task/task#request-input` and `murmur:process`.
+fn tool_linker(
+    engine: &Engine,
+    name: &str,
+    events: EventsSink,
+    input_sink: InputSink,
+) -> Result<Linker<ToolStoreState>, String> {
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|err| format!("failed to add WASI linker for tool '{name}': {err}"))?;
@@ -10343,91 +10628,7 @@ pub(crate) async fn execute_tool_call(
             crate::session_process::PROCESS_IFACE
         )
     })?;
-
-    let tool_limits = spec.limits;
-    let site = match role {
-        ComponentRole::Driver => crate::guest_worker::StoreSite::Driver,
-        _ => crate::guest_worker::StoreSite::Tool,
-    };
-    crate::guest_worker::check_store_placement(site).map_err(|err| err.to_string())?;
-    let state = ToolStoreState {
-        limits: tool_limits.limiter(),
-        table: ResourceTable::new(),
-        wasi: apply_wasi_plan(&spec.wasi)
-            .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
-        http: WasiHttpCtx::new(),
-        http_hooks,
-        process,
-    };
-
-    let mut store = Store::new(engine, state);
-    // Registered before instantiation — see the capsule store for why.
-    store.limiter(|state| &mut state.limits);
-
-    let subject = format!("tool '{name}'");
-    let stopped = |_| wall_deadline_message(&subject, tool_limits.deadline_seconds);
-    store.set_epoch_deadline(tool_limits.deadline_ticks());
-    let instance = call_deadlines
-        .bound(
-            name,
-            role,
-            "instantiate",
-            &tool_limits,
-            linker.instantiate_async(&mut store, component),
-        )
-        .await
-        .map_err(stopped)?
-        .map_err(|err| format!("failed to instantiate tool '{name}': {err}"))?;
-
-    let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
-        .ok_or_else(|| {
-            RuntimeError::ToolExportMissing {
-                name: name.to_string(),
-            }
-            .to_string()
-        })?;
-    let tool_run = instance
-        .get_export_index(&mut store, Some(&tool_iface), "run")
-        .and_then(|idx| instance.get_func(&mut store, idx))
-        .ok_or_else(|| {
-            RuntimeError::ToolExportMissing {
-                name: name.to_string(),
-            }
-            .to_string()
-        })?;
-
-    let run = tool_run
-        .typed::<(murmur::tool::run::ToolInput,), (murmur::tool::run::ToolResult,)>(&store)
-        .map_err(|err| format!("failed to type-check tool '{name}' run export: {err}"))?;
-
-    // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
-    // also the driver path (`agent.rs` dispatches the inference driver through here).
-    store.set_epoch_deadline(tool_limits.deadline_ticks());
-    store
-        .data_mut()
-        .process
-        .begin_call(std::time::Duration::from_secs(tool_limits.deadline_seconds));
-    let called = call_deadlines
-        .bound(
-            name,
-            role,
-            "run",
-            &tool_limits,
-            run.call_async(&mut store, (input,)),
-        )
-        .await
-        .map_err(stopped)?;
-    let (result,) = match called {
-        Ok(result) => result,
-        Err(err) => {
-            // Classified rather than folded into the generic "trapped" string, so a
-            // deadline or limit trap is distinguishable on a path that reports failures
-            // as plain text. `Other` reproduces the pre-slice wording verbatim.
-            let failure = classify_guest_failure(&err, &store.data().limits);
-            return Err(failure.message(&subject, &err));
-        }
-    };
-    Ok(result)
+    Ok(linker)
 }
 
 /// `request-input`'s answerer: the call's own input wait, or the supervisor.
@@ -10495,6 +10696,22 @@ fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
         .or(summary)
         .unwrap_or_else(|| "tool returned no data".to_string());
     result.data = Some(crate::fence::wrap_untrusted(source, &text));
+}
+
+/// A code mode call its dispatch still awaits; dropped while armed, the call is dropped with it
+/// and the instance it was cut in ends as `canceled`.
+struct AttachedCodeModeCall<'a> {
+    code_mode: &'a Arc<crate::code_mode::CodeMode>,
+    ticket: &'a crate::code_mode::CallTicket,
+    armed: bool,
+}
+
+impl Drop for AttachedCodeModeCall<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.code_mode.cancel(self.ticket);
+        }
+    }
 }
 
 /// Fence a dispatched outcome and record what it was fenced under, in that order and nowhere
@@ -10679,6 +10896,46 @@ impl CapsuleStoreState {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
         };
+        let (spec, host) =
+            self.prepared_tool_call(name, gateway, inference_env, tool_calls, role, process)?;
+        if let Some(workers) = &self.guest_workers {
+            let kind = self.worker_kind_of(name);
+            return Box::pin(workers.run_tool(
+                kind,
+                component,
+                spec,
+                host,
+                input,
+                &self.call_deadlines,
+            ))
+            .await;
+        }
+        // Boxed: the invocation's state machine is large, and inlined into every caller's future
+        // it overflows a 2 MiB thread stack on the process transport's bridged path, which
+        // `launch_session` drives on the caller's own thread.
+        Box::pin(execute_tool_call(
+            &self.engine,
+            &spec,
+            ToolHostSide::Local(Box::new(host)),
+            &self.call_deadlines,
+            component,
+            input,
+        ))
+        .await
+    }
+
+    /// The store spec and host objects of a call to tool `name` from this session: its grant,
+    /// its preopens, and what its host imports reach.
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_tool_call(
+        &self,
+        name: &str,
+        gateway: Option<&Arc<CredentialGateway>>,
+        inference_env: &[(String, String)],
+        tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
+        role: ComponentRole,
+        process: crate::session_process::ProcessAccess,
+    ) -> Result<(ToolCallSpec, ToolCallHost), String> {
         let extra_roots = self.extra_roots_preopen(name);
         let env = ToolInvokeEnv {
             engine: &self.engine,
@@ -10709,23 +10966,85 @@ impl CapsuleStoreState {
             task_registry: self.a2a_task_registry.clone(),
             input_timeout_secs: self.input_timeout_secs,
         };
-        if let Some(workers) = &self.guest_workers {
-            let (spec, host) = prepare_tool_call(env, a2a, name)?;
-            let kind = self.worker_kind_of(name);
-            return Box::pin(workers.run_tool(
-                kind,
-                component,
-                spec,
-                host,
-                input,
-                &self.call_deadlines,
-            ))
-            .await;
-        }
-        // Boxed: the invocation's state machine is large, and inlined into every caller's future
-        // it overflows a 2 MiB thread stack on the process transport's bridged path, which
-        // `launch_session` drives on the caller's own thread.
-        Box::pin(invoke_tool_component(env, a2a, name, component, input)).await
+        prepare_tool_call(env, a2a, name)
+    }
+
+    /// A call to the code mode tool `name`, run on the session's instance in the tools worker:
+    /// the first call opens it, and a call that arrives while another runs is refused.
+    ///
+    /// The call runs on its own task, so a `detachable` call — the model's own, on either
+    /// transport — that outruns `code_mode.detach_after_secs` returns a work id while it keeps
+    /// running. A call dropped before that, as a task cancel drops it, ends the instance.
+    async fn dispatch_code_mode(
+        &self,
+        code_mode: &Arc<crate::code_mode::CodeMode>,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        gateway: Option<&Arc<CredentialGateway>>,
+        process: crate::session_process::ProcessAccess,
+        detachable: bool,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        let Some(workers) = self.guest_workers.clone() else {
+            return Err(RuntimeError::CodeModeWithoutGuestWorkers.to_string());
+        };
+        let Some(component) = self.tool_components.get(name).cloned() else {
+            return Err(format!("tool '{name}' is not available in this session"));
+        };
+        let (spec, host) = self.prepared_tool_call(
+            name,
+            gateway,
+            &self.inference_env,
+            None,
+            ComponentRole::Tool,
+            process,
+        )?;
+        let task_id = self
+            .session_status
+            .as_ref()
+            .and_then(|status| status.task_id());
+        let ticket = code_mode.begin(task_id).await?;
+        let kind = self.worker_kind_of(name);
+        let call_deadlines = self.call_deadlines.clone();
+        let settle = Arc::clone(code_mode);
+        let call_ticket = ticket.clone();
+        let mut call = tokio::spawn(async move {
+            let reply = workers
+                .run_session_tool(
+                    kind,
+                    &component,
+                    spec,
+                    host,
+                    input,
+                    &call_deadlines,
+                    call_ticket.instance,
+                )
+                .await;
+            settle.finish(&call_ticket, reply).await
+        });
+        code_mode.set_abort(&ticket, call.abort_handle());
+        let mut attached = AttachedCodeModeCall {
+            code_mode,
+            ticket: &ticket,
+            armed: true,
+        };
+        let joined = match code_mode.detach_after().filter(|_| detachable) {
+            None => (&mut call).await,
+            Some(after) => {
+                tokio::select! {
+                    joined = &mut call => joined,
+                    () = tokio::time::sleep(after) => match code_mode.detach(&ticket).await {
+                        Some(detached) => {
+                            attached.armed = false;
+                            return Ok(detached);
+                        }
+                        // It finished as the clock ran out.
+                        None => (&mut call).await,
+                    },
+                }
+            }
+        };
+        attached.armed = false;
+        joined.map_err(|error| format!("tool '{name}' call did not complete: {error}"))?
     }
 
     /// The session's lost guest worker, as the error that ends the task and the session.
@@ -10956,7 +11275,7 @@ impl CapsuleStoreState {
         process_gate: Option<crate::session_process::GateSender>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = self
-            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled, process_gate)
+            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled, process_gate, true)
             .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         self.deliver_deadline_notice(name, &mut outcome).await;
@@ -11013,6 +11332,11 @@ impl CapsuleStoreState {
     ///
     /// `process_gate` reaches the WASM branch only: the process-transport bridge's route to the
     /// decision point, which has no `gate` of its own here. `None` for every other caller.
+    ///
+    /// `detachable` reaches the code mode branch only: `true` for the model's own call on either
+    /// transport, which `code_mode.detach_after_secs` can move to the background, and `false` for
+    /// a plan step's.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
@@ -11021,6 +11345,7 @@ impl CapsuleStoreState {
         abandon: Option<crate::detached::AbandonSignal>,
         canceled: Option<crate::cancel::CancelSignal>,
         process_gate: Option<crate::session_process::GateSender>,
+        detachable: bool,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -11173,7 +11498,7 @@ impl CapsuleStoreState {
                 "tool '{name}' is not declared in manifest allowlist"
             ));
         }
-        self.dispatch_agent_wasm_tool(name, input, gate, process_gate)
+        self.dispatch_agent_wasm_tool(name, input, gate, process_gate, detachable)
             .await
     }
 
@@ -11185,31 +11510,54 @@ impl CapsuleStoreState {
     /// otherwise `gate`, answered here while the tool's call is driven, when it can refuse
     /// anything; otherwise, for a session that gates calls, no route at all, and every program is
     /// refused.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_agent_wasm_tool(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
         process_gate: Option<crate::session_process::GateSender>,
+        detachable: bool,
     ) -> Result<DispatchOutcome, String> {
         use crate::session_process::{
             GateRoute, GateSender, ProcessAccess, ProcessCallCtx, ProcessGateRequest,
             ProcessRefusal,
         };
         let gateway = self.gateways.for_artifact(name);
+        let code_mode = self
+            .code_mode
+            .as_ref()
+            .filter(|code_mode| code_mode.tool() == name);
+        let component_call =
+            |input: murmur::tool::run::ToolInput, process: ProcessAccess| async move {
+                match code_mode {
+                    Some(code_mode) => {
+                        Box::pin(self.dispatch_code_mode(
+                            code_mode, name, input, gateway, process, detachable,
+                        ))
+                        .await
+                    }
+                    None => {
+                        self.dispatch_component_with_env(
+                            name,
+                            input,
+                            gateway,
+                            &self.inference_env,
+                            None,
+                            ComponentRole::Tool,
+                            process,
+                        )
+                        .await
+                    }
+                }
+            };
         let Some(registry) = self.session_processes.clone() else {
-            return self
-                .dispatch_component_with_env(
-                    name,
-                    input,
-                    gateway,
-                    &self.inference_env,
-                    None,
-                    ComponentRole::Tool,
-                    ProcessAccess::Unavailable(crate::session_process::unavailable::NO_REGISTRY),
-                )
-                .await
-                .map(DispatchOutcome::tool);
+            return component_call(
+                input,
+                ProcessAccess::Unavailable(crate::session_process::unavailable::NO_REGISTRY),
+            )
+            .await
+            .map(DispatchOutcome::tool);
         };
         let mut gate = gate;
         let mut requests = None;
@@ -11229,13 +11577,11 @@ impl CapsuleStoreState {
             .session_status
             .as_ref()
             .and_then(|status| status.task_id());
-        let dispatch = self.dispatch_component_with_env(
-            name,
+        // A code mode call moved to the background leaves this dispatch while it runs on: a
+        // program it starts after that is put to `route`, whose answerer here is gone, and is
+        // refused rather than waited on.
+        let dispatch = component_call(
             input,
-            gateway,
-            &self.inference_env,
-            None,
-            ComponentRole::Tool,
             ProcessAccess::Available(ProcessCallCtx::new(
                 Arc::clone(&registry),
                 name,
@@ -11923,12 +12269,24 @@ impl CapsuleStoreState {
     ) -> Result<DispatchOutcome, String> {
         use crate::background_command::{self, Operation};
 
-        let Some(registry) = &self.detached else {
+        if self.detached.is_none() && self.code_mode.is_none() {
             return Err(background_command::not_available());
-        };
+        }
         let args = parse_tool_json_input(BACKGROUND_COMMAND_TOOL, &input)?;
         let request = background_command::parse_request(&args)?;
         let unknown = || background_command::unknown_work_id(&request.work_id);
+        if let Some(code_mode) = self
+            .code_mode
+            .as_ref()
+            .filter(|code_mode| code_mode.knows(&request.work_id))
+        {
+            return self
+                .dispatch_code_mode_background(code_mode, &request)
+                .await;
+        }
+        let Some(registry) = &self.detached else {
+            return Err(unknown());
+        };
         let mut waited = None;
         match request.operation {
             Operation::Status => {}
@@ -11975,6 +12333,7 @@ impl CapsuleStoreState {
                         .map(|completion| completion.exit_code),
                     waited.map(|waited| waited.as_millis().try_into().unwrap_or(u64::MAX)),
                     snapshot.output_bytes,
+                    None,
                 )
                 .await;
             // The completion reached the agent through this call, so this call records it, and
@@ -11992,6 +12351,69 @@ impl CapsuleStoreState {
             runtime_note,
             ..DispatchOutcome::tool(result)
         })
+    }
+
+    /// `background-command` on a code mode work id: the call's state, a wait for it, or a stop of
+    /// it, which ends the code mode instance. Recorded as `background_command` naming the
+    /// artifact.
+    async fn dispatch_code_mode_background(
+        &self,
+        code_mode: &crate::code_mode::CodeMode,
+        request: &crate::background_command::Request,
+    ) -> Result<DispatchOutcome, String> {
+        use crate::background_command::{self, Operation};
+
+        let unknown = || background_command::unknown_work_id(&request.work_id);
+        let mut waited = None;
+        match request.operation {
+            Operation::Status => {}
+            Operation::Wait => {
+                let cancel = self.task_cancel_signal();
+                let started = std::time::Instant::now();
+                let end = code_mode
+                    .wait(
+                        &request.work_id,
+                        background_command::effective_wait(request.wait_secs),
+                        cancel.as_ref(),
+                    )
+                    .await;
+                match end {
+                    detached::WaitEnd::Unknown => return Err(unknown()),
+                    detached::WaitEnd::Canceled => {
+                        if let Some(signal) = &cancel {
+                            signal.note_phase(crate::cancel::PHASE_BACKGROUND_WAIT);
+                        }
+                    }
+                    detached::WaitEnd::Finished | detached::WaitEnd::TimedOut => {}
+                }
+                waited = Some(started.elapsed());
+            }
+            Operation::Stop => {
+                if !code_mode.stop(&request.work_id).await {
+                    return Err(unknown());
+                }
+            }
+        }
+        let snapshot = code_mode.snapshot(&request.work_id).ok_or_else(unknown)?;
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_background_command(
+                    self.session_status
+                        .as_ref()
+                        .and_then(|status| status.task_id()),
+                    &snapshot.work_id,
+                    request.operation.as_str(),
+                    snapshot.state.as_str(),
+                    None,
+                    waited.map(|waited| waited.as_millis().try_into().unwrap_or(u64::MAX)),
+                    background_command::code_mode_output_bytes(&snapshot.state),
+                    Some(code_mode.artifact()),
+                )
+                .await;
+        }
+        Ok(DispatchOutcome::tool(background_command::render_code_mode(
+            &snapshot, waited,
+        )))
     }
 
     /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
@@ -12367,7 +12789,7 @@ impl CapsuleStoreState {
                 // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
                 // recursion is one level deep in practice.
                 let outcome = Box::pin(
-                    self.dispatch_agent_tool_unfenced(&name, input, gate, None, None, None),
+                    self.dispatch_agent_tool_unfenced(&name, input, gate, None, None, None, false),
                 )
                 .await
                 .map(|outcome| outcome.result);
@@ -13563,16 +13985,23 @@ fn write_session_status_tool_manifest(
 }
 
 /// Writes `background-command`'s synthetic manifest for an agent capsule whose shell commands
-/// can be demoted on a clock, on either transport, and for no other capsule: the file exists
-/// exactly when `inference` does, `capabilities.shell.allow` is non-empty and `shell_grace_secs`
-/// (`lifecycle.shell_grace_secs`, which no `--lifecycle-*` flag changes) is set.
+/// can be demoted on a clock, on either transport, or whose code mode calls can be moved to the
+/// background, and for no other capsule: the file exists exactly when `inference` does and either
+/// `capabilities.shell.allow` is non-empty and `shell_grace_secs` (`lifecycle.shell_grace_secs`,
+/// which no `--lifecycle-*` flag changes) is set, or `code_mode.detach_after_secs` is set. The
+/// description names what the capsule has.
 fn write_background_command_tool_manifest(
     runtime_root: &WorkdirRoot,
     inference: Option<&InferenceConfig>,
     policy: &CapabilityPolicy,
     shell_grace_secs: Option<u64>,
+    code_mode: Option<&murmur_artifact::CodeModeConfig>,
 ) -> Result<(), RuntimeError> {
-    if inference.is_none() || policy.shell_allow.is_empty() || shell_grace_secs.is_none() {
+    let shell = !policy.shell_allow.is_empty() && shell_grace_secs.is_some();
+    let code_mode_tool = code_mode
+        .filter(|code_mode| code_mode.detach_after_secs.is_some())
+        .map(|code_mode| murmur_artifact::tool_name_of(&code_mode.repl));
+    if inference.is_none() || (!shell && code_mode_tool.is_none()) {
         return Ok(());
     }
     write_runtime_provided_tool_manifest(
@@ -13580,7 +14009,7 @@ fn write_background_command_tool_manifest(
         BACKGROUND_COMMAND_TOOL,
         &runtime_tool_manifest_yaml(
             BACKGROUND_COMMAND_TOOL,
-            crate::background_command::description(),
+            crate::background_command::description(shell, code_mode_tool),
             crate::background_command::INPUT_SCHEMA.to_string(),
         ),
     )
@@ -16042,6 +16471,7 @@ mod tests {
                 Some(&inference),
                 &with_shell,
                 Some(10),
+                None,
             )
             .unwrap();
             let manifest: Value =
@@ -16051,7 +16481,7 @@ mod tests {
             assert!(manifest.get("implementation").is_none());
             assert_eq!(
                 manifest["description"].as_str(),
-                Some(crate::background_command::description().as_str())
+                Some(crate::background_command::description(true, None).as_str())
             );
             assert_eq!(
                 manifest["input_schema"].as_str(),
@@ -16064,6 +16494,7 @@ mod tests {
                 Some(&inference),
                 &with_shell,
                 Some(0),
+                None,
             )
             .unwrap();
             assert!(manifest_path(zero_grace.path()).exists(), "{transport}");
@@ -16075,6 +16506,7 @@ mod tests {
                 Some(&inference),
                 &with_shell,
                 None,
+                None,
             )
             .unwrap();
             assert!(!manifest_path(no_grace.path()).exists(), "{transport}");
@@ -16085,6 +16517,7 @@ mod tests {
                 Some(&inference),
                 &CapabilityPolicy::default(),
                 Some(10),
+                None,
             )
             .unwrap();
             assert!(!manifest_path(no_shell.path()).exists(), "{transport}");
@@ -16095,6 +16528,7 @@ mod tests {
             None,
             &with_shell,
             Some(10),
+            None,
         )
         .unwrap();
         assert!(!manifest_path(script.path()).exists());
@@ -16112,6 +16546,71 @@ mod tests {
             state.resolve_call(BACKGROUND_COMMAND_TOOL, &input),
             ResolvedCall::Tool { tool_name, .. } if tool_name == BACKGROUND_COMMAND_TOOL
         ));
+    }
+
+    /// `code_mode.detach_after_secs` offers `background-command` on its own, described for code
+    /// mode, or beside shell demotion with the combined text; code mode without it offers nothing.
+    #[test]
+    fn background_command_manifest_follows_code_mode_detach() {
+        let manifest_path = |dir: &Path| {
+            dir.join("tools")
+                .join(BACKGROUND_COMMAND_TOOL)
+                .join(PACKED_MANIFEST_ENTRY)
+        };
+        let description = |dir: &Path| -> Option<String> {
+            let text = fs::read_to_string(manifest_path(dir)).ok()?;
+            let manifest: Value = serde_norway::from_str(&text).unwrap();
+            manifest["description"].as_str().map(str::to_string)
+        };
+        let code_mode = |detach_after_secs| murmur_artifact::CodeModeConfig {
+            repl: "local/counter-tool".to_string(),
+            detach_after_secs,
+            tools_visible: true,
+        };
+        let with_shell = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let inference = inference_without_prompt();
+        let write =
+            |policy: &CapabilityPolicy, grace, config: Option<&murmur_artifact::CodeModeConfig>| {
+                let dir = TempDir::new().unwrap();
+                super::write_background_command_tool_manifest(
+                    &WorkdirRoot::open(dir.path()).unwrap(),
+                    Some(&inference),
+                    policy,
+                    grace,
+                    config,
+                )
+                .unwrap();
+                description(dir.path())
+            };
+        assert_eq!(
+            write(
+                &CapabilityPolicy::default(),
+                None,
+                Some(&code_mode(Some(0)))
+            ),
+            Some(crate::background_command::description(
+                false,
+                Some("counter-tool")
+            ))
+        );
+        assert_eq!(
+            write(&with_shell, Some(10), Some(&code_mode(Some(5)))),
+            Some(crate::background_command::description(
+                true,
+                Some("counter-tool")
+            ))
+        );
+        assert_eq!(
+            write(&with_shell, Some(10), Some(&code_mode(None))),
+            Some(crate::background_command::description(true, None))
+        );
+        assert_eq!(
+            write(&CapabilityPolicy::default(), None, Some(&code_mode(None))),
+            None
+        );
     }
 
     /// `session-status` needs no grant: its manifest is written for every agent capsule, with
@@ -16262,6 +16761,7 @@ mod tests {
     /// `project/workdir`.
     fn tool_name_stage_request(project: &Path, names: &[&str]) -> StageRequest {
         StageRequest {
+            code_mode: None,
             artifacts: names
                 .iter()
                 .map(|name| crate::types::ArtifactRequest {
@@ -17419,6 +17919,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -17522,6 +18023,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -17616,6 +18118,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -17709,6 +18212,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -17925,6 +18429,7 @@ inference:
 
         let project = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -18043,6 +18548,7 @@ inference:
         };
 
         StageRequest {
+            code_mode: None,
             source_supply: None,
             expected_workdir_identity: None,
             parent_workdir_snapshot: None,
@@ -18212,6 +18718,7 @@ inference:
         ];
         for (route, policy, expected) in cases {
             let request = StageRequest {
+                code_mode: None,
                 capability_policy: policy,
                 ..local_source_skill_agent_request(project.path())
             };
@@ -18267,6 +18774,7 @@ inference:
         let mut blocks = Vec::new();
         for workdir in [None, Some(operator.path().to_path_buf())] {
             let request = StageRequest {
+                code_mode: None,
                 capability_policy: policy.clone(),
                 workdir: workdir.clone(),
                 ..local_source_skill_agent_request(project.path())
@@ -18373,6 +18881,7 @@ inference:
         lock_expectations: Vec<crate::types::LockExpectation>,
     ) -> StageRequest {
         StageRequest {
+            code_mode: None,
             artifacts,
             lock_expectations: Some(lock_expectations),
             ..local_source_skill_agent_request(project)
@@ -19500,6 +20009,7 @@ inference:
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
             session_processes: None,
+            code_mode: None,
             shell_grace_secs: None,
             background_results_delivered: false,
             a2a_task_registry: None,
@@ -19794,6 +20304,7 @@ inference:
             None,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         assert_eq!(
             tool_refresh_payload(held.tools())["tools"],
@@ -19887,6 +20398,7 @@ inference:
             None,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         let before = serde_json::to_string(&tool_refresh_payload(held.tools())).unwrap();
 
@@ -19960,6 +20472,7 @@ inference:
                 None,
                 &state.installed_artifacts,
                 state.installed_generation,
+                None,
             );
             pull_late_skill(&mut state);
 
@@ -19995,6 +20508,7 @@ inference:
             None,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         pull_late_skill(&mut state);
         held.refresh_before_call(
@@ -20012,6 +20526,7 @@ inference:
             &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
+            None,
         );
         assert_eq!(
             serde_json::to_string(held.tools()).unwrap(),
@@ -20037,6 +20552,7 @@ inference:
             prompt_skill,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         let before = serde_json::to_string(held.tools()).unwrap();
         pull_late_skill(&mut state);
@@ -20088,6 +20604,7 @@ inference:
             None,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         let before = serde_json::to_string(held.tools()).unwrap();
         fs::remove_dir_all(workdir.join("tools").join("zzz-existing-tool")).unwrap();
@@ -20718,6 +21235,7 @@ inference:
             None,
             &state.installed_artifacts,
             state.installed_generation,
+            None,
         );
         crate::agent::log_tool_inventory(
             &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
@@ -28897,6 +29415,7 @@ mod member_call_tests {
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             None,
             &[],
+            None,
         ))
     }
 

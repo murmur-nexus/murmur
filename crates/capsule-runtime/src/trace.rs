@@ -905,8 +905,77 @@ struct BackgroundCommandEvent<'a> {
     /// How long a `wait` blocked. Absent for the other operations.
     #[serde(skip_serializing_if = "Option::is_none")]
     waited_ms: Option<u64>,
-    /// Bytes in the log's output section, as the call returned it.
+    /// Bytes in the log's output section, as the call returned it. For a code mode call, the
+    /// bytes of the call's own `data` once it has finished, and `0` before.
     output_bytes: u64,
+    /// The code mode artifact whose call the work id names. Absent for a shell command's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<&'a str>,
+}
+
+/// `code_mode_instance_start`: the call that opened a code mode instance. Hangs off the session.
+#[derive(Serialize)]
+pub(crate) struct CodeModeInstanceStartEvent<'a> {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) timestamp: u64,
+    /// The task whose call opened it. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    /// The artifact's full `<scope>/<name>`, as `code_mode.repl` names it.
+    pub(crate) artifact: &'a str,
+    /// The tool name the model calls it by.
+    pub(crate) tool: &'a str,
+    /// 1 for the session's first instance, 2 for the next, and so on.
+    pub(crate) instance: u64,
+}
+
+/// `code_mode_instance_end`: a code mode instance ended. Hangs off the session.
+#[derive(Serialize)]
+pub(crate) struct CodeModeInstanceEndEvent<'a> {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) timestamp: u64,
+    /// The task whose call ended it. Absent outside a task, and at the session's end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    pub(crate) artifact: &'a str,
+    pub(crate) tool: &'a str,
+    pub(crate) instance: u64,
+    /// `session_end`, `stopped`, `trap`, `deadline`, `resource_limit`, `canceled` or
+    /// `worker_lost`.
+    pub(crate) reason: &'static str,
+    /// The calls this instance answered with a result.
+    pub(crate) calls: u64,
+    /// The failure text, for `trap`, `deadline` and `resource_limit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<&'a str>,
+}
+
+/// `code_mode_detach`: a call to the code mode tool moved to the background. Hangs off the
+/// session.
+#[derive(Serialize)]
+pub(crate) struct CodeModeDetachEvent<'a> {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) timestamp: u64,
+    /// The task whose call it was. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    pub(crate) artifact: &'a str,
+    pub(crate) tool: &'a str,
+    /// The instance the call runs in.
+    pub(crate) instance: u64,
+    /// The work id the call returned.
+    pub(crate) work_id: &'a str,
+    /// How long the call had run when it was moved.
+    pub(crate) after_ms: u64,
 }
 
 /// The fields of a `process_start` line: a program a WASM tool started through `murmur:process`.
@@ -5124,7 +5193,8 @@ impl ResourceTraceAppender {
     }
 
     /// Records one answered `background-command` call, hung off the session node. Failures are
-    /// swallowed: the call is answered whether or not its record lands.
+    /// swallowed: the call is answered whether or not its record lands. `artifact` is the code
+    /// mode artifact for a code mode work id, and `None` for a shell command's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_background_command(
         &self,
@@ -5135,6 +5205,7 @@ impl ResourceTraceAppender {
         exit_code: Option<i32>,
         waited_ms: Option<u64>,
         output_bytes: u64,
+        artifact: Option<&str>,
     ) {
         let event = BackgroundCommandEvent {
             event_type: "background_command",
@@ -5149,6 +5220,85 @@ impl ResourceTraceAppender {
             exit_code,
             waited_ms,
             output_bytes,
+            artifact,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records the call that opened code mode instance `instance`, hung off the session node.
+    pub(crate) async fn write_code_mode_instance_start(
+        &self,
+        task_id: Option<String>,
+        artifact: &str,
+        tool: &str,
+        instance: u64,
+    ) {
+        let event = CodeModeInstanceStartEvent {
+            event_type: "code_mode_instance_start",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            artifact,
+            tool,
+            instance,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records the end of code mode instance `instance`, hung off the session node.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_code_mode_instance_end(
+        &self,
+        task_id: Option<String>,
+        artifact: &str,
+        tool: &str,
+        instance: u64,
+        reason: &'static str,
+        calls: u64,
+        message: Option<&str>,
+    ) {
+        let event = CodeModeInstanceEndEvent {
+            event_type: "code_mode_instance_end",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            artifact,
+            tool,
+            instance,
+            reason,
+            calls,
+            message,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records a code mode call moved to the background as `work_id`, hung off the session node.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_code_mode_detach(
+        &self,
+        task_id: Option<String>,
+        artifact: &str,
+        tool: &str,
+        instance: u64,
+        work_id: &str,
+        after_ms: u64,
+    ) {
+        let event = CodeModeDetachEvent {
+            event_type: "code_mode_detach",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            artifact,
+            tool,
+            instance,
+            work_id,
+            after_ms,
         };
         self.append(&event).await;
     }

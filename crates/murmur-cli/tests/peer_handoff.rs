@@ -444,6 +444,7 @@ fn stage_request(
     port: u16,
 ) -> StageRequest {
     StageRequest {
+        code_mode: None,
         source_supply: None,
         expected_workdir_identity: None,
         parent_workdir_snapshot: None,

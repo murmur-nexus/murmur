@@ -1144,6 +1144,58 @@ impl GuestWorkers {
         }
     }
 
+    /// Runs one call of the code mode tool `name` on session instance `instance` in the worker
+    /// of `kind`, which opens the instance from `spec` when it does not hold it. Registers `host`
+    /// as what the call's host imports reach, as [`Self::run_tool`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_session_tool(
+        self: &Arc<Self>,
+        kind: WorkerKind,
+        component: &Component,
+        spec: ToolCallSpec,
+        host: ToolCallHost,
+        input: ToolInput,
+        call_deadlines: &CallDeadlines,
+        instance: u64,
+    ) -> Result<crate::code_mode::SessionToolReply, String> {
+        let name = spec.name.clone();
+        let mut entry = CallEntry::bare(format!("{} '{name}'", spec.role.wire_name()));
+        entry.http = Arc::new(Mutex::new(host.http_hooks));
+        entry.events = host.events;
+        entry.input = host.input;
+        entry.process = tokio::sync::Mutex::new(RemoteProcessHost::new(host.process));
+        // The first call instantiates as well as runs, each phase bounded by the worker.
+        let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
+        let reply = self
+            .call(
+                kind,
+                &name,
+                component,
+                entry,
+                bound,
+                call_deadlines,
+                |req, guest| ToWorker::SessionToolCall {
+                    req,
+                    guest,
+                    instance,
+                    spec: Box::new(spec),
+                    input,
+                },
+            )
+            .await?;
+        match reply {
+            Reply::SessionTool { result, ended, .. } => {
+                Ok(crate::code_mode::SessionToolReply { result, ended })
+            }
+            other => Err(format!("the guest worker answered {other:?}")),
+        }
+    }
+
+    /// Drops code mode instance `instance` in the tools worker.
+    pub(crate) fn close_session_tool(&self, instance: u64) {
+        self.close(WorkerKind::Tools, ToWorker::SessionToolClose { instance });
+    }
+
     /// Drops hook instance `instance` in the hooks worker.
     pub(crate) fn close_hook(&self, instance: u64) {
         self.close(WorkerKind::Hooks, ToWorker::HookClose { instance });

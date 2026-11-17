@@ -1068,6 +1068,10 @@ pub(crate) async fn run_agent_loop(
         system_prompt_artifact,
         &store_state.installed_artifacts,
         store_state.installed_generation,
+        store_state
+            .code_mode
+            .as_ref()
+            .and_then(|code_mode| code_mode.offered_only()),
     );
     log_tool_inventory(
         &records_root,
@@ -8819,6 +8823,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(std::path::Path::new(&workdir)).unwrap(),
             None,
             &[],
+            None,
         );
         let system = build_augmented_system_prompt(
             &name,

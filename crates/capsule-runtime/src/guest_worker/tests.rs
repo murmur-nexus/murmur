@@ -1154,3 +1154,96 @@ fn a_confined_worker_is_spawned_through_prepare_enforcement() {
     let error = started.expect_err("the forced enforcement failure refuses the start");
     assert!(error.contains("forced by test seam"), "{error}");
 }
+
+/// The committed `counter-tool` fixture, compiled with the session engine.
+fn counter_tool(engine: &wasmtime::Engine) -> wasmtime::component::Component {
+    let wasm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../murmur-cli/tests/fixtures/counter-tool/tool/counter-tool.wasm");
+    wasmtime::component::Component::from_file(engine, wasm).expect("counter-tool compiles")
+}
+
+fn counter_input(op: &str) -> ToolInput {
+    ToolInput {
+        data: Some(format!(r#"{{"op":"{op}"}}"#)),
+        log_path: None,
+    }
+}
+
+/// A code mode instance keeps its state from one call to the next, and another instance id is a
+/// fresh instance.
+#[test]
+fn code_mode_instance_keeps_its_state_in_a_thread_worker() {
+    let workers = GuestWorkers::new(Launcher::Thread);
+    let engine = crate::runtime::build_engine().unwrap();
+    let component = counter_tool(&engine);
+    let workdir = tempfile::TempDir::new().unwrap();
+    let mut spec = spec("counter-tool", Vec::new());
+    spec.wasi.preopens[0].host_path = workdir.path().to_path_buf();
+    let rt = runtime();
+    let call = |instance: u64| {
+        rt.block_on(workers.run_session_tool(
+            WorkerKind::Tools,
+            &component,
+            spec.clone(),
+            test_host(),
+            counter_input("incr"),
+            &CallDeadlines::default(),
+            instance,
+        ))
+        .expect("the worker answered")
+    };
+    let data = |reply: crate::code_mode::SessionToolReply| {
+        assert!(reply.ended.is_none(), "{reply:?}");
+        reply.result.expect("the call returned").data.unwrap()
+    };
+    assert_eq!(data(call(7001)), "count=1");
+    assert_eq!(data(call(7001)), "count=2");
+    assert_eq!(data(call(7002)), "count=1");
+    workers.close_session_tool(7001);
+    assert_eq!(data(call(7002)), "count=2");
+}
+
+/// A computing call past its deadline on a code mode instance, whose store yields at each tick,
+/// still ends as the epoch deadline's own failure, and ends the instance.
+#[test]
+fn code_mode_spin_past_its_deadline_is_a_deadline_end() {
+    let workers = GuestWorkers::new(Launcher::Thread);
+    let engine = crate::runtime::build_engine().unwrap();
+    let component = counter_tool(&engine);
+    let workdir = tempfile::TempDir::new().unwrap();
+    let mut spec = spec("counter-tool", Vec::new());
+    spec.wasi.preopens[0].host_path = workdir.path().to_path_buf();
+    spec.limits.deadline_seconds = 1;
+    let rt = runtime();
+    let reply = rt
+        .block_on(workers.run_session_tool(
+            WorkerKind::Tools,
+            &component,
+            spec.clone(),
+            test_host(),
+            counter_input("spin"),
+            &CallDeadlines::default(),
+            7101,
+        ))
+        .expect("the worker answered");
+    let end = reply.ended.expect("the instance ended");
+    assert_eq!(end.reason, crate::code_mode::EndReason::Deadline, "{end:?}");
+    let error = reply.result.unwrap_err();
+    assert!(
+        error.contains("exceeded its 1s execution deadline (capabilities.limits.deadline_seconds)"),
+        "{error}"
+    );
+    // The instance is gone: the same id opens a fresh one.
+    let reply = rt
+        .block_on(workers.run_session_tool(
+            WorkerKind::Tools,
+            &component,
+            spec,
+            test_host(),
+            counter_input("incr"),
+            &CallDeadlines::default(),
+            7101,
+        ))
+        .expect("the worker answered");
+    assert_eq!(reply.result.unwrap().data.as_deref(), Some("count=1"));
+}

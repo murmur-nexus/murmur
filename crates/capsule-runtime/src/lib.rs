@@ -29,6 +29,7 @@ pub(crate) mod cancel;
 pub(crate) mod capsule_facts;
 pub(crate) mod cgroup;
 pub mod child_launch;
+pub(crate) mod code_mode;
 pub(crate) mod compiled_forms;
 pub mod containment;
 pub(crate) mod control_plane;

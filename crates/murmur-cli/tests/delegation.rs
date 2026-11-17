@@ -1021,6 +1021,7 @@ impl Parent {
         let staged = stage_session(
             Arc::new(LocalRegistry::new(&suite.registry)),
             StageRequest {
+                code_mode: None,
                 source_supply: None,
                 expected_workdir_identity: None,
                 parent_workdir_snapshot: None,
@@ -1288,6 +1289,7 @@ fn stage_request(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
 ) -> StageRequest {
     StageRequest {
+        code_mode: None,
         source_supply: None,
         expected_workdir_identity: None,
         parent_workdir_snapshot: None,

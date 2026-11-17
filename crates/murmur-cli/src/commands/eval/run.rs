@@ -503,6 +503,7 @@ impl Arm {
     fn stage_request(&self, case_id: &str) -> StageRequest {
         let manifest = &self.manifest;
         StageRequest {
+            code_mode: manifest.code_mode.clone(),
             credentials_file: crate::config::mur_config_path().ok(),
             manifest_dir: self.project_dir.clone(),
             capsule_name: manifest.name.clone(),

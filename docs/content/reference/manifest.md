@@ -3200,3 +3200,30 @@ mur run --manifest murmur.yaml --lifecycle-task-acceptance queue --lifecycle-aft
 ```
 
 Values follow the same `snake_case` names as the manifest fields.
+
+## Code mode { #code-mode }
+
+The `code_mode:` block names one `runtime: tool` artifact whose instance lives for the rest of the
+session: a value one call leaves in the tool's memory is there for the next call. Every other tool
+runs each call in a fresh instance.
+
+```yaml
+code_mode:
+  repl: ana/js-repl        # an artifacts entry declared with runtime: tool
+  detach_after_secs: 30    # optional
+  tools_visible: false     # optional, defaults to true
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `code_mode.repl` | string | yes | The full `<scope>/<name>` of one `artifacts` entry, exactly as that entry's `name`. The entry is declared with `runtime: tool`, and its installed package's own `murmur.yaml` declares `runtime: tool` (or the older `wasm` spelling, or no `runtime:`). |
+| `code_mode.detach_after_secs` | integer ≥ 0 | no | Default: not set — a call runs until it returns. Seconds a call from the model runs before it moves to the background under a work id. While it is set, the [`background-command`](runtime-provided-tools.md#background-command) tool is offered. |
+| `code_mode.tools_visible` | boolean | no | Default: `true`. With `false`, the model is offered the code mode tool alone, and `background-command` beside it when `detach_after_secs` is set. Every other tool stays callable. |
+
+A capsule without the block gives every call a fresh instance, offers the tool array it would
+offer anyway, and writes no code mode record. A script capsule
+(no `inference:`) cannot declare the block. `mur run` and `mur doctor` refuse an invalid block with
+[`E-MAN-004`](diagnostics.md#e-man-004).
+
+[Code mode](../concepts/tools.md#code-mode) describes the instance's lifetime, and
+[Observability schemas](observability-schemas.md#code-mode-records) the records it writes.

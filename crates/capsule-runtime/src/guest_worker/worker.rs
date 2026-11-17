@@ -20,6 +20,7 @@ use super::{WorkerKind, PROTOCOL_VERSION};
 use crate::bindings::hook::murmur::conversation::read::MessagePage;
 use crate::bindings::hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse};
 use crate::bindings::hook::murmur::task_io::read::IoError;
+use crate::code_mode::{EndReason, InstanceEnd};
 use crate::inference_import::HookInferencePurpose;
 use crate::limits::CallDeadlines;
 use crate::process_driver::{DriverAnswer, DriverError, ProcessDriver};
@@ -281,6 +282,7 @@ pub(crate) fn serve(kind: WorkerKind, stream: UnixStream) -> i32 {
         guests: Mutex::new(HashMap::new()),
         hooks: Mutex::new(HashMap::new()),
         drivers: Mutex::new(HashMap::new()),
+        session_tools: Mutex::new(SessionTools::default()),
     });
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
@@ -678,6 +680,38 @@ pub(crate) fn serve(kind: WorkerKind, stream: UnixStream) -> i32 {
                 }
             }
             ToWorker::Shutdown => break,
+            ToWorker::SessionToolCall {
+                req,
+                guest,
+                instance,
+                spec,
+                input,
+            } => {
+                let state = Arc::clone(&state);
+                let task = spawn_call(
+                    req,
+                    Box::pin(async move {
+                        let deadlines = CallDeadlines::default();
+                        let (result, ended) = state
+                            .session_tool_call(req, guest, instance, &spec, input, &deadlines)
+                            .await;
+                        Reply::SessionTool {
+                            result,
+                            ended,
+                            deadlines: deadlines.take(),
+                        }
+                    }),
+                );
+                running.insert(req, task);
+            }
+            ToWorker::SessionToolClose { instance } => {
+                let mut tools = state
+                    .session_tools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tools.held.remove(&instance);
+                tools.closed.insert(instance);
+            }
         }
     }
     for (_, task) in running {
@@ -718,6 +752,23 @@ struct ServerState {
     guests: Mutex<HashMap<u64, Component>>,
     hooks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<WorkerHook>>>>,
     drivers: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<WorkerDriver>>>>,
+    session_tools: Mutex<SessionTools>,
+}
+
+/// The code mode instances the tools worker holds, and every instance the supervisor closed: an
+/// instantiation that finishes after its instance was closed is dropped rather than held.
+#[derive(Default)]
+struct SessionTools {
+    held: HashMap<u64, Arc<tokio::sync::Mutex<WorkerSessionTool>>>,
+    closed: std::collections::HashSet<u64>,
+}
+
+/// A code mode instance in the tools worker, with the link its host imports use.
+struct WorkerSessionTool {
+    tool: crate::runtime::ToolInstance,
+    link: Arc<RemoteLink>,
+    /// Set while a call runs; still set when a call was dropped mid-guest by `Cancel`.
+    in_call: bool,
 }
 
 /// A process driver instance in the driver worker, with the latch its wall-clock bounds record
@@ -725,6 +776,109 @@ struct ServerState {
 type WorkerDriver = (ProcessDriver, CallDeadlines);
 
 impl ServerState {
+    fn session_tools(&self) -> std::sync::MutexGuard<'_, SessionTools> {
+        self.session_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs one call on code mode instance `instance`, instantiating guest `guest` from `spec`
+    /// first when the instance is not held. A call that fails drops the instance and says why it
+    /// ended.
+    async fn session_tool_call(
+        &self,
+        req: u64,
+        guest: u64,
+        instance: u64,
+        spec: &crate::runtime::ToolCallSpec,
+        input: crate::bindings::host::murmur::tool::run::ToolInput,
+        deadlines: &CallDeadlines,
+    ) -> (
+        Result<crate::bindings::host::murmur::tool::run::ToolResult, String>,
+        Option<InstanceEnd>,
+    ) {
+        let held = self.session_tools().held.get(&instance).cloned();
+        let held = match held {
+            Some(held) => held,
+            None => {
+                let Some(component) = self.guest(guest) else {
+                    let message = format!("tool '{}' is not loaded in the guest worker", spec.name);
+                    return (
+                        Err(message.clone()),
+                        Some(InstanceEnd {
+                            reason: EndReason::Trap,
+                            message,
+                        }),
+                    );
+                };
+                let link = RemoteLink::new(req, &self.shared);
+                let opened = crate::runtime::open_session_tool(
+                    &self.engine,
+                    spec,
+                    ToolHostSide::Remote(Arc::clone(&link)),
+                    deadlines,
+                    &component,
+                )
+                .await;
+                let tool = match opened {
+                    Ok(tool) => tool,
+                    Err(failure) => {
+                        let end = InstanceEnd::from_failure(&failure);
+                        return (Err(failure.into_message()), Some(end));
+                    }
+                };
+                let held = Arc::new(tokio::sync::Mutex::new(WorkerSessionTool {
+                    tool,
+                    link,
+                    in_call: false,
+                }));
+                let mut tools = self.session_tools();
+                if tools.closed.contains(&instance) {
+                    let message = format!(
+                        "code mode instance {instance} was closed while it was being opened"
+                    );
+                    return (
+                        Err(message.clone()),
+                        Some(InstanceEnd {
+                            reason: EndReason::Canceled,
+                            message,
+                        }),
+                    );
+                }
+                tools.held.insert(instance, Arc::clone(&held));
+                held
+            }
+        };
+        let mut held_tool = held.lock().await;
+        held_tool.link.set_call(req);
+        // A call dropped mid-guest by `Cancel` left the instance where its future stopped: it is
+        // cut, and is never entered again.
+        if held_tool.in_call {
+            self.session_tools().held.remove(&instance);
+            let message =
+                format!("code mode instance {instance} was cut by a call dropped mid-guest");
+            return (
+                Err(message.clone()),
+                Some(InstanceEnd {
+                    reason: EndReason::Canceled,
+                    message,
+                }),
+            );
+        }
+        held_tool.in_call = true;
+        let result =
+            crate::runtime::run_tool_instance(&mut held_tool.tool, spec, deadlines, input).await;
+        held_tool.in_call = false;
+        match result {
+            Ok(result) => (Ok(result), None),
+            Err(failure) => {
+                self.session_tools().held.remove(&instance);
+                let end = InstanceEnd::from_failure(&failure);
+                (Err(failure.into_message()), Some(end))
+            }
+        }
+    }
+
     fn guest(&self, guest: u64) -> Option<Component> {
         self.guests
             .lock()

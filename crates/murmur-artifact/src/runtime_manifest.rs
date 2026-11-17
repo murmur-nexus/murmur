@@ -582,6 +582,21 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
     })
 }
 
+/// The `code_mode:` block: one `runtime: tool` artifact whose instance lives for the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeModeConfig {
+    /// `code_mode.repl`: the full `<scope>/<name>` of the `artifacts` entry, exactly as that
+    /// entry's `name`. Always a `runtime: tool` entry.
+    pub repl: String,
+    /// `code_mode.detach_after_secs`: how long a model's call to the artifact runs before it is
+    /// moved to the background under a work id. `None` when not declared: a call never detaches.
+    pub detach_after_secs: Option<u64>,
+    /// `code_mode.tools_visible`: whether the model is offered every other tool as well. `true`
+    /// when not declared; `false` offers the artifact's tool alone, and `background-command`
+    /// beside it when `detach_after_secs` is set.
+    pub tools_visible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeManifest {
     pub name: String,
@@ -603,6 +618,8 @@ pub struct RuntimeManifest {
     pub control: Option<ControlConfig>,
     /// The `deploy:` block. `None` when the manifest declares none.
     pub deploy: Option<DeployConfig>,
+    /// The `code_mode:` block. `None` when the manifest declares none.
+    pub code_mode: Option<CodeModeConfig>,
     /// Every key the manifest declared that this build does not recognize, captured by each
     /// `Raw*` block's `#[serde(flatten)]` overflow map instead of dropped.
     ///
@@ -2115,6 +2132,13 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidLifecycleConfig { field: String, message: String },
+    /// The `code_mode` block, or one of its keys, holds a value the runtime cannot act on; `field`
+    /// is its dotted path.
+    #[error(
+        "{}: invalid code_mode config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
+    InvalidCodeMode { field: String, message: String },
     /// A field naming an artifact to resolve does not hold a full `<scope>/<name>`, or a
     /// `source:` entry's name is not a bare name. `hint` names the form to write instead.
     #[error("{}: invalid artifact name in '{field}': {message}", MANIFEST_FILENAME)]
@@ -2182,6 +2206,8 @@ struct RawRuntimeManifest {
     control: Option<RawControl>,
     #[serde(default)]
     deploy: Option<RawDeploy>,
+    #[serde(default)]
+    code_mode: Option<RawCodeModeConfig>,
     /// Captured only to refuse it, as [`RuntimeManifestError::TopLevelMurVersion`]: the pin is
     /// `deploy.mur_version`. Present-detection rather than a typed value, so a number, a blank
     /// string and a bare `mur_version:` are all refused.
@@ -2215,6 +2241,21 @@ struct RawRuntimeManifest {
     #[serde(default)]
     #[allow(dead_code)]
     requires_files: Option<serde_norway::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCodeModeConfig {
+    /// Untyped, as every key of this block is, so a value of the wrong type is refused as an
+    /// [`RuntimeManifestError::InvalidCodeMode`] naming the field rather than as a serde type
+    /// error naming a line number. Present-detection, so a bare key is refused too.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    repl: Option<serde_norway::Value>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    detach_after_secs: Option<serde_norway::Value>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    tools_visible: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2915,6 +2956,7 @@ impl RawBlock for RawRuntimeManifest {
         "exports",
         "control",
         "deploy",
+        "code_mode",
         "mur_version",
         "config",
         "runtime",
@@ -2961,6 +3003,16 @@ impl RawBlock for RawRuntimeManifest {
         if let Some(deploy) = &self.deploy {
             collect_block(deploy, &child_path(path, "deploy"), out);
         }
+        if let Some(code_mode) = &self.code_mode {
+            collect_block(code_mode, &child_path(path, "code_mode"), out);
+        }
+    }
+}
+
+impl RawBlock for RawCodeModeConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["repl", "detach_after_secs", "tools_visible"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -4237,6 +4289,7 @@ impl RuntimeManifest {
         let exports = parse_exports(raw.exports)?;
         let control = parse_control(raw.control, &gateway_references, inference.as_ref())?;
         validate_alternates_selectable(inference.as_ref(), control.as_ref())?;
+        let code_mode = parse_code_mode(raw.code_mode, &artifacts, inference.as_ref())?;
 
         Ok(Self {
             name,
@@ -4254,9 +4307,122 @@ impl RuntimeManifest {
             deploy: raw.deploy.map(|deploy| DeployConfig {
                 mur_version: deploy.mur_version.filter(|s| !s.trim().is_empty()),
             }),
+            code_mode,
             unknown_keys,
         })
     }
+}
+
+/// The refusal for `code_mode.repl`, `repl`, resolving to a package whose packed `murmur.yaml`,
+/// `packed_manifest_yaml`, declares a runtime other than `tool`; `None` for a tool's package. The
+/// legacy `wasm` spelling and an absent `runtime:` are a tool. Read by staging and `mur doctor`
+/// once the package is resolved.
+#[must_use]
+pub fn code_mode_package_refusal(repl: &str, packed_manifest_yaml: &str) -> Option<String> {
+    let manifest: serde_norway::Value = serde_norway::from_str(packed_manifest_yaml).ok()?;
+    match manifest
+        .get("runtime")
+        .and_then(serde_norway::Value::as_str)
+    {
+        None | Some("tool" | "wasm") => None,
+        Some("capsule") => Some(format!(
+            "'{repl}' is a script capsule's package (its murmur.yaml declares runtime: capsule)"
+        )),
+        Some(other) => Some(format!(
+            "'{repl}' is a package whose murmur.yaml declares runtime: {other}; code_mode.repl \
+             names a runtime: tool artifact"
+        )),
+    }
+}
+
+/// Lowers the `code_mode:` block against the manifest's own `artifacts` and `inference`.
+///
+/// What a package's own `murmur.yaml` declares is not known here; staging and `mur doctor` check
+/// the resolved package of `repl` once it is in hand.
+fn parse_code_mode(
+    raw: Option<RawCodeModeConfig>,
+    artifacts: &[RuntimeArtifact],
+    inference: Option<&InferenceConfig>,
+) -> Result<Option<CodeModeConfig>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let invalid = |field: &str, message: String| RuntimeManifestError::InvalidCodeMode {
+        field: field.to_string(),
+        message,
+    };
+    if inference.is_none() {
+        return Err(invalid(
+            "code_mode",
+            "a script capsule (no inference:) cannot declare code_mode".to_string(),
+        ));
+    }
+    let repl =
+        match raw.repl {
+            None => return Err(invalid(
+                "code_mode.repl",
+                "is required: the full <scope>/<name> of a runtime: tool artifact this manifest \
+                 declares in artifacts"
+                    .to_string(),
+            )),
+            Some(serde_norway::Value::String(repl)) if repl.trim().is_empty() => {
+                return Err(invalid(
+                    "code_mode.repl",
+                    "is blank; it is the full <scope>/<name> of a runtime: tool artifact this \
+                 manifest declares in artifacts"
+                        .to_string(),
+                ))
+            }
+            Some(serde_norway::Value::String(repl)) => repl,
+            Some(_) => {
+                return Err(invalid(
+                    "code_mode.repl",
+                    "must be a string: the full <scope>/<name> of a runtime: tool artifact this \
+                 manifest declares in artifacts"
+                        .to_string(),
+                ))
+            }
+        };
+    let detach_after_secs = match raw.detach_after_secs {
+        None => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            invalid(
+                "code_mode.detach_after_secs",
+                "must be a whole number of seconds, 0 or more".to_string(),
+            )
+        })?),
+    };
+    let tools_visible = match raw.tools_visible {
+        None => true,
+        Some(serde_norway::Value::Bool(visible)) => visible,
+        Some(_) => {
+            return Err(invalid(
+                "code_mode.tools_visible",
+                "must be true or false".to_string(),
+            ))
+        }
+    };
+    let Some(entry) = artifacts.iter().find(|artifact| artifact.name == repl) else {
+        return Err(invalid(
+            "code_mode.repl",
+            format!("'{repl}' is not an artifact this manifest declares in artifacts"),
+        ));
+    };
+    if entry.runtime != ArtifactRuntime::Tool {
+        return Err(invalid(
+            "code_mode.repl",
+            format!(
+                "'{repl}' is declared with runtime: {}; code_mode.repl names a runtime: tool \
+                 artifact",
+                entry.runtime.as_str()
+            ),
+        ));
+    }
+    Ok(Some(CodeModeConfig {
+        repl,
+        detach_after_secs,
+        tools_visible,
+    }))
 }
 
 /// Every artifact entry whose `gateway.api_key` is written as `${NAME}`, as `(artifact, NAME)`.
@@ -15974,5 +16140,204 @@ mod host_paths_tests {
         let input = "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  filesystem:\n    \
                      workdir_exec: false\n";
         assert!(RuntimeManifest::from_yaml_str(input).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod code_mode_tests {
+    use super::*;
+
+    const ARTIFACTS: &str = "artifacts:\n  - name: local/counter-tool\n    version: 0.1.0\n    \
+                             runtime: tool\n  - name: local/a-hook\n    version: 0.1.0\n    \
+                             runtime: hook\n  - name: local/a-skill\n    version: 0.1.0\n    \
+                             runtime: skill\n  - name: murmur/driver-anthropic\n    \
+                             version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                             endpoint: https://api.anthropic.com\n      api_key: test-key\n";
+    const INFERENCE: &str = "inference:\n  transport: http\n  model: test-model\n  driver:\n    \
+                             artifact: murmur/driver-anthropic\n";
+
+    fn manifest(code_mode: &str) -> String {
+        format!("name: cap\nversion: 0.0.1\n{ARTIFACTS}{INFERENCE}{code_mode}")
+    }
+
+    fn parsed(code_mode: &str) -> RuntimeManifest {
+        RuntimeManifest::from_yaml_str(&manifest(code_mode)).unwrap()
+    }
+
+    /// The refused field and message of a `code_mode` block `parse` refuses.
+    fn refused(input: &str) -> (String, String) {
+        match RuntimeManifest::from_yaml_str(input) {
+            Err(RuntimeManifestError::InvalidCodeMode { field, message }) => (field, message),
+            other => panic!("expected InvalidCodeMode for {input:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_mode_absent_is_none() {
+        assert_eq!(parsed("").code_mode, None);
+    }
+
+    #[test]
+    fn code_mode_defaults_offer_every_tool_and_never_detach() {
+        let code_mode = parsed("code_mode:\n  repl: local/counter-tool\n")
+            .code_mode
+            .unwrap();
+        assert_eq!(
+            code_mode,
+            CodeModeConfig {
+                repl: "local/counter-tool".to_string(),
+                detach_after_secs: None,
+                tools_visible: true,
+            }
+        );
+    }
+
+    #[test]
+    fn code_mode_every_key_lowers() {
+        let code_mode = parsed(
+            "code_mode:\n  repl: local/counter-tool\n  detach_after_secs: 30\n  \
+             tools_visible: false\n",
+        )
+        .code_mode
+        .unwrap();
+        assert_eq!(code_mode.detach_after_secs, Some(30));
+        assert!(!code_mode.tools_visible);
+        let zero = parsed("code_mode:\n  repl: local/counter-tool\n  detach_after_secs: 0\n")
+            .code_mode
+            .unwrap();
+        assert_eq!(zero.detach_after_secs, Some(0));
+    }
+
+    #[test]
+    fn code_mode_unknown_key_is_reported_at_its_path() {
+        let manifest = parsed("code_mode:\n  repl: local/counter-tool\n  snapshot: true\n");
+        assert!(manifest.code_mode.is_some());
+        let unknown: Vec<_> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.block_path.as_str(), key.key.as_str()))
+            .collect();
+        assert_eq!(unknown, vec![("code_mode", "snapshot")]);
+    }
+
+    #[test]
+    fn code_mode_refuses_each_invalid_key_naming_the_field() {
+        for (block, field, says) in [
+            ("code_mode: {}\n", "code_mode.repl", "is required"),
+            (
+                "code_mode:\n  repl:\n",
+                "code_mode.repl",
+                "must be a string",
+            ),
+            ("code_mode:\n  repl: '  '\n", "code_mode.repl", "is blank"),
+            (
+                "code_mode:\n  repl: 7\n",
+                "code_mode.repl",
+                "must be a string",
+            ),
+            (
+                "code_mode:\n  repl: local/counter-tool\n  detach_after_secs: -1\n",
+                "code_mode.detach_after_secs",
+                "whole number of seconds, 0 or more",
+            ),
+            (
+                "code_mode:\n  repl: local/counter-tool\n  detach_after_secs: 1.5\n",
+                "code_mode.detach_after_secs",
+                "whole number of seconds, 0 or more",
+            ),
+            (
+                "code_mode:\n  repl: local/counter-tool\n  detach_after_secs: soon\n",
+                "code_mode.detach_after_secs",
+                "whole number of seconds, 0 or more",
+            ),
+            (
+                "code_mode:\n  repl: local/counter-tool\n  tools_visible: maybe\n",
+                "code_mode.tools_visible",
+                "true or false",
+            ),
+            (
+                "code_mode:\n  repl: local/other-tool\n",
+                "code_mode.repl",
+                "'local/other-tool' is not an artifact this manifest declares in artifacts",
+            ),
+            (
+                "code_mode:\n  repl: counter-tool\n",
+                "code_mode.repl",
+                "'counter-tool' is not an artifact this manifest declares in artifacts",
+            ),
+            (
+                "code_mode:\n  repl: local/a-hook\n",
+                "code_mode.repl",
+                "'local/a-hook' is declared with runtime: hook; code_mode.repl names a runtime: \
+                 tool artifact",
+            ),
+            (
+                "code_mode:\n  repl: local/a-skill\n",
+                "code_mode.repl",
+                "'local/a-skill' is declared with runtime: skill",
+            ),
+        ] {
+            let (refused_field, message) = refused(&manifest(block));
+            assert_eq!(refused_field, field, "{block}");
+            assert!(message.contains(says), "{block}: {message}");
+        }
+    }
+
+    #[test]
+    fn code_mode_refuses_a_driver_repl() {
+        let input =
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    \
+                     version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: \
+                     https://api.anthropic.com\n      api_key: test-key\ninference:\n  \
+                     transport: http\n  model: test-model\n  driver:\n    artifact: \
+                     murmur/driver-anthropic\ncode_mode:\n  repl: murmur/driver-anthropic\n";
+        let (field, message) = refused(input);
+        assert_eq!(field, "code_mode.repl");
+        assert!(
+            message.contains("is declared with runtime: driver"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn code_mode_package_refusal_names_the_declared_runtime() {
+        for tool in [
+            "name: local/t\nversion: 0.1.0\nruntime: tool\n",
+            "name: local/t\nversion: 0.1.0\nruntime: wasm\n",
+            "name: local/t\nversion: 0.1.0\n",
+        ] {
+            assert_eq!(code_mode_package_refusal("local/t", tool), None, "{tool}");
+        }
+        assert_eq!(
+            code_mode_package_refusal("local/t", "name: local/t\nruntime: capsule\n").as_deref(),
+            Some("'local/t' is a script capsule's package (its murmur.yaml declares runtime: capsule)")
+        );
+        assert_eq!(
+            code_mode_package_refusal("local/t", "name: local/t\nruntime: hook\n").as_deref(),
+            Some(
+                "'local/t' is a package whose murmur.yaml declares runtime: hook; code_mode.repl \
+                 names a runtime: tool artifact"
+            )
+        );
+    }
+
+    #[test]
+    fn code_mode_in_a_script_capsule_is_refused() {
+        let input = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/counter-tool\n    \
+                     version: 0.1.0\n    runtime: tool\ncode_mode:\n  repl: local/counter-tool\n";
+        let (field, message) = refused(input);
+        assert_eq!(field, "code_mode");
+        assert_eq!(
+            message,
+            "a script capsule (no inference:) cannot declare code_mode"
+        );
+        let error = RuntimeManifest::from_yaml_str(input)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "murmur.yaml: invalid code_mode config for 'code_mode': a script capsule (no \
+             inference:) cannot declare code_mode"
+        );
     }
 }

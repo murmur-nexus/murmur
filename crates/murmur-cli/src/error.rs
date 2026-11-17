@@ -12,6 +12,7 @@ use murmur_artifact::{
 pub const E_MAN_001: &str = "E-MAN-001"; // missing required field
 pub const E_MAN_002: &str = "E-MAN-002"; // YAML syntax error
 pub const E_MAN_003: &str = "E-MAN-003"; // field type mismatch
+pub const E_MAN_004: &str = "E-MAN-004"; // an invalid code_mode block
 
 // Registry
 pub const E_REG_001: &str = "E-REG-001"; // artifact not found
@@ -1171,6 +1172,12 @@ impl From<RuntimeError> for CliError {
                  capabilities.spawn.allow from the manifest if this capsule spawns nothing",
             ),
             RuntimeError::NativeTool { artifact, field } => native_tool_launch_error(&artifact, &field),
+            error @ RuntimeError::InvalidCodeModePackage { .. } => {
+                CliError::new(E_MAN_004, error.to_string())
+            }
+            error @ RuntimeError::CodeModeWithoutGuestWorkers => {
+                CliError::new(E_IO_003, error.to_string())
+            }
             RuntimeError::GuestWorkerLost(message) => CliError::with_hint(
                 E_RUN_065,
                 message,
