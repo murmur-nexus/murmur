@@ -9,7 +9,6 @@
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use capsule_runtime::record_seal::{self, RecordReport, Seal, Verdict, TRACE_STREAM};
@@ -523,13 +522,6 @@ fn unknown_event<'a>(trace: &[u8], events: &'a [String]) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 /// `mur trace attach`: verifies the session's record as `mur trace verify` does, then writes one
 /// attachment naming its sealed head. Refuses, writing nothing, unless the record verifies.
 pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
@@ -599,7 +591,7 @@ pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
         evaluator: request.evaluator,
         value,
         events: request.events,
-        attached_at: now_ms(),
+        attached_at: capsule_runtime::retention::now_ms(),
         record: AttachedHead {
             stream: TRACE_STREAM.to_string(),
             head: seal.head,

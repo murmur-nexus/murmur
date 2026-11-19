@@ -1982,7 +1982,8 @@ a link, not a regular file, owned by another user, or readable by group or other
 verify it on another machine.
 
 **What is not covered.** The records directory's `home/`, `tmp/`, `logs/` and `out/` are not
-sealed streams, nor are [`attachments/`](#record-attachments) and `blobs/` (each blob is named by its own sha256, which the trace records).
+sealed streams, nor are [`attachments/`](#record-attachments) and `blobs/` (each blob is named by
+its own sha256, which the trace records).
 Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.seal`'s
 `conversation` pointer is not signed, so removing it drops the conversation record from the check.
 
@@ -2022,8 +2023,9 @@ written to a temporary name and renamed into place, at mode `0666` less the umas
 | `record` | object | The record it judges, copied from `trace.jsonl.seal`: `stream` (`"trace.jsonl"`), `head`, `lines` and `key_id` |
 
 `record.head` is always a head that verified when the attachment was written. The same head is
-what the `capsule.session` span carries as [`murmur.record.head`](#otel-span-emission), so an
-attachment can be matched against a collector's copy.
+what the session's last `capsule.session` span carries as
+[`murmur.record.head`](#otel-span-emission), so an attachment can be matched against a collector's
+copy.
 
 **Trust.** An attachment is neither signed nor sealed. Anyone who can write the records directory
 can add, edit or remove one, and nothing in Murmur vouches for its value or its evaluator.
