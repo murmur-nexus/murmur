@@ -154,6 +154,7 @@ nav:
       - Pause your agent for human input: how-to/hitl-request-input.md
       - Read your agent's trace and compare two runs: how-to/read-trace-and-diff.md
       - Score your agent's behavior with eval: how-to/agent-eval-score.md
+      - Gate a runtime change on eval results: how-to/gate-a-runtime-change.md
       - Shape agent behavior with a system prompt: how-to/capsule-system-prompt.md
       - Enable context compaction: how-to/context-compaction.md
       - Give a capsule memory: how-to/give-capsule-memory.md

@@ -683,6 +683,7 @@ fn test_host() -> crate::runtime::ToolCallHost {
             formation: None,
             task_provenance: None,
             member_requests: None,
+            network_requests: None,
         },
         events: crate::stream_events::StreamEventsTarget {
             sse: None,
@@ -808,6 +809,7 @@ fn no_credential() {
             role: ComponentRole::Driver,
             call_deadlines: &deadlines,
             member_requests: &member_requests,
+            network_requests: &crate::network_request::NetworkRequests::default(),
             task_id: None,
             process: crate::session_process::ProcessAccess::Unavailable(
                 crate::session_process::unavailable::DRIVER,

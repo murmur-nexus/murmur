@@ -25,6 +25,8 @@ pub(crate) const TRACE_FILE_NAME: &str = "trace.jsonl";
 pub(crate) struct TraceWriter {
     /// The file's chain, shared with every other appender of the same `trace.jsonl`.
     chain: Arc<crate::record_seal::InlineChain>,
+    /// `trace.sync`, set on the chain by [`Self::set_trace_sync`]; `None` makes no sync call.
+    trace_sync: Option<murmur_artifact::TraceSync>,
     /// The records directory the trace is in, which its seal is written beside.
     records_root: WorkdirRoot,
     /// What the seal written after `session_end` covered, for the OTel session span.
@@ -159,6 +161,10 @@ pub(crate) struct TraceWriter {
     /// `member_request` lines at the same points as [`Self::call_deadlines`]. Set by
     /// [`Self::set_member_requests`]; `None` drains nothing.
     member_requests: Option<crate::member_request::MemberRequests>,
+    /// The session's record of requests guests sent through `wasi:http` on their own, drained
+    /// into `network_request` lines right after [`Self::member_requests`]. Set by
+    /// [`Self::set_network_requests`]; `None` drains nothing.
+    network_requests: Option<crate::network_request::NetworkRequests>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -458,6 +464,29 @@ struct SessionStartEvent {
     /// Present exactly when `formation_member` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     formation_callees: Option<Vec<String>>,
+    /// `trace.sync`: when this session's own lines reach the disk. Written only when the field is
+    /// set; absent rather than `null` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_sync: Option<SessionTraceSync>,
+}
+
+/// `session_start.trace_sync`: `{"mode":"line"}` or `{"mode":"interval","interval_secs":N}`.
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum SessionTraceSync {
+    Line,
+    Interval { interval_secs: u64 },
+}
+
+impl From<murmur_artifact::TraceSync> for SessionTraceSync {
+    fn from(sync: murmur_artifact::TraceSync) -> Self {
+        match sync {
+            murmur_artifact::TraceSync::Line => Self::Line,
+            murmur_artifact::TraceSync::Interval { secs } => Self::Interval {
+                interval_secs: secs,
+            },
+        }
+    }
 }
 
 /// `session_start.deadline`.
@@ -1953,6 +1982,49 @@ struct MemberRequestEvent {
     duration_ms: u64,
 }
 
+/// One request a guest sent through `wasi:http` on its own, refusals included. Written once per
+/// request, after it was accounted for and before `session_end`. Never holds a path, a query, a
+/// header, a key or a body.
+#[derive(Serialize)]
+struct NetworkRequestEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The calling task; absent when the request was sent for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    component: String,
+    /// [`crate::limits::ComponentRole::wire_name`].
+    role: &'static str,
+    /// [`crate::network_request::NetworkRoute::wire_name`]: `direct` or `gateway`.
+    route: &'static str,
+    scheme: String,
+    /// Host, and `:port` when the address named one; absent when the URI named no host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    method: String,
+    /// `sent`, `refused` or `failed`.
+    outcome: &'static str,
+    /// Present exactly for `refused` and `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_bytes: Option<u64>,
+    /// Present exactly when `request_bytes` is and `trace.capture` is not `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_sha256: Option<String>,
+    /// Present exactly when `response_bytes` is and `trace.capture` is not `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_sha256: Option<String>,
+    duration_ms: u64,
+}
+
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
 /// line follows its last attempt.
 #[derive(Serialize)]
@@ -2780,6 +2852,7 @@ impl TraceWriter {
         }
         Ok(Self {
             chain,
+            trace_sync: None,
             records_root: records_root.clone(),
             sealed_head: None,
             session_id,
@@ -2834,6 +2907,7 @@ impl TraceWriter {
             session_status: None,
             call_deadlines: None,
             member_requests: None,
+            network_requests: None,
         })
     }
 
@@ -2847,6 +2921,16 @@ impl TraceWriter {
     /// `member_request` line per request wherever it drains [`Self::set_call_deadlines`]' latch.
     pub(crate) fn set_member_requests(&mut self, requests: crate::member_request::MemberRequests) {
         self.member_requests = Some(requests);
+    }
+
+    /// The session's [`crate::network_request::NetworkRequests`], which this writer drains into
+    /// one `network_request` line per request wherever it drains [`Self::set_member_requests`]'
+    /// latch, storing each captured body under `blobs/` first.
+    pub(crate) fn set_network_requests(
+        &mut self,
+        requests: crate::network_request::NetworkRequests,
+    ) {
+        self.network_requests = Some(requests);
     }
 
     /// The session's standing, which every later `inference`, `task_start` and `task_end` write
@@ -2911,6 +2995,16 @@ impl TraceWriter {
     /// Records the session's credential gateways for `session_start.gateways`.
     pub(crate) fn set_gateways(&mut self, gateways: Vec<SessionGateway>) {
         self.gateways = gateways;
+    }
+
+    /// Applies `trace.sync` to this trace's chain — every appender of the file shares it — and
+    /// records it for `session_start.trace_sync`. Called before the first line is written, so
+    /// the policy covers every line. `None` leaves the chain making no sync call.
+    pub(crate) fn set_trace_sync(&mut self, sync: Option<murmur_artifact::TraceSync>) {
+        self.trace_sync = sync;
+        if let Some(policy) = sync {
+            self.chain.set_sync(policy);
+        }
     }
 
     /// Records what `control:` declares for `session_start.control`.
@@ -3095,6 +3189,7 @@ impl TraceWriter {
                 .formation_member
                 .as_ref()
                 .map(|(_, callees)| callees.clone()),
+            trace_sync: self.trace_sync.map(SessionTraceSync::from),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -4788,6 +4883,10 @@ impl TraceWriter {
             exit_status: exit_status.to_string(),
         };
         self.write_event(&event).await?;
+        // Under an interval policy `session_end` may still be pending; the ending waits for it.
+        if self.trace_sync.is_some() {
+            self.chain.sync_now()?;
+        }
         self.session_ended = true;
         self.sealed_head =
             crate::record_seal::seal_session_end(&self.records_root, &self.session_id);
@@ -4835,19 +4934,69 @@ impl TraceWriter {
     }
 
     /// Write `event` as one line, after a `call_deadline` line for each firing the session's
-    /// latch holds and a `member_request` line for each request its other latch holds. Draining
-    /// here, ahead of every line, is what puts a cut call's `call_deadline` before the record of
-    /// that call and every one of both before `session_end`.
+    /// latch holds, a `member_request` line for each request its second latch holds and a
+    /// `network_request` line for each request its third holds. Draining here, ahead of every
+    /// line, is what puts a cut call's `call_deadline` before the record of that call, a tool's
+    /// requests before its `tool_call`, and every one of them before `session_end`.
     async fn write_event(&mut self, event: &impl Serialize) -> std::io::Result<()> {
         self.write_latched().await?;
         self.write_line(event).await
     }
 
-    /// Drains both of the session's latches: [`Self::write_call_deadlines`], then
-    /// [`Self::write_member_requests`].
+    /// Drains the session's latches: [`Self::write_call_deadlines`], then
+    /// [`Self::write_member_requests`], then [`Self::write_network_requests`].
     async fn write_latched(&mut self) -> std::io::Result<()> {
         self.write_call_deadlines().await?;
-        self.write_member_requests().await
+        self.write_member_requests().await?;
+        self.write_network_requests().await
+    }
+
+    /// One `network_request` line per request [`Self::network_requests`] holds, parented to the
+    /// session node. Nothing before `session_start`. Each line carries the task its own record
+    /// names, never the writer's active task. Under `trace.capture: content` each captured body
+    /// is stored as `blobs/<sha256>` before the line that names it.
+    async fn write_network_requests(&mut self) -> std::io::Result<()> {
+        let Some(requests) = self
+            .network_requests
+            .as_ref()
+            .filter(|_| self.session_started)
+        else {
+            return Ok(());
+        };
+        for request in requests.take() {
+            for body in [&request.request_body, &request.response_body]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(bytes) = body.bytes.as_deref() {
+                    self.blobs.put(&body.sha256, bytes).await?;
+                }
+            }
+            let event = NetworkRequestEvent {
+                event_type: "network_request",
+                event_id: new_event_id(),
+                parent_id: self.session_parent(),
+                session_id: self.session_id.clone(),
+                timestamp: timestamp_ms(),
+                task_id: request.task_id,
+                component: request.component,
+                role: request.role.wire_name(),
+                route: request.route.wire_name(),
+                scheme: request.scheme,
+                host: request.host,
+                method: request.method,
+                outcome: request.outcome.wire_name(),
+                reason: request.outcome.reason(),
+                http_status: request.http_status,
+                request_bytes: request.request_bytes,
+                response_bytes: request.response_bytes,
+                request_sha256: request.request_body.map(|body| body.sha256),
+                response_sha256: request.response_body.map(|body| body.sha256),
+                duration_ms: request.duration_ms,
+            };
+            self.write_line(&event).await?;
+        }
+        Ok(())
     }
 
     /// One `member_request` line per request [`Self::member_requests`] holds, parented to the
@@ -6725,6 +6874,35 @@ mod tests {
         assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(e["model_limits"], serde_json::Value::Null);
+    }
+
+    /// `trace_sync` is absent without `trace.sync`, and names the mode — and the interval — with
+    /// it; the lines it covers carry the same `prev_hash` chain either way.
+    #[tokio::test]
+    async fn session_start_trace_sync_is_absent_unset_and_names_the_policy() {
+        use murmur_artifact::TraceSync;
+        for (sync, expected) in [
+            (None, None),
+            (
+                Some(TraceSync::Line),
+                Some(serde_json::json!({"mode": "line"})),
+            ),
+            (
+                Some(TraceSync::Interval { secs: 5 }),
+                Some(serde_json::json!({"mode": "interval", "interval_secs": 5})),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.set_trace_sync(sync);
+            w.write_session_start(None, None, Vec::new()).await.unwrap();
+            w.write_session_end("ok").await.unwrap();
+
+            let events = read_events(dir.path());
+            assert_eq!(events.len(), 2, "{sync:?}");
+            assert_eq!(events[0].get("trace_sync").cloned(), expected, "{sync:?}");
+            assert!(events[1]["prev_hash"].is_string(), "{sync:?}");
+        }
     }
 
     /// No turn cap is written as `null`, beside the primary's limits and their sources.

@@ -49,7 +49,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_busy`, `member_call_start`, `member_call`, `member_request` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_busy`, `member_call_start`, `member_call`, `member_request`, `network_request` | The session node |
 | `plan_start` | The session node. Its `event_id` is the plan node |
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
@@ -80,11 +80,12 @@ before the first task begins
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
 | `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
 | `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver` (the driver artifact's full name), `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch), `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch) and `model_limits` (the choice's own, shaped as the top-level `model_limits`). Written only when `inference.alternates` is declared; absent otherwise |
-| `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
+| `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null` |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
-| `formation_id` | string | `frm_…` — the [formation](cli.md#mur-run-formation) this session is a member of. Written only for a member; absent rather than `null` otherwise, so a session in no formation produces a byte-identical record. `session_start` is always the trace's first line, so this is too. See [Reading a formation](#formation) |
+| `formation_id` | string | `frm_…` — the [formation](cli.md#mur-run-formation) this session is a member of. Written only for a member; absent rather than `null` otherwise. `session_start` is always the trace's first line, so this is too. See [Reading a formation](#formation) |
 | `formation_member` | string | This session's roster name. Written only for a session `mur run --roster` launched as a member, which is handed its credentials on a [formation channel](roster.md#formation-channel); absent otherwise, a member's delegated child included |
 | `formation_callees` | list of strings | The members this one may call, in roster order: `[]` for a member that may call nobody. Present exactly when `formation_member` is. See [How reachability is enforced](roster.md#enforcement) |
+| `trace_sync` | object | The manifest's [`trace.sync`](manifest.md#trace-sync) in force: `{"mode":"line"}`, or `{"mode":"interval","interval_secs":5}` for a duration, in whole seconds. Written only when the field is set; absent rather than `null` otherwise |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `gateway.api_key` on the driver's entry, a driver entry with [`keyless: true`](manifest.md#gateway-keyless), or no inference gateway at all. Never the key, a hash of it, its length or any part of it |
 | `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's full name, `scope/name`), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the gateways of the configured `transport: http` driver and of each `inference.alternates` driver, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
@@ -415,6 +416,9 @@ itself is the conversation's `blobs/<sha256>` — see
 `system_prompt_sha256` from `session_start` resolves the same way, to the resolved prompt before
 the `[Capsule]` block was prepended, and so does `message_sha256` from
 [`a2a_task_received`](#a2a-task-received), to the message text of a task the door let in.
+`request_sha256` and `response_sha256` from [`network_request`](#network-request) resolve to the
+request body the component sent and the response body it read. Both blobs are written with the
+line, once the request has ended, so under `content` each body is also held in memory until then.
 
 **Blob bodies are the payload verbatim, unredacted** — including any peer handle token, which
 `tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
@@ -1143,7 +1147,7 @@ is accounted for and before `session_end`. A session in no formation writes none
 | `reason` | string | Present exactly for `refused` and `failed` — see the table below |
 | `http_status` | u16 | The member door's HTTP status. Present when a response arrived |
 | `member_task_id` | string | The callee's task: the `task.id` of the `SendMessage` answer. Present when the response carried one |
-| `duration_ms` | u64 | From the request reaching the runtime to the line being accounted for: the end of the response for `sent` |
+| `duration_ms` | u64 | From the request leaving the component to the request ending: for `sent`, the end of the response or the moment the component dropped it |
 
 | `outcome` | `reason` | Written when |
 |---|---|---|
@@ -1163,9 +1167,67 @@ field carries a door address, a port, a token, a header value or a request or re
 {"event_type":"member_request","event_id":"evt_01a2c4e0b7d17a40b9f3c2d1e0a9b8c7","parent_id":"evt_01a2c4e0a1f07b1c8d2e3f4a5b6c7d8e","session_id":"ses_01a2c4e0a1e57c3d9e8f7a6b5c4d3e2f","timestamp":1793820004120,"call_id":"mrq_01a2c4e0b7c07d5e8f9a0b1c2d3e4f50","task_id":"tsk_01a2c4e0a2017e6f9a0b1c2d3e4f5a6b","member":"coder","component":"formation-probe","role":"tool","via":"wasi_http","outcome":"sent","http_status":200,"member_task_id":"tsk_01a2c4e0b8a27f708192a3b4c5d6e7f8","duration_ms":38}
 ```
 
-`mur trace show` lists each as
+`mur trace steps` lists each as
 `member_request coder  mrq_01a2…  sent  200  38ms  via tool formation-probe`, and a refused one as
 `member_request reviewer  mrq_01a2…  refused not_a_callee  0ms  via tool formation-probe`.
+
+**`network_request`**{ #network-request } — written once per HTTP request a component sent on
+its own, refused requests included. The component is a WASM tool, a `transport: http` driver
+reached as a tool, a hook, or a script capsule's own component. The request went straight to the
+host it named, through that artifact's own [credential gateway](manifest.md#artifact-gateway), or
+was refused before any connection opened. Written once the request has ended and before
+`session_end`; a tool's requests are written before that call's `tool_call` line. A request still
+open when its component's call ends is ended with it, so a call stopped at its
+[`call_deadline`](#call-deadline) still leaves a line for each request it sent.
+
+Two kinds of request are recorded by their own line and never by this one:
+
+| Request | Recorded by |
+|---|---|
+| A model call through the inference gateway | [`inference`](#inference) |
+| A request to a member's virtual address (`http://<member>.formation.invalid`) | [`member_request`](#member-request) |
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task the request was sent for. Absent for a request sent for no task: a hook's, a hook's `run-inference` driver's, a script capsule's, and the agent capsule's own |
+| `component` | string | The artifact's tool name for a tool or driver, the hook's name, or the capsule's `name` |
+| `role` | string | `"tool"` \| `"driver"` \| `"hook"` \| `"capsule"` — as [`call_deadline.role`](#call-deadline). A driver reached by name is `"tool"` |
+| `route` | string | `"direct"` — to the host the request named \| `"gateway"` — through the artifact's credential gateway |
+| `scheme` | string | `"http"` \| `"https"`: the request's, or for `gateway` that of the artifact's `gateway.endpoint` |
+| `host` | string | The host, with `:port` when the address names a port: the request's, or for `gateway` that of the artifact's `gateway.endpoint`. Absent only when the request names no host |
+| `method` | string | The HTTP method, such as `"GET"` |
+| `outcome` | string | `"sent"` \| `"refused"` \| `"failed"` — see the table below |
+| `reason` | string | Present exactly for `refused` and `failed` — see the table below |
+| `http_status` | u16 | The host's HTTP status. Present when a response arrived |
+| `request_bytes` | u64 | Request body bytes the runtime read. Absent for `refused` |
+| `response_bytes` | u64 | Response body bytes the component read, which is fewer than the body holds when it stopped reading early. Present when a response arrived |
+| `request_sha256` | string | SHA-256 of exactly the `request_bytes` bytes. Present when `request_bytes` is, under [`trace.capture`](manifest.md#field-trace) `meta` and `content`. Under `content` the body is stored at [`blobs/<request_sha256>`](#trace-blobs) |
+| `response_sha256` | string | SHA-256 of exactly the `response_bytes` bytes, present on the same terms as `request_sha256` |
+| `duration_ms` | u64 | From the request leaving the component to the request ending: for `sent`, the end of the response, the moment the component dropped it, or the end of its call |
+
+| `outcome` | `reason` | Written when |
+|---|---|---|
+| `"sent"` | — | The host answered, whatever the status. A response the component dropped before its end, or was still reading when its call ended, is `sent` with the bytes read |
+| `"refused"` | `"not_allowed"` | No [`capabilities.network.allow`](manifest.md#network-allow-entries) rule reaches the host |
+| `"refused"` | `"not_admitted"` | The request is addressed to the inference gateway with no driver call open to send it for. `route` is `gateway` |
+| `"failed"` | `"connection_failed"` | No response arrived: the connection or the write failed, or the gateway's injected credential was not supplied |
+| `"failed"` | `"response_interrupted"` | The response could not be read to its end. Keeps `http_status` and counts the bytes read |
+| `"failed"` | `"interrupted"` | No response arrived before the request was abandoned: the component's call ended — past its [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), cancelled, or with its [guest worker](../concepts/guest-workers.md) lost — or the component dropped the request |
+
+A refused request opens no connection. A gateway that resends a request once with a re-read
+credential after a `401` writes one line for it. No field carries a path, a query, a header name
+or value, a key or a token, or any request or response body text.
+
+```json
+{"event_type":"network_request","event_id":"evt_01a2c4e0b7d17a40b9f3c2d1e0a9b8c9","parent_id":"evt_01a2c4e0a1f07b1c8d2e3f4a5b6c7d8e","session_id":"ses_01a2c4e0a1e57c3d9e8f7a6b5c4d3e2f","timestamp":1793820004120,"task_id":"tsk_01a2c4e0a2017e6f9a0b1c2d3e4f5a6b","component":"fetcher","role":"tool","route":"direct","scheme":"https","host":"api.example.com","method":"GET","outcome":"sent","http_status":200,"request_bytes":12,"response_bytes":4100,"request_sha256":"3bdb5a5184dacfb4b6f55949a13a800168b87a30b92ca33f71289af60abfa35b","response_sha256":"1bf9e588060a73e6748479719beb68975d292ff1a0a358e9ac848b0d846e8ed8","duration_ms":38}
+```
+
+`mur trace steps` lists each as
+`network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher`, and a
+refused one as
+`network_request  GET https blocked.example.com  refused not_allowed  0ms  via capsule probe-capsule`.
+Body sizes are bytes below 1000, then KB and MB to one decimal place; `-` stands for a response
+that never arrived.
 
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
 terminal `task_end`
@@ -1982,7 +2044,8 @@ a link, not a regular file, owned by another user, or readable by group or other
 verify it on another machine.
 
 **What is not covered.** The records directory's `home/`, `tmp/`, `logs/` and `out/` are not
-sealed streams, nor is `blobs/` (each blob is named by its own sha256, which the trace records).
+sealed streams, nor are [`attachments/`](#record-attachments) and `blobs/` (each blob is named by
+its own sha256, which the trace records).
 Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.seal`'s
 `conversation` pointer is not signed, so removing it drops the conversation record from the check.
 
@@ -1997,6 +2060,41 @@ Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.sea
 
 To keep a copy of each session's head that nothing on the host can rewrite, export spans to an
 OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-span-emission).
+
+### Attachments { #record-attachments }
+
+An attachment is an outside party's judgment of a sealed record — a reviewer's, a CI job's, a
+second model's — kept beside the record and never in it. [`mur trace attach`](cli.md#mur-trace-attach)
+writes one only after the record verifies, and [`mur trace verify`](cli.md#mur-trace-verify-attachments)
+lists each one with whether it points at the head that verified. The runtime never writes one.
+
+**File.** `attachments/<attachment_id>.json` in the session's
+[records directory](workdir.md#records-directory): one pretty-printed JSON object and a newline,
+written to a temporary name and renamed into place, at mode `0666` less the umask. The format is
+**stable**.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `format` | string | `"murmur.attachment/1"` |
+| `attachment_id` | string | `att_` and a UUID v7 as 32 lowercase hex characters; also the file's name |
+| `session_id` | string | The session whose record it judges |
+| `evaluator` | string | Who or what judged it, as given to `--evaluator` |
+| `value` | string | The judgment exactly as given: a number, a label, JSON or any UTF-8 text. `mur` never parses it |
+| `events` | array of strings | `event_id`s of `trace.jsonl` the judgment points at, each present when it was written; `[]` for none |
+| `attached_at` | integer | Milliseconds since the epoch, set by `mur` |
+| `record` | object | The record it judges, copied from `trace.jsonl.seal`: `stream` (`"trace.jsonl"`), `head`, `lines` and `key_id` |
+
+`record.head` is always a head that verified when the attachment was written. The same head is
+what the session's last `capsule.session` span carries as
+[`murmur.record.head`](#otel-span-emission), so an attachment can be matched against a collector's
+copy.
+
+**Trust.** An attachment is neither signed nor sealed. Anyone who can write the records directory
+can add, edit or remove one, and nothing in Murmur vouches for its value or its evaluator.
+`mur trace verify` says only whether an attachment points at the head that verified; an
+attachment's status never changes the record's verdict or the command's exit status. A capsule's
+commands at `scoped` and `sealed` see the records directory read-only apart from `home/` and
+`tmp/`, so a contained capsule cannot write an attachment.
 
 ## Task stream `artifact` frame { #task-stream-artifact-frame }
 
@@ -2117,7 +2215,24 @@ Each `runs[]` entry:
 | `cached_tokens` | u64 \| null | The provider's cache-read count, beside `input_tokens`; `null` when no driver reported it |
 | `cache_write_tokens` | u64 \| null | The provider's cache-write count, on the same terms |
 | `agent_ms` | u64 \| null | The sum of the trace's `task_end.duration_ms` |
+| `spend_tokens` | u64 \| null | The tokens the session's spend meter was charged, the number [`inference.max_session_tokens`](manifest.md#field-inference) counts, read back from the trace as listed below. `null` for a run never launched or whose trace could not be read; a record from an older `mur` has no key |
 | `scores_overall` | string \| null | `overall` of the session's `hooks/eval.jsonl` [`dataset_run`](#structured-evaluation-evaljsonl) record, or `null` |
+
+`spend_tokens` is the sum over the session's trace of:
+
+| Line | Charge |
+|---|---|
+| `inference` carrying both `input_tokens_actual` and `output_tokens_actual` | `input_tokens_actual + cached_tokens + cache_write_tokens + output_tokens_actual`, an absent cache count read as 0 |
+| Any other `inference` | `input_tokens + output_tokens`, an absent count read as 0. This covers the runtime's own counts and a `transport: process` harness's reported counts |
+| `inference_retry` | `charged_tokens` |
+
+Thinking tokens are never added; the meter does not charge them. One charge the trace does not
+state: an agent-loop call whose last attempt failed with no provider `usage` (a dispatch error, a
+refused status, an unreadable or `"error"` response) is charged the runtime's input estimate, or
+its input and output estimates when the response could not be parsed, and its failed `inference`
+line carries neither token count. Such a call reads as 0, so `spend_tokens` can be below what the
+meter counted for a session whose last call failed that way. The tokens a delegated child spent
+are in the child's own trace.
 
 ### Check outcome { #check-outcome }
 

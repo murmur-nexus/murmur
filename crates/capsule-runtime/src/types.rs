@@ -773,6 +773,9 @@ pub struct StagedSession {
     /// What bounds this workdir's session directories, from the manifest's `trace.retain` block.
     /// `None` — the overwhelmingly common case — prunes nothing, ever.
     pub(crate) trace_retain: Option<murmur_artifact::TraceRetainConfig>,
+    /// When this session's trace lines reach the disk, from the manifest's `trace.sync`. `None`
+    /// makes no sync call.
+    pub(crate) trace_sync: Option<murmur_artifact::TraceSync>,
     /// Address the HTTP server is bound to (copied from StageRequest::bind_addr).
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).
@@ -852,6 +855,9 @@ pub struct StagedSession {
     /// staging beside [`Self::call_deadlines`] and cloned the same way: into every store that can
     /// route one and into the session's trace writer, which drains it.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's record of every request a guest sends through `wasi:http`, cloned into each
+    /// store beside [`Self::member_requests`].
+    pub(crate) network_requests: crate::network_request::NetworkRequests,
     /// The credential this session presents when it asks `mur-roost` to spawn a capsule.
     ///
     /// `None` for every session that cannot delegate, which is nearly all of them. Set by the

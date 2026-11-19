@@ -96,6 +96,7 @@ pub(crate) mod murmur_md;
 pub mod namespace_probe;
 pub mod network_namespace;
 pub(crate) mod network_policy;
+pub(crate) mod network_request;
 pub mod origin;
 pub(crate) mod otel;
 pub(crate) mod outgoing;

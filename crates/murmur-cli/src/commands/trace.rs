@@ -27,16 +27,23 @@ use crate::formation_trace::{
 use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
 
+use super::trace_attach;
+
 const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
 /// A session's record no longer matches its chain or seal.
-const E_TRC_003: &str = "E-TRC-003";
+pub(crate) const E_TRC_003: &str = "E-TRC-003";
 /// A session's record is not covered by a seal: it ended without one, or lines were appended
 /// after it or cut off.
 const E_TRC_004: &str = "E-TRC-004";
 /// A session's record cannot be checked: written before records were sealed, no public key, or
 /// sealed by another key.
 const E_TRC_005: &str = "E-TRC-005";
+/// An attachment's input is refused: an empty or unprintable evaluator, an empty, unreadable,
+/// non-UTF-8 or oversized value, or an event id the trace does not hold.
+pub(crate) const E_TRC_006: &str = "E-TRC-006";
+/// An attachment cannot be written beneath the records directory.
+pub(crate) const E_TRC_007: &str = "E-TRC-007";
 
 /// The `inference.stop_reason` value a provider reports for a turn it cut off at the output cap.
 const MAX_TOKENS_STOP_REASON: &str = "max_tokens";
@@ -144,6 +151,43 @@ pub(crate) enum TraceCommand {
         #[arg(long, value_name = "FILE")]
         public_key: Option<PathBuf>,
         /// Print one JSON object, the stable interface documented under mur trace verify
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach an outside party's judgment to a session's sealed record
+    ///
+    /// Verifies the record as `mur trace verify` does and refuses unless it verifies, then writes
+    /// one new file, attachments/<id>.json in the records directory, naming the sealed head it
+    /// judges. Nothing in the record or its seals changes. The attachment is not signed.
+    #[command(group(
+        clap::ArgGroup::new("attach_value")
+            .args(["value", "value_file"])
+            .required(true)
+    ))]
+    Attach {
+        /// Session: @N, a full ses_ id, a suffix of one (4+ characters), a records directory, or
+        /// a trace.jsonl path
+        session: String,
+        /// Who or what judged the record: a reviewer, a CI job, a model
+        #[arg(long)]
+        evaluator: String,
+        /// The judgment, stored exactly as given and never parsed
+        #[arg(long)]
+        value: Option<String>,
+        /// Read the judgment from FILE, or from standard input when FILE is -
+        #[arg(long, value_name = "FILE")]
+        value_file: Option<PathBuf>,
+        /// An event of the trace the judgment points at; repeat for more
+        #[arg(long = "event", value_name = "EVENT_ID")]
+        event: Vec<String>,
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// The record-seal public key to check against (default: ~/.murmur/keys/record-seal.pub)
+        #[arg(long, value_name = "FILE")]
+        public_key: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace attach
         #[arg(long)]
         json: bool,
     },
@@ -400,6 +444,24 @@ where
 }
 
 impl InferenceEvent {
+    /// What the spend meter was charged for this call, as far as the line states it: the
+    /// provider's request (`input + cached + cache_write`) and output when the driver reported
+    /// both counts, the runtime's own `input_tokens + output_tokens` otherwise. Thinking is never
+    /// added. An agent-loop call that failed with no provider report carries neither token key
+    /// and reads `0`, although the meter charged it the runtime's input estimate.
+    fn charge(&self) -> u64 {
+        match (self.input_tokens_actual, self.output_tokens_actual) {
+            (Some(input), Some(output)) => input
+                .saturating_add(self.cached_tokens.unwrap_or(0))
+                .saturating_add(self.cache_write_tokens.unwrap_or(0))
+                .saturating_add(output),
+            _ => self
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(self.output_tokens.unwrap_or(0)),
+        }
+    }
+
     /// The call's failure, when the record says it failed.
     fn failure(&self) -> Option<FailedCall> {
         self.error_code.as_ref().map(|code| FailedCall {
@@ -1064,6 +1126,83 @@ impl CallDeadlineEvent {
     }
 }
 
+/// One `network_request` line: a request a guest sent through `wasi:http` on its own, straight to
+/// its host or through its artifact's credential gateway, refusals included.
+#[derive(Debug, Deserialize)]
+struct NetworkRequestLine {
+    #[serde(default)]
+    component: String,
+    /// `capsule`, `driver`, `tool`, `hook` or `process_driver`.
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    scheme: String,
+    /// Host, and `:port` when the request named one.
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    method: String,
+    /// `sent`, `refused` or `failed`.
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    http_status: Option<u16>,
+    #[serde(default)]
+    request_bytes: Option<u64>,
+    #[serde(default)]
+    response_bytes: Option<u64>,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+impl NetworkRequestLine {
+    /// `network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher`:
+    /// the method, scheme and host, the outcome with its reason, the status, the request and
+    /// response body sizes, the duration and the component that sent it.
+    fn row(&self) -> String {
+        let mut row = format!(
+            "network_request  {} {} {}  {}",
+            self.method,
+            self.scheme,
+            self.host.as_deref().unwrap_or("-"),
+            self.outcome
+        );
+        if let Some(reason) = &self.reason {
+            row.push(' ');
+            row.push_str(reason);
+        }
+        if let Some(status) = self.http_status {
+            row.push_str(&format!("  {status}"));
+        }
+        if let Some(sent) = self.request_bytes {
+            let received = self
+                .response_bytes
+                .map_or_else(|| "-".to_string(), fmt_body_bytes);
+            row.push_str(&format!("  {}→{received}", fmt_body_bytes(sent)));
+        }
+        row.push_str(&format!(
+            "  {}  via {} {}",
+            fmt_dur(self.duration_ms),
+            self.role,
+            self.component
+        ));
+        row
+    }
+}
+
+/// A body size as a `network_request` row shows it: bytes under 1000, then decimal KB and MB to
+/// one place.
+fn fmt_body_bytes(bytes: u64) -> String {
+    if bytes < 1_000 {
+        format!("{bytes}B")
+    } else if bytes < 1_000_000 {
+        format!("{:.1}KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+    }
+}
+
 /// A driver call failed transiently and was made again. The call's one `inference` line follows
 /// its last attempt.
 #[derive(Debug, Deserialize)]
@@ -1081,6 +1220,10 @@ struct InferenceRetryEvent {
     /// `hook:<name>` for a hook's `run-inference` call; absent for an agent-loop turn.
     #[serde(default)]
     origin: Option<String>,
+    /// What the spend meter was charged for the failed attempt: `0` for a `"status"` or
+    /// `"connection"` failure, the provider's counts or the input estimate for a `"driver"` one.
+    #[serde(default)]
+    charged_tokens: u64,
 }
 
 impl InferenceRetryEvent {
@@ -1447,6 +1590,7 @@ enum TraceEvent {
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
     MemberRequest(MemberRequestLine),
+    NetworkRequest(NetworkRequestLine),
     PlanStart(PlanStartEvent),
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
@@ -1753,6 +1897,9 @@ struct TraceMetrics {
     total_turns: u32,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    /// What the session's spend meter was charged, read back from its lines: every `inference`
+    /// line's [`InferenceEvent::charge`] plus every `inference_retry` line's `charged_tokens`.
+    spend_tokens: u64,
     total_tool_calls: u32,
     tool_ok: u32,
     tool_error: u32,
@@ -2690,6 +2837,7 @@ fn compute_metrics(
     let mut seen_turns = 0u32;
     let mut seen_input_tokens = 0u64;
     let mut seen_output_tokens = 0u64;
+    let mut spend_tokens = 0u64;
     let mut seen_shell_calls = 0u32;
     let mut tool_ok = 0u32;
     let mut tool_error = 0u32;
@@ -2757,6 +2905,7 @@ fn compute_metrics(
         match event {
             TraceEvent::SessionStart(e) => ss = Some(e),
             TraceEvent::Inference(e) => {
+                spend_tokens = spend_tokens.saturating_add(e.charge());
                 // Summed over every record that reported them, a hook's `run-inference`
                 // included: these are what the provider billed the session for.
                 if e.input_tokens_actual.is_some()
@@ -3052,6 +3201,7 @@ fn compute_metrics(
             TraceEvent::MemberCall(e) => fold_member_call(&mut member_calls, e),
             // Joined with the callee's side in the Formation section, which reads the trace itself.
             TraceEvent::MemberRequest(_) => {}
+            TraceEvent::NetworkRequest(_) => {}
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
                 plan_id: e.plan_id,
                 step_count: e.step_count,
@@ -3127,7 +3277,10 @@ fn compute_metrics(
             }
             // Rendered in the step list; the summary has no spend section.
             TraceEvent::SpendCeilingReached(_) => {}
-            TraceEvent::InferenceRetry(e) => retries.push((e.turn, e.row())),
+            TraceEvent::InferenceRetry(e) => {
+                spend_tokens = spend_tokens.saturating_add(e.charged_tokens);
+                retries.push((e.turn, e.row()));
+            }
             TraceEvent::CallDeadline(e) => call_deadlines.push(e.row()),
             TraceEvent::ControlChange(change) => control_changes.push(ControlChangeRecord {
                 change,
@@ -3222,6 +3375,7 @@ fn compute_metrics(
             total_turns: se.total_turns,
             total_input_tokens: se.total_input_tokens,
             total_output_tokens: se.total_output_tokens,
+            spend_tokens,
             total_tool_calls: se.total_tool_calls,
             tool_ok,
             tool_error,
@@ -3309,6 +3463,9 @@ pub(super) struct EvalTraceSummary {
     /// `None` when no turn's driver reported the count.
     pub(super) cached_tokens: Option<u64>,
     pub(super) cache_write_tokens: Option<u64>,
+    /// The tokens the session's spend meter was charged, as `inference.max_session_tokens`
+    /// counts them, read back from the trace's lines.
+    pub(super) spend_tokens: u64,
     /// The sum of every `task_end.duration_ms`: the agent's own time, without staging or teardown.
     pub(super) agent_ms: u64,
     pub(super) exit_status: String,
@@ -3329,6 +3486,7 @@ pub(super) fn eval_trace_summary(path: &Path) -> Result<EvalTraceSummary, CliErr
             .unwrap_or(metrics.total_output_tokens),
         cached_tokens: provider.and_then(|tokens| tokens.cached),
         cache_write_tokens: provider.and_then(|tokens| tokens.cache_write),
+        spend_tokens: metrics.spend_tokens,
         agent_ms: tasks.iter().map(|task| task.duration_ms).sum(),
         exit_status: metrics.exit_status,
     })
@@ -5514,6 +5672,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
         ),
         TraceEvent::InferenceRetry(e) => e.row(),
         TraceEvent::CallDeadline(e) => e.row(),
+        TraceEvent::NetworkRequest(e) => e.row(),
         TraceEvent::SpendCeilingReached(e) => format!(
             "{}{}  used {} of {}  needs {}{}",
             kind("spend_ceiling_reached"),
@@ -6949,7 +7108,7 @@ fn refused(base: &Path, refused_at: &str, message: String, place: RefusedPlace) 
 
 /// The records directory a resolved session address names: the directory itself, or the one
 /// holding the `trace.jsonl` it names.
-fn records_dir_of(path: &Path) -> PathBuf {
+pub(crate) fn records_dir_of(path: &Path) -> PathBuf {
     if path.is_dir() {
         return path.to_path_buf();
     }
@@ -6984,7 +7143,7 @@ fn conversations_root() -> Option<PathBuf> {
 }
 
 /// Every stream of the records directory `records_dir`, checked.
-fn verify_records(
+pub(crate) fn verify_records(
     records_dir: &Path,
     public_key: Option<&Path>,
 ) -> Result<capsule_runtime::record_seal::RecordReport, CliError> {
@@ -6997,7 +7156,7 @@ fn verify_records(
 }
 
 /// The worst stream of `report`, the one its verdict comes from.
-fn worst_stream(
+pub(crate) fn worst_stream(
     report: &capsule_runtime::record_seal::RecordReport,
 ) -> Option<&capsule_runtime::record_seal::StreamReport> {
     report
@@ -7008,7 +7167,7 @@ fn worst_stream(
 }
 
 /// `stream: detail`, naming the first bad line when there is one.
-fn stream_finding(stream: &capsule_runtime::record_seal::StreamReport) -> String {
+pub(crate) fn stream_finding(stream: &capsule_runtime::record_seal::StreamReport) -> String {
     match stream.first_bad_line {
         Some(line) => format!("{} line {line}: {}", stream.stream, stream.detail),
         None => format!("{}: {}", stream.stream, stream.detail),
@@ -7030,6 +7189,20 @@ fn print_record_mark(trace_path: &Path) {
     capsule_runtime::report_println!("record:        {}: {finding}", report.verdict.as_str());
 }
 
+/// The code `mur trace verify` exits with for `verdict`, `None` for [`Verdict::Verified`].
+///
+/// [`Verdict::Verified`]: capsule_runtime::record_seal::Verdict::Verified
+pub(crate) fn verdict_code(verdict: capsule_runtime::record_seal::Verdict) -> Option<&'static str> {
+    use capsule_runtime::record_seal::Verdict;
+    match verdict {
+        Verdict::Verified => None,
+        Verdict::Changed => Some(E_TRC_003),
+        Verdict::Unsealed => Some(E_TRC_004),
+        Verdict::Unverifiable => Some(E_TRC_005),
+        Verdict::Absent => Some(E_TRC_001),
+    }
+}
+
 pub(crate) fn run_trace_verify(
     session: Option<String>,
     workdir_arg: Option<PathBuf>,
@@ -7042,13 +7215,19 @@ pub(crate) fn run_trace_verify(
     let path = resolve_session(session, &workdir)?;
     let records_dir = records_dir_of(&path);
     let report = verify_records(&records_dir, public_key.as_deref())?;
+    let attachments = trace_attach::attachment_entries(&records_dir, &report);
     if json {
+        let output = trace_attach::VerifyOutput {
+            report: &report,
+            attachments: &attachments,
+        };
         capsule_runtime::report_println!(
             "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
         );
     } else {
         print_record_report(&report);
+        trace_attach::print_attachments(&attachments);
     }
     let session_name = report
         .session_id
@@ -7284,6 +7463,46 @@ mod tests {
         let path = dir.path().join("trace.jsonl");
         std::fs::write(&path, lines).unwrap();
         (dir, path)
+    }
+
+    /// `spend_tokens` of a trace holding `UNENDED_START` and then `lines`.
+    fn spend_of(lines: &[&str]) -> u64 {
+        let mut trace = format!("{UNENDED_START}\n");
+        for line in lines {
+            trace.push_str(line);
+            trace.push('\n');
+        }
+        let (_dir, path) = trace_of(&trace);
+        eval_trace_summary(&path)
+            .expect("the trace reads")
+            .spend_tokens
+    }
+
+    /// Each line is charged as the spend meter charged its call: the provider's request and
+    /// output when both counts are on the line, the runtime's counts otherwise, a retry's
+    /// `charged_tokens` as written, and thinking never.
+    #[test]
+    fn spend_reads_each_call_as_the_meter_charged_it() {
+        let provider = r#"{"event_type":"inference","turn":0,"input_tokens":90,"output_tokens":4,"input_tokens_actual":100,"output_tokens_actual":5,"cached_tokens":25,"cache_write_tokens":7,"thinking_tokens":300,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[provider]), 100 + 25 + 7 + 5);
+
+        // An input count alone is no report: the runtime's own counts are charged.
+        let runtime = r#"{"event_type":"inference","turn":0,"input_tokens":90,"output_tokens":4,"input_tokens_actual":100,"cached_tokens":25,"thinking_tokens":300,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[runtime]), 94);
+
+        let process = r#"{"event_type":"inference","turn":0,"transport":"process","input_tokens":40,"output_tokens":20,"cached_tokens":1000,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[process]), 60);
+
+        let failed = r#"{"event_type":"inference","turn":1,"decision":"error","stop_reason":"error","error_code":"driver_error","error":"HTTP 500: boom","tool_name":null}"#;
+        assert_eq!(spend_of(&[failed]), 0);
+
+        let retry = r#"{"event_type":"inference_retry","turn":0,"attempt":1,"max_retries":6,"reason":"driver","error":"stream broke","delay_ms":8,"charged_tokens":120}"#;
+        let released = r#"{"event_type":"inference_retry","turn":0,"attempt":2,"max_retries":6,"reason":"status","provider_status":429,"error":"HTTP 429","delay_ms":8,"charged_tokens":0}"#;
+        assert_eq!(spend_of(&[retry]), 120);
+        assert_eq!(
+            spend_of(&[retry, released, provider, runtime, process, failed]),
+            120 + 137 + 94 + 60
+        );
     }
 
     /// The harness section shows the latest window per name, in the order names were first
@@ -8538,6 +8757,23 @@ mod tests {
         assert_eq!(
             row(refused),
             "member_request reviewer  mrq_0193a2  refused not_a_callee  0ms  via tool formation-probe"
+        );
+    }
+
+    /// A `network_request` row names the method, scheme and host, the outcome with its reason,
+    /// the status, both body sizes, the duration and the sending component; a refused request
+    /// has no status and no sizes. Neither hash is shown.
+    #[test]
+    fn network_request_rows_render_their_route_outcome_and_sizes() {
+        let sent = r#"{"event_type":"network_request","event_id":"evt_2","parent_id":"evt_1","session_id":"s","timestamp":9,"task_id":"tsk_1","component":"fetcher","role":"tool","route":"direct","scheme":"https","host":"api.example.com","method":"GET","outcome":"sent","http_status":200,"request_bytes":12,"response_bytes":4100,"request_sha256":"aa","response_sha256":"bb","duration_ms":38}"#;
+        let refused = r#"{"event_type":"network_request","event_id":"evt_3","parent_id":"evt_1","session_id":"s","timestamp":9,"component":"probe-capsule","role":"capsule","route":"direct","scheme":"https","host":"blocked.example.com","method":"GET","outcome":"refused","reason":"not_allowed","duration_ms":0}"#;
+        assert_eq!(
+            row(sent),
+            "network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher"
+        );
+        assert_eq!(
+            row(refused),
+            "network_request  GET https blocked.example.com  refused not_allowed  0ms  via capsule probe-capsule"
         );
     }
 

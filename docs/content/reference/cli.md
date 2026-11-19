@@ -35,6 +35,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace list` | List the sessions of one workdir root, newest first |
 | `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
 | `mur trace verify` | Check a session's sealed records with the host's public key alone, naming the first line that changed |
+| `mur trace attach` | Attach an outside party's judgment to a session's sealed record, as a separate file |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions, or with `--run` the arms of one `mur eval run` |
 | `mur eval run` | Drive a multi-case dataset against a capsule, and optionally a variant, and judge each run by the case's check |
@@ -99,6 +100,7 @@ loses its key.
 | `run --json` | 1 | [Readiness line](#mur-run-json) |
 | `run --roster --json` | 1 | [Launching a formation](#mur-run-roster) |
 | `token` | 1 | [`mur token`](#mur-token): standard output is the token |
+| `trace attach --json` | 1 | [`mur trace attach`](#mur-trace-attach) |
 | `trace list --json` | 1 | [`mur trace list`](#mur-trace-list) |
 | `trace rm --json` | 1 | [`mur trace rm`](#mur-trace-rm) |
 | `trace verify --json` | 1 | [`mur trace verify`](#mur-trace-verify) |
@@ -3117,9 +3119,10 @@ The second line is printed only when a blob was removed. A record already at or 
 
 ## `mur trace`
 
-Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`, and
-remove ended sessions. Every command but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies
-no file and launches no capsule.
+Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`,
+[attach](#mur-trace-attach) judgments to them, and remove ended sessions. Every command but
+[`mur trace rm`](#mur-trace-rm) and [`mur trace attach`](#mur-trace-attach) is read-only: it
+modifies no file and launches no capsule.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -4022,6 +4025,7 @@ status still follows it:
 | `public_key` | object | `path` (string or `null`) and `key_id` (string or `null`) of the key used; both `null` when no key was available |
 | `verdict` | string | The worst stream verdict: `verified`, `unverifiable`, `unsealed` or `changed`; `absent` when no stream exists |
 | `streams` | array | One object per stream, below |
+| `attachments` | array | One object per [attachment](#mur-trace-verify-attachments); `[]` when there are none |
 
 | Stream key | Type | Meaning |
 |---|---|---|
@@ -4038,6 +4042,49 @@ status still follows it:
 These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
 a consumer ignores keys it does not know.
 
+#### Attachments { #mur-trace-verify-attachments }
+
+After the record, `mur trace verify` lists every attachment [`mur trace attach`](#mur-trace-attach)
+wrote under the records directory's `attachments/`, oldest first, and says whether each points at
+the head that verified:
+
+| Status | When |
+|---|---|
+| `matches` | The record verified and the attachment names the head of `trace.jsonl.seal` |
+| `mismatch` | The record verified and the attachment names another head. When that head is an earlier line of this `trace.jsonl`, the detail names the line and the line count the trace now holds |
+| `unverified` | The record did not verify, so there is no head to compare with |
+| `unreadable` | The file is a link or not a regular file, is larger than 64 MiB, is not JSON, or is not in the `murmur.attachment/1` format. Unreadable entries are listed last |
+
+Only files named `*.json` are read; other entries of `attachments/` are skipped. An attachment is
+not signed: `matches` says only which record it points at, not that its value or evaluator is
+genuine.
+
+Without `--json`, the rows follow the `record:` line:
+
+```text
+record: verified, checked with key 1508dc0fd94150e8 (/home/me/.murmur/keys/record-seal.pub)
+attachments:
+  att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b  ci        matches   0.75                   points at the verified head, trace.jsonl line 14
+  att_019a3c5f02d47e8b9c1a3e5f7a9b1c3d  reviewer  mismatch  <212 bytes, see --json>  attached to head sha256:41d0…, which names line 9 of a trace that now holds 14 lines; the record verified at head sha256:9f2c…
+```
+
+A value is shown inline when it is one line of at most 120 characters with no control characters,
+and otherwise by its size. With no attachments the block is the single line `attachments: none`.
+
+| Attachment key | Type | Meaning |
+|---|---|---|
+| `file` | string | The file, relative to the records directory: `attachments/<name>.json` |
+| `attachment_id` | string or `null` | The attachment's `attachment_id` |
+| `evaluator` | string or `null` | Its `evaluator` |
+| `value` | string or `null` | Its `value`, exactly as stored |
+| `events` | array of strings or `null` | Its `events` |
+| `attached_at` | integer or `null` | Its `attached_at`, milliseconds since the epoch |
+| `record_head` | string or `null` | The head it names, its `record.head` |
+| `status` | string | `matches`, `mismatch`, `unverified` or `unreadable` |
+| `detail` | string | One sentence saying why; for `unreadable`, the file and the reason |
+
+Every key but `file`, `status` and `detail` is `null` for an `unreadable` entry.
+
 | Exit | When |
 |---|---|
 | `0` | Every stream that exists is `verified` |
@@ -4045,6 +4092,64 @@ a consumer ignores keys it does not know.
 | `1` | [`E-TRC-004`](diagnostics.md#e-trc-004): a stream is `unsealed`, and none is changed |
 | `1` | [`E-TRC-005`](diagnostics.md#e-trc-005): a stream is `unverifiable`, and none is changed or unsealed; also a `--public-key` file that cannot be read |
 | `1` | `E-TRC-001`: the directory holds no `trace.jsonl`; `E-TRC-002`: the address names no session |
+
+The exit status follows the record alone: no attachment status changes it.
+
+### `mur trace attach` { #mur-trace-attach }
+
+Attach an outside party's judgment — a reviewer's, a CI job's, a second model's — to a session's
+sealed record. The judgment is written to a new file beside the record; nothing in the record or
+its seals changes.
+
+```bash
+mur trace attach <session> --evaluator <name> (--value <value> | --value-file <file>)
+                 [--event <event-id>]... [--workdir <dir>] [--public-key <file>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | required | A [session address](#session-addresses), a records directory, or a `trace.jsonl` path |
+| `--evaluator` | required | Who or what judged the record. Not empty, no control characters |
+| `--value` | — | The judgment: a number, a label, JSON, any UTF-8 text. Stored exactly as given and never parsed. Exactly one of `--value` and `--value-file` |
+| `--value-file` | — | Read the judgment from a file, or from standard input when the file is `-`. The bytes are stored exactly as read, trailing newline included, and must be UTF-8 |
+| `--event` | none | An `event_id` of the session's `trace.jsonl` the judgment points at. Repeat for more |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read, as under [`mur trace show`](#mur-trace-show) |
+| `--public-key` | `~/.murmur/keys/record-seal.pub` | The key the record is verified with, as under [`mur trace verify`](#mur-trace-verify) |
+| `--json` | off | Print one JSON object, the stable interface below |
+
+Before writing, it checks, in order:
+
+| Check | Refused with |
+|---|---|
+| The address names a session | `E-TRC-002` |
+| The evaluator and the value are acceptable: not empty, the value UTF-8 and at most 64 MiB | [`E-TRC-006`](diagnostics.md#e-trc-006) |
+| The record verifies exactly as under [`mur trace verify`](#mur-trace-verify) | The code `mur trace verify` exits with: `E-TRC-003`, `E-TRC-004`, `E-TRC-005` or `E-TRC-001` |
+| Every `--event` names a line of `trace.jsonl` | [`E-TRC-006`](diagnostics.md#e-trc-006) |
+
+It then writes one file, `attachments/<attachment_id>.json` in the session's
+[records directory](workdir.md#records-directory), in the
+[`murmur.attachment/1` format](observability-schemas.md#record-attachments). The file names the
+head, line count and key id of `trace.jsonl.seal`, the record that verified. The attachment is not
+signed. A refused command writes nothing.
+
+Without `--json` it prints the attachment and the file:
+
+```text
+attached att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b to session ses_019a3c… (trace.jsonl line 14, head sha256:9f2c…)
+/home/me/.murmur/records/home/me/project/workdir/ses_019a3c…/attachments/att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b.json
+```
+
+With `--json` it prints one pretty-printed JSON object: every key of the
+[attachment file](observability-schemas.md#record-attachments), then `path`, the file written.
+These keys are a stable interface, on the same terms as `mur trace verify --json`.
+
+| Exit | When |
+|---|---|
+| `0` | The attachment was written |
+| `1` | `E-TRC-001` to `E-TRC-005`: the session is not found or its record does not verify. The message starts `cannot attach to session <id>:` and gives the finding `mur trace verify` reports |
+| `1` | [`E-TRC-006`](diagnostics.md#e-trc-006): the evaluator, the value or an `--event` is refused |
+| `1` | [`E-TRC-007`](diagnostics.md#e-trc-007): the file cannot be written |
+| `2` | Neither or both of `--value` and `--value-file`, or no `--evaluator` |
 
 ---
 
@@ -4127,7 +4232,7 @@ overall                  fail           pass
 #### Comparing the arms of an eval run { #mur-eval-diff-run }
 
 ```bash
-mur eval diff --run [<run>] [--workdir <dir>] [--json]
+mur eval diff --run [<run>] [--workdir <dir>] [--json] [--require <REQ>]…
 ```
 
 With `--run`, `mur eval diff` reads one [eval-run record](observability-schemas.md#eval-run-record)
@@ -4140,6 +4245,7 @@ instead of two sessions and prints how the baseline and the variant of that
 | `<run>` | `@1`, the most recent run | `@N` counting back from the newest run, the full `evr_` id, its last 4 or more characters (any case), or a path to the record file: anything containing `/` or ending `.json` |
 | `--workdir` | `./workdir` | The baseline's workdir root, `<baseline capsule dir>/workdir`, whose records group holds the run's record |
 | `--json` | off | Print the comparison as one JSON object |
+| `--require` | none | A threshold the run must meet, in the [requirement grammar](#mur-eval-diff-require). Repeatable, and one value may hold several separated by commas. Only with `--run` |
 
 `--run` and the two session arguments cannot be given together. A run that names nothing, an
 ordinal out of range and a group with no run are refused with [`E-EVAL-002`](diagnostics.md).
@@ -4158,6 +4264,8 @@ The output has a header, one block per case and a total block:
 ── case: fix_parser ────────────────────────
                        baseline                 variant                  delta (variant − baseline)
   check                1/3 pass                 3/3 pass                 +2
+  spend per pass       105462                   27043.3                  -78418.7
+  spend                35210 (31250–39002)      27120 (25480–28530)      -8090
   turns                4 (3–6)                  3 (3–4)                  -1
   input tokens         21840 (18210–30117)      15022 (14873–16540)      -6818
   cached tokens        9120 (0–11002)           8890 (7310–9020)         -230
@@ -4170,15 +4278,23 @@ The output has a header, one block per case and a total block:
 | Row | Each column | Delta |
 |---|---|---|
 | `check` | `k/n pass` over the arm's runs, plus `(j not run)` when a run never reached its check; `—` for a case with no check | Variant passes minus baseline passes |
-| `turns`, `input tokens`, `cached tokens`, `cache write tokens`, `output tokens`, `time` | The median with the min–max spread when the arm has more than one run, the value itself for one, `—` when no run reported it | Variant median minus baseline median |
+| `spend per pass` | The arm's spend over its runs of the case divided by its strict passes on the case, as an integer or with one decimal. `no pass` when the arm has no strict pass; `—` for a case with no check, or when a launched run recorded no spend | Variant number minus baseline number, `—` unless both are numbers |
+| `spend`, `turns`, `input tokens`, `cached tokens`, `cache write tokens`, `output tokens`, `time` | The median with the min–max spread when the arm has more than one run, the value itself for one, `—` when no run reported it | Variant median minus baseline median |
 | `scorers` | `k/n pass` of the runs' `murmur/hook-eval` overall; printed only when some run has one | Variant passes minus baseline passes |
+
+A *strict pass* is a run whose check result is `pass`. `spend` is the tokens the session's spend
+meter was charged, the number [`inference.max_session_tokens`](manifest.md#field-inference)
+counts, as the run's [`spend_tokens`](observability-schemas.md#eval-run-record) records it. It is
+tokens, never money: convert it with your own price. In `spend per pass`, a run that staging
+refused or whose start did not match was never launched and adds 0 tokens.
 
 `time` is the agent's own time, the sum of the session's `task_end.duration_ms`. Tokens are the
 provider's counts as the trace records them; `cached tokens` and `cache write tokens` are counted
 beside `input tokens`, never inside them. Each repeat ends with the `mur trace diff` line pairing
 its two sessions. The total block sums every run of each arm, and its delta is the difference of
-the sums. A run with no variant prints one column and no delta; an interrupted run's header reads
-`incomplete: k of m runs recorded`.
+the sums. Its `spend per pass` is the arm's spend over every run of a case that has a check,
+divided by the arm's strict passes over every case. A run with no variant prints one column and
+no delta; an interrupted run's header reads `incomplete: k of m runs recorded`.
 
 With `--json`:
 
@@ -4195,6 +4311,8 @@ With `--json`:
     "arms": {
       "baseline": {
         "runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0,
+        "spend_tokens": {"median": 35210.0, "min": 31250, "max": 39002},
+        "spend_per_pass": 105462,
         "turns": {"median": 4.0, "min": 3, "max": 6},
         "input_tokens": {…}, "cached_tokens": {…}, "cache_write_tokens": {…},
         "output_tokens": {…}, "agent_ms": {…},
@@ -4204,7 +4322,7 @@ With `--json`:
     },
     "trace_diffs": [["<baseline trace.jsonl>", "<variant trace.jsonl>"], …]
   }],
-  "total": {"baseline": {"runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0, "turns": 13, …}, "variant": {…}}
+  "total": {"baseline": {"runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0, "spend_tokens": 105462, "spend_per_pass": 105462, "turns": 13, …}, "variant": {…}}
 }
 ```
 
@@ -4212,11 +4330,64 @@ With `--json`:
 |---|---|
 | `cases[].arms.<arm>.<measure>` | `{median, min, max}` over the runs that reported the measure, or `null` when none did. `median` is a number that may be fractional: the mean of the middle two for an even count |
 | `cases[].arms.<arm>.check_pass`, `check_runs`, `check_not_run` | The `check` row's counts. `check_runs` is 0 for a case with no check |
+| `cases[].arms.<arm>.spend_per_pass` | The `spend per pass` row's number, or `null` for a case with no check, an arm with no strict pass, or a launched run that recorded no spend |
 | `cases[].arms.<arm>.scores_pass` | Runs whose hook-eval overall is `pass`, or `null` when no run has one |
-| `total.<arm>` | The same counts, and each measure summed over every run of the arm, `null` when no run reported it |
+| `total.<arm>` | The same counts, each measure summed over every run of the arm (`null` when no run reported it), and the total block's `spend_per_pass` |
+| `requirements` | With `--require` only: one object per requirement, keys below |
+| `requirements_met` | With `--require` only: `true` when every requirement is met and the record is complete |
+
+| `requirements[]` key | Value |
+|---|---|
+| `requirement` | The requirement with its arm named, for example `variant.spend-per-pass<=400000` |
+| `arm` | `baseline`, `variant`, or `null` for `pass-lead` |
+| `measure` | `passes`, `spend-per-pass` or `pass-lead` |
+| `op` | `>=`, `<=`, `>` or `<` |
+| `threshold` | The number given |
+| `actual` | The run's number, or `null` when there is none to compare |
+| `met` | Whether `actual op threshold` holds; `false` when `actual` is `null` |
+| `reason` | `no strict pass` or `spend not recorded` when `actual` is `null`, otherwise `null` |
 
 An outer capsule that edits a harness reads `cases[].arms.variant.check_pass` against
 `check_runs` to decide whether the change helped, and the measures to weigh what it cost.
+
+##### Requirements { #mur-eval-diff-require }
+
+`--require` states a threshold the run must meet. Murmur ships no threshold: without `--require`,
+`mur eval diff --run` exits `0` whatever the checks say. A requirement is
+`[baseline.|variant.]<measure><op><number>`, written without spaces:
+
+| Measure | The number it compares | Threshold |
+|---|---|---|
+| `passes` | The arm's strict passes over every case | A whole number, 0 or more |
+| `spend-per-pass` | The arm's total `spend per pass` | A number of tokens, 0 or more, with an optional decimal fraction |
+| `pass-lead` | The variant's strict passes minus the baseline's | A whole number, which may be negative. Takes no arm prefix |
+
+The operator is `>=`, `<=`, `>` or `<`; quote the requirement so the shell does not read it as a
+redirection: `--require 'variant.passes>=3'`. A `passes` or `spend-per-pass` requirement without a
+prefix applies to the variant when the run has one, otherwise to the baseline. A
+`spend-per-pass` requirement on an arm with no strict pass, or with a launched run that recorded
+no spend, is not met.
+
+The comparison prints as without `--require`, then the requirements block:
+
+```text
+── requirements ────────────────────────
+  met      pass-lead>=4                 pass lead 6
+  not met  variant.spend-per-pass<=999  spend per pass 1000
+  not met  run is incomplete: 4 of 6 runs recorded
+```
+
+Each line states the requirement with its arm named and the run's number, or why there is none.
+The number is the one compared, unrounded: a `spend per pass` of `1000/3` reads `333.3` in the
+row and `333.3333333333333` here, and does not meet `spend-per-pass<=333.3`. The last line
+appears only for an incomplete record.
+
+| Outcome | Exit | Code |
+|---|---|---|
+| Every requirement met and the record complete | `0` | — |
+| A requirement not met, or the record incomplete. The comparison, human or `--json`, is printed first | `1` | [`E-EVAL-005`](diagnostics.md) |
+| `pass-lead` or a `variant.` requirement on a run with no variant. Nothing is printed | `1` | [`E-EVAL-006`](diagnostics.md) |
+| A requirement that does not parse | `2` | usage error, `invalid value '<REQ>' for '--require <REQ>'` |
 
 ### `mur eval run`
 
@@ -4273,7 +4444,7 @@ variant, repeat 2 the variant then the baseline, and so on alternately.
 3. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 4. Launches the session.
 5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
-6. Reads the session's trace for its turns, tokens, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
+6. Reads the session's trace for its turns, tokens, spend, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
 7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, and `check: <result>` for a case with a check. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
 8. Rewrites the [eval-run record](observability-schemas.md#eval-run-record).
 

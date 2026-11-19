@@ -254,6 +254,7 @@ session ends:
     └── <session-id>/                             0700, created at staging, kept after the session
         ├── trace.jsonl
         ├── trace.jsonl.seal
+        ├── attachments/<attachment_id>.json      written by mur trace attach, never by the runtime
         ├── blobs/<sha256>
         ├── logs/bootstrap.log | otel.log | hook-<hook-name>.log
         ├── logs/shell-<timestamp>.log | <work-id>.log | check.log
@@ -282,6 +283,7 @@ stays under the old path.
 |---|---|---|
 | `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md#session-trace-tracejsonl) | The runtime |
 | `trace.jsonl.seal`, `hooks/eval.jsonl.seal`, `completion.json.seal` | The [seal](observability-schemas.md#sealed-records) of each stream beside it: its chain head signed with the host's record-seal key, written when the session ends, at teardown, and after every write of `completion.json` | The runtime |
+| `attachments/<attachment_id>.json` | One outside party's judgment of the sealed record, naming the head it judges. See [Attachments](observability-schemas.md#record-attachments). Created only by an attach; removed with the records directory by [`mur trace rm`](cli.md#mur-trace-rm) and [`trace.retain`](manifest.md#trace-retain) | [`mur trace attach`](cli.md#mur-trace-attach), never the runtime |
 | `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Trace blobs](observability-schemas.md#trace-blobs) | The runtime |
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) | The runtime |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics | The runtime |

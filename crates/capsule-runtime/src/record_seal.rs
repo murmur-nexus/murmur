@@ -27,6 +27,9 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use murmur_artifact::TraceSync;
 
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -612,6 +615,34 @@ struct ChainState {
     /// Set once a `flock` wait ran out: something else holds the lock, so later appends try it
     /// once and never wait again.
     lock_contended: bool,
+    /// When written lines are synced to disk; `None` makes no sync call.
+    sync: Option<TraceSync>,
+    /// A line written since the last successful sync is not yet known to be on disk.
+    unsynced: bool,
+    /// When the last successful sync returned.
+    last_sync: Option<Instant>,
+    /// The file's directory and that directory's parent have been synced once, so the file's
+    /// directory entry is on disk as well as its data.
+    dirs_synced: bool,
+    /// The interval thread for this chain has been started.
+    interval_thread: bool,
+}
+
+impl ChainState {
+    fn new() -> Self {
+        Self {
+            head: GENESIS.to_string(),
+            lines: 0,
+            len: None,
+            torn: None,
+            lock_contended: false,
+            sync: None,
+            unsynced: false,
+            last_sync: None,
+            dirs_synced: false,
+            interval_thread: false,
+        }
+    }
 }
 
 /// One `trace.jsonl`'s chain, shared by every appender holding the same file.
@@ -620,6 +651,9 @@ struct ChainState {
 /// file's length is not what this state last wrote (another process appended, or this is the
 /// first write), terminates a torn last line, and writes its line with `"prev_hash"` in one
 /// `write_all`.
+///
+/// With a [`TraceSync`] policy set through [`InlineChain::set_sync`], every line any of those
+/// appenders writes is synced on that policy's terms; without one no sync call is made.
 pub struct InlineChain {
     file: std::fs::File,
     /// The directory and name the file was opened by, for reading it back.
@@ -661,13 +695,7 @@ impl InlineChain {
             file,
             root: root.clone(),
             rel: rel.to_string(),
-            state: Mutex::new(ChainState {
-                head: GENESIS.to_string(),
-                lines: 0,
-                len: None,
-                torn: None,
-                lock_contended: false,
-            }),
+            state: Mutex::new(ChainState::new()),
         });
         chains.insert(identity, Arc::downgrade(&chain));
         Ok(chain)
@@ -685,13 +713,7 @@ impl InlineChain {
             file,
             root: root.clone(),
             rel: rel.to_string(),
-            state: Mutex::new(ChainState {
-                head: GENESIS.to_string(),
-                lines: 0,
-                len: None,
-                torn: None,
-                lock_contended: false,
-            }),
+            state: Mutex::new(ChainState::new()),
         })
     }
 
@@ -708,7 +730,7 @@ impl InlineChain {
             return Err(std::io::Error::other("a trace line must be a JSON object"));
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let _lock = FileLock::take(&self.file, &mut state.lock_contended);
+        let lock = FileLock::take(&self.file, &mut state.lock_contended);
         self.sync(&mut state)?;
         let mut line = Vec::with_capacity(body.len() + 90);
         let mut lines = state.lines;
@@ -737,7 +759,114 @@ impl InlineChain {
         state.head = hash;
         state.lines = lines + 1;
         state.len = state.len.map(|len| len + line.len() as u64);
+        // Syncing needs no `flock`: another process's appends need not wait on this disk write.
+        drop(lock);
+        match state.sync {
+            None => Ok(()),
+            Some(TraceSync::Line) => self.sync_data_now(&mut state),
+            Some(TraceSync::Interval { secs }) => {
+                let due = state
+                    .last_sync
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(secs));
+                if due {
+                    self.sync_data_now(&mut state)
+                } else {
+                    state.unsynced = true;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Sets when this chain's lines reach the disk, for every appender sharing it.
+    ///
+    /// [`TraceSync::Line`] syncs each line before its append returns. [`TraceSync::Interval`]
+    /// syncs an append once the interval has passed since the last sync, and a `mur-trace-sync`
+    /// thread syncs any line still pending every interval, so no line waits longer than that; the
+    /// thread holds the chain weakly and ends once the chain is gone. A later call replaces the
+    /// policy and reuses the thread.
+    pub fn set_sync(self: &Arc<Self>, policy: TraceSync) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.sync = Some(policy);
+        if !matches!(policy, TraceSync::Interval { .. }) || state.interval_thread {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("mur-trace-sync".into())
+            .spawn(move || loop {
+                let Some(secs) = weak.upgrade().and_then(|chain| chain.interval_or_retire()) else {
+                    return;
+                };
+                std::thread::sleep(Duration::from_secs(secs));
+                let Some(chain) = weak.upgrade() else {
+                    return;
+                };
+                let _ = chain.sync_now();
+            });
+        // Without the thread a pending line is still synced by the next due append, by
+        // `sync_now` and when the chain is dropped.
+        state.interval_thread = spawned.is_ok();
+    }
+
+    /// The interval of an interval policy. Under any other the interval thread is ending, and
+    /// is recorded as gone so a later interval policy starts another.
+    fn interval_or_retire(&self) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match state.sync {
+            Some(TraceSync::Interval { secs }) => Some(secs),
+            _ => {
+                state.interval_thread = false;
+                None
+            }
+        }
+    }
+
+    /// Syncs every line written so far to disk when a policy is set and a line is pending;
+    /// otherwise makes no sync call.
+    pub fn sync_now(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sync.is_some() && state.unsynced {
+            self.sync_data_now(&mut state)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `fdatasync`s the file and, after the first success, makes its directory entry durable
+    /// too. A failure leaves the lines pending; the lines themselves were written.
+    fn sync_data_now(&self, state: &mut ChainState) -> std::io::Result<()> {
+        if let Err(error) = self.file.sync_data() {
+            state.unsynced = true;
+            return Err(error);
+        }
+        state.unsynced = false;
+        state.last_sync = Some(Instant::now());
+        if !state.dirs_synced {
+            state.dirs_synced = true;
+            self.sync_dirs();
+        }
         Ok(())
+    }
+
+    /// Best-effort `fsync` of the file's directory and its parent: a new file's entry and a new
+    /// session directory's entry are only on disk once the directories holding them are.
+    fn sync_dirs(&self) {
+        let Ok(dir) = self.root.dir_fd() else {
+            return;
+        };
+        let _ = rustix::fs::fsync(&dir);
+        let parent = rustix::fs::openat(
+            &dir,
+            "..",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        if let Ok(parent) = parent {
+            let _ = rustix::fs::fsync(&parent);
+        }
     }
 
     /// The head and line count as the file holds them now.
@@ -763,6 +892,16 @@ impl InlineChain {
         state.torn = recovered.torn;
         state.len = Some(len);
         Ok(())
+    }
+}
+
+impl Drop for InlineChain {
+    /// A line still pending under a policy gets one last best-effort sync.
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        if state.sync.is_some() && state.unsynced {
+            let _ = self.file.sync_data();
+        }
     }
 }
 

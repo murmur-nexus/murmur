@@ -100,7 +100,7 @@ pub use program_needs::{
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
     LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
-    RESERVED_VERSIONS,
+    Sha256Hasher, RESERVED_VERSIONS,
 };
 pub use registry_warnings::{
     registry_warning_link, W_REG_002, W_REG_003, W_REG_004, W_REG_005, W_REG_006,
@@ -129,7 +129,7 @@ pub use runtime_manifest::{
     PeerTasksExport, PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits,
     RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities,
     StagedRuntimeGrant, StateCapabilities, TaskAcceptance, TaskIoCapabilities, ToolRefresh,
-    TraceConfig, TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES,
+    TraceConfig, TraceRetainConfig, TraceSync, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES,
     DEFAULT_IMAGES_KEEP, DEFAULT_IMAGES_MAX_BYTES, DEFAULT_IMAGES_MAX_PER_TURN,
     DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET,
     DEFAULT_SEED_OVERFLOW_MARGIN, DOOR_SCOPES, DURATION_ACCEPTED_FORM, OPERATOR_CREDENTIAL,
