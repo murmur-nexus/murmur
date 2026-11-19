@@ -1231,7 +1231,7 @@ fn checked_record(run_id: &str, paired: bool, complete: bool, runs: Vec<Value>) 
     })
 }
 
-/// The S2 record: baseline pass/fail/fail for 1000/1200/800 tokens, variant pass/pass/pass for
+/// A two-arm record: baseline pass/fail/fail for 1000/1200/800 tokens, variant pass/pass/pass for
 /// 900/1100/1000.
 fn gate_record(run_id: &str) -> Value {
     checked_record(
@@ -1288,7 +1288,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
     let world = World::new();
     let gate = gate_record("evr_0192aaaa000070008000000000003333");
 
-    // S2: the rows, and no threshold applies without --require.
+    // The rows, and no threshold applies without --require.
     let plain = diff_record(&world, &gate, &[]);
     assert_eq!(plain.code, Some(0), "{}", plain.stderr);
     assert_eq!(
@@ -1363,7 +1363,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
     );
     assert_eq!(below.code, Some(0), "{}", below.stdout);
 
-    // S3: a requirement that does not parse is a usage error, and nothing reaches stdout.
+    // A requirement that does not parse is a usage error, and nothing reaches stdout.
     for malformed in [
         "cost<=5",
         "passes=~3",
@@ -1391,7 +1391,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
     assert_eq!(without_run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&without_run.stderr).contains("--run"));
 
-    // S4: a one-arm record cannot answer pass-lead or variant., and the bare measure is the
+    // A one-arm record cannot answer pass-lead or variant., and the bare measure is the
     // baseline's.
     let single = checked_record(
         "evr_0192aaaa000070008000000000004444",
@@ -1431,7 +1431,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
     );
     assert!(requirement_line(&baseline.stdout, "baseline.passes>=1").ends_with("passes 2"));
 
-    // S5: no pass, no recorded spend, and a run never launched.
+    // No pass, no recorded spend, and a run never launched.
     let no_pass = checked_record(
         "evr_0192aaaa000070008000000000005555",
         true,
@@ -1511,7 +1511,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
         ["700", "300", "-400"]
     );
 
-    // S6: an incomplete record never meets its requirements.
+    // An incomplete record never meets its requirements.
     let mut partial = gate_record("evr_0192aaaa000070008000000000008888");
     partial["complete"] = json!(false);
     partial["cases"][0]["runs"]
@@ -1533,7 +1533,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
         .stderr
         .contains("run evr_0192aaaa000070008000000000008888 is incomplete: 4 of 6 runs recorded"));
 
-    // S7: the JSON gains the spend keys always and the requirements only with --require.
+    // The JSON gains the spend keys always and the requirements only with --require.
     let json_plain = diff_record(&world, &gate, &["--json"]);
     assert_eq!(json_plain.code, Some(0));
     let comparison: Value = serde_json::from_str(&json_plain.stdout).unwrap();
@@ -1587,7 +1587,7 @@ fn spend_per_pass_and_requirements_read_from_the_record() {
     assert_eq!(comparison["requirements_met"], true);
     assert_eq!(comparison["requirements"][0]["arm"], Value::Null);
 
-    // S8: a variant that fails every check and spends more still exits 0 without --require.
+    // A variant that fails every check and spends more still exits 0 without --require.
     let worse = checked_record(
         "evr_0192aaaa000070008000000000009999",
         true,

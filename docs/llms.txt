@@ -65,6 +65,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Work with capsule trace spans in Grafana](/how-to/grafana-tempo-spans.md): The OpenTelemetry span tree a session emits when `observability.otel_endpoint` is set, and how to read it in Tempo.
 - [Visualise capsule sessions with mur topology](/how-to/topology-view.md): Reconstructing which capsule called which from Grafana Tempo spans, rendered as an interactive graph.
 - [Score your agent's behavior with eval](/how-to/agent-eval-score.md): Running a capsule against a dataset of test cases and scoring each session automatically.
+- [Gate a runtime change on eval results](/how-to/gate-a-runtime-change.md): Comparing a changed capsule with the current one over three seeds per case, reading spend per strict pass, and failing a script or CI job with `mur eval diff --run --require` thresholds you choose.
 
 ### Packaging & Deployment
 

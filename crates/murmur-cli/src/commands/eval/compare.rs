@@ -3,8 +3,8 @@
 //! Everything printed is read from the record alone, so a session `trace.retain` has pruned since
 //! changes nothing.
 //!
-//! The exit status is the comparison's own business only when the operator declares thresholds
-//! with `--require`: without one, how the checks went never moves it.
+//! The exit status depends on the comparison only when `--require` declares thresholds; without
+//! one, check results never change it.
 
 use std::{
     fs,
@@ -370,12 +370,11 @@ fn verdicts(record: &EvalRunRecord, requirements: &[Requirement]) -> Vec<Verdict
 }
 
 impl Verdict {
-    /// The actual number as the requirements block states it.
+    /// The actual number as the requirements block states it: the number compared, never rounded
+    /// as the `spend per pass` row rounds it, so a line cannot read as meeting a threshold it
+    /// failed.
     fn actual_text(&self) -> Option<String> {
-        self.actual.map(|actual| match self.requirement.measure {
-            RequirementMeasure::SpendPerPass => Measure::Spend.value(actual),
-            _ => format!("{actual}"),
-        })
+        self.actual.map(|actual| format!("{actual}"))
     }
 
     fn json(&self) -> Value {
@@ -589,7 +588,7 @@ impl ArmSummary {
     }
 }
 
-/// Each arm's runs of every case, in `names` order.
+/// Each arm's runs of every case, in `names` order: the total block, and what `--require` measures.
 fn arm_totals(record: &EvalRunRecord, names: &[&str]) -> Vec<ArmSummary> {
     names
         .iter()
@@ -812,18 +811,11 @@ pub(super) fn print_human(record: &EvalRunRecord) {
     capsule_runtime::report_println!("  model:    {model}");
 
     let header_cells: Vec<String> = names.iter().map(|name| name.to_string()).collect();
-    let mut totals: Vec<ArmSummary> = names.iter().map(|_| ArmSummary::default()).collect();
-
     for case in &record.cases {
         let summaries: Vec<ArmSummary> = names
             .iter()
             .map(|name| ArmSummary::of(case.runs.iter().filter(|run| run.arm == *name)))
             .collect();
-        for (total, name) in totals.iter_mut().zip(&names) {
-            for run in case.runs.iter().filter(|run| run.arm == *name) {
-                total.add(run);
-            }
-        }
 
         capsule_runtime::report_println!();
         capsule_runtime::report_println!("── case: {} {}", case.case_id, "─".repeat(24));
@@ -841,7 +833,13 @@ pub(super) fn print_human(record: &EvalRunRecord) {
 
     capsule_runtime::report_println!();
     capsule_runtime::report_println!("── total {}", "─".repeat(24));
-    print_block(&header_cells, &totals, paired, Measure::total, Measure::sum);
+    print_block(
+        &header_cells,
+        &arm_totals(record, &names),
+        paired,
+        Measure::total,
+        Measure::sum,
+    );
 }
 
 fn print_block(
@@ -1001,17 +999,13 @@ fn spend_per_pass_json(summary: &ArmSummary) -> Value {
 /// The comparison `record` holds, for an outer capsule: what [`print_human`] prints, as data.
 pub(super) fn comparison_json(record: &EvalRunRecord) -> Value {
     let names = arm_names(record);
-    let mut totals: Vec<ArmSummary> = names.iter().map(|_| ArmSummary::default()).collect();
     let cases: Vec<Value> = record
         .cases
         .iter()
         .map(|case| {
             let mut arms = serde_json::Map::new();
-            for (name, total) in names.iter().zip(totals.iter_mut()) {
+            for name in &names {
                 let runs = case.runs.iter().filter(|run| run.arm == *name);
-                for run in runs.clone() {
-                    total.add(run);
-                }
                 arms.insert(name.to_string(), arm_json(&ArmSummary::of(runs)));
             }
             json!({
@@ -1025,7 +1019,7 @@ pub(super) fn comparison_json(record: &EvalRunRecord) -> Value {
         })
         .collect();
     let mut total = serde_json::Map::new();
-    for (name, summary) in names.iter().zip(&totals) {
+    for (name, summary) in names.iter().zip(&arm_totals(record, &names)) {
         total.insert(name.to_string(), total_json(summary));
     }
     json!({
@@ -1283,6 +1277,30 @@ mod tests {
         assert_eq!(total.spend_per_pass(), SpendPerPass::Tokens(500.5));
         assert_eq!(total.spend_per_pass().cell(), "500.5");
         assert_eq!(Measure::Spend.total(total), "1001");
+    }
+
+    /// The requirements block states the number it compared, so a line never reads as meeting a
+    /// threshold it failed.
+    #[test]
+    fn a_requirement_states_the_number_it_compared_unrounded() {
+        let record = record(
+            false,
+            true,
+            vec![
+                run(BASELINE, "completed", Some("pass"), Some(300)),
+                run(BASELINE, "completed", Some("pass"), Some(300)),
+                run(BASELINE, "completed", Some("pass"), Some(400)),
+            ],
+        );
+        let total = &arm_totals(&record, &[BASELINE])[0];
+        assert_eq!(total.spend_per_pass().cell(), "333.3");
+        let failed = verdict(&record, "spend-per-pass<=333.3");
+        assert!(!failed.met);
+        assert_eq!(failed.actual_text().as_deref(), Some("333.3333333333333"));
+        assert_eq!(
+            verdict(&record, "passes>=3").actual_text().as_deref(),
+            Some("3")
+        );
     }
 
     #[test]

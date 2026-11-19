@@ -450,10 +450,10 @@ mur eval diff --run
 
 The `check` row says which manifest's work passes: here the variant fixed the parser in all three
 runs and the baseline in one. `spend per pass` divides the tokens each arm spent on the case by
-its passing runs, so a cheaper harness that passes less often does not read as cheaper. Each measure is the median over the repeats with the min–max
-spread, and the delta is the variant's median minus the baseline's. Run the printed
-`mur trace diff` line to see where a pair of sessions diverged. A total block after the cases sums
-every run.
+its passing runs, so a cheaper harness that passes less often does not read as cheaper. Each
+measure is the median over the repeats with the min–max spread, and the delta is the variant's
+median minus the baseline's. Run the printed `mur trace diff` line to see where a pair of sessions
+diverged. A total block after the cases sums every run.
 
 The comparison is kept as a `0600` record beside the session directories:
 

@@ -4293,8 +4293,8 @@ provider's counts as the trace records them; `cached tokens` and `cache write to
 beside `input tokens`, never inside them. Each repeat ends with the `mur trace diff` line pairing
 its two sessions. The total block sums every run of each arm, and its delta is the difference of
 the sums. Its `spend per pass` is the arm's spend over every run of a case that has a check,
-divided by the arm's strict passes over every case. A run with no variant prints one column and no delta; an interrupted run's header reads
-`incomplete: k of m runs recorded`.
+divided by the arm's strict passes over every case. A run with no variant prints one column and
+no delta; an interrupted run's header reads `incomplete: k of m runs recorded`.
 
 With `--json`:
 
@@ -4378,7 +4378,9 @@ The comparison prints as without `--require`, then the requirements block:
 ```
 
 Each line states the requirement with its arm named and the run's number, or why there is none.
-The last line appears only for an incomplete record.
+The number is the one compared, unrounded: a `spend per pass` of `1000/3` reads `333.3` in the
+row and `333.3333333333333` here, and does not meet `spend-per-pass<=333.3`. The last line
+appears only for an incomplete record.
 
 | Outcome | Exit | Code |
 |---|---|---|
@@ -4442,7 +4444,7 @@ variant, repeat 2 the variant then the baseline, and so on alternately.
 3. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 4. Launches the session.
 5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
-6. Reads the session's trace for its turns, tokens, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
+6. Reads the session's trace for its turns, tokens, spend, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
 7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, and `check: <result>` for a case with a check. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
 8. Rewrites the [eval-run record](observability-schemas.md#eval-run-record).
 
