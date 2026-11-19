@@ -29,6 +29,7 @@ use murmur_artifact::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::commands::trace_attach;
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::stores::FallbackRegistry;
 
@@ -270,6 +271,13 @@ pub(super) struct RunRecord {
     /// `None` when the case has no check.
     pub(super) check_result: Option<RunCheckResult>,
     pub(super) check: Option<CheckOutcome>,
+    /// The attachment holding this run's check result. `None` when the check did not run, when
+    /// none could be written, and in a record without the key.
+    #[serde(default)]
+    pub(super) attachment_id: Option<String>,
+    /// `<code>: <message>`: why no attachment was written for a check that ran. `None` otherwise.
+    #[serde(default)]
+    pub(super) attachment_error: Option<String>,
     pub(super) turns: Option<u32>,
     pub(super) input_tokens: Option<u64>,
     pub(super) output_tokens: Option<u64>,
@@ -297,6 +305,8 @@ impl RunRecord {
             exit_status: None,
             check_result: None,
             check: None,
+            attachment_id: None,
+            attachment_error: None,
             turns: None,
             input_tokens: None,
             output_tokens: None,
@@ -1085,10 +1095,22 @@ fn run_one(
 
     // After the launch has returned, whatever it returned: every process the session started is
     // dead by then.
-    if let Some((check, _)) = &case.check {
+    if let Some((check, spec)) = &case.check {
         let outcome = check_runner.run(check);
-        run.check_result = Some(outcome.result.into());
+        let result = outcome.result;
+        run.check_result = Some(result.into());
         run.check = Some(outcome);
+        match attach_check_result(&records_dir, &spec.command, result) {
+            Ok(id) => run.attachment_id = Some(id),
+            Err(error) => {
+                capsule_runtime::report_eprintln!(
+                    "    warning: check result not attached: error[{}]: {}",
+                    error.code,
+                    error.message
+                );
+                run.attachment_error = Some(format!("{}: {}", error.code, error.message));
+            }
+        }
     }
 
     match super::super::trace::eval_trace_summary(&records_dir.join("trace.jsonl")) {
@@ -1140,7 +1162,44 @@ fn run_one(
             RunCheckResult::from(check.result).as_str()
         );
     }
+    if let Some(id) = &run.attachment_id {
+        capsule_runtime::report_println!("    attached: {id}");
+    }
     (run, overall, case_workdir, run_record)
+}
+
+/// The evaluator a check result is attached under: `check: ` and the command, each control
+/// character written as its escape so the name is one printable line.
+fn check_evaluator(command: &str) -> String {
+    let mut evaluator = String::from("check: ");
+    for c in command.chars() {
+        if c.is_control() {
+            evaluator.extend(c.escape_debug());
+        } else {
+            evaluator.push(c);
+        }
+    }
+    evaluator
+}
+
+/// Attaches `result` to the sealed record in `records_dir`, as `mur trace attach` would, under
+/// [`check_evaluator`]'s name for `command`. Returns the attachment id.
+fn attach_check_result(
+    records_dir: &Path,
+    command: &str,
+    result: CheckResult,
+) -> Result<String, CliError> {
+    let evaluator = check_evaluator(command);
+    trace_attach::check_evaluator(&evaluator)?;
+    let value = RunCheckResult::from(result).as_str();
+    let (attachment, _) = trace_attach::attach_to_records(
+        records_dir,
+        evaluator,
+        value.to_string(),
+        Vec::new(),
+        None,
+    )?;
+    Ok(attachment.attachment_id)
 }
 
 #[cfg(test)]
@@ -1274,5 +1333,72 @@ mod tests {
         );
         fs::set_permissions(dir.path().join("src"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(target.path().join("src"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn check_evaluator_names_the_command() {
+        let evaluator = check_evaluator("grep -q fixed main.txt");
+        assert_eq!(evaluator, "check: grep -q fixed main.txt");
+        trace_attach::check_evaluator(&evaluator).unwrap();
+    }
+
+    #[test]
+    fn check_evaluator_escapes_control_characters() {
+        let evaluator = check_evaluator("a\nb\tc");
+        assert_eq!(evaluator, "check: a\\nb\\tc");
+        assert_eq!(evaluator.chars().filter(|c| *c == '\\').count(), 2);
+        trace_attach::check_evaluator(&evaluator).unwrap();
+        for command in ["\r\u{7}\u{1b}[31m", "\u{85}x\u{9b}", "plain ünïcode"] {
+            trace_attach::check_evaluator(&check_evaluator(command)).unwrap();
+        }
+    }
+
+    #[test]
+    fn attach_refuses_a_records_dir_without_a_trace() {
+        let records = tempfile::tempdir().unwrap();
+        let error = attach_check_result(records.path(), "true", CheckResult::Pass).unwrap_err();
+        assert_eq!(error.code, "E-TRC-001", "{}", error.message);
+        assert!(
+            error.message.starts_with("cannot attach to session "),
+            "{}",
+            error.message
+        );
+        assert!(!records.path().join(trace_attach::ATTACHMENTS_DIR).exists());
+    }
+
+    #[test]
+    fn attach_refuses_an_unsealed_trace() {
+        let records = tempfile::tempdir().unwrap();
+        // One chained line and no `trace.jsonl.seal`.
+        fs::write(
+            records.path().join("trace.jsonl"),
+            "{\"event_id\":\"evt_1\",\"type\":\"session_start\",\"prev_hash\":\"genesis\"}\n",
+        )
+        .unwrap();
+        let error = attach_check_result(records.path(), "true", CheckResult::Fail).unwrap_err();
+        assert_eq!(error.code, "E-TRC-004", "{}", error.message);
+        assert!(
+            error.message.starts_with("cannot attach to session "),
+            "{}",
+            error.message
+        );
+        assert!(!records.path().join(trace_attach::ATTACHMENTS_DIR).exists());
+    }
+
+    #[test]
+    fn attach_fields_default_to_none_in_an_older_record() {
+        let mut json = serde_json::to_value(RunRecord::not_launched(
+            "baseline",
+            0,
+            0,
+            RunOutcome::StageFailed,
+        ))
+        .unwrap();
+        let object = json.as_object_mut().unwrap();
+        assert!(object.remove("attachment_id").is_some());
+        assert!(object.remove("attachment_error").is_some());
+        let run: RunRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(run.attachment_id, None);
+        assert_eq!(run.attachment_error, None);
     }
 }
