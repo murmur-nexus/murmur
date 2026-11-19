@@ -35,6 +35,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace list` | List the sessions of one workdir root, newest first |
 | `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
 | `mur trace verify` | Check a session's sealed records with the host's public key alone, naming the first line that changed |
+| `mur trace attach` | Attach an outside party's judgment to a session's sealed record, as a separate file |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions, or with `--run` the arms of one `mur eval run` |
 | `mur eval run` | Drive a multi-case dataset against a capsule, and optionally a variant, and judge each run by the case's check |
@@ -99,6 +100,7 @@ loses its key.
 | `run --json` | 1 | [Readiness line](#mur-run-json) |
 | `run --roster --json` | 1 | [Launching a formation](#mur-run-roster) |
 | `token` | 1 | [`mur token`](#mur-token): standard output is the token |
+| `trace attach --json` | 1 | [`mur trace attach`](#mur-trace-attach) |
 | `trace list --json` | 1 | [`mur trace list`](#mur-trace-list) |
 | `trace rm --json` | 1 | [`mur trace rm`](#mur-trace-rm) |
 | `trace verify --json` | 1 | [`mur trace verify`](#mur-trace-verify) |
@@ -3117,9 +3119,10 @@ The second line is printed only when a blob was removed. A record already at or 
 
 ## `mur trace`
 
-Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`, and
-remove ended sessions. Every command but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies
-no file and launches no capsule.
+Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`,
+[attach](#mur-trace-attach) judgments to them, and remove ended sessions. Every command but
+[`mur trace rm`](#mur-trace-rm) and [`mur trace attach`](#mur-trace-attach) is read-only: it
+modifies no file and launches no capsule.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -4022,6 +4025,7 @@ status still follows it:
 | `public_key` | object | `path` (string or `null`) and `key_id` (string or `null`) of the key used; both `null` when no key was available |
 | `verdict` | string | The worst stream verdict: `verified`, `unverifiable`, `unsealed` or `changed`; `absent` when no stream exists |
 | `streams` | array | One object per stream, below |
+| `attachments` | array | One object per [attachment](#mur-trace-verify-attachments); `[]` when there are none |
 
 | Stream key | Type | Meaning |
 |---|---|---|
@@ -4038,6 +4042,49 @@ status still follows it:
 These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
 a consumer ignores keys it does not know.
 
+#### Attachments { #mur-trace-verify-attachments }
+
+After the record, `mur trace verify` lists every attachment [`mur trace attach`](#mur-trace-attach)
+wrote under the records directory's `attachments/`, oldest first, and says whether each points at
+the head that verified:
+
+| Status | When |
+|---|---|
+| `matches` | The record verified and the attachment names the head of `trace.jsonl.seal` |
+| `mismatch` | The record verified and the attachment names another head. When that head is an earlier line of this `trace.jsonl`, the detail names the line and the line count the trace now holds |
+| `unverified` | The record did not verify, so there is no head to compare with |
+| `unreadable` | The file is a link or not a regular file, is larger than 64 MiB, is not JSON, or is not in the `murmur.attachment/1` format. Unreadable entries are listed last |
+
+Only files named `*.json` are read; other entries of `attachments/` are skipped. An attachment is
+not signed: `matches` says only which record it points at, not that its value or evaluator is
+genuine.
+
+Without `--json`, the rows follow the `record:` line:
+
+```text
+record: verified, checked with key 1508dc0fd94150e8 (/home/me/.murmur/keys/record-seal.pub)
+attachments:
+  att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b  ci        matches   0.75                   points at the verified head, trace.jsonl line 14
+  att_019a3c5f02d47e8b9c1a3e5f7a9b1c3d  reviewer  mismatch  <212 bytes, see --json>  attached to head sha256:41d0…, which names line 9 of a trace that now holds 14 lines; the record verified at head sha256:9f2c…
+```
+
+A value is shown inline when it is one line of at most 120 characters with no control characters,
+and otherwise by its size. With no attachments the block is the single line `attachments: none`.
+
+| Attachment key | Type | Meaning |
+|---|---|---|
+| `file` | string | The file, relative to the records directory: `attachments/<name>.json` |
+| `attachment_id` | string or `null` | The attachment's `attachment_id` |
+| `evaluator` | string or `null` | Its `evaluator` |
+| `value` | string or `null` | Its `value`, exactly as stored |
+| `events` | array of strings or `null` | Its `events` |
+| `attached_at` | integer or `null` | Its `attached_at`, milliseconds since the epoch |
+| `record_head` | string or `null` | The head it names, its `record.head` |
+| `status` | string | `matches`, `mismatch`, `unverified` or `unreadable` |
+| `detail` | string | One sentence saying why; for `unreadable`, the file and the reason |
+
+Every key but `file`, `status` and `detail` is `null` for an `unreadable` entry.
+
 | Exit | When |
 |---|---|
 | `0` | Every stream that exists is `verified` |
@@ -4045,6 +4092,64 @@ a consumer ignores keys it does not know.
 | `1` | [`E-TRC-004`](diagnostics.md#e-trc-004): a stream is `unsealed`, and none is changed |
 | `1` | [`E-TRC-005`](diagnostics.md#e-trc-005): a stream is `unverifiable`, and none is changed or unsealed; also a `--public-key` file that cannot be read |
 | `1` | `E-TRC-001`: the directory holds no `trace.jsonl`; `E-TRC-002`: the address names no session |
+
+The exit status follows the record alone: no attachment status changes it.
+
+### `mur trace attach` { #mur-trace-attach }
+
+Attach an outside party's judgment — a reviewer's, a CI job's, a second model's — to a session's
+sealed record. The judgment is written to a new file beside the record; nothing in the record or
+its seals changes.
+
+```bash
+mur trace attach <session> --evaluator <name> (--value <value> | --value-file <file>)
+                 [--event <event-id>]... [--workdir <dir>] [--public-key <file>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | required | A [session address](#session-addresses), a records directory, or a `trace.jsonl` path |
+| `--evaluator` | required | Who or what judged the record. Not empty, no control characters |
+| `--value` | — | The judgment: a number, a label, JSON, any UTF-8 text. Stored exactly as given and never parsed. Exactly one of `--value` and `--value-file` |
+| `--value-file` | — | Read the judgment from a file, or from standard input when the file is `-`. The bytes are stored exactly as read, trailing newline included, and must be UTF-8 |
+| `--event` | none | An `event_id` of the session's `trace.jsonl` the judgment points at. Repeat for more |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read, as under [`mur trace show`](#mur-trace-show) |
+| `--public-key` | `~/.murmur/keys/record-seal.pub` | The key the record is verified with, as under [`mur trace verify`](#mur-trace-verify) |
+| `--json` | off | Print one JSON object, the stable interface below |
+
+Before writing, it checks, in order:
+
+| Check | Refused with |
+|---|---|
+| The address names a session | `E-TRC-002` |
+| The evaluator and the value are acceptable: not empty, the value UTF-8 and at most 64 MiB | [`E-TRC-006`](diagnostics.md#e-trc-006) |
+| The record verifies exactly as under [`mur trace verify`](#mur-trace-verify) | The code `mur trace verify` exits with: `E-TRC-003`, `E-TRC-004`, `E-TRC-005` or `E-TRC-001` |
+| Every `--event` names a line of `trace.jsonl` | [`E-TRC-006`](diagnostics.md#e-trc-006) |
+
+It then writes one file, `attachments/<attachment_id>.json` in the session's
+[records directory](workdir.md#records-directory), in the
+[`murmur.attachment/1` format](observability-schemas.md#record-attachments). The file names the
+head, line count and key id of `trace.jsonl.seal`, the record that verified. The attachment is not
+signed. A refused command writes nothing.
+
+Without `--json` it prints the attachment and the file:
+
+```text
+attached att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b to session ses_019a3c… (trace.jsonl line 14, head sha256:9f2c…)
+/home/me/.murmur/records/home/me/project/workdir/ses_019a3c…/attachments/att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b.json
+```
+
+With `--json` it prints one pretty-printed JSON object: every key of the
+[attachment file](observability-schemas.md#record-attachments), then `path`, the file written.
+These keys are a stable interface, on the same terms as `mur trace verify --json`.
+
+| Exit | When |
+|---|---|
+| `0` | The attachment was written |
+| `1` | `E-TRC-001` to `E-TRC-005`: the session is not found or its record does not verify. The message starts `cannot attach to session <id>:` and gives the finding `mur trace verify` reports |
+| `1` | [`E-TRC-006`](diagnostics.md#e-trc-006): the evaluator, the value or an `--event` is refused |
+| `1` | [`E-TRC-007`](diagnostics.md#e-trc-007): the file cannot be written |
+| `2` | Neither or both of `--value` and `--value-file`, or no `--evaluator` |
 
 ---
 

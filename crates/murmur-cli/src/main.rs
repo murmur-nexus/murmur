@@ -69,6 +69,7 @@ use commands::{
         run_trace_diff, run_trace_list, run_trace_report, run_trace_rm, run_trace_show,
         run_trace_steps, run_trace_verify, TraceCommand,
     },
+    trace_attach::{run_trace_attach, AttachRequest},
     version::run_version,
     watch::run_watch,
 };
@@ -937,6 +938,25 @@ fn main() {
                 public_key,
                 json,
             } => run_trace_verify(session, workdir, public_key, json),
+            TraceCommand::Attach {
+                session,
+                evaluator,
+                value,
+                value_file,
+                event,
+                workdir,
+                public_key,
+                json,
+            } => run_trace_attach(AttachRequest {
+                session,
+                evaluator,
+                value,
+                value_file,
+                events: event,
+                workdir,
+                public_key,
+                json,
+            }),
             TraceCommand::Rm {
                 session,
                 workdir,

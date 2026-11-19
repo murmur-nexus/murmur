@@ -1982,7 +1982,7 @@ a link, not a regular file, owned by another user, or readable by group or other
 verify it on another machine.
 
 **What is not covered.** The records directory's `home/`, `tmp/`, `logs/` and `out/` are not
-sealed streams, nor is `blobs/` (each blob is named by its own sha256, which the trace records).
+sealed streams, nor are [`attachments/`](#record-attachments) and `blobs/` (each blob is named by its own sha256, which the trace records).
 Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.seal`'s
 `conversation` pointer is not signed, so removing it drops the conversation record from the check.
 
@@ -1997,6 +1997,40 @@ Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.sea
 
 To keep a copy of each session's head that nothing on the host can rewrite, export spans to an
 OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-span-emission).
+
+### Attachments { #record-attachments }
+
+An attachment is an outside party's judgment of a sealed record — a reviewer's, a CI job's, a
+second model's — kept beside the record and never in it. [`mur trace attach`](cli.md#mur-trace-attach)
+writes one only after the record verifies, and [`mur trace verify`](cli.md#mur-trace-verify-attachments)
+lists each one with whether it points at the head that verified. The runtime never writes one.
+
+**File.** `attachments/<attachment_id>.json` in the session's
+[records directory](workdir.md#records-directory): one pretty-printed JSON object and a newline,
+written to a temporary name and renamed into place, at mode `0666` less the umask. The format is
+**stable**.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `format` | string | `"murmur.attachment/1"` |
+| `attachment_id` | string | `att_` and a UUID v7 as 32 lowercase hex characters; also the file's name |
+| `session_id` | string | The session whose record it judges |
+| `evaluator` | string | Who or what judged it, as given to `--evaluator` |
+| `value` | string | The judgment exactly as given: a number, a label, JSON or any UTF-8 text. `mur` never parses it |
+| `events` | array of strings | `event_id`s of `trace.jsonl` the judgment points at, each present when it was written; `[]` for none |
+| `attached_at` | integer | Milliseconds since the epoch, set by `mur` |
+| `record` | object | The record it judges, copied from `trace.jsonl.seal`: `stream` (`"trace.jsonl"`), `head`, `lines` and `key_id` |
+
+`record.head` is always a head that verified when the attachment was written. The same head is
+what the `capsule.session` span carries as [`murmur.record.head`](#otel-span-emission), so an
+attachment can be matched against a collector's copy.
+
+**Trust.** An attachment is neither signed nor sealed. Anyone who can write the records directory
+can add, edit or remove one, and nothing in Murmur vouches for its value or its evaluator.
+`mur trace verify` says only whether an attachment points at the head that verified; an
+attachment's status never changes the record's verdict or the command's exit status. A capsule's
+commands at `scoped` and `sealed` see the records directory read-only apart from `home/` and
+`tmp/`, so a contained capsule cannot write an attachment.
 
 ## Task stream `artifact` frame { #task-stream-artifact-frame }
 
