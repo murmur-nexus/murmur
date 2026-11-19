@@ -77,6 +77,10 @@ pub const COMPLETION_STREAM: &str = crate::delegation::COMPLETION_FILE;
 pub const CONVERSATION_STREAM_PREFIX: &str = "conversation:";
 /// `~/.murmur/conversations`, relative to the murmur home: where conversation records live.
 pub const CONVERSATIONS_DIR: &str = crate::conversation::CONVERSATION_ROOT_DIR;
+/// A records directory's, or a conversation context directory's, content-addressed blobs.
+pub const BLOBS_DIR: &str = crate::trace_blobs::BLOB_DIR_NAME;
+/// A conversation record's file name in its context directory.
+pub const CONVERSATION_RECORD_FILE: &str = crate::conversation::RECORD_FILE_NAME;
 /// The `session_id` a conversation seal carries when no session rewrote it: `mur conversation`
 /// truncating a record from the command line.
 pub const CLI_SEALER: &str = "mur conversation";
@@ -1638,7 +1642,9 @@ fn trace_session_id(bytes: &[u8]) -> Option<String> {
     value.get("session_id")?.as_str().map(str::to_string)
 }
 
-fn single_segment(name: &str) -> bool {
+/// Whether `name` can be one path segment of a conversation pointer: not empty, not `.` or `..`,
+/// and holding no `/` or NUL, so joining it cannot leave the conversations root.
+pub fn single_segment(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 

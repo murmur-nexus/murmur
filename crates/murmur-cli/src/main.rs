@@ -70,6 +70,7 @@ use commands::{
         run_trace_steps, run_trace_verify, TraceCommand,
     },
     trace_attach::{run_trace_attach, AttachRequest},
+    trace_export::run_trace_export,
     version::run_version,
     watch::run_watch,
 };
@@ -935,9 +936,16 @@ fn main() {
             TraceCommand::Verify {
                 session,
                 workdir,
+                bundle,
                 public_key,
                 json,
-            } => run_trace_verify(session, workdir, public_key, json),
+            } => run_trace_verify(session, workdir, bundle, public_key, json),
+            TraceCommand::Export {
+                session,
+                out,
+                workdir,
+                json,
+            } => run_trace_export(session, out, workdir, json),
             TraceCommand::Attach {
                 session,
                 evaluator,

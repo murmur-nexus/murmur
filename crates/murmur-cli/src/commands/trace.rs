@@ -29,21 +29,26 @@ use crate::session_address::{self, ses_entries, SessionQuery};
 
 use super::trace_attach;
 
-const E_TRC_001: &str = "E-TRC-001";
+pub(crate) const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
 /// A session's record no longer matches its chain or seal.
 pub(crate) const E_TRC_003: &str = "E-TRC-003";
 /// A session's record is not covered by a seal: it ended without one, or lines were appended
 /// after it or cut off.
-const E_TRC_004: &str = "E-TRC-004";
+pub(crate) const E_TRC_004: &str = "E-TRC-004";
 /// A session's record cannot be checked: written before records were sealed, no public key, or
 /// sealed by another key.
-const E_TRC_005: &str = "E-TRC-005";
+pub(crate) const E_TRC_005: &str = "E-TRC-005";
 /// An attachment's input is refused: an empty or unprintable evaluator, an empty, unreadable,
 /// non-UTF-8 or oversized value, or an event id the trace does not hold.
 pub(crate) const E_TRC_006: &str = "E-TRC-006";
 /// An attachment cannot be written beneath the records directory.
 pub(crate) const E_TRC_007: &str = "E-TRC-007";
+/// A bundle cannot be exported: the destination exists, a link or non-regular file is among the
+/// record's files, or the destination cannot be written.
+pub(crate) const E_TRC_008: &str = "E-TRC-008";
+/// The path given to `mur trace verify --bundle` is not a usable bundle.
+pub(crate) const E_TRC_009: &str = "E-TRC-009";
 
 /// The `inference.stop_reason` value a provider reports for a turn it cut off at the output cap.
 const MAX_TOKENS_STOP_REASON: &str = "max_tokens";
@@ -138,7 +143,8 @@ pub(crate) enum TraceCommand {
     /// public key alone
     ///
     /// Checks trace.jsonl, hooks/eval.jsonl, completion.json and the conversation record the
-    /// session appended to; exits non-zero unless every one verifies.
+    /// session appended to; exits non-zero unless every one verifies. With --bundle, checks an
+    /// exported bundle instead, and every file in it against its name and bundle.json.
     Verify {
         /// Session: @N, a full ses_ id, a suffix of one (4+ characters), a records directory, or
         /// a trace.jsonl path; omit for the most recent session
@@ -147,6 +153,10 @@ pub(crate) enum TraceCommand {
         /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// A bundle written by mur trace export, a directory or a .zip, to check instead of a
+        /// session
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["session", "workdir"])]
+        bundle: Option<PathBuf>,
         /// The record-seal public key to check against (default: ~/.murmur/keys/record-seal.pub)
         #[arg(long, value_name = "FILE")]
         public_key: Option<PathBuf>,
@@ -188,6 +198,28 @@ pub(crate) enum TraceCommand {
         #[arg(long, value_name = "FILE")]
         public_key: Option<PathBuf>,
         /// Print one JSON object, the stable interface documented under mur trace attach
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pack one ended session's sealed record into a bundle: a directory, or a .zip when --out
+    /// ends in .zip
+    ///
+    /// The bundle holds the record's streams and seals, its blobs, its attachments and the
+    /// conversation record its trace seal names, plus bundle.json listing every file with its
+    /// size and SHA-256. Check it anywhere with mur trace verify --bundle.
+    Export {
+        /// Session: @N, a full ses_ id, a suffix of one (4+ characters), a records directory, or
+        /// a trace.jsonl path
+        session: String,
+        /// Where to write the bundle: a .zip file when the path ends in .zip, else a directory;
+        /// must not exist (default: ./<session-id>.bundle.zip)
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace export
         #[arg(long)]
         json: bool,
     },
@@ -6837,7 +6869,10 @@ pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(),
 /// The record in `scan` naming `session_id` whose process is alive, or alive with a start time
 /// that could not be read: the one rule by which `mur trace list` reports a session `running` and
 /// `mur trace rm` refuses to remove one. Layers 1 and 2 alone, with no door probe.
-fn running_record<'a>(scan: &'a RecordScan, session_id: &str) -> Option<&'a RunningRecord> {
+pub(crate) fn running_record<'a>(
+    scan: &'a RecordScan,
+    session_id: &str,
+) -> Option<&'a RunningRecord> {
     scan.records.iter().find(|record| {
         record.session_id == session_id && running::process_state(record).is_running()
     })
@@ -7120,7 +7155,7 @@ pub(crate) fn records_dir_of(path: &Path) -> PathBuf {
 /// The public key to check against: `--public-key`, or `~/.murmur/keys/record-seal.pub` when it
 /// exists. `Ok(None)` when no key was given and the default does not exist, which reads every
 /// sealed stream as unverifiable.
-fn record_public_key(
+pub(crate) fn record_public_key(
     given: Option<&Path>,
 ) -> Result<Option<capsule_runtime::record_seal::PublicKey>, CliError> {
     use capsule_runtime::record_seal::{public_key_path, PublicKey};
@@ -7136,7 +7171,7 @@ fn record_public_key(
 }
 
 /// The conversation records root, `~/.murmur/conversations`, of this host.
-fn conversations_root() -> Option<PathBuf> {
+pub(crate) fn conversations_root() -> Option<PathBuf> {
     capsule_runtime::murmur_home::usable_murmur_home()
         .ok()
         .map(|home| home.join(capsule_runtime::record_seal::CONVERSATIONS_DIR))
@@ -7203,13 +7238,18 @@ pub(crate) fn verdict_code(verdict: capsule_runtime::record_seal::Verdict) -> Op
     }
 }
 
+/// `mur trace verify`: a session's records, or with `bundle` an exported bundle.
 pub(crate) fn run_trace_verify(
     session: Option<String>,
     workdir_arg: Option<PathBuf>,
+    bundle: Option<PathBuf>,
     public_key: Option<PathBuf>,
     json: bool,
 ) -> Result<(), CliError> {
     use capsule_runtime::record_seal::Verdict;
+    if let Some(bundle) = bundle {
+        return super::trace_export::run_trace_verify_bundle(bundle, public_key, json);
+    }
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let workdir = workdir_arg.unwrap_or_else(|| current_dir.join("workdir"));
     let path = resolve_session(session, &workdir)?;
@@ -7220,6 +7260,7 @@ pub(crate) fn run_trace_verify(
         let output = trace_attach::VerifyOutput {
             report: &report,
             attachments: &attachments,
+            bundle: None,
         };
         capsule_runtime::report_println!(
             "{}",
@@ -7258,7 +7299,7 @@ pub(crate) fn run_trace_verify(
 }
 
 /// One row per stream, then the `record:` line naming the key used.
-fn print_record_report(report: &capsule_runtime::record_seal::RecordReport) {
+pub(crate) fn print_record_report(report: &capsule_runtime::record_seal::RecordReport) {
     let width = report
         .streams
         .iter()

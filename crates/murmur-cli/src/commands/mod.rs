@@ -34,6 +34,7 @@ pub(crate) mod token;
 pub(crate) mod topology;
 pub(crate) mod trace;
 pub(crate) mod trace_attach;
+pub(crate) mod trace_export;
 pub(crate) mod version;
 pub(crate) mod watch;
 

@@ -121,7 +121,7 @@ section that explains it.
 | `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle, or `MURMUR_SPAWNER_LIFELINE` to something that is not this session's spawner lifeline | [E-RUN-020](#e-run-020) |
 | `E-RUN-022` | A session address or formation id names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
-| `E-RUN-024` | The session or formation named could not be ended and is still running, or `mur trace rm` named a session that is still running | [E-RUN-024](#e-run-024) |
+| `E-RUN-024` | The session or formation named could not be ended and is still running, or `mur trace rm` or `mur trace export` named a session that is still running | [E-RUN-024](#e-run-024) |
 | `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `upstream_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
@@ -173,6 +173,8 @@ section that explains it.
 | `E-TRC-005` | `mur trace verify`, `mur trace attach`: the session's record cannot be checked with the key given | [E-TRC-005](#e-trc-005) |
 | `E-TRC-006` | `mur trace attach`: the evaluator, the value or an `--event` is refused | [E-TRC-006](#e-trc-006) |
 | `E-TRC-007` | `mur trace attach`: the attachment file cannot be written | [E-TRC-007](#e-trc-007) |
+| `E-TRC-008` | `mur trace export`: the destination exists, a link or non-regular file is among the record's files, or the bundle cannot be written | [E-TRC-008](#e-trc-008) |
+| `E-TRC-009` | `mur trace verify --bundle`: the path is not a usable bundle | [E-TRC-009](#e-trc-009) |
 | `E-WIT-LEVEL-001` | A driver a launch stages, an artifact version `mur install` names, or a version a runtime pull resolves, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
@@ -807,6 +809,7 @@ has on it. Try again, or read what the session is doing with
 |---|---|
 | [`mur stop`](cli.md#mur-stop) | The session or formation could not be ended |
 | [`mur trace rm`](cli.md#mur-trace-rm) | The session to remove is still running |
+| [`mur trace export`](cli.md#mur-trace-export) | The session to export is still running: `session <id> is still running (pid <pid>); nothing was exported` |
 
 [`mur stop`](cli.md#mur-stop) could not end the process a [running-capsule
 record](cli.md#running-capsule-records) names: a signal was refused, or the process is still there
@@ -1045,6 +1048,46 @@ error[E-TRC-007]: the attachment /home/me/.murmur/records/…/ses_01a1…/attach
 ```
 
 No partial file is left behind, and the record is unchanged.
+
+### E-TRC-008 — a bundle cannot be exported { #e-trc-008 }
+
+[`mur trace export`](cli.md#mur-trace-export) wrote no bundle. The records directory and the
+conversation record are unchanged, and no partial bundle is left behind.
+
+| Cause | Message |
+|---|---|
+| `--out` exists: a file, a directory, even an empty one, or a link | `<path> already exists; nothing was exported` |
+| A stream, a seal, or an entry of `blobs/` or `attachments/` is a link | `<file> in <dir> is a symbolic link; nothing was exported` |
+| One of those is a FIFO, a device or another non-regular file | `<file> in <dir> is not a regular file; nothing was exported` |
+| The destination's directory does not exist or this user may not write it, or the disk is full | `the bundle <path> cannot be written: <reason>` |
+
+```text
+error[E-TRC-008]: /home/me/project/ses_01a1….bundle.zip already exists; nothing was exported
+```
+
+Choose another `--out`, or remove the old bundle.
+
+### E-TRC-009 — not a usable bundle { #e-trc-009 }
+
+[`mur trace verify --bundle`](cli.md#mur-trace-verify-bundle) could not read the path as a
+[run bundle](run-bundle.md) and printed no report:
+
+| Cause | Reason reads |
+|---|---|
+| The path does not exist | `it does not exist` |
+| A zip entry's name holds a `..` component or is absolute | `zip entry '<name>' has an unsafe path: …` |
+| A zip entry is a symbolic link or another non-regular file | `zip entry '<name>' is a symbolic link`, `… is not a regular file` |
+| Two zip entries name one file | `zip holds two entries named <name>` |
+| A zip entry is larger than the decompression limit | `zip entry '<name>' exceeds the <n>-byte decompression ceiling` |
+| No `bundle.json` at the root | `it holds no bundle.json` |
+| `bundle.json` is not JSON, or names another format | `bundle.json is not JSON: …`, `bundle.json has format "<x>", not murmur.bundle/1` |
+
+```text
+error[E-TRC-009]: /home/me/bundle.zip is not a usable bundle: zip entry '../escape.txt' has an unsafe path: contains a '..' component
+```
+
+A refused zip writes nothing outside its private extraction directory, which is removed. The
+decompression limit is 500 MiB per entry, or `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`.
 
 ### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
 
