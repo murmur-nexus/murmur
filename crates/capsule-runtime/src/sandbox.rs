@@ -2831,6 +2831,10 @@ impl ShellEnforcement {
         cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
         workdir_guard: Option<Arc<crate::resources::WorkdirGuard>>,
     ) -> Self {
+        // The guard kills the scope the moment it latches a breach, so a writer stops where it is.
+        if let Some(guard) = &workdir_guard {
+            guard.attach_scope(cgroup_scope.clone());
+        }
         self.cgroup_scope = cgroup_scope;
         self.workdir_guard = workdir_guard;
         self
@@ -2921,6 +2925,15 @@ impl ShellEnforcement {
     /// The latched workdir-size breach, if the guard has seen one.
     pub(crate) fn workdir_breach(&self) -> Option<crate::resources::WorkdirBreach> {
         self.workdir_guard.as_ref().and_then(|guard| guard.breach())
+    }
+
+    /// Measures the work folder, `$HOME` and `$TMPDIR` now, on this thread, and returns the breach
+    /// if the session is past its ceiling. The measurement that decides a session's final status:
+    /// see [`crate::resources::WorkdirGuard::settle`]. `None` for a session with no guard.
+    pub(crate) fn settle_workdir(&self) -> Option<crate::resources::WorkdirBreach> {
+        let guard = self.workdir_guard.as_ref()?;
+        guard.settle();
+        guard.breach()
     }
 
     /// Refuse to spawn once the workdir ceiling has been crossed.

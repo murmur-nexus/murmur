@@ -485,6 +485,32 @@ async fn run_task_with_reopens(
             result = Err(error);
             thread.ending = Some(agent::AttemptEnding::failed(reason));
         }
+        // The same checkpoint settles the workdir ceiling. The attempt may have returned `ok`
+        // before the guard's poll came round to a breach the command already made, so the session
+        // measures once more here, before its status is decided, and a breach ends it with the
+        // error the turn loop would have given had the poll been faster.
+        //
+        // A breach wins over an error the attempt returned: the guard kills the session's scope on
+        // a breach, which takes a process-transport harness down with it, and the turn then fails
+        // as a harness error. That failure is the breach's own doing, and the session's ending is
+        // E-RUN-013 whichever way the attempt reported it. Only a person's cancel, a refusal of a
+        // path (a security finding of its own) and a breach already reported are left as they are.
+        crate::race::window(crate::race::point::ATTEMPT_RETURNED).await;
+        if !matches!(
+            result,
+            Ok(AgentLoopExit::Canceled)
+                | Err(RuntimeError::WorkdirSizeExceeded { .. })
+                | Err(RuntimeError::WorkdirPathRefused { .. })
+        ) {
+            if let Some(breach) = state.shell_enforcement.settle_workdir() {
+                let error = RuntimeError::WorkdirSizeExceeded {
+                    max_bytes: breach.max_bytes,
+                    observed_bytes: breach.observed_bytes,
+                };
+                thread.ending = Some(agent::AttemptEnding::failed(error.to_string()));
+                result = Err(error);
+            }
+        }
         let refused = matches!(result, Err(RuntimeError::WorkdirPathRefused { .. }));
 
         // Stands in for work between `task_canceled` and `task_end` — a slow `on-task-end` hook —
@@ -5906,10 +5932,13 @@ fn launch(
                     // A deadline that ended the session ends it `deadline_reached` even when it
                     // cancelled no run: it fell before a task started, or while the session
                     // waited for one.
-                    if terminating.is_canceled()
-                        && termination_ending.get() == Some(LaunchEnding::DeadlineReached)
-                    {
-                        outcome.ended_as(LaunchEnding::DeadlineReached);
+                    // Read from the cause, which is set before anything is cancelled and before the
+                    // token is raised, so a deadline or a formation's end that came while the
+                    // session was finishing is not missed for want of the token: a task cancelled
+                    // a moment before the token rises is recorded by the plain path, and only this
+                    // read still knows why the session stopped.
+                    if let Some(ending) = termination_ending.decided() {
+                        outcome.ended_as(ending);
                     }
 
                     // Every task the door accepted reaches a terminal state before the door
@@ -15130,16 +15159,43 @@ struct DeadlineEndTrace {
 /// that begins the termination and gives one, before `terminating` is raised. Unset under a
 /// `SIGTERM` or the spawner lifeline, which leave a cancelled run `canceled`.
 #[derive(Debug, Default)]
-struct TerminationEnding(std::sync::OnceLock<LaunchEnding>);
+struct TerminationEnding {
+    ending: std::sync::OnceLock<LaunchEnding>,
+    /// Whether the termination cancelled a live run. A formation's end gives its ending only to a
+    /// session it interrupted: one that was idle when the lifeline closed ends `ok`.
+    cancelled_a_run: std::sync::atomic::AtomicBool,
+}
 
 impl TerminationEnding {
     #[cfg(unix)]
     fn set(&self, ending: LaunchEnding) {
-        let _ = self.0.set(ending);
+        let _ = self.ending.set(ending);
     }
 
     fn get(&self) -> Option<LaunchEnding> {
-        self.0.get().copied()
+        self.ending.get().copied()
+    }
+
+    #[cfg(unix)]
+    fn note_cancelled_a_run(&self) {
+        self.cancelled_a_run
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The ending the session's final status takes from the termination: a deadline's always, any
+    /// other only when it cancelled a run.
+    fn decided(&self) -> Option<LaunchEnding> {
+        match self.get()? {
+            LaunchEnding::DeadlineReached => Some(LaunchEnding::DeadlineReached),
+            ending
+                if self
+                    .cancelled_a_run
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Some(ending)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -15298,6 +15354,9 @@ async fn start_termination(
     termination_ending: &TerminationEnding,
     shell_enforcement: &sandbox::ShellEnforcement,
 ) {
+    // Before the record is written: the record's append is itself a wait in which the session can
+    // finish, and a session that finishes after the cause arrived has ended by that cause.
+    set_termination_ending(termination_ending, cause);
     match cause {
         TerminationCause::Sigterm => {}
         TerminationCause::FormationEnded => {
@@ -15334,6 +15393,16 @@ async fn start_termination(
     );
 }
 
+/// Gives the launch the ending `cause` gives it, when it gives one.
+#[cfg(unix)]
+fn set_termination_ending(termination_ending: &TerminationEnding, cause: TerminationCause) {
+    match cause {
+        TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
+        TerminationCause::Deadline => termination_ending.set(LaunchEnding::DeadlineReached),
+        TerminationCause::Sigterm | TerminationCause::SpawnerEnded => {}
+    }
+}
+
 /// Cancel every live task, set the launch's ending when the formation's end or the deadline is
 /// the cause, raise `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which
 /// the session's processes are killed and the process exits with status 143 whatever it is doing.
@@ -15345,19 +15414,25 @@ fn begin_termination(
     cause: TerminationCause,
     shell_enforcement: &sandbox::ShellEnforcement,
 ) {
+    // The ending is set before anything else wakes: a task cancelled below can finish and the
+    // session can decide its status before `terminating` is raised, and every decision reads the
+    // cause, not the token, to know a termination has begun. Idempotent, so `start_termination`
+    // having set it first is the same call.
+    set_termination_ending(termination_ending, cause);
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
     // The deadline spares a task kept working past a turn end: it ends with the answer it holds.
-    let _ = task_registry
-        .lock()
-        .unwrap()
-        .cancel_every_live(matches!(cause, TerminationCause::Deadline));
-    // Before `terminating`, so the task loop that wakes on it reads the cause already set.
-    match cause {
-        TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
-        TerminationCause::Deadline => termination_ending.set(LaunchEnding::DeadlineReached),
-        TerminationCause::Sigterm | TerminationCause::SpawnerEnded => {}
+    // The note is made under the registry's lock: a cancelled task records its terminal state
+    // under the same lock, so by the time the session can read its result the note is made.
+    {
+        let mut registry = task_registry.lock().unwrap();
+        let cancelled = registry.cancel_every_live(matches!(cause, TerminationCause::Deadline));
+        if !cancelled.is_empty() {
+            termination_ending.note_cancelled_a_run();
+        }
     }
+    // The gap a test holds open: the task may finish here, before `terminating` is raised.
+    crate::race::window_blocking(crate::race::point::TERMINATION_AFTER_CANCEL);
     terminating.cancel();
     match cause {
         TerminationCause::Sigterm => crate::runtime_err!(

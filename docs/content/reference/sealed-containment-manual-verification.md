@@ -1281,7 +1281,7 @@ that do not are `hardlink-escape` and `rename-across-boundary`, for a structural
 | `syscall-keyctl` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
 | `resource-fork-bomb` | `Must(Contained)` | CONTAINED (EAGAIN at 31 children, `pids.max` 32) |
 | `resource-disk-filler-per-file` | `Must(Contained)` | CONTAINED (EFBIG at exactly 10 MiB) |
-| `resource-disk-filler-aggregate` | `Must(Contained)` | CONTAINED (second spawn refused, naming `workdir_max_bytes`) |
+| `resource-disk-filler-aggregate` | `Must(Contained)` | CONTAINED (the breach ended the session with E-RUN-013 naming `workdir_max_bytes`; a follow-up spawn refused naming it is accepted too) |
 | `resource-memory-hog` | `Must(Contained)` | CONTAINED (shell tool exit 137) |
 | `resource-fd-exhauster` | `Must(Contained)` | CONTAINED (EMFILE at 125 of 128) |
 

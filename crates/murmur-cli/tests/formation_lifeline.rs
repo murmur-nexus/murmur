@@ -420,6 +420,51 @@ fn a_cancelled_task_does_not_leave_an_earlier_answer_as_its_result() {
     assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
 }
 
+/// The same ending with the termination held between cancelling the task and raising its token
+/// (`termination.after_cancel`, for longer than the cancelled task takes to wind up). The cancelled
+/// task finishes inside that gap, and the session must still end `formation_ended`, not `ok`: the
+/// ending is the cause, which is set before anything is cancelled. Needs a `mur` built with
+/// `race-windows`, which `scripts/test.sh` does. Without the fix this ends `ok`, every time.
+#[cfg(feature = "race-windows")]
+#[test]
+fn a_task_cancelled_inside_the_formations_termination_still_ends_formation_ended() {
+    let home = driver_home();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let server = ScriptedServer::start_answering(2, move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(120));
+        end_turn(1, "late")
+    });
+    let formation = FormationId::mint();
+    let mut member = Member::start(
+        home.path(),
+        &server,
+        Some(&formation),
+        true,
+        &[("MURMUR_RACE_WINDOWS", "termination.after_cancel=4000")],
+    );
+    let held = member.send(message("m-held", "hold"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while asked.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "the task never asked its model");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    member.close_lifeline();
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    assert_eq!(status.code(), Some(0), "{}", member.stderr());
+    let events = member.trace();
+    assert!(
+        events.iter().any(|event| event["event_type"] == "task_end"
+            && event["task_id"] == held
+            && event["exit_status"] == "canceled"),
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(session_exit_status(&events), "formation_ended");
+}
+
 /// A `CancelTask` is a cancel of one task, not of the session: the member keeps serving, its
 /// result file says the cancelled task has none, and when its lifeline later closes on an idle
 /// session it ends `ok`.

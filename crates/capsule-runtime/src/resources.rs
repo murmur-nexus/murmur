@@ -153,13 +153,14 @@ pub const DEFAULT_CGROUP_IO_BYTES_PER_SEC: u64 = 100 * 1024 * 1024;
 /// Default ceiling on total workdir size — 10 GiB, checked periodically.
 pub const DEFAULT_WORKDIR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
-/// How often [`WorkdirGuard`] walks the workdir tree.
+/// The shortest pause between two of [`WorkdirGuard`]'s walks of the workdir tree.
 ///
 /// An internal constant rather than a manifest key, matching [`crate::limits::EPOCH_TICK_INTERVAL`]:
-/// the cadence changes *when* a breach is noticed, never *whether* it is, so exposing it would
-/// add a knob with no security meaning. The consequence: a disk filler is caught within one
-/// interval of crossing the ceiling, not at the instant it crosses.
-pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// the cadence changes *how far past the ceiling* a writer gets before it is stopped, never
+/// *whether* the breach is reported (that is [`WorkdirGuard::settle`]'s job, and it does not
+/// depend on the cadence at all). A walk that took longer than this to finish is followed by a
+/// pause twice as long as the walk, so a very large tree costs at most a third of a core.
+pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Fully-resolved host-process limits for one session: the manifest's `capabilities.resources`
 /// block with every omitted field replaced by its `DEFAULT_*`, except the two CPU fields, which
@@ -756,27 +757,54 @@ pub(crate) struct WorkdirBreach {
     pub(crate) observed_bytes: u64,
 }
 
-/// Periodic workdir-size check for one session.
+/// Workdir-size guard for one session: a periodic check that stops a writer, and a final
+/// measurement that decides the session's status.
 ///
-/// Walks the workdir tree every [`WORKDIR_CHECK_INTERVAL`] on a plain OS thread (not a tokio
-/// task — the session runs guests on several runtimes and the guard must outlive all of them),
-/// and latches the first breach it sees. Three consumers read that latch:
+/// **Two jobs, and only the second one is a promise.**
 ///
-///   * `shell::execute_shell` and `runtime::dispatch_native_tool` refuse to spawn once it is
-///     set, which stops a disk filler from writing another byte;
-///   * the agent turn loop turns it into [`crate::errors::RuntimeError::WorkdirSizeExceeded`],
-///     which terminates the session.
+///   * The polling thread walks the work folder, `$HOME` and `$TMPDIR` every
+///     [`WORKDIR_CHECK_INTERVAL`] (a plain OS thread, not a tokio task: the session runs guests on
+///     several runtimes and the guard must outlive all of them), latches the first breach it sees
+///     and, when the session has a cgroup scope, kills everything in the scope at once. That keeps
+///     a disk filler from writing the whole disk while it is noticed. It is a bound on *how far
+///     past the ceiling* a writer gets (about one poll's worth of its write rate), not on whether
+///     the breach is reported.
+///   * [`Self::settle`] measures once, synchronously, on the caller's thread, and latches. The
+///     runtime calls it at the one place a session's final status is decided, after the attempt
+///     has returned and before anything reports it. So a breach can never be missed because the
+///     poll had not come round yet: the status is decided by the measurement, and the poll only
+///     decides how much was written first. The breach this reports is E-RUN-013.
 ///
-/// **Why a periodic check and not a tmpfs-backed workdir with a size mount option.** The
-/// structural version needs a mount namespace the runtime does not have: nothing in this
-/// codebase's process model ever runs as root, and the `sealed-containment-runtime` work that
-/// would create one is separate and unbuilt. A poll is what is available without it, at the cost
-/// of a one-interval detection lag.
+/// The latch is read by `shell::spawn_contained` and `runtime::dispatch_native_tool`, which refuse
+/// to spawn once it is set, and by the agent turn loop, which turns it into
+/// [`crate::errors::RuntimeError::WorkdirSizeExceeded`].
+///
+/// **Why not enforce at write time.** The kernel offers two write-time bounds: a size-limited
+/// mount (tmpfs `size=`, a project quota) and `RLIMIT_FSIZE`. The first needs a mount namespace
+/// and a work folder that is not a real host directory; the runtime's work folder is one the host
+/// and its records read directly, and nothing in the unsealed tiers ever runs as root, so the
+/// mount is not available to every session the limit is promised to. `RLIMIT_FSIZE` bounds one
+/// file, not the sum, and is already `max_file_size_bytes`. A guard that measures at the decision
+/// point is the one design that holds on every tier; a mount-backed work folder for the sealed
+/// tier remains a possible later tightening of the first job, not a change to the second.
 #[derive(Debug)]
 pub(crate) struct WorkdirGuard {
     max_bytes: u64,
+    measured: Measured,
     breach: Mutex<Option<WorkdirBreach>>,
     stop: AtomicBool,
+    /// The session's cgroup scope, once [`Self::attach_scope`] gave it one.
+    scope: Mutex<Option<Arc<crate::cgroup::CgroupScope>>>,
+}
+
+/// The directories a guard measures, against one ceiling for their sum.
+#[derive(Debug, Clone)]
+struct Measured {
+    workdir: crate::workdir_fs::WorkdirRoot,
+    temp_dir: Option<crate::workdir_fs::WorkdirRoot>,
+    home_dir: Option<crate::workdir_fs::WorkdirRoot>,
+    /// Where a breach is logged, or `None` outside a session, where it is reported on stderr alone.
+    records_root: Option<crate::workdir_fs::WorkdirRoot>,
 }
 
 impl WorkdirGuard {
@@ -794,63 +822,121 @@ impl WorkdirGuard {
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
         max_bytes: u64,
     ) -> Arc<Self> {
-        let guard = Arc::new(Self {
-            max_bytes,
-            breach: Mutex::new(None),
-            stop: AtomicBool::new(false),
-        });
+        let guard = Self::unpolled(workdir, temp_dir, home_dir, records_root, max_bytes);
 
         // The thread holds a Weak, so it can never keep the session's guard alive; the stop flag
         // covers the reverse (guard dropped while the thread is mid-sleep). Same both-ends shape
         // as `limits::EpochTicker`.
         let weak = Arc::downgrade(&guard);
-        let workdir = workdir.clone();
-        let temp_dir = temp_dir.cloned();
-        let home_dir = home_dir.cloned();
-        let records_root = records_root.cloned();
         thread::spawn(move || loop {
             thread::sleep(WORKDIR_CHECK_INTERVAL);
+            // The gap a test holds open: the poll has not come round yet. Before the upgrade, so a
+            // held poll keeps nothing of the session alive.
+            crate::race::window_blocking(crate::race::point::WORKDIR_POLL);
             let Some(guard) = weak.upgrade() else {
                 break;
             };
             if guard.stop.load(Ordering::Relaxed) || guard.breach().is_some() {
                 break;
             }
-            if guard.check(
-                &workdir,
-                temp_dir.as_ref(),
-                home_dir.as_ref(),
-                records_root.as_ref(),
-            ) {
+            let walk_started = std::time::Instant::now();
+            let observed = guard.measure();
+            if guard.latch(observed) {
+                guard.stop_writers();
                 break;
             }
+            // A walk that was slow is followed by a pause in proportion, to cap the CPU it costs.
+            let extra = walk_started
+                .elapsed()
+                .saturating_mul(2)
+                .saturating_sub(WORKDIR_CHECK_INTERVAL);
+            drop(guard);
+            thread::sleep(extra);
         });
 
         guard
     }
 
-    /// One measurement of `workdir`, `temp_dir` and `home_dir` together, latching a breach when
-    /// their sum is past the ceiling. `true` when it was.
-    fn check(
-        &self,
+    /// A guard with no polling thread: only [`Self::settle`] measures. What [`Self::spawn`] builds
+    /// before it starts the thread, and what a test uses to measure exactly when it chooses.
+    pub(crate) fn unpolled(
         workdir: &crate::workdir_fs::WorkdirRoot,
         temp_dir: Option<&crate::workdir_fs::WorkdirRoot>,
         home_dir: Option<&crate::workdir_fs::WorkdirRoot>,
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
-    ) -> bool {
-        let measured: Vec<&Path> = std::iter::once(workdir)
-            .chain(temp_dir)
-            .chain(home_dir)
-            .map(crate::workdir_fs::WorkdirRoot::path)
-            .collect();
-        let observed = measured.iter().fold(0u64, |sum, dir| {
+        max_bytes: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            max_bytes,
+            measured: Measured {
+                workdir: workdir.clone(),
+                temp_dir: temp_dir.cloned(),
+                home_dir: home_dir.cloned(),
+                records_root: records_root.cloned(),
+            },
+            breach: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            scope: Mutex::new(None),
+        })
+    }
+
+    /// Gives the guard the session's cgroup scope, which it kills when a breach is latched.
+    pub(crate) fn attach_scope(&self, scope: Option<Arc<crate::cgroup::CgroupScope>>) {
+        if let Ok(mut slot) = self.scope.lock() {
+            *slot = scope;
+        }
+    }
+
+    /// Measures the directories now and latches a breach when their sum is past the ceiling.
+    /// `true` when the session has breached, whether this call latched it or an earlier one did.
+    ///
+    /// This is the measurement that decides the session's status: it runs on the caller's thread
+    /// and returns only once it has the answer, so it does not depend on the polling thread having
+    /// run since the writer last wrote.
+    pub(crate) fn settle(&self) -> bool {
+        if self.breach().is_some() {
+            return true;
+        }
+        let observed = self.measure();
+        let breached = self.latch(observed);
+        if breached {
+            self.stop_writers();
+        }
+        breached
+    }
+
+    /// The size of the measured directories, summed.
+    fn measure(&self) -> u64 {
+        self.paths().iter().fold(0u64, |sum, dir| {
             sum.saturating_add(directory_size_bytes(dir))
-        });
+        })
+    }
+
+    fn paths(&self) -> Vec<&Path> {
+        std::iter::once(&self.measured.workdir)
+            .chain(self.measured.temp_dir.as_ref())
+            .chain(self.measured.home_dir.as_ref())
+            .map(crate::workdir_fs::WorkdirRoot::path)
+            .collect()
+    }
+
+    /// Latches a breach when `observed` is past the ceiling. `true` when it is.
+    fn latch(&self, observed: u64) -> bool {
         if observed > self.max_bytes {
-            self.record_breach(records_root, observed, &measured);
+            self.record_breach(observed);
             return true;
         }
         false
+    }
+
+    /// Kills every process in the session's scope, so a writer stops where it is. A session with
+    /// no scope has nothing to kill here: its writers stop at the next spawn, and the session
+    /// ends at the next decision point.
+    fn stop_writers(&self) {
+        let scope = self.scope.lock().ok().and_then(|slot| slot.clone());
+        if let Some(scope) = scope {
+            let _ = scope.kill_all();
+        }
     }
 
     /// The latched breach, if the workdir has crossed its ceiling.
@@ -858,29 +944,31 @@ impl WorkdirGuard {
         self.breach.lock().ok().and_then(|breach| *breach)
     }
 
-    fn record_breach(
-        &self,
-        records_root: Option<&crate::workdir_fs::WorkdirRoot>,
-        observed_bytes: u64,
-        measured: &[&Path],
-    ) {
+    fn record_breach(&self, observed_bytes: u64) {
         let breach = WorkdirBreach {
             max_bytes: self.max_bytes,
             observed_bytes,
         };
-        if let Ok(mut slot) = self.breach.lock() {
-            if slot.is_none() {
+        // Only the first latch reports: the poll and a settle can both see the same breach.
+        let first = match self.breach.lock() {
+            Ok(mut slot) if slot.is_none() => {
                 *slot = Some(breach);
+                true
             }
+            _ => false,
+        };
+        if !first {
+            return;
         }
-        let measured = measured
+        let measured = self
+            .paths()
             .iter()
             .map(|dir| dir.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!("{}; measured: {measured}", workdir_breach_message(breach));
         crate::runtime_err!("[capsule-runtime] {message}");
-        if let Some(records_root) = records_root {
+        if let Some(records_root) = self.measured.records_root.as_ref() {
             crate::agent::append_bootstrap_log(records_root, &format!("[resources] {message}"));
         }
     }
@@ -1331,15 +1419,13 @@ mod tests {
         let [workdir, temp, home] =
             [0, 1, 2].map(|i| crate::workdir_fs::WorkdirRoot::open(dirs[i].path()).unwrap());
 
-        let guard = WorkdirGuard::spawn(&workdir, Some(&temp), Some(&home), None, MIB);
         if dir != 0 {
-            assert!(
-                !guard.check(&workdir, None, None, None),
-                "the work folder alone is under 1 MiB"
-            );
-            assert_eq!(guard.breach(), None);
+            let alone = WorkdirGuard::unpolled(&workdir, None, None, None, MIB);
+            assert!(!alone.settle(), "the work folder alone is under 1 MiB");
+            assert_eq!(alone.breach(), None);
         }
-        assert!(guard.check(&workdir, Some(&temp), Some(&home), None));
+        let guard = WorkdirGuard::unpolled(&workdir, Some(&temp), Some(&home), None, MIB);
+        assert!(guard.settle());
         let breach = guard.breach().expect("the bytes breach the ceiling");
         assert_eq!(breach.max_bytes, MIB);
         assert_eq!(breach.observed_bytes, 2 * MIB + 100);
@@ -1379,8 +1465,9 @@ mod tests {
         std::fs::write(dirs[0].path().join("big"), vec![0u8; 4096]).unwrap();
         let [workdir, temp, home, records] =
             [0, 1, 2, 3].map(|i| crate::workdir_fs::WorkdirRoot::open(dirs[i].path()).unwrap());
-        let guard = WorkdirGuard::spawn(&workdir, Some(&temp), Some(&home), None, 1024);
-        assert!(guard.check(&workdir, Some(&temp), Some(&home), Some(&records)));
+        let guard =
+            WorkdirGuard::unpolled(&workdir, Some(&temp), Some(&home), Some(&records), 1024);
+        assert!(guard.settle());
         let log = std::fs::read_to_string(dirs[3].path().join("logs/bootstrap.log")).unwrap();
         for dir in &dirs[..3] {
             assert!(log.contains(&dir.path().display().to_string()), "{log}");
@@ -1434,9 +1521,16 @@ mod tests {
     }
 
     /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
-    /// can be raised back by the capsule itself. Asserted against the live process by lowering
-    /// a safely lowerable limit (`RLIMIT_CORE`, which a spawned process gets at one byte anyway)
-    /// and reading it back.
+    /// can be raised back by the capsule itself. Asserted against a live process by lowering a
+    /// safely lowerable limit (`RLIMIT_CORE`, which a spawned process gets at one byte anyway) and
+    /// reading it back.
+    ///
+    /// The lowering happens in a forked child, never in the test process. A hard limit cannot be
+    /// raised again, and the test binary is one process shared by every test in the crate: this
+    /// test used to set the hard `RLIMIT_CORE` to 0 for all of them, which made
+    /// `shell::tests::a_kernel_tier_command_gets_the_one_byte_core_limit` find a hard limit of 0
+    /// and skip itself, whenever it ran after this one. The child does nothing but two
+    /// async-signal-safe syscalls and `_exit`, which is all a fork of a threaded process may do.
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
@@ -1444,21 +1538,65 @@ mod tests {
     // `c_int` on macOS, so the cast only looks redundant from whichever platform clippy runs on.
     #[allow(clippy::unnecessary_cast)]
     fn set_hard_rlimit_writes_both_the_soft_and_hard_slot() {
-        set_hard_rlimit(libc::RLIMIT_CORE as u32, 0).unwrap();
-
-        let mut current = libc::rlimit {
-            rlim_cur: 1,
-            rlim_max: 1,
+        let read_core = || {
+            let mut current = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            // SAFETY: a plain `getrlimit` read into a live stack `rlimit`.
+            let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE as _, &mut current) };
+            assert_eq!(rc, 0);
+            current
         };
-        // SAFETY: a plain `getrlimit` read into a live stack `rlimit`.
+        let before = read_core();
+
+        // SAFETY: the child calls only `setrlimit`, `getrlimit` and `_exit`, none of which
+        // allocates or takes a lock, so it is safe in a process forked from a threaded one.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let code = (|| {
+                // The function under test. Its success path allocates nothing.
+                if set_hard_rlimit(libc::RLIMIT_CORE as u32, 0).is_err() {
+                    return 11;
+                }
+                let mut current = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                // SAFETY: as above.
+                if unsafe { libc::getrlimit(libc::RLIMIT_CORE as _, &mut current) } != 0 {
+                    return 12;
+                }
+                if current.rlim_cur != 0 {
+                    return 13;
+                }
+                if current.rlim_max != 0 {
+                    return 14;
+                }
+                0
+            })();
+            // SAFETY: `_exit` ends the child without running the parent's destructors or the test
+            // harness's exit path.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: `child` is this process's own child, and `status` is a live stack integer.
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
         assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_CORE as _, &mut current) },
-            0
+            libc::WEXITSTATUS(status),
+            0,
+            "child exit: 11 = write failed, 12 = read failed, \
+             13 = soft slot not set, 14 = the hard slot must be set, not only the soft one"
         );
-        assert_eq!(current.rlim_cur, 0);
+
+        // The test process itself is untouched, which is what the other tests rely on.
+        let after = read_core();
         assert_eq!(
-            current.rlim_max, 0,
-            "the hard slot must be set, not only the soft one"
+            (after.rlim_cur, after.rlim_max),
+            (before.rlim_cur, before.rlim_max)
         );
     }
 

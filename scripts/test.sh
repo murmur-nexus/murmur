@@ -8,6 +8,10 @@
 #     beta features, so a bare run silently skips them rather than reporting them. `beta-all` turns
 #     on every beta feature.
 #
+#   * `race-windows` turns on the named race windows (crates/capsule-runtime/src/race.rs) that the
+#     tests which force a timing hold open. Without it those tests compile out and a fix for a race
+#     would go unproven. It is a test-only feature; a release build refuses to compile it.
+#
 # The runtime refuses to launch a subprocess-capable capsule without a delegated cgroup v2 scope
 # (fail-closed; see crates/capsule-runtime/src/cgroup.rs). Each test binary asks systemd for its
 # own transient scope the first time it needs a cgroup base, so the tests that need one run under
@@ -24,7 +28,7 @@
 #         scripts/test.sh -p capsule-runtime          # narrow to one crate
 set -uo pipefail
 
-FEATURES="beta-all"
+FEATURES="beta-all,race-windows"
 cd "$(dirname "$0")/.."
 
 LOG_DIR="target/test-logs"

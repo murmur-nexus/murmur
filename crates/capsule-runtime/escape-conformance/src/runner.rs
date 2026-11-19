@@ -1030,6 +1030,26 @@ pub fn run_case(
                          measured nothing. Tool call: {driver_summary}"
                     ),
                 )
+            } else if second.is_empty() && output.contains("E-RUN-013") && output.contains(needle) {
+                // The breach ended the session itself, which is the promise the ceiling makes and
+                // more than the next spawn being refused: the runtime kills what the session was
+                // running, the harness's follow-up call included, so there is no second call to
+                // refuse. The session's own error names the ceiling.
+                (
+                    Verdict::Contained,
+                    format!(
+                        "the breach ended the session with E-RUN-013 naming `{needle}`, and the \
+                         probe was killed before it could finish. Tool call: {driver_summary}"
+                    ),
+                )
+            } else if second.is_empty() && first.contains("EC_VERDICT=UNCONTAINED") {
+                (
+                    Verdict::Uncontained,
+                    format!(
+                        "the probe wrote everything it was going to write and the session was \
+                         not ended with E-RUN-013 naming `{needle}`. Tool call: {driver_summary}"
+                    ),
+                )
             } else if second.is_empty() {
                 (
                     Verdict::Inconclusive,

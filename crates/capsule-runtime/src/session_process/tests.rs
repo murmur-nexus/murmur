@@ -394,6 +394,56 @@ async fn exit_code_within(
     }
 }
 
+/// The forced half of `exited_means_every_byte_is_readable`, which can only hope to catch the
+/// window by running 204 processes. Here the output pump is held after it read the last byte and
+/// before it marks its stream ended (`race::point::PUMP_BEFORE_END`), for longer than the program
+/// takes to exit by orders of magnitude, and the process must not be reported `Exited` meanwhile.
+/// Once the pump is let go, the exit appears and one read returns every byte. A reaper that
+/// reported the exit when the leader died, without waiting for the pumps, fails the first half
+/// every time, not one run in some.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exit_is_not_reported_while_the_output_pump_is_still_behind_it() {
+    let (registry, _workdir) = registry(&["sh"]);
+    let access = ctx(&registry, "probe", GateRoute::Ungated);
+    let mut table = ResourceTable::new();
+    let mut view = ProcessView {
+        access: &access,
+        table: &mut table,
+    };
+    let hold = crate::race::hold_scoped(crate::race::point::PUMP_BEFORE_END, "held-pump");
+    let started = view
+        .start(start_request(
+            "held-pump",
+            "sh",
+            &["-c", "printf 'all of the output'"],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        hold.reached(Duration::from_secs(10)),
+        "the pump never reached the window, so nothing here was held"
+    );
+
+    // Well inside OUTPUT_DRAIN_LIMIT, which would end the wait by itself, and long after the
+    // program (a `printf`) has exited.
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let state = view.status(started.handle.clone()).await.unwrap();
+        assert!(
+            !matches!(state, wit::State::Exited(_)),
+            "the exit was reported with the output pump still behind it: {state:?}"
+        );
+    }
+
+    hold.release();
+    let code = exit_code_within(&mut view, &started.handle, Duration::from_secs(10)).await;
+    assert_eq!(code, Some(0));
+    let output = view.read(started.handle.clone(), 1 << 20).await.unwrap();
+    assert_eq!(output.stdout, b"all of the output");
+    assert!(output.stdout_ended && output.stderr_ended, "{output:?}");
+    registry.end_session().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exited_means_every_byte_is_readable() {
     const TASKS: usize = 6;
