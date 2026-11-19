@@ -25,6 +25,8 @@ pub(crate) const TRACE_FILE_NAME: &str = "trace.jsonl";
 pub(crate) struct TraceWriter {
     /// The file's chain, shared with every other appender of the same `trace.jsonl`.
     chain: Arc<crate::record_seal::InlineChain>,
+    /// `trace.sync`, set on the chain by [`Self::set_trace_sync`]; `None` makes no sync call.
+    trace_sync: Option<murmur_artifact::TraceSync>,
     /// The records directory the trace is in, which its seal is written beside.
     records_root: WorkdirRoot,
     /// What the seal written after `session_end` covered, for the OTel session span.
@@ -458,6 +460,29 @@ struct SessionStartEvent {
     /// Present exactly when `formation_member` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     formation_callees: Option<Vec<String>>,
+    /// `trace.sync`: when this session's own lines reach the disk. Written only when the field is
+    /// set; absent rather than `null` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_sync: Option<SessionTraceSync>,
+}
+
+/// `session_start.trace_sync`: `{"mode":"line"}` or `{"mode":"interval","interval_secs":N}`.
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum SessionTraceSync {
+    Line,
+    Interval { interval_secs: u64 },
+}
+
+impl From<murmur_artifact::TraceSync> for SessionTraceSync {
+    fn from(sync: murmur_artifact::TraceSync) -> Self {
+        match sync {
+            murmur_artifact::TraceSync::Line => Self::Line,
+            murmur_artifact::TraceSync::Interval { secs } => Self::Interval {
+                interval_secs: secs,
+            },
+        }
+    }
 }
 
 /// `session_start.deadline`.
@@ -2780,6 +2805,7 @@ impl TraceWriter {
         }
         Ok(Self {
             chain,
+            trace_sync: None,
             records_root: records_root.clone(),
             sealed_head: None,
             session_id,
@@ -2911,6 +2937,16 @@ impl TraceWriter {
     /// Records the session's credential gateways for `session_start.gateways`.
     pub(crate) fn set_gateways(&mut self, gateways: Vec<SessionGateway>) {
         self.gateways = gateways;
+    }
+
+    /// Applies `trace.sync` to this trace's chain — every appender of the file shares it — and
+    /// records it for `session_start.trace_sync`. Called before the first line is written, so
+    /// the policy covers every line. `None` leaves the chain making no sync call.
+    pub(crate) fn set_trace_sync(&mut self, sync: Option<murmur_artifact::TraceSync>) {
+        self.trace_sync = sync;
+        if let Some(policy) = sync {
+            self.chain.set_sync(policy);
+        }
     }
 
     /// Records what `control:` declares for `session_start.control`.
@@ -3095,6 +3131,7 @@ impl TraceWriter {
                 .formation_member
                 .as_ref()
                 .map(|(_, callees)| callees.clone()),
+            trace_sync: self.trace_sync.map(SessionTraceSync::from),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -4788,6 +4825,10 @@ impl TraceWriter {
             exit_status: exit_status.to_string(),
         };
         self.write_event(&event).await?;
+        // Under an interval policy `session_end` may still be pending; the ending waits for it.
+        if self.trace_sync.is_some() {
+            self.chain.sync_now()?;
+        }
         self.session_ended = true;
         self.sealed_head =
             crate::record_seal::seal_session_end(&self.records_root, &self.session_id);
@@ -6725,6 +6766,35 @@ mod tests {
         assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(e["model_limits"], serde_json::Value::Null);
+    }
+
+    /// `trace_sync` is absent without `trace.sync`, and names the mode — and the interval — with
+    /// it; the lines it covers carry the same `prev_hash` chain either way.
+    #[tokio::test]
+    async fn session_start_trace_sync_is_absent_unset_and_names_the_policy() {
+        use murmur_artifact::TraceSync;
+        for (sync, expected) in [
+            (None, None),
+            (
+                Some(TraceSync::Line),
+                Some(serde_json::json!({"mode": "line"})),
+            ),
+            (
+                Some(TraceSync::Interval { secs: 5 }),
+                Some(serde_json::json!({"mode": "interval", "interval_secs": 5})),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.set_trace_sync(sync);
+            w.write_session_start(None, None, Vec::new()).await.unwrap();
+            w.write_session_end("ok").await.unwrap();
+
+            let events = read_events(dir.path());
+            assert_eq!(events.len(), 2, "{sync:?}");
+            assert_eq!(events[0].get("trace_sync").cloned(), expected, "{sync:?}");
+            assert!(events[1]["prev_hash"].is_string(), "{sync:?}");
+        }
     }
 
     /// No turn cap is written as `null`, beside the primary's limits and their sources.
