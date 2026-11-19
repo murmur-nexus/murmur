@@ -277,18 +277,27 @@ fn row<'a>(stdout: &'a str, case: &str, label: &str) -> &'a str {
     let block = &block[..block.find("\n── ").unwrap_or(block.len())];
     block
         .lines()
-        .find(|line| line.trim_start().starts_with(label))
+        .find(|line| is_row(line, label))
         .unwrap_or_else(|| panic!("no {label} row for {case} in\n{stdout}"))
 }
 
+/// Whether `line` is the row labelled `label`: the label, then the column padding, so `spend`
+/// never matches `spend per pass`.
+fn is_row(line: &str, label: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(label)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("  "))
+}
+
 fn total_block(stdout: &str) -> &str {
-    stdout.rsplit("── total").next().unwrap()
+    let block = stdout.rsplit("── total").next().unwrap();
+    &block[..block.find("\n── ").unwrap_or(block.len())]
 }
 
 fn total_row<'a>(stdout: &'a str, label: &str) -> &'a str {
     total_block(stdout)
         .lines()
-        .find(|line| line.trim_start().starts_with(label))
+        .find(|line| is_row(line, label))
         .unwrap_or_else(|| panic!("no total {label} row in\n{stdout}"))
 }
 
@@ -974,6 +983,16 @@ fn repeats_report_the_median_and_the_spread() {
         .map(|run| run["cached_tokens"].clone())
         .collect();
     assert_eq!(cached, [json!(0), json!(50), json!(0)], "{record:#}");
+    // Each call is charged its request (input + cache read + cache write) and its 5 output
+    // tokens: 100 + 5; two calls of 150 + 25 + 5; 200 + 5; and two calls of 10 + 5 per variant run.
+    let spend = |arm: &str| -> Vec<u64> {
+        arm_runs(&record, 0, arm)
+            .iter()
+            .map(|run| run["spend_tokens"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(spend("baseline"), [105, 360, 205], "{record:#}");
+    assert_eq!(spend("variant"), [30, 30, 30], "{record:#}");
 
     let input = row(&stdout, "spread", "input tokens");
     assert!(input.contains("200 (100–300)"), "{input}");
@@ -991,6 +1010,33 @@ fn repeats_report_the_median_and_the_spread() {
     assert!(total_input.contains("600"), "{total_input}");
     assert!(total_input.trim_end().ends_with("-540"), "{total_input}");
 
+    // One baseline pass for 670 tokens against three variant passes for 90.
+    let per_pass = row(&stdout, "spread", "spend per pass");
+    assert_eq!(
+        cells(per_pass, "spend per pass"),
+        ["670", "30", "-640"],
+        "{stdout}"
+    );
+    let spend_row = row(&stdout, "spread", "spend");
+    assert!(spend_row.contains("205 (105–360)"), "{spend_row}");
+    assert!(
+        spread_cell_after(spend_row, "205 (105–360)").starts_with("30"),
+        "{spend_row}"
+    );
+    assert!(spend_row.trim_end().ends_with("-175"), "{spend_row}");
+    assert_eq!(
+        cells(total_row(&stdout, "spend"), "spend"),
+        ["670", "90", "-580"]
+    );
+    assert_eq!(
+        cells(total_row(&stdout, "spend per pass"), "spend per pass"),
+        ["670", "30", "-640"]
+    );
+    let lines: Vec<&str> = total_block(&stdout).lines().collect();
+    let at = |label: &str| lines.iter().position(|line| is_row(line, label)).unwrap();
+    assert!(at("check") + 1 == at("spend per pass") && at("spend per pass") + 1 == at("spend"));
+    assert!(at("spend") + 1 == at("turns"), "{stdout}");
+
     let json_out = run_ok(world.mur().args([
         "eval",
         "diff",
@@ -1006,6 +1052,14 @@ fn repeats_report_the_median_and_the_spread() {
         json!({"median": 200.0, "min": 100, "max": 300})
     );
     assert_eq!(baseline["cached_tokens"]["max"], 50);
+    assert_eq!(
+        baseline["spend_tokens"],
+        json!({"median": 205.0, "min": 105, "max": 360})
+    );
+    assert_eq!(baseline["spend_per_pass"], 670);
+    assert_eq!(comparison["total"]["variant"]["spend_per_pass"], 30);
+    assert_eq!(comparison["total"]["baseline"]["spend_tokens"], 670);
+    assert!(comparison.get("requirements").is_none());
     assert_eq!(baseline["check_pass"], 1);
     assert_eq!(baseline["check_runs"], 3);
     assert_eq!(comparison["cases"][0]["arms"]["variant"]["check_pass"], 3);
@@ -1016,6 +1070,17 @@ fn repeats_report_the_median_and_the_spread() {
             .len(),
         3
     );
+}
+
+/// A row's cells after its label: the columns are separated by two or more spaces.
+fn cells<'a>(row: &'a str, label: &str) -> Vec<&'a str> {
+    row.trim_start()
+        .strip_prefix(label)
+        .unwrap()
+        .split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect()
 }
 
 /// The text after `cell` in a table row, trimmed.
@@ -1127,6 +1192,415 @@ fn an_eval_run_is_addressed_like_a_session() {
         "{}",
         String::from_utf8_lossy(&conflicting.stderr)
     );
+}
+
+// ── Spend per pass and --require ──────────────────────────────────────────────
+
+/// One run of a synthetic record: its arm, repeat, outcome, check result and spend. A run never
+/// launched carries no session and no measures.
+fn synthetic_run(arm: &str, repeat: u32, outcome: &str, check: &str, spend: Option<u64>) -> Value {
+    let launched = outcome == "completed" || outcome == "launch_failed";
+    json!({
+        "arm": arm, "repeat": repeat, "order": 0,
+        "session_id": launched.then(|| format!("ses_{arm}{repeat}")),
+        "records_dir": launched.then(|| format!("/r/ses_{arm}{repeat}")),
+        "workdir": null, "start_sha256": null, "outcome": outcome,
+        "exit_status": launched.then_some("ok"), "check_result": check, "check": null,
+        "turns": launched.then_some(2), "input_tokens": launched.then_some(10),
+        "output_tokens": launched.then_some(5), "cached_tokens": null, "cache_write_tokens": null,
+        "agent_ms": launched.then_some(1000), "spend_tokens": spend, "scores_overall": null
+    })
+}
+
+/// A record of one checked case holding `runs`, with a variant arm when `paired`.
+fn checked_record(run_id: &str, paired: bool, complete: bool, runs: Vec<Value>) -> Value {
+    let mut arms = vec![
+        json!({"name": "baseline", "manifest": "/m/base/murmur.yaml", "manifest_sha256": "00", "model": "m"}),
+    ];
+    if paired {
+        arms.push(json!({"name": "variant", "manifest": "/m/variant/murmur.yaml", "manifest_sha256": "11", "model": "m"}));
+    }
+    json!({
+        "record_version": 1, "run_id": run_id, "started_at_ms": 1, "ended_at_ms": 2,
+        "complete": complete, "dataset": "/d/eval.jsonl", "repeat": 3, "arms": arms,
+        "cases": [{
+            "case_id": "gate", "task_path": "t.md", "start": null, "start_sha256": null,
+            "check": {"command": "make test", "files": null, "timeout_secs": 600},
+            "runs": runs
+        }]
+    })
+}
+
+/// The S2 record: baseline pass/fail/fail for 1000/1200/800 tokens, variant pass/pass/pass for
+/// 900/1100/1000.
+fn gate_record(run_id: &str) -> Value {
+    checked_record(
+        run_id,
+        true,
+        true,
+        vec![
+            synthetic_run("baseline", 0, "completed", "pass", Some(1000)),
+            synthetic_run("variant", 0, "completed", "pass", Some(900)),
+            synthetic_run("variant", 1, "completed", "pass", Some(1100)),
+            synthetic_run("baseline", 1, "completed", "fail", Some(1200)),
+            synthetic_run("baseline", 2, "completed", "fail", Some(800)),
+            synthetic_run("variant", 2, "completed", "pass", Some(1000)),
+        ],
+    )
+}
+
+struct Diff {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// `mur eval diff --run <record> <args>` on `record`, written to a scratch file.
+fn diff_record(world: &World, record: &Value, args: &[&str]) -> Diff {
+    let run_id = record["run_id"].as_str().unwrap();
+    let path = world.path(&format!("{run_id}.json"));
+    fs::write(&path, record.to_string()).unwrap();
+    let mut command = world.mur();
+    command.args(["eval", "diff", "--run", path.to_str().unwrap()]);
+    command.args(args);
+    let output = command.output().unwrap();
+    Diff {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+/// The requirements block's line for `requirement`.
+fn requirement_line<'a>(stdout: &'a str, requirement: &str) -> &'a str {
+    let block = stdout
+        .split("── requirements")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no requirements block in\n{stdout}"));
+    block
+        .lines()
+        .find(|line| line.split_whitespace().any(|word| word == requirement))
+        .unwrap_or_else(|| panic!("no line for {requirement} in\n{stdout}"))
+}
+
+#[test]
+fn spend_per_pass_and_requirements_read_from_the_record() {
+    let world = World::new();
+    let gate = gate_record("evr_0192aaaa000070008000000000003333");
+
+    // S2: the rows, and no threshold applies without --require.
+    let plain = diff_record(&world, &gate, &[]);
+    assert_eq!(plain.code, Some(0), "{}", plain.stderr);
+    assert_eq!(
+        cells(
+            row(&plain.stdout, "gate", "spend per pass"),
+            "spend per pass"
+        ),
+        ["3000", "1000", "-2000"]
+    );
+    assert_eq!(
+        cells(row(&plain.stdout, "gate", "spend"), "spend"),
+        ["1000 (800–1200)", "1000 (900–1100)", "+0"]
+    );
+    assert_eq!(
+        cells(total_row(&plain.stdout, "spend per pass"), "spend per pass"),
+        ["3000", "1000", "-2000"]
+    );
+    assert_eq!(
+        cells(total_row(&plain.stdout, "spend"), "spend"),
+        ["3000", "3000", "+0"]
+    );
+    assert!(!plain.stdout.contains("requirements"), "{}", plain.stdout);
+
+    let met = diff_record(
+        &world,
+        &gate,
+        &["--require", "passes>=3,spend-per-pass<=1000"],
+    );
+    assert_eq!(met.code, Some(0), "{}", met.stderr);
+    assert!(met.stdout.starts_with(&plain.stdout), "{}", met.stdout);
+    let passes = requirement_line(&met.stdout, "variant.passes>=3");
+    assert!(
+        passes.starts_with("  met ") && passes.ends_with("passes 3"),
+        "{passes}"
+    );
+    let per_pass = requirement_line(&met.stdout, "variant.spend-per-pass<=1000");
+    assert!(per_pass.starts_with("  met ") && per_pass.ends_with("spend per pass 1000"));
+
+    let unmet = diff_record(&world, &gate, &["--require", "spend-per-pass<=999"]);
+    assert_eq!(unmet.code, Some(1));
+    let line = requirement_line(&unmet.stdout, "variant.spend-per-pass<=999");
+    assert!(
+        line.starts_with("  not met ") && line.ends_with("spend per pass 1000"),
+        "{line}"
+    );
+    assert!(
+        unmet.stderr.contains("error[E-EVAL-005]"),
+        "{}",
+        unmet.stderr
+    );
+    assert!(
+        unmet
+            .stderr
+            .contains("1 of 1 requirements not met: variant.spend-per-pass<=999"),
+        "{}",
+        unmet.stderr
+    );
+
+    let lead = diff_record(&world, &gate, &["--require", "pass-lead>=4"]);
+    assert_eq!(lead.code, Some(1));
+    let line = requirement_line(&lead.stdout, "pass-lead>=4");
+    assert!(
+        line.starts_with("  not met ") && line.ends_with("pass lead 2"),
+        "{line}"
+    );
+    let strict = diff_record(&world, &gate, &["--require", "pass-lead>2"]);
+    assert_eq!(strict.code, Some(1), "{}", strict.stdout);
+    let below = diff_record(
+        &world,
+        &gate,
+        &["--require", "baseline.passes<2,pass-lead>1"],
+    );
+    assert_eq!(below.code, Some(0), "{}", below.stdout);
+
+    // S3: a requirement that does not parse is a usage error, and nothing reaches stdout.
+    for malformed in [
+        "cost<=5",
+        "passes=~3",
+        "passes>=-1",
+        "variant.pass-lead>=1",
+        "spend-per-pass<=abc",
+        "other.passes>=1",
+    ] {
+        let refused = diff_record(&world, &gate, &["--require", malformed]);
+        assert_eq!(refused.code, Some(2), "{malformed}: {}", refused.stderr);
+        assert!(refused.stdout.is_empty(), "{malformed}: {}", refused.stdout);
+        assert!(
+            refused.stderr.contains(&format!(
+                "invalid value '{malformed}' for '--require <REQ>'"
+            )),
+            "{malformed}: {}",
+            refused.stderr
+        );
+    }
+    let without_run = world
+        .mur()
+        .args(["eval", "diff", "--require", "passes>=1"])
+        .output()
+        .unwrap();
+    assert_eq!(without_run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&without_run.stderr).contains("--run"));
+
+    // S4: a one-arm record cannot answer pass-lead or variant., and the bare measure is the
+    // baseline's.
+    let single = checked_record(
+        "evr_0192aaaa000070008000000000004444",
+        false,
+        true,
+        vec![
+            synthetic_run("baseline", 0, "completed", "pass", Some(400)),
+            synthetic_run("baseline", 1, "completed", "fail", Some(600)),
+            synthetic_run("baseline", 2, "completed", "pass", Some(500)),
+        ],
+    );
+    for unanswerable in ["pass-lead>=0", "variant.passes>=1"] {
+        let refused = diff_record(&world, &single, &["--require", unanswerable]);
+        assert_eq!(refused.code, Some(1), "{unanswerable}");
+        assert!(refused.stdout.is_empty(), "{}", refused.stdout);
+        assert!(
+            refused.stderr.contains("error[E-EVAL-006]"),
+            "{}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains(&format!(
+                "--require {unanswerable}: run evr_0192aaaa000070008000000000004444 has one arm"
+            )),
+            "{}",
+            refused.stderr
+        );
+    }
+    let baseline = diff_record(&world, &single, &["--require", "passes>=1"]);
+    assert_eq!(baseline.code, Some(0), "{}", baseline.stderr);
+    assert_eq!(
+        cells(
+            row(&baseline.stdout, "gate", "spend per pass"),
+            "spend per pass"
+        ),
+        ["750"]
+    );
+    assert!(requirement_line(&baseline.stdout, "baseline.passes>=1").ends_with("passes 2"));
+
+    // S5: no pass, no recorded spend, and a run never launched.
+    let no_pass = checked_record(
+        "evr_0192aaaa000070008000000000005555",
+        true,
+        true,
+        vec![
+            synthetic_run("baseline", 0, "completed", "pass", Some(100)),
+            synthetic_run("variant", 0, "completed", "fail", Some(100)),
+            synthetic_run("variant", 1, "launch_failed", "fail", Some(50)),
+        ],
+    );
+    let zero = diff_record(&world, &no_pass, &["--require", "spend-per-pass<=1000000"]);
+    assert_eq!(zero.code, Some(1));
+    assert_eq!(
+        cells(
+            row(&zero.stdout, "gate", "spend per pass"),
+            "spend per pass"
+        ),
+        ["100", "no pass", "—"]
+    );
+    assert!(
+        requirement_line(&zero.stdout, "variant.spend-per-pass<=1000000")
+            .ends_with("no strict pass")
+    );
+
+    let mut unkeyed = gate_record("evr_0192aaaa000070008000000000006666");
+    for run in unkeyed["cases"][0]["runs"].as_array_mut().unwrap() {
+        run.as_object_mut().unwrap().remove("spend_tokens");
+    }
+    let old = diff_record(&world, &unkeyed, &["--require", "spend-per-pass<=1000000"]);
+    assert_eq!(old.code, Some(1));
+    assert_eq!(
+        cells(row(&old.stdout, "gate", "spend per pass"), "spend per pass"),
+        ["—", "—", "—"]
+    );
+    assert_eq!(
+        cells(row(&old.stdout, "gate", "spend"), "spend"),
+        ["—", "—", "—"]
+    );
+    assert_eq!(
+        cells(total_row(&old.stdout, "spend"), "spend"),
+        ["—", "—", "—"]
+    );
+    assert!(
+        requirement_line(&old.stdout, "variant.spend-per-pass<=1000000")
+            .ends_with("spend not recorded")
+    );
+    // Every other row reads as the same record with spend did.
+    let without_spend = |stdout: &str| -> String {
+        stdout
+            .lines()
+            .filter(|line| !is_row(line, "spend") && !is_row(line, "spend per pass"))
+            .take_while(|line| !line.starts_with("── requirements"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+            .trim_end()
+            .replace("6666", "3333")
+    };
+    assert_eq!(without_spend(&old.stdout), without_spend(&plain.stdout));
+
+    let staged = checked_record(
+        "evr_0192aaaa000070008000000000007777",
+        true,
+        true,
+        vec![
+            synthetic_run("baseline", 0, "completed", "pass", Some(700)),
+            synthetic_run("variant", 0, "stage_failed", "not_run", None),
+            synthetic_run("variant", 1, "completed", "pass", Some(300)),
+        ],
+    );
+    let counted = diff_record(&world, &staged, &["--require", "spend-per-pass<=300"]);
+    assert_eq!(counted.code, Some(0), "{}", counted.stdout);
+    assert_eq!(
+        cells(
+            row(&counted.stdout, "gate", "spend per pass"),
+            "spend per pass"
+        ),
+        ["700", "300", "-400"]
+    );
+
+    // S6: an incomplete record never meets its requirements.
+    let mut partial = gate_record("evr_0192aaaa000070008000000000008888");
+    partial["complete"] = json!(false);
+    partial["cases"][0]["runs"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(4);
+    let incomplete = diff_record(&world, &partial, &["--require", "passes>=1"]);
+    assert_eq!(incomplete.code, Some(1));
+    assert!(
+        incomplete
+            .stdout
+            .trim_end()
+            .ends_with("  not met  run is incomplete: 4 of 6 runs recorded"),
+        "{}",
+        incomplete.stdout
+    );
+    assert!(incomplete.stderr.contains("error[E-EVAL-005]"));
+    assert!(incomplete
+        .stderr
+        .contains("run evr_0192aaaa000070008000000000008888 is incomplete: 4 of 6 runs recorded"));
+
+    // S7: the JSON gains the spend keys always and the requirements only with --require.
+    let json_plain = diff_record(&world, &gate, &["--json"]);
+    assert_eq!(json_plain.code, Some(0));
+    let comparison: Value = serde_json::from_str(&json_plain.stdout).unwrap();
+    let variant = &comparison["cases"][0]["arms"]["variant"];
+    for key in [
+        "runs",
+        "check_pass",
+        "check_runs",
+        "check_not_run",
+        "turns",
+        "input_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "agent_ms",
+        "scores_pass",
+        "scores_runs",
+    ] {
+        assert!(variant.get(key).is_some(), "{key}: {variant}");
+    }
+    assert_eq!(
+        variant["spend_tokens"],
+        json!({"median": 1000.0, "min": 900, "max": 1100})
+    );
+    assert_eq!(variant["spend_per_pass"], 1000);
+    assert_eq!(comparison["total"]["baseline"]["spend_tokens"], 3000);
+    assert_eq!(comparison["total"]["baseline"]["spend_per_pass"], 3000);
+    assert!(comparison.get("requirements").is_none());
+    assert!(comparison.get("requirements_met").is_none());
+
+    let json_unmet = diff_record(
+        &world,
+        &gate,
+        &["--json", "--require", "spend-per-pass<=999"],
+    );
+    assert_eq!(json_unmet.code, Some(1));
+    assert!(json_unmet.stderr.contains("error[E-EVAL-005]"));
+    let comparison: Value = serde_json::from_str(&json_unmet.stdout).unwrap();
+    assert_eq!(comparison["requirements_met"], false);
+    assert_eq!(
+        comparison["requirements"],
+        json!([{
+            "requirement": "variant.spend-per-pass<=999", "arm": "variant",
+            "measure": "spend-per-pass", "op": "<=", "threshold": 999, "actual": 1000,
+            "met": false, "reason": null
+        }])
+    );
+    let json_met = diff_record(&world, &gate, &["--json", "--require", "pass-lead>=2"]);
+    assert_eq!(json_met.code, Some(0));
+    let comparison: Value = serde_json::from_str(&json_met.stdout).unwrap();
+    assert_eq!(comparison["requirements_met"], true);
+    assert_eq!(comparison["requirements"][0]["arm"], Value::Null);
+
+    // S8: a variant that fails every check and spends more still exits 0 without --require.
+    let worse = checked_record(
+        "evr_0192aaaa000070008000000000009999",
+        true,
+        true,
+        vec![
+            synthetic_run("baseline", 0, "completed", "pass", Some(100)),
+            synthetic_run("variant", 0, "completed", "fail", Some(5000)),
+        ],
+    );
+    let ungated = diff_record(&world, &worse, &[]);
+    assert_eq!(ungated.code, Some(0), "{}", ungated.stderr);
+    assert!(!ungated.stdout.contains("requirements"));
+    assert!(ungated.stderr.is_empty(), "{}", ungated.stderr);
 }
 
 // ── S10: a variant that cannot stage ──────────────────────────────────────────

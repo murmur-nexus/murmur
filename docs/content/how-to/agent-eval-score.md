@@ -437,6 +437,8 @@ mur eval diff --run
 ── case: fix-parser ────────────────────────
                        baseline                 variant                  delta (variant − baseline)
   check                1/3 pass                 3/3 pass                 +2
+  spend per pass       105462                   27043.3                  -78418.7
+  spend                35210 (31250–39002)      27120 (25480–28530)      -8090
   turns                4 (3–6)                  3 (3–4)                  -1
   input tokens         21840 (18210–30117)      15022 (14873–16540)      -6818
   cached tokens        9120 (0–11002)           8890 (7310–9020)         -230
@@ -447,7 +449,8 @@ mur eval diff --run
 ```
 
 The `check` row says which manifest's work passes: here the variant fixed the parser in all three
-runs and the baseline in one. Each measure is the median over the repeats with the min–max
+runs and the baseline in one. `spend per pass` divides the tokens each arm spent on the case by
+its passing runs, so a cheaper harness that passes less often does not read as cheaper. Each measure is the median over the repeats with the min–max
 spread, and the delta is the variant's median minus the baseline's. Run the printed
 `mur trace diff` line to see where a pair of sessions diverged. A total block after the cases sums
 every run.
@@ -461,6 +464,10 @@ ls -l ~/.murmur/records$(pwd)/workdir/evr_*.json
 For a program deciding whether to keep a change, `mur eval diff --run --json` prints the same
 comparison as one JSON object. See [`mur eval diff --run`](../reference/cli.md#mur-eval-diff-run)
 and the [eval-run record](../reference/observability-schemas.md#eval-run-record).
+
+To turn the comparison into a pass/fail gate with thresholds you choose, follow
+[Gate a runtime change on eval results](gate-a-runtime-change.md), which uses
+[`--require`](../reference/cli.md#mur-eval-diff-require).
 
 ---
 

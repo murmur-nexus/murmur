@@ -4232,7 +4232,7 @@ overall                  fail           pass
 #### Comparing the arms of an eval run { #mur-eval-diff-run }
 
 ```bash
-mur eval diff --run [<run>] [--workdir <dir>] [--json]
+mur eval diff --run [<run>] [--workdir <dir>] [--json] [--require <REQ>]…
 ```
 
 With `--run`, `mur eval diff` reads one [eval-run record](observability-schemas.md#eval-run-record)
@@ -4245,6 +4245,7 @@ instead of two sessions and prints how the baseline and the variant of that
 | `<run>` | `@1`, the most recent run | `@N` counting back from the newest run, the full `evr_` id, its last 4 or more characters (any case), or a path to the record file: anything containing `/` or ending `.json` |
 | `--workdir` | `./workdir` | The baseline's workdir root, `<baseline capsule dir>/workdir`, whose records group holds the run's record |
 | `--json` | off | Print the comparison as one JSON object |
+| `--require` | none | A threshold the run must meet, in the [requirement grammar](#mur-eval-diff-require). Repeatable, and one value may hold several separated by commas. Only with `--run` |
 
 `--run` and the two session arguments cannot be given together. A run that names nothing, an
 ordinal out of range and a group with no run are refused with [`E-EVAL-002`](diagnostics.md).
@@ -4263,6 +4264,8 @@ The output has a header, one block per case and a total block:
 ── case: fix_parser ────────────────────────
                        baseline                 variant                  delta (variant − baseline)
   check                1/3 pass                 3/3 pass                 +2
+  spend per pass       105462                   27043.3                  -78418.7
+  spend                35210 (31250–39002)      27120 (25480–28530)      -8090
   turns                4 (3–6)                  3 (3–4)                  -1
   input tokens         21840 (18210–30117)      15022 (14873–16540)      -6818
   cached tokens        9120 (0–11002)           8890 (7310–9020)         -230
@@ -4275,14 +4278,22 @@ The output has a header, one block per case and a total block:
 | Row | Each column | Delta |
 |---|---|---|
 | `check` | `k/n pass` over the arm's runs, plus `(j not run)` when a run never reached its check; `—` for a case with no check | Variant passes minus baseline passes |
-| `turns`, `input tokens`, `cached tokens`, `cache write tokens`, `output tokens`, `time` | The median with the min–max spread when the arm has more than one run, the value itself for one, `—` when no run reported it | Variant median minus baseline median |
+| `spend per pass` | The arm's spend over its runs of the case divided by its strict passes on the case, as an integer or with one decimal. `no pass` when the arm has no strict pass; `—` for a case with no check, or when a launched run recorded no spend | Variant number minus baseline number, `—` unless both are numbers |
+| `spend`, `turns`, `input tokens`, `cached tokens`, `cache write tokens`, `output tokens`, `time` | The median with the min–max spread when the arm has more than one run, the value itself for one, `—` when no run reported it | Variant median minus baseline median |
 | `scorers` | `k/n pass` of the runs' `murmur/hook-eval` overall; printed only when some run has one | Variant passes minus baseline passes |
+
+A *strict pass* is a run whose check result is `pass`. `spend` is the tokens the session's spend
+meter was charged, the number [`inference.max_session_tokens`](manifest.md#field-inference)
+counts, as the run's [`spend_tokens`](observability-schemas.md#eval-run-record) records it. It is
+tokens, never money: convert it with your own price. In `spend per pass`, a run that staging
+refused or whose start did not match was never launched and adds 0 tokens.
 
 `time` is the agent's own time, the sum of the session's `task_end.duration_ms`. Tokens are the
 provider's counts as the trace records them; `cached tokens` and `cache write tokens` are counted
 beside `input tokens`, never inside them. Each repeat ends with the `mur trace diff` line pairing
 its two sessions. The total block sums every run of each arm, and its delta is the difference of
-the sums. A run with no variant prints one column and no delta; an interrupted run's header reads
+the sums. Its `spend per pass` is the arm's spend over every run of a case that has a check,
+divided by the arm's strict passes over every case. A run with no variant prints one column and no delta; an interrupted run's header reads
 `incomplete: k of m runs recorded`.
 
 With `--json`:
@@ -4300,6 +4311,8 @@ With `--json`:
     "arms": {
       "baseline": {
         "runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0,
+        "spend_tokens": {"median": 35210.0, "min": 31250, "max": 39002},
+        "spend_per_pass": 105462,
         "turns": {"median": 4.0, "min": 3, "max": 6},
         "input_tokens": {…}, "cached_tokens": {…}, "cache_write_tokens": {…},
         "output_tokens": {…}, "agent_ms": {…},
@@ -4309,7 +4322,7 @@ With `--json`:
     },
     "trace_diffs": [["<baseline trace.jsonl>", "<variant trace.jsonl>"], …]
   }],
-  "total": {"baseline": {"runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0, "turns": 13, …}, "variant": {…}}
+  "total": {"baseline": {"runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0, "spend_tokens": 105462, "spend_per_pass": 105462, "turns": 13, …}, "variant": {…}}
 }
 ```
 
@@ -4317,11 +4330,62 @@ With `--json`:
 |---|---|
 | `cases[].arms.<arm>.<measure>` | `{median, min, max}` over the runs that reported the measure, or `null` when none did. `median` is a number that may be fractional: the mean of the middle two for an even count |
 | `cases[].arms.<arm>.check_pass`, `check_runs`, `check_not_run` | The `check` row's counts. `check_runs` is 0 for a case with no check |
+| `cases[].arms.<arm>.spend_per_pass` | The `spend per pass` row's number, or `null` for a case with no check, an arm with no strict pass, or a launched run that recorded no spend |
 | `cases[].arms.<arm>.scores_pass` | Runs whose hook-eval overall is `pass`, or `null` when no run has one |
-| `total.<arm>` | The same counts, and each measure summed over every run of the arm, `null` when no run reported it |
+| `total.<arm>` | The same counts, each measure summed over every run of the arm (`null` when no run reported it), and the total block's `spend_per_pass` |
+| `requirements` | With `--require` only: one object per requirement, keys below |
+| `requirements_met` | With `--require` only: `true` when every requirement is met and the record is complete |
+
+| `requirements[]` key | Value |
+|---|---|
+| `requirement` | The requirement with its arm named, for example `variant.spend-per-pass<=400000` |
+| `arm` | `baseline`, `variant`, or `null` for `pass-lead` |
+| `measure` | `passes`, `spend-per-pass` or `pass-lead` |
+| `op` | `>=`, `<=`, `>` or `<` |
+| `threshold` | The number given |
+| `actual` | The run's number, or `null` when there is none to compare |
+| `met` | Whether `actual op threshold` holds; `false` when `actual` is `null` |
+| `reason` | `no strict pass` or `spend not recorded` when `actual` is `null`, otherwise `null` |
 
 An outer capsule that edits a harness reads `cases[].arms.variant.check_pass` against
 `check_runs` to decide whether the change helped, and the measures to weigh what it cost.
+
+##### Requirements { #mur-eval-diff-require }
+
+`--require` states a threshold the run must meet. Murmur ships no threshold: without `--require`,
+`mur eval diff --run` exits `0` whatever the checks say. A requirement is
+`[baseline.|variant.]<measure><op><number>`, written without spaces:
+
+| Measure | The number it compares | Threshold |
+|---|---|---|
+| `passes` | The arm's strict passes over every case | A whole number, 0 or more |
+| `spend-per-pass` | The arm's total `spend per pass` | A number of tokens, 0 or more, with an optional decimal fraction |
+| `pass-lead` | The variant's strict passes minus the baseline's | A whole number, which may be negative. Takes no arm prefix |
+
+The operator is `>=`, `<=`, `>` or `<`; quote the requirement so the shell does not read it as a
+redirection: `--require 'variant.passes>=3'`. A `passes` or `spend-per-pass` requirement without a
+prefix applies to the variant when the run has one, otherwise to the baseline. A
+`spend-per-pass` requirement on an arm with no strict pass, or with a launched run that recorded
+no spend, is not met.
+
+The comparison prints as without `--require`, then the requirements block:
+
+```text
+── requirements ────────────────────────
+  met      pass-lead>=4                 pass lead 6
+  not met  variant.spend-per-pass<=999  spend per pass 1000
+  not met  run is incomplete: 4 of 6 runs recorded
+```
+
+Each line states the requirement with its arm named and the run's number, or why there is none.
+The last line appears only for an incomplete record.
+
+| Outcome | Exit | Code |
+|---|---|---|
+| Every requirement met and the record complete | `0` | — |
+| A requirement not met, or the record incomplete. The comparison, human or `--json`, is printed first | `1` | [`E-EVAL-005`](diagnostics.md) |
+| `pass-lead` or a `variant.` requirement on a run with no variant. Nothing is printed | `1` | [`E-EVAL-006`](diagnostics.md) |
+| A requirement that does not parse | `2` | usage error, `invalid value '<REQ>' for '--require <REQ>'` |
 
 ### `mur eval run`
 

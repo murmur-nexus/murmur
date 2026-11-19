@@ -444,6 +444,24 @@ where
 }
 
 impl InferenceEvent {
+    /// What the spend meter was charged for this call, as far as the line states it: the
+    /// provider's request (`input + cached + cache_write`) and output when the driver reported
+    /// both counts, the runtime's own `input_tokens + output_tokens` otherwise. Thinking is never
+    /// added. An agent-loop call that failed with no provider report carries neither token key
+    /// and reads `0`, although the meter charged it the runtime's input estimate.
+    fn charge(&self) -> u64 {
+        match (self.input_tokens_actual, self.output_tokens_actual) {
+            (Some(input), Some(output)) => input
+                .saturating_add(self.cached_tokens.unwrap_or(0))
+                .saturating_add(self.cache_write_tokens.unwrap_or(0))
+                .saturating_add(output),
+            _ => self
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(self.output_tokens.unwrap_or(0)),
+        }
+    }
+
     /// The call's failure, when the record says it failed.
     fn failure(&self) -> Option<FailedCall> {
         self.error_code.as_ref().map(|code| FailedCall {
@@ -1125,6 +1143,10 @@ struct InferenceRetryEvent {
     /// `hook:<name>` for a hook's `run-inference` call; absent for an agent-loop turn.
     #[serde(default)]
     origin: Option<String>,
+    /// What the spend meter was charged for the failed attempt: `0` for a `"status"` or
+    /// `"connection"` failure, the provider's counts or the input estimate for a `"driver"` one.
+    #[serde(default)]
+    charged_tokens: u64,
 }
 
 impl InferenceRetryEvent {
@@ -1797,6 +1819,9 @@ struct TraceMetrics {
     total_turns: u32,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    /// What the session's spend meter was charged, read back from its lines: every `inference`
+    /// line's [`InferenceEvent::charge`] plus every `inference_retry` line's `charged_tokens`.
+    spend_tokens: u64,
     total_tool_calls: u32,
     tool_ok: u32,
     tool_error: u32,
@@ -2734,6 +2759,7 @@ fn compute_metrics(
     let mut seen_turns = 0u32;
     let mut seen_input_tokens = 0u64;
     let mut seen_output_tokens = 0u64;
+    let mut spend_tokens = 0u64;
     let mut seen_shell_calls = 0u32;
     let mut tool_ok = 0u32;
     let mut tool_error = 0u32;
@@ -2801,6 +2827,7 @@ fn compute_metrics(
         match event {
             TraceEvent::SessionStart(e) => ss = Some(e),
             TraceEvent::Inference(e) => {
+                spend_tokens = spend_tokens.saturating_add(e.charge());
                 // Summed over every record that reported them, a hook's `run-inference`
                 // included: these are what the provider billed the session for.
                 if e.input_tokens_actual.is_some()
@@ -3171,7 +3198,10 @@ fn compute_metrics(
             }
             // Rendered in the step list; the summary has no spend section.
             TraceEvent::SpendCeilingReached(_) => {}
-            TraceEvent::InferenceRetry(e) => retries.push((e.turn, e.row())),
+            TraceEvent::InferenceRetry(e) => {
+                spend_tokens = spend_tokens.saturating_add(e.charged_tokens);
+                retries.push((e.turn, e.row()));
+            }
             TraceEvent::CallDeadline(e) => call_deadlines.push(e.row()),
             TraceEvent::ControlChange(change) => control_changes.push(ControlChangeRecord {
                 change,
@@ -3266,6 +3296,7 @@ fn compute_metrics(
             total_turns: se.total_turns,
             total_input_tokens: se.total_input_tokens,
             total_output_tokens: se.total_output_tokens,
+            spend_tokens,
             total_tool_calls: se.total_tool_calls,
             tool_ok,
             tool_error,
@@ -3353,6 +3384,9 @@ pub(super) struct EvalTraceSummary {
     /// `None` when no turn's driver reported the count.
     pub(super) cached_tokens: Option<u64>,
     pub(super) cache_write_tokens: Option<u64>,
+    /// The tokens the session's spend meter was charged, as `inference.max_session_tokens`
+    /// counts them, read back from the trace's lines.
+    pub(super) spend_tokens: u64,
     /// The sum of every `task_end.duration_ms`: the agent's own time, without staging or teardown.
     pub(super) agent_ms: u64,
     pub(super) exit_status: String,
@@ -3373,6 +3407,7 @@ pub(super) fn eval_trace_summary(path: &Path) -> Result<EvalTraceSummary, CliErr
             .unwrap_or(metrics.total_output_tokens),
         cached_tokens: provider.and_then(|tokens| tokens.cached),
         cache_write_tokens: provider.and_then(|tokens| tokens.cache_write),
+        spend_tokens: metrics.spend_tokens,
         agent_ms: tasks.iter().map(|task| task.duration_ms).sum(),
         exit_status: metrics.exit_status,
     })
@@ -7348,6 +7383,46 @@ mod tests {
         let path = dir.path().join("trace.jsonl");
         std::fs::write(&path, lines).unwrap();
         (dir, path)
+    }
+
+    /// `spend_tokens` of a trace holding `UNENDED_START` and then `lines`.
+    fn spend_of(lines: &[&str]) -> u64 {
+        let mut trace = format!("{UNENDED_START}\n");
+        for line in lines {
+            trace.push_str(line);
+            trace.push('\n');
+        }
+        let (_dir, path) = trace_of(&trace);
+        eval_trace_summary(&path)
+            .expect("the trace reads")
+            .spend_tokens
+    }
+
+    /// Each line is charged as the spend meter charged its call: the provider's request and
+    /// output when both counts are on the line, the runtime's counts otherwise, a retry's
+    /// `charged_tokens` as written, and thinking never.
+    #[test]
+    fn spend_reads_each_call_as_the_meter_charged_it() {
+        let provider = r#"{"event_type":"inference","turn":0,"input_tokens":90,"output_tokens":4,"input_tokens_actual":100,"output_tokens_actual":5,"cached_tokens":25,"cache_write_tokens":7,"thinking_tokens":300,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[provider]), 100 + 25 + 7 + 5);
+
+        // An input count alone is no report: the runtime's own counts are charged.
+        let runtime = r#"{"event_type":"inference","turn":0,"input_tokens":90,"output_tokens":4,"input_tokens_actual":100,"cached_tokens":25,"thinking_tokens":300,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[runtime]), 94);
+
+        let process = r#"{"event_type":"inference","turn":0,"transport":"process","input_tokens":40,"output_tokens":20,"cached_tokens":1000,"decision":"end_turn","tool_name":null}"#;
+        assert_eq!(spend_of(&[process]), 60);
+
+        let failed = r#"{"event_type":"inference","turn":1,"decision":"error","stop_reason":"error","error_code":"driver_error","error":"HTTP 500: boom","tool_name":null}"#;
+        assert_eq!(spend_of(&[failed]), 0);
+
+        let retry = r#"{"event_type":"inference_retry","turn":0,"attempt":1,"max_retries":6,"reason":"driver","error":"stream broke","delay_ms":8,"charged_tokens":120}"#;
+        let released = r#"{"event_type":"inference_retry","turn":0,"attempt":2,"max_retries":6,"reason":"status","provider_status":429,"error":"HTTP 429","delay_ms":8,"charged_tokens":0}"#;
+        assert_eq!(spend_of(&[retry]), 120);
+        assert_eq!(
+            spend_of(&[retry, released, provider, runtime, process, failed]),
+            120 + 137 + 94 + 60
+        );
     }
 
     /// The harness section shows the latest window per name, in the order names were first
