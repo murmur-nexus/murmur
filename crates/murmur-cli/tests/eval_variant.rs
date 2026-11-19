@@ -1716,7 +1716,7 @@ fn an_old_dataset_runs_as_it_always_has() {
     assert!(row(&diff, "old_1", "check").contains('—'), "{diff}");
 }
 
-// ── S12: check results as attachments ─────────────────────────────────────────
+// ── Check results as attachments ──────────────────────────────────────────────
 
 /// Every `attachments/*.json` of `records_dir`, as (file stem, parsed body), ordered by name.
 fn attachments_of(records_dir: &Path) -> Vec<(String, Value)> {
@@ -1853,6 +1853,12 @@ fn a_check_result_is_attached_to_its_session() {
         assert_eq!(report["attachments"][0]["status"], "matches", "{report:#}");
         assert_eq!(report["attachments"][0]["attachment_id"], id.as_str());
         assert_eq!(report["attachments"][0]["value"], value);
+        assert_eq!(
+            report["attachments"][0]["evaluator"],
+            format!("check: {command}")
+        );
+        let seal = read_json(&records_dir.join("trace.jsonl.seal"));
+        assert_eq!(report["attachments"][0]["record_head"], seal["head"]);
         ids.push((value, id));
     }
 

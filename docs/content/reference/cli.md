@@ -4045,8 +4045,8 @@ a consumer ignores keys it does not know.
 #### Attachments { #mur-trace-verify-attachments }
 
 After the record, `mur trace verify` lists every attachment [`mur trace attach`](#mur-trace-attach)
-or [`mur eval run`](#mur-eval-run) wrote under the records directory's `attachments/`, oldest first, and says whether each points at
-the head that verified:
+or [`mur eval run`](#mur-eval-run) wrote under the records directory's `attachments/`, oldest
+first, and says whether each points at the head that verified:
 
 | Status | When |
 |---|---|
