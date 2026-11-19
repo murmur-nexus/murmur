@@ -77,6 +77,10 @@ pub const COMPLETION_STREAM: &str = crate::delegation::COMPLETION_FILE;
 pub const CONVERSATION_STREAM_PREFIX: &str = "conversation:";
 /// `~/.murmur/conversations`, relative to the murmur home: where conversation records live.
 pub const CONVERSATIONS_DIR: &str = crate::conversation::CONVERSATION_ROOT_DIR;
+/// A records directory's, or a conversation context directory's, content-addressed blobs.
+pub const BLOBS_DIR: &str = crate::trace_blobs::BLOB_DIR_NAME;
+/// A conversation record's file name in its context directory.
+pub const CONVERSATION_RECORD_FILE: &str = crate::conversation::RECORD_FILE_NAME;
 /// The `session_id` a conversation seal carries when no session rewrote it: `mur conversation`
 /// truncating a record from the command line.
 pub const CLI_SEALER: &str = "mur conversation";

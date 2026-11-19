@@ -308,6 +308,8 @@ can say whether any of them changed, given only the public key. The format, the 
 each seal is written and what is not sealed are under
 [Sealed records](observability-schemas.md#sealed-records). No capsule command reaches
 `~/.murmur/keys` at `scoped` or `sealed` ([containment](containment.md#record-seal-key)).
+[`mur trace export`](cli.md#mur-trace-export) packs these sealed files, the blobs and the
+attachments into one [run bundle](run-bundle.md) that verifies on another machine.
 
 Beside the session directories, a group holds one [eval-run record](observability-schemas.md#eval-run-record),
 `evr_<32 hex>.json`, for each `mur eval run` whose baseline capsule's workdir root it is.

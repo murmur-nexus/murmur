@@ -2000,6 +2000,9 @@ Deleting a stream together with its seal reads as `absent`, and `trace.jsonl.sea
 To keep a copy of each session's head that nothing on the host can rewrite, export spans to an
 OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-span-emission).
 
+To hand a sealed record to someone else, pack it with its blobs, attachments and conversation
+record as a [run bundle](run-bundle.md).
+
 ### Attachments { #record-attachments }
 
 An attachment is an outside party's judgment of a sealed record — a reviewer's, a CI job's, a

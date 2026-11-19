@@ -190,6 +190,7 @@ nav:
       - Control Surface: reference/control-surface.md
       - Agent Card: reference/agent-card.md
       - Observability Schemas: reference/observability-schemas.md
+      - Run Bundles: reference/run-bundle.md
       - Streaming Protocol: reference/streaming-protocol.md
       - Untrusted Fence: reference/untrusted-fence.md
       - Default Artifacts: reference/default-artifacts.md

@@ -132,12 +132,14 @@ pub(crate) struct AttachmentEntry {
     pub(crate) detail: String,
 }
 
-/// `mur trace verify --json`: the record report with `attachments` appended.
+/// `mur trace verify --json`: the record report with `attachments` and `bundle` appended.
 #[derive(Serialize)]
 pub(crate) struct VerifyOutput<'a> {
     #[serde(flatten)]
     pub(crate) report: &'a RecordReport,
     pub(crate) attachments: &'a [AttachmentEntry],
+    /// The bundle checks with `--bundle`; `null` without.
+    pub(crate) bundle: Option<&'a crate::commands::trace_export::BundleReport>,
 }
 
 /// `mur trace attach --json`: the attachment's keys, then the file written.

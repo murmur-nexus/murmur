@@ -36,6 +36,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
 | `mur trace verify` | Check a session's sealed records with the host's public key alone, naming the first line that changed |
 | `mur trace attach` | Attach an outside party's judgment to a session's sealed record, as a separate file |
+| `mur trace export` | Pack one ended session's sealed record into a bundle that verifies anywhere with the host's public key |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions, or with `--run` the arms of one `mur eval run` |
 | `mur eval run` | Drive a multi-case dataset against a capsule, and optionally a variant, and judge each run by the case's check |
@@ -101,6 +102,7 @@ loses its key.
 | `run --roster --json` | 1 | [Launching a formation](#mur-run-roster) |
 | `token` | 1 | [`mur token`](#mur-token): standard output is the token |
 | `trace attach --json` | 1 | [`mur trace attach`](#mur-trace-attach) |
+| `trace export --json` | 1 | [`mur trace export`](#mur-trace-export) |
 | `trace list --json` | 1 | [`mur trace list`](#mur-trace-list) |
 | `trace rm --json` | 1 | [`mur trace rm`](#mur-trace-rm) |
 | `trace verify --json` | 1 | [`mur trace verify`](#mur-trace-verify) |
@@ -3120,9 +3122,10 @@ The second line is printed only when a blob was removed. A record already at or 
 ## `mur trace`
 
 Read, analyze and [verify](#mur-trace-verify) `trace.jsonl` files produced by `mur run`,
-[attach](#mur-trace-attach) judgments to them, and remove ended sessions. Every command but
-[`mur trace rm`](#mur-trace-rm) and [`mur trace attach`](#mur-trace-attach) is read-only: it
-modifies no file and launches no capsule.
+[attach](#mur-trace-attach) judgments to them, [export](#mur-trace-export) them as bundles, and
+remove ended sessions. Every command but [`mur trace rm`](#mur-trace-rm),
+[`mur trace attach`](#mur-trace-attach) and [`mur trace export`](#mur-trace-export) is read-only:
+it modifies no file and launches no capsule. `mur trace export` writes only the bundle.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -3986,12 +3989,14 @@ them, with the host's public key and nothing else.
 
 ```bash
 mur trace verify [<session>] [--workdir <dir>] [--public-key <file>] [--json]
+mur trace verify --bundle <path> [--public-key <file>] [--json]
 ```
 
 | Argument / Flag | Default | Description |
 |---|---|---|
 | `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), a records directory, or a `trace.jsonl` path. A copied record is checked where it lies |
 | `--workdir` | `./workdir` | The workdir root whose sessions are read, as under [`mur trace show`](#mur-trace-show) |
+| `--bundle` | — | A [run bundle](run-bundle.md), a directory or a `.zip`, to check instead of a session; see [Bundles](#mur-trace-verify-bundle). Cannot be combined with `<session>` or `--workdir` |
 | `--public-key` | `~/.murmur/keys/record-seal.pub` | The record-seal public key to check against: 64 hex characters. Pass the `record-seal.pub` of the host that ran the session to verify its record anywhere |
 | `--json` | off | Print one JSON object, the stable interface below, instead of the table |
 
@@ -4026,6 +4031,7 @@ status still follows it:
 | `verdict` | string | The worst stream verdict: `verified`, `unverifiable`, `unsealed` or `changed`; `absent` when no stream exists |
 | `streams` | array | One object per stream, below |
 | `attachments` | array | One object per [attachment](#mur-trace-verify-attachments); `[]` when there are none |
+| `bundle` | object or `null` | The [bundle checks](#mur-trace-verify-bundle) with `--bundle`; always present, `null` without it |
 
 | Stream key | Type | Meaning |
 |---|---|---|
@@ -4093,7 +4099,67 @@ Every key but `file`, `status` and `detail` is `null` for an `unreadable` entry.
 | `1` | [`E-TRC-005`](diagnostics.md#e-trc-005): a stream is `unverifiable`, and none is changed or unsealed; also a `--public-key` file that cannot be read |
 | `1` | `E-TRC-001`: the directory holds no `trace.jsonl`; `E-TRC-002`: the address names no session |
 
-The exit status follows the record alone: no attachment status changes it.
+No attachment status changes the exit status.
+
+#### Bundles { #mur-trace-verify-bundle }
+
+`mur trace verify --bundle <path>` checks a [run bundle](run-bundle.md) written by
+[`mur trace export`](#mur-trace-export). Its only inputs are the bundle and the public key: it
+reads no records directory and no conversation record on this host. A `.zip` is extracted into a
+private temporary directory, removed when the command ends.
+
+It checks, in order:
+
+1. Every stream of the bundle, as above, with the conversation record read from the bundle's
+   `conversations/`. `records_dir` is the bundle path as given.
+2. Every attachment, as above.
+3. Every file of the bundle against its name and `bundle.json`.
+
+| Check | Finding (`changed`) or note |
+|---|---|
+| A file directly under `blobs/` or `conversations/<record>/<context-id>/blobs/` named by 64 lowercase hex characters hashes to its name | Finding: `blobs/<name>: holds bytes whose sha256 is <actual>, not the <name> it is named by` |
+| A blob's name appears in `trace.jsonl` or the packed `conversation.jsonl` | Note: `<path> is not named by any sealed line of the record` |
+| A file under a `blobs/` has a blob name | Note: `<path> is not a blob name` |
+| Every file `bundle.json` lists is held | Finding: `bundle.json lists <path> (<bytes> bytes, sha256 <x>), which the bundle does not hold` |
+| Every listed file has the listed size and SHA-256 | Finding: `bundle.json lists sha256 <x> for <path>; the file holds <y>` |
+| Every file held is listed | Note: `<path> is not listed in bundle.json` |
+| The bundle holds no link or other non-regular file | Finding: `<path> is a symbolic link or not a regular file` |
+| `bundle.json`'s `session_id` is the trace's | Finding: `bundle.json names session <a>; trace.jsonl is session <b>` |
+
+A finding makes the bundle `changed`; a note changes nothing. The command's verdict, the
+`record:` line and the JSON `verdict` are the worse of the record's and the bundle's. Without
+`--json`, a `bundle:` block follows the attachments:
+
+```text
+record: changed, checked with key 1508dc0fd94150e8 (/home/me/a.pub)
+attachments:
+  att_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b  ci  matches  0.75  points at the verified head, trace.jsonl line 14
+bundle: changed, 9 files listed in bundle.json, exported 1763531234567 by mur 1.0.0
+  blobs/0a11…f264  changed  blobs/0a11…f264: holds bytes whose sha256 is 4aa0…6ffe, not the 0a11…f264 it is named by
+  blobs/0a11…f264  changed  bundle.json lists sha256 0a11…f264 for blobs/0a11…f264; the file holds 4aa0…6ffe
+  note: notes.txt is not listed in bundle.json
+error[E-TRC-003]: the bundle of session ses_01a1… has changed: blobs/0a11…f264: holds bytes whose sha256 is 4aa0…6ffe, not the 0a11…f264 it is named by
+```
+
+| `bundle` key | Type | Meaning |
+|---|---|---|
+| `path` | string | The bundle path as given, made absolute |
+| `format` | string | `bundle.json`'s `format`: `murmur.bundle/1` |
+| `session_id` | string or `null` | `bundle.json`'s `session_id` |
+| `exported_at` | integer | `bundle.json`'s `exported_at`, milliseconds since the epoch |
+| `verdict` | string | `verified`, or `changed` with any finding |
+| `files` | integer | The number of entries in `bundle.json`'s `files` |
+| `findings` | array | One `{"path", "verdict", "detail"}` per finding; `verdict` is `changed` |
+| `notes` | array of strings | One sentence per note |
+
+The exit status follows the command's verdict as in the table above. When only the bundle is
+`changed`, the message reads `the bundle of session <id> has changed: <first finding>`.
+
+| Exit | When |
+|---|---|
+| `1` | [`E-TRC-009`](diagnostics.md#e-trc-009): the path does not exist, a zip entry is refused (a `..` component, a symbolic link, a non-regular file, two entries of one name), or `bundle.json` is absent, not a regular file, not JSON, or not `murmur.bundle/1`. No report is printed |
+| `1` | `E-TRC-001`: the bundle holds no `trace.jsonl` and no finding |
+| `2` | `--bundle` together with `<session>` or `--workdir` |
 
 ### `mur trace attach` { #mur-trace-attach }
 
@@ -4150,6 +4216,73 @@ These keys are a stable interface, on the same terms as `mur trace verify --json
 | `1` | [`E-TRC-006`](diagnostics.md#e-trc-006): the evaluator, the value or an `--event` is refused |
 | `1` | [`E-TRC-007`](diagnostics.md#e-trc-007): the file cannot be written |
 | `2` | Neither or both of `--value` and `--value-file`, or no `--evaluator` |
+
+### `mur trace export` { #mur-trace-export }
+
+Pack one ended session's sealed record into a [run bundle](run-bundle.md): a directory, or a
+`.zip` holding the same tree. [`mur trace verify --bundle`](#mur-trace-verify-bundle) checks it
+on any machine with the host's public key.
+
+```bash
+mur trace export <session> [--out <path>] [--workdir <dir>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | required | A [session address](#session-addresses), a records directory, or a `trace.jsonl` path |
+| `--out` | `./<session-id>.bundle.zip` | Where to write the bundle. A path ending in `.zip`, in any case, is written as a zip file; any other path as a directory. Must not exist |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read, as under [`mur trace show`](#mur-trace-show) |
+| `--json` | off | Print one JSON object, the stable interface below |
+
+The bundle holds the record's streams and seals, its `blobs/`, its `attachments/`, and the
+conversation record `trace.jsonl.seal` names, with `bundle.json` listing every file;
+[Layout](run-bundle.md#layout) lists what is packed and what is not. Directories are created at
+`0700`, files and the zip at `0600`. The records directory and the conversation record are only
+read.
+
+Before writing, it checks, in order:
+
+| Check | Refused with |
+|---|---|
+| The address names a session | `E-TRC-002` |
+| The session is not running | [`E-RUN-024`](diagnostics.md#e-run-024): `session <id> is still running (pid <pid>); nothing was exported` |
+| `--out` does not exist, as a file, a directory or a link | [`E-TRC-008`](diagnostics.md#e-trc-008): `<path> already exists; nothing was exported` |
+| The records directory holds a `trace.jsonl` | `E-TRC-001` |
+| No stream, seal, or entry of `blobs/` or `attachments/` is a link or a non-regular file | [`E-TRC-008`](diagnostics.md#e-trc-008): `<file> in <dir> is a symbolic link; nothing was exported` |
+
+A bundle that cannot be written fails with [`E-TRC-008`](diagnostics.md#e-trc-008), `the bundle
+<path> cannot be written: <reason>`, and everything the command created is removed. A refused or
+failed export leaves no file behind.
+
+It then reports the record as this host sees it, checked as [`mur trace verify`](#mur-trace-verify)
+checks it with this host's key:
+
+```text
+exported session ses_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b to /home/me/project/ses_019a3c5e7b2f7c1e9d4a6b8c0e2f4a6b.bundle.zip
+9 files, 48213 bytes
+record: verified
+```
+
+The count and size are those of the files `bundle.json` lists. For any verdict but `verified`
+the last line adds the finding: `record: changed: trace.jsonl line 3: …`. The export exits 0
+whatever the verdict: whoever receives the bundle verifies it.
+
+With `--json` it prints one pretty-printed JSON object and nothing else on stdout. These keys are
+a stable interface, on the same terms as `mur trace verify --json`:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `session_id` | string or `null` | The session exported |
+| `path` | string | The bundle written, absolute |
+| `form` | string | `directory` or `zip` |
+| `files` | integer | The number of files `bundle.json` lists |
+| `bytes` | integer | Their total size |
+| `verdict` | string | The record's verdict on this host: `verified`, `unverifiable`, `unsealed` or `changed` |
+
+| Exit | When |
+|---|---|
+| `0` | The bundle was written |
+| `1` | `E-TRC-001`, `E-TRC-002`, [`E-RUN-024`](diagnostics.md#e-run-024) or [`E-TRC-008`](diagnostics.md#e-trc-008), as above |
 
 ---
 
