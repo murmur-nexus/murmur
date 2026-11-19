@@ -461,8 +461,7 @@ struct SessionStartEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     formation_callees: Option<Vec<String>>,
     /// `trace.sync`: when this session's own lines reach the disk. Written only when the field is
-    /// set; absent rather than `null` otherwise, so a trace from a capsule without it is
-    /// byte-identical.
+    /// set; absent rather than `null` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_sync: Option<SessionTraceSync>,
 }

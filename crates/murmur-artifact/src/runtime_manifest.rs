@@ -7710,7 +7710,7 @@ mod tests {
             ("  sync: 0s\n", "0s"),
             ("  sync:\n", ""),
             ("  sync:\n    every: line\n", "every"),
-            ("  sync: [line]\n", "line"),
+            ("  sync: [line]\n", "Sequence"),
         ] {
             match trace_sync_of(line) {
                 Err(RuntimeManifestError::InvalidTraceConfig { field, message }) => {

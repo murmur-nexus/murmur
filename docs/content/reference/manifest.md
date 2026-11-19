@@ -1566,21 +1566,21 @@ disk:
 | `trace.sync` | Each line is on disk |
 |---|---|
 | Omitted | Whenever the kernel writes it back. No sync call is made. |
-| `line` | Before the call that wrote it returns (`fdatasync`). |
-| A duration, such as `5s` | No later than that long after it was written. `session_end` is on disk before the session's ending returns. |
+| `line` | As it is written: each line is synced (`fdatasync`) before the next one is written. |
+| A duration, such as `5s` | No later than that long after it was written. `session_end` is synced as the session ends. |
 
 The first sync also syncs the session's records directory and the directory holding it, so the
 file's own directory entry is on disk. The
 [`session_start` event](observability-schemas.md#session-trace-tracejsonl) records the setting as
-`trace_sync`. The lines, their `prev_hash` chain, `trace.jsonl.seal` and the verdict of
-[`mur trace verify`](cli.md#mur-trace-verify) are the same with and without the field.
+`trace_sync`. Syncing does not change how the trace is chained or sealed:
+[`mur trace verify`](cli.md#mur-trace-verify) checks a synced trace the same way.
 
 `trace.sync` does not cover:
 
 - Any file other than `trace.jsonl`: `blobs/`, `trace.jsonl.seal`, `hooks/eval.jsonl`,
   `completion.json` and the conversation records are not synced.
 - A line another process appends to the file, such as the `shell_lost` line a later launch writes
-  into an earlier session's trace. That line is written under the other process's own `trace.sync`.
+  into an earlier session's trace. That line is not synced, whatever either capsule sets.
 - Killing the process. A `SIGKILL` loses no written line with or without the field, because the
   kernel holds the lines. The field makes them survive a power loss or a kernel panic.
 
