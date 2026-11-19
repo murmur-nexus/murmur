@@ -33,6 +33,10 @@ pub(crate) mod point {
     /// In a workdir guard's polling thread, before it walks the directories: held there, the poll
     /// never comes round, so the session's status has to be decided by the final measurement.
     pub(crate) const WORKDIR_POLL: &str = "workdir.poll";
+    /// In the termination routine, after it cancelled every live task and before it raised
+    /// `terminating`: a task that finishes in the gap must still end the session with the
+    /// termination's own ending (a deadline is `deadline_reached`, never `ok`).
+    pub(crate) const TERMINATION_AFTER_CANCEL: &str = "termination.after_cancel";
     /// In a session process's output pump, after it read its last chunk and before it marks the
     /// stream ended: the exit must not be reported ahead of the output.
     pub(crate) const PUMP_BEFORE_END: &str = "pump.before_end";
@@ -303,4 +307,5 @@ const KNOWN_POINTS: &[&str] = &[
     point::ATTEMPT_RETURNED,
     point::WORKDIR_POLL,
     point::PUMP_BEFORE_END,
+    point::TERMINATION_AFTER_CANCEL,
 ];

@@ -5897,9 +5897,9 @@ fn launch(
                     // A deadline that ended the session ends it `deadline_reached` even when it
                     // cancelled no run: it fell before a task started, or while the session
                     // waited for one.
-                    if terminating.is_canceled()
-                        && termination_ending.get() == Some(LaunchEnding::DeadlineReached)
-                    {
+                    // Read from the cause, which is set before the token is raised, so a deadline
+                    // that fell while the session was finishing is not missed for want of the token.
+                    if termination_ending.get() == Some(LaunchEnding::DeadlineReached) {
                         outcome.ended_as(LaunchEnding::DeadlineReached);
                     }
 
@@ -15151,6 +15151,9 @@ async fn start_termination(
     termination_ending: &TerminationEnding,
     shell_enforcement: &sandbox::ShellEnforcement,
 ) {
+    // Before the record is written: the record's append is itself a wait in which the session can
+    // finish, and a session that finishes after the cause arrived has ended by that cause.
+    set_termination_ending(termination_ending, cause);
     match cause {
         TerminationCause::Sigterm => {}
         TerminationCause::FormationEnded => {
@@ -15187,6 +15190,16 @@ async fn start_termination(
     );
 }
 
+/// Gives the launch the ending `cause` gives it, when it gives one.
+#[cfg(unix)]
+fn set_termination_ending(termination_ending: &TerminationEnding, cause: TerminationCause) {
+    match cause {
+        TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
+        TerminationCause::Deadline => termination_ending.set(LaunchEnding::DeadlineReached),
+        TerminationCause::Sigterm | TerminationCause::SpawnerEnded => {}
+    }
+}
+
 /// Cancel every live task, set the launch's ending when the formation's end or the deadline is
 /// the cause, raise `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which
 /// the session's processes are killed and the process exits with status 143 whatever it is doing.
@@ -15198,6 +15211,11 @@ fn begin_termination(
     cause: TerminationCause,
     shell_enforcement: &sandbox::ShellEnforcement,
 ) {
+    // The ending is set before anything else wakes: a task cancelled below can finish and the
+    // session can decide its status before `terminating` is raised, and every decision reads the
+    // cause, not the token, to know a termination has begun. Idempotent, so `start_termination`
+    // having set it first is the same call.
+    set_termination_ending(termination_ending, cause);
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
     // The deadline spares a task kept working past a turn end: it ends with the answer it holds.
@@ -15205,12 +15223,8 @@ fn begin_termination(
         .lock()
         .unwrap()
         .cancel_every_live(matches!(cause, TerminationCause::Deadline));
-    // Before `terminating`, so the task loop that wakes on it reads the cause already set.
-    match cause {
-        TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
-        TerminationCause::Deadline => termination_ending.set(LaunchEnding::DeadlineReached),
-        TerminationCause::Sigterm | TerminationCause::SpawnerEnded => {}
-    }
+    // The gap a test holds open: the task may finish here, before `terminating` is raised.
+    crate::race::window_blocking(crate::race::point::TERMINATION_AFTER_CANCEL);
     terminating.cancel();
     match cause {
         TerminationCause::Sigterm => crate::runtime_err!(
