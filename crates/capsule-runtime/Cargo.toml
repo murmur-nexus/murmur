@@ -82,6 +82,10 @@ alloc-bench = []
 # `wasm-guest` route grades. Never in a release build: `src/lib.rs` refuses to compile it without
 # debug assertions, and `scripts/check-no-escape-probe.sh` checks the released binaries.
 escape-probe = []
+# Test-only: named race windows (`src/race.rs`) that a run can hold open through
+# `MURMUR_RACE_WINDOWS`, so an end-to-end test forces a timing the way a unit test does. Off by
+# default: a normal build compiles each window to nothing. Never in a release build.
+race-windows = []
 
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }

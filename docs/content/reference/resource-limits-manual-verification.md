@@ -529,11 +529,12 @@ mur run --manifest murmur.yaml --task "$PREAMBLE"' The workdir cap is 50 MiB. Co
 
 **Expected, and note the timing carefully:**
 
-- the breach is caught **within one poll interval of 10 seconds** of the workdir crossing 50 MiB —
-  not instantaneously, and not never. The workdir can legitimately overshoot the ceiling by
-  whatever is written inside one interval;
-- once latched, the *next* subprocess spawn is refused outright, so the filler stops writing at
-  the first spawn boundary after the breach;
+- the breach is caught **within a fraction of a second** of the workdir crossing 50 MiB, and the
+  session's final status is decided by one more measurement, so it is never `status: ok` — not
+  instantaneously, and never not at all. The workdir can legitimately overshoot the ceiling by
+  whatever is written inside one poll (250 ms, longer on a very large tree);
+- once latched, every process in the session's cgroup scope is killed, so the filler stops where
+  it is rather than at the next spawn boundary, and the next spawn is refused outright;
 - the session terminates with `E-RUN-013` naming both numbers:
 
 ```

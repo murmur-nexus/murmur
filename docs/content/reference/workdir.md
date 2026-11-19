@@ -85,8 +85,12 @@ Under `--json` the same rows are `runtime_writes`, one object per path:
 
 [`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits) bounds the
 work folder, the records directory's `tmp/` and its `home/` together. The runtime walks the three
-every 10 seconds and sums their sizes; crossing the ceiling ends the session with
-[`E-RUN-013`](diagnostics.md). `MURMUR.md` states the ceiling for every
+about four times a second and sums their sizes, and walks them once more before it decides the
+session's final status; crossing the ceiling at either point ends the session with
+[`E-RUN-013`](diagnostics.md), never `ok`. A command that is running when the walk sees the breach
+is killed with the rest of the session's processes where the session has a cgroup scope, so a
+writer overshoots the ceiling by about one walk's worth of its own write rate; the final walk is
+what makes the ending certain. `MURMUR.md` states the ceiling for every
 `inference.transport: http` session.
 
 Under `--workdir` the work folder is the whole folder you pass, including the files that were in it

@@ -484,6 +484,21 @@ async fn run_task_with_reopens(
             result = Err(error);
             thread.ending = Some(agent::AttemptEnding::failed(reason));
         }
+        // The same checkpoint settles the workdir ceiling. The attempt may have returned `ok`
+        // before the guard's poll came round to a breach the command already made, so the session
+        // measures once more here, before its status is decided, and a breach ends it with the
+        // error the turn loop would have given had the poll been faster.
+        crate::race::window(crate::race::point::ATTEMPT_RETURNED).await;
+        if !matches!(result, Err(_) | Ok(AgentLoopExit::Canceled)) {
+            if let Some(breach) = state.shell_enforcement.settle_workdir() {
+                let error = RuntimeError::WorkdirSizeExceeded {
+                    max_bytes: breach.max_bytes,
+                    observed_bytes: breach.observed_bytes,
+                };
+                thread.ending = Some(agent::AttemptEnding::failed(error.to_string()));
+                result = Err(error);
+            }
+        }
         let refused = matches!(result, Err(RuntimeError::WorkdirPathRefused { .. }));
 
         // Stands in for work between `task_canceled` and `task_end` — a slow `on-task-end` hook —
