@@ -489,8 +489,19 @@ async fn run_task_with_reopens(
         // before the guard's poll came round to a breach the command already made, so the session
         // measures once more here, before its status is decided, and a breach ends it with the
         // error the turn loop would have given had the poll been faster.
+        //
+        // A breach wins over an error the attempt returned: the guard kills the session's scope on
+        // a breach, which takes a process-transport harness down with it, and the turn then fails
+        // as a harness error. That failure is the breach's own doing, and the session's ending is
+        // E-RUN-013 whichever way the attempt reported it. Only a person's cancel, a refusal of a
+        // path (a security finding of its own) and a breach already reported are left as they are.
         crate::race::window(crate::race::point::ATTEMPT_RETURNED).await;
-        if !matches!(result, Err(_) | Ok(AgentLoopExit::Canceled)) {
+        if !matches!(
+            result,
+            Ok(AgentLoopExit::Canceled)
+                | Err(RuntimeError::WorkdirSizeExceeded { .. })
+                | Err(RuntimeError::WorkdirPathRefused { .. })
+        ) {
             if let Some(breach) = state.shell_enforcement.settle_workdir() {
                 let error = RuntimeError::WorkdirSizeExceeded {
                     max_bytes: breach.max_bytes,

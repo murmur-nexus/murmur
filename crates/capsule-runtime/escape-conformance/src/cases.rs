@@ -1611,15 +1611,17 @@ def main():
         summary: "fills the workdir with many files each under the per-file ceiling",
         attribution: "DENIAL OF SERVICE, NOT AN ESCAPE. RLIMIT_FSIZE bounds one file; nothing in \
                       it stops a thousand files just under the ceiling, which is what \
-                      workdir_max_bytes covers. The check is periodic (10s), so the workdir can \
-                      legitimately overshoot by whatever is written inside one interval — a \
-                      breach caught late is still contained, a breach never caught is not. \
-                      Graded on a **second** tool call being refused, not on the session dying: \
-                      scenario 6 says the session terminates with E-RUN-013, but the shipped \
-                      mechanism is narrower than that wording — `WorkdirGuard` latches a breach \
-                      and `ShellEnforcement::check_workdir_budget` refuses the next spawn, so a \
-                      single-tool-call case observes nothing at all. Asserted at `advisory` too: \
-                      the watcher is platform-independent. Lifted from scenario 6.\
+                      workdir_max_bytes covers. The guard polls (250 ms) and the session measures \
+                      once more before it decides its status, so the workdir can legitimately \
+                      overshoot by whatever is written inside one poll — a breach caught late is \
+                      still contained, a breach never caught is not. Graded on the session ending \
+                      with E-RUN-013 naming the ceiling (the promise scenario 6 states), which \
+                      is how a breach now ends: the guard kills what the session is running, \
+                      the harness's follow-up call included. Before that the case could only \
+                      observe a **second** tool call being refused at the next spawn, and that \
+                      refusal is still accepted when the follow-up call does happen. Asserted \
+                      at `advisory` too: the watcher is platform-independent. Lifted from \
+                      scenario 6.\
                       Measured CONTAINED at `sealed`: the probe itself reported UNCONTAINED after \
                       writing about 1080 MiB, and the *second* spawn was then refused naming \
                       `workdir_max_bytes` (471864427 bytes past the 52428800 ceiling) — which is \
@@ -1650,9 +1652,9 @@ def main():
                     fh.write(chunk)
         except OSError:
             return
-        # The check is periodic (10s). Pausing every few files keeps the writes spread across
-        # more than one poll interval, so a latching failure is a real finding rather than a
-        # race against a burst that finished before the first poll.
+        # Pausing every few files keeps the writes spread across more than one poll interval, so
+        # a latching failure is a real finding rather than a race against a burst that finished
+        # before the first poll.
         if i % 5 == 4:
             time.sleep(1)
     verdict("UNCONTAINED", "wrote 120 files of 9 MiB (about 1080 MiB) into the session workdir "
