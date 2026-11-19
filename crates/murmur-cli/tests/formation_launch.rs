@@ -3274,7 +3274,9 @@ fn mur_stop_ends_launched_and_hand_started_members_together() {
         &reported_pids(&formation, Some(&planner)),
         Duration::from_secs(30),
     );
-    assert!(by_hand.has_exited());
+    // Waits for the exit it asserts, as `assert_no_member_remains` does for the others: the member
+    // was sent `SIGTERM` and tears down at its own pace, which a loaded host stretches.
+    assert!(by_hand.wait_exited(Duration::from_secs(30)));
     project.assert_no_member_was_sent_sigterm(&launcher);
     assert!(
         by_hand.stderr().contains(SIGTERM_RECEIVED),

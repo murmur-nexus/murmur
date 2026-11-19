@@ -5897,10 +5897,13 @@ fn launch(
                     // A deadline that ended the session ends it `deadline_reached` even when it
                     // cancelled no run: it fell before a task started, or while the session
                     // waited for one.
-                    // Read from the cause, which is set before the token is raised, so a deadline
-                    // that fell while the session was finishing is not missed for want of the token.
-                    if termination_ending.get() == Some(LaunchEnding::DeadlineReached) {
-                        outcome.ended_as(LaunchEnding::DeadlineReached);
+                    // Read from the cause, which is set before anything is cancelled and before the
+                    // token is raised, so a deadline or a formation's end that came while the
+                    // session was finishing is not missed for want of the token: a task cancelled
+                    // a moment before the token rises is recorded by the plain path, and only this
+                    // read still knows why the session stopped.
+                    if let Some(ending) = termination_ending.decided() {
+                        outcome.ended_as(ending);
                     }
 
                     // Every task the door accepted reaches a terminal state before the door
@@ -14983,16 +14986,43 @@ struct DeadlineEndTrace {
 /// that begins the termination and gives one, before `terminating` is raised. Unset under a
 /// `SIGTERM` or the spawner lifeline, which leave a cancelled run `canceled`.
 #[derive(Debug, Default)]
-struct TerminationEnding(std::sync::OnceLock<LaunchEnding>);
+struct TerminationEnding {
+    ending: std::sync::OnceLock<LaunchEnding>,
+    /// Whether the termination cancelled a live run. A formation's end gives its ending only to a
+    /// session it interrupted: one that was idle when the lifeline closed ends `ok`.
+    cancelled_a_run: std::sync::atomic::AtomicBool,
+}
 
 impl TerminationEnding {
     #[cfg(unix)]
     fn set(&self, ending: LaunchEnding) {
-        let _ = self.0.set(ending);
+        let _ = self.ending.set(ending);
     }
 
     fn get(&self) -> Option<LaunchEnding> {
-        self.0.get().copied()
+        self.ending.get().copied()
+    }
+
+    #[cfg(unix)]
+    fn note_cancelled_a_run(&self) {
+        self.cancelled_a_run
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The ending the session's final status takes from the termination: a deadline's always, any
+    /// other only when it cancelled a run.
+    fn decided(&self) -> Option<LaunchEnding> {
+        match self.get()? {
+            LaunchEnding::DeadlineReached => Some(LaunchEnding::DeadlineReached),
+            ending
+                if self
+                    .cancelled_a_run
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Some(ending)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -15219,10 +15249,15 @@ fn begin_termination(
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
     // The deadline spares a task kept working past a turn end: it ends with the answer it holds.
-    let _ = task_registry
-        .lock()
-        .unwrap()
-        .cancel_every_live(matches!(cause, TerminationCause::Deadline));
+    // The note is made under the registry's lock: a cancelled task records its terminal state
+    // under the same lock, so by the time the session can read its result the note is made.
+    {
+        let mut registry = task_registry.lock().unwrap();
+        let cancelled = registry.cancel_every_live(matches!(cause, TerminationCause::Deadline));
+        if !cancelled.is_empty() {
+            termination_ending.note_cancelled_a_run();
+        }
+    }
     // The gap a test holds open: the task may finish here, before `terminating` is raised.
     crate::race::window_blocking(crate::race::point::TERMINATION_AFTER_CANCEL);
     terminating.cancel();
