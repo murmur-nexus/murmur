@@ -975,8 +975,9 @@ fn main() {
                 workdir,
                 run,
                 json,
+                require,
             } => match run {
-                Some(run) => run_eval_diff_run(&run, workdir, json),
+                Some(run) => run_eval_diff_run(&run, workdir, json, &require),
                 None => run_eval_diff(a, b, workdir),
             },
             EvalCommand::Run {

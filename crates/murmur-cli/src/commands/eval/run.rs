@@ -276,6 +276,10 @@ pub(super) struct RunRecord {
     pub(super) cached_tokens: Option<u64>,
     pub(super) cache_write_tokens: Option<u64>,
     pub(super) agent_ms: Option<u64>,
+    /// The tokens the session's spend meter was charged, read back from its trace. `None` for a
+    /// run never launched, one whose trace could not be read, and a record without the key.
+    #[serde(default)]
+    pub(super) spend_tokens: Option<u64>,
     pub(super) scores_overall: Option<String>,
 }
 
@@ -299,6 +303,7 @@ impl RunRecord {
             cached_tokens: None,
             cache_write_tokens: None,
             agent_ms: None,
+            spend_tokens: None,
             scores_overall: None,
         }
     }
@@ -1095,6 +1100,7 @@ fn run_one(
             run.cached_tokens = summary.cached_tokens;
             run.cache_write_tokens = summary.cache_write_tokens;
             run.agent_ms = Some(summary.agent_ms);
+            run.spend_tokens = Some(summary.spend_tokens);
         }
         Err(error) => {
             capsule_runtime::report_eprintln!("    warning: failed to read the trace: {error}");

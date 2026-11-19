@@ -62,6 +62,17 @@ pub(crate) enum EvalCommand {
         /// With --run, print the comparison as JSON
         #[arg(long, requires = "run")]
         json: bool,
+        /// With --run, a threshold the run must meet, or mur exits 1 after the comparison:
+        /// [baseline.|variant.]<measure><op><number>, measure passes, spend-per-pass or
+        /// pass-lead, op >=, <=, > or <. Repeatable and comma-separated.
+        #[arg(
+            long,
+            value_name = "REQ",
+            requires = "run",
+            value_delimiter = ',',
+            value_parser = compare::parse_requirement
+        )]
+        require: Vec<Requirement>,
     },
     /// Run a capsule against each case in a dataset and collect eval scores
     Run {
@@ -447,5 +458,5 @@ fn print_diff(a: &EvalMetrics, b: &EvalMetrics) {
 
 // ── Run ───────────────────────────────────────────────────────────────────────
 
-pub(crate) use compare::run_eval_diff_run;
+pub(crate) use compare::{run_eval_diff_run, Requirement};
 pub(crate) use run::{run_eval_run, EvalRunArgs};

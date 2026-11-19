@@ -2153,7 +2153,24 @@ Each `runs[]` entry:
 | `cached_tokens` | u64 \| null | The provider's cache-read count, beside `input_tokens`; `null` when no driver reported it |
 | `cache_write_tokens` | u64 \| null | The provider's cache-write count, on the same terms |
 | `agent_ms` | u64 \| null | The sum of the trace's `task_end.duration_ms` |
+| `spend_tokens` | u64 \| null | The tokens the session's spend meter was charged, the number [`inference.max_session_tokens`](manifest.md#field-inference) counts, read back from the trace as listed below. `null` for a run never launched or whose trace could not be read; a record from an older `mur` has no key |
 | `scores_overall` | string \| null | `overall` of the session's `hooks/eval.jsonl` [`dataset_run`](#structured-evaluation-evaljsonl) record, or `null` |
+
+`spend_tokens` is the sum over the session's trace of:
+
+| Line | Charge |
+|---|---|
+| `inference` carrying both `input_tokens_actual` and `output_tokens_actual` | `input_tokens_actual + cached_tokens + cache_write_tokens + output_tokens_actual`, an absent cache count read as 0 |
+| Any other `inference` | `input_tokens + output_tokens`, an absent count read as 0. This covers the runtime's own counts and a `transport: process` harness's reported counts |
+| `inference_retry` | `charged_tokens` |
+
+Thinking tokens are never added; the meter does not charge them. One charge the trace does not
+state: an agent-loop call whose last attempt failed with no provider `usage` (a dispatch error, a
+refused status, an unreadable or `"error"` response) is charged the runtime's input estimate, or
+its input and output estimates when the response could not be parsed, and its failed `inference`
+line carries neither token count. Such a call reads as 0, so `spend_tokens` can be below what the
+meter counted for a session whose last call failed that way. The tokens a delegated child spent
+are in the child's own trace.
 
 ### Check outcome { #check-outcome }
 
