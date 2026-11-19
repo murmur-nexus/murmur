@@ -1126,6 +1126,83 @@ impl CallDeadlineEvent {
     }
 }
 
+/// One `network_request` line: a request a guest sent through `wasi:http` on its own, straight to
+/// its host or through its artifact's credential gateway, refusals included.
+#[derive(Debug, Deserialize)]
+struct NetworkRequestLine {
+    #[serde(default)]
+    component: String,
+    /// `capsule`, `driver`, `tool`, `hook` or `process_driver`.
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    scheme: String,
+    /// Host, and `:port` when the request named one.
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    method: String,
+    /// `sent`, `refused` or `failed`.
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    http_status: Option<u16>,
+    #[serde(default)]
+    request_bytes: Option<u64>,
+    #[serde(default)]
+    response_bytes: Option<u64>,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+impl NetworkRequestLine {
+    /// `network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher`:
+    /// the method, scheme and host, the outcome with its reason, the status, the request and
+    /// response body sizes, the duration and the component that sent it.
+    fn row(&self) -> String {
+        let mut row = format!(
+            "network_request  {} {} {}  {}",
+            self.method,
+            self.scheme,
+            self.host.as_deref().unwrap_or("-"),
+            self.outcome
+        );
+        if let Some(reason) = &self.reason {
+            row.push(' ');
+            row.push_str(reason);
+        }
+        if let Some(status) = self.http_status {
+            row.push_str(&format!("  {status}"));
+        }
+        if let Some(sent) = self.request_bytes {
+            let received = self
+                .response_bytes
+                .map_or_else(|| "-".to_string(), fmt_body_bytes);
+            row.push_str(&format!("  {}→{received}", fmt_body_bytes(sent)));
+        }
+        row.push_str(&format!(
+            "  {}  via {} {}",
+            fmt_dur(self.duration_ms),
+            self.role,
+            self.component
+        ));
+        row
+    }
+}
+
+/// A body size as a `network_request` row shows it: bytes under 1000, then decimal KB and MB to
+/// one place.
+fn fmt_body_bytes(bytes: u64) -> String {
+    if bytes < 1_000 {
+        format!("{bytes}B")
+    } else if bytes < 1_000_000 {
+        format!("{:.1}KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+    }
+}
+
 /// A driver call failed transiently and was made again. The call's one `inference` line follows
 /// its last attempt.
 #[derive(Debug, Deserialize)]
@@ -1513,6 +1590,7 @@ enum TraceEvent {
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
     MemberRequest(MemberRequestLine),
+    NetworkRequest(NetworkRequestLine),
     PlanStart(PlanStartEvent),
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
@@ -3123,6 +3201,7 @@ fn compute_metrics(
             TraceEvent::MemberCall(e) => fold_member_call(&mut member_calls, e),
             // Joined with the callee's side in the Formation section, which reads the trace itself.
             TraceEvent::MemberRequest(_) => {}
+            TraceEvent::NetworkRequest(_) => {}
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
                 plan_id: e.plan_id,
                 step_count: e.step_count,
@@ -5593,6 +5672,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
         ),
         TraceEvent::InferenceRetry(e) => e.row(),
         TraceEvent::CallDeadline(e) => e.row(),
+        TraceEvent::NetworkRequest(e) => e.row(),
         TraceEvent::SpendCeilingReached(e) => format!(
             "{}{}  used {} of {}  needs {}{}",
             kind("spend_ceiling_reached"),
@@ -8677,6 +8757,23 @@ mod tests {
         assert_eq!(
             row(refused),
             "member_request reviewer  mrq_0193a2  refused not_a_callee  0ms  via tool formation-probe"
+        );
+    }
+
+    /// A `network_request` row names the method, scheme and host, the outcome with its reason,
+    /// the status, both body sizes, the duration and the sending component; a refused request
+    /// has no status and no sizes. Neither hash is shown.
+    #[test]
+    fn network_request_rows_render_their_route_outcome_and_sizes() {
+        let sent = r#"{"event_type":"network_request","event_id":"evt_2","parent_id":"evt_1","session_id":"s","timestamp":9,"task_id":"tsk_1","component":"fetcher","role":"tool","route":"direct","scheme":"https","host":"api.example.com","method":"GET","outcome":"sent","http_status":200,"request_bytes":12,"response_bytes":4100,"request_sha256":"aa","response_sha256":"bb","duration_ms":38}"#;
+        let refused = r#"{"event_type":"network_request","event_id":"evt_3","parent_id":"evt_1","session_id":"s","timestamp":9,"component":"probe-capsule","role":"capsule","route":"direct","scheme":"https","host":"blocked.example.com","method":"GET","outcome":"refused","reason":"not_allowed","duration_ms":0}"#;
+        assert_eq!(
+            row(sent),
+            "network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher"
+        );
+        assert_eq!(
+            row(refused),
+            "network_request  GET https blocked.example.com  refused not_allowed  0ms  via capsule probe-capsule"
         );
     }
 

@@ -205,6 +205,9 @@ pub(crate) struct HookInferenceCtx {
     /// The session's latch, where a request the driver routes to a member's virtual address is
     /// recorded.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's record of every request a guest sends through `wasi:http`, cloned into each
+    /// store beside [`Self::member_requests`].
+    pub(crate) network_requests: crate::network_request::NetworkRequests,
     /// The session's guest workers, when guests run in worker processes: the driver then runs in
     /// the driver worker, as the agent loop's own turns do.
     pub(crate) guest_workers: Option<Arc<crate::guest_worker::GuestWorkers>>,
@@ -489,6 +492,7 @@ impl HookInferenceCtx {
             role: ComponentRole::Driver,
             call_deadlines: &self.call_deadlines,
             member_requests: &self.member_requests,
+            network_requests: &self.network_requests,
             // Nor is its `member_request` sent for any task.
             task_id: None,
             process: crate::session_process::ProcessAccess::Unavailable(
@@ -1181,6 +1185,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            network_requests: Default::default(),
             guest_workers: None,
         }
     }

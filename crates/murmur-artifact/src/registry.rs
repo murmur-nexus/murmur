@@ -1067,7 +1067,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// known-answer tests. A caller hashing a file too large to hold in memory uses this rather than a
 /// second hasher, so its digest matches the ones `murmur.lock` and the `.sha256` sidecars hold.
 pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<(u64, String)> {
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut hasher = Sha256Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
@@ -1075,10 +1075,40 @@ pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<
         if read == 0 {
             break;
         }
-        context.update(&buffer[..read]);
+        hasher.update(&buffer[..read]);
         total = total.saturating_add(read as u64);
     }
-    Ok((total, lowercase_hex(context.finish().as_ref())))
+    Ok((total, hasher.finish_hex()))
+}
+
+/// SHA-256 fed piece by piece, for bytes that arrive in chunks rather than from one reader.
+///
+/// Same engine and output as [`sha256_hex`]: a digest from here matches one `murmur.lock`, a
+/// `.sha256` sidecar or a trace hash holds for the same bytes.
+#[derive(Clone)]
+pub struct Sha256Hasher(ring::digest::Context);
+
+impl Sha256Hasher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The digest of every byte fed so far, as 64 lowercase hex characters.
+    #[must_use]
+    pub fn finish_hex(self) -> String {
+        lowercase_hex(self.0.finish().as_ref())
+    }
+}
+
+impl Default for Sha256Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn lowercase_hex(digest: &[u8]) -> String {

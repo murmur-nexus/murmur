@@ -549,7 +549,7 @@ observability:
   otel_endpoint: http://localhost:4318
 ```
 
-`trace.capture: content` stores unredacted inference bodies and tool outputs in blobs. Treat that as sensitive data collection, not a harmless debugging switch. Prefer the default metadata-only capture unless full content is required.
+`trace.capture: content` stores unredacted inference bodies, tool outputs, and the request and response bodies of every HTTP request a tool, hook or script capsule sends on its own, in blobs. Treat that as sensitive data collection, not a harmless debugging switch. Prefer the default metadata-only capture unless full content is required.
 
 Evaluation scorer configuration is meaningful only when the corresponding evaluation hook/artifact is actually present and supports the intended scorer behavior. A scoring hook must declare `capabilities.filesystem.records: true`; with `scope: .` it writes `eval.jsonl` into the workdir, where `mur eval` does not read it.
 
