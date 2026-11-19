@@ -1212,7 +1212,7 @@ Two kinds of request are recorded by their own line and never by this one:
 | `"refused"` | `"not_admitted"` | The request is addressed to the inference gateway with no driver call open to send it for. `route` is `gateway` |
 | `"failed"` | `"connection_failed"` | No response arrived: the connection or the write failed, or the gateway's injected credential was not supplied |
 | `"failed"` | `"response_interrupted"` | The response could not be read to its end. Keeps `http_status` and counts the bytes read |
-| `"failed"` | `"interrupted"` | No response arrived before the request was abandoned: the component's call ended — past its [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), cancelled, or with its guest worker lost — or the component dropped the request |
+| `"failed"` | `"interrupted"` | No response arrived before the request was abandoned: the component's call ended — past its [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), cancelled, or with its [guest worker](../concepts/guest-workers.md) lost — or the component dropped the request |
 
 A refused request opens no connection. A gateway that resends a request once with a re-read
 credential after a `401` writes one line for it. No field carries a path, a query, a header name
