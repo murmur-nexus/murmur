@@ -1065,7 +1065,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Each running command counts one task more than its own: its [relay](containment.md#capsule-proc). Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: not set — no CPU cap; the scope's `cpu.max` stays at the kernel's `max`. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) reports [`io_max.status: unavailable`](resource-limits.md#io-max-report) with [`W-SEC-021`](diagnostics.md#w-sec-021) and keeps its other limits on the scope. |
-| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the work folder, the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) together, in bytes, checked every 10 seconds; crossing it ends the session with `E-RUN-013`. See [Size ceiling](workdir.md#work-folder-ceiling). Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
+| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the work folder, the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) together, in bytes, checked about four times a second and once more before the session's final status is decided; crossing it ends the session with `E-RUN-013`, never `ok`. See [Size ceiling](workdir.md#work-folder-ceiling). Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
@@ -1545,19 +1545,22 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 | `trace.sync` | `line`, or a duration | no | No default. When each line of `trace.jsonl` is synced to disk, so it survives the host going down. A duration is an integer, optionally suffixed `s`/`m`/`h`/`d`; a bare integer is seconds. `0` and any other value are refused with [`E-MAN-003`](diagnostics.md#e-man-003). Omitted, no sync call is made. See [Syncing the trace](#trace-sync). |
 
-| `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `blobs/` | `tool_call.output` |
-|---|---|---|---|---|
-| `none` | — | — | — | — |
-| `meta` | written | written | — | — |
-| `content` | written | written | written | written |
+| `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `network_request` body hashes | `blobs/` | `tool_call.output` |
+|---|---|---|---|---|---|
+| `none` | — | — | — | — | — |
+| `meta` | written | written | written | — | — |
+| `content` | written | written | written | written | written |
 
 The hashes are `system_sha`, `tools_sha`, `response_sha` and `message_shas` on each
-[`inference` event](observability-schemas.md#wire-hashes), and the hash of the message text of
+[`inference` event](observability-schemas.md#wire-hashes), the hash of the message text of
 each task the door let in, on its
-[`a2a_task_received` event](observability-schemas.md#a2a-task-received). Under `content` the body
-behind each one is also written to
+[`a2a_task_received` event](observability-schemas.md#a2a-task-received), and `request_sha256` and
+`response_sha256` on each [`network_request` event](observability-schemas.md#network-request),
+for the bodies of a component's own HTTP request. Every `network_request` line is written under every
+mode; `none` drops only its hashes. Under `content` the body behind each hash is also written to
 [`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs), verbatim and unredacted —
-bodies can be large, and a blob holds the wire payload or the received message as sent.
+bodies can be large, and a blob holds the wire payload, the received message or the component's
+HTTP body as sent.
 
 `trace.sync` sets when each line the session's own `mur` process writes to `trace.jsonl` is on
 disk:

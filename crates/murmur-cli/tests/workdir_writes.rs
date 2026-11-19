@@ -595,26 +595,16 @@ fn a_work_folder_past_its_ceiling_ends_the_session_under_workdir() {
             "",
             (10, 5),
         ),
-        // Longer than the guard's 10 s check interval.
-        scripted(
-            "msg_2",
-            Some(("bash", json!({"command": "sleep 12"}))),
-            "",
-            (10, 5),
-        ),
-        scripted(
-            "msg_3",
-            Some(("bash", json!({"command": "true"}))),
-            "",
-            (10, 5),
-        ),
-        scripted("msg_4", None, "never reached", (10, 5)),
+        // The model answers straight after the write. The session ends on the breach because the
+        // status is decided by a final measurement, not because the guard's poll happened to come
+        // round while a long command (`sleep 12` used to stand in for that) kept the session open.
+        scripted("msg_2", None, "never reached", (10, 5)),
     ];
     let run = run_agent(
         responses,
         std::time::Duration::ZERO,
         Some(workdir.path()),
-        &["sleep"],
+        &[],
         "  resources:\n    workdir_max_bytes: 1048576\n",
     );
 

@@ -149,8 +149,14 @@ impl Run {
 
 /// `mur run --task … --verbose` on `project`, with `extra` arguments.
 fn run(home: &TempDir, project: &Project, extra: &[&str]) -> Run {
+    run_with_env(home, project, extra, &[])
+}
+
+/// [`run`] with `env` set on the `mur` process.
+fn run_with_env(home: &TempDir, project: &Project, extra: &[&str], env: &[(&str, &str)]) -> Run {
     let output = Command::cargo_bin("mur")
         .unwrap()
+        .envs(env.iter().copied())
         .env("HOME", home.path())
         .env("MURMUR_A2A_TIMEOUT_SECS", "1")
         .current_dir(project.dir.path())
@@ -498,6 +504,35 @@ fn the_deadline_ends_a_kept_working_task_deadline_reached_with_its_last_answer()
         .filter(|inference| inference["decision"] == "end_turn")
         .count();
     assert_eq!(run.result(), format!("answer {answered}"));
+}
+
+/// The deadline's termination cancels the live task and only then raises `terminating`. A task
+/// kept working is spared the cancel and finishes with the answer it holds, so it can finish, and
+/// the session can decide its status, inside that gap. The `termination.after_cancel` window holds
+/// the termination in the gap for longer than a turn takes, every time: the session must still
+/// end `deadline_reached`, not `ok`. (Without the fix this test ends `status: ok`, exit 0.)
+/// Needs a `mur` built with `race-windows`, which `scripts/test.sh` does.
+#[cfg(feature = "race-windows")]
+#[test]
+fn a_task_that_finishes_inside_the_deadlines_termination_still_ends_deadline_reached() {
+    let home = home_with_driver();
+    let server = common::ScriptedServer::start_answering(200, move |_| {
+        std::thread::sleep(Duration::from_millis(300));
+        end_turn("answer")
+    });
+    let project = project(&http_manifest(&server.endpoint, &keep_working(1000), ""));
+    let run = run_with_env(
+        &home,
+        &project,
+        &["--deadline", "3"],
+        &[("MURMUR_RACE_WINDOWS", "termination.after_cancel=5000")],
+    );
+    assert_ne!(run.output.status.code(), Some(0), "{}", run.context());
+    assert!(
+        run.stdout.contains("status:  deadline_reached"),
+        "{}",
+        run.context()
+    );
 }
 
 // ── S8: a person's cancel ─────────────────────────────────────────────────────

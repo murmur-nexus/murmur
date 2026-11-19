@@ -97,6 +97,10 @@ jobs:
         # singleton. 1.58.2 installs build 1208.
         timeout-minutes: 5
         run: npx --yes playwright@1.58.2 install chromium-headless-shell
+      - name: Build mur
+        # The tests run target/debug/mur, so it must carry every beta feature, as in `contained`:
+        # without them its beta subcommands, such as `destroy`, are unrecognized.
+        run: cargo build -p murmur-cli --bin mur --features beta-all
       - name: Run the workspace test suite
         # nextest runs the tests of every binary in parallel, each in its own process, rather
         # than one binary after another. The `ci` profile in .config/nextest.toml retries a

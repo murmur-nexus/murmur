@@ -55,14 +55,7 @@ pub fn mur_binary() -> &'static Path {
         if let Some(path) = std::env::var_os(MUR_BINARY_ENV) {
             return PathBuf::from(path);
         }
-        // .../target/<profile>/deps/<test binary>
-        let profile_dir = std::env::current_exe()
-            .expect("the test binary has a path")
-            .parent()
-            .and_then(Path::parent)
-            .expect("the test binary lives under target/<profile>/deps")
-            .to_path_buf();
-        let candidate = profile_dir.join("mur");
+        let candidate = profile_dir().join("mur");
         if !candidate.is_file() {
             let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
                 .args(["build", "-p", "murmur-cli", "--bin", "mur"])
@@ -77,6 +70,32 @@ pub fn mur_binary() -> &'static Path {
         );
         candidate
     })
+}
+
+/// `target/<profile>`, where cargo uplifts `mur`, found from this test binary's own path.
+///
+/// Cargo has two layouts for test binaries: `target/<profile>/deps/<test binary>`, and the
+/// build-dir layout cargo 1.100 uses for a fresh target folder,
+/// `target/<profile>/build/<package>/<hash>/out/<test binary>`. Taking a fixed number of parents
+/// lands inside `build/` under the second; nothing is there, so `mur_binary` would rebuild `mur`
+/// without features over the one every other suite reads.
+fn profile_dir() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name == "deps" || name == "build")
+        })
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            panic!(
+                "the test binary {} is under neither target/<profile>/deps nor \
+                 target/<profile>/build",
+                exe.display()
+            )
+        })
+        .to_path_buf()
 }
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────

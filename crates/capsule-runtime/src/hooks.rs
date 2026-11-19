@@ -825,6 +825,9 @@ pub(crate) struct HookEnvVars<'a> {
     /// The session's latch, where a request a hook routes to a member's virtual address is
     /// recorded. Carried here for the same reason as `call_deadlines`.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's record of every request a guest sends through `wasi:http`, cloned into each
+    /// store beside [`Self::member_requests`].
+    pub(crate) network_requests: crate::network_request::NetworkRequests,
     /// The session's guest workers, when guests run in worker processes: every hook instance and
     /// every `on-stage` call then runs in the hooks worker.
     pub(crate) guest_workers: Option<&'a Arc<crate::guest_worker::GuestWorkers>>,
@@ -1155,6 +1158,10 @@ fn hook_network_policy(
         task_provenance: None,
         member_requests: Some(crate::member_request::MemberRequestScope::for_hook(
             &env_vars.member_requests,
+            staged.name.clone(),
+        )),
+        network_requests: Some(crate::network_request::NetworkRequestScope::for_hook(
+            &env_vars.network_requests,
             staged.name.clone(),
         )),
     }
@@ -2796,6 +2803,7 @@ pub(crate) async fn guard_probe(
             formation: None,
             task_provenance: None,
             member_requests: None,
+            network_requests: None,
         })
     };
     let instance = open_instance(
@@ -4335,6 +4343,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            network_requests: Default::default(),
             guest_workers: None,
         });
 
@@ -4421,6 +4430,7 @@ mod tests {
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: Default::default(),
+            network_requests: Default::default(),
             guest_workers: None,
         })
     }
@@ -5688,6 +5698,7 @@ mod tests {
                 formation: None,
                 task_provenance: None,
                 member_requests: None,
+                network_requests: None,
             }),
             inference_purpose: HookInferencePurpose::Lifecycle,
             call_deadlines: CallDeadlines::default(),

@@ -972,8 +972,16 @@ impl SessionProcesses {
         *lock(&process.started) = started;
         *lock(&process.stdin) = child.stdin.take();
         process.pid.store(pgid, Ordering::SeqCst);
-        let stdout_ended = pump_into(child.stdout.take(), Arc::clone(&process.stdout));
-        let stderr_ended = pump_into(child.stderr.take(), Arc::clone(&process.stderr));
+        let stdout_ended = pump_into(
+            child.stdout.take(),
+            Arc::clone(&process.stdout),
+            process.name.clone(),
+        );
+        let stderr_ended = pump_into(
+            child.stderr.take(),
+            Arc::clone(&process.stderr),
+            process.name.clone(),
+        );
         self.trace_start(
             ctx,
             &process.handle,
@@ -1311,9 +1319,13 @@ impl Drop for KillGroupOnDrop {
 /// Reads one pipe on its own thread into `ring` until end-of-file or a read error, then marks the
 /// ring at end-of-file. The receiver completes once the mark is set (or the thread is gone); with
 /// no pipe the ring is marked at once.
+///
+/// `scope` is the process's name, which a test that holds [`crate::race::point::PUMP_BEFORE_END`]
+/// open names to stop this process's pumps and no other's.
 fn pump_into(
     pipe: Option<impl std::io::Read + Send + 'static>,
     ring: Arc<Mutex<OutputRing>>,
+    scope: String,
 ) -> oneshot::Receiver<()> {
     let (ended, on_end) = oneshot::channel();
     let Some(mut pipe) = pipe else {
@@ -1331,6 +1343,9 @@ fn pump_into(
                 Err(_) => break,
             }
         }
+        // The gap a test holds open: everything is read and nothing yet says so. The exit must
+        // not be reported across it.
+        crate::race::window_blocking_scoped(crate::race::point::PUMP_BEFORE_END, &scope);
         lock(&ring).mark_end_of_file();
         let _ = ended.send(());
     });

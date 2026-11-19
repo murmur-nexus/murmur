@@ -4051,8 +4051,8 @@ a consumer ignores keys it does not know.
 #### Attachments { #mur-trace-verify-attachments }
 
 After the record, `mur trace verify` lists every attachment [`mur trace attach`](#mur-trace-attach)
-wrote under the records directory's `attachments/`, oldest first, and says whether each points at
-the head that verified:
+or [`mur eval run`](#mur-eval-run) wrote under the records directory's `attachments/`, oldest
+first, and says whether each points at the head that verified:
 
 | Status | When |
 |---|---|
@@ -4576,9 +4576,9 @@ variant, repeat 2 the variant then the baseline, and so on alternately.
 2. With `start`, copies it into the work folder, keeping every entry's permission bits, and compares the copy's [start digest](observability-schemas.md#start-digest) with the source's. A different digest is recorded as `start_mismatch`, and that run is not launched.
 3. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 4. Launches the session.
-5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
+5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check). Then writes the result as an [attachment](observability-schemas.md#record-attachments) on the session, as `mur trace attach` would; when the record does not verify or the file cannot be written, a warning is printed and the run goes on.
 6. Reads the session's trace for its turns, tokens, spend, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
-7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, and `check: <result>` for a case with a check. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
+7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, then `check: <result>` for a case with a check and `attached: <attachment-id>` when its result was attached. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
 8. Rewrites the [eval-run record](observability-schemas.md#eval-run-record).
 
 After all runs it prints the summary table, then the comparison [`mur eval diff --run`](#mur-eval-diff-run) prints, then the run's id:

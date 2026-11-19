@@ -100,7 +100,7 @@ pub use program_needs::{
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
     LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
-    RESERVED_VERSIONS,
+    Sha256Hasher, RESERVED_VERSIONS,
 };
 pub use registry_warnings::{
     registry_warning_link, W_REG_002, W_REG_003, W_REG_004, W_REG_005, W_REG_006,

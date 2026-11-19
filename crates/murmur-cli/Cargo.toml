@@ -89,6 +89,9 @@ alloc-bench = ["capsule-runtime/alloc-bench"]
 # Test-only: the escape-conformance gate's `wasm-guest` route needs a `mur` built with it. A
 # release profile refuses to compile it (see `capsule-runtime`'s feature of the same name).
 escape-probe = ["capsule-runtime/escape-probe"]
+# Test-only: named race windows a run can hold open through `MURMUR_RACE_WINDOWS` (see
+# `capsule-runtime/src/race.rs`). A release profile refuses to compile it.
+race-windows = ["capsule-runtime/race-windows"]
 
 # `build.rs` reads the commit out of a source package's `.cargo_vcs_info.json`.
 [build-dependencies]

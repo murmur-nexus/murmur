@@ -1005,6 +1005,12 @@ It writes nothing:
 error[E-TRC-003]: cannot attach to session ses_01a1…: trace.jsonl line 3: line 3 changed, or line 4's prev_hash did: line 4 names a hash line 3 no longer has
 ```
 
+[`mur eval run`](cli.md#mur-eval-run) attaches each check result the same way. On any of these
+codes, or on [`E-TRC-007`](#e-trc-007), it prints
+`warning: check result not attached: error[<code>]: <message>`, records `<code>: <message>` as the
+run's [`attachment_error`](observability-schemas.md#eval-run-record) and goes on; its exit status
+does not change.
+
 ### E-TRC-006 — an attachment's input is refused { #e-trc-006 }
 
 [`mur trace attach`](cli.md#mur-trace-attach) refused its input before verifying anything and

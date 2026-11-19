@@ -412,6 +412,12 @@ impl CredentialGateway {
         &self.upstream_authority
     }
 
+    /// The upstream's scheme, `http` or `https`, which decides whether the runtime's connection
+    /// to it uses TLS.
+    pub(crate) fn upstream_scheme(&self) -> &str {
+        self.upstream.scheme()
+    }
+
     /// Whether `uri` is addressed to the gateway.
     pub(crate) fn is_addressed_to_gateway(uri: &Uri) -> bool {
         uri.scheme_str() == Some("http")

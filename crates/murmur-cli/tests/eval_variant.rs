@@ -878,6 +878,7 @@ fn a_check_that_outruns_its_timeout_is_killed() {
         let duration = run["check"]["duration_ms"].as_u64().unwrap();
         assert!((2000..=10000).contains(&duration), "{duration}");
         assert!(run["check"]["exit_code"].is_null());
+        check_attachment(run, "sleep 60", "timed_out");
     }
     assert!(sleeps_under(world.workspace.path()).is_empty());
 }
@@ -927,6 +928,7 @@ fn check_files_are_not_written_through_a_link_the_agent_planted() {
     assert!(run["check"]["exit_code"].is_null());
     assert!(run["check"]["output_log"].is_null());
     assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+    check_attachment(&run, "cat hidden/check.txt", "error");
 }
 
 // ── S8: the spread over repeats ───────────────────────────────────────────────
@@ -1640,10 +1642,11 @@ fn a_variant_that_cannot_stage_is_recorded_and_the_run_completes() {
         assert_eq!(variant[0]["outcome"], "stage_failed", "{record:#}");
         assert_eq!(variant[0]["check_result"], "not_run");
         assert!(variant[0]["check"].is_null());
-        assert_eq!(
-            arm_runs(&record, case, "baseline")[0]["check_result"],
-            "fail"
-        );
+        assert!(variant[0]["attachment_id"].is_null(), "{record:#}");
+        assert!(variant[0]["attachment_error"].is_null(), "{record:#}");
+        let baseline = arm_runs(&record, case, "baseline")[0];
+        assert_eq!(baseline["check_result"], "fail");
+        check_attachment(baseline, "grep -q fixed main.txt", "fail");
     }
     assert!(variant_server.requests().is_empty());
     let total = total_row(&stdout, "check");
@@ -1674,6 +1677,7 @@ fn an_old_dataset_runs_as_it_always_has() {
         "{stdout}"
     );
     assert!(!stdout.contains("arm: "), "{stdout}");
+    assert!(!stdout.contains("attached:"), "{stdout}");
     assert!(stdout.contains("── Summary ──────────────────────────────────────\npass: 0/2\n"));
     assert!(
         stdout.contains("  old_2                    no_scores"),
@@ -1687,6 +1691,11 @@ fn an_old_dataset_runs_as_it_always_has() {
         assert!(case["check"].is_null());
         let run = &case["runs"][0];
         assert!(run["check_result"].is_null());
+        assert!(run["attachment_id"].is_null(), "{run:#}");
+        assert!(run["attachment_error"].is_null(), "{run:#}");
+        let records_dir = PathBuf::from(run["records_dir"].as_str().unwrap());
+        assert!(records_dir.join("trace.jsonl.seal").is_file(), "{run:#}");
+        assert!(!records_dir.join("attachments").exists(), "{run:#}");
         let workdir = PathBuf::from(run["workdir"].as_str().unwrap());
         assert!(
             fs::read_dir(&workdir).unwrap().next().is_none(),
@@ -1705,4 +1714,173 @@ fn an_old_dataset_runs_as_it_always_has() {
     assert!(!diff.contains("delta"), "{diff}");
     assert!(!diff.contains("mur trace diff"), "{diff}");
     assert!(row(&diff, "old_1", "check").contains('—'), "{diff}");
+}
+
+// ── Check results as attachments ──────────────────────────────────────────────
+
+/// Every `attachments/*.json` of `records_dir`, as (file stem, parsed body), ordered by name.
+fn attachments_of(records_dir: &Path) -> Vec<(String, Value)> {
+    let Ok(entries) = fs::read_dir(records_dir.join("attachments")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, Value)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .map(|path| {
+            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+            assert_eq!(path.extension().unwrap(), "json", "{path:?}");
+            (stem, read_json(&path))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// The one attachment `run` names: its file exists under the run's records directory, holds the
+/// check's result under `check: <command>` and names the sealed head of `trace.jsonl`. Returns the
+/// records directory and the attachment id.
+fn check_attachment(run: &Value, command: &str, value: &str) -> (PathBuf, String) {
+    let records_dir = PathBuf::from(run["records_dir"].as_str().unwrap());
+    let attachments = attachments_of(&records_dir);
+    assert_eq!(attachments.len(), 1, "{attachments:?}");
+    let (stem, attachment) = &attachments[0];
+    let hex = stem.strip_prefix("att_").unwrap();
+    assert_eq!(hex.len(), 32, "{stem}");
+    assert!(
+        hex.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{stem}"
+    );
+    assert_eq!(run["attachment_id"], stem.as_str(), "{run:#}");
+    assert!(run["attachment_error"].is_null(), "{run:#}");
+    assert_eq!(run["check_result"], value, "{run:#}");
+
+    let seal = read_json(&records_dir.join("trace.jsonl.seal"));
+    let keys: Vec<&str> = attachment
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        BTreeSet::from_iter(keys),
+        BTreeSet::from([
+            "format",
+            "attachment_id",
+            "session_id",
+            "evaluator",
+            "value",
+            "events",
+            "attached_at",
+            "record",
+        ]),
+        "{attachment:#}"
+    );
+    assert_eq!(attachment["format"], "murmur.attachment/1");
+    assert_eq!(attachment["attachment_id"], stem.as_str());
+    assert_eq!(attachment["session_id"], run["session_id"]);
+    assert_eq!(attachment["evaluator"], format!("check: {command}"));
+    assert_eq!(attachment["value"], value);
+    assert_eq!(attachment["events"], json!([]));
+    assert!(attachment["attached_at"].is_u64(), "{attachment:#}");
+    assert_eq!(attachment["record"]["stream"], "trace.jsonl");
+    assert_eq!(attachment["record"]["head"], seal["head"]);
+    assert_eq!(attachment["record"]["lines"], seal["lines"]);
+    assert_eq!(attachment["record"]["key_id"], seal["key_id"]);
+    (records_dir, stem.clone())
+}
+
+#[test]
+fn a_check_result_is_attached_to_its_session() {
+    if common::skip_without_host_support("a_check_result_is_attached_to_its_session") {
+        return;
+    }
+    let world = World::new();
+    let baseline_server = ScriptedServer::start(giving_up());
+    let variant_server = ScriptedServer::start(fixing("toolu_a"));
+    world.capsule("base", &baseline_server.endpoint, "test-model", SHELL_ALLOW);
+    world.capsule(
+        "variant",
+        &variant_server.endpoint,
+        "test-model",
+        SHELL_ALLOW,
+    );
+    buggy_start(&world);
+    let command = "grep -q fixed main.txt";
+    world.dataset(&[
+        json!({"case_id": "case_a", "task_path": "task.md", "start": "start", "check": command}),
+    ]);
+
+    let stdout = run_ok(world.mur().args([
+        "eval",
+        "run",
+        "base",
+        "--dataset",
+        "eval.jsonl",
+        "--variant",
+        "./variant",
+    ]));
+
+    let record = read_json(&world.run_records("base")[0]);
+    let mut ids = Vec::new();
+    for (arm, value) in [("baseline", "fail"), ("variant", "pass")] {
+        let run = arm_runs(&record, 0, arm)[0];
+        let (records_dir, id) = check_attachment(run, command, value);
+
+        let verified = run_ok(
+            world
+                .mur()
+                .args(["trace", "verify", records_dir.to_str().unwrap()]),
+        );
+        let header = verified
+            .lines()
+            .position(|line| line == "attachments:")
+            .unwrap_or_else(|| panic!("{verified}"));
+        let rows: Vec<&str> = verified.lines().skip(header + 1).collect();
+        assert_eq!(rows.len(), 1, "{verified}");
+        assert!(
+            rows[0].starts_with(&format!("  {id}  check: {command}  matches  {value}  ")),
+            "{verified}"
+        );
+        let report: Value = serde_json::from_str(&run_ok(world.mur().args([
+            "trace",
+            "verify",
+            records_dir.to_str().unwrap(),
+            "--json",
+        ])))
+        .unwrap();
+        assert_eq!(report["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(report["attachments"][0]["status"], "matches", "{report:#}");
+        assert_eq!(report["attachments"][0]["attachment_id"], id.as_str());
+        assert_eq!(report["attachments"][0]["value"], value);
+        assert_eq!(
+            report["attachments"][0]["evaluator"],
+            format!("check: {command}")
+        );
+        let seal = read_json(&records_dir.join("trace.jsonl.seal"));
+        assert_eq!(report["attachments"][0]["record_head"], seal["head"]);
+        ids.push((value, id));
+    }
+
+    // `    attached: <id>` follows each run's `    check: <result>`.
+    for (value, id) in &ids {
+        assert!(
+            stdout.contains(&format!("    check: {value}\n    attached: {id}\n")),
+            "{stdout}"
+        );
+    }
+
+    let diff = run_ok(world.mur().args([
+        "eval",
+        "diff",
+        "--run",
+        "@1",
+        "--workdir",
+        world.path("base/workdir").to_str().unwrap(),
+    ]));
+    let check = row(&diff, "case_a", "check");
+    assert!(check.contains("0/1 pass"), "{check}");
+    assert!(check.contains("1/1 pass"), "{check}");
+    let table = diff.trim_end();
+    assert!(stdout.contains(table), "eval run:\n{stdout}\ndiff:\n{diff}");
 }

@@ -11,6 +11,13 @@ compile_error!(
      and a build without debug assertions (every release profile) must not carry it"
 );
 
+// Race windows stop the runtime on purpose, for a test. No release profile may carry them.
+#[cfg(all(feature = "race-windows", not(debug_assertions)))]
+compile_error!(
+    "the `race-windows` feature is test-only: it lets a test hold the runtime at a handoff, and \
+     a build without debug assertions (every release profile) must not carry it"
+);
+
 pub(crate) mod a2a;
 #[cfg(test)]
 mod a2a_conformance;
@@ -89,6 +96,7 @@ pub(crate) mod murmur_md;
 pub mod namespace_probe;
 pub mod network_namespace;
 pub(crate) mod network_policy;
+pub(crate) mod network_request;
 pub mod origin;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
@@ -103,6 +111,7 @@ pub mod proc_view;
 pub mod process_driver;
 pub(crate) mod protected_paths;
 pub mod provider_tool;
+pub(crate) mod race;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
 pub mod record_seal;
