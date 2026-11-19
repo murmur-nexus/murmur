@@ -344,9 +344,21 @@ impl Run {
             .collect()
     }
 
-    fn trace(&self) -> Vec<Value> {
+    /// Every `network_request` line of the session's trace, in order.
+    fn network_requests(&self) -> Vec<Value> {
+        self.trace()
+            .into_iter()
+            .filter(|event| event["event_type"] == "network_request")
+            .collect()
+    }
+
+    fn records_dir(&self) -> PathBuf {
         assert!(self.stdout.contains("records: "), "{}", self.context());
-        let records_dir = common::parse_records_from_stdout(&self.stdout);
+        common::parse_records_from_stdout(&self.stdout)
+    }
+
+    fn trace(&self) -> Vec<Value> {
+        let records_dir = self.records_dir();
         fs::read_to_string(records_dir.join("trace.jsonl"))
             .unwrap_or_else(|err| panic!("no trace.jsonl ({err}); {}", self.context()))
             .lines()
@@ -513,7 +525,117 @@ fn gateway_is_per_artifact() {
         requests[0].header_values("authorization"),
         vec![format!("Bearer {MARKER}").as_str()]
     );
+
+    // Each tool's request is one `network_request` line: through the gateway, and refused.
+    let lines = run.network_requests();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let through = one_line_of(&lines, tool_name_of(TOOL));
+    assert_gateway_probe_sent(through, &upstream, &requests[0].body);
+    let refused = one_line_of(&lines, tool_name_of(TOOL_B));
+    assert_eq!(refused["role"], "tool");
+    assert_eq!(refused["route"], "direct");
+    assert_eq!(refused["scheme"], "http");
+    assert_eq!(refused["host"], "127.0.0.1:9");
+    assert_eq!(refused["method"], "POST");
+    assert_eq!(refused["outcome"], "refused");
+    assert_eq!(refused["reason"], "not_allowed");
+    for absent in [
+        "http_status",
+        "request_bytes",
+        "response_bytes",
+        "request_sha256",
+        "response_sha256",
+    ] {
+        assert!(refused.get(absent).is_none(), "{absent} in {refused}");
+    }
     project.assert_key_recorded_nowhere(&run, MARKER);
+}
+
+/// The one line in `lines` sent by `component`.
+fn one_line_of<'a>(lines: &'a [Value], component: &str) -> &'a Value {
+    let mine: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["component"] == component)
+        .collect();
+    assert_eq!(mine.len(), 1, "{component}: {lines:?}");
+    mine[0]
+}
+
+/// `line` records `gateway-probe`'s request through its gateway at `upstream`: the
+/// `{"query":"gateway-probe"}` body the upstream received as `sent_body`, answered with
+/// [`UPSTREAM_REPLY`], and named by the upstream's host and port alone.
+fn assert_gateway_probe_sent(line: &Value, upstream: &RecordingUpstream, sent_body: &[u8]) {
+    assert_eq!(sent_body, br#"{"query":"gateway-probe"}"#);
+    assert_eq!(line["role"], "tool");
+    assert_eq!(line["route"], "gateway");
+    assert_eq!(line["scheme"], "http");
+    assert_eq!(line["host"], format!("127.0.0.1:{}", upstream.port));
+    assert_eq!(line["method"], "POST");
+    assert_eq!(line["outcome"], "sent");
+    assert!(line.get("reason").is_none(), "{line}");
+    assert_eq!(line["http_status"], 200);
+    assert_eq!(line["request_bytes"], 25);
+    assert_eq!(line["response_bytes"], UPSTREAM_REPLY.len());
+    assert_eq!(line["request_sha256"], sha256_hex(sent_body));
+    assert_eq!(
+        line["response_sha256"],
+        sha256_hex(UPSTREAM_REPLY.as_bytes())
+    );
+    let text = line.to_string();
+    for absent in ["/v1/probe", "query", "authorization", "Bearer", MARKER] {
+        assert!(!text.contains(absent), "{absent} in {text}");
+    }
+}
+
+/// `trace.capture` decides what a `network_request` line keeps beyond its sizes: no hash under
+/// `none`, both hashes under `meta`, and under `content` both hashes with each body stored as
+/// `blobs/<sha256>` beside `trace.jsonl`. No `blobs/` directory appears under the other two.
+#[test]
+fn network_request_follows_trace_capture() {
+    for mode in ["none", "meta", "content"] {
+        let (project, upstream) = keyed_tool_project();
+        project.script_manifest(
+            &tool_entry(&upstream.endpoint),
+            &format!("trace:\n  capture: {mode}\n"),
+        );
+        let run = project.run(&[], &[]);
+        assert!(run.ok(), "{mode}: {}", run.context());
+
+        let lines = run.network_requests();
+        assert_eq!(lines.len(), 1, "{mode}: {lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "sent", "{mode}: {line}");
+        assert_eq!(line["request_bytes"], 25, "{mode}");
+        assert_eq!(line["response_bytes"], UPSTREAM_REPLY.len(), "{mode}");
+        let sent_body = upstream.requests()[0].body.clone();
+        let blobs = run.records_dir().join("blobs");
+        match mode {
+            "none" => {
+                assert!(line.get("request_sha256").is_none(), "{line}");
+                assert!(line.get("response_sha256").is_none(), "{line}");
+            }
+            _ => {
+                assert_eq!(line["request_sha256"], sha256_hex(&sent_body), "{mode}");
+                assert_eq!(
+                    line["response_sha256"],
+                    sha256_hex(UPSTREAM_REPLY.as_bytes()),
+                    "{mode}"
+                );
+            }
+        }
+        if mode == "content" {
+            for (field, bytes) in [
+                ("request_sha256", sent_body.as_slice()),
+                ("response_sha256", UPSTREAM_REPLY.as_bytes()),
+            ] {
+                let blob = blobs.join(line[field].as_str().unwrap());
+                assert_eq!(fs::read(&blob).unwrap(), bytes, "{field}");
+            }
+        } else {
+            assert!(!blobs.exists(), "{mode} wrote {}", blobs.display());
+        }
+        project.assert_key_recorded_nowhere(&run, MARKER);
+    }
 }
 
 /// An artifact with a `gateway:` whose own manifest does not say how its upstream takes the key
@@ -992,7 +1114,12 @@ fn tool_gateway_credential_rotates() {
 #[test]
 fn unmetered_gateway_is_labelled() {
     let tool_upstream = RecordingUpstream::replying(UPSTREAM_REPLY);
-    let provider = RecordingUpstream::with_handler(|_, _| Reply::json(end_turn()));
+    let provider = RecordingUpstream::with_handler(|index, _| {
+        Reply::json(match index {
+            0 => tool_use_turn("first"),
+            _ => end_turn(),
+        })
+    });
     let project = agent_project(&provider, &tool_upstream);
 
     for (surface, output) in [
@@ -1042,6 +1169,41 @@ fn unmetered_gateway_is_labelled() {
         ])
     );
     assert_eq!(session_start["credential_source"], "config");
+
+    // The driver's metered model calls keep their `inference` lines and write no
+    // `network_request`; the tool's one request through its own gateway writes one, for its task,
+    // ahead of that call's `tool_call` line.
+    let trace = run.trace();
+    assert!(
+        trace.iter().any(|event| event["event_type"] == "inference"),
+        "no inference line"
+    );
+    let provider_host = format!("127.0.0.1:{}", provider.port);
+    let positions: Vec<usize> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event_type"] == "network_request")
+        .map(|(index, _)| index)
+        .collect();
+    for &index in &positions {
+        assert_ne!(trace[index]["role"], "driver", "{}", trace[index]);
+        assert_ne!(trace[index]["host"], provider_host, "{}", trace[index]);
+    }
+    assert_eq!(positions.len(), 1, "{trace:?}");
+    let line = &trace[positions[0]];
+    assert_eq!(line["component"], tool_name_of(TOOL));
+    assert!(line["task_id"].is_string(), "{line}");
+    assert_gateway_probe_sent(line, &tool_upstream, &tool_upstream.requests()[0].body);
+    let tool_call = trace
+        .iter()
+        .position(|event| {
+            event["event_type"] == "tool_call" && event["tool_name"] == tool_name_of(TOOL)
+        })
+        .expect("a tool_call line for the probe");
+    assert!(
+        positions[0] < tool_call,
+        "network_request after its tool_call"
+    );
     for key in [MARKER, DRIVER_MARKER] {
         project.assert_key_recorded_nowhere(&run, key);
     }

@@ -1130,6 +1130,7 @@ mod tests {
             formation: None,
             task_provenance: None,
             member_requests: None,
+            network_requests: None,
         }
     }
 

@@ -306,11 +306,38 @@ fn run_disallowed_network_call_is_denied_without_panic() {
         .stdout
         .clone();
 
-    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let stdout = String::from_utf8(output).unwrap();
+    let workdir = common::parse_workdir_from_stdout(&stdout);
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "denied"
     );
+
+    // The capsule's own request is one refused `network_request` line naming where it went.
+    let lines = network_request_lines(&stdout);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(line["component"], "capsule");
+    assert_eq!(line["role"], "capsule");
+    assert_eq!(line["route"], "direct");
+    assert_eq!(line["scheme"], "https");
+    assert_eq!(line["host"], "blocked.example.com");
+    assert_eq!(line["method"], "GET");
+    assert_eq!(line["outcome"], "refused");
+    assert_eq!(line["reason"], "not_allowed");
+    assert!(line.get("http_status").is_none(), "{line}");
+}
+
+/// Every `network_request` line of the trace whose records directory `mur run --verbose` printed
+/// in `stdout`, in order.
+fn network_request_lines(stdout: &str) -> Vec<serde_json::Value> {
+    let records = common::parse_records_from_stdout(stdout);
+    fs::read_to_string(records.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event_type"] == "network_request")
+        .collect()
 }
 
 #[test]
@@ -341,11 +368,23 @@ fn run_allowlisted_network_host_is_not_denied() {
         .stdout
         .clone();
 
-    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let stdout = String::from_utf8(output).unwrap();
+    let workdir = common::parse_workdir_from_stdout(&stdout);
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "allowed"
     );
+
+    // Admitted, the request is recorded whatever became of it on the network.
+    let lines = network_request_lines(&stdout);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(line["role"], "capsule");
+    assert_eq!(line["route"], "direct");
+    assert_eq!(line["scheme"], "https");
+    assert_eq!(line["host"], "blocked.example.com");
+    assert_eq!(line["method"], "GET");
+    assert_ne!(line["outcome"], "refused", "{line}");
 }
 
 /// Runs the env-echo fixture with `extra_env` set on the `mur` process and returns the

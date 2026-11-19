@@ -1545,19 +1545,22 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 | `trace.sync` | `line`, or a duration | no | No default. When each line of `trace.jsonl` is synced to disk, so it survives the host going down. A duration is an integer, optionally suffixed `s`/`m`/`h`/`d`; a bare integer is seconds. `0` and any other value are refused with [`E-MAN-003`](diagnostics.md#e-man-003). Omitted, no sync call is made. See [Syncing the trace](#trace-sync). |
 
-| `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `blobs/` | `tool_call.output` |
-|---|---|---|---|---|
-| `none` | — | — | — | — |
-| `meta` | written | written | — | — |
-| `content` | written | written | written | written |
+| `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `network_request` body hashes | `blobs/` | `tool_call.output` |
+|---|---|---|---|---|---|
+| `none` | — | — | — | — | — |
+| `meta` | written | written | written | — | — |
+| `content` | written | written | written | written | written |
 
 The hashes are `system_sha`, `tools_sha`, `response_sha` and `message_shas` on each
-[`inference` event](observability-schemas.md#wire-hashes), and the hash of the message text of
+[`inference` event](observability-schemas.md#wire-hashes), the hash of the message text of
 each task the door let in, on its
-[`a2a_task_received` event](observability-schemas.md#a2a-task-received). Under `content` the body
-behind each one is also written to
+[`a2a_task_received` event](observability-schemas.md#a2a-task-received), and `request_sha256` and
+`response_sha256` on each [`network_request` event](observability-schemas.md#network-request),
+for the bodies of a guest's own HTTP request. Every `network_request` line is written under every
+mode; `none` drops only its hashes. Under `content` the body behind each hash is also written to
 [`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs), verbatim and unredacted —
-bodies can be large, and a blob holds the wire payload or the received message as sent.
+bodies can be large, and a blob holds the wire payload, the received message or the guest's HTTP
+body as sent.
 
 `trace.sync` sets when each line the session's own `mur` process writes to `trace.jsonl` is on
 disk:

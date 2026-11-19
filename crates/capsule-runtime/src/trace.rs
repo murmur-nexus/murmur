@@ -161,6 +161,10 @@ pub(crate) struct TraceWriter {
     /// `member_request` lines at the same points as [`Self::call_deadlines`]. Set by
     /// [`Self::set_member_requests`]; `None` drains nothing.
     member_requests: Option<crate::member_request::MemberRequests>,
+    /// The session's record of requests guests sent through `wasi:http` on their own, drained
+    /// into `network_request` lines right after [`Self::member_requests`]. Set by
+    /// [`Self::set_network_requests`]; `None` drains nothing.
+    network_requests: Option<crate::network_request::NetworkRequests>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -1978,6 +1982,49 @@ struct MemberRequestEvent {
     duration_ms: u64,
 }
 
+/// One request a guest sent through `wasi:http` on its own, refusals included. Written once per
+/// request, after it was accounted for and before `session_end`. Never holds a path, a query, a
+/// header, a key or a body.
+#[derive(Serialize)]
+struct NetworkRequestEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The calling task; absent when the request was sent for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    component: String,
+    /// [`crate::limits::ComponentRole::wire_name`].
+    role: &'static str,
+    /// [`crate::network_request::NetworkRoute::wire_name`]: `direct` or `gateway`.
+    route: &'static str,
+    scheme: String,
+    /// Host, and `:port` when the address named one; absent when the URI named no host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    method: String,
+    /// `sent`, `refused` or `failed`.
+    outcome: &'static str,
+    /// Present exactly for `refused` and `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_bytes: Option<u64>,
+    /// Present exactly when `request_bytes` is and `trace.capture` is not `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_sha256: Option<String>,
+    /// Present exactly when `response_bytes` is and `trace.capture` is not `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_sha256: Option<String>,
+    duration_ms: u64,
+}
+
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
 /// line follows its last attempt.
 #[derive(Serialize)]
@@ -2860,6 +2907,7 @@ impl TraceWriter {
             session_status: None,
             call_deadlines: None,
             member_requests: None,
+            network_requests: None,
         })
     }
 
@@ -2873,6 +2921,16 @@ impl TraceWriter {
     /// `member_request` line per request wherever it drains [`Self::set_call_deadlines`]' latch.
     pub(crate) fn set_member_requests(&mut self, requests: crate::member_request::MemberRequests) {
         self.member_requests = Some(requests);
+    }
+
+    /// The session's [`crate::network_request::NetworkRequests`], which this writer drains into
+    /// one `network_request` line per request wherever it drains [`Self::set_member_requests`]'
+    /// latch, storing each captured body under `blobs/` first.
+    pub(crate) fn set_network_requests(
+        &mut self,
+        requests: crate::network_request::NetworkRequests,
+    ) {
+        self.network_requests = Some(requests);
     }
 
     /// The session's standing, which every later `inference`, `task_start` and `task_end` write
@@ -4876,19 +4934,69 @@ impl TraceWriter {
     }
 
     /// Write `event` as one line, after a `call_deadline` line for each firing the session's
-    /// latch holds and a `member_request` line for each request its other latch holds. Draining
-    /// here, ahead of every line, is what puts a cut call's `call_deadline` before the record of
-    /// that call and every one of both before `session_end`.
+    /// latch holds, a `member_request` line for each request its second latch holds and a
+    /// `network_request` line for each request its third holds. Draining here, ahead of every
+    /// line, is what puts a cut call's `call_deadline` before the record of that call, a tool's
+    /// requests before its `tool_call`, and every one of them before `session_end`.
     async fn write_event(&mut self, event: &impl Serialize) -> std::io::Result<()> {
         self.write_latched().await?;
         self.write_line(event).await
     }
 
-    /// Drains both of the session's latches: [`Self::write_call_deadlines`], then
-    /// [`Self::write_member_requests`].
+    /// Drains the session's latches: [`Self::write_call_deadlines`], then
+    /// [`Self::write_member_requests`], then [`Self::write_network_requests`].
     async fn write_latched(&mut self) -> std::io::Result<()> {
         self.write_call_deadlines().await?;
-        self.write_member_requests().await
+        self.write_member_requests().await?;
+        self.write_network_requests().await
+    }
+
+    /// One `network_request` line per request [`Self::network_requests`] holds, parented to the
+    /// session node. Nothing before `session_start`. Each line carries the task its own record
+    /// names, never the writer's active task. Under `trace.capture: content` each captured body
+    /// is stored as `blobs/<sha256>` before the line that names it.
+    async fn write_network_requests(&mut self) -> std::io::Result<()> {
+        let Some(requests) = self
+            .network_requests
+            .as_ref()
+            .filter(|_| self.session_started)
+        else {
+            return Ok(());
+        };
+        for request in requests.take() {
+            for body in [&request.request_body, &request.response_body]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(bytes) = body.bytes.as_deref() {
+                    self.blobs.put(&body.sha256, bytes).await?;
+                }
+            }
+            let event = NetworkRequestEvent {
+                event_type: "network_request",
+                event_id: new_event_id(),
+                parent_id: self.session_parent(),
+                session_id: self.session_id.clone(),
+                timestamp: timestamp_ms(),
+                task_id: request.task_id,
+                component: request.component,
+                role: request.role.wire_name(),
+                route: request.route.wire_name(),
+                scheme: request.scheme,
+                host: request.host,
+                method: request.method,
+                outcome: request.outcome.wire_name(),
+                reason: request.outcome.reason(),
+                http_status: request.http_status,
+                request_bytes: request.request_bytes,
+                response_bytes: request.response_bytes,
+                request_sha256: request.request_body.map(|body| body.sha256),
+                response_sha256: request.response_body.map(|body| body.sha256),
+                duration_ms: request.duration_ms,
+            };
+            self.write_line(&event).await?;
+        }
+        Ok(())
     }
 
     /// One `member_request` line per request [`Self::member_requests`] holds, parented to the

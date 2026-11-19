@@ -91,6 +91,7 @@ use crate::{
         validate_filesystem_scope, HookCapabilityGrant, NetworkAllowRule, RequestTarget,
         ToolCapabilityGrant,
     },
+    network_request::{host_of, NetworkRequestRecorder, NetworkRequestScope, NetworkRoute},
     origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
     outgoing,
@@ -3076,6 +3077,15 @@ pub fn stage_session(
     // Every component this session runs, from the on-stage hooks below on, records a request it
     // routed to a member's virtual address here.
     let member_requests = MemberRequests::default();
+    // Every request a guest sends through `wasi:http` on its own, from the on-stage hooks below
+    // on, is recorded here, keeping what the session's `trace.capture` asks of its bodies.
+    let network_requests = crate::network_request::NetworkRequests::new(
+        request
+            .trace
+            .as_ref()
+            .map(|t| t.capture)
+            .unwrap_or_default(),
+    );
     // Every report above names artifacts by full name; from here on the session knows each by its
     // tool name, and `full_names` takes it back to the full name for the store, the lock and the
     // identity records.
@@ -3933,6 +3943,7 @@ pub fn stage_session(
         formation_member: request.formation_member.as_ref(),
         call_deadlines: call_deadlines.clone(),
         member_requests: member_requests.clone(),
+        network_requests: network_requests.clone(),
         guest_workers: guest_workers.as_ref(),
         ..HookEnvVars::default()
     };
@@ -4116,6 +4127,7 @@ pub fn stage_session(
         _epoch_ticker: epoch_ticker,
         call_deadlines,
         member_requests,
+        network_requests,
         // Minted by the daemon at registration, which `launch_session` performs — it names a
         // session id, and staging is what mints one.
         spawn_credential: None,
@@ -4813,6 +4825,7 @@ fn launch(
         let staged_code_mode = staged.code_mode.clone();
         let call_deadlines = staged.call_deadlines.clone();
         let member_requests = staged.member_requests.clone();
+        let network_requests = staged.network_requests.clone();
         let capability_policy = staged.capability_policy.clone();
         let protected_paths = staged.protected_paths.clone();
         let tool_annotations = staged.tool_annotations.clone();
@@ -4892,6 +4905,7 @@ fn launch(
             trace.set_trace_sync(trace_sync);
             trace.set_call_deadlines(call_deadlines.clone());
             trace.set_member_requests(member_requests.clone());
+            trace.set_network_requests(network_requests.clone());
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
             let session_status = Arc::new(crate::session_status::SessionStatus::new(
                 std::time::Instant::now(),
@@ -5138,6 +5152,7 @@ fn launch(
                         limits: capability_policy.limits.limiter(),
                         call_deadlines: call_deadlines.clone(),
                         member_requests: member_requests.clone(),
+                        network_requests: network_requests.clone(),
                         table: ResourceTable::new(),
                         // The capsule's own store is the ceiling itself, never narrowed:
                         // per-artifact grants apply to staged tools/drivers, not to the
@@ -5171,6 +5186,10 @@ fn launch(
                             // from the tool and driver stores dispatched for it.
                             member_requests: Some(MemberRequestScope::for_capsule(
                                 &member_requests,
+                                capsule_name.clone(),
+                            )),
+                            network_requests: Some(NetworkRequestScope::for_capsule(
+                                &network_requests,
                                 capsule_name.clone(),
                             )),
                         },
@@ -5310,6 +5329,7 @@ fn launch(
                                     deadline: session_status.deadline(),
                                     call_deadlines: state.call_deadlines.clone(),
                                     member_requests: state.member_requests.clone(),
+                                    network_requests: state.network_requests.clone(),
                                     guest_workers: guest_workers.clone(),
                                 })
                             })
@@ -5338,6 +5358,7 @@ fn launch(
                             formation_member: formation_member.as_ref(),
                             call_deadlines: call_deadlines.clone(),
                             member_requests: member_requests.clone(),
+                            network_requests: network_requests.clone(),
                             guest_workers: guest_workers.as_ref(),
                         },
                         hook_limits,
@@ -6206,6 +6227,7 @@ fn launch(
     trace.set_tool_refresh(None);
     trace.set_call_deadlines(staged.call_deadlines.clone());
     trace.set_member_requests(staged.member_requests.clone());
+    trace.set_network_requests(staged.network_requests.clone());
     trace.set_runtime_artifacts(&staged.installed_artifacts);
     trace.set_host_facts(&staged.host_facts);
     trace.set_formation_id(staged.formation_id.as_ref());
@@ -6239,6 +6261,10 @@ fn launch(
             // A script capsule runs no task loop, so its requests are sent for no task.
             member_requests: Some(MemberRequestScope::for_capsule(
                 &staged.member_requests,
+                staged.capsule_name.clone(),
+            )),
+            network_requests: Some(NetworkRequestScope::for_capsule(
+                &staged.network_requests,
                 staged.capsule_name.clone(),
             )),
         },
@@ -6333,6 +6359,7 @@ fn launch(
         limits: capsule_limits.limiter(),
         call_deadlines: staged.call_deadlines.clone(),
         member_requests: staged.member_requests.clone(),
+        network_requests: staged.network_requests.clone(),
     };
 
     let call_deadlines = staged.call_deadlines.clone();
@@ -8636,6 +8663,11 @@ pub(crate) struct NetworkPolicyHooks {
     /// the component, role and calling task it is recorded under. `None` records nothing; a
     /// session in no formation records nothing either way.
     pub(crate) member_requests: Option<MemberRequestScope>,
+    /// Where every other request is accounted for as one `network_request` line — refused,
+    /// direct, or through an unmetered gateway — and the component, role and calling task it is
+    /// recorded under. A request admitted to the metered inference gateway is recorded by its
+    /// `inference` line instead. `None` records nothing.
+    pub(crate) network_requests: Option<NetworkRequestScope>,
 }
 
 /// Where [`NetworkPolicyHooks::admit`] lets a request go.
@@ -8811,6 +8843,7 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     ) -> Box<
         dyn Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>> + Send,
     > {
+        let started = Instant::now();
         // A formation call may wait for its callee's address, so it is resolved off this thread,
         // inside the response future, and still before any connection is opened.
         if request.uri().host().is_some_and(is_formation_host) {
@@ -8853,11 +8886,99 @@ impl WasiHttpHooks for NetworkPolicyHooks {
         // A refused request gets a future that has already failed, so no connection is opened
         // for it. The guest reads the refusal from its response future.
         match self.admit(request.uri()) {
-            Err(refused) => Box::new(std::future::ready(Err(refused))),
-            Ok(Admission::Gateway(gateway)) => Box::new(gateway.send(request, options)),
-            Ok(Admission::Direct) => Box::new(send_direct(request, options)),
+            Err(refused) => {
+                self.record_refusal(request.uri(), request.method(), started);
+                Box::new(std::future::ready(Err(refused)))
+            }
+            // A model call keeps its `inference` line, which is that request's record.
+            Ok(Admission::Gateway(gateway)) if gateway.is_metered() => {
+                Box::new(gateway.send(request, options))
+            }
+            Ok(Admission::Gateway(gateway)) => {
+                let recorder = NetworkRequestRecorder::begin(
+                    self.network_requests.as_ref(),
+                    NetworkRoute::Gateway,
+                    gateway.upstream_scheme(),
+                    Some(gateway.upstream_host().to_string()),
+                    request.method(),
+                    started,
+                );
+                Box::new(send_network_recorded(recorder, request, move |request| {
+                    gateway.send(request, options)
+                }))
+            }
+            Ok(Admission::Direct) => {
+                let recorder = NetworkRequestRecorder::begin(
+                    self.network_requests.as_ref(),
+                    NetworkRoute::Direct,
+                    request.uri().scheme_str().unwrap_or_default(),
+                    host_of(request.uri()),
+                    request.method(),
+                    started,
+                );
+                Box::new(send_network_recorded(recorder, request, move |request| {
+                    send_direct(request, options)
+                }))
+            }
         }
     }
+}
+
+impl NetworkPolicyHooks {
+    /// Records a request [`Self::admit`] refused. One addressed to the metered inference gateway
+    /// with no spend admission open is `not_admitted` and named by that gateway's upstream; every
+    /// other refusal is the allow-list's `not_allowed`, named by the address the guest wrote.
+    fn record_refusal(&self, uri: &http::Uri, method: &http::Method, started: Instant) {
+        let scope = self.network_requests.as_ref();
+        let closed_gateway = self.gateway.as_deref().filter(|gateway| {
+            gateway.is_metered() && CredentialGateway::is_addressed_to_gateway(uri)
+        });
+        let (recorder, reason) = match closed_gateway {
+            Some(gateway) => (
+                NetworkRequestRecorder::begin(
+                    scope,
+                    NetworkRoute::Gateway,
+                    gateway.upstream_scheme(),
+                    Some(gateway.upstream_host().to_string()),
+                    method,
+                    started,
+                ),
+                crate::network_request::REASON_NOT_ADMITTED,
+            ),
+            None => (
+                NetworkRequestRecorder::begin(
+                    scope,
+                    NetworkRoute::Direct,
+                    uri.scheme_str().unwrap_or_default(),
+                    host_of(uri),
+                    method,
+                    started,
+                ),
+                crate::network_request::REASON_NOT_ALLOWED,
+            ),
+        };
+        recorder.refuse(reason);
+    }
+}
+
+/// Sends `request` through `send` with its body counted on the way out and its response body
+/// counted on the way back to the guest, recording the request through `recorder`. An error
+/// before a response head leaves the recorder to drop, which records `connection_failed`.
+async fn send_network_recorded<F, Fut>(
+    mut recorder: NetworkRequestRecorder,
+    request: http::Request<WasiBody>,
+    send: F,
+) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>
+where
+    F: FnOnce(http::Request<WasiBody>) -> Fut,
+    Fut: Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>>,
+{
+    let request = recorder.wrap_request(request);
+    let (response, io) = send(request).await?;
+    let status = response.status().as_u16();
+    let (parts, body) = response.into_parts();
+    let body = recorder.wrap_response(body, status);
+    Ok((http::Response::from_parts(parts, body), io))
 }
 
 /// Whether `name` is entering `warned` now, so its `W-RUN-004` is due. A poisoned memo counts as
@@ -8901,6 +9022,9 @@ pub(crate) struct CapsuleStoreState {
     /// The session's latch, cloned into every tool and driver store dispatched from here, where
     /// a request routed to a member's virtual address is recorded.
     pub(crate) member_requests: MemberRequests,
+    /// The session's latch, cloned into every tool and driver store dispatched from here, where
+    /// a request a guest sends through `wasi:http` is recorded.
+    pub(crate) network_requests: crate::network_request::NetworkRequests,
     pub(crate) table: ResourceTable,
     pub(crate) wasi: WasiCtx,
     pub(crate) http: WasiHttpCtx,
@@ -10016,6 +10140,7 @@ pub(crate) struct ToolInvokeEnv<'a> {
     /// The session's latch, where each request the store routes to a member's virtual address is
     /// recorded.
     pub(crate) member_requests: &'a MemberRequests,
+    pub(crate) network_requests: &'a crate::network_request::NetworkRequests,
     /// The task this dispatch runs for, recorded on each of those requests; `None` for a hook's
     /// `run-inference` driver call.
     pub(crate) task_id: Option<String>,
@@ -10175,6 +10300,7 @@ pub(crate) fn prepare_tool_call(
         role,
         call_deadlines: _,
         member_requests,
+        network_requests,
         task_id,
         process,
     } = env;
@@ -10224,6 +10350,12 @@ pub(crate) fn prepare_tool_call(
             task_provenance,
             member_requests: Some(MemberRequestScope::new(
                 member_requests,
+                name,
+                role,
+                task_id.clone(),
+            )),
+            network_requests: Some(NetworkRequestScope::new(
+                network_requests,
                 name,
                 role,
                 task_id,
@@ -11015,6 +11147,7 @@ impl CapsuleStoreState {
             role,
             call_deadlines: &self.call_deadlines,
             member_requests: &self.member_requests,
+            network_requests: &self.network_requests,
             task_id: self.current_task_id.clone(),
             process,
         };
@@ -19494,6 +19627,14 @@ inference:
     /// A script session over `records`, with its `session_start` written, as `launch` holds it on
     /// the script path.
     async fn script_session_over(records: &Path) -> ScriptSessionRecord {
+        script_session_capturing(records, murmur_artifact::TraceCapture::Meta).await
+    }
+
+    /// [`script_session_over`] under `capture`.
+    async fn script_session_capturing(
+        records: &Path,
+        capture: murmur_artifact::TraceCapture,
+    ) -> ScriptSessionRecord {
         let records_root = crate::workdir_fs::WorkdirRoot::open(records).unwrap();
         let mut trace = TraceWriter::open(
             &records_root,
@@ -19520,7 +19661,7 @@ inference:
                 )),
                 crate::cgroup::IoMaxReport::default(),
             ),
-            murmur_artifact::TraceCapture::Meta,
+            capture,
             None,
             false,
             None,
@@ -20096,6 +20237,7 @@ inference:
             limits: crate::limits::ExecutionLimits::default().limiter(),
             call_deadlines: CallDeadlines::default(),
             member_requests: MemberRequests::default(),
+            network_requests: crate::network_request::NetworkRequests::default(),
             table: ResourceTable::new(),
             wasi,
             http: WasiHttpCtx::new(),
@@ -20105,6 +20247,7 @@ inference:
                 formation: None,
                 task_provenance: None,
                 member_requests: None,
+                network_requests: None,
             },
             network_allow_rules: Vec::new(),
             peer_fetch_rules: Vec::new(),
@@ -24152,6 +24295,7 @@ inference:
             formation: None,
             task_provenance: None,
             member_requests: None,
+            network_requests: None,
         };
         hooks.admit(&uri.parse().expect("uri parses")).is_ok()
     }
@@ -24240,6 +24384,7 @@ inference:
             formation: None,
             task_provenance: None,
             member_requests: None,
+            network_requests: None,
         };
         let request = http::Request::builder()
             .uri("http://127.0.0.1:9/")
@@ -24588,6 +24733,7 @@ inference:
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
                     member_requests: &MemberRequests::default(),
+                    network_requests: &crate::network_request::NetworkRequests::default(),
                     task_id: None,
                     process: crate::session_process::ProcessAccess::Unavailable(
                         crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
@@ -24642,6 +24788,7 @@ inference:
                     role: ComponentRole::Tool,
                     call_deadlines: &CallDeadlines::default(),
                     member_requests: &MemberRequests::default(),
+                    network_requests: &crate::network_request::NetworkRequests::default(),
                     task_id: None,
                     process: crate::session_process::ProcessAccess::Unavailable(
                         crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
@@ -26636,6 +26783,7 @@ inference:
             deadline: None,
             call_deadlines: CallDeadlines::default(),
             member_requests: MemberRequests::default(),
+            network_requests: crate::network_request::NetworkRequests::default(),
             guest_workers: None,
         });
         let mut hooks =
@@ -28089,6 +28237,7 @@ inference:
             formation: member,
             task_provenance: task,
             member_requests: None,
+            network_requests: None,
         }
     }
 
@@ -28638,6 +28787,7 @@ inference:
                     role,
                     call_deadlines: &CallDeadlines::default(),
                     member_requests: &requests,
+                    network_requests: &crate::network_request::NetworkRequests::default(),
                     task_id: task_id.clone(),
                     process: crate::session_process::ProcessAccess::Unavailable(
                         crate::session_process::unavailable::NOT_AGENT_TOOL_CALL,
@@ -28775,6 +28925,503 @@ inference:
             "x-murmur-member-request-id: {}\r\n",
             sent_line["call_id"].as_str().unwrap()
         )));
+    }
+
+    // ── Guest network requests ───────────────────────────────────────────────
+
+    /// The `network_request` lines a session's writer, keeping what `requests`' capture asks,
+    /// drains from `requests`, in order, with the records directory they were written in. Each one
+    /// is written ahead of `session_end` and hangs off the session node.
+    fn drained_network_requests(
+        requests: &crate::network_request::NetworkRequests,
+    ) -> (tempfile::TempDir, Vec<serde_json::Value>) {
+        let records = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut session = rt.block_on(script_session_capturing(records.path(), requests.capture()));
+        session.trace.set_network_requests(requests.clone());
+        rt.block_on(session.trace.write_session_end("ok")).unwrap();
+        let lines = script_trace_lines(records.path());
+        assert_eq!(lines[0]["event_type"], "session_start");
+        assert_eq!(lines.last().unwrap()["event_type"], "session_end");
+        let session_event = lines[0]["event_id"].clone();
+        let lines = lines
+            .into_iter()
+            .filter(|line| line["event_type"] == "network_request")
+            .inspect(|line| assert_eq!(line["parent_id"], session_event, "{line}"))
+            .collect();
+        (records, lines)
+    }
+
+    /// [`egress_hooks`] allowing `allow`, whose guest requests are recorded under a tool
+    /// `fetcher` sending for `tsk_a`.
+    fn network_hooks(
+        allow: &[&str],
+        requests: &crate::network_request::NetworkRequests,
+    ) -> NetworkPolicyHooks {
+        let mut hooks = egress_hooks(None, allow, None);
+        hooks.network_requests = Some(NetworkRequestScope::new(
+            requests,
+            "fetcher",
+            ComponentRole::Tool,
+            Some("tsk_a".to_string()),
+        ));
+        hooks
+    }
+
+    /// A listener that answers the first connection with `reply` verbatim, after reading the
+    /// request's head and its `content-length` body, and then closes it.
+    fn answer_once(reply: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|rest| rest.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            let _ = stream.read_exact(&mut body);
+            let _ = stream.write_all(&reply);
+            head.extend_from_slice(&body);
+            head
+        });
+        (port, served)
+    }
+
+    fn ok_reply(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A guest `POST` of `body` to `uri`, as wasi-http hands it to the hook.
+    fn guest_post(uri: &str, body: &'static [u8]) -> http::Request<WasiBody> {
+        use http_body_util::{BodyExt, Full};
+        let authority = uri
+            .parse::<http::Uri>()
+            .unwrap()
+            .authority()
+            .unwrap()
+            .clone();
+        http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(http::header::HOST, authority.as_str())
+            .header(http::header::CONTENT_LENGTH, body.len())
+            .body(
+                Full::new(bytes::Bytes::from_static(body))
+                    .map_err(|err| match err {})
+                    .boxed_unsync(),
+            )
+            .unwrap()
+    }
+
+    /// What the guest sees of one request through `hooks`: the refusal or failure before a head,
+    /// or the status and the body read to its end (or the error that ended it).
+    type Exchanged = Result<(u16, Result<bytes::Bytes, String>), WasiHttpError>;
+
+    fn exchange(hooks: &mut NetworkPolicyHooks, request: http::Request<WasiBody>) -> Exchanged {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let options = RequestOptions {
+            connect_timeout: Some(std::time::Duration::from_secs(10)),
+            first_byte_timeout: Some(std::time::Duration::from_secs(10)),
+            between_bytes_timeout: Some(std::time::Duration::from_secs(10)),
+        };
+        let sent = hooks.send_request(request, Some(options), Box::new(async { Ok(()) }));
+        rt.block_on(async {
+            let (response, io) = Box::into_pin(sent).await?;
+            let io = tokio::spawn(Box::into_pin(io));
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .map_err(|err| err.to_string());
+            io.abort();
+            Ok((status, body))
+        })
+    }
+
+    /// A request sent straight to an allowed host is one `sent` line naming the store's
+    /// component, role and task, the host and port, the method, the status and both exact body
+    /// sizes and hashes — and nothing of the path, the query or either body.
+    #[test]
+    fn network_request_sent_direct_counts_both_bodies_exactly() {
+        let (port, served) = answer_once(ok_reply("pong-pong"));
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        let uri = format!("http://127.0.0.1:{port}/v1/secret-path?key=sk-query-marker");
+        let (status, body) = exchange(&mut hooks, guest_post(&uri, b"hello")).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.unwrap(), bytes::Bytes::from_static(b"pong-pong"));
+        let served = String::from_utf8(served.join().unwrap()).unwrap();
+        assert!(served.ends_with("\r\n\r\nhello"), "{served}");
+
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["component"], "fetcher");
+        assert_eq!(line["role"], "tool");
+        assert_eq!(line["task_id"], "tsk_a");
+        assert_eq!(line["route"], "direct");
+        assert_eq!(line["scheme"], "http");
+        assert_eq!(line["host"], format!("127.0.0.1:{port}"));
+        assert_eq!(line["method"], "POST");
+        assert_eq!(line["outcome"], "sent");
+        assert!(line.get("reason").is_none(), "{line}");
+        assert_eq!(line["http_status"], 200);
+        assert_eq!(line["request_bytes"], 5);
+        assert_eq!(line["response_bytes"], 9);
+        assert_eq!(
+            line["request_sha256"],
+            murmur_artifact::sha256_hex(b"hello")
+        );
+        assert_eq!(
+            line["response_sha256"],
+            murmur_artifact::sha256_hex(b"pong-pong")
+        );
+        assert!(line["duration_ms"].is_u64(), "{line}");
+        let text = line.to_string();
+        for absent in ["/v1", "secret-path", "sk-query-marker", "hello", "pong"] {
+            assert!(!text.contains(absent), "{absent} in {text}");
+        }
+    }
+
+    /// An allowed address nothing listens on fails the guest's request as before and is one
+    /// `failed`/`connection_failed` line with no status and no response size.
+    #[test]
+    fn network_request_to_a_port_nothing_listens_on_is_connection_failed() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        let failed = exchange(
+            &mut hooks,
+            guest_request(&format!("http://127.0.0.1:{port}/"), &[]),
+        );
+        assert!(failed.is_err(), "{failed:?}");
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "failed");
+        assert_eq!(line["reason"], "connection_failed");
+        assert_eq!(line["host"], format!("127.0.0.1:{port}"));
+        assert_eq!(line["method"], "GET");
+        assert!(line.get("http_status").is_none(), "{line}");
+        assert!(line.get("response_bytes").is_none(), "{line}");
+        assert!(line.get("response_sha256").is_none(), "{line}");
+        assert_eq!(
+            line.get("request_sha256").is_some(),
+            line.get("request_bytes").is_some(),
+            "{line}"
+        );
+    }
+
+    /// A body cut off mid-stream ends the guest's read with an error as before, and is one
+    /// `failed`/`response_interrupted` line keeping the status and the bytes that did arrive.
+    #[test]
+    fn network_request_cut_off_body_is_response_interrupted_with_its_status() {
+        let (port, _served) = answer_once(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789"
+                .to_vec(),
+        );
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        let (status, body) = exchange(
+            &mut hooks,
+            guest_request(&format!("http://127.0.0.1:{port}/"), &[]),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert!(body.is_err(), "{body:?}");
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["outcome"], "failed");
+        assert_eq!(line["reason"], "response_interrupted");
+        assert_eq!(line["http_status"], 200);
+        assert_eq!(line["response_bytes"], 10);
+        assert_eq!(
+            line["response_sha256"],
+            murmur_artifact::sha256_hex(b"0123456789")
+        );
+    }
+
+    /// A host outside the allow-list is refused as before, with no connection opened, and is one
+    /// `refused`/`not_allowed` line with no status, no sizes and no hashes.
+    #[test]
+    fn network_request_outside_the_allow_list_is_refused_without_a_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["api.example.com"], &requests);
+        let refused = exchange(
+            &mut hooks,
+            guest_post(&format!("http://127.0.0.1:{port}/upload"), b"payload"),
+        );
+        assert!(
+            matches!(refused, Err(WasiHttpError::HttpRequestDenied)),
+            "{refused:?}"
+        );
+        assert!(listener.accept().is_err(), "a refused request connected");
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["route"], "direct");
+        assert_eq!(line["host"], format!("127.0.0.1:{port}"));
+        assert_eq!(line["method"], "POST");
+        assert_eq!(line["outcome"], "refused");
+        assert_eq!(line["reason"], "not_allowed");
+        for absent in [
+            "http_status",
+            "request_bytes",
+            "response_bytes",
+            "request_sha256",
+            "response_sha256",
+        ] {
+            assert!(line.get(absent).is_none(), "{absent} in {line}");
+        }
+    }
+
+    /// A response the guest drops unread is still one `sent` line, with the status and the zero
+    /// bytes it read.
+    #[test]
+    fn network_request_dropped_unread_is_sent_with_no_response_bytes() {
+        let (port, _served) = answer_once(ok_reply("never read"));
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent = hooks.send_request(
+            guest_request(&format!("http://127.0.0.1:{port}/"), &[]),
+            None,
+            Box::new(async { Ok(()) }),
+        );
+        rt.block_on(async {
+            let (response, io) = Box::into_pin(sent).await.unwrap();
+            let io = tokio::spawn(Box::into_pin(io));
+            assert!(requests.take().is_empty(), "recorded before the body ended");
+            drop(response);
+            io.abort();
+        });
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "sent");
+        assert_eq!(lines[0]["http_status"], 200);
+        assert_eq!(lines[0]["response_bytes"], 0);
+        assert_eq!(
+            lines[0]["response_sha256"],
+            murmur_artifact::sha256_hex(b"")
+        );
+    }
+
+    /// A request to a member's virtual address is recorded by its `member_request` line alone.
+    #[test]
+    fn network_request_none_for_a_formation_host() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let members = MemberRequests::default();
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = recorded_egress_hooks(Some(member), &["127.0.0.1"], &members);
+        hooks.network_requests = Some(NetworkRequestScope::new(
+            &requests,
+            "probe",
+            ComponentRole::Tool,
+            Some("tsk_a".to_string()),
+        ));
+        for uri in [
+            "http://reviewer.formation.invalid/",
+            "http://planner.formation.invalid/",
+        ] {
+            let _ = exchange(&mut hooks, guest_request(uri, &[]));
+        }
+        assert_eq!(drained_member_requests(&members).len(), 2);
+        assert!(requests.take().is_empty());
+    }
+
+    /// A model call admitted to the metered inference gateway keeps its `inference` line and
+    /// writes no `network_request`; one refused for want of an admission is `not_admitted`, named
+    /// by the gateway's upstream. A tool's own unmetered gateway is recorded on route `gateway`.
+    #[test]
+    fn network_request_metered_gateway_is_left_to_its_inference_line() {
+        let meter = Arc::new(SpendMeter::unlimited());
+        let gateway_hooks =
+            |port: u16,
+             metering: GatewayMetering,
+             requests: &crate::network_request::NetworkRequests| {
+                let mut hooks = network_hooks(&[], requests);
+                hooks.gateway = Some(Arc::new(test_gateway(
+                    "the-driver",
+                    &format!("http://127.0.0.1:{port}/v1"),
+                    "sk-gateway-marker",
+                    metering,
+                )));
+                hooks
+            };
+
+        // Closed admission: refused before any connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = gateway_hooks(
+            port,
+            GatewayMetering::Inference(Arc::clone(&meter)),
+            &requests,
+        );
+        let refused = exchange(
+            &mut hooks,
+            guest_post("http://127.0.0.1:9/v1/messages", b"{}"),
+        );
+        assert!(matches!(refused, Err(WasiHttpError::HttpRequestDenied)));
+        assert!(listener.accept().is_err());
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["route"], "gateway");
+        assert_eq!(lines[0]["host"], format!("127.0.0.1:{port}"));
+        assert_eq!(lines[0]["outcome"], "refused");
+        assert_eq!(lines[0]["reason"], "not_admitted");
+        assert!(lines[0].get("request_bytes").is_none());
+
+        // Open admission: sent, and recorded by nothing here.
+        let (port, _served) = answer_once(ok_reply("{}"));
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = gateway_hooks(
+            port,
+            GatewayMetering::Inference(Arc::clone(&meter)),
+            &requests,
+        );
+        let admission = meter.admit(0, 0).unwrap();
+        let (status, _) = exchange(
+            &mut hooks,
+            guest_post("http://127.0.0.1:9/v1/messages", b"{}"),
+        )
+        .unwrap();
+        drop(admission);
+        assert_eq!(status, 200);
+        assert!(requests.take().is_empty());
+
+        // Unmetered: one line on route `gateway`, named by the upstream and never the key.
+        let (port, _served) = answer_once(ok_reply("[1]"));
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = gateway_hooks(port, GatewayMetering::Unmetered, &requests);
+        let (status, _) = exchange(
+            &mut hooks,
+            guest_post("http://127.0.0.1:9/v1/search", b"{\"q\":1}"),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let (_records, lines) = drained_network_requests(&requests);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["route"], "gateway");
+        assert_eq!(line["scheme"], "http");
+        assert_eq!(line["host"], format!("127.0.0.1:{port}"));
+        assert_eq!(line["outcome"], "sent");
+        assert_eq!(line["request_bytes"], 7);
+        assert_eq!(line["response_bytes"], 3);
+        let text = line.to_string();
+        assert!(
+            !text.contains("sk-gateway-marker") && !text.contains("/v1"),
+            "{text}"
+        );
+    }
+
+    /// `trace.capture` decides what each line keeps beyond its sizes: nothing under `none`, both
+    /// hashes under `meta`, and under `content` both hashes with each body stored behind its hash.
+    #[test]
+    fn network_request_follows_each_trace_capture_mode() {
+        use murmur_artifact::TraceCapture;
+        for capture in [
+            TraceCapture::None,
+            TraceCapture::Meta,
+            TraceCapture::Content,
+        ] {
+            let (port, _served) = answer_once(ok_reply("the answer"));
+            let requests = crate::network_request::NetworkRequests::new(capture);
+            let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+            let (_, body) = exchange(
+                &mut hooks,
+                guest_post(&format!("http://127.0.0.1:{port}/"), b"the question"),
+            )
+            .unwrap();
+            assert_eq!(body.unwrap(), bytes::Bytes::from_static(b"the answer"));
+            let (records, lines) = drained_network_requests(&requests);
+            assert_eq!(lines.len(), 1, "{capture:?}: {lines:?}");
+            let line = &lines[0];
+            assert_eq!(line["request_bytes"], 12, "{capture:?}");
+            assert_eq!(line["response_bytes"], 10, "{capture:?}");
+            let blobs = records.path().join(crate::trace_blobs::BLOB_DIR_NAME);
+            match capture {
+                TraceCapture::None => {
+                    assert!(line.get("request_sha256").is_none(), "{line}");
+                    assert!(line.get("response_sha256").is_none(), "{line}");
+                }
+                TraceCapture::Meta | TraceCapture::Content => {
+                    assert_eq!(
+                        line["request_sha256"],
+                        murmur_artifact::sha256_hex(b"the question")
+                    );
+                    assert_eq!(
+                        line["response_sha256"],
+                        murmur_artifact::sha256_hex(b"the answer")
+                    );
+                }
+            }
+            if capture == TraceCapture::Content {
+                for (field, bytes) in [
+                    ("request_sha256", &b"the question"[..]),
+                    ("response_sha256", b"the answer"),
+                ] {
+                    let stored = fs::read(blobs.join(line[field].as_str().unwrap())).unwrap();
+                    assert_eq!(stored, bytes, "{field}");
+                }
+            } else {
+                assert!(!blobs.exists(), "{capture:?} wrote {}", blobs.display());
+            }
+        }
+    }
+
+    /// A store with no scope sends and refuses exactly as before and records nothing.
+    #[test]
+    fn network_request_store_without_a_scope_records_nothing() {
+        let (port, _served) = answer_once(ok_reply("plain"));
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        hooks.network_requests = None;
+        let (status, body) = exchange(
+            &mut hooks,
+            guest_request(&format!("http://127.0.0.1:{port}/"), &[]),
+        )
+        .unwrap();
+        assert_eq!((status, body.unwrap()), (200, bytes::Bytes::from("plain")));
+        assert!(matches!(
+            exchange(
+                &mut hooks,
+                guest_request("http://blocked.example.com/", &[])
+            ),
+            Err(WasiHttpError::HttpRequestDenied)
+        ));
+        assert!(requests.take().is_empty());
     }
 
     // ── Links inside the workdir: every runtime path refuses them ─────────────

@@ -90,6 +90,7 @@ impl CallEntry {
                 formation: None,
                 task_provenance: None,
                 member_requests: None,
+                network_requests: None,
             })),
             events: StreamEventsTarget {
                 sse: None,

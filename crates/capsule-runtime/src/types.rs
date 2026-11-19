@@ -855,6 +855,9 @@ pub struct StagedSession {
     /// staging beside [`Self::call_deadlines`] and cloned the same way: into every store that can
     /// route one and into the session's trace writer, which drains it.
     pub(crate) member_requests: crate::member_request::MemberRequests,
+    /// The session's record of every request a guest sends through `wasi:http`, cloned into each
+    /// store beside [`Self::member_requests`].
+    pub(crate) network_requests: crate::network_request::NetworkRequests,
     /// The credential this session presents when it asks `mur-roost` to spawn a capsule.
     ///
     /// `None` for every session that cannot delegate, which is nearly all of them. Set by the
