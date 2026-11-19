@@ -98,6 +98,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 ### Observability
 
 - [Observability Schemas](/reference/observability-schemas.md): The file formats a session writes and the OpenTelemetry span tree they map onto.
+- [Run Bundles](/reference/run-bundle.md): One ended session's sealed record packed as a directory or `.zip` that anyone can check with the host's public key — the layout, `bundle.json`, and how to check it without Murmur.
 
 ### Artifacts & Registry
 

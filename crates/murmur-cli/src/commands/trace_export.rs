@@ -16,15 +16,16 @@ use std::{
     io::Write as _,
     os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use capsule_runtime::record_seal::{
-    self, ConversationPointer, RecordReport, Verdict, BLOBS_DIR, COMPLETION_STREAM,
+    self, single_segment, ConversationPointer, RecordReport, Verdict, BLOBS_DIR, COMPLETION_STREAM,
     CONVERSATIONS_DIR, CONVERSATION_RECORD_FILE, EVAL_STREAM, SEAL_SUFFIX, TRACE_STREAM,
 };
+use capsule_runtime::retention::now_ms;
 use capsule_runtime::running;
 use capsule_runtime::{EntryKind, WorkdirError, WorkdirRoot};
+use murmur_artifact::is_sha256_hex;
 use murmur_artifact::zip_guard::{
     max_artifact_decompressed_bytes, normalized_entry_name, read_zip_entry_capped,
 };
@@ -128,13 +129,6 @@ impl BundleManifest {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 // ── mur trace export ──────────────────────────────────────────────────────────
 
 /// Where a packed file is read from.
@@ -152,11 +146,19 @@ struct PlannedFile {
     path: String,
 }
 
+/// The conversation context directory an export reads from: opened beneath the conversations
+/// root, its path for messages, and the trace seal's pointer that named it.
+struct ConversationSource {
+    root: WorkdirRoot,
+    dir: PathBuf,
+    pointer: ConversationPointer,
+}
+
 /// What an export packs, decided before anything is written.
 struct ExportPlan {
     records: WorkdirRoot,
     records_dir: PathBuf,
-    conversation: Option<(WorkdirRoot, PathBuf, ConversationPointer)>,
+    conversation: Option<ConversationSource>,
     files: Vec<PlannedFile>,
     key_id: Option<String>,
 }
@@ -233,11 +235,6 @@ fn files_in(
     Ok(names)
 }
 
-/// A name a conversation pointer may use to reach a directory: one path segment.
-fn single_segment(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
-}
-
 /// Every stream with its seal, the blobs and the attachments of `records`.
 fn plan_records(records: &WorkdirRoot, dir: &Path) -> Result<Vec<PlannedFile>, CliError> {
     let mut files = Vec::new();
@@ -275,10 +272,9 @@ fn plan_records(records: &WorkdirRoot, dir: &Path) -> Result<Vec<PlannedFile>, C
 
 /// The conversation record `pointer` names under this host's conversations root, with its seal
 /// and blobs, or `None` when the record is not here.
-#[allow(clippy::type_complexity)]
 fn plan_conversation(
     pointer: &ConversationPointer,
-) -> Result<Option<(WorkdirRoot, PathBuf, Vec<PlannedFile>)>, CliError> {
+) -> Result<Option<(ConversationSource, Vec<PlannedFile>)>, CliError> {
     if !single_segment(&pointer.record) || !single_segment(&pointer.context_id) {
         return Ok(None);
     }
@@ -316,7 +312,14 @@ fn plan_conversation(
             rel,
         });
     }
-    Ok(Some((context, dir, files)))
+    Ok(Some((
+        ConversationSource {
+            root: context,
+            dir,
+            pointer: pointer.clone(),
+        },
+        files,
+    )))
 }
 
 fn plan_export(records_dir: &Path) -> Result<ExportPlan, CliError> {
@@ -343,10 +346,10 @@ fn plan_export(records_dir: &Path) -> Result<ExportPlan, CliError> {
         .ok()
         .flatten();
     let mut conversation = None;
-    if let Some(pointer) = seal.as_ref().and_then(|seal| seal.conversation.clone()) {
-        if let Some((root, dir, packed)) = plan_conversation(&pointer)? {
+    if let Some(pointer) = seal.as_ref().and_then(|seal| seal.conversation.as_ref()) {
+        if let Some((source, packed)) = plan_conversation(pointer)? {
             files.extend(packed);
-            conversation = Some((root, dir, pointer));
+            conversation = Some(source);
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -363,7 +366,7 @@ impl ExportPlan {
     /// The bytes of `file`, read through its root.
     fn read(&self, file: &PlannedFile) -> Result<Vec<u8>, CliError> {
         let (root, dir) = match (file.source, &self.conversation) {
-            (Source::Conversation, Some((root, dir, _))) => (root, dir.as_path()),
+            (Source::Conversation, Some(source)) => (&source.root, source.dir.as_path()),
             _ => (&self.records, self.records_dir.as_path()),
         };
         match root.read_file(&file.rel, u64::MAX) {
@@ -497,7 +500,7 @@ fn write_bundle(
         plan.key_id.clone(),
         plan.conversation
             .as_ref()
-            .map(|(_, _, pointer)| pointer.clone()),
+            .map(|source| source.pointer.clone()),
         files,
     );
     destination
@@ -836,14 +839,6 @@ fn walk_bundle(root: &WorkdirRoot) -> (BTreeMap<String, HeldFile>, Vec<String>) 
     (held, odd)
 }
 
-/// Whether `name` is a blob name: 64 lowercase hex characters.
-pub(crate) fn is_blob_name(name: &str) -> bool {
-    name.len() == 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 /// The blob name of `path` when it is a file directly under `blobs/` or
 /// `conversations/<record>/<context-id>/blobs/`, whatever the name.
 fn blob_file_name(path: &str) -> Option<&str> {
@@ -871,7 +866,7 @@ pub(crate) fn check_blobs(
         let Some(name) = blob_file_name(path) else {
             continue;
         };
-        if !is_blob_name(name) {
+        if !is_sha256_hex(name) {
             notes.push(format!("{path} is not a blob name"));
             continue;
         }
@@ -1273,8 +1268,6 @@ mod tests {
                 format!("{lonely_path} is not named by any sealed line of the record"),
             ]
         );
-        assert!(is_blob_name(&good_name));
-        assert!(!is_blob_name(&good_name.to_uppercase()));
     }
 
     #[test]

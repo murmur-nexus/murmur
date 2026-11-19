@@ -426,7 +426,7 @@ fn stream<'a>(report: &'a Value, name: &str) -> &'a Value {
 
 // ── scenarios ────────────────────────────────────────────────────────────────
 
-/// S1: a directory export holds exactly the record's sealed files, byte for byte, at private
+/// A directory export holds exactly the record's sealed files, byte for byte, at private
 /// modes, with a manifest naming each one, and leaves the sources as they were.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -543,8 +543,8 @@ fn s1_directory_export_holds_exactly_the_sealed_record() {
     assert_eq!(tree(&p.context_dir(context)), conversation_before);
 }
 
-/// S2: a zip export holds S1's tree, entry for entry, at mode 0600; `--json` prints one object;
-/// with no `--out` the zip lands in the current directory named for the session.
+/// A zip export holds the directory export's tree, entry for entry, at mode 0600; `--json` prints
+/// one object; with no `--out` the zip lands in the current directory named for the session.
 #[test]
 #[allow(clippy::print_stdout)]
 fn s2_zip_export_holds_the_same_tree() {
@@ -606,7 +606,7 @@ fn s2_zip_export_holds_the_same_tree() {
     );
 }
 
-/// S3: on another host, with the exporting host's public key and nothing else, both bundle forms
+/// On another host, with the exporting host's public key and nothing else, both bundle forms
 /// verify; without that key the record names the key that sealed it.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -723,7 +723,7 @@ fn s3_bundle_verifies_on_another_machine() {
     fs::rename(&moved_home, p.home.path()).unwrap();
 }
 
-/// S4: one changed byte of a blob fails verify naming the blob, in either form; a forged blob
+/// One changed byte of a blob fails verify naming the blob, in either form; a forged blob
 /// saved under its own hash with the manifest rewritten verifies with a note.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -797,7 +797,7 @@ fn s4_a_changed_blob_is_named() {
     verify_bundle(home, &dir, &[]).success();
 }
 
-/// S5: a changed trace line, attachment, deleted file or session id fails verify naming it; an
+/// A changed trace line, attachment, deleted file or session id fails verify naming it; an
 /// unlisted extra file is a note.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -893,7 +893,7 @@ fn s5_changed_files_and_manifest_are_named() {
     );
 }
 
-/// S6: a path that is not a usable bundle is refused with E-TRC-009 before any report, and a zip
+/// A path that is not a usable bundle is refused with E-TRC-009 before any report, and a zip
 /// that would escape or plant a link writes nothing anywhere.
 #[test]
 fn s6_unusable_bundles_are_refused() {
@@ -992,7 +992,7 @@ fn s6_unusable_bundles_are_refused() {
     }
 }
 
-/// S7: export refuses an existing destination, a running session, an unknown address, a link
+/// Export refuses an existing destination, a running session, an unknown address, a link
 /// among the blobs and an unwritable destination, each leaving everything as it was.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -1136,7 +1136,7 @@ fn s7_export_refusals_leave_everything_untouched() {
     assert!(status.success(), "{status:?}");
 }
 
-/// S8: a changed record still exports, says so, and its bundle fails verify; a session with no
+/// A changed record still exports, says so, and its bundle fails verify; a session with no
 /// blobs, conversation record or attachment exports only its trace and seal.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -1180,7 +1180,7 @@ fn s8_changed_and_minimal_records_export() {
     assert!(text.contains("bundle: verified, 2 files listed"), "{text}");
 }
 
-/// S9: the outside checker, written from `run-bundle.md` alone with the Python standard library
+/// The outside checker, written from `run-bundle.md` alone with the Python standard library
 /// and `openssl`, accepts an exported bundle and names a changed blob.
 #[test]
 #[allow(clippy::print_stdout)]

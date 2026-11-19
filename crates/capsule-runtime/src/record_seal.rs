@@ -1642,7 +1642,9 @@ fn trace_session_id(bytes: &[u8]) -> Option<String> {
     value.get("session_id")?.as_str().map(str::to_string)
 }
 
-fn single_segment(name: &str) -> bool {
+/// Whether `name` can be one path segment of a conversation pointer: not empty, not `.` or `..`,
+/// and holding no `/` or NUL, so joining it cannot leave the conversations root.
+pub fn single_segment(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 

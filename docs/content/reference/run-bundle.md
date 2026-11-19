@@ -79,11 +79,12 @@ From the bundle root, with `sha256sum`, `jq` and OpenSSL 3:
 5. **Attachments.** Each attachment's `record.head` equals `trace.jsonl.seal`'s `head`, per
    [Attachments](observability-schemas.md#record-attachments).
 
-To check a seal's Ed25519 signature with `openssl`, build a PEM public key from the raw 32-byte
-key in `record-seal.pub`: the base64 of the bytes `302a300506032b6570032100` followed by the raw
-key, between `-----BEGIN PUBLIC KEY-----` and `-----END PUBLIC KEY-----` lines. Write the signed
-message (`murmur.seal/1\n<stream>\n<session_id>\n<lines>\n<head>\n`) and the signature's 64 raw
-bytes to files, then:
+To check a seal's Ed25519 signature with `openssl`, build a PEM public key from the 32-byte key
+that `record-seal.pub` holds as 64 hex characters: the base64 of the bytes
+`302a300506032b6570032100` followed by the 32 key bytes, between `-----BEGIN PUBLIC KEY-----` and
+`-----END PUBLIC KEY-----` lines. Write the signed message
+(`murmur.seal/1\n<stream>\n<session_id>\n<lines>\n<head>\n`) and the 64 bytes the seal's hex
+`signature` decodes to into files, then:
 
 ```bash
 openssl pkeyutl -verify -pubin -inkey host.pem -rawin -in message -sigfile signature
@@ -99,6 +100,7 @@ key:
 | A byte of a stream | Yes: the stream's chain or seal fails |
 | A byte of a blob | Yes: the blob no longer hashes to its name |
 | A blob withheld | No: the record names its hash, the bundle lacks its body |
+| `hooks/eval.jsonl`, `completion.json` or the conversation record withheld with its seal | No: the stream reads as `absent` |
 | An attachment edited, added or removed | No, once `bundle.json` is rewritten to match: attachments are not signed |
 | `bundle.json` rewritten | No: only the seals are signed |
 
