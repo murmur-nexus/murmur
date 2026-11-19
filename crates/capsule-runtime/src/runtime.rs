@@ -8834,6 +8834,24 @@ impl NetworkPolicyHooks {
     }
 }
 
+impl NetworkPolicyHooks {
+    /// Records every request this store sent that is not yet accounted for, as the end of the
+    /// store's call leaves it: see [`NetworkRequestScope::interrupt_in_flight`].
+    pub(crate) fn interrupt_in_flight(&self) {
+        if let Some(scope) = &self.network_requests {
+            scope.interrupt_in_flight();
+        }
+    }
+}
+
+/// A store's hooks are dropped with the store, when its call ends: every request still in flight
+/// is accounted for then, before the call's own line is written.
+impl Drop for NetworkPolicyHooks {
+    fn drop(&mut self) {
+        self.interrupt_in_flight();
+    }
+}
+
 impl WasiHttpHooks for NetworkPolicyHooks {
     fn send_request(
         &mut self,
@@ -8963,7 +8981,8 @@ impl NetworkPolicyHooks {
 
 /// Sends `request` through `send` with its body counted on the way out and its response body
 /// counted on the way back to the guest, recording the request through `recorder`. An error
-/// before a response head leaves the recorder to drop, which records `connection_failed`.
+/// before a response head records `connection_failed`; this future dropped before one leaves the
+/// recorder to drop, which records `interrupted`.
 async fn send_network_recorded<F, Fut>(
     mut recorder: NetworkRequestRecorder,
     request: http::Request<WasiBody>,
@@ -8974,7 +8993,13 @@ where
     Fut: Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>>,
 {
     let request = recorder.wrap_request(request);
-    let (response, io) = send(request).await?;
+    let (response, io) = match send(request).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            recorder.fail(crate::network_request::REASON_CONNECTION_FAILED);
+            return Err(error);
+        }
+    };
     let status = response.status().as_u16();
     let (parts, body) = response.into_parts();
     let body = recorder.wrap_response(body, status);
@@ -29103,7 +29128,7 @@ inference:
         }
     }
 
-    /// An allowed address nothing listens on fails the guest's request as before and is one
+    /// An allowed address nothing listens on fails the guest's request and is one
     /// `failed`/`connection_failed` line with no status and no response size.
     #[test]
     fn network_request_to_a_port_nothing_listens_on_is_connection_failed() {
@@ -29135,7 +29160,7 @@ inference:
         );
     }
 
-    /// A body cut off mid-stream ends the guest's read with an error as before, and is one
+    /// A body cut off mid-stream ends the guest's read with an error and is one
     /// `failed`/`response_interrupted` line keeping the status and the bytes that did arrive.
     #[test]
     fn network_request_cut_off_body_is_response_interrupted_with_its_status() {
@@ -29165,7 +29190,7 @@ inference:
         );
     }
 
-    /// A host outside the allow-list is refused as before, with no connection opened, and is one
+    /// A host outside the allow-list is refused with no connection opened and is one
     /// `refused`/`not_allowed` line with no status, no sizes and no hashes.
     #[test]
     fn network_request_outside_the_allow_list_is_refused_without_a_connection() {
@@ -29230,6 +29255,61 @@ inference:
         assert_eq!(
             lines[0]["response_sha256"],
             murmur_artifact::sha256_hex(b"")
+        );
+    }
+
+    /// A request still waiting on its response head when its store ends — the call cut by its
+    /// deadline drops the store — is one `failed`/`interrupted` line, in the latch before the
+    /// call's own line could be written, with the request bytes the host read and no status. The
+    /// send, stopped afterwards, adds nothing.
+    #[test]
+    fn network_request_waiting_when_its_store_ends_is_interrupted() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let _held = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\nhello") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+            }
+            read_tx.send(()).unwrap();
+            // Holds the connection open, never answering.
+            let _ = stream.read(&mut byte);
+        });
+        let requests = crate::network_request::NetworkRequests::default();
+        let mut hooks = network_hooks(&["127.0.0.1"], &requests);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent = hooks.send_request(
+            guest_post(&format!("http://127.0.0.1:{port}/slow"), b"hello"),
+            None,
+            Box::new(async { Ok(()) }),
+        );
+        let send = rt.spawn(async move { Box::into_pin(sent).await.map(|_| ()) });
+        read_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the host read the request");
+        assert!(requests.take().is_empty(), "recorded while still waiting");
+
+        drop(hooks);
+        let lines = requests.take();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(
+            line.outcome,
+            crate::network_request::NetworkRequestOutcome::Failed("interrupted")
+        );
+        assert_eq!(line.http_status, None);
+        assert_eq!(line.request_bytes, Some(5));
+        assert_eq!(line.response_bytes, None);
+
+        send.abort();
+        let _ = rt.block_on(send);
+        assert!(
+            requests.take().is_empty(),
+            "the stopped send recorded again"
         );
     }
 
@@ -29401,7 +29481,7 @@ inference:
         }
     }
 
-    /// A store with no scope sends and refuses exactly as before and records nothing.
+    /// A store with no scope still sends and refuses, and records nothing.
     #[test]
     fn network_request_store_without_a_scope_records_nothing() {
         let (port, _served) = answer_once(ok_reply("plain"));

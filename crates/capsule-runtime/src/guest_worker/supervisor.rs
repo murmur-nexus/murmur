@@ -71,8 +71,12 @@ struct CallEntry {
     /// The script capsule's session state, for its root's run: its registry, artifact manager,
     /// message send and `wasi:http` policy.
     capsule: Option<Arc<Mutex<CapsuleStoreState>>>,
-    /// The response bodies this call is streaming, stopped when the call ends.
-    bodies: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Where the script capsule's own `wasi:http` requests are recorded, for its root's run: read
+    /// without the session state's lock, which a registry call holds for as long as it runs.
+    capsule_requests: Option<crate::network_request::NetworkRequestScope>,
+    /// The `wasi:http` requests this call has waiting on a response head and the response bodies
+    /// it is streaming, stopped when the call ends.
+    http_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Where the code mode instance's `murmur:bus` requests go, for its calls.
     bus: crate::bus::BusLink,
 }
@@ -106,21 +110,51 @@ impl CallEntry {
             )),
             hook: None,
             capsule: None,
-            bodies: Mutex::new(Vec::new()),
+            capsule_requests: None,
+            http_tasks: Mutex::new(Vec::new()),
             bus: crate::bus::BusLink::none(),
+        }
+    }
+
+    fn track_http(&self, task: tokio::task::AbortHandle) {
+        self.http_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(task);
+    }
+
+    /// Ends the call's `wasi:http` traffic: every request it sent that is not yet accounted for
+    /// is recorded in the session's latch now, before the call's own line, and then its request
+    /// and body tasks are stopped.
+    fn end_http(&self) {
+        self.http
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .interrupt_in_flight();
+        if let Some(scope) = &self.capsule_requests {
+            scope.interrupt_in_flight();
+        }
+        let tasks = std::mem::take(
+            &mut *self
+                .http_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for task in tasks {
+            task.abort();
         }
     }
 }
 
 impl Drop for CallEntry {
     fn drop(&mut self) {
-        for body in self
-            .bodies
+        for task in self
+            .http_tasks
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
         {
-            body.abort();
+            task.abort();
         }
     }
 }
@@ -408,10 +442,14 @@ impl WorkerConn {
                     );
                     return;
                 };
+                let http = matches!(request, HostRequest::Http(_)).then(|| Arc::clone(&entry));
                 let conn = Arc::clone(self);
-                self.host_runtime.spawn(async move {
+                let task = self.host_runtime.spawn(async move {
                     conn.answer(host, call, entry, request).await;
                 });
+                if let Some(entry) = http {
+                    entry.track_http(task.abort_handle());
+                }
             }
         }
     }
@@ -572,11 +610,7 @@ impl WorkerConn {
                                 }
                             }
                         });
-                        entry
-                            .bodies
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(body.abort_handle());
+                        entry.track_http(body.abort_handle());
                     }
                 }
             }
@@ -976,17 +1010,22 @@ impl GuestWorkers {
         message: impl FnOnce(u64) -> ToWorker,
     ) -> Result<Reply, String> {
         let req = next_id();
+        let entry = Arc::new(entry);
         conn.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(req, Arc::new(entry));
+            .insert(req, Arc::clone(&entry));
         let mut in_flight = InFlight {
             conn: Arc::clone(conn),
             req,
+            entry: Arc::clone(&entry),
             done: false,
         };
         let replied = tokio::time::timeout(bound, conn.request(req, message(req))).await;
         in_flight.done = true;
+        // However the call ended — answered, cut by a deadline, or its worker lost — the requests
+        // it left in flight are recorded before the caller writes the call's own line.
+        entry.end_http();
         let entry = conn
             .calls
             .lock()
@@ -1307,6 +1346,12 @@ impl GuestWorkers {
         call_deadlines: &CallDeadlines,
     ) -> Result<Result<(), crate::runtime::CapsuleRunError>, String> {
         let mut entry = CallEntry::bare(format!("capsule '{name}'"));
+        entry.capsule_requests = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .http_hooks
+            .network_requests
+            .clone();
         entry.capsule = Some(state);
         let bound = spec.limits.wall_bound() * 2 + UNRESPONSIVE_GRACE;
         let reply = self
@@ -1523,10 +1568,12 @@ fn driver_call_name(call: &DriverCall) -> &'static str {
     }
 }
 
-/// A guest call in flight; dropped before its reply, it tells the worker to drop the call.
+/// A guest call in flight; dropped before its reply, it tells the worker to drop the call and
+/// ends the call's `wasi:http` traffic.
 struct InFlight {
     conn: Arc<WorkerConn>,
     req: u64,
+    entry: Arc<CallEntry>,
     done: bool,
 }
 
@@ -1544,6 +1591,7 @@ impl Drop for InFlight {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&self.req);
             let _ = self.conn.send(&ToWorker::Cancel { req: self.req });
+            self.entry.end_http();
         }
     }
 }

@@ -33,6 +33,9 @@ pub(crate) const REASON_NOT_ADMITTED: &str = "not_admitted";
 pub(crate) const REASON_CONNECTION_FAILED: &str = "connection_failed";
 /// A response head arrived, then reading its body failed.
 pub(crate) const REASON_RESPONSE_INTERRUPTED: &str = "response_interrupted";
+/// No response head arrived before the request was abandoned: the component's call ended — its
+/// deadline, a cancel or a lost guest worker — or the component dropped the request.
+pub(crate) const REASON_INTERRUPTED: &str = "interrupted";
 
 /// How a request left the runtime, as `network_request.route` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +61,8 @@ pub(crate) enum NetworkRequestOutcome {
     Sent,
     /// Refused before any connection, with [`REASON_NOT_ALLOWED`] or [`REASON_NOT_ADMITTED`].
     Refused(&'static str),
-    /// With [`REASON_CONNECTION_FAILED`] or [`REASON_RESPONSE_INTERRUPTED`].
+    /// With [`REASON_CONNECTION_FAILED`], [`REASON_RESPONSE_INTERRUPTED`] or
+    /// [`REASON_INTERRUPTED`].
     Failed(&'static str),
 }
 
@@ -165,14 +169,15 @@ impl NetworkRequests {
     }
 }
 
-/// Who sends from one store: the session's latch, and the component, role and calling task each
-/// of that store's requests is recorded under.
+/// Who sends from one store: the session's latch, the component, role and calling task each of
+/// that store's requests is recorded under, and the requests it has in flight.
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkRequestScope {
     pub(crate) requests: NetworkRequests,
     pub(crate) component: String,
     pub(crate) role: ComponentRole,
     pub(crate) task_id: Option<String>,
+    in_flight: InFlight,
 }
 
 impl NetworkRequestScope {
@@ -187,7 +192,16 @@ impl NetworkRequestScope {
             component: component.into(),
             role,
             task_id,
+            in_flight: InFlight::default(),
         }
+    }
+
+    /// Records every request sent under this scope that is not yet accounted for, oldest first:
+    /// one whose response head arrived as `sent` with the response bytes read so far, any other
+    /// as `failed`/`interrupted`. Called when the store's call ends, so each line is in the latch
+    /// before the call's own; the request's recorder or body, dropped later, records nothing.
+    pub(crate) fn interrupt_in_flight(&self) {
+        self.in_flight.interrupt();
     }
 
     /// A capsule's own store: recorded under the capsule's manifest `name`, for no task.
@@ -212,11 +226,10 @@ pub(crate) fn host_of(uri: &http::Uri) -> Option<String> {
 }
 
 /// The size, digest and copy of one body, kept as its frames pass.
-#[derive(Clone)]
 struct Tally {
     bytes: u64,
     /// `None` under `trace.capture: none`.
-    digest: Option<ring::digest::Context>,
+    digest: Option<murmur_artifact::Sha256Hasher>,
     /// `Some` only under `trace.capture: content`.
     copy: Option<Vec<u8>>,
 }
@@ -227,7 +240,7 @@ impl Tally {
             bytes: 0,
             digest: capture
                 .captures_hashes()
-                .then(|| ring::digest::Context::new(&ring::digest::SHA256)),
+                .then(murmur_artifact::Sha256Hasher::new),
             copy: capture.captures_content().then(Vec::new),
         }
     }
@@ -247,24 +260,14 @@ impl Tally {
     /// The byte count and what `trace.capture` keeps, as of every frame counted so far.
     fn finish(self) -> (u64, Option<CapturedBody>) {
         let captured = self.digest.map(|digest| CapturedBody {
-            sha256: lowercase_hex(digest.finish().as_ref()),
+            sha256: digest.finish_hex(),
             bytes: self.copy,
         });
         (self.bytes, captured)
     }
 }
 
-fn lowercase_hex(digest: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut hex = String::with_capacity(2 * digest.len());
-    for byte in digest {
-        // Writing into a `String` cannot fail.
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// A request body's [`Tally`], shared between the body the runtime reads and the recorder that
+/// A request body's [`Tally`], shared between the body the runtime reads and the record that
 /// reads the tally when the request is accounted for.
 type SharedTally = Arc<Mutex<Tally>>;
 
@@ -274,14 +277,114 @@ fn lock_tally(tally: &SharedTally) -> std::sync::MutexGuard<'_, Tally> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// One request in flight. It records into the scope's latch exactly once: through
-/// [`Self::finish`] (or [`Self::refuse`]), or, dropped unfinished — before any response head
-/// arrived — as `failed`/`connection_failed`.
-pub(crate) struct NetworkRequestRecorder {
-    pending: Option<(NetworkRequests, NetworkRequest)>,
+/// One request not yet accounted for.
+struct Pending {
+    requests: NetworkRequests,
+    request: NetworkRequest,
     started: Instant,
-    /// Set once the request body is wrapped; read when the request is accounted for.
+    /// Set once the request body is wrapped.
     request_tally: Option<SharedTally>,
+    /// The status and the response body's tally, once a response head arrived.
+    response: Option<(u16, Tally)>,
+}
+
+impl Pending {
+    /// Pushes the request into the session's latch with `outcome`, the status and both tallies
+    /// as of now.
+    fn record(self, outcome: NetworkRequestOutcome) {
+        let Self {
+            requests,
+            mut request,
+            started,
+            request_tally,
+            response,
+        } = self;
+        if !matches!(outcome, NetworkRequestOutcome::Refused(_)) {
+            // A body the runtime never read — a connection that failed before writing it — is
+            // still a request of zero bytes counted, so its size and hash are present together.
+            // Nothing reads the tally once the request is recorded, so it is taken, not copied.
+            let tally = request_tally.map_or_else(
+                || Tally::new(requests.capture()),
+                |tally| std::mem::replace(&mut *lock_tally(&tally), Tally::new(TraceCapture::None)),
+            );
+            let (bytes, captured) = tally.finish();
+            request.request_bytes = Some(bytes);
+            request.request_body = captured;
+            if let Some((status, tally)) = response {
+                let (bytes, captured) = tally.finish();
+                request.http_status = Some(status);
+                request.response_bytes = Some(bytes);
+                request.response_body = captured;
+            }
+        }
+        request.outcome = outcome;
+        request.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        requests.push(request);
+    }
+}
+
+/// One request's [`Pending`] record, shared by its recorder (then its response body) and the
+/// [`InFlight`] list of the store that sent it: whichever ends the request first records it, and
+/// the slot is empty from then on.
+type Slot = Arc<Mutex<Option<Pending>>>;
+
+/// A [`Slot`] as an [`InFlight`] list holds it: gone once the recorder and body have both dropped.
+type WeakSlot = std::sync::Weak<Mutex<Option<Pending>>>;
+
+fn lock_slot(slot: &Slot) -> std::sync::MutexGuard<'_, Option<Pending>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records the request in `slot` with `outcome`, unless it has been recorded already.
+fn finish_slot(slot: &Slot, outcome: NetworkRequestOutcome) {
+    let pending = lock_slot(slot).take();
+    if let Some(pending) = pending {
+        pending.record(outcome);
+    }
+}
+
+/// The requests one store has sent and not yet accounted for, oldest first, so the end of the
+/// store's call can account for each one still in flight.
+#[derive(Debug, Clone, Default)]
+struct InFlight(Arc<Mutex<Vec<WeakSlot>>>);
+
+impl InFlight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<WeakSlot>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register(&self, slot: &Slot) {
+        let mut slots = self.lock();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Arc::downgrade(slot));
+    }
+
+    fn interrupt(&self) {
+        let slots = std::mem::take(&mut *self.lock());
+        for slot in slots.iter().filter_map(std::sync::Weak::upgrade) {
+            let pending = lock_slot(&slot).take();
+            if let Some(pending) = pending {
+                let outcome = if pending.response.is_some() {
+                    NetworkRequestOutcome::Sent
+                } else {
+                    NetworkRequestOutcome::Failed(REASON_INTERRUPTED)
+                };
+                pending.record(outcome);
+            }
+        }
+    }
+}
+
+/// One request in flight. It records into the scope's latch exactly once: through
+/// [`Self::refuse`] or [`Self::fail`], through the response body [`Self::wrap_response`] returns,
+/// through [`NetworkRequestScope::interrupt_in_flight`], or, dropped before any response head
+/// arrived, as `failed`/`interrupted`.
+pub(crate) struct NetworkRequestRecorder {
+    /// `None` when the store records nothing.
+    slot: Option<Slot>,
 }
 
 impl NetworkRequestRecorder {
@@ -294,10 +397,10 @@ impl NetworkRequestRecorder {
         method: &http::Method,
         started: Instant,
     ) -> Self {
-        let pending = scope.map(|scope| {
-            (
-                scope.requests.clone(),
-                NetworkRequest {
+        let slot = scope.map(|scope| {
+            let slot = Arc::new(Mutex::new(Some(Pending {
+                requests: scope.requests.clone(),
+                request: NetworkRequest {
                     task_id: scope.task_id.clone(),
                     component: scope.component.clone(),
                     role: scope.role,
@@ -313,24 +416,29 @@ impl NetworkRequestRecorder {
                     response_body: None,
                     duration_ms: 0,
                 },
-            )
+                started,
+                request_tally: None,
+                response: None,
+            })));
+            scope.in_flight.register(&slot);
+            slot
         });
-        Self {
-            pending,
-            started,
-            request_tally: None,
-        }
-    }
-
-    /// Whether this request is still to be recorded.
-    pub(crate) fn is_pending(&self) -> bool {
-        self.pending.is_some()
+        Self { slot }
     }
 
     /// Records the request as refused before any connection: no status, no sizes, no hashes.
     pub(crate) fn refuse(mut self, reason: &'static str) {
-        self.request_tally = None;
-        self.record(NetworkRequestOutcome::Refused(reason), None, None);
+        if let Some(slot) = self.slot.take() {
+            finish_slot(&slot, NetworkRequestOutcome::Refused(reason));
+        }
+    }
+
+    /// Records the request as failed before any response head arrived, with the request bytes
+    /// read so far.
+    pub(crate) fn fail(mut self, reason: &'static str) {
+        if let Some(slot) = self.slot.take() {
+            finish_slot(&slot, NetworkRequestOutcome::Failed(reason));
+        }
     }
 
     /// `request` with its body counted, and hashed and copied as `trace.capture` asks, frame by
@@ -340,78 +448,49 @@ impl NetworkRequestRecorder {
         request: http::Request<wasmtime_wasi_http::WasiBody>,
     ) -> http::Request<wasmtime_wasi_http::WasiBody> {
         use http_body_util::BodyExt;
-        let Some((requests, _)) = self.pending.as_ref() else {
+        let Some(slot) = self.slot.as_ref() else {
             return request;
         };
-        let tally = Arc::new(Mutex::new(Tally::new(requests.capture())));
-        self.request_tally = Some(Arc::clone(&tally));
+        let tally = {
+            let mut pending = lock_slot(slot);
+            let Some(pending) = pending.as_mut() else {
+                return request;
+            };
+            let tally = Arc::new(Mutex::new(Tally::new(pending.requests.capture())));
+            pending.request_tally = Some(Arc::clone(&tally));
+            tally
+        };
         request.map(|body| CountedRequestBody { inner: body, tally }.boxed_unsync())
     }
 
     /// `body`, the response to this request, passed through to the guest and accounted for as it
-    /// is read. Unchanged when this recorder records nothing.
+    /// is read. Unchanged when this recorder records nothing or the request was already
+    /// accounted for.
     pub(crate) fn wrap_response(
-        self,
+        mut self,
         body: wasmtime_wasi_http::WasiBody,
         http_status: u16,
     ) -> wasmtime_wasi_http::WasiBody {
         use http_body_util::BodyExt;
-        if !self.is_pending() {
+        let Some(slot) = self.slot.take() else {
             return body;
-        }
-        NetworkRequestBody::new(body, self, http_status).boxed_unsync()
-    }
-
-    /// Records the request with `outcome`, the status and the response body's tally; a no-op once
-    /// it has been recorded.
-    fn finish(
-        &mut self,
-        outcome: NetworkRequestOutcome,
-        http_status: Option<u16>,
-        response: Option<Tally>,
-    ) {
-        self.record(outcome, http_status, response.map(Tally::finish));
-    }
-
-    fn record(
-        &mut self,
-        outcome: NetworkRequestOutcome,
-        http_status: Option<u16>,
-        response: Option<(u64, Option<CapturedBody>)>,
-    ) {
-        let Some((requests, mut request)) = self.pending.take() else {
-            return;
         };
-        let request_tally = self
-            .request_tally
-            .take()
-            .map(|tally| lock_tally(&tally).clone().finish());
-        if !matches!(outcome, NetworkRequestOutcome::Refused(_)) {
-            // A body the runtime never read — a connection that failed before writing it — is
-            // still a request of zero bytes counted, so its size and hash are present together.
-            let (bytes, captured) =
-                request_tally.unwrap_or_else(|| Tally::new(requests.capture()).finish());
-            request.request_bytes = Some(bytes);
-            request.request_body = captured;
+        {
+            let mut pending = lock_slot(&slot);
+            let Some(pending) = pending.as_mut() else {
+                return body;
+            };
+            pending.response = Some((http_status, Tally::new(pending.requests.capture())));
         }
-        if let Some((bytes, captured)) = response {
-            request.response_bytes = Some(bytes);
-            request.response_body = captured;
-        }
-        request.outcome = outcome;
-        request.http_status = http_status;
-        request.duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        requests.push(request);
+        NetworkRequestBody { inner: body, slot }.boxed_unsync()
     }
 }
 
 impl Drop for NetworkRequestRecorder {
     fn drop(&mut self) {
-        self.finish(
-            NetworkRequestOutcome::Failed(REASON_CONNECTION_FAILED),
-            None,
-            None,
-        );
+        if let Some(slot) = self.slot.take() {
+            finish_slot(&slot, NetworkRequestOutcome::Failed(REASON_INTERRUPTED));
+        }
     }
 }
 
@@ -456,33 +535,9 @@ where
 /// the `trace.capture: content` copy, that records its request once: `sent` at the end of the
 /// stream or when dropped, with the bytes read so far, and `failed`/`response_interrupted` when
 /// the stream errors.
-pub(crate) struct NetworkRequestBody<B> {
+struct NetworkRequestBody<B> {
     inner: B,
-    recorder: NetworkRequestRecorder,
-    http_status: u16,
-    tally: Option<Tally>,
-}
-
-impl<B> NetworkRequestBody<B> {
-    pub(crate) fn new(inner: B, recorder: NetworkRequestRecorder, http_status: u16) -> Self {
-        let tally = recorder
-            .pending
-            .as_ref()
-            .map(|(requests, _)| Tally::new(requests.capture()));
-        Self {
-            inner,
-            recorder,
-            http_status,
-            tally,
-        }
-    }
-
-    fn finish(&mut self, outcome: NetworkRequestOutcome) {
-        if self.recorder.is_pending() {
-            let tally = self.tally.take();
-            self.recorder.finish(outcome, Some(self.http_status), tally);
-        }
-    }
+    slot: Slot,
 }
 
 impl<B> Body for NetworkRequestBody<B>
@@ -499,20 +554,29 @@ where
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let (Some(data), Some(tally)) = (frame.data_ref(), this.tally.as_mut()) {
-                    tally.update(data);
+                if let Some(data) = frame.data_ref() {
+                    if let Some(Pending {
+                        response: Some((_, tally)),
+                        ..
+                    }) = lock_slot(&this.slot).as_mut()
+                    {
+                        tally.update(data);
+                    }
                 }
                 if this.inner.is_end_stream() {
-                    this.finish(NetworkRequestOutcome::Sent);
+                    finish_slot(&this.slot, NetworkRequestOutcome::Sent);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
-                this.finish(NetworkRequestOutcome::Failed(REASON_RESPONSE_INTERRUPTED));
+                finish_slot(
+                    &this.slot,
+                    NetworkRequestOutcome::Failed(REASON_RESPONSE_INTERRUPTED),
+                );
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.finish(NetworkRequestOutcome::Sent);
+                finish_slot(&this.slot, NetworkRequestOutcome::Sent);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -530,7 +594,7 @@ where
 
 impl<B> Drop for NetworkRequestBody<B> {
     fn drop(&mut self) {
-        self.finish(NetworkRequestOutcome::Sent);
+        finish_slot(&self.slot, NetworkRequestOutcome::Sent);
     }
 }
 
@@ -565,6 +629,24 @@ mod tests {
             .boxed_unsync()
     }
 
+    /// A body that yields its one frame and then never ends.
+    struct Stalling(Option<&'static [u8]>);
+
+    impl Body for Stalling {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            match self.0.take() {
+                Some(bytes) => Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(bytes))))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
     #[test]
     fn network_request_host_keeps_an_explicit_port_and_drops_user_info_path_and_query() {
         let uri: http::Uri = "https://user:pw@api.example.com:8443/v1/x?key=secret"
@@ -578,14 +660,14 @@ mod tests {
     }
 
     #[test]
-    fn network_request_recorder_dropped_unfinished_records_connection_failed_once() {
+    fn network_request_recorder_dropped_unfinished_records_interrupted_once() {
         let requests = NetworkRequests::default();
         drop(recorder(&requests));
         let lines = requests.take();
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0].outcome,
-            NetworkRequestOutcome::Failed(REASON_CONNECTION_FAILED)
+            NetworkRequestOutcome::Failed(REASON_INTERRUPTED)
         );
         assert_eq!(lines[0].task_id.as_deref(), Some("tsk_a"));
         assert_eq!(lines[0].request_bytes, Some(0));
@@ -646,8 +728,10 @@ mod tests {
     }
 
     #[test]
-    fn network_request_with_no_scope_wraps_and_records_nothing() {
-        let requests = NetworkRequests::default();
+    fn network_request_with_no_scope_passes_both_bodies_through_unchanged() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let mut recorder = NetworkRequestRecorder::begin(
             None,
             NetworkRoute::Direct,
@@ -656,9 +740,73 @@ mod tests {
             &http::Method::GET,
             Instant::now(),
         );
-        assert!(!recorder.is_pending());
-        let _ = recorder.wrap_request(http::Request::new(wasi_body(b"x")));
-        drop(recorder.wrap_response(wasi_body(b"y"), 200));
+        let request = recorder.wrap_request(http::Request::new(wasi_body(b"x")));
+        let sent = rt.block_on(request.into_body().collect()).unwrap();
+        assert_eq!(sent.to_bytes(), Bytes::from_static(b"x"));
+        let body = recorder.wrap_response(wasi_body(b"y"), 200);
+        let read = rt.block_on(body.collect()).unwrap();
+        assert_eq!(read.to_bytes(), Bytes::from_static(b"y"));
+    }
+
+    /// The end of a store's call accounts for each request still in flight once, in the order
+    /// sent: one with no response head as `interrupted`, one mid-body as `sent` with the bytes
+    /// read so far. Neither its recorder nor its body, dropped afterwards, adds a line.
+    #[test]
+    fn network_request_in_flight_at_call_end_is_recorded_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let requests = NetworkRequests::new(TraceCapture::Content);
+        let scope = scope(&requests);
+        let begin = || {
+            NetworkRequestRecorder::begin(
+                Some(&scope),
+                NetworkRoute::Direct,
+                "https",
+                Some("api.example.com".into()),
+                &http::Method::GET,
+                Instant::now(),
+            )
+        };
+        let mut waiting = begin();
+        let request = waiting.wrap_request(http::Request::new(wasi_body(b"abc")));
+        rt.block_on(request.into_body().collect()).unwrap();
+        let reading = begin();
+        let mut body = reading.wrap_response(
+            Stalling(Some(b"part"))
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+            200,
+        );
+        rt.block_on(async {
+            let frame = body.frame().await.unwrap().unwrap();
+            assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"part"));
+        });
+
+        scope.interrupt_in_flight();
+        let lines = requests.take();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0].outcome,
+            NetworkRequestOutcome::Failed(REASON_INTERRUPTED)
+        );
+        assert_eq!(lines[0].http_status, None);
+        assert_eq!(lines[0].request_bytes, Some(3));
+        assert_eq!(lines[0].response_bytes, None);
+        assert_eq!(lines[1].outcome, NetworkRequestOutcome::Sent);
+        assert_eq!(lines[1].http_status, Some(200));
+        assert_eq!(lines[1].response_bytes, Some(4));
+        assert_eq!(
+            lines[1]
+                .response_body
+                .as_ref()
+                .and_then(|b| b.bytes.as_deref()),
+            Some(&b"part"[..])
+        );
+
+        drop(waiting);
+        drop(body);
+        scope.interrupt_in_flight();
         assert!(requests.take().is_empty());
     }
 }

@@ -417,8 +417,8 @@ itself is the conversation's `blobs/<sha256>` — see
 the `[Capsule]` block was prepended, and so does `message_sha256` from
 [`a2a_task_received`](#a2a-task-received), to the message text of a task the door let in.
 `request_sha256` and `response_sha256` from [`network_request`](#network-request) resolve to the
-request body the guest sent and the response body it read. Each is written when its line is,
-after the request is accounted for, so the runtime holds a `content` body in memory until then.
+request body the component sent and the response body it read. Both blobs are written with the
+line, once the request has ended, so under `content` each body is also held in memory until then.
 
 **Blob bodies are the payload verbatim, unredacted** — including any peer handle token, which
 `tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
@@ -1147,7 +1147,7 @@ is accounted for and before `session_end`. A session in no formation writes none
 | `reason` | string | Present exactly for `refused` and `failed` — see the table below |
 | `http_status` | u16 | The member door's HTTP status. Present when a response arrived |
 | `member_task_id` | string | The callee's task: the `task.id` of the `SendMessage` answer. Present when the response carried one |
-| `duration_ms` | u64 | From the request reaching the runtime to the line being accounted for: the end of the response for `sent` |
+| `duration_ms` | u64 | From the request leaving the component to the request ending: for `sent`, the end of the response or the moment the component dropped it |
 
 | `outcome` | `reason` | Written when |
 |---|---|---|
@@ -1167,16 +1167,18 @@ field carries a door address, a port, a token, a header value or a request or re
 {"event_type":"member_request","event_id":"evt_01a2c4e0b7d17a40b9f3c2d1e0a9b8c7","parent_id":"evt_01a2c4e0a1f07b1c8d2e3f4a5b6c7d8e","session_id":"ses_01a2c4e0a1e57c3d9e8f7a6b5c4d3e2f","timestamp":1793820004120,"call_id":"mrq_01a2c4e0b7c07d5e8f9a0b1c2d3e4f50","task_id":"tsk_01a2c4e0a2017e6f9a0b1c2d3e4f5a6b","member":"coder","component":"formation-probe","role":"tool","via":"wasi_http","outcome":"sent","http_status":200,"member_task_id":"tsk_01a2c4e0b8a27f708192a3b4c5d6e7f8","duration_ms":38}
 ```
 
-`mur trace show` lists each as
+`mur trace steps` lists each as
 `member_request coder  mrq_01a2…  sent  200  38ms  via tool formation-probe`, and a refused one as
 `member_request reviewer  mrq_01a2…  refused not_a_callee  0ms  via tool formation-probe`.
 
-**`network_request`**{ #network-request } — written once per HTTP request a guest sent through
-its own `wasi:http`, refused requests included. The guest is a WASM tool, a `transport: http`
-driver reached as a tool, a hook, or a script capsule's own component. The request went straight
-to the host it named, through that artifact's own [credential gateway](manifest.md#artifact-gateway),
-or was refused before any connection opened. Written after the request is accounted for and
-before `session_end`; a tool's requests are written before that call's `tool_call` line.
+**`network_request`**{ #network-request } — written once per HTTP request a component sent on
+its own, refused requests included. The component is a WASM tool, a `transport: http` driver
+reached as a tool, a hook, or a script capsule's own component. The request went straight to the
+host it named, through that artifact's own [credential gateway](manifest.md#artifact-gateway), or
+was refused before any connection opened. Written once the request has ended and before
+`session_end`; a tool's requests are written before that call's `tool_call` line. A request still
+open when its component's call ends is ended with it, so a call stopped at its
+[`call_deadline`](#call-deadline) still leaves a line for each request it sent.
 
 Two kinds of request are recorded by their own line and never by this one:
 
@@ -1191,25 +1193,26 @@ Two kinds of request are recorded by their own line and never by this one:
 | `component` | string | The artifact's tool name for a tool or driver, the hook's name, or the capsule's `name` |
 | `role` | string | `"tool"` \| `"driver"` \| `"hook"` \| `"capsule"` — as [`call_deadline.role`](#call-deadline). A driver reached by name is `"tool"` |
 | `route` | string | `"direct"` — to the host the request named \| `"gateway"` — through the artifact's credential gateway |
-| `scheme` | string | `"http"` \| `"https"`: the request's, or for `gateway` the gateway endpoint's |
-| `host` | string | The host, with `:port` when the address names a port: the request's, or for `gateway` the gateway endpoint's. Absent only when the request names no host |
+| `scheme` | string | `"http"` \| `"https"`: the request's, or for `gateway` that of the artifact's `gateway.endpoint` |
+| `host` | string | The host, with `:port` when the address names a port: the request's, or for `gateway` that of the artifact's `gateway.endpoint`. Absent only when the request names no host |
 | `method` | string | The HTTP method, such as `"GET"` |
 | `outcome` | string | `"sent"` \| `"refused"` \| `"failed"` — see the table below |
 | `reason` | string | Present exactly for `refused` and `failed` — see the table below |
 | `http_status` | u16 | The host's HTTP status. Present when a response arrived |
 | `request_bytes` | u64 | Request body bytes the runtime read. Absent for `refused` |
-| `response_bytes` | u64 | Response body bytes the guest read, which is fewer than the body holds when it stopped reading early. Present when a response arrived |
+| `response_bytes` | u64 | Response body bytes the component read, which is fewer than the body holds when it stopped reading early. Present when a response arrived |
 | `request_sha256` | string | SHA-256 of exactly the `request_bytes` bytes. Present when `request_bytes` is, under [`trace.capture`](manifest.md#field-trace) `meta` and `content`. Under `content` the body is stored at [`blobs/<request_sha256>`](#trace-blobs) |
 | `response_sha256` | string | SHA-256 of exactly the `response_bytes` bytes, present on the same terms as `request_sha256` |
-| `duration_ms` | u64 | From the request reaching the runtime to the line being accounted for: the end of the response for `sent` |
+| `duration_ms` | u64 | From the request leaving the component to the request ending: for `sent`, the end of the response, the moment the component dropped it, or the end of its call |
 
 | `outcome` | `reason` | Written when |
 |---|---|---|
-| `"sent"` | — | The host answered, whatever the status. A response the guest dropped before its end is `sent` |
+| `"sent"` | — | The host answered, whatever the status. A response the component dropped before its end, or was still reading when its call ended, is `sent` with the bytes read |
 | `"refused"` | `"not_allowed"` | No [`capabilities.network.allow`](manifest.md#network-allow-entries) rule reaches the host |
 | `"refused"` | `"not_admitted"` | The request is addressed to the inference gateway with no driver call open to send it for. `route` is `gateway` |
 | `"failed"` | `"connection_failed"` | No response arrived: the connection or the write failed, or the gateway's injected credential was not supplied |
 | `"failed"` | `"response_interrupted"` | The response could not be read to its end. Keeps `http_status` and counts the bytes read |
+| `"failed"` | `"interrupted"` | No response arrived before the request was abandoned: the component's call ended — past its [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), cancelled, or with its guest worker lost — or the component dropped the request |
 
 A refused request opens no connection. A gateway that resends a request once with a re-read
 credential after a `401` writes one line for it. No field carries a path, a query, a header name
@@ -1219,7 +1222,7 @@ or value, a key or a token, or any request or response body text.
 {"event_type":"network_request","event_id":"evt_01a2c4e0b7d17a40b9f3c2d1e0a9b8c9","parent_id":"evt_01a2c4e0a1f07b1c8d2e3f4a5b6c7d8e","session_id":"ses_01a2c4e0a1e57c3d9e8f7a6b5c4d3e2f","timestamp":1793820004120,"task_id":"tsk_01a2c4e0a2017e6f9a0b1c2d3e4f5a6b","component":"fetcher","role":"tool","route":"direct","scheme":"https","host":"api.example.com","method":"GET","outcome":"sent","http_status":200,"request_bytes":12,"response_bytes":4100,"request_sha256":"3bdb5a5184dacfb4b6f55949a13a800168b87a30b92ca33f71289af60abfa35b","response_sha256":"1bf9e588060a73e6748479719beb68975d292ff1a0a358e9ac848b0d846e8ed8","duration_ms":38}
 ```
 
-`mur trace show` lists each as
+`mur trace steps` lists each as
 `network_request  GET https api.example.com  sent  200  12B→4.1KB  38ms  via tool fetcher`, and a
 refused one as
 `network_request  GET https blocked.example.com  refused not_allowed  0ms  via capsule probe-capsule`.

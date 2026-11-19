@@ -1556,11 +1556,11 @@ The hashes are `system_sha`, `tools_sha`, `response_sha` and `message_shas` on e
 each task the door let in, on its
 [`a2a_task_received` event](observability-schemas.md#a2a-task-received), and `request_sha256` and
 `response_sha256` on each [`network_request` event](observability-schemas.md#network-request),
-for the bodies of a guest's own HTTP request. Every `network_request` line is written under every
+for the bodies of a component's own HTTP request. Every `network_request` line is written under every
 mode; `none` drops only its hashes. Under `content` the body behind each hash is also written to
 [`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs), verbatim and unredacted —
-bodies can be large, and a blob holds the wire payload, the received message or the guest's HTTP
-body as sent.
+bodies can be large, and a blob holds the wire payload, the received message or the component's
+HTTP body as sent.
 
 `trace.sync` sets when each line the session's own `mur` process writes to `trace.jsonl` is on
 disk:

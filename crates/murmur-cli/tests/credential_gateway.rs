@@ -623,6 +623,16 @@ fn network_request_follows_trace_capture() {
                 );
             }
         }
+        // No mode writes either body's text into the trace, raw or as an escaped JSON string.
+        let text = fs::read_to_string(run.records_dir().join("trace.jsonl")).unwrap();
+        for body in [r#"{"query":"gateway-probe"}"#, UPSTREAM_REPLY] {
+            let escaped = serde_json::to_string(body).unwrap();
+            assert!(!text.contains(body), "{mode}: {body} in trace.jsonl");
+            assert!(
+                !text.contains(escaped.trim_matches('"')),
+                "{mode}: {escaped} in trace.jsonl"
+            );
+        }
         if mode == "content" {
             for (field, bytes) in [
                 ("request_sha256", sent_body.as_slice()),
@@ -636,6 +646,132 @@ fn network_request_follows_trace_capture() {
         }
         project.assert_key_recorded_nowhere(&run, MARKER);
     }
+}
+
+/// A request still waiting on its upstream when the tool's call is cut by
+/// `capabilities.limits.deadline_seconds` is one `failed`/`interrupted` line, written before that
+/// call's `tool_call` line and before `session_end`, with the request bytes counted and no
+/// status. The upstream accepts the connection and reads the request but never answers.
+#[test]
+fn network_request_cut_by_the_call_deadline_is_recorded_as_failed() {
+    let upstream = SilentUpstream::start();
+    let mut project = Project::new();
+    project.publish_tool(TOOL, BEARER_AUTH);
+    project.set_credential(CREDENTIAL, MARKER);
+    // Compiled ahead, so the call's deadline is spent waiting on the upstream, not compiling.
+    let compiled = project
+        .mur(&[])
+        .arg("precompile")
+        .arg(
+            project
+                .artifacts
+                .path()
+                .join(format!("{}-{VERSION}.mur.zip", tool_name_of(TOOL))),
+        )
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    project.script_manifest(
+        &tool_entry(&upstream.endpoint),
+        "capabilities:\n  limits:\n    deadline_seconds: 2\n",
+    );
+
+    let run = project.run(&[], &[]);
+    assert!(!run.ok(), "{}", run.context());
+    assert!(upstream.read_a_request(), "{}", run.context());
+
+    let trace = only_trace(project.home.path());
+    let position = |wanted: &dyn Fn(&Value) -> bool| {
+        let found: Vec<usize> = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| wanted(event))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(found.len(), 1, "{trace:#?}");
+        found[0]
+    };
+    let request = position(&|event| event["event_type"] == "network_request");
+    let tool_call = position(&|event| {
+        event["event_type"] == "tool_call" && event["tool_name"] == tool_name_of(TOOL)
+    });
+    let session_end = position(&|event| event["event_type"] == "session_end");
+    assert!(request < tool_call && tool_call < session_end, "{trace:#?}");
+
+    let line = &trace[request];
+    assert_eq!(line["component"], tool_name_of(TOOL));
+    assert_eq!(line["role"], "tool");
+    assert_eq!(line["route"], "gateway");
+    assert_eq!(line["host"], format!("127.0.0.1:{}", upstream.port));
+    assert_eq!(line["method"], "POST");
+    assert_eq!(line["outcome"], "failed");
+    assert_eq!(line["reason"], "interrupted");
+    assert_eq!(line["request_bytes"], 25);
+    assert_eq!(
+        line["request_sha256"],
+        sha256_hex(br#"{"query":"gateway-probe"}"#)
+    );
+    for absent in ["http_status", "response_bytes", "response_sha256"] {
+        assert!(line.get(absent).is_none(), "{absent} in {line}");
+    }
+    project.assert_key_recorded_nowhere(&run, MARKER);
+}
+
+/// A loopback upstream that accepts every connection, reads what is sent on it and never
+/// answers.
+struct SilentUpstream {
+    endpoint: String,
+    port: u16,
+    read: Arc<Mutex<bool>>,
+}
+
+impl SilentUpstream {
+    fn start() -> Self {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let read = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&read);
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let flag = Arc::clone(&flag);
+                thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(read) = stream.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                        *flag.lock().unwrap() = true;
+                    }
+                });
+            }
+        });
+        Self {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            port,
+            read,
+        }
+    }
+
+    fn read_a_request(&self) -> bool {
+        *self.read.lock().unwrap()
+    }
+}
+
+/// The lines of the one session trace under `home`'s records, for a run that printed no records
+/// path.
+fn only_trace(home: &Path) -> Vec<Value> {
+    let traces: Vec<PathBuf> = session_dirs(&common::records_root(home))
+        .into_iter()
+        .map(|dir| dir.join("trace.jsonl"))
+        .filter(|trace| trace.is_file())
+        .collect();
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    fs::read_to_string(&traces[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 /// An artifact with a `gateway:` whose own manifest does not say how its upstream takes the key
