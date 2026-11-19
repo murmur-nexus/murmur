@@ -33,6 +33,7 @@ pub(crate) mod token;
 #[cfg(feature = "beta-mur-topology")]
 pub(crate) mod topology;
 pub(crate) mod trace;
+pub(crate) mod trace_attach;
 pub(crate) mod version;
 pub(crate) mod watch;
 

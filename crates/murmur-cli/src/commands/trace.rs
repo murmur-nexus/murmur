@@ -27,16 +27,23 @@ use crate::formation_trace::{
 use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
 
+use super::trace_attach;
+
 const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
 /// A session's record no longer matches its chain or seal.
-const E_TRC_003: &str = "E-TRC-003";
+pub(crate) const E_TRC_003: &str = "E-TRC-003";
 /// A session's record is not covered by a seal: it ended without one, or lines were appended
 /// after it or cut off.
 const E_TRC_004: &str = "E-TRC-004";
 /// A session's record cannot be checked: written before records were sealed, no public key, or
 /// sealed by another key.
 const E_TRC_005: &str = "E-TRC-005";
+/// An attachment's input is refused: an empty or unprintable evaluator, an empty, unreadable,
+/// non-UTF-8 or oversized value, or an event id the trace does not hold.
+pub(crate) const E_TRC_006: &str = "E-TRC-006";
+/// An attachment cannot be written beneath the records directory.
+pub(crate) const E_TRC_007: &str = "E-TRC-007";
 
 /// The `inference.stop_reason` value a provider reports for a turn it cut off at the output cap.
 const MAX_TOKENS_STOP_REASON: &str = "max_tokens";
@@ -144,6 +151,43 @@ pub(crate) enum TraceCommand {
         #[arg(long, value_name = "FILE")]
         public_key: Option<PathBuf>,
         /// Print one JSON object, the stable interface documented under mur trace verify
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach an outside party's judgment to a session's sealed record
+    ///
+    /// Verifies the record as `mur trace verify` does and refuses unless it verifies, then writes
+    /// one new file, attachments/<id>.json in the records directory, naming the sealed head it
+    /// judges. Nothing in the record or its seals changes. The attachment is not signed.
+    #[command(group(
+        clap::ArgGroup::new("attach_value")
+            .args(["value", "value_file"])
+            .required(true)
+    ))]
+    Attach {
+        /// Session: @N, a full ses_ id, a suffix of one (4+ characters), a records directory, or
+        /// a trace.jsonl path
+        session: String,
+        /// Who or what judged the record: a reviewer, a CI job, a model
+        #[arg(long)]
+        evaluator: String,
+        /// The judgment, stored exactly as given and never parsed
+        #[arg(long)]
+        value: Option<String>,
+        /// Read the judgment from FILE, or from standard input when FILE is -
+        #[arg(long, value_name = "FILE")]
+        value_file: Option<PathBuf>,
+        /// An event of the trace the judgment points at; repeat for more
+        #[arg(long = "event", value_name = "EVENT_ID")]
+        event: Vec<String>,
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// The record-seal public key to check against (default: ~/.murmur/keys/record-seal.pub)
+        #[arg(long, value_name = "FILE")]
+        public_key: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace attach
         #[arg(long)]
         json: bool,
     },
@@ -6949,7 +6993,7 @@ fn refused(base: &Path, refused_at: &str, message: String, place: RefusedPlace) 
 
 /// The records directory a resolved session address names: the directory itself, or the one
 /// holding the `trace.jsonl` it names.
-fn records_dir_of(path: &Path) -> PathBuf {
+pub(crate) fn records_dir_of(path: &Path) -> PathBuf {
     if path.is_dir() {
         return path.to_path_buf();
     }
@@ -6984,7 +7028,7 @@ fn conversations_root() -> Option<PathBuf> {
 }
 
 /// Every stream of the records directory `records_dir`, checked.
-fn verify_records(
+pub(crate) fn verify_records(
     records_dir: &Path,
     public_key: Option<&Path>,
 ) -> Result<capsule_runtime::record_seal::RecordReport, CliError> {
@@ -6997,7 +7041,7 @@ fn verify_records(
 }
 
 /// The worst stream of `report`, the one its verdict comes from.
-fn worst_stream(
+pub(crate) fn worst_stream(
     report: &capsule_runtime::record_seal::RecordReport,
 ) -> Option<&capsule_runtime::record_seal::StreamReport> {
     report
@@ -7008,7 +7052,7 @@ fn worst_stream(
 }
 
 /// `stream: detail`, naming the first bad line when there is one.
-fn stream_finding(stream: &capsule_runtime::record_seal::StreamReport) -> String {
+pub(crate) fn stream_finding(stream: &capsule_runtime::record_seal::StreamReport) -> String {
     match stream.first_bad_line {
         Some(line) => format!("{} line {line}: {}", stream.stream, stream.detail),
         None => format!("{}: {}", stream.stream, stream.detail),
@@ -7030,6 +7074,20 @@ fn print_record_mark(trace_path: &Path) {
     capsule_runtime::report_println!("record:        {}: {finding}", report.verdict.as_str());
 }
 
+/// The code `mur trace verify` exits with for `verdict`, `None` for [`Verdict::Verified`].
+///
+/// [`Verdict::Verified`]: capsule_runtime::record_seal::Verdict::Verified
+pub(crate) fn verdict_code(verdict: capsule_runtime::record_seal::Verdict) -> Option<&'static str> {
+    use capsule_runtime::record_seal::Verdict;
+    match verdict {
+        Verdict::Verified => None,
+        Verdict::Changed => Some(E_TRC_003),
+        Verdict::Unsealed => Some(E_TRC_004),
+        Verdict::Unverifiable => Some(E_TRC_005),
+        Verdict::Absent => Some(E_TRC_001),
+    }
+}
+
 pub(crate) fn run_trace_verify(
     session: Option<String>,
     workdir_arg: Option<PathBuf>,
@@ -7042,13 +7100,19 @@ pub(crate) fn run_trace_verify(
     let path = resolve_session(session, &workdir)?;
     let records_dir = records_dir_of(&path);
     let report = verify_records(&records_dir, public_key.as_deref())?;
+    let attachments = trace_attach::attachment_entries(&records_dir, &report);
     if json {
+        let output = trace_attach::VerifyOutput {
+            report: &report,
+            attachments: &attachments,
+        };
         capsule_runtime::report_println!(
             "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
         );
     } else {
         print_record_report(&report);
+        trace_attach::print_attachments(&attachments);
     }
     let session_name = report
         .session_id

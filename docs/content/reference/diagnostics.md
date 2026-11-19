@@ -164,11 +164,13 @@ section that explains it.
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
-| `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
-| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. A full session id is refused when no records group under `~/.murmur/records` holds it, or when the workdir's group does not and several other records groups do. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to, and a literal path given to `mur trace rm` | [`mur trace`](cli.md#mur-trace), [Session addresses](cli.md#session-addresses), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace rm`](cli.md#mur-trace-rm) |
-| `E-TRC-003` | `mur trace verify`: a stream of the session's record changed since it was sealed | [E-TRC-003](#e-trc-003) |
-| `E-TRC-004` | `mur trace verify`: a stream of the session's record is not covered by a seal | [E-TRC-004](#e-trc-004) |
-| `E-TRC-005` | `mur trace verify`: the session's record cannot be checked with the key given | [E-TRC-005](#e-trc-005) |
+| `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls. `mur trace attach` raises it for a records directory that holds no `trace.jsonl` | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
+| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. A full session id is refused when no records group under `~/.murmur/records` holds it, or when the workdir's group does not and several other records groups do. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to, and a literal path given to `mur trace rm`. `mur trace attach` raises it on the same terms | [`mur trace`](cli.md#mur-trace), [Session addresses](cli.md#session-addresses), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace rm`](cli.md#mur-trace-rm) |
+| `E-TRC-003` | `mur trace verify`, `mur trace attach`: a stream of the session's record changed since it was sealed | [E-TRC-003](#e-trc-003) |
+| `E-TRC-004` | `mur trace verify`, `mur trace attach`: a stream of the session's record is not covered by a seal | [E-TRC-004](#e-trc-004) |
+| `E-TRC-005` | `mur trace verify`, `mur trace attach`: the session's record cannot be checked with the key given | [E-TRC-005](#e-trc-005) |
+| `E-TRC-006` | `mur trace attach`: the evaluator, the value or an `--event` is refused | [E-TRC-006](#e-trc-006) |
+| `E-TRC-007` | `mur trace attach`: the attachment file cannot be written | [E-TRC-007](#e-trc-007) |
 | `E-WIT-LEVEL-001` | A driver a launch stages, an artifact version `mur install` names, or a version a runtime pull resolves, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
@@ -988,6 +990,53 @@ error[E-TRC-005]: the record of session ses_01a1… cannot be verified: trace.js
 ```
 
 Pass the sealing host's `record-seal.pub` with `--public-key`.
+
+[`mur trace attach`](cli.md#mur-trace-attach) refuses a record that does not verify with the code
+`mur trace verify` would exit with — `E-TRC-003`, `E-TRC-004`, `E-TRC-005`, or `E-TRC-001` for a
+directory with no `trace.jsonl` — and the same finding, after `cannot attach to session <id>:`.
+It writes nothing:
+
+```text
+error[E-TRC-003]: cannot attach to session ses_01a1…: trace.jsonl line 3: line 3 changed, or line 4's prev_hash did: line 4 names a hash line 3 no longer has
+```
+
+### E-TRC-006 — an attachment's input is refused { #e-trc-006 }
+
+[`mur trace attach`](cli.md#mur-trace-attach) refused its input before verifying anything and
+wrote nothing. The message names the flag:
+
+| Cause | Message |
+|---|---|
+| `--evaluator ''` | `--evaluator is empty` |
+| An evaluator holding a newline, tab or other control character | `--evaluator "<name>" holds a control character` |
+| `--value ''`, or a `--value-file` with no bytes | `--value is empty`, `--value-file <file> is empty` |
+| A `--value-file` that does not exist or cannot be read | `--value-file <file> cannot be read: <reason>` |
+| A `--value-file` whose bytes are not UTF-8 | `--value-file <file> is not UTF-8: <reason>` |
+| A value larger than 64 MiB | `--value is larger than 67108864 bytes` |
+| An `--event` no line of `trace.jsonl` carries as its `event_id` | `--event <id> names no event of session <id>'s trace.jsonl` |
+
+`--value-file -` reads standard input and names it `--value-file - (standard input)`. Copy event ids
+from [`mur trace show`](cli.md#mur-trace-show) or from `trace.jsonl` itself. The `--event` check runs
+after the record verifies, so a record that does not verify is refused with its own code first.
+
+### E-TRC-007 — an attachment cannot be written { #e-trc-007 }
+
+[`mur trace attach`](cli.md#mur-trace-attach) verified the record but could not write
+`attachments/<attachment_id>.json` beneath the records directory. The message names the file and
+the reason:
+
+| Cause | Reason reads |
+|---|---|
+| This user may not write the records directory or its `attachments/` | `Permission denied` |
+| `attachments` is a link | `refused to write attachments/<attachment_id>.json: attachments is a symbolic link …` |
+| A file is where the `attachments` directory belongs | The path refused and why |
+| The disk is full | `No space left on device` |
+
+```text
+error[E-TRC-007]: the attachment /home/me/.murmur/records/…/ses_01a1…/attachments/att_019a3c….json cannot be written: attachments: Permission denied (os error 13)
+```
+
+No partial file is left behind, and the record is unchanged.
 
 ### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
 
