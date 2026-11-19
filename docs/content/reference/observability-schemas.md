@@ -2064,9 +2064,17 @@ OTel collector: the `capsule.session` span carries [`murmur.record.head`](#otel-
 ### Attachments { #record-attachments }
 
 An attachment is an outside party's judgment of a sealed record — a reviewer's, a CI job's, a
-second model's — kept beside the record and never in it. [`mur trace attach`](cli.md#mur-trace-attach)
-writes one only after the record verifies, and [`mur trace verify`](cli.md#mur-trace-verify-attachments)
-lists each one with whether it points at the head that verified. The runtime never writes one.
+second model's, an eval check's — kept beside the record and never in it. Two commands write one,
+each only after the record verifies; the runtime never writes one.
+
+| Writer | When | `evaluator` | `value` | `events` |
+|---|---|---|---|---|
+| [`mur trace attach`](cli.md#mur-trace-attach) | When run | `--evaluator` | `--value` or `--value-file` | `--event` |
+| [`mur eval run`](cli.md#mur-eval-run) | After each run's check exits | `check: <command>`, each control character written as its escape (a newline as `\n`) | The check's result: `pass`, `fail`, `timed_out` or `error` | `[]` |
+
+`mur eval run` writes none for a run whose check did not run (`not_run`) or for a case with no
+check. [`mur trace verify`](cli.md#mur-trace-verify-attachments) lists each attachment with whether
+it points at the head that verified.
 
 **File.** `attachments/<attachment_id>.json` in the session's
 [records directory](workdir.md#records-directory): one pretty-printed JSON object and a newline,
@@ -2078,7 +2086,7 @@ written to a temporary name and renamed into place, at mode `0666` less the umas
 | `format` | string | `"murmur.attachment/1"` |
 | `attachment_id` | string | `att_` and a UUID v7 as 32 lowercase hex characters; also the file's name |
 | `session_id` | string | The session whose record it judges |
-| `evaluator` | string | Who or what judged it, as given to `--evaluator` |
+| `evaluator` | string | Who or what judged it, as the writer above names it |
 | `value` | string | The judgment exactly as given: a number, a label, JSON or any UTF-8 text. `mur` never parses it |
 | `events` | array of strings | `event_id`s of `trace.jsonl` the judgment points at, each present when it was written; `[]` for none |
 | `attached_at` | integer | Milliseconds since the epoch, set by `mur` |
@@ -2209,6 +2217,8 @@ Each `runs[]` entry:
 | `exit_status` | string \| null | The trace's `session_end.exit_status` |
 | `check_result` | string \| null | `pass`, `fail`, `timed_out`, `error`, `not_run`; `null` for a case with no check |
 | `check` | object \| null | The [check outcome](#check-outcome); `null` when the check did not run |
+| `attachment_id` | string \| null | The [attachment](#record-attachments) holding this run's check result; `null` when the check did not run or none could be written |
+| `attachment_error` | string \| null | `<code>: <message>` saying why no attachment was written for a check that ran; `null` otherwise |
 | `turns` | u32 \| null | From the trace; `null` when it could not be read |
 | `input_tokens` | u64 \| null | The provider's count summed over the session's inference records, or the session's total where no driver reported one |
 | `output_tokens` | u64 \| null | The same, for output |

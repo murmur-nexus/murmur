@@ -496,7 +496,8 @@ fn read_value(value: Option<String>, value_file: Option<&Path>) -> Result<String
     Ok(value)
 }
 
-fn check_evaluator(evaluator: &str) -> Result<(), CliError> {
+/// Refuses (E-TRC-006) an evaluator that is empty or holds a control character.
+pub(crate) fn check_evaluator(evaluator: &str) -> Result<(), CliError> {
     if evaluator.is_empty() {
         return Err(CliError::new(E_TRC_006, "--evaluator is empty"));
     }
@@ -522,20 +523,20 @@ fn unknown_event<'a>(trace: &[u8], events: &'a [String]) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// `mur trace attach`: verifies the session's record as `mur trace verify` does, then writes one
-/// attachment naming its sealed head. Refuses, writing nothing, unless the record verifies.
-pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let workdir = request
-        .workdir
-        .unwrap_or_else(|| current_dir.join("workdir"));
-    let path = resolve_session(Some(request.session), &workdir)?;
-    let records_dir = records_dir_of(&path);
-
-    check_evaluator(&request.evaluator)?;
-    let value = read_value(request.value, request.value_file.as_deref())?;
-
-    let report = verify_records(&records_dir, request.public_key.as_deref())?;
+/// Verifies the record in `records_dir` as `mur trace verify` does and, when it verifies, writes
+/// one attachment naming its sealed head. Writes nothing on any refusal.
+///
+/// The caller checks `evaluator` with [`check_evaluator`] and `value` for emptiness and size first;
+/// each of `events` must be an `event_id` of `trace.jsonl`. Returns the attachment and the absolute
+/// path of the file written.
+pub(crate) fn attach_to_records(
+    records_dir: &Path,
+    evaluator: String,
+    value: String,
+    events: Vec<String>,
+    public_key: Option<&Path>,
+) -> Result<(Attachment, PathBuf), CliError> {
+    let report = verify_records(records_dir, public_key)?;
     let session_name = report
         .session_id
         .clone()
@@ -560,7 +561,7 @@ pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
         )
     };
     let records =
-        WorkdirRoot::open(&records_dir).map_err(|error| write_refused(error.to_string()))?;
+        WorkdirRoot::open(records_dir).map_err(|error| write_refused(error.to_string()))?;
     let unread = |reason: String| {
         CliError::new(
             E_TRC_003,
@@ -571,7 +572,7 @@ pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
         .read_file(TRACE_STREAM, u64::MAX)
         .map_err(|error| unread(error.to_string()))?
         .ok_or_else(|| unread("trace.jsonl is gone".to_string()))?;
-    if let Some(unknown) = unknown_event(&trace, &request.events) {
+    if let Some(unknown) = unknown_event(&trace, &events) {
         return Err(CliError::new(
             E_TRC_006,
             format!("--event {unknown} names no event of session {session_name}'s trace.jsonl"),
@@ -588,9 +589,9 @@ pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
             .session_id
             .clone()
             .unwrap_or_else(|| seal.session_id.clone()),
-        evaluator: request.evaluator,
+        evaluator,
         value,
-        events: request.events,
+        events,
         attached_at: capsule_runtime::retention::now_ms(),
         record: AttachedHead {
             stream: TRACE_STREAM.to_string(),
@@ -609,6 +610,29 @@ pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
             ),
         )
     })?;
+    Ok((attachment, file))
+}
+
+/// `mur trace attach`: resolves the session, checks the evaluator and value, then attaches through
+/// [`attach_to_records`]. Refuses, writing nothing, unless the record verifies.
+pub(crate) fn run_trace_attach(request: AttachRequest) -> Result<(), CliError> {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let workdir = request
+        .workdir
+        .unwrap_or_else(|| current_dir.join("workdir"));
+    let path = resolve_session(Some(request.session), &workdir)?;
+    let records_dir = records_dir_of(&path);
+
+    check_evaluator(&request.evaluator)?;
+    let value = read_value(request.value, request.value_file.as_deref())?;
+
+    let (attachment, file) = attach_to_records(
+        &records_dir,
+        request.evaluator,
+        value,
+        request.events,
+        request.public_key.as_deref(),
+    )?;
 
     if request.json {
         let output = AttachOutput {
