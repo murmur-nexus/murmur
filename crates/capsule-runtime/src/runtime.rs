@@ -4097,6 +4097,7 @@ pub fn stage_session(
             .map(|t| t.capture)
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
+        trace_sync: request.trace.as_ref().and_then(|t| t.sync),
         host_probe,
         provider_tool_terms,
         temp_mapping,
@@ -4837,6 +4838,7 @@ fn launch(
             .map(|d| d.artifact.clone())
             .filter(|a| !a.is_empty());
         let trace_capture = staged.trace_capture;
+        let trace_sync = staged.trace_sync;
         // Retention inputs, taken before `staged` and `run_config` are moved into the agent loop.
         // Both are `None` on a capsule that declared no `retain:` block, and `None` deletes
         // nothing, ever.
@@ -4887,6 +4889,7 @@ fn launch(
                 Some(refusal) => RuntimeError::WorkdirPathRefused { refusal },
                 None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
             })?;
+            trace.set_trace_sync(trace_sync);
             trace.set_call_deadlines(call_deadlines.clone());
             trace.set_member_requests(member_requests.clone());
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
@@ -6195,6 +6198,7 @@ fn launch(
             Some(refusal) => RuntimeError::WorkdirPathRefused { refusal },
             None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
         })?;
+    trace.set_trace_sync(staged.trace_sync);
     trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
     trace.set_credential_source("none");
     trace.set_gateways(session_gateway_records);

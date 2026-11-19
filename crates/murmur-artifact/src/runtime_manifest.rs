@@ -1473,6 +1473,25 @@ pub struct TraceConfig {
     /// that deletes an operator's traces unless they opt out is the one default-allow in a
     /// runtime that is default-deny everywhere else.
     pub retain: Option<TraceRetainConfig>,
+    /// When each line this session's own process writes to `trace.jsonl` reaches the disk —
+    /// resolved from `trace.sync`. `None` — the key was absent — makes no sync call: lines reach
+    /// the disk whenever the kernel writes them back. There is no default.
+    pub sync: Option<TraceSync>,
+}
+
+/// The `trace.sync` setting: when a `trace.jsonl` line is on disk, so that it survives the host
+/// going down (power loss, kernel panic) and not only the process being killed.
+///
+/// It covers only lines the session's own `mur` process writes to its `trace.jsonl`; blobs, the
+/// seal file and every other record are not synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceSync {
+    /// `line`: each line is synced (`fdatasync`) before the call that wrote it returns.
+    Line,
+    /// A duration: each line is on disk no later than `secs` seconds after it was written, and
+    /// `session_end` is synced before the session's ending returns. Never zero — `line` is the
+    /// spelling for syncing every line.
+    Interval { secs: u64 },
 }
 
 /// The `trace.retain` block: what bounds the set of session directories beside the running one.
@@ -2475,6 +2494,10 @@ struct RawTraceConfig {
     /// Untyped for the same reason as `context.retain` — see [`RawContextConfig::retain`].
     #[serde(default, deserialize_with = "present_yaml_value")]
     retain: Option<serde_norway::Value>,
+    /// Untyped so `line`, a bare integer and a suffixed duration all reach [`parse_trace_sync`],
+    /// and `sync:` with nothing under it is refused there rather than read as absent.
+    #[serde(default, deserialize_with = "present_yaml_value")]
+    sync: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3257,7 +3280,7 @@ impl RawBlock for RawObservabilityConfig {
 }
 
 impl RawBlock for RawTraceConfig {
-    const KNOWN_KEYS: &'static [&'static str] = &["capture", "retain"];
+    const KNOWN_KEYS: &'static [&'static str] = &["capture", "retain", "sync"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -4237,7 +4260,12 @@ impl RuntimeManifest {
             .map(|raw_trace| {
                 let capture = resolve_trace_capture(raw_trace.capture.as_deref())?;
                 let retain = parse_trace_retain(raw_trace.retain)?;
-                Ok::<_, RuntimeManifestError>(TraceConfig { capture, retain })
+                let sync = parse_trace_sync(raw_trace.sync)?;
+                Ok::<_, RuntimeManifestError>(TraceConfig {
+                    capture,
+                    retain,
+                    sync,
+                })
             })
             .transpose()?;
         let network = raw
@@ -6617,6 +6645,45 @@ fn parse_trace_retain(
     }))
 }
 
+/// The accepted spellings of `trace.sync`, quoted in every refusal of the field.
+const TRACE_SYNC_ACCEPTED_FORM: &str =
+    "must be 'line' or a duration: an integer, optionally suffixed s/m/h/d";
+
+/// Resolves `trace.sync`: `line`, or a duration (bare integer = seconds) greater than zero.
+/// Absent is `None`; `sync:` with nothing under it, a block, a list and any other text are
+/// refused naming the field.
+fn parse_trace_sync(
+    raw: Option<serde_norway::Value>,
+) -> Result<Option<TraceSync>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let invalid = |message: String| RuntimeManifestError::InvalidTraceConfig {
+        field: "trace.sync".into(),
+        message,
+    };
+    let Some(text) = scalar_text(&raw) else {
+        let shown = match &raw {
+            serde_norway::Value::Null => String::new(),
+            other => format!("{other:?}"),
+        };
+        return Err(invalid(format!(
+            "{TRACE_SYNC_ACCEPTED_FORM}; got '{shown}'"
+        )));
+    };
+    if text == "line" {
+        return Ok(Some(TraceSync::Line));
+    }
+    let secs = parse_duration_secs(&text)
+        .map_err(|_| invalid(format!("{TRACE_SYNC_ACCEPTED_FORM}; got '{text}'")))?;
+    if secs == 0 {
+        return Err(invalid(format!(
+            "must be greater than zero, got '{text}'; use 'line' to sync every line"
+        )));
+    }
+    Ok(Some(TraceSync::Interval { secs }))
+}
+
 fn parse_context_retain(
     raw: Option<serde_norway::Value>,
 ) -> Result<Option<ContextRetainConfig>, RuntimeManifestError> {
@@ -7346,7 +7413,8 @@ mod tests {
                 manifest.trace,
                 Some(TraceConfig {
                     capture: expected,
-                    retain: None
+                    retain: None,
+                    sync: None,
                 })
             );
         }
@@ -7603,6 +7671,67 @@ mod tests {
             }
             other => panic!("expected InvalidInferenceConfig, got {other:?}"),
         }
+    }
+
+    // ── sync ─────────────────────────────────────────────────────────────────
+
+    fn trace_sync_of(line: &str) -> Result<Option<TraceSync>, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n{line}"
+        ))
+        .map(|manifest| manifest.trace.unwrap().sync)
+    }
+
+    #[test]
+    fn trace_sync_accepts_line_and_durations() {
+        assert_eq!(
+            trace_sync_of("  sync: line\n").unwrap(),
+            Some(TraceSync::Line)
+        );
+        for (value, secs) in [("30s", 30), ("5m", 300), ("90", 90), ("2h", 7_200)] {
+            assert_eq!(
+                trace_sync_of(&format!("  sync: {value}\n")).unwrap(),
+                Some(TraceSync::Interval { secs }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_sync_absent_is_none() {
+        assert_eq!(trace_sync_of("").unwrap(), None);
+    }
+
+    #[test]
+    fn trace_sync_refuses_other_text_zero_empty_and_blocks() {
+        for (line, shown) in [
+            ("  sync: always\n", "always"),
+            ("  sync: 0\n", "0"),
+            ("  sync: 0s\n", "0s"),
+            ("  sync:\n", ""),
+            ("  sync:\n    every: line\n", "every"),
+            ("  sync: [line]\n", "line"),
+        ] {
+            match trace_sync_of(line) {
+                Err(RuntimeManifestError::InvalidTraceConfig { field, message }) => {
+                    assert_eq!(field, "trace.sync", "{line:?}");
+                    assert!(message.contains(shown), "{line:?}: {message}");
+                    assert!(message.contains("'line'"), "{line:?}: {message}");
+                }
+                other => panic!("{line:?}: expected a trace.sync refusal, got {other:?}"),
+            }
+        }
+        let empty = trace_sync_of("  sync:\n").unwrap_err().to_string();
+        assert!(empty.contains("got ''"), "{empty}");
+        let zero = trace_sync_of("  sync: 0s\n").unwrap_err().to_string();
+        assert!(zero.contains("sync every line"), "{zero}");
+        let other = trace_sync_of("  sync: always\n").unwrap_err().to_string();
+        assert!(other.contains(TRACE_SYNC_ACCEPTED_FORM), "{other}");
+    }
+
+    #[test]
+    fn trace_sync_is_a_known_key() {
+        assert!(unknown_keys_of("name: cap\nversion: 0.1.0\ntrace:\n  sync: line\n").is_empty());
     }
 
     #[test]
