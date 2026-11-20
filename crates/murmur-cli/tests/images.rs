@@ -347,6 +347,8 @@ fn images_age_out_after_keep() {
 
 // ── Truncation ────────────────────────────────────────────────────────────────
 
+/// A record line whose user message carries one image block per sha in `shas`. A `tool` message
+/// would need the call it answers in the kept messages, or the truncation is refused.
 fn image_line(index: u64, shas: &[&str]) -> String {
     let mut content = vec![json!({"type": "text", "text": format!("m{index}")})];
     for sha in shas {
@@ -354,7 +356,7 @@ fn image_line(index: u64, shas: &[&str]) -> String {
             {"type": "file", "sha256": sha, "media_type": "image/png", "bytes": 4}}));
     }
     json!({"id": format!("msg_{:012x}{index:020x}", 1_700_000_000_000u64 + index),
-        "role": "tool", "content": content})
+        "role": "user", "content": content})
     .to_string()
 }
 

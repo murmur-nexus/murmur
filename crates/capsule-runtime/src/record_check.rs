@@ -302,8 +302,8 @@ mod tests {
         );
     }
 
-    /// A set comparison of issued against answered ids passes this record; the order rule does
-    /// not. The call is unanswered too, since its only result comes before it.
+    /// Rule 1 is about order, not only membership: the ids pair up, yet the result comes first.
+    /// The call is unanswered too, since its only result comes before it.
     #[test]
     fn a_result_before_its_call_is_orphaned() {
         let faults = check_rewrite(&[result("c1"), call("c1")], &[]);
@@ -486,9 +486,8 @@ mod tests {
         assert_eq!(faults[2].message_id.as_deref(), Some("msg_3"));
     }
 
-    /// The cases the set comparison this check replaced tested: a call with no answer and an
-    /// answer with no call both fail; an empty list, a plain message, a paired call and result,
-    /// and a pair among other messages pass.
+    /// A call with no answer and an answer with no call both fail; an empty list, a plain
+    /// message, a paired call and result, and a pair among other messages pass.
     #[test]
     fn unpaired_calls_and_results_fail_in_both_directions() {
         assert!(!check_rewrite(&[call("c1")], &[]).is_empty());
