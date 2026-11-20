@@ -1,0 +1,46 @@
+# The isolation sets: tests that prove Murmur's isolation only where the host lets them isolate.
+#
+# Inside a capsule, or on any host that cannot create the namespaces, cgroup scope or Landlock
+# domain a test needs, each of these prints a host-skip line (`[SKIP-HOST] …` or `skipping <test>:
+# …`) and returns, which nextest counts as a pass. scripts/isolation-proofs.py runs them on the host
+# instead and records per-test evidence in which a skip is never a pass. The contributor page
+# docs/content/contributing/isolation-tests.md explains the placements and the grants.
+#
+# This is not an exhaustive list of the tests that need the host. Any test that prints a host-skip
+# line in a capsule is handed over by `isolation-proofs.py handover` and reported `unclassified`
+# until a set here names it.
+#
+# Each [[set]]:
+#   name      unique, [a-z0-9-]+
+#   package   the cargo package the tests live in
+#   target    lib | test:<name> | bin:<name>
+#   filter    `test(=<exact test path>)` or `test(/<regex>/)` terms joined by ` | `; the runner
+#             evaluates membership itself and passes the same string to nextest's -E
+#   needs     from: landlock, user-namespace, network-namespace, mount-namespace, pid-namespace,
+#             cgroup-delegation, seccomp, wasmtime
+#   class     the containment class the host must reach: scoped | sealed
+#   why       one sentence
+#   features  optional; passed as --features a,b
+#
+# Put a test in a set only after seeing it run, not skip, on a prepared host: a test that always
+# prints a skip line there makes every run of its set "no evidence".
+
+version = 1
+
+[[set]]
+name = "landlock"
+package = "capsule-runtime"
+target = "lib"
+filter = "test(=sandbox::linux_integration_tests::kernel_tier_refuses_rename_out_of_the_workdir) | test(=sandbox::linux_integration_tests::kernel_tier_refuses_rename_into_the_workdir) | test(=sandbox::linux_integration_tests::kernel_tier_truncate_outside_the_workdir_is_refused)"
+needs = ["landlock", "user-namespace", "network-namespace"]
+class = "scoped"
+why = "A scoped shell command's Landlock domain must refuse moving, linking and truncating files across the workdir's edge, which only a real ruleset in a real network namespace can show."
+
+[[set]]
+name = "wasm-guest-workers"
+package = "murmur-cli"
+target = "test:guest_workers"
+filter = "test(=tools_worker_runs_under_scoped)"
+needs = ["wasmtime", "user-namespace", "network-namespace", "pid-namespace", "cgroup-delegation", "seccomp", "landlock"]
+class = "scoped"
+why = "The real mur must run its WASM tools and driver guest workers under the session's seccomp filter, PID namespace and cgroup at scoped, which needs a host that installs scoped."

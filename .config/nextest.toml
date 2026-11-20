@@ -58,3 +58,21 @@ store-success-output = true
 # retries and timeouts; its own name keeps its JUnit report under target/nextest/ci-default-build/,
 # so the full run's target/nextest/ci/junit.xml, which the job uploads and counts skips in, survives.
 inherits = "ci"
+
+[profile.isolation]
+# Run by scripts/isolation-proofs.py, on the host and outside any capsule, for the isolation sets
+# in .config/isolation-tests.toml. Retries are 0 because the evidence must show the run that
+# happened: a test that failed once and then passed is a failure there, not FLAKY. The runner also
+# passes `--retries 0 --no-fail-fast` on the command line, so a card that edits this profile cannot
+# loosen either.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
+failure-output = "immediate-final"
+
+[profile.isolation.junit]
+# Written to target/nextest/isolation/junit.xml; the runner copies it beside the evidence. Passing
+# tests' output is kept because a `[SKIP-HOST]` or `skipping <test>:` line in it makes the test
+# no evidence rather than a pass.
+path = "junit.xml"
+store-success-output = true
