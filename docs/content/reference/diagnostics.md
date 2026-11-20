@@ -41,6 +41,7 @@ section that explains it.
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
+| `E-CNV-004` | `mur conversation truncate --keep` would leave the record breaking a structural rule | [E-CNV-004](#e-cnv-004) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-CFG-003` | `registry:` in a config file cannot be used: a removed `default:` key, a source's `name:`, `type:` or `url:`, a `repo` that is not `<owner>/<repo>`, a reserved scope claimed, or two sources for one scope | [E-CFG-003](#e-cfg-003) |
@@ -2431,6 +2432,20 @@ error[E-CNV-002]: context 'ctx_fixed' is present under 2 record stores: store-a,
 error[E-CNV-003]: --keep must be at least 1
   hint: truncating a record to nothing is `mur conversation rm ctx_fixed`
 ```
+
+### E-CNV-004 — truncation would break the record { #e-cnv-004 }
+
+`mur conversation truncate` refuses a `--keep` whose kept messages fail the
+[record check](observability-schemas.md#record-check-failed): most often a cut that keeps a tool
+result and drops the tool call it answers. The message names the first fault's `check`, its
+position among the kept messages and its tool call id, or `none`. The record is not changed.
+
+```text
+error[E-CNV-004]: keeping the newest 2 messages would leave orphaned_tool_result at index 0 (tool call c1)
+  hint: nothing was changed; a --keep that starts the kept messages at a turn boundary avoids it
+```
+
+Pick a `--keep` that starts the kept messages at a user message.
 
 ---
 

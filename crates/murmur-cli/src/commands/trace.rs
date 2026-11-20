@@ -796,6 +796,40 @@ struct CompactionDeclinedEvent {
     reason: String,
 }
 
+/// A rewritten conversation failed the record check and was not saved. Rendered as a steps row
+/// naming the rewrite and the first fault; the trace line lists the rest.
+#[derive(Debug, Deserialize)]
+struct RecordCheckFailedEvent {
+    /// `"compaction"` or `"truncation"`.
+    rewrite: String,
+    faults_total: u32,
+    #[serde(default)]
+    faults: Vec<RecordFaultEntry>,
+}
+
+impl RecordCheckFailedEvent {
+    /// `<rewrite>  <faults_total> faults  first: <check> at <index>`, the part of the row after
+    /// the event type.
+    fn row(&self) -> String {
+        format!(
+            "{}  {} faults{}",
+            self.rewrite,
+            self.faults_total,
+            self.faults
+                .first()
+                .map(|fault| format!("  first: {} at {}", fault.check, fault.index))
+                .unwrap_or_default()
+        )
+    }
+}
+
+/// One entry of `record_check_failed.faults`: the rule broken and where in the rewrite.
+#[derive(Debug, Deserialize)]
+struct RecordFaultEntry {
+    check: String,
+    index: u32,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionEndEvent {
     total_turns: u32,
@@ -1625,6 +1659,7 @@ enum TraceEvent {
     CodeModeDetach(CodeModeDetachEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
+    RecordCheckFailed(RecordCheckFailedEvent),
     ContextSeed(ContextSeedEvent),
     SessionEnd(SessionEndEvent),
     TaskStart(TaskStartEvent),
@@ -2042,6 +2077,8 @@ struct TraceMetrics {
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
     /// anything at this session's launch.
     retentions: Vec<RetentionRecord>,
+    /// One row per `record_check_failed` record, in file order.
+    record_checks: Vec<String>,
     resource_lists: OutcomeCounts,
     resource_reads: OutcomeCounts,
     peer_mints: OutcomeCounts,
@@ -2958,6 +2995,7 @@ fn compute_metrics(
     let mut harness_lines: Vec<HarnessLine> = Vec::new();
     let mut quota_windows: Vec<HarnessQuotaWindow> = Vec::new();
     let mut retentions: Vec<RetentionRecord> = Vec::new();
+    let mut record_checks: Vec<String> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
     let mut resource_reads = OutcomeCounts::new();
     let mut peer_mints = OutcomeCounts::new();
@@ -3217,6 +3255,9 @@ fn compute_metrics(
                         None => quota_windows.push(window),
                     }
                 }
+            }
+            TraceEvent::RecordCheckFailed(e) => {
+                record_checks.push(format!("record_check_failed  {}", e.row()));
             }
             TraceEvent::Retention(e) => {
                 retentions.push(RetentionRecord {
@@ -3491,6 +3532,7 @@ fn compute_metrics(
             hook_failures,
             harness_lines,
             retentions,
+            record_checks,
             resource_lists,
             resource_reads,
             peer_mints,
@@ -4088,6 +4130,15 @@ fn print_show(m: &TraceMetrics) {
             if !r.targets.is_empty() {
                 capsule_runtime::report_println!("  {}", r.targets.join(", "));
             }
+        }
+        capsule_runtime::report_println!();
+    }
+
+    // A rewrite the runtime refused left the record as it was; this is the only account of it.
+    if !m.record_checks.is_empty() {
+        capsule_runtime::report_println!("── Record check ─────────────────────────────────");
+        for row in &m.record_checks {
+            capsule_runtime::report_println!("{row}");
         }
         capsule_runtime::report_println!();
     }
@@ -5658,6 +5709,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_thousands(e.tokens),
             e.reason
         ),
+        TraceEvent::RecordCheckFailed(e) => format!("{}{}", kind("record_check_failed"), e.row()),
         TraceEvent::ContextSeed(e) => format!(
             "{}{}  {}  {} tokens",
             kind("context_seed"),
@@ -8677,6 +8729,22 @@ mod tests {
         assert_eq!(
             row(line),
             "tool_input_refused murmur-tool-editor  missing operation, dest_path"
+        );
+    }
+
+    /// A `record_check_failed` line renders one row naming the rewrite, the fault count and the
+    /// first fault.
+    #[test]
+    fn record_check_failed_renders_a_steps_row() {
+        let line = r#"{"event_type":"record_check_failed","event_id":"evt_7","parent_id":"evt_2","session_id":"s","timestamp":7,"turn":1,"task_id":"tsk_1","rewrite":"compaction","messages":2,"faults_total":2,"faults":[{"check":"unanswered_tool_call","index":0,"message_id":"msg_1","tool_call_id":"toolu_ls","detail":"d"},{"check":"orphaned_tool_result","index":1,"message_id":"msg_2","tool_call_id":null,"detail":"d"}]}"#;
+        assert_eq!(
+            row(line),
+            "record_check_failed compaction  2 faults  first: unanswered_tool_call at 0"
+        );
+        let truncation = r#"{"event_type":"record_check_failed","event_id":"evt_8","parent_id":"evt_1","session_id":"s","timestamp":8,"turn":null,"task_id":null,"rewrite":"truncation","messages":2,"faults_total":1,"faults":[{"check":"orphaned_tool_result","index":0,"message_id":null,"tool_call_id":"c1","detail":"d"}]}"#;
+        assert_eq!(
+            row(truncation),
+            "record_check_failed truncation  1 faults  first: orphaned_tool_result at 0"
         );
     }
 

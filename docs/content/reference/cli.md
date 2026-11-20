@@ -3117,6 +3117,11 @@ removed 1 image blobs no kept message names
 The second line is printed only when a blob was removed. A record already at or under `N` prints
 `<path> already holds <n> messages; nothing dropped`.
 
+The kept messages pass the [record check](observability-schemas.md#record-check-failed) before
+anything is written. A `--keep` whose kept messages fail it — most often a cut that keeps a tool
+result and drops the tool call it answers — is refused with
+[`E-CNV-004`](diagnostics.md#e-cnv-004) and the file is left exactly as it was.
+
 ---
 
 ## `mur trace`

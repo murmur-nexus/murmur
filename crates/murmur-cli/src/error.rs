@@ -281,6 +281,7 @@ pub(crate) const SCHEMA_1_INDEX_HINT: &str =
 pub const E_CNV_001: &str = "E-CNV-001"; // no such record store or context id
 pub const E_CNV_002: &str = "E-CNV-002"; // context id is present under more than one record store
 pub const E_CNV_003: &str = "E-CNV-003"; // --keep is not a usable number of messages to keep
+pub const E_CNV_004: &str = "E-CNV-004"; // truncating would leave the record breaking a structural rule
 
 // Config
 #[cfg(feature = "beta-mur-new")]

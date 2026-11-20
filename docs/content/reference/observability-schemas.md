@@ -40,7 +40,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `task_continued`, `keep_working`, `done_check`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
-| `inference` (a hook's, carrying `origin`), `effect_started`, `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `inference` (a hook's, carrying `origin`), `effect_started`, `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined`, `record_check_failed` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `effects_unfinished`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused`, `code_mode_instance_start`, `code_mode_instance_end`, `code_mode_detach` | The session node |
@@ -730,11 +730,46 @@ left as it was
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
 | `tokens` | u64 | Context occupancy at the moment of the decline — the same measurement `compaction` records as `tokens_before`, compared against the threshold × the turn's `input_budget`, and the budget the session went on running over. The `on-compaction` event the hooks declined carried `threshold` = `tokens` ÷ that budget |
 | `tokens_source` | string | `"actual"` \| `"estimate"`: which number `tokens` is, on the terms of `compaction`'s `tokens_before_source`. Always written |
-| `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"unresolved_tool_call"` when a hook's replacement was discarded because its tool calls and tool results did not pair up |
+| `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"record_check_failed"` when a hook's replacement failed the [record check](#record-check-failed), whose `record_check_failed` line comes just before this one |
 
 The session continues over budget on both. Each decline is also written to
 `logs/bootstrap.log` in the session's records directory. A trace can hold any number of them, and a `compaction_declined` on
 one turn does not stop a later turn from compacting successfully.
+
+**`record_check_failed`**{ #record-check-failed } — written when a rewritten conversation fails
+the record check and is not saved. Two rewrites are checked before they are saved: the context a
+compaction hook's `replace-context` would commit, on the per-turn threshold trigger and on
+[`mur run --resume-mode compact`](cli.md#mur-run), and the messages a
+[`context.retain.max_messages`](manifest.md#field-context) truncation would keep. The record the
+session had stays as it was, in memory and on disk, and the session carries on with it
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 \| null | The turn whose compaction was refused. `null` for a truncation, which runs at launch before any turn |
+| `task_id` | string \| null | The task in scope. `null` when none is, which is always the case for a truncation |
+| `rewrite` | string | `"compaction"` or `"truncation"` |
+| `messages` | u32 | How many messages the refused rewrite held: the messages the hook returned, or the messages the truncation would keep |
+| `faults_total` | u32 | Every fault the check found |
+| `faults` | list of object | The first 20 faults, in record order. Each is one row of the table below |
+
+| Fault field | Type | Notes |
+|---|---|---|
+| `check` | string | The rule broken — see below |
+| `index` | u32 | Position of the offending message in the refused rewrite, counting from 0. For a compaction, a position in the list the hook returned, counting a message the runtime could not read |
+| `message_id` | string \| null | The message's `msg_` id. `null` when it has none, which includes a tool result the hook returned unreadable |
+| `tool_call_id` | string \| null | The tool call the fault concerns. `null` when the message names none, or names an empty or non-string one |
+| `detail` | string | One sentence saying what is wrong. Never contains argument or result text |
+
+| `check` | The rewrite holds |
+|---|---|
+| `"orphaned_tool_result"` | A tool result that names no tool call made by an earlier assistant message: an unknown id, a result placed before its call, no `tool_call_id`, or — for a compaction — content the runtime could not read as a tool result, such as cut-off JSON |
+| `"unparseable_tool_arguments"` | A tool call whose arguments are present and are not a JSON object: a string, whether or not the string would parse, an array, a number, a boolean or `null`. A call with no arguments at all is dispatched as `{}` and passes |
+| `"unanswered_tool_call"` | A tool call with no tool result after it, or with no id. A call that was in flight in the record the rewrite replaces — one that record held without a result — may stay unanswered; any other may not |
+
+A refused compaction is followed by a `compaction_declined` line with
+`reason: "record_check_failed"` and a `[compaction]` line in `logs/bootstrap.log`. A refused
+truncation writes no `retention` line, prints a `[retention]` line to stderr and
+`logs/bootstrap.log`, and the record keeps growing.
 
 **`context_seed`**{ #context-seed } — written once per task whose `on-task-start` hook returned
 `seed-context`, recording what the runtime did with it
@@ -2007,8 +2042,10 @@ failed early. A `"canceled"` run settles every step, so its counts sum to `steps
 **Non-obvious behaviour:**
 
 - A trace write that fails ends the session with `E-RUN-007` (see [Diagnostics](diagnostics.md)).
-  The exceptions are `compaction`, `compaction_declined` and `context_seed`: that failure is
-  logged to `logs/bootstrap.log` in the session's records directory and the session continues.
+  The exceptions are `compaction`, `compaction_declined`, `record_check_failed` and
+  `context_seed`: that failure is logged to `logs/bootstrap.log` in the session's records
+  directory and the session continues. A `record_check_failed` for a truncation, like
+  `retention`, is not logged when its write fails.
 - When the launch fails before `session_start` is written (a missing driver artifact, for
   example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
   started.

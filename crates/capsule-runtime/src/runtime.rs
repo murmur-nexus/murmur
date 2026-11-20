@@ -15015,7 +15015,29 @@ async fn apply_retention(
                 .await;
         }
         Ok(_) => {}
-        Err(reason) => {
+        // The kept messages would leave a record no resume can send, so the record keeps every
+        // message it had and the trace names each fault.
+        Err(crate::retention::TruncationError::RecordCheck { faults, messages }) => {
+            let _ = trace
+                .write_record_check_failed(
+                    None,
+                    crate::trace::REWRITE_TRUNCATION,
+                    messages,
+                    &faults,
+                )
+                .await;
+            let message = format!(
+                "[retention] {} was not truncated: the kept messages fail the record check ({} \
+                 faults; first: {} at {}); this record keeps growing",
+                path.display(),
+                faults.len(),
+                faults[0].check.as_str(),
+                faults[0].index
+            );
+            crate::runtime_err!("[capsule-runtime] {message}");
+            agent::append_bootstrap_log(records_root, &message);
+        }
+        Err(crate::retention::TruncationError::Io(reason)) => {
             let message = format!(
                 "[retention] {} could not be truncated ({reason}); this record keeps growing",
                 path.display()
@@ -21147,7 +21169,7 @@ inference:
                 "assistant",
                 Some(unresolved),
                 CompactionOutcome::Declined,
-                Some(crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL),
+                Some(crate::trace::COMPACTION_DECLINED_RECORD_CHECK_FAILED),
             ),
         ];
 
@@ -21226,6 +21248,245 @@ inference:
                 }
             }
         }
+    }
+
+    /// What one `try_compact_via_hooks` call did to a context `[task, assistant(tool_call c1)]`,
+    /// `c1` in flight, under [`echo_compaction_hooks`] replacing it with one `role` message whose
+    /// content is `replacement`. The context is also a conversation record on disk and the state
+    /// holds a driver continuation, so a refusal can be shown to leave both alone.
+    struct CompactionAttempt {
+        outcome: crate::agent::CompactionOutcome,
+        events: Vec<serde_json::Value>,
+        bootstrap: String,
+        messages_before: String,
+        messages_after: String,
+        record_before: Vec<u8>,
+        record_after: Vec<u8>,
+        tokens_unchanged: bool,
+        continuation: Option<String>,
+    }
+
+    async fn attempt_compaction(role: &str, replacement: &str) -> CompactionAttempt {
+        use crate::agent::{try_compact_via_hooks, ContextOccupancy, SessionOccupancy};
+        use crate::hooks::test_support::echo_compaction_hooks;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        let root = crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap();
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        state.record_continuation("resp_held".to_string(), None, "primary", 2);
+        let mut hooks = echo_compaction_hooks(&state.engine, &workdir, role).await;
+        let mut trace = tool_refresh_trace(&workdir).await;
+        let otel = OtelEmitter::new(None, &root, "cap".to_string(), "0.1.0".to_string());
+        let occupancy = ContextOccupancy {
+            model: "test-model",
+            max_output_tokens: 1024,
+            tools: &[],
+            system: "sys",
+            prompt_cache_key: None,
+            view: None,
+        };
+        let mut messages = vec![
+            serde_json::json!({
+                "id": "msg_task",
+                "role": "user",
+                "content": [{"type": "text", "text": "a long conversation"}],
+            }),
+            serde_json::json!({
+                "id": "msg_call",
+                "role": "assistant",
+                "content": [{"type": "tool_call", "id": "c1", "name": "bash", "input": {}}],
+            }),
+        ];
+        let conversations = workdir.join("conversations");
+        let mut record = crate::conversation::ConversationRecord::open(
+            &conversations,
+            "ctx_check",
+            &root,
+            Some("cap"),
+        )
+        .unwrap();
+        record.append(&messages);
+        let record_before = fs::read(record.path()).unwrap();
+        let messages_before = serde_json::to_string(&messages).unwrap();
+        let mut session_tokens = SessionOccupancy::estimate(occupancy.count(&messages));
+        let tokens_before = session_tokens;
+
+        let outcome = try_compact_via_hooks(
+            &mut messages,
+            &mut None,
+            None,
+            &mut session_tokens,
+            &occupancy,
+            &mut state,
+            3,
+            100,
+            &root,
+            &mut hooks,
+            &mut trace,
+            &otel,
+            Some(replacement.to_string()),
+            None,
+            false,
+            Some(&mut record),
+        )
+        .await
+        .expect("no case fails the session");
+        trace.flush().await.unwrap();
+
+        CompactionAttempt {
+            outcome,
+            events: read_trace_events(&workdir),
+            bootstrap: fs::read_to_string(workdir.join("logs/bootstrap.log")).unwrap_or_default(),
+            messages_before,
+            messages_after: serde_json::to_string(&messages).unwrap(),
+            record_before,
+            record_after: fs::read(record.path()).unwrap(),
+            tokens_unchanged: session_tokens == tokens_before,
+            continuation: state.driver_continuation_id.clone(),
+        }
+    }
+
+    /// A replacement that breaks a rule is refused whole: one `record_check_failed` naming the
+    /// rule, the position and the tool call, then the ordinary `compaction_declined`, one
+    /// bootstrap line, and nothing else changed — not the context, not the record on disk, not
+    /// the occupancy, not the held continuation.
+    #[tokio::test]
+    async fn compaction_refuses_a_replacement_that_fails_the_record_check() {
+        let cut = r#"{"__murmur_tool_msg__":true,"tool_call_id":"c1","is_error":false,"body":[{"type":"text","text":"hel"#;
+        let orphan = r#"{"__murmur_tool_msg__":true,"tool_call_id":"c9","is_error":false,"body":[{"type":"text","text":"ok"}]}"#;
+        let cases: [(&str, &str, &str, Option<&str>, &str); 4] = [
+            (
+                "assistant",
+                r#"[{"type":"tool_call","id":"c1","name":"bash","input":"{\"command\": \"echo hel"}]"#,
+                "unparseable_tool_arguments",
+                Some("c1"),
+                "the arguments are stored as text rather than as an object, and the text does \
+                 not parse as JSON (it fails at line 1, column 21)",
+            ),
+            (
+                "assistant",
+                r#"[{"type":"tool_call","id":"c1","name":"bash","input":["ls"]}]"#,
+                "unparseable_tool_arguments",
+                Some("c1"),
+                "the arguments are an array, not an object",
+            ),
+            (
+                "tool",
+                cut,
+                "orphaned_tool_result",
+                None,
+                "its content could not be read as a tool result: its JSON is cut off (it ends at \
+                 line 1, column 99)",
+            ),
+            (
+                "tool",
+                orphan,
+                "orphaned_tool_result",
+                Some("c9"),
+                "no earlier assistant message makes the tool call this result answers",
+            ),
+        ];
+
+        for (role, replacement, check, tool_call_id, detail) in cases {
+            let attempt = attempt_compaction(role, replacement).await;
+            assert_eq!(
+                attempt.outcome,
+                crate::agent::CompactionOutcome::Declined,
+                "{replacement}"
+            );
+            assert_eq!(attempt.messages_after, attempt.messages_before);
+            assert_eq!(
+                attempt.record_after, attempt.record_before,
+                "the record gains no line"
+            );
+            assert!(attempt.tokens_unchanged);
+            assert_eq!(attempt.continuation.as_deref(), Some("resp_held"));
+            assert!(!attempt
+                .events
+                .iter()
+                .any(|e| e["event_type"] == "compaction"));
+
+            let kinds: Vec<&str> = attempt
+                .events
+                .iter()
+                .filter_map(|e| e["event_type"].as_str())
+                .filter(|kind| ["record_check_failed", "compaction_declined"].contains(kind))
+                .collect();
+            assert_eq!(kinds, ["record_check_failed", "compaction_declined"]);
+            let failed = attempt
+                .events
+                .iter()
+                .find(|e| e["event_type"] == "record_check_failed")
+                .unwrap();
+            assert_eq!(failed["rewrite"], "compaction");
+            assert_eq!(failed["turn"], 3);
+            assert_eq!(failed["messages"], 1);
+            assert_eq!(failed["faults_total"], 1, "{failed}");
+            let fault = &failed["faults"][0];
+            assert_eq!(fault["check"], check);
+            assert_eq!(fault["index"], 0);
+            assert_eq!(fault["tool_call_id"], serde_json::json!(tool_call_id));
+            assert_eq!(fault["detail"], detail);
+            // A message the hook returned unreadable was never rebuilt, so it has no id.
+            if role == "tool" && tool_call_id.is_none() {
+                assert_eq!(fault["message_id"], serde_json::Value::Null);
+            } else {
+                assert!(fault["message_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("msg_")));
+            }
+            let declined = attempt
+                .events
+                .iter()
+                .find(|e| e["event_type"] == "compaction_declined")
+                .unwrap();
+            assert_eq!(declined["reason"], "record_check_failed");
+
+            let lines: Vec<&str> = attempt
+                .bootstrap
+                .lines()
+                .filter(|line| line.contains("[compaction]"))
+                .collect();
+            assert_eq!(
+                lines,
+                [format!(
+                    "[compaction] the replacement failed the record check (1 faults; first: \
+                     {check} at 0); continuing without compaction"
+                )],
+                "{}",
+                attempt.bootstrap
+            );
+            for text in [attempt.bootstrap.as_str(), &failed.to_string()] {
+                assert!(!text.contains("echo hel"), "{text}");
+                assert!(!text.contains("\"hel"), "{text}");
+            }
+        }
+    }
+
+    /// A replacement may keep a call the context left in flight without its result: committed,
+    /// and no `record_check_failed`.
+    #[tokio::test]
+    async fn compaction_commits_a_replacement_keeping_an_in_flight_call() {
+        let attempt = attempt_compaction(
+            "assistant",
+            r#"[{"type":"tool_call","id":"c1","name":"bash","input":{}}]"#,
+        )
+        .await;
+        assert_eq!(attempt.outcome, crate::agent::CompactionOutcome::Committed);
+        assert!(!attempt
+            .events
+            .iter()
+            .any(|e| e["event_type"] == "record_check_failed"));
+        assert!(attempt
+            .events
+            .iter()
+            .any(|e| e["event_type"] == "compaction"));
+        assert_ne!(attempt.record_after, attempt.record_before);
     }
 
     /// The real http agent loop over one session's state, its driver a double that answers every

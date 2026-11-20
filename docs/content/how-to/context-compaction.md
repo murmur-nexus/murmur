@@ -421,13 +421,23 @@ configured to begin with. The runtime logs `no hook returned replace-context` to
 `logs/bootstrap.log`, writes a `compaction_declined` line to `trace.jsonl` with
 `reason: "no_hook_replacement"`, and the session continues with the uncompacted history.
 
-**A bound hook returned a replacement the runtime rejected.** A compacted history whose tool calls
-and tool results no longer pair up would make the next request malformed, so the runtime discards
-the replacement whole and keeps the original, larger history. Non-fatal: it logs
-`compacted result has an unresolved tool_call` to `logs/bootstrap.log`, writes a
-`compaction_declined` line with `reason: "unresolved_tool_call"`, and the session continues over
-budget. Recurring `unresolved_tool_call` declines mean the hook is dropping one half of a
-call/result pair.
+**A bound hook returned a replacement that failed the record check.** Before a replacement is
+committed, the runtime checks it against three rules:
+
+- every tool result names a tool call made earlier in the replacement;
+- every tool call's arguments are a JSON object;
+- every tool call has a tool result later in the replacement, unless the call was still in flight
+  in the context the hook was handed.
+
+A replacement that breaks any of them would make the next request malformed or replay a broken
+call on every resume, so the runtime refuses it whole and keeps the original, larger history, in
+memory and in the conversation record. Non-fatal: it writes a
+[`record_check_failed`](../reference/observability-schemas.md#record-check-failed) line naming
+every broken rule, the position in the hook's list where it broke and the tool call, then a
+`compaction_declined` line with `reason: "record_check_failed"`, logs
+`the replacement failed the record check` to `logs/bootstrap.log`, and the session continues over
+budget. The usual causes are a hook that rewrites a `tool` message's content instead of handing it
+back unmodified, keeps one half of a call/result pair, or writes a call's arguments as a string.
 
 **A bound hook ran and returned an error, with no refused `run-inference` call behind it.** This
 *is* treated as a failure, and it ends the
@@ -492,7 +502,7 @@ compaction.
 | `inference.compaction.driver_config: {reasoning_effort: low}` | Runs the compaction call with `reasoning_effort: low` laid over `inference.driver.config`; agent turns keep their own |
 | `capabilities.limits.deadline_seconds` on the hook's entry | That hook's call deadline, ahead of the capsule-wide value and the 30-second default |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
-| A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
+| A bound hook returns a replacement that fails the record check | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `record_check_failed` and `compaction_declined` written to the trace |
 | A bound hook returns an error with no refused `run-inference` call behind it | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | The driver refuses a key of `inference.compaction.driver_config` | Fatal — the session ends as failed with `E-RUN-040`, naming the key; see [Compaction failure modes](#compaction-failure-modes) |
 | The compaction hook runs past its deadline | Fatal — the session ends as failed with `E-RUN-040`, naming `capabilities.limits.deadline_seconds` on the hook's entry |

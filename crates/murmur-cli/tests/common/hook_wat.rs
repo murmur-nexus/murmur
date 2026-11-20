@@ -236,7 +236,21 @@ pub fn compaction_hook_wasm_expecting(
     )
 }
 
+/// An `on-compaction` hook returning `replace-context(messages)`, each `(role, content)` exactly
+/// as given, so a test can hand the runtime a replacement of any shape.
+pub fn compaction_hook_wasm_returning(messages: &[(&str, &str)]) -> Vec<u8> {
+    compaction_hook_messages(messages, None, "")
+}
+
 fn compaction_hook(role: &str, summary: &str, inserted_by: Option<u8>, guard: &str) -> Vec<u8> {
+    compaction_hook_messages(&[(role, summary)], inserted_by, guard)
+}
+
+fn compaction_hook_messages(
+    messages: &[(&str, &str)],
+    inserted_by: Option<u8>,
+    guard: &str,
+) -> Vec<u8> {
     let compaction_event = r#"  (type $event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
@@ -249,7 +263,7 @@ fn compaction_hook(role: &str, summary: &str, inserted_by: Option<u8>, guard: &s
         compaction_event,
         "compaction-event",
         1,
-        &[(role, summary)],
+        messages,
         inserted_by,
         guard,
     )

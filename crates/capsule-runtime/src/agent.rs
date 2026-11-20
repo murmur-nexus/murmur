@@ -4144,11 +4144,29 @@ const TOOL_MARKER: &str = "__murmur_tool_msg__";
 /// held message had, including none, so handing back a person's turn does not relabel it and a
 /// held id on rewritten content cannot pass a summary off as that turn. The hook's own
 /// `inserted-by` is never read.
+///
+/// A "tool" message that cannot be rebuilt is dropped; [`reconstruct_hook_replacement`] keeps
+/// its place instead.
 fn reconstruct_hook_messages(
     wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
     insertion: ContextInsertion,
     handed: &[Value],
 ) -> Vec<Value> {
+    reconstruct_hook_replacement(wit_messages, insertion, handed)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// [`reconstruct_hook_messages`] with every message the hook returned kept in its position: a
+/// "tool" message that cannot be rebuilt is an `Err` saying why, in words that never quote its
+/// content. The record check reads a `replace-context` this way, so its fault positions are
+/// positions in the list the hook returned.
+fn reconstruct_hook_replacement(
+    wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
+    insertion: ContextInsertion,
+    handed: &[Value],
+) -> Vec<Result<Value, String>> {
     // Each held message as a hook handing it back verbatim would reconstruct it, so a carried
     // message is recognized by value rather than by the bytes of its JSON encoding.
     let held: HashMap<String, (Value, Option<ContextInsertion>)> = handed
@@ -4158,14 +4176,17 @@ fn reconstruct_hook_messages(
             let lowered = to_wit_messages(std::slice::from_ref(message)).pop()?;
             Some((
                 id,
-                (hook_message_body(&lowered)?, ContextInsertion::of(message)),
+                (
+                    hook_message_body(&lowered).ok()?,
+                    ContextInsertion::of(message),
+                ),
             ))
         })
         .collect();
 
     wit_messages
         .into_iter()
-        .filter_map(|m| {
+        .map(|m| {
             let mut message = hook_message_body(&m)?;
             let mark = match m.id.as_ref().and_then(|id| held.get(id)) {
                 Some((body, held_mark)) if *body == message => *held_mark,
@@ -4183,30 +4204,38 @@ fn reconstruct_hook_messages(
                     fields.insert(MESSAGE_INSERTED_BY_KEY.to_string(), json!(mark.as_str()));
                 }
             }
-            Some(message)
+            Ok(message)
         })
         .collect()
 }
 
 /// The agent-loop message one hook-returned WIT message stands for, before any envelope key is
-/// attached, or `None` for a "tool" message that cannot be rebuilt.
+/// attached, or why a "tool" message cannot be rebuilt — in words that never quote its content.
 fn hook_message_body(
     m: &crate::bindings::hook::exports::murmur::hook::lifecycle::Message,
-) -> Option<Value> {
+) -> Result<Value, String> {
     if m.role == "tool" {
-        // Only keep a "tool" message if our marker round-tripped intact (i.e. the
-        // hook left this message's content untouched) — otherwise we have no way
-        // to recover a valid tool_call_id, and a "tool" message without one is
-        // guaranteed to break the next request. Drop it rather than risk that.
-        let parsed: Value = serde_json::from_str(&m.content).ok()?;
+        // Only a "tool" message whose marker round-tripped intact (the hook left this
+        // message's content untouched) can be rebuilt — otherwise there is no way to recover a
+        // valid tool_call_id, and a "tool" message without one is guaranteed to break the next
+        // request.
+        let parsed: Value = serde_json::from_str(&m.content).map_err(|error| {
+            let at = format!("line {}, column {}", error.line(), error.column());
+            if error.is_eof() {
+                format!("its JSON is cut off (it ends at {at})")
+            } else {
+                format!("it is not valid JSON (it fails at {at})")
+            }
+        })?;
         if parsed.get(TOOL_MARKER).and_then(Value::as_bool) != Some(true) {
-            return None;
+            return Err("it is JSON but not the runtime's tool-result wrapper".to_string());
         }
-        let tool_call_id = parsed.get("tool_call_id")?.as_str()?.to_string();
-        if tool_call_id.is_empty() {
-            return None;
-        }
-        Some(json!({
+        let tool_call_id = match parsed.get("tool_call_id").and_then(Value::as_str) {
+            Some("") => return Err("its tool_call_id is empty".to_string()),
+            Some(id) => id.to_string(),
+            None => return Err("it carries no tool_call_id".to_string()),
+        };
+        Ok(json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
@@ -4222,7 +4251,7 @@ fn hook_message_body(
             Value::String(s) => json!([{"type": "text", "text": s}]),
             other => json!([{"type": "text", "text": other.to_string()}]),
         };
-        Some(json!({"role": m.role, "content": content}))
+        Ok(json!({"role": m.role, "content": content}))
     }
 }
 
@@ -4332,32 +4361,6 @@ fn dump_compaction_summary(
         .map_err(|e| format!("failed to write compaction summary: {e}"))
 }
 
-/// Whether a candidate message list has a tool call and a tool result that do not pair up.
-///
-/// An `assistant` message's `tool_call` blocks and a `tool` message's `tool_call_id` only
-/// round-trip through a compaction hook independently of each other — one side can survive
-/// (verbatim content, or the `TOOL_MARKER` wrapper) while its pair is dropped or summarized
-/// away. Either direction of mismatch produces the same class of malformed request, so both
-/// answer `true` here: a `tool_call` with no answer, and an answer with no matching
-/// `tool_call`. The caller's remedy is the same either way — discard the whole compaction
-/// result and keep the original, larger, valid history.
-fn has_unresolved_tool_call(messages: &[Value]) -> bool {
-    let issued: std::collections::HashSet<&str> = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .filter_map(|m| m.get("content").and_then(Value::as_array))
-        .flatten()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_call"))
-        .filter_map(|b| b.get("id").and_then(Value::as_str))
-        .collect();
-    let answered: std::collections::HashSet<&str> = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-        .filter_map(|m| m.get("tool_call_id").and_then(Value::as_str))
-        .collect();
-    issued != answered
-}
-
 /// Write the `compaction_declined` record for a threshold crossing that left the context
 /// alone. Same non-fatal contract as the committed path's `compaction` write: a trace failure
 /// here goes to `bootstrap.log` and the session continues over budget, because refusing to
@@ -4451,20 +4454,62 @@ pub(crate) async fn try_compact_via_hooks(
         return Ok(CompactionOutcome::Declined);
     };
 
+    // Every message the hook returned, in its order. One that cannot be rebuilt stands in its
+    // place as a "tool" message naming no call, which the check always reports, so the fault
+    // positions are positions in the hook's list and nothing it returned goes unchecked.
+    let mut unreadable: HashMap<usize, String> = HashMap::new();
     let candidate_messages: Vec<Value> =
-        reconstruct_hook_messages(new_wit_messages, ContextInsertion::ReplaceContext, messages);
+        reconstruct_hook_replacement(new_wit_messages, ContextInsertion::ReplaceContext, messages)
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                message.unwrap_or_else(|reason| {
+                    unreadable.insert(index, reason);
+                    json!({"role": "tool"})
+                })
+            })
+            .collect();
 
-    if has_unresolved_tool_call(&candidate_messages) {
+    // Checked against the context it would replace, before anything is appended to the record
+    // or committed: a refused replacement leaves the record, the context, the occupancy and the
+    // held continuation exactly as they were.
+    let mut faults = crate::record_check::check_rewrite(&candidate_messages, messages);
+    if !faults.is_empty() {
+        for fault in &mut faults {
+            if let Some(reason) = unreadable.get(&fault.index) {
+                fault.detail = crate::record_check::unreadable_tool_result_detail(reason);
+            }
+        }
+        if let Err(e) = trace
+            .write_record_check_failed(
+                Some(turn_u32),
+                crate::trace::REWRITE_COMPACTION,
+                candidate_messages.len(),
+                &faults,
+            )
+            .await
+        {
+            append_bootstrap_log(
+                records_root,
+                &format!("[compaction] trace write failed: {e}; continuing"),
+            );
+        }
         append_bootstrap_log(
             records_root,
-            "[compaction] compacted result has an unresolved tool_call; continuing without compaction",
+            &format!(
+                "[compaction] the replacement failed the record check ({} faults; first: {} at \
+                 {}); continuing without compaction",
+                faults.len(),
+                faults[0].check.as_str(),
+                faults[0].index
+            ),
         );
         record_compaction_declined(
             trace,
             records_root,
             turn_u32,
             tokens_before,
-            crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
+            crate::trace::COMPACTION_DECLINED_RECORD_CHECK_FAILED,
         )
         .await;
         return Ok(CompactionOutcome::Declined);
@@ -4508,7 +4553,7 @@ pub(crate) async fn try_compact_via_hooks(
     otel.emit_compaction(u64::from(tokens_before.tokens), u64::from(tokens_after))
         .await;
     // Placed after the commit on purpose: both early returns above (no hook returned
-    // replace-context, and the safety net rejecting a mismatched tool_call) leave without
+    // replace-context, and the record check refusing the replacement) leave without
     // reaching here, so the dump records only compactions that actually replaced the context.
     // Same non-fatal contract as the trace write above — losing the eval log must never cost
     // the session a context we already successfully compacted.
@@ -8879,66 +8924,6 @@ mod tests {
             .join("out")
             .join("compaction-summaries.jsonl")
             .exists());
-    }
-
-    // ── Compaction tool-call pairing ─────────────────────────────────────────
-
-    fn assistant_with_tool_call(id: &str) -> Value {
-        json!({
-            "role": "assistant",
-            "content": [{"type": "tool_call", "id": id, "name": "bash", "input": {}}],
-        })
-    }
-
-    fn tool_result_for(id: &str) -> Value {
-        json!({
-            "role": "tool",
-            "tool_call_id": id,
-            "is_error": false,
-            "content": [{"type": "text", "text": "ok"}],
-        })
-    }
-
-    /// Both directions of mismatch are the same defect to the driver, so both answer `true`:
-    /// a tool call nothing answered, and an answer to a tool call that is no longer there.
-    #[test]
-    fn unresolved_tool_call_detected_in_both_directions() {
-        assert!(
-            has_unresolved_tool_call(&[assistant_with_tool_call("toolu_1")]),
-            "a tool_call with no matching tool message is unresolved"
-        );
-        assert!(
-            has_unresolved_tool_call(&[tool_result_for("toolu_1")]),
-            "a tool message with no matching tool_call is unresolved"
-        );
-        assert!(
-            has_unresolved_tool_call(&[
-                assistant_with_tool_call("toolu_1"),
-                tool_result_for("toolu_2"),
-            ]),
-            "ids that do not correspond are unresolved in both directions at once"
-        );
-    }
-
-    /// A candidate whose two sets agree passes, including one carrying no tool calls at all —
-    /// the single summary message a compaction hook usually returns.
-    #[test]
-    fn paired_tool_calls_and_plain_summaries_are_resolved() {
-        assert!(!has_unresolved_tool_call(&[]));
-        assert!(!has_unresolved_tool_call(&[json!({
-            "role": "user",
-            "content": [{"type": "text", "text": "summary of the conversation so far"}],
-        })]));
-        assert!(!has_unresolved_tool_call(&[
-            assistant_with_tool_call("toolu_1"),
-            tool_result_for("toolu_1"),
-        ]));
-        assert!(!has_unresolved_tool_call(&[
-            assistant_with_tool_call("toolu_1"),
-            assistant_with_tool_call("toolu_2"),
-            tool_result_for("toolu_2"),
-            tool_result_for("toolu_1"),
-        ]));
     }
 
     /// The strings that reach `task_end.exit_status` and `session_end.exit_status` are the
