@@ -446,7 +446,25 @@ fn call_runs_an_operation_and_refuses_with_each_check() {
         assert_eq!(calls[0]["status"], "ok");
         assert!(calls[0].get("refusal").is_none(), "{}", calls[0]);
         assert!(calls[0]["tool_call_id"].is_null(), "{}", calls[0]);
+        // A program's call through the bus is not journaled; the model's own call is.
+        assert!(calls[0].get("effect_id").is_none(), "{}", calls[0]);
+        let repl_call = repl_record(&trace, repl_id);
+        let effect_id = repl_call["effect_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the model's own code mode call is journaled: {repl_call}"));
+        assert!(trace
+            .iter()
+            .any(|event| event["event_type"] == "effect_started"
+                && event["effect_id"] == effect_id
+                && event["tool_name"] == "bus-repl"));
     }
+    assert!(
+        trace
+            .iter()
+            .filter(|event| event["event_type"] == "effect_started")
+            .all(|event| event["tool_name"] == "bus-repl"),
+        "only the model's own calls are journaled: {trace:#?}"
+    );
     for (repl_id, tool, reason) in [
         ("t3", "nope", "not-listed"),
         ("t4", "bus-repl", "code-mode-tool"),

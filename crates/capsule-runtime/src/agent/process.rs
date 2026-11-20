@@ -830,6 +830,24 @@ fn write_driver_files(
     Ok(names)
 }
 
+/// The harness's prompt for an attempt: the task payload alone, or — on the attempt that reports
+/// a resumed session's unfinished calls — that fact, fenced on the same condition as the http
+/// path's message, then a blank line, then the task payload. This transport keeps no conversation
+/// record, so the two travel as one prompt.
+fn prompt_with_unfinished_effects(
+    unfinished_effects: Option<&crate::effect_journal::UnfinishedEffects>,
+    task: String,
+) -> String {
+    match unfinished_effects {
+        None => task,
+        Some(effects) => {
+            let (fact, _fence_source) =
+                super::fence_task_payload(Some(effects.provenance()), effects.fact_text());
+            format!("{fact}\n\n{task}")
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_process_inference_loop(
     // `store_state` (shared &) lets the tool bridge execute declared tool artifacts through the
@@ -857,6 +875,9 @@ pub(crate) async fn run_process_inference_loop(
     // member answers — sent as the harness's prompt in place of `task.md`. `None` on an attempt
     // that starts from the task.
     continuation: Option<super::Continuation>,
+    // The calls a resumed session started and recorded no outcome for, on the one attempt that
+    // reports them: sent ahead of the task text. `None` on every other attempt.
+    unfinished_effects: Option<crate::effect_journal::UnfinishedEffects>,
     // Where the session this run leaves behind is written, for the task's next attempt.
     carried_session: &mut Option<String>,
     // Where this attempt's ending is recorded, for the reopen loop's final status.
@@ -887,6 +908,7 @@ pub(crate) async fn run_process_inference_loop(
         cancel.as_ref(),
         &mut a2a,
         continuation,
+        unfinished_effects,
         carried_session,
     )
     .await;
@@ -915,6 +937,7 @@ async fn run_attempt(
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
     continuation: Option<super::Continuation>,
+    unfinished_effects: Option<crate::effect_journal::UnfinishedEffects>,
     carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
@@ -942,6 +965,7 @@ async fn run_attempt(
         cancel,
         a2a,
         continuation,
+        unfinished_effects,
         carried_session,
     ))
     .await;
@@ -972,6 +996,7 @@ async fn run_harness(
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
     continuation: Option<super::Continuation>,
+    unfinished_effects: Option<crate::effect_journal::UnfinishedEffects>,
     carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // A task's turns number straight through its attempts, so this run's first turn carries on
@@ -1061,6 +1086,7 @@ async fn run_harness(
             super::fresh_task_text(&store_state.runtime_root),
         ),
     };
+    let task = prompt_with_unfinished_effects(unfinished_effects.as_ref(), task);
 
     forget_harness_session(&session_policy, trace).await;
     let session_plan = plan_session(&session_policy);
@@ -1465,7 +1491,7 @@ async fn drive_harness(
                         // Resolved exactly once, for both remaining checks, from the same values
                         // dispatch is about to be handed.
                         let resolved = store_state.resolve_call(&tool_name, &ToolInput {
-                            data: Some(input_json),
+                            data: Some(input_json.clone()),
                             log_path: None,
                         });
                         match gate.check(store_state, &resolved).await {
@@ -1476,6 +1502,37 @@ async fn drive_harness(
                     Ok(verdict) => verdict,
                     Err(error) => Some(error.to_string()),
                 };
+                // A call the gate lets run is journaled before the answer that releases it goes
+                // out, so the intent is on record before the bridge dispatches it. The sink pairs
+                // it with the harness's result for the same call. A call that cannot be journaled
+                // is refused and ends the run, as a failed trace write does on the http path.
+                if verdict.is_none() {
+                    let resolved = store_state.resolve_call(&tool_name, &ToolInput {
+                        data: Some(input_json.clone()),
+                        log_path: None,
+                    });
+                    match gate
+                        .write_effect_started(
+                            &tool_name,
+                            None,
+                            &resolved,
+                            &input,
+                            input_json.len() as u64,
+                        )
+                        .await
+                    {
+                        Ok(effect_id) => sink.queue_effect(&tool_name, input, effect_id),
+                        Err(error) => {
+                            let _ = reply.send(Some(format!(
+                                "the call was not dispatched: it could not be journaled in the \
+                                 trace ({error})"
+                            )));
+                            break RunEnd::Failed(RuntimeError::AgentLoopFailed(format!(
+                                "trace write failed: {error}"
+                            )));
+                        }
+                    }
+                }
                 let _ = reply.send(verdict);
                 // Deciding is work, not silence, and a hook may spend all of
                 // `capabilities.limits.deadline_seconds` doing it. Without this the window the
@@ -2177,6 +2234,48 @@ async fn read_lines(stdout: tokio::process::ChildStdout, tx: mpsc::Sender<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn unfinished(trust: crate::origin::TrustClass) -> crate::effect_journal::UnfinishedEffects {
+        crate::effect_journal::UnfinishedEffects {
+            from_session: "ses_prior".to_string(),
+            effects: vec![crate::effect_journal::UnfinishedEffect {
+                effect_id: "eff_0123".to_string(),
+                kind: "shell".to_string(),
+                tool_name: "bash".to_string(),
+                tool_call_id: None,
+                binary: Some("/usr/bin/bash".to_string()),
+                command: Some("sleep 30".to_string()),
+                input: json!({"command": "sleep 30"}),
+                turn: 1,
+                task_id: Some("tsk_1".to_string()),
+                started_at_ms: 1750,
+            }],
+            trust,
+        }
+    }
+
+    /// The prompt is the fact, a blank line, then the task payload; with no fact it is the task
+    /// payload alone. An untrusted fact is fenced as a `completion` task, as on the http path.
+    #[test]
+    fn effects_unfinished_prompt_is_the_fact_a_blank_line_then_the_task() {
+        let task = "do the next thing".to_string();
+        assert_eq!(prompt_with_unfinished_effects(None, task.clone()), task);
+
+        let trusted = unfinished(crate::origin::TrustClass::Trusted);
+        assert_eq!(
+            prompt_with_unfinished_effects(Some(&trusted), task.clone()),
+            format!("{}\n\n{task}", trusted.fact_text())
+        );
+
+        let untrusted = unfinished(crate::origin::TrustClass::Untrusted);
+        let prompt = prompt_with_unfinished_effects(Some(&untrusted), task.clone());
+        let (fenced, source) =
+            super::super::fence_task_payload(Some(untrusted.provenance()), untrusted.fact_text());
+        assert_eq!(source.as_deref(), Some("task:completion"));
+        assert_ne!(fenced, untrusted.fact_text());
+        assert_eq!(prompt, format!("{fenced}\n\n{task}"));
+        assert!(prompt.ends_with("\n\ndo the next thing"), "{prompt}");
+    }
 
     /// The facts of a process capsule declaring `shell.allow: [bash]`, one read-only path, one
     /// network entry and a session token ceiling, with or without the plan tool.

@@ -419,6 +419,18 @@ fn a_policy_hook_refuses_a_bridged_tool_call() {
     assert_eq!(denial["hook_name"], "tool-policy");
     assert_eq!(denial["target"], TOOL, "the bare tool name");
     assert_eq!(denial["reason"], "no tool calls today");
+
+    // The gate refused the call, so it was never journaled, and no line names an effect.
+    assert!(
+        session.events("effect_started").is_empty(),
+        "a refused call writes no intent:\n{}",
+        session.trace_raw
+    );
+    assert!(
+        !session.trace_raw.contains("\"effect_id\""),
+        "no line names an effect:\n{}",
+        session.trace_raw
+    );
 }
 
 // ── S3: a read_only write is refused before the tool runs ────────────────────
@@ -513,6 +525,31 @@ fn an_allowing_hook_leaves_a_bridged_call_alone() {
         "nothing was refused:\n{}",
         session.trace_raw
     );
+
+    // The call the gate let run is journaled before its result is recorded, with no provider id
+    // (the bridge's request carries none), and its `tool_call` names the same effect.
+    let started = session.events("effect_started");
+    assert_eq!(started.len(), 1, "{}", session.trace_raw);
+    let effect_id = started[0]["effect_id"].as_str().unwrap();
+    assert!(
+        effect_id.starts_with("eff_") && effect_id.len() == 36,
+        "{effect_id}"
+    );
+    assert_eq!(started[0]["tool_name"], TOOL);
+    assert_eq!(started[0]["kind"], "tool_call");
+    assert_eq!(started[0]["tool_call_id"], Value::Null, "{}", started[0]);
+    let calls = session.events("tool_call");
+    assert_eq!(calls.len(), 1, "{}", session.trace_raw);
+    assert_eq!(calls[0]["effect_id"], effect_id, "{}", calls[0]);
+    let intent_at = session
+        .trace_raw
+        .find("\"event_type\":\"effect_started\"")
+        .unwrap();
+    let outcome_at = session
+        .trace_raw
+        .find("\"event_type\":\"tool_call\"")
+        .unwrap();
+    assert!(intent_at < outcome_at, "{}", session.trace_raw);
 }
 
 /// What the decision point costs a bridged call, as a per-call figure a build summary can name.

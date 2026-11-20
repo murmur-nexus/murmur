@@ -204,6 +204,14 @@ struct QueuedReport {
     report: CallReport,
 }
 
+/// A call the gate let run and journaled as an `effect_started` line, waiting for the harness's
+/// result for it, keyed as a [`QueuedReport`] is: by bare name and parsed arguments.
+struct QueuedEffect {
+    name: String,
+    input: Value,
+    effect_id: String,
+}
+
 /// The turn currently open: which index it will be recorded under, the text it produced, and
 /// whether it called anything.
 struct OpenTurn {
@@ -238,6 +246,9 @@ pub(super) struct ProcessEventSink<'a> {
     /// Attachment reports no result has claimed yet, oldest first, at most
     /// [`MAX_UNCLAIMED_REPORTS`].
     reports: VecDeque<QueuedReport>,
+    /// Journaled calls no result has claimed yet, oldest first, at most
+    /// [`MAX_UNCLAIMED_REPORTS`].
+    effects: VecDeque<QueuedEffect>,
     /// Set by the first terminal event, so the rest of its batch is ignored.
     finished: bool,
     /// The conversation this run belongs to, and where its session id is remembered.
@@ -306,6 +317,7 @@ impl<'a> ProcessEventSink<'a> {
             open: None,
             pending: HashMap::new(),
             reports: VecDeque::new(),
+            effects: VecDeque::new(),
             finished: false,
             session,
             reported_session: None,
@@ -336,6 +348,33 @@ impl<'a> ProcessEventSink<'a> {
             input: serde_json::from_str(&report.input_json).unwrap_or(Value::Null),
             report,
         });
+    }
+
+    /// Hold `effect_id`, the `effect_started` line just written for a call of `name` with `input`,
+    /// until the harness's result for that call is recorded naming it. Past
+    /// [`MAX_UNCLAIMED_REPORTS`] the oldest is dropped, and stays unpaired in the trace.
+    pub(super) fn queue_effect(&mut self, name: &str, input: Value, effect_id: String) {
+        if self.effects.len() >= MAX_UNCLAIMED_REPORTS {
+            self.effects.pop_front();
+        }
+        self.effects.push_back(QueuedEffect {
+            name: name.to_string(),
+            input,
+            effect_id,
+        });
+    }
+
+    /// The oldest journaled call of `name` with `input`, removed from the queue: the same match
+    /// [`Self::claim_report`] makes, since the bridge's request carries no id that ties it to the
+    /// harness's result. A result that matches none — a refused call, or one whose arguments the
+    /// harness reshaped — is recorded without an `effect_id`, which leaves its effect reading as
+    /// one with no outcome.
+    fn claim_effect(&mut self, name: &str, input: &Value) -> Option<String> {
+        let index = self
+            .effects
+            .iter()
+            .position(|queued| queued.name == name && queued.input == *input)?;
+        self.effects.remove(index).map(|queued| queued.effect_id)
     }
 
     /// The queued report for a call of `name` with `input` whose result is `output`, removed from
@@ -653,6 +692,7 @@ impl<'a> ProcessEventSink<'a> {
                         None => (result.output, Vec::new(), None),
                     };
                 let fence_source = fence_source.filter(|source| carries_fence(&output, source));
+                let effect_id = self.claim_effect(&call.name, &call.input);
                 let output_bytes = output.len() as u64;
                 let result_id = result.id.clone();
                 // Measured by the runtime rather than taken from the harness: the bridge executes
@@ -664,7 +704,7 @@ impl<'a> ProcessEventSink<'a> {
                     .try_into()
                     .unwrap_or(u64::MAX);
                 let _ = trace
-                    .write_tool_call_with_attachments(
+                    .write_tool_call_marked(
                         call.turn,
                         call.name.clone(),
                         Some(result.id),
@@ -678,6 +718,8 @@ impl<'a> ProcessEventSink<'a> {
                         None,
                         None,
                         attachments,
+                        None,
+                        effect_id.as_deref(),
                     )
                     .await;
                 hooks

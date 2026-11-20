@@ -874,6 +874,15 @@ fn push_continuation(
     messages.push(message);
 }
 
+/// The user message that tells a resumed agent which calls the session it resumes started and
+/// recorded no outcome for, fenced as a `completion` task whenever one of them is untrusted.
+fn unfinished_effects_message(effects: &crate::effect_journal::UnfinishedEffects) -> Value {
+    user_message(fence_task_payload(
+        Some(effects.provenance()),
+        effects.fact_text(),
+    ))
+}
+
 /// A user message carrying `text`, labelled with `fence_source` when the text was wrapped.
 fn user_message((text, fence_source): (String, Option<String>)) -> Value {
     with_fence_source(
@@ -946,6 +955,13 @@ pub(crate) async fn run_agent_loop(
             EMPTY_TASK_REFUSAL.to_string(),
         ));
     }
+    // What a resume found the resumed session started and never finished, read by exactly one
+    // attempt: the first fresh one of the first task this launch runs. A continued attempt's
+    // conversation already holds it.
+    let unfinished_effects = continuation
+        .is_none()
+        .then(|| store_state.unfinished_effects.take())
+        .flatten();
 
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
@@ -1016,6 +1032,7 @@ pub(crate) async fn run_agent_loop(
             session_policy,
             cancel,
             continuation,
+            unfinished_effects,
             &mut thread.harness_session,
             &mut thread.ending,
         ))
@@ -1246,6 +1263,14 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
+            // The resumed session's unfinished calls, as a runtime message of their own right
+            // before the task's: after any loaded or compacted history, so the agent reads them
+            // as the latest thing it knows, and ahead of the task it is about to act on.
+            if let Some(effects) = unfinished_effects {
+                let fact = unfinished_effects_message(&effects);
+                append_to_record(record.as_mut(), std::slice::from_ref(&fact));
+                messages.push(fact);
+            }
             let mut task = task_user_message(
                 store_state.current_task_provenance,
                 fresh_task_text(&store_state.runtime_root),
@@ -2332,9 +2357,37 @@ pub(crate) async fn run_agent_loop(
                     // the arm knows whether what it produced is a fenced tool result, a skill
                     // result read off disk, or the runtime's own dispatch-failure message.
                     let generation_before = store_state.installed_generation;
+                    // Set once the call is journaled, which is exactly when it is dispatched: a
+                    // required-field refusal dispatches nothing and writes no intent.
+                    let mut effect_id: Option<String> = None;
                     let dispatched = match refused {
                         Some(refusal) => Err(refusal),
                         None => {
+                            // The intent goes on record before the dispatch begins, so a runtime
+                            // killed while the call runs leaves the call named in the trace. A
+                            // call that cannot be journaled is not dispatched.
+                            let resolved = store_state.resolve_call(
+                                &tool_name,
+                                &ToolInput {
+                                    data: Some(input_json.clone()),
+                                    log_path: None,
+                                },
+                            );
+                            effect_id = Some(
+                                gate.write_effect_started(
+                                    &tool_name,
+                                    Some(&tool_call_id),
+                                    &resolved,
+                                    &input,
+                                    input_bytes,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    RuntimeError::AgentLoopFailed(format!(
+                                        "trace write failed: {e}"
+                                    ))
+                                })?,
+                            );
                             // The frame a code mode program's `murmur:bus` requests are
                             // answered in, while this call runs in the foreground.
                             let frame = crate::bus::BusFrame {
@@ -2437,6 +2490,7 @@ pub(crate) async fn run_agent_loop(
                                     input_bytes,
                                     duration_ms,
                                     mark: None,
+                                    effect_id: effect_id.as_deref(),
                                     result: ObservedResult::Ran(Box::new(RanCall {
                                         text: &text,
                                         is_error,
@@ -2509,6 +2563,7 @@ pub(crate) async fn run_agent_loop(
                                     input_bytes,
                                     duration_ms,
                                     mark: None,
+                                    effect_id: effect_id.as_deref(),
                                     result: ObservedResult::Failed(&error),
                                 },
                             )
@@ -3516,6 +3571,9 @@ pub(crate) struct ObservedCall<'a> {
     pub(crate) duration_ms: u64,
     /// Set for a call a code mode program made through `murmur:bus`.
     pub(crate) mark: Option<&'a crate::trace::CodeModeMark>,
+    /// The `effect_started` line written for this call before its dispatch, named on every
+    /// outcome line written for it. `None` for a call that was never journaled.
+    pub(crate) effect_id: Option<&'a str>,
     pub(crate) result: ObservedResult<'a>,
 }
 
@@ -3608,6 +3666,7 @@ pub(crate) async fn observe_dispatched_call(
                     Some(error),
                     Vec::new(),
                     call.mark,
+                    call.effect_id,
                 )
                 .await
                 .map_err(trace_failed)?;
@@ -3635,6 +3694,7 @@ pub(crate) async fn observe_dispatched_call(
                 call.duration_ms,
                 status.to_string(),
                 call.mark,
+                call.effect_id,
             )
             .await
             .map_err(trace_failed)?;
@@ -3655,6 +3715,7 @@ pub(crate) async fn observe_dispatched_call(
                 ran.runtime_error,
                 ran.attachments,
                 call.mark,
+                call.effect_id,
             )
             .await
             .map_err(trace_failed)?;
@@ -3703,6 +3764,7 @@ pub(crate) async fn observe_dispatched_call(
                 shell.stderr_bytes,
                 shell.duration_ms,
                 shell.resource_limit.clone(),
+                call.effect_id,
             )
             .await
             .map_err(trace_failed)?;
@@ -3774,6 +3836,29 @@ impl<'a> CallGate<'a> {
     ) -> std::io::Result<()> {
         self.trace
             .write_safety_check(self.turn, tool_call_id, tool, checks, outcome)
+            .await
+    }
+
+    /// Journals a call every check has let through as an `effect_started` line on the gate's
+    /// turn, immediately before the dispatch the gate is handed to, and returns its effect id.
+    /// See [`TraceWriter::write_effect_started`].
+    pub(crate) async fn write_effect_started(
+        &mut self,
+        tool_name: &str,
+        tool_call_id: Option<&str>,
+        resolved: &crate::hooks::ResolvedCall,
+        input: &Value,
+        input_bytes: u64,
+    ) -> std::io::Result<String> {
+        self.trace
+            .write_effect_started(
+                self.turn,
+                tool_name,
+                tool_call_id,
+                resolved,
+                input.clone(),
+                input_bytes,
+            )
             .await
     }
 

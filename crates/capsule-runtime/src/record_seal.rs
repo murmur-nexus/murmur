@@ -721,6 +721,14 @@ impl InlineChain {
         })
     }
 
+    /// `(unsynced, synced_once)`: whether a written line is still pending a sync, and whether
+    /// any sync has returned on this chain.
+    #[cfg(test)]
+    pub(crate) fn sync_state_for_test(&self) -> (bool, bool) {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.unsynced, state.last_sync.is_some())
+    }
+
     /// Appends `event` as one line ending in `"prev_hash"`.
     pub fn append_event(&self, event: &impl Serialize) -> std::io::Result<()> {
         let json = serde_json::to_string(event).map_err(std::io::Error::other)?;

@@ -499,6 +499,8 @@ impl CapsuleStoreState {
             input_bytes: request.input.len() as u64,
             duration_ms,
             mark: Some(&mark),
+            // A code mode program's calls are not journaled.
+            effect_id: None,
             result,
         };
         match result {
@@ -588,6 +590,7 @@ impl CapsuleStoreState {
             input_bytes: request.input.len() as u64,
             duration_ms: 0,
             mark: Some(&mark),
+            effect_id: None,
             result: if observed {
                 ObservedResult::Failed(text)
             } else {

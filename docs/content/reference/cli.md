@@ -3611,6 +3611,20 @@ every missing field, followed by a `tool_call` row marked `✗` on both transpor
 
 No `call_denied` row sits beside it: the policy hook is not asked about a call missing a field.
 
+A tool call that started and recorded no outcome — its runtime was killed while the call ran —
+renders as an `effect_started` row under its turn; `--verbose` appends the command or the input
+summary. A call that recorded its outcome renders no `effect_started` row. A session launched with
+`--resume` renders the calls it found unfinished in the session it resumed as one
+`effects_unfinished` row, naming that session and each call's effect id. See
+[`effect_started`](observability-schemas.md#effect-started) and
+[`effects_unfinished`](observability-schemas.md#effects-unfinished).
+
+```text
+  turn 1  tool_call  bash
+    effect_started bash  eff_019a2b3c…  no outcome
+effects_unfinished 1 from ses_019f01a9…  no outcome: eff_019a2b3c…
+```
+
 A failed attempt renders as a `task_failed` row under its task, naming the
 [cause](observability-schemas.md#task-failed) and the first 120 characters of the reason:
 

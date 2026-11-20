@@ -293,6 +293,11 @@ pub(crate) const RETENTION_REASON_MAX_AGE: &str = "max_age";
 /// `retention.reason` when `context.retain.max_messages` truncated the front of a record.
 pub(crate) const RETENTION_REASON_MAX_MESSAGES: &str = "max_messages";
 
+/// A fresh `effect_started.effect_id`: `eff_` and a UUID v7's 32 hex digits.
+pub(crate) fn new_effect_id() -> String {
+    format!("eff_{}", uuid::Uuid::now_v7().simple())
+}
+
 /// Mint one event identity: `evt_` + a UUID v7 in simple form, the same scheme `ses_`, `tsk_`,
 /// `ctx_`, `dep_` and `req_` use. Ids therefore sort by mint time and carry their own
 /// millisecond timestamp, so a trace can be ordered and time-bounded without reading any
@@ -768,6 +773,10 @@ struct ToolCallEvent {
     /// for a call that ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal: Option<&'static str>,
+    /// The `effect_started` line written for this call before it was dispatched. Absent for a
+    /// call that was never journaled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect_id: Option<String>,
 }
 
 /// What marks a `tool_call` or `skill_call` record as a call a code mode program made through
@@ -846,6 +855,9 @@ struct SkillCallEvent {
     /// As on `tool_call`.
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal: Option<&'static str>,
+    /// As on `tool_call`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -873,7 +885,74 @@ struct ShellEvent {
     /// pinned to, which must not read as "no limit was involved".
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_limit: Option<String>,
+    /// As on `tool_call`: the effect the shell tool call that ran this command was journaled as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect_id: Option<String>,
 }
+
+/// A tool call the runtime is about to dispatch, written before the dispatch begins.
+///
+/// The outcome lines of the same call — `tool_call` or `skill_call`, and `shell` for a shell tool
+/// — name the same `effect_id`. A line no outcome names is a call that started and left no record
+/// of how it ended, which is what a resume reports through `effects_unfinished`.
+#[derive(Serialize)]
+struct EffectStartedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    effect_id: String,
+    /// `shell` for a call that resolves to a shell command, `tool_call` for every other.
+    kind: &'static str,
+    tool_name: &'a str,
+    /// The provider's id, `null` when it named none; always `null` on the process transport,
+    /// whose bridge request carries no id.
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<&'a str>,
+    input: Value,
+    input_bytes: u64,
+}
+
+/// `effects_unfinished`: the calls a resumed-from session journaled and recorded no outcome for,
+/// written once into the resuming session's trace.
+#[derive(Serialize)]
+struct EffectsUnfinishedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    from_session: &'a str,
+    effects: Vec<UnfinishedEffectEntry<'a>>,
+}
+
+/// One element of `effects_unfinished.effects`. The input is not repeated here: it stays on the
+/// resumed-from session's `effect_started` line, which `effect_id` names.
+#[derive(Serialize)]
+struct UnfinishedEffectEntry<'a> {
+    effect_id: &'a str,
+    kind: &'a str,
+    tool_name: &'a str,
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<&'a str>,
+    turn: u32,
+    task_id: Option<&'a str>,
+    started_at_ms: u64,
+}
+
+/// `effect_started.kind` for a call that resolves to a shell command.
+pub(crate) const EFFECT_KIND_SHELL: &str = "shell";
+/// `effect_started.kind` for every other call.
+pub(crate) const EFFECT_KIND_TOOL_CALL: &str = "tool_call";
 
 /// A shell command that outran its grace period and moved to the background. Hangs off the turn
 /// that started it, so `mur trace steps` shows it where the model saw it.
@@ -3575,12 +3654,14 @@ impl TraceWriter {
             error,
             attachments,
             None,
+            None,
         )
         .await
     }
 
     /// [`Self::write_tool_call_with_attachments`], with `mark` set for a call a code mode program
-    /// made through `murmur:bus`.
+    /// made through `murmur:bus` and `effect_id` set for a call journaled by
+    /// [`Self::write_effect_started`] before it was dispatched.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_tool_call_marked(
         &mut self,
@@ -3598,6 +3679,7 @@ impl TraceWriter {
         error: Option<&str>,
         attachments: Vec<AttachmentRecord>,
         mark: Option<&CodeModeMark>,
+        effect_id: Option<&str>,
     ) -> std::io::Result<()> {
         let (origin, repl_call_id, refusal) = CodeModeMark::fields(mark);
         // A peer handle reaches this event by an ordinary route — it is an argument the model
@@ -3637,6 +3719,7 @@ impl TraceWriter {
             origin,
             repl_call_id,
             refusal,
+            effect_id: effect_id.map(str::to_string),
         };
         self.write_event(&event).await?;
         self.total_tool_calls = self.total_tool_calls.saturating_add(1);
@@ -3667,12 +3750,13 @@ impl TraceWriter {
             duration_ms,
             status,
             None,
+            None,
         )
         .await
     }
 
     /// [`Self::write_skill_call`], with `mark` set for a skill a code mode program read through
-    /// `murmur:bus`.
+    /// `murmur:bus` and `effect_id` set for a call journaled before it was dispatched.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_skill_call_marked(
         &mut self,
@@ -3683,6 +3767,7 @@ impl TraceWriter {
         duration_ms: u64,
         status: String,
         mark: Option<&CodeModeMark>,
+        effect_id: Option<&str>,
     ) -> std::io::Result<()> {
         let (call_origin, repl_call_id, refusal) = CodeModeMark::fields(mark);
         let event = SkillCallEvent {
@@ -3702,6 +3787,7 @@ impl TraceWriter {
             call_origin,
             repl_call_id,
             refusal,
+            effect_id: effect_id.map(str::to_string),
         };
         self.write_event(&event).await
         // Intentionally does not increment total_tool_calls or task_tool_calls.
@@ -3720,6 +3806,7 @@ impl TraceWriter {
         stderr_bytes: u64,
         duration_ms: u64,
         resource_limit: Option<String>,
+        effect_id: Option<&str>,
     ) -> std::io::Result<()> {
         let event = ShellEvent {
             event_type: "shell",
@@ -3736,11 +3823,101 @@ impl TraceWriter {
             stderr_bytes,
             duration_ms,
             resource_limit,
+            effect_id: effect_id.map(str::to_string),
         };
         self.write_event(&event).await?;
         self.total_shell_calls = self.total_shell_calls.saturating_add(1);
         self.task_shell_calls = self.task_shell_calls.saturating_add(1);
         Ok(())
+    }
+
+    /// Journals a tool call the runtime is about to dispatch as one `effect_started` line, and
+    /// returns the fresh `eff_` id the call's outcome lines name.
+    ///
+    /// Written before the dispatch begins, so a runtime killed while the call runs leaves this
+    /// line and no outcome. Under `trace.sync` the line is synced before this returns, whichever
+    /// policy is set — an interval policy would otherwise leave it pending for up to its interval
+    /// — and without `trace.sync` no sync call is made. Counts nothing: the call is counted by
+    /// its outcome line.
+    ///
+    /// `resolved` decides `kind`, and names `binary` and `command` for a shell call. `input` has
+    /// peer handles redacted exactly as the `tool_call` line's does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_effect_started(
+        &mut self,
+        turn: u32,
+        tool_name: &str,
+        tool_call_id: Option<&str>,
+        resolved: &crate::hooks::ResolvedCall,
+        mut input: Value,
+        input_bytes: u64,
+    ) -> std::io::Result<String> {
+        crate::peer_handoff::redact_handles_in_json(&mut input);
+        let effect_id = new_effect_id();
+        let (kind, binary, command) = match resolved {
+            crate::hooks::ResolvedCall::Shell {
+                binary, command, ..
+            } => (
+                EFFECT_KIND_SHELL,
+                Some(binary.as_str()),
+                Some(command.as_str()),
+            ),
+            crate::hooks::ResolvedCall::Tool { .. } => (EFFECT_KIND_TOOL_CALL, None, None),
+        };
+        let event = EffectStartedEvent {
+            event_type: "effect_started",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            effect_id: effect_id.clone(),
+            kind,
+            tool_name,
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()),
+            binary,
+            command,
+            input,
+            input_bytes,
+        };
+        self.write_event(&event).await?;
+        if self.trace_sync.is_some() {
+            self.chain.sync_now()?;
+        }
+        Ok(effect_id)
+    }
+
+    /// Records, in the resuming session's trace, the calls the resumed-from session journaled and
+    /// recorded no outcome for. Parented to the session node.
+    pub(crate) async fn write_effects_unfinished(
+        &mut self,
+        unfinished: &crate::effect_journal::UnfinishedEffects,
+    ) -> std::io::Result<()> {
+        let event = EffectsUnfinishedEvent {
+            event_type: "effects_unfinished",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            from_session: &unfinished.from_session,
+            effects: unfinished
+                .effects
+                .iter()
+                .map(|effect| UnfinishedEffectEntry {
+                    effect_id: &effect.effect_id,
+                    kind: &effect.kind,
+                    tool_name: &effect.tool_name,
+                    tool_call_id: effect.tool_call_id.as_deref(),
+                    binary: effect.binary.as_deref(),
+                    command: effect.command.as_deref(),
+                    turn: effect.turn,
+                    task_id: effect.task_id.as_deref(),
+                    started_at_ms: effect.started_at_ms,
+                })
+                .collect(),
+        };
+        self.write_event(&event).await
     }
 
     /// A command demoted to the background, written from the agent loop at the moment of
@@ -5611,6 +5788,7 @@ impl ResourceTraceAppender {
             origin,
             repl_call_id,
             refusal,
+            effect_id: None,
         };
         self.append(&event).await;
     }
@@ -6874,6 +7052,440 @@ mod tests {
         assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(e["model_limits"], serde_json::Value::Null);
+    }
+
+    fn shell_resolved(command: &str) -> crate::hooks::ResolvedCall {
+        crate::hooks::ResolvedCall::Shell {
+            binary: "/usr/bin/bash".to_string(),
+            command: command.to_string(),
+            argv: vec!["-c".to_string(), command.to_string()],
+            script: Some(command.to_string()),
+            recipe: None,
+        }
+    }
+
+    fn tool_resolved() -> crate::hooks::ResolvedCall {
+        crate::hooks::ResolvedCall::Tool {
+            tool_name: "write-file".to_string(),
+            input: r#"{"path":"a.md"}"#.to_string(),
+            input_bytes: 15,
+        }
+    }
+
+    /// The top-level keys of one raw trace line, in the order they were written: `Value` sorts
+    /// keys, so the order is read off the text.
+    fn assert_keys_in_order(line: &str, keys: &[&str]) {
+        let mut last = 0;
+        for key in keys {
+            let needle = format!("\"{key}\":");
+            let at = line[last..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{key} missing or out of order in {line}"))
+                + last;
+            last = at + needle.len();
+        }
+    }
+
+    fn raw_lines(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Both kinds: every key in the record's order, a fresh `eff_` id it returns, `binary` and
+    /// `command` on a shell effect only, the provider's id or `null`, and nothing counted.
+    #[tokio::test]
+    async fn effect_started_record_keys_and_order_for_both_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        let shell_id = w
+            .write_effect_started(
+                3,
+                "bash",
+                Some("toolu_1"),
+                &shell_resolved("sleep 30"),
+                serde_json::json!({"command": "sleep 30"}),
+                22,
+            )
+            .await
+            .unwrap();
+        let tool_id = w
+            .write_effect_started(
+                4,
+                "write-file",
+                Some(""),
+                &tool_resolved(),
+                serde_json::json!({"path": "a.md"}),
+                15,
+            )
+            .await
+            .unwrap();
+        assert_ne!(shell_id, tool_id);
+        for id in [&shell_id, &tool_id] {
+            let hex = id.strip_prefix("eff_").expect("eff_ prefix");
+            assert_eq!(hex.len(), 32, "{id}");
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+        assert_eq!(w.total_tool_calls, 0);
+        assert_eq!(w.total_shell_calls, 0);
+
+        let lines = raw_lines(dir.path());
+        assert_eq!(lines.len(), 3);
+        let shell_keys = [
+            "event_type",
+            "event_id",
+            "parent_id",
+            "session_id",
+            "timestamp",
+            "turn",
+            "task_id",
+            "effect_id",
+            "kind",
+            "tool_name",
+            "tool_call_id",
+            "binary",
+            "command",
+            "input",
+            "input_bytes",
+        ];
+        assert_keys_in_order(&lines[1], &shell_keys);
+        let tool_keys: Vec<&str> = shell_keys
+            .iter()
+            .copied()
+            .filter(|key| *key != "binary" && *key != "command")
+            .collect();
+        assert_keys_in_order(&lines[2], &tool_keys);
+
+        let events = read_events(dir.path());
+        let shell = &events[1];
+        assert_eq!(shell["event_type"], "effect_started");
+        assert_eq!(shell["parent_id"], events[0]["event_id"]);
+        assert_eq!(shell["session_id"], "test-session-id");
+        assert_eq!(shell["turn"], 3);
+        assert_eq!(shell["task_id"], Value::Null);
+        assert_eq!(shell["effect_id"], shell_id.as_str());
+        assert_eq!(shell["kind"], "shell");
+        assert_eq!(shell["tool_name"], "bash");
+        assert_eq!(shell["tool_call_id"], "toolu_1");
+        assert_eq!(shell["binary"], "/usr/bin/bash");
+        assert_eq!(shell["command"], "sleep 30");
+        assert_eq!(shell["input"], serde_json::json!({"command": "sleep 30"}));
+        assert_eq!(shell["input_bytes"], 22);
+        assert_eq!(shell.as_object().unwrap().len(), 16, "{shell}");
+
+        let tool = &events[2];
+        assert_eq!(tool["kind"], "tool_call");
+        assert_eq!(tool["effect_id"], tool_id.as_str());
+        assert_eq!(
+            tool["tool_call_id"],
+            Value::Null,
+            "an empty id records as null"
+        );
+        assert!(tool.get("binary").is_none(), "{tool}");
+        assert!(tool.get("command").is_none(), "{tool}");
+    }
+
+    /// A peer handle in the call's arguments is redacted on the intent exactly as on the
+    /// `tool_call` line, under every capture mode.
+    #[tokio::test]
+    async fn effect_started_redacts_a_peer_handle_in_the_input() {
+        let token = crate::peer_handoff::mint(
+            &crate::peer_handoff::PeerMintKey::generate().unwrap(),
+            &crate::peer_handoff::HandlePayload {
+                v: 1,
+                iss: "ses_1".to_string(),
+                p: "report.md".to_string(),
+                exp: timestamp_ms() + 3_600_000,
+                n: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            "a@b",
+        )
+        .unwrap();
+        let id = crate::peer_handoff::handle_id(&token);
+        for capture in [
+            TraceCapture::None,
+            TraceCapture::Meta,
+            TraceCapture::Content,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer_with_opts(dir.path(), capture).await;
+            w.write_effect_started(
+                1,
+                "fetch-peer-file",
+                None,
+                &tool_resolved(),
+                serde_json::json!({"handle": token}),
+                40,
+            )
+            .await
+            .unwrap();
+            let events = read_events(dir.path());
+            assert_eq!(
+                events[0]["input"]["handle"],
+                format!("<handle:{id}>"),
+                "{capture:?}"
+            );
+        }
+    }
+
+    /// `effect_id` is omitted from `tool_call`, `skill_call` and `shell` without one, and written
+    /// as given with one.
+    #[tokio::test]
+    async fn effect_started_id_on_outcome_lines_is_omitted_when_none_and_present_when_set() {
+        for effect_id in [None, Some("eff_0123")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.write_tool_call_marked(
+                1,
+                "bash".to_string(),
+                Some("toolu_1".to_string()),
+                serde_json::json!({}),
+                2,
+                "",
+                0,
+                1,
+                "ok".to_string(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                effect_id,
+            )
+            .await
+            .unwrap();
+            w.write_skill_call_marked(
+                1,
+                "skill".to_string(),
+                &LockOrigin::Operator,
+                0,
+                1,
+                "ok".to_string(),
+                None,
+                effect_id,
+            )
+            .await
+            .unwrap();
+            w.write_shell(
+                1,
+                "/usr/bin/bash".to_string(),
+                "true".to_string(),
+                0,
+                0,
+                0,
+                1,
+                None,
+                effect_id,
+            )
+            .await
+            .unwrap();
+            let events = read_events(dir.path());
+            let lines = raw_lines(dir.path());
+            assert_eq!(events.len(), 3);
+            for (event, line) in events.iter().zip(&lines) {
+                match effect_id {
+                    None => assert!(event.get("effect_id").is_none(), "{event}"),
+                    Some(id) => {
+                        assert_eq!(event["effect_id"], id, "{event}");
+                        // The last field the record writes, ahead of the chain's `prev_hash`.
+                        assert!(
+                            line.contains(&format!("\"effect_id\":\"{id}\",\"prev_hash\":")),
+                            "{line}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under an interval policy an ordinary line may stay pending, but `effect_started` is synced
+    /// before `write_effect_started` returns; the line after it is pending again.
+    #[tokio::test]
+    async fn effect_started_is_synced_under_an_interval_policy_and_ordinary_lines_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.set_trace_sync(Some(murmur_artifact::TraceSync::Interval { secs: 3600 }));
+        // The first line is due — nothing has been synced yet — and the next one is not.
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        w.write_shell(
+            1,
+            "/bin/ls".to_string(),
+            "ls".to_string(),
+            0,
+            0,
+            0,
+            1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.chain.sync_state_for_test(), (true, true));
+
+        w.write_effect_started(
+            1,
+            "bash",
+            None,
+            &shell_resolved("sleep 30"),
+            serde_json::json!({"command": "sleep 30"}),
+            22,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            w.chain.sync_state_for_test(),
+            (false, true),
+            "no line may be pending once the intent is written"
+        );
+
+        w.write_shell(
+            1,
+            "/bin/ls".to_string(),
+            "ls".to_string(),
+            0,
+            0,
+            0,
+            1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.chain.sync_state_for_test(), (true, true));
+    }
+
+    /// Without `trace.sync` the intent is written and no sync is made.
+    #[tokio::test]
+    async fn effect_started_without_trace_sync_makes_no_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        w.write_effect_started(
+            1,
+            "bash",
+            None,
+            &shell_resolved("sleep 30"),
+            serde_json::json!({"command": "sleep 30"}),
+            22,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.chain.sync_state_for_test(), (false, false));
+        assert_eq!(read_events(dir.path()).len(), 2);
+    }
+
+    /// A trace that cannot be written fails the intent, which is what keeps the call from being
+    /// dispatched.
+    #[tokio::test]
+    async fn effect_started_over_an_unwritable_chain_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        writer.chain = crate::record_seal::InlineChain::over_file_for_test(
+            full,
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            TRACE_FILE_NAME,
+        );
+        assert!(writer
+            .write_effect_started(
+                1,
+                "bash",
+                None,
+                &shell_resolved("sleep 30"),
+                serde_json::json!({"command": "sleep 30"}),
+                22,
+            )
+            .await
+            .is_err());
+    }
+
+    /// `effects_unfinished`: every key in the record's order, parented to the session node, and
+    /// one entry per effect with `binary` and `command` on a shell effect only.
+    #[tokio::test]
+    async fn effects_unfinished_record_keys_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        let effect = |id: &str, kind: &str| crate::effect_journal::UnfinishedEffect {
+            effect_id: id.to_string(),
+            kind: kind.to_string(),
+            tool_name: if kind == "shell" {
+                "bash"
+            } else {
+                "write-file"
+            }
+            .to_string(),
+            tool_call_id: (kind == "shell").then(|| "toolu_1".to_string()),
+            binary: (kind == "shell").then(|| "/usr/bin/bash".to_string()),
+            command: (kind == "shell").then(|| "sleep 30".to_string()),
+            input: serde_json::json!({"command": "sleep 30"}),
+            turn: 2,
+            task_id: (kind == "shell").then(|| "tsk_1".to_string()),
+            started_at_ms: 1750,
+        };
+        w.write_effects_unfinished(&crate::effect_journal::UnfinishedEffects {
+            from_session: "ses_prior".to_string(),
+            effects: vec![effect("eff_a", "shell"), effect("eff_b", "tool_call")],
+            trust: crate::origin::TrustClass::Trusted,
+        })
+        .await
+        .unwrap();
+
+        let lines = raw_lines(dir.path());
+        assert_keys_in_order(
+            &lines[1],
+            &[
+                "event_type",
+                "event_id",
+                "parent_id",
+                "session_id",
+                "timestamp",
+                "from_session",
+                "effects",
+            ],
+        );
+        let entries = &lines[1][lines[1].find("\"effects\":").unwrap()..];
+        assert_keys_in_order(
+            entries,
+            &[
+                "effect_id",
+                "kind",
+                "tool_name",
+                "tool_call_id",
+                "binary",
+                "command",
+                "turn",
+                "task_id",
+                "started_at_ms",
+            ],
+        );
+
+        let events = read_events(dir.path());
+        let e = &events[1];
+        assert_eq!(e["event_type"], "effects_unfinished");
+        assert_eq!(e["parent_id"], events[0]["event_id"]);
+        assert_eq!(e["session_id"], "test-session-id");
+        assert_eq!(e["from_session"], "ses_prior");
+        assert_eq!(
+            e["effects"],
+            serde_json::json!([
+                {
+                    "effect_id": "eff_a", "kind": "shell", "tool_name": "bash",
+                    "tool_call_id": "toolu_1", "binary": "/usr/bin/bash", "command": "sleep 30",
+                    "turn": 2, "task_id": "tsk_1", "started_at_ms": 1750
+                },
+                {
+                    "effect_id": "eff_b", "kind": "tool_call", "tool_name": "write-file",
+                    "tool_call_id": null, "turn": 2, "task_id": null, "started_at_ms": 1750
+                }
+            ])
+        );
     }
 
     /// `trace_sync` is absent without `trace.sync`, and names the mode — and the interval — with
@@ -8394,6 +9006,7 @@ mod tests {
             0,
             10,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -8490,9 +9103,19 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "/bin/ls".to_string(), "ls".to_string(), 0, 3, 0, 2, None)
-            .await
-            .unwrap();
+        w.write_shell(
+            0,
+            "/bin/ls".to_string(),
+            "ls".to_string(),
+            0,
+            3,
+            0,
+            2,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
 
@@ -8638,6 +9261,7 @@ mod tests {
             4,
             0,
             1,
+            None,
             None,
         )
         .await
@@ -9642,6 +10266,7 @@ mod tests {
             0,
             2,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -9914,6 +10539,7 @@ mod tests {
                 None,
                 Vec::new(),
                 mark.as_ref(),
+                None,
             )
             .await
             .unwrap();

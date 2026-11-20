@@ -600,6 +600,9 @@ struct ToolCallEvent {
     /// Why the runtime refused a code mode program's call; absent for a call that ran.
     #[serde(default)]
     refusal: Option<String>,
+    /// The `effect_started` line this call was journaled as; absent for a call that was not.
+    #[serde(default)]
+    effect_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,6 +619,9 @@ struct SkillCallEvent {
     origin: String,
     #[serde(default)]
     trust: String,
+    /// As on `tool_call`.
+    #[serde(default)]
+    effect_id: Option<String>,
 }
 
 impl SkillCallEvent {
@@ -653,6 +659,37 @@ struct ShellEvent {
     /// `steps` tree; absent on a trace from a runtime predating the key.
     #[serde(default)]
     binary: Option<String>,
+    /// As on `tool_call`.
+    #[serde(default)]
+    effect_id: Option<String>,
+}
+
+/// A call the runtime journaled before dispatching it. Its outcome lines name the same
+/// `effect_id`; one no outcome names started and recorded nothing after.
+#[derive(Debug, Deserialize)]
+struct EffectStartedEvent {
+    effect_id: String,
+    #[serde(default)]
+    kind: String,
+    tool_name: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+}
+
+/// The calls a resumed-from session journaled with no outcome, recorded in the resuming session.
+#[derive(Debug, Deserialize)]
+struct EffectsUnfinishedEvent {
+    from_session: String,
+    #[serde(default)]
+    effects: Vec<UnfinishedEffectEntry>,
+}
+
+/// One element of `effects_unfinished.effects`; `steps` names each by its id.
+#[derive(Debug, Deserialize)]
+struct UnfinishedEffectEntry {
+    effect_id: String,
 }
 
 /// A shell command moved to the background: it outran `lifecycle.shell_grace_secs`, or the call
@@ -1580,6 +1617,8 @@ enum TraceEvent {
     ShellCompleted(ShellCompletedEvent),
     ShellAbandoned(ShellAbandonedEvent),
     ShellLost(ShellLostEvent),
+    EffectStarted(EffectStartedEvent),
+    EffectsUnfinished(EffectsUnfinishedEvent),
     BackgroundCommand(BackgroundCommandEvent),
     CodeModeInstanceStart(CodeModeInstanceStartEvent),
     CodeModeInstanceEnd(CodeModeInstanceEndEvent),
@@ -3042,6 +3081,9 @@ fn compute_metrics(
             }
             TraceEvent::ShellDetached(_) => seen_shell_calls += 1,
             TraceEvent::ShellAbandoned(_) | TraceEvent::ShellLost(_) => {}
+            // The effect journal: `steps` renders it; the summary counts each call once, from
+            // its outcome line.
+            TraceEvent::EffectStarted(_) | TraceEvent::EffectsUnfinished(_) => {}
             TraceEvent::BackgroundCommand(e) => background_rows.push(background_command_row(&e)),
             TraceEvent::Compaction(e) => {
                 compaction = Some(CompactionRecord {
@@ -5543,6 +5585,41 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.work_id, 12),
             fmt_dur(e.after_ms)
         ),
+        // Rendered only when no outcome names it: `steps_row_with` drops a paired one.
+        TraceEvent::EffectStarted(e) => format!(
+            "{}{}  {}  no outcome{}",
+            kind("effect_started"),
+            e.tool_name,
+            fmt_id_short(&e.effect_id, 12),
+            if verbose {
+                let detail = if e.kind == "shell" {
+                    e.command.clone().unwrap_or_default()
+                } else {
+                    e.input
+                        .as_ref()
+                        .map(extract_input_summary)
+                        .unwrap_or_default()
+                };
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            } else {
+                String::new()
+            }
+        ),
+        TraceEvent::EffectsUnfinished(e) => format!(
+            "{}{} from {}  no outcome: {}",
+            kind("effects_unfinished"),
+            e.effects.len(),
+            fmt_id_short(&e.from_session, 12),
+            e.effects
+                .iter()
+                .map(|effect| fmt_id_short(&effect.effect_id, 12))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         TraceEvent::ShellLost(e) => format!(
             "{}{}  {}  detached at {}  no result, reported by {}",
             kind("shell_lost"),
@@ -5792,6 +5869,33 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
     })
 }
 
+/// [`steps_row`], except that an `effect_started` some outcome line names renders no row: its
+/// `tool_call` (or `skill_call`) row already says how the call ended.
+fn steps_row_with(
+    record: &TraceRecord,
+    verbose: bool,
+    finished_effects: &HashSet<&str>,
+) -> Option<String> {
+    match &record.event {
+        TraceEvent::EffectStarted(e) if finished_effects.contains(e.effect_id.as_str()) => None,
+        _ => steps_row(record, verbose),
+    }
+}
+
+/// The `effect_id`s some `tool_call`, `skill_call` or `shell` line names: the journaled calls that
+/// recorded an outcome.
+fn finished_effect_ids(records: &[TraceRecord]) -> HashSet<&str> {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::ToolCall(e) => e.effect_id.as_deref(),
+            TraceEvent::SkillCall(e) => e.effect_id.as_deref(),
+            TraceEvent::Shell(e) => e.effect_id.as_deref(),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Render the session → task → turn tree by following `parent_id`, one indent level per
 /// rendered ancestor, in file order within each parent.
 fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
@@ -5852,8 +5956,9 @@ fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
         if turns == 1 { "" } else { "s" }
     );
 
+    let finished_effects = finished_effect_ids(records);
     for root in roots {
-        walk_steps_tree(records, &children, root, 0, verbose);
+        walk_steps_tree(records, &children, &finished_effects, root, 0, verbose);
     }
     capsule_runtime::report_println!();
 }
@@ -5861,11 +5966,12 @@ fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
 fn walk_steps_tree(
     records: &[TraceRecord],
     children: &HashMap<usize, Vec<usize>>,
+    finished_effects: &HashSet<&str>,
     index: usize,
     depth: usize,
     verbose: bool,
 ) {
-    let child_depth = match steps_row(&records[index], verbose) {
+    let child_depth = match steps_row_with(&records[index], verbose, finished_effects) {
         Some(row) => {
             if matches!(records[index].event, TraceEvent::TaskStart(_)) {
                 capsule_runtime::report_println!();
@@ -5879,7 +5985,14 @@ fn walk_steps_tree(
     };
     if let Some(kids) = children.get(&index) {
         for &child in kids {
-            walk_steps_tree(records, children, child, child_depth, verbose);
+            walk_steps_tree(
+                records,
+                children,
+                finished_effects,
+                child,
+                child_depth,
+                verbose,
+            );
         }
     }
 }
@@ -7874,6 +7987,62 @@ mod tests {
         assert!(
             !rendered.contains("exit"),
             "a lost command asserts no exit code: {rendered}"
+        );
+    }
+
+    fn record(line: &str) -> TraceRecord {
+        TraceRecord {
+            identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+            event: serde_json::from_str::<TraceEvent>(line).expect("the record should parse"),
+        }
+    }
+
+    const EFFECT_STARTED_SHELL: &str = r#"{"event_type":"effect_started","event_id":"evt_6","parent_id":"evt_2","session_id":"ses_0a1b2c3d4e5f6a7b","timestamp":6,"turn":1,"task_id":"tsk_1","effect_id":"eff_019a2b3c4d5e6f708192a3b4c5d6e7f8","kind":"shell","tool_name":"bash","tool_call_id":"toolu_1","binary":"/usr/bin/bash","command":"sleep 30","input":{"command":"sleep 30"},"input_bytes":22}"#;
+
+    /// An `effect_started` no outcome names renders as its own row under its turn, saying so;
+    /// `--verbose` adds the command.
+    #[test]
+    fn effect_started_row_without_an_outcome_says_no_outcome() {
+        let records = vec![record(EFFECT_STARTED_SHELL)];
+        let finished = finished_effect_ids(&records);
+        assert_eq!(
+            steps_row_with(&records[0], false, &finished).as_deref(),
+            Some("effect_started bash  eff_019a2b3c…  no outcome")
+        );
+        assert_eq!(
+            steps_row_with(&records[0], true, &finished).as_deref(),
+            Some("effect_started bash  eff_019a2b3c…  no outcome  sleep 30")
+        );
+    }
+
+    /// An `effect_started` its `tool_call` (or `shell`) names renders no row: the outcome's own
+    /// row already says how the call ended.
+    #[test]
+    fn effect_started_row_is_absent_once_an_outcome_names_it() {
+        for outcome in [
+            r#"{"event_type":"tool_call","event_id":"evt_7","parent_id":"evt_2","session_id":"s","timestamp":7,"turn":1,"tool_name":"bash","input":{},"duration_ms":4,"status":"ok","effect_id":"eff_019a2b3c4d5e6f708192a3b4c5d6e7f8"}"#,
+            r#"{"event_type":"skill_call","event_id":"evt_7","parent_id":"evt_2","session_id":"s","timestamp":7,"turn":1,"skill_name":"bash","duration_ms":4,"status":"ok","effect_id":"eff_019a2b3c4d5e6f708192a3b4c5d6e7f8"}"#,
+            r#"{"event_type":"shell","event_id":"evt_8","parent_id":"evt_2","session_id":"s","timestamp":8,"turn":1,"binary":"/usr/bin/bash","command":"sleep 30","exit_code":0,"duration_ms":4,"effect_id":"eff_019a2b3c4d5e6f708192a3b4c5d6e7f8"}"#,
+        ] {
+            let records = vec![record(EFFECT_STARTED_SHELL), record(outcome)];
+            let finished = finished_effect_ids(&records);
+            assert_eq!(
+                steps_row_with(&records[0], false, &finished),
+                None,
+                "{outcome}"
+            );
+            assert!(steps_row_with(&records[1], false, &finished).is_some());
+        }
+    }
+
+    /// A resumed session's `effects_unfinished` names how many calls the resumed-from session left
+    /// without an outcome, that session, and each call's effect id.
+    #[test]
+    fn effects_unfinished_row_names_the_session_and_each_effect() {
+        let line = r#"{"event_type":"effects_unfinished","event_id":"evt_3","parent_id":"evt_1","session_id":"ses_9f8e7d6c5b4a3210","timestamp":3,"from_session":"ses_0a1b2c3d4e5f6a7b","effects":[{"effect_id":"eff_019a2b3c4d5e6f708192a3b4c5d6e7f8","kind":"shell","tool_name":"bash","tool_call_id":"toolu_1","binary":"/usr/bin/bash","command":"sleep 30","turn":1,"task_id":"tsk_1","started_at_ms":6},{"effect_id":"eff_019a2b3d00000000000000000000000f","kind":"tool_call","tool_name":"write-file","tool_call_id":null,"turn":1,"task_id":null,"started_at_ms":7}]}"#;
+        assert_eq!(
+            row(line),
+            "effects_unfinished 2 from ses_0a1b2c3d…  no outcome: eff_019a2b3c…, eff_019a2b3d…"
         );
     }
 

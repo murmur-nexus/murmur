@@ -605,3 +605,20 @@ The session a resume continues is the one the trace's own `session_start` line n
 that session, with the same report, and the copy is the file the `shell_lost` markers are appended
 to. A trace with no `session_start` line still resumes its conversation, but names no session whose
 background work could be reported: nothing is reported, and one line on stderr says so.
+
+The runtime also journals every tool call it dispatches, shell commands included: an
+[`effect_started`](../reference/observability-schemas.md#effect-started) line is written before the
+call runs, and the call's outcome lines name the same `effect_id`. A runtime killed while a call
+runs leaves that line with no outcome. A resume finds every such call and reports it two ways:
+
+| Where | What |
+|---|---|
+| The resuming session's own `trace.jsonl` | One [`effects_unfinished`](../reference/observability-schemas.md#effects-unfinished) line listing the calls |
+| The first task the resumed launch runs | A runtime message ahead of its task text, naming each call's `effect_id`, tool, and command or input, and stating that no outcome was recorded, that whether each took effect is unknown, and that none was run again |
+
+The message reaches the agent before it acts on the resumed task, unlike the `shell_lost` report,
+which runs after it. It is fenced as a `completion` task whenever one of the calls belonged to an
+untrusted task. Nothing is rerun, nothing is marked, and nothing is written into the resumed-from
+trace, so a second resume of the same session reports the same calls again. Calls of the
+interrupted turn that did finish are not part of the report; their outcome lines are in the
+resumed-from trace.
