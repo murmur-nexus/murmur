@@ -53,7 +53,7 @@ Each placement that proves isolation tests trades something away. Read this befo
 |---|---|---|
 | The unconfined stance | the model's commands get the operator's `HOME`, every credential variable, the host filesystem and network, and `sudo`; see [What running unconfined gives up](../how-to/run-capsule-on-the-host.md#what-running-unconfined-gives-up) | use it only for a session you would run by hand |
 | `kernel.apparmor_restrict_unprivileged_userns=0`, host-wide | every process on the host can create user namespaces, which is the kernel attack surface the restriction exists to close | prefer a dedicated host or VM; set it back to `1` after the run |
-| The host runner | card-authored test code runs as the operator, outside any sandbox; it can read the operator's files and reach the network | run the board as a dedicated user where you can |
+| The host runner | card-authored test code runs as the operator, outside any sandbox; it can read the operator's files, reach the network, and change any file the operator can, the board's trusted copies and evidence included | run the board as a dedicated user that owns nothing else, where you can |
 
 The host runner limits what a card controls:
 
