@@ -375,6 +375,27 @@ class RefusalTests(Scratch):
         self.assertEqual(sorted(os.listdir(self.dir)), ["ev.json"])
 
 
+class JunitLocationTests(Scratch):
+    def test_the_report_is_under_the_workspace_store_not_the_target_dir(self) -> None:
+        repo_config = os.path.join(os.path.dirname(os.path.dirname(HERE)), ".config", "nextest.toml")
+        self.assertEqual(
+            ip.junit_location(repo_config, "/repo"), "/repo/target/nextest/isolation/junit.xml"
+        )
+
+    def test_a_store_dir_in_the_config_moves_the_report(self) -> None:
+        config = self.write(
+            "nextest.toml",
+            '[store]\ndir = "out/nt"\n[profile.isolation.junit]\npath = "report.xml"\n',
+        )
+        self.assertEqual(ip.junit_location(config, "/repo"), "/repo/out/nt/isolation/report.xml")
+
+    def test_a_config_without_the_isolation_report_is_refused(self) -> None:
+        config = self.write("nextest.toml", "[profile.ci]\nretries = 2\n")
+        with self.assertRaises(ip.Refusal) as caught:
+            ip.junit_location(config, "/repo")
+        self.assertIn("[profile.isolation.junit]", str(caught.exception))
+
+
 class GitRepo(Scratch):
     """A scratch repository with one commit, and evidence built from a fixture against it."""
 

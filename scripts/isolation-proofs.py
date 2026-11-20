@@ -982,6 +982,29 @@ def resolve_target_dir(args_target: str | None, repo: str, env: dict[str, str]) 
     return json.loads(done.stdout)["target_directory"]
 
 
+def junit_location(nextest_config: str, repo: str) -> str:
+    """Where `cargo nextest run --profile isolation` writes its JUnit report under this config.
+
+    nextest resolves `[store] dir` (default `target/nextest`) against the workspace root, not
+    cargo's target directory, and the report sits at `<store>/<profile>/<junit path>`.
+    """
+    try:
+        with open(nextest_config, "rb") as handle:
+            config = tomllib.load(handle)
+    except OSError as error:
+        raise Refusal(f"{nextest_config}: the nextest config cannot be read: {error.strerror or error}") from None
+    except tomllib.TOMLDecodeError as error:
+        raise Refusal(f"{nextest_config}: not valid TOML: {error}") from None
+    store = config.get("store", {}).get("dir", os.path.join("target", "nextest"))
+    junit = config.get("profile", {}).get(NEXTEST_PROFILE, {}).get("junit", {}).get("path")
+    if not isinstance(store, str) or not isinstance(junit, str) or not junit:
+        raise Refusal(
+            f"{nextest_config}: no [profile.{NEXTEST_PROFILE}.junit] path, so nextest would write "
+            "no report to read"
+        )
+    return os.path.join(repo, store, NEXTEST_PROFILE, junit)
+
+
 def cmd_run(args: argparse.Namespace, context: RunContext | None = None) -> int:
     evidence = os.path.abspath(args.evidence)
     # Invariant: a refused run leaves no evidence, so the first act is to remove any.
@@ -1006,6 +1029,7 @@ def cmd_run(args: argparse.Namespace, context: RunContext | None = None) -> int:
     nextest_config = os.path.abspath(args.nextest_config or os.path.join(repo, DEFAULT_NEXTEST_CONFIG))
     if not os.path.isfile(nextest_config):
         raise Refusal(f"{nextest_config}: no nextest config there")
+    junit_written = junit_location(nextest_config, repo)
     preflight = os.path.abspath(args.preflight_script or os.path.join(repo, DEFAULT_PREFLIGHT))
     if not os.path.isfile(preflight):
         raise Refusal(f"{preflight}: no preflight script there")
@@ -1050,7 +1074,6 @@ def cmd_run(args: argparse.Namespace, context: RunContext | None = None) -> int:
     directory, base = os.path.split(evidence)
     stem = os.path.splitext(base)[0]
     os.makedirs(directory, exist_ok=True)
-    junit_written = os.path.join(target_dir, "nextest", NEXTEST_PROFILE, "junit.xml")
     runs: list[dict] = []
     tests: list[dict] = []
     for number, group in enumerate(groups, start=1):
