@@ -182,6 +182,32 @@ pub fn artifact_trust(origin: &murmur_artifact::LockOrigin) -> TrustClass {
     }
 }
 
+/// The trust class each task of an earlier session's `trace.jsonl` was stamped with, read off its
+/// `task_start` lines, for joining a record of that trace to the task it ran under.
+#[derive(Debug, Default)]
+pub(crate) struct RecordedTaskTrust(std::collections::BTreeMap<String, TrustClass>);
+
+impl RecordedTaskTrust {
+    /// Notes the task and trust a `task_start` record names; a record missing either is ignored.
+    pub(crate) fn observe_task_start(&mut self, record: &serde_json::Value) {
+        if let (Some(task_id), Some(trust)) = (
+            record["task_id"].as_str(),
+            record["trust"].as_str().and_then(TrustClass::parse),
+        ) {
+            self.0.insert(task_id.to_string(), trust);
+        }
+    }
+
+    /// The trust of `task_id`'s task. A join that finds nothing — no task id, or one no
+    /// `task_start` named — is [`TrustClass::Untrusted`]: an absent claim is not a trusted one, the
+    /// same rule [`TaskProvenance::derive`] applies to an absent inherited class.
+    pub(crate) fn of(&self, task_id: Option<&str>) -> TrustClass {
+        task_id
+            .and_then(|task_id| self.0.get(task_id).copied())
+            .unwrap_or(TrustClass::Untrusted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

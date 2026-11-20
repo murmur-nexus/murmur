@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::{
     detached::{LostReport, LostWork},
-    origin::{TaskOrigin, TaskProvenance, TrustClass},
+    origin::{RecordedTaskTrust, TaskOrigin, TaskProvenance, TrustClass},
     trace::PriorSessionTraceAppender,
 };
 
@@ -152,7 +152,7 @@ fn scan_prior_trace(contents: &str) -> PriorSessionScan {
     // Keyed on the work id, which is a UUID v7, so iteration order is demotion order.
     let mut detached: BTreeMap<String, (LostWork, Option<String>)> = BTreeMap::new();
     let mut accounted: BTreeSet<String> = BTreeSet::new();
-    let mut task_trust: BTreeMap<String, TrustClass> = BTreeMap::new();
+    let mut task_trust = RecordedTaskTrust::default();
 
     for line in contents.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
@@ -167,14 +167,7 @@ fn scan_prior_trace(contents: &str) -> PriorSessionScan {
                     .map(str::to_string);
                 session_event_id = record["event_id"].as_str().map(str::to_string);
             }
-            "task_start" => {
-                if let (Some(task_id), Some(trust)) = (
-                    record["task_id"].as_str(),
-                    record["trust"].as_str().and_then(TrustClass::parse),
-                ) {
-                    task_trust.insert(task_id.to_string(), trust);
-                }
-            }
+            "task_start" => task_trust.observe_task_start(&record),
             "shell_detached" => {
                 let Some(id) = record["work_id"].as_str() else {
                     continue;
@@ -210,12 +203,7 @@ fn scan_prior_trace(contents: &str) -> PriorSessionScan {
         if accounted.contains(&work_id) {
             continue;
         }
-        // A join that finds nothing yields untrusted: an absent claim is not a trusted one, the
-        // same rule [`TaskProvenance::derive`] applies to an absent inherited class.
-        let work_trust = task_id
-            .and_then(|task_id| task_trust.get(&task_id).copied())
-            .unwrap_or(TrustClass::Untrusted);
-        if work_trust == TrustClass::Untrusted {
+        if task_trust.of(task_id.as_deref()) == TrustClass::Untrusted {
             trust = TrustClass::Untrusted;
         }
         unaccounted.push(work);

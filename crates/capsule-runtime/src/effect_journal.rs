@@ -10,12 +10,12 @@
 //! is marked done, no liveness is checked and nothing is written into the resumed-from trace, so
 //! every resume of the same session reports the same calls again.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::Value;
 
 use crate::{
-    origin::{TaskOrigin, TaskProvenance, TrustClass},
+    origin::{RecordedTaskTrust, TaskOrigin, TaskProvenance, TrustClass},
     workdir_fs::WorkdirRoot,
 };
 
@@ -39,7 +39,6 @@ pub(crate) struct UnfinishedEffect {
     /// Set for a `shell` effect.
     pub(crate) command: Option<String>,
     pub(crate) input: Value,
-    pub(crate) input_bytes: u64,
     pub(crate) turn: u32,
     pub(crate) task_id: Option<String>,
     /// The `effect_started` line's own `timestamp`.
@@ -161,7 +160,7 @@ fn scan(contents: &str, resumed_from: &str) -> Option<UnfinishedEffects> {
     let mut session_id: Option<String> = None;
     let mut started: Vec<UnfinishedEffect> = Vec::new();
     let mut finished: HashSet<String> = HashSet::new();
-    let mut task_trust: BTreeMap<String, TrustClass> = BTreeMap::new();
+    let mut task_trust = RecordedTaskTrust::default();
 
     for line in contents.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
@@ -174,14 +173,7 @@ fn scan(contents: &str, resumed_from: &str) -> Option<UnfinishedEffects> {
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
             }
-            "task_start" => {
-                if let (Some(task_id), Some(trust)) = (
-                    record["task_id"].as_str(),
-                    record["trust"].as_str().and_then(TrustClass::parse),
-                ) {
-                    task_trust.insert(task_id.to_string(), trust);
-                }
-            }
+            "task_start" => task_trust.observe_task_start(&record),
             "effect_started" => {
                 let Some(effect_id) = record["effect_id"].as_str().filter(|id| !id.is_empty())
                 else {
@@ -197,7 +189,6 @@ fn scan(contents: &str, resumed_from: &str) -> Option<UnfinishedEffects> {
                     binary: text("binary"),
                     command: text("command"),
                     input: record["input"].clone(),
-                    input_bytes: record["input_bytes"].as_u64().unwrap_or_default(),
                     turn: record["turn"]
                         .as_u64()
                         .and_then(|turn| u32::try_from(turn).ok())
@@ -222,13 +213,7 @@ fn scan(contents: &str, resumed_from: &str) -> Option<UnfinishedEffects> {
         .into_iter()
         .filter(|effect| !finished.contains(&effect.effect_id))
         .inspect(|effect| {
-            // A join that finds nothing yields untrusted: an absent claim is not a trusted one.
-            let effect_trust = effect
-                .task_id
-                .as_ref()
-                .and_then(|task_id| task_trust.get(task_id).copied())
-                .unwrap_or(TrustClass::Untrusted);
-            if effect_trust == TrustClass::Untrusted {
+            if task_trust.of(effect.task_id.as_deref()) == TrustClass::Untrusted {
                 trust = TrustClass::Untrusted;
             }
         })
@@ -347,7 +332,6 @@ mod tests {
         assert_eq!(b.turn, 1);
         assert_eq!(b.task_id.as_deref(), Some("tsk_1"));
         assert_eq!(b.started_at_ms, 1750);
-        assert_eq!(b.input_bytes, 20);
 
         let d = &found.effects[1];
         assert_eq!(d.kind, "tool_call");

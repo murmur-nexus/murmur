@@ -293,6 +293,11 @@ pub(crate) const RETENTION_REASON_MAX_AGE: &str = "max_age";
 /// `retention.reason` when `context.retain.max_messages` truncated the front of a record.
 pub(crate) const RETENTION_REASON_MAX_MESSAGES: &str = "max_messages";
 
+/// A fresh `effect_started.effect_id`: `eff_` and a UUID v7's 32 hex digits.
+pub(crate) fn new_effect_id() -> String {
+    format!("eff_{}", uuid::Uuid::now_v7().simple())
+}
+
 /// Mint one event identity: `evt_` + a UUID v7 in simple form, the same scheme `ses_`, `tsk_`,
 /// `ctx_`, `dep_` and `req_` use. Ids therefore sort by mint time and carry their own
 /// millisecond timestamp, so a trace can be ordered and time-bounded without reading any
@@ -300,11 +305,6 @@ pub(crate) const RETENTION_REASON_MAX_MESSAGES: &str = "max_messages";
 ///
 /// Called once per line at the moment of the write. An id is never reused, never derived from
 /// the event's content, and never reconstructed from anything else in the file.
-/// A fresh `effect_started.effect_id`: `eff_` and a UUID v7's 32 hex digits.
-pub(crate) fn new_effect_id() -> String {
-    format!("eff_{}", uuid::Uuid::now_v7().simple())
-}
-
 pub(crate) fn new_event_id() -> String {
     format!("evt_{}", uuid::Uuid::now_v7().simple())
 }
@@ -7425,7 +7425,6 @@ mod tests {
             binary: (kind == "shell").then(|| "/usr/bin/bash".to_string()),
             command: (kind == "shell").then(|| "sleep 30".to_string()),
             input: serde_json::json!({"command": "sleep 30"}),
-            input_bytes: 22,
             turn: 2,
             task_id: (kind == "shell").then(|| "tsk_1".to_string()),
             started_at_ms: 1750,

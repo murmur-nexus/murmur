@@ -2246,7 +2246,6 @@ mod tests {
                 binary: Some("/usr/bin/bash".to_string()),
                 command: Some("sleep 30".to_string()),
                 input: json!({"command": "sleep 30"}),
-                input_bytes: 22,
                 turn: 1,
                 task_id: Some("tsk_1".to_string()),
                 started_at_ms: 1750,
