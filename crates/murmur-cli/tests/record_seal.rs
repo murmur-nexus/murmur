@@ -830,8 +830,10 @@ fn completion_and_conversation_reseal() {
     let before = fs::read_to_string(&conversation).unwrap();
     p.verify(&first, &[]).success();
 
+    // The record is task, `toolu_ls` call, its result, answer: keeping the answer alone is a
+    // valid cut, where keeping two would keep the result without its call and be refused.
     mur(p.home.path())
-        .args(["conversation", "truncate", "ctx-trunc", "--keep", "2"])
+        .args(["conversation", "truncate", "ctx-trunc", "--keep", "1"])
         .assert()
         .success();
     let after = fs::read_to_string(&conversation).unwrap();

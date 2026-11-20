@@ -605,7 +605,7 @@ that opens it under `mur run --context` writes the header and applies its policy
 | Policy | Removed |
 |---|---|
 | [`trace.retain`](manifest.md#trace-retain) | A whole session: its [records directory](#records-directory), with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>` |
-| [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`, then every `blobs/<sha256>` no surviving line's image block names. The file, the directory, every surviving `id` and every image a kept line names stay |
+| [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`, then every `blobs/<sha256>` no surviving line's image block names. The file, the directory, every surviving `id` and every image a kept line names stay. Nothing is removed when the kept lines fail the [record check](observability-schemas.md#record-check-failed); the launch writes `record_check_failed` instead of `retention` |
 | [`context.retain.max_age`](manifest.md#context-retain) | A whole `<context-id>/` directory under the record store |
 | [`mur trace rm`](cli.md#mur-trace-rm) | One ended session, named by the operator: its [records directory](#records-directory), its work folder when the runtime created it under `./workdir`, and a running-capsule record left by a process that is gone. A `--workdir` folder and the conversation record stay |
 

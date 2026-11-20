@@ -9,12 +9,13 @@
 
 use capsule_runtime::{
     find_context_dirs, list_records, locate_message, read_context_dir, remove_record,
-    truncate_record, ContextContents, MessageStatus, RecordSummary, TruncationMarker,
+    truncate_record, ContextContents, MessageStatus, RecordFault, RecordSummary, TruncationError,
+    TruncationMarker,
 };
 use clap::Subcommand;
 use serde_json::{json, Value};
 
-use crate::error::{CliError, E_CNV_001, E_CNV_002, E_CNV_003, E_IO_003};
+use crate::error::{CliError, E_CNV_001, E_CNV_002, E_CNV_003, E_CNV_004, E_IO_003};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConversationCommand {
@@ -340,6 +341,26 @@ pub(crate) fn run_conversation_rm(
 
 // ── truncate ──────────────────────────────────────────────────────────────────
 
+/// The `E-CNV-004` refusal of a `--keep` whose kept messages fail the record check, naming the
+/// first fault.
+fn truncation_refusal(keep: u32, faults: &[RecordFault]) -> CliError {
+    let (check, index, tool_call) = faults.first().map_or(("none", 0, "none"), |fault| {
+        (
+            fault.check.as_str(),
+            fault.index,
+            fault.tool_call_id.as_deref().unwrap_or("none"),
+        )
+    });
+    CliError::with_hint(
+        E_CNV_004,
+        format!(
+            "keeping the newest {keep} messages would leave {check} at index {index} (tool call \
+             {tool_call})"
+        ),
+        "nothing was changed; a --keep that starts the kept messages at a turn boundary avoids it",
+    )
+}
+
 pub(crate) fn run_conversation_truncate(
     context_id: &str,
     keep: u32,
@@ -353,8 +374,11 @@ pub(crate) fn run_conversation_truncate(
         ));
     }
     let target = resolve_context(context_id, record.as_deref())?;
-    let outcome = truncate_record(&target.path, keep, &target.record)
-        .map_err(|reason| CliError::new(E_IO_003, reason))?;
+    let outcome =
+        truncate_record(&target.path, keep, &target.record).map_err(|error| match error {
+            TruncationError::RecordCheck { faults, .. } => truncation_refusal(keep, &faults),
+            TruncationError::Io(reason) => CliError::new(E_IO_003, reason),
+        })?;
     if outcome.dropped == 0 {
         capsule_runtime::report_println!(
             "{} already holds {} messages; nothing dropped",
@@ -504,6 +528,32 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal names the first fault's rule, position and tool call, and says nothing
+    /// changed.
+    #[test]
+    fn a_record_check_refusal_names_the_first_fault() {
+        let fault = |tool_call_id: Option<&str>| RecordFault {
+            check: capsule_runtime::RecordCheck::OrphanedToolResult,
+            index: 0,
+            message_id: Some("msg_3".to_string()),
+            tool_call_id: tool_call_id.map(str::to_string),
+            detail: "d".to_string(),
+        };
+        let error = truncation_refusal(2, &[fault(Some("c1")), fault(None)]);
+        assert_eq!(error.code, E_CNV_004);
+        assert_eq!(
+            error.message,
+            "keeping the newest 2 messages would leave orphaned_tool_result at index 0 (tool call c1)"
+        );
+        assert_eq!(
+            error.hint.as_deref(),
+            Some("nothing was changed; a --keep that starts the kept messages at a turn boundary avoids it")
+        );
+        assert!(truncation_refusal(2, &[fault(None)])
+            .message
+            .ends_with("(tool call none)"));
+    }
 
     #[test]
     fn fmt_timestamp_reads_as_utc_wall_clock() {

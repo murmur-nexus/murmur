@@ -130,7 +130,7 @@ fired:      no
 declined:   at turn 4  (198,340 tokens)  no_hook_replacement
 ```
 
-`no_hook_replacement` means the capsule declares no compaction hook, or the one it declares returned nothing — declare one to fix it. `unresolved_tool_call` means a hook did return a replacement and the runtime discarded it because its tool calls and tool results no longer paired up; that is a defect in the hook.
+`no_hook_replacement` means the capsule declares no compaction hook, or the one it declares returned nothing — declare one to fix it. `record_check_failed` means a hook did return a replacement and the runtime discarded it because it broke a structural rule — a tool result with no call before it, a call whose arguments are not a JSON object, or a call left without its result; that is a defect in the hook. The `record_check_failed` line just before the decline names each fault; `mur trace show` lists it under **Record check** as `record_check_failed  compaction  2 faults  first: unanswered_tool_call at 0`, and `mur trace steps` shows it as a `record_check_failed` row under its turn.
 
 ---
 

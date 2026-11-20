@@ -3117,6 +3117,11 @@ removed 1 image blobs no kept message names
 The second line is printed only when a blob was removed. A record already at or under `N` prints
 `<path> already holds <n> messages; nothing dropped`.
 
+The kept messages pass the [record check](observability-schemas.md#record-check-failed) before
+anything is written. A `--keep` whose kept messages fail it — most often a cut that keeps a tool
+result and drops the tool call it answers — is refused with
+[`E-CNV-004`](diagnostics.md#e-cnv-004) and the file is left exactly as it was.
+
 ---
 
 ## `mur trace`
@@ -3179,6 +3184,7 @@ Output sections, in the order they are printed:
 | Harness | one or more `harness_warning`, `harness_failed`, `harness_interrupt` or [`harness_quota`](observability-schemas.md#harness-quota) records | One line per warning (`warning <code>: <message>`), failed turn (`harness failed (<kind>): <message>`) and interrupt (`interrupt <method>: …`), in file order. Then one line per subscription window name, with the latest values reported under it, in the order the names were first reported: `quota <name>: used <fraction>, resets <RFC 3339 UTC>, <n> min window, <state>`. A value the harness did not report is left off the line: `quota five-hour: used 0.5, warning` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
+| Record check | one or more [`record_check_failed`](observability-schemas.md#record-check-failed) records | One `record_check_failed  <rewrite>  <n> faults  first: <check> at <index>` row per refused rewrite, in file order |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
 | Turns | always | Turn count and configured max. When the task continued with the outcomes of work it handed off, a `continued:  <N>  (<A> member answer(s), <D> delegation outcome(s))` line follows, counting its [`task_continued`](observability-schemas.md#task-continued) records. When any turn stopped at the [output cap](manifest.md#inference-max-tokens-reached), a `capped:     <N> turn(s) stopped at the inference.max_tokens output cap` line follows |
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing each reported count — `in`, `out`, `cached`, `cache write`, `thinking` — over the turns that reported it. A count no turn reported is left off the line. Under [`transport: process`](manifest.md#transport-process) the harness's input and output counts are the totals above, so only the cache and thinking counts appear here |

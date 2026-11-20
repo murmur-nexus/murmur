@@ -93,6 +93,44 @@ pub struct TruncationOutcome {
     pub blobs_removed: u64,
 }
 
+/// Why a truncation left the record as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TruncationError {
+    /// The record could not be read, or the rewrite could not be staged or committed.
+    Io(String),
+    /// The messages the truncation would keep fail the record check; nothing was staged.
+    /// `faults` is every fault in record order, `messages` the number of messages kept.
+    RecordCheck {
+        faults: Vec<crate::record_check::RecordFault>,
+        messages: usize,
+    },
+}
+
+impl std::fmt::Display for TruncationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(reason) => f.write_str(reason),
+            Self::RecordCheck { faults, messages } => {
+                write!(
+                    f,
+                    "the {messages} kept messages fail the record check ({} faults",
+                    faults.len()
+                )?;
+                if let Some(first) = faults.first() {
+                    write!(f, "; first: {} at {}", first.check.as_str(), first.index)?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+impl From<String> for TruncationError {
+    fn from(reason: String) -> Self {
+        Self::Io(reason)
+    }
+}
+
 /// Where one message id turned up, and in what state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageStatus {
@@ -455,7 +493,16 @@ pub fn prune_records(
 ///
 /// Once the rewrite commits, every blob in the record's `blobs/` that no surviving line's image
 /// block names is removed, and counted in `blobs_removed`. A blob a kept line still names stays.
-pub fn truncate_record(path: &Path, keep: u32, capsule: &str) -> Result<TruncationOutcome, String> {
+///
+/// A truncation whose kept messages fail the record check is refused with
+/// [`TruncationError::RecordCheck`] and the file is not touched: the cut is at a message count,
+/// and a count that starts the kept messages between a tool call and its result would leave a
+/// record no resume can send.
+pub fn truncate_record(
+    path: &Path,
+    keep: u32,
+    capsule: &str,
+) -> Result<TruncationOutcome, TruncationError> {
     match stage_truncation(path, keep, capsule, now_ms())? {
         None => Ok(TruncationOutcome {
             dropped: 0,
@@ -521,29 +568,31 @@ fn sweep_orphan_blobs(path: &Path) -> u64 {
 /// is on disk under a temporary name in the record's own directory, and the original is still the
 /// original until [`StagedRewrite::commit`] renames over it.
 ///
-/// `None` means there was nothing to drop.
+/// `None` means there was nothing to drop. The kept messages are checked against the whole
+/// record ([`crate::record_check::check_rewrite`]) before anything is staged; a fault is
+/// [`TruncationError::RecordCheck`] and leaves nothing on disk.
 pub(crate) fn stage_truncation(
     path: &Path,
     keep: u32,
     capsule: &str,
     at_ms: u64,
-) -> Result<Option<(StagedRewrite, TruncationOutcome)>, String> {
+) -> Result<Option<(StagedRewrite, TruncationOutcome)>, TruncationError> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("{}: {err}", path.display())),
+        Err(err) => return Err(TruncationError::Io(format!("{}: {err}", path.display()))),
     };
 
     let existing = read_header(path);
     let lines: Vec<&str> = raw.lines().collect();
-    // Every line that is a message, by its index in the file. Non-message lines — the header,
-    // and a torn final line — are not messages to any reader and are not counted here either.
-    let message_indices: Vec<usize> = lines
+    // Every line that is a message, by its index in the file, with the message it parses to.
+    // Non-message lines — the header, and a torn final line — are not messages to any reader and
+    // are not counted here either.
+    let (message_indices, messages): (Vec<usize>, Vec<serde_json::Value>) = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| parse_message_line(line).is_some())
-        .map(|(index, _)| index)
-        .collect();
+        .filter_map(|(index, line)| parse_message_line(line).map(|message| (index, message)))
+        .unzip();
 
     let total = message_indices.len();
     let keep = keep as usize;
@@ -553,17 +602,23 @@ pub(crate) fn stage_truncation(
     let dropped = total - keep;
     let first_kept_index = message_indices[dropped];
 
-    let id_of = |index: usize| -> String {
-        parse_message_line(lines[index])
-            .as_ref()
-            .and_then(|message| crate::agent::message_id(message).map(str::to_string))
+    let faults = crate::record_check::check_rewrite(&messages[dropped..], &messages);
+    if !faults.is_empty() {
+        return Err(TruncationError::RecordCheck {
+            faults,
+            messages: keep,
+        });
+    }
+
+    let id_of = |position: usize| -> String {
+        messages
+            .get(position)
+            .and_then(crate::agent::message_id)
+            .map(str::to_string)
             .unwrap_or_default()
     };
-    let last_dropped_id = id_of(message_indices[dropped - 1]);
-    let oldest_surviving_id = message_indices
-        .get(dropped)
-        .map(|i| id_of(*i))
-        .unwrap_or_default();
+    let last_dropped_id = id_of(dropped - 1);
+    let oldest_surviving_id = id_of(dropped);
 
     let header = RecordHeader {
         kind: crate::conversation::RECORD_HEADER_TYPE.to_string(),
@@ -1318,7 +1373,68 @@ mod tests {
         path
     }
 
-    /// A record line whose tool message carries one image block per sha in `shas`.
+    /// `[user, assistant(tool_call c1), tool(c1), assistant text]`, the shape one tool turn
+    /// leaves on disk.
+    fn write_tool_turn_record(dir: &Path) -> PathBuf {
+        let path = dir.join(RECORD_FILE_NAME);
+        let lines = [
+            json!({"id": msg(NOW - 3000, 1), "role": "user", "content": [{"type": "text", "text": "go"}]}),
+            json!({"id": msg(NOW - 2000, 2), "role": "assistant", "content": [{"type": "tool_call", "id": "c1", "name": "bash", "input": {"command": "ls"}}]}),
+            json!({"id": msg(NOW - 1000, 3), "role": "tool", "tool_call_id": "c1", "is_error": false, "content": [{"type": "text", "text": "ok"}]}),
+            json!({"id": msg(NOW, 4), "role": "assistant", "content": [{"type": "text", "text": "done"}]}),
+        ];
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Keeping the newest two of one tool turn would start the record at a tool result whose
+    /// call was dropped: refused, the file byte for byte what it was and no staged file left
+    /// behind. A count that cuts at a turn boundary truncates as it always did.
+    #[test]
+    fn a_truncation_that_orphans_a_tool_result_is_refused_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tool_turn_record(dir.path());
+        let before = std::fs::read(&path).unwrap();
+
+        let refused = truncate_record(&path, 2, "capsule").unwrap_err();
+        let TruncationError::RecordCheck { faults, messages } = &refused else {
+            panic!("expected a record check refusal, got {refused:?}");
+        };
+        assert_eq!(*messages, 2);
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert_eq!(
+            faults[0].check,
+            crate::record_check::RecordCheck::OrphanedToolResult
+        );
+        assert_eq!(faults[0].index, 0);
+        assert_eq!(faults[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(
+            faults[0].message_id.as_deref(),
+            Some(msg(NOW - 1000, 3).as_str())
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the 2 kept messages fail the record check (1 faults; first: orphaned_tool_result at 0)"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != RECORD_FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        assert_eq!(truncate_record(&path, 3, "capsule").unwrap().dropped, 1);
+        assert_eq!(count_messages(&path), 3);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tool_turn_record(dir.path());
+        assert_eq!(truncate_record(&path, 1, "capsule").unwrap().dropped, 3);
+        assert_eq!(count_messages(&path), 1);
+    }
+
+    /// A record line whose user message carries one image block per sha in `shas`.
     fn image_line(id: &str, shas: &[&str]) -> String {
         let mut content = vec![serde_json::json!({"type": "text", "text": "shot"})];
         for sha in shas {
@@ -1327,7 +1443,7 @@ mod tests {
                 "source": {"type": "file", "sha256": sha, "media_type": "image/png", "bytes": 4},
             }));
         }
-        serde_json::json!({"id": id, "role": "tool", "content": content}).to_string()
+        serde_json::json!({"id": id, "role": "user", "content": content}).to_string()
     }
 
     /// A blob only dropped lines name is removed after the rewrite; one a kept line still names

@@ -37,7 +37,7 @@ failed:
 
 | Why compaction did not replace the context | Outcome |
 |---|---|
-| No hook bound to `on-compaction`, or a replacement the runtime rejected | Non-fatal. A `compaction_declined` line in `trace.jsonl` names the turn and the reason, and the session continues with the uncompacted history |
+| No hook bound to `on-compaction`, or a replacement that failed the [record check](../reference/observability-schemas.md#record-check-failed) | Non-fatal. A `compaction_declined` line in `trace.jsonl` names the turn and the reason, a `record_check_failed` line before it names every broken rule, and the session continues with the uncompacted history in memory and in the conversation record |
 | A bound hook returned an error after a spend ceiling refused its `run-inference` call | The session ends with `exit_status: "spend_ceiling_reached"`. `out/result.txt` in the session's [records directory](../reference/workdir.md#records-directory) reads `stopped: spend ceiling reached: …`, and the trace carries one `spend_ceiling_reached` line tagged with the hook's `origin` |
 | A bound hook returned any other error | The session ends with `exit_status: "failed"`. `out/result.txt` in the records directory records the error, and the SSE stream (if the session has a `task_id`) emits a final `status` event with `state: "failed"` |
 

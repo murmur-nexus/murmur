@@ -243,9 +243,15 @@ pub(crate) fn recorded_driver_config(
 /// `replace-context`.
 pub(crate) const COMPACTION_DECLINED_NO_HOOK_REPLACEMENT: &str = "no_hook_replacement";
 
-/// `compaction_declined.reason` when a hook's replacement was rejected because its tool calls
-/// and tool results did not pair up.
-pub(crate) const COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL: &str = "unresolved_tool_call";
+/// `compaction_declined.reason` when a hook's replacement failed the record check; the
+/// `record_check_failed` line written just before it names every fault.
+pub(crate) const COMPACTION_DECLINED_RECORD_CHECK_FAILED: &str = "record_check_failed";
+
+/// `record_check_failed.rewrite` for a compaction hook's `replace-context`.
+pub(crate) const REWRITE_COMPACTION: &str = "compaction";
+
+/// `record_check_failed.rewrite` for the tail a `context.retain.max_messages` truncation keeps.
+pub(crate) const REWRITE_TRUNCATION: &str = "truncation";
 
 /// `context_seed.outcome` when the whole proposal fit the budget and was committed as-is.
 pub(crate) const SEED_OUTCOME_SEEDED: &str = "seeded";
@@ -1377,8 +1383,44 @@ struct CompactionDeclinedEvent {
     /// Which kind of number `tokens` is.
     tokens_source: OccupancyBasis,
     /// `"no_hook_replacement"` when no bound hook returned `replace-context`;
-    /// `"unresolved_tool_call"` when the replacement's tool calls and tool results did not pair.
+    /// `"record_check_failed"` when the replacement failed the record check, whose
+    /// `record_check_failed` line comes just before this one.
     reason: String,
+}
+
+/// A rewritten conversation failed the record check and was not saved: the record the session
+/// had stays as it was, in memory and on disk. Names every broken rule, where it broke and which
+/// message and tool call it concerns, and never the argument or result text.
+#[derive(Serialize)]
+struct RecordCheckFailedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The turn whose compaction was refused; `None` for a launch-time truncation, which runs
+    /// before any turn.
+    turn: Option<u32>,
+    task_id: Option<String>,
+    /// [`REWRITE_COMPACTION`] or [`REWRITE_TRUNCATION`].
+    rewrite: &'static str,
+    /// How many messages the refused rewrite held.
+    messages: u32,
+    /// Every fault the check found, however many `faults` lists.
+    faults_total: u32,
+    /// The first [`crate::record_check::MAX_REPORTED_FAULTS`] faults, in record order.
+    faults: Vec<RecordFaultLine>,
+}
+
+/// One entry of `record_check_failed.faults`.
+#[derive(Serialize)]
+struct RecordFaultLine {
+    check: &'static str,
+    /// Position in the refused rewrite, counting from 0.
+    index: u32,
+    message_id: Option<String>,
+    tool_call_id: Option<String>,
+    detail: String,
 }
 
 /// An `on-task-start` hook proposed context and the runtime decided what to do with it.
@@ -4564,7 +4606,7 @@ impl TraceWriter {
     /// `tokens` is the occupancy at the moment of the decline and `tokens_source` the kind of
     /// number it is; `reason` is
     /// [`COMPACTION_DECLINED_NO_HOOK_REPLACEMENT`] or
-    /// [`COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL`].
+    /// [`COMPACTION_DECLINED_RECORD_CHECK_FAILED`].
     pub(crate) async fn write_compaction_declined(
         &mut self,
         turn: u32,
@@ -4583,6 +4625,46 @@ impl TraceWriter {
             tokens,
             tokens_source,
             reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that a rewrite of the conversation failed the record check and was not saved.
+    ///
+    /// `turn` is `None` for a truncation, which runs at launch before any turn; `rewrite` is
+    /// [`REWRITE_COMPACTION`] or [`REWRITE_TRUNCATION`]; `messages` is the refused rewrite's
+    /// length. `faults` is every fault, of which the first
+    /// [`crate::record_check::MAX_REPORTED_FAULTS`] are listed.
+    pub(crate) async fn write_record_check_failed(
+        &mut self,
+        turn: Option<u32>,
+        rewrite: &'static str,
+        messages: usize,
+        faults: &[crate::record_check::RecordFault],
+    ) -> std::io::Result<()> {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let event = RecordCheckFailedEvent {
+            event_type: "record_check_failed",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            rewrite,
+            messages: count(messages),
+            faults_total: count(faults.len()),
+            faults: faults
+                .iter()
+                .take(crate::record_check::MAX_REPORTED_FAULTS)
+                .map(|fault| RecordFaultLine {
+                    check: fault.check.as_str(),
+                    index: count(fault.index),
+                    message_id: fault.message_id.clone(),
+                    tool_call_id: fault.tool_call_id.clone(),
+                    detail: fault.detail.clone(),
+                })
+                .collect(),
         };
         self.write_event(&event).await
     }
@@ -11116,7 +11198,7 @@ mod tests {
             2,
             4321,
             OccupancyBasis::Actual,
-            COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
+            COMPACTION_DECLINED_RECORD_CHECK_FAILED,
         )
         .await
         .unwrap();
@@ -11129,7 +11211,7 @@ mod tests {
             .collect();
         assert_eq!(declined.len(), 1);
         let d = declined[0];
-        assert_eq!(d["reason"], "unresolved_tool_call");
+        assert_eq!(d["reason"], "record_check_failed");
         assert_eq!(d["turn"], 2);
         assert_eq!(d["task_id"], "tsk_1");
         assert_eq!(d["tokens"], 4321);
@@ -11142,6 +11224,80 @@ mod tests {
                 .find(|e| e["event_type"] == "inference")
                 .unwrap()["event_id"]
         );
+    }
+
+    /// `record_check_failed` writes its keys in the documented order, an absent `message_id` or
+    /// `tool_call_id` and a truncation's `turn` as `null`, and lists at most
+    /// `MAX_REPORTED_FAULTS` faults while `faults_total` counts them all.
+    #[tokio::test]
+    async fn record_check_failed_writes_its_keys_in_order_and_caps_the_list() {
+        use crate::record_check::{RecordCheck, RecordFault, MAX_REPORTED_FAULTS};
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
+        let fault = |index: usize| RecordFault {
+            check: RecordCheck::UnansweredToolCall,
+            index,
+            message_id: (index == 0).then(|| "msg_0".to_string()),
+            tool_call_id: (index == 0).then(|| "toolu_0".to_string()),
+            detail: "one sentence".to_string(),
+        };
+        let faults: Vec<RecordFault> = (0..MAX_REPORTED_FAULTS + 3).map(fault).collect();
+        w.write_record_check_failed(None, REWRITE_TRUNCATION, 40, &faults)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("\"record_check_failed\""))
+            .unwrap();
+        let order: Vec<usize> = [
+            "event_type",
+            "event_id",
+            "parent_id",
+            "session_id",
+            "timestamp",
+            "turn",
+            "task_id",
+            "rewrite",
+            "messages",
+            "faults_total",
+            "faults",
+            "check",
+            "index",
+            "message_id",
+            "tool_call_id",
+            "detail",
+        ]
+        .iter()
+        .map(|key| line.find(&format!("\"{key}\":")).unwrap())
+        .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{line}");
+
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["turn"], Value::Null);
+        assert_eq!(event["task_id"], Value::Null);
+        assert_eq!(event["rewrite"], "truncation");
+        assert_eq!(event["messages"], 40);
+        assert_eq!(event["faults_total"], MAX_REPORTED_FAULTS + 3);
+        let listed = event["faults"].as_array().unwrap();
+        assert_eq!(listed.len(), MAX_REPORTED_FAULTS);
+        assert_eq!(
+            listed[0],
+            serde_json::json!({
+                "check": "unanswered_tool_call",
+                "index": 0,
+                "message_id": "msg_0",
+                "tool_call_id": "toolu_0",
+                "detail": "one sentence",
+            })
+        );
+        assert_eq!(listed[1]["message_id"], Value::Null);
+        assert_eq!(listed[1]["tool_call_id"], Value::Null);
     }
 
     /// `evt_` ids sort by mint time and carry their own millisecond timestamp, the same

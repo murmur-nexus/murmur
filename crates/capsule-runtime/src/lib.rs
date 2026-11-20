@@ -115,6 +115,7 @@ pub mod provider_tool;
 pub(crate) mod race;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
+pub(crate) mod record_check;
 pub mod record_seal;
 pub mod records_dir;
 pub mod registration;
@@ -309,8 +310,11 @@ pub use retention::{
     find_context_dirs, list_records, locate_message, prune_records, prune_sessions,
     read_context_dir, remove_record, truncate_record, ContextContents, ContextDir,
     HarnessSessionEntry, MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader,
-    RecordSummary, RemovedRecord, TruncationMarker, TruncationOutcome,
+    RecordSummary, RemovedRecord, TruncationError, TruncationMarker, TruncationOutcome,
 };
+// The fault a refused truncation reports, so `mur conversation truncate` can name the rule, the
+// position and the tool call in its refusal.
+pub use record_check::{RecordCheck, RecordFault};
 pub use roster::{
     admit_roster, admit_roster_file, caller_overflow_fix, caller_overflow_warning, AdmittedMember,
     AdmittedRoster, CallerOverflow, RosterEdge, RosterRefusal,
