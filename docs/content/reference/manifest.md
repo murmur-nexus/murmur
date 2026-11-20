@@ -1572,6 +1572,10 @@ disk:
 | `line` | As it is written: each line is synced (`fdatasync`) before the next one is written. |
 | A duration, such as `5s` | No later than that long after it was written. `session_end` is synced as the session ends. |
 
+Under either policy, each [`effect_started`](observability-schemas.md#effect-started) line is
+synced before the tool call it records is dispatched, so a call that started is on record before
+it can take effect. With the field omitted, no sync call is made for it either.
+
 The first sync also syncs the session's records directory and the directory holding it, so the
 file's own directory entry is on disk. The
 [`session_start` event](observability-schemas.md#session-trace-tracejsonl) records the setting as

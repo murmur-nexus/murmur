@@ -1657,3 +1657,329 @@ fn a_declared_grace_still_demotes() {
     );
     assert!(!limits.contains("CPU time"), "got: {limits}");
 }
+
+// ── Effect journal ────────────────────────────────────────────────────────────
+
+/// `mur trace <subcommand> <trace.jsonl>` under `home`, which must succeed; its stdout.
+fn mur_trace(home: &TempDir, subcommand: &str, records_dir: &Path) -> String {
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .env("HOME", home.path())
+        .args(["trace", subcommand])
+        .arg(records_dir.join("trace.jsonl"))
+        .output()
+        .expect("mur trace runs");
+    assert!(
+        output.status.success(),
+        "mur trace {subcommand} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `mur trace verify <records dir>` under `home` succeeds.
+fn assert_trace_verifies(home: &TempDir, records_dir: &Path) {
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .env("HOME", home.path())
+        .args(["trace", "verify"])
+        .arg(records_dir)
+        .output()
+        .expect("mur trace verify runs");
+    assert!(
+        output.status.success(),
+        "mur trace verify failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `eff_` and 32 lowercase hex digits.
+fn assert_effect_id(id: &str) {
+    let hex = id
+        .strip_prefix("eff_")
+        .unwrap_or_else(|| panic!("{id} has no eff_ prefix"));
+    assert_eq!(hex.len(), 32, "{id}");
+    assert!(
+        hex.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{id}"
+    );
+}
+
+/// Every text block of every message of `request`, in order: a fact and the task after it read
+/// as neighbours whether the driver sends them as two user messages or merges them into one.
+fn request_texts(request: &Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|message| match &message["content"] {
+            Value::String(text) => vec![text.clone()],
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// A foreground shell call is journaled before it runs and closed by its outcome: the
+/// `effect_started` line comes first and names the provider's id, the binary and the command, and
+/// the `tool_call` and `shell` lines name its `effect_id`. `steps` shows no row for the paired
+/// intent, and the trace verifies. The same holds with `trace.sync: line`.
+#[test]
+fn a_foreground_shell_call_is_journaled_before_it_runs_and_paired_by_effect_id() {
+    if common::skip_without_host_support(
+        "a_foreground_shell_call_is_journaled_before_it_runs_and_paired_by_effect_id",
+    ) {
+        return;
+    }
+    for extra_yaml in ["", "trace:\n  sync: line\n"] {
+        let server = ScriptedServer::start(vec![
+            bash_call("msg_1", "toolu_echo", "echo journaled"),
+            end_turn("msg_2", "Done."),
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let driver_artifact = create_driver_artifact(
+            artifact_dir.path(),
+            DRIVER_ANTHROPIC_NAME,
+            &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        );
+        common::publish_local(&home, &driver_artifact).success();
+        let manifest = create_agent_project_with_lifecycle(
+            project.path(),
+            &server.endpoint,
+            DRIVER_ANTHROPIC_NAME,
+            &["bash", "echo"],
+            extra_yaml,
+        );
+        let status = spawn_mur_run(
+            &home,
+            project.path(),
+            &manifest,
+            &["--task", "Echo something.", "--json"],
+            "paired",
+        )
+        .wait()
+        .unwrap();
+        let stderr = fs::read_to_string(project.path().join("paired-stderr.txt")).unwrap();
+        assert!(
+            status.success(),
+            "{extra_yaml:?}: the run failed:\n{stderr}"
+        );
+
+        let records = session_records(home.path(), project.path());
+        assert_eq!(records.len(), 1, "{extra_yaml:?}");
+        let events = trace_events(&records[0]);
+        let position = |event_type: &str| {
+            events
+                .iter()
+                .position(|event| event["event_type"] == event_type)
+                .unwrap_or_else(|| panic!("{extra_yaml:?}: no {event_type} line"))
+        };
+        let started = events_of_type(&events, "effect_started");
+        assert_eq!(started.len(), 1, "{extra_yaml:?}");
+        let effect = started[0];
+        let effect_id = effect["effect_id"].as_str().unwrap();
+        assert_effect_id(effect_id);
+        assert_eq!(effect["kind"], "shell", "{effect}");
+        assert_eq!(effect["tool_name"], "bash", "{effect}");
+        assert_eq!(effect["tool_call_id"], "toolu_echo", "{effect}");
+        assert_eq!(effect["input"], json!({"command": "echo journaled"}));
+        assert!(position("effect_started") < position("tool_call"));
+
+        let tool_call = events_of_type(&events, "tool_call")[0];
+        let shell = events_of_type(&events, "shell")[0];
+        assert_eq!(tool_call["tool_call_id"], "toolu_echo");
+        assert_eq!(tool_call["effect_id"], effect_id, "{tool_call}");
+        assert_eq!(shell["effect_id"], effect_id, "{shell}");
+        assert_eq!(effect["binary"], shell["binary"], "{effect}");
+        assert_eq!(effect["command"], shell["command"], "{effect}");
+        assert_eq!(effect["turn"], tool_call["turn"]);
+        assert_eq!(effect["task_id"], tool_call["task_id"]);
+
+        let steps = mur_trace(&home, "steps", &records[0]);
+        assert!(
+            !steps.contains("effect_started"),
+            "{extra_yaml:?}: a paired intent renders no row:\n{steps}"
+        );
+        assert!(steps.contains("tool_call  bash"), "{steps}");
+        assert_trace_verifies(&home, &records[0]);
+    }
+}
+
+/// A call whose runtime is killed while it runs leaves its intent and nothing after it. `steps`
+/// shows it as started with no outcome; each resume records `effects_unfinished` and hands the
+/// first request the fact right before the task text; nothing is rerun, and the killed trace is
+/// never written. A second resume reports the same effect again.
+#[test]
+fn a_call_killed_mid_run_is_reported_unfinished_on_every_resume() {
+    if common::skip_without_host_support(
+        "a_call_killed_mid_run_is_reported_unfinished_on_every_resume",
+    ) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call("msg_1", "toolu_sleep", "sleep 30"),
+        end_turn("msg_2", "Noted, carrying on."),
+        end_turn("msg_3", "Noted again."),
+        end_turn("msg_4", "Spare."),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    // No `shell_grace_secs`: the command runs in the foreground until the kill.
+    let manifest = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+    );
+
+    let mut killed = spawn_mur_run(
+        &home,
+        project.path(),
+        &manifest,
+        &["--task", "Sleep for a while.", "--json"],
+        "killed",
+    );
+    let killed_dir = await_trace(
+        home.path(),
+        project.path(),
+        "the bash call to be journaled",
+        |events| !events_of_type(events, "effect_started").is_empty(),
+    );
+    killed.kill().expect("SIGKILL reaches the run");
+    killed.wait().expect("the killed run is reaped");
+
+    let killed_events = trace_events(&killed_dir);
+    let started = events_of_type(&killed_events, "effect_started");
+    assert_eq!(started.len(), 1);
+    let effect = started[0].clone();
+    let effect_id = effect["effect_id"].as_str().unwrap().to_string();
+    assert_effect_id(&effect_id);
+    assert_eq!(effect["command"], "sleep 30", "{effect}");
+    for absent in ["tool_call", "shell", "session_end"] {
+        assert!(
+            events_of_type(&killed_events, absent).is_empty(),
+            "a call killed mid-run leaves no {absent}"
+        );
+    }
+    let killed_bytes = fs::read(killed_dir.join("trace.jsonl")).unwrap();
+    let killed_session = session_name(&killed_dir);
+
+    let steps = mur_trace(&home, "steps", &killed_dir);
+    let unpaired = format!("effect_started bash  {}…  no outcome", &effect_id[..12]);
+    assert!(
+        steps.lines().any(|line| line.trim_start() == unpaired),
+        "steps must list the call as started with no outcome ({unpaired}):\n{steps}"
+    );
+
+    let mut seen_sessions = vec![killed_dir.clone()];
+    for (round, task) in [(1, "Carry on."), (2, "Carry on again.")] {
+        let tag = format!("resume-{round}");
+        let requests_before = server.requests().len();
+        let status = spawn_mur_run(
+            &home,
+            project.path(),
+            &manifest,
+            &["--resume", &killed_session, "--task", task, "--json"],
+            &tag,
+        )
+        .wait()
+        .unwrap();
+        let stderr = fs::read_to_string(project.path().join(format!("{tag}-stderr.txt"))).unwrap();
+        assert!(status.success(), "resume {round} failed:\n{stderr}");
+
+        let resumed_dir = session_records(home.path(), project.path())
+            .into_iter()
+            .find(|dir| !seen_sessions.contains(dir))
+            .expect("the resume opened its own session");
+        seen_sessions.push(resumed_dir.clone());
+        let resumed_events = trace_events(&resumed_dir);
+
+        let reports = events_of_type(&resumed_events, "effects_unfinished");
+        assert_eq!(reports.len(), 1, "resume {round}");
+        let report = reports[0];
+        assert_eq!(report["from_session"], killed_session.as_str());
+        let entries = report["effects"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{report}");
+        let entry = &entries[0];
+        assert_eq!(entry["effect_id"], effect_id.as_str());
+        assert_eq!(entry["kind"], "shell");
+        assert_eq!(entry["tool_name"], "bash");
+        assert_eq!(entry["tool_call_id"], "toolu_sleep");
+        assert_eq!(entry["binary"], effect["binary"]);
+        assert_eq!(entry["command"], "sleep 30");
+        assert_eq!(entry["turn"], effect["turn"]);
+        assert_eq!(entry["task_id"], effect["task_id"]);
+        assert_eq!(entry["started_at_ms"], effect["timestamp"]);
+        for absent in ["effect_started", "tool_call", "shell"] {
+            assert!(
+                events_of_type(&resumed_events, absent).is_empty(),
+                "resume {round} reran nothing, so it has no {absent}"
+            );
+        }
+
+        // The first request the resumed task sent: the fact right before the task text.
+        let requests = server.requests();
+        let first = requests
+            .get(requests_before)
+            .unwrap_or_else(|| panic!("resume {round} sent no request"));
+        let texts = request_texts(first);
+        // The last one: a second resume reloads the conversation the first appended its own
+        // fact and task to.
+        let fact_at = texts
+            .iter()
+            .rposition(|text| {
+                text.starts_with("Effects started in an earlier session have no recorded outcome.")
+            })
+            .unwrap_or_else(|| panic!("resume {round}: no fact in {texts:#?}"));
+        let fact = &texts[fact_at];
+        assert!(
+            fact.lines()
+                .any(|line| line == format!("effect_id: {effect_id}")),
+            "{fact}"
+        );
+        assert!(
+            fact.lines().any(|line| line == "command: sleep 30"),
+            "{fact}"
+        );
+        assert!(fact.contains(&killed_session), "{fact}");
+        assert_eq!(
+            texts.get(fact_at + 1).map(|text| text.trim()),
+            Some(task),
+            "the task text follows the fact: {texts:#?}"
+        );
+        assert_eq!(
+            fact_at + 2,
+            texts.len(),
+            "the task is the last text: {texts:#?}"
+        );
+
+        let steps = mur_trace(&home, "steps", &resumed_dir);
+        let row = format!(
+            "effects_unfinished 1 from {}…  no outcome: {}…",
+            &killed_session[..12],
+            &effect_id[..12]
+        );
+        assert!(
+            steps.lines().any(|line| line.trim_start() == row),
+            "steps must show {row}:\n{steps}"
+        );
+
+        assert_eq!(
+            fs::read(killed_dir.join("trace.jsonl")).unwrap(),
+            killed_bytes,
+            "resume {round} wrote into the resumed-from trace"
+        );
+    }
+}

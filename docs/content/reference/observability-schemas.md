@@ -40,10 +40,10 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `task_continued`, `keep_working`, `done_check`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
-| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `inference` (a hook's, carrying `origin`), `effect_started`, `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `safety_check`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry`, `call_deadline` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_quota`, `harness_suggestion`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused`, `code_mode_instance_start`, `code_mode_instance_end`, `code_mode_detach` | The session node |
+| `session_end`, `effects_unfinished`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached`, `process_start`, `process_exit`, `process_refused`, `code_mode_instance_start`, `code_mode_instance_end`, `code_mode_detach` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -424,6 +424,43 @@ line, once the request has ended, so under `content` each body is also held in m
 `tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
 storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 
+**`effect_started`**{ #effect-started } — written for each tool call the runtime dispatches,
+before the dispatch begins. A shell command is a call to a shell tool and is covered by the same
+line. Under `transport: http` it is written for every call the model makes once every check has let
+it through; under `transport: process`, for every bridged call the session's gate lets run, before
+the bridge is answered
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
+| `effect_id` | string | `eff_` followed by 32 hex digits. Every outcome line written for the call names it |
+| `kind` | string | `"shell"` for a call that runs a shell command, `"tool_call"` for every other |
+| `tool_name` | string | The tool as the model named it |
+| `tool_call_id` | string \| null | The provider's id for the call. `null` when the provider named none, and always `null` under `transport: process` |
+| `binary` | string | As on [`shell`](#shell). `kind: "shell"` only; absent otherwise |
+| `command` | string | As on `shell`. `kind: "shell"` only; absent otherwise |
+| `input` | object | The call's arguments, with peer handle tokens redacted as on `tool_call`. Written under every [`trace.capture`](manifest.md#field-trace) mode |
+| `input_bytes` | u64 | Byte length of the serialized arguments |
+
+The call's outcome lines name the same `effect_id`:
+
+| Outcome line | Written for |
+|---|---|
+| [`tool_call`](#tool-call), or [`skill_call`](#skill-call) for a skill | Every journaled call, when it ends. A command moved to the background ends its call at the move |
+| [`shell`](#shell) | A shell call whose command ran in the foreground |
+
+An `effect_started` that no outcome line names is a call that started and recorded nothing after:
+the runtime was killed or failed while it ran. A call refused before dispatch — by a required-field
+check, a policy hook, a `read_only` path or an unacknowledged safety check — has no `effect_started`.
+Under [`trace.sync`](manifest.md#trace-sync) the line is synced to disk before the call is
+dispatched. A failure to write it ends the run as a failed trace write, and the call is not
+dispatched. It counts toward no total.
+
+Under `transport: process` the outcome is paired by tool name and arguments, because the bridge's
+request carries no id. A result whose arguments the harness changed is written without `effect_id`,
+and its `effect_started` stays unpaired.
+
 **`tool_call`**{ #tool-call } — written after each tool invocation returns
 
 | Field | Type | Notes |
@@ -445,6 +482,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `origin` | string | `"code_mode"` for a call a code mode program made through [`murmur:bus`](wit-interfaces.md#bus). Absent on the model's own calls |
 | `repl_call_id` | string \| null | The `tool_call_id` of the model's call to the code mode tool the program ran in; `null` when that call had none. Present exactly when `origin` is |
 | `refusal` | string | Why the runtime did not run a code mode program's call, one of the [bus refusal reasons](wit-interfaces.md#bus-refusals): `not-listed`, `code-mode-tool`, `not-served`, `input-not-json`, `required-fields`, `capabilities.filesystem.read_only`, `on-tool-call`, `on-shell`, `detached` or `not-answered`. Present only for a refused call |
+| `effect_id` | string | The [`effect_started`](#effect-started) line written for this call before it was dispatched. Absent for a call that was never journaled: a code mode program's call through `murmur:bus`, a script capsule's `invoke`, a call refused before dispatch |
 
 A call a code mode program made through `murmur:bus` writes exactly the records the model's call to
 that tool writes — `tool_call`, or `skill_call` for a skill; `shell`, and `shell_detached` or
@@ -483,7 +521,7 @@ A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_cal
 | `status` | `"ok"` when the tool returned `passed`, else `"error"` |
 | `error` | The refusal, for a call the runtime refused, such as a tool not in the manifest's `artifacts:` |
 
-**`skill_call`** — written after each skill invocation returns
+**`skill_call`**{ #skill-call } — written after each skill invocation returns
 
 | Field | Type | Notes |
 |---|---|---|
@@ -498,11 +536,12 @@ A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_cal
 | `call_origin` | string | `"code_mode"` for a skill a code mode program read through [`murmur:bus`](wit-interfaces.md#bus); absent otherwise. Named `call_origin` because `origin` holds the lock origin |
 | `repl_call_id` | string \| null | As on [`tool_call`](#tool-call). Present exactly when `call_origin` is |
 | `refusal` | string | As on `tool_call`. Present only for a refused call |
+| `effect_id` | string | The [`effect_started`](#effect-started) line written for this call before it was dispatched. Absent for a call that was never journaled: a code mode program's call through `murmur:bus`, a script capsule's `invoke`, a call refused before dispatch |
 
 Skill calls are counted separately from tool calls: they never raise `total_tool_calls` or a
 `task_end`'s `tool_calls`.
 
-**`shell`** — written after each shell command returns (follows its `tool_call` line)
+**`shell`**{ #shell } — written after each shell command returns (follows its `tool_call` line)
 
 | Field | Type | Notes |
 |---|---|---|
@@ -515,6 +554,7 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 | `stderr_bytes` | u64 | |
 | `duration_ms` | u64 | |
 | `resource_limit` | string | The `capabilities.resources` field this subprocess hit — `cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes` or `cgroup_pids_max`. Written only when the kernel's own evidence names exactly one limit, and omitted from the line otherwise — see [Which limit a subprocess hit](resource-limits.md#which-limit) |
+| `effect_id` | string | The [`effect_started`](#effect-started) line of the shell tool call that ran this command, the same id its `tool_call` carries. Absent for a command whose call was never journaled: a code mode program's call through `murmur:bus`, a script capsule's `invoke` |
 
 **`shell_detached`** — written when a command moves to the background, in place of that command's
 `shell` line: it outran
@@ -605,6 +645,33 @@ no `duration_ms`, no `output_path` and no `output_bytes`, because a command whos
 killed produced none of them — including no output log, which is written from inside the
 runtime after the command exits. Its presence is also what keeps a second resume of the same
 trace from reporting the same work id again.
+
+**`effects_unfinished`**{ #effects-unfinished } — written once into the trace of a session
+`mur run --resume` launched, when the resumed session's trace holds `effect_started` lines that no
+`tool_call`, `skill_call` or `shell` line names. Nothing is written into the resumed session's trace
+
+| Field | Type | Notes |
+|---|---|---|
+| `from_session` | string | The session whose trace was read: its own `session_start.session_id`, or the session `--resume` named when that trace has no `session_start` |
+| `effects` | array of object | One object per unpaired `effect_started`, in the order they were written. Keys below |
+
+Each `effects` object, in this order:
+
+| Key | Type | Notes |
+|---|---|---|
+| `effect_id` | string | The `effect_started` line's `effect_id` |
+| `kind` | string | `"shell"` \| `"tool_call"` |
+| `tool_name` | string | |
+| `tool_call_id` | string \| null | |
+| `binary`, `command` | string | `kind: "shell"` only; absent otherwise |
+| `turn` | u32 | |
+| `task_id` | string \| null | |
+| `started_at_ms` | u64 | The `effect_started` line's own `timestamp` |
+
+The input is not repeated; it stays on the resumed session's `effect_started` line. The same list is
+handed to the resumed launch's first task — see
+[What a resume reports](../concepts/session-loop.md#what-a-resume-reports-about-the-session-before-it).
+Every resume of the same session writes the same list again.
 
 **`shell_detach_unrecorded`** — written when a command was moved to the background and its own
 `shell_detached` line could not be written

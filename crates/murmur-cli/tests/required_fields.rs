@@ -335,6 +335,13 @@ fn http_call_missing_operation_is_refused() {
     assert_eq!(calls.len(), 1, "trace was:\n{}", session.trace_raw);
     assert_eq!(calls[0]["status"], "error");
     assert_eq!(calls[0]["tool_call_id"], "toolu_edit");
+    // Nothing was dispatched, so nothing was journaled: no intent, and no effect on the refusal.
+    assert!(
+        session.events("effect_started").is_empty(),
+        "a refused call writes no intent:\n{}",
+        session.trace_raw
+    );
+    assert!(calls[0].get("effect_id").is_none(), "{}", calls[0]);
 
     session.assert_no_policy_refusal();
     assert_eq!(session.exit_status(), "ok");
@@ -384,6 +391,14 @@ fn a_complete_call_runs() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["status"], "ok");
     assert!(session.tool_result_text("toolu_edit").contains(TOOL_OUTPUT));
+    // A dispatched tool call is journaled as `kind: tool_call` and closed by its `tool_call`.
+    let started = session.events("effect_started");
+    assert_eq!(started.len(), 1, "{}", session.trace_raw);
+    assert_eq!(started[0]["kind"], "tool_call");
+    assert_eq!(started[0]["tool_name"], EDITOR);
+    assert_eq!(started[0]["tool_call_id"], "toolu_edit");
+    assert!(started[0].get("binary").is_none(), "{}", started[0]);
+    assert_eq!(calls[0]["effect_id"], started[0]["effect_id"]);
 }
 
 /// S5: a tool that declares no `input_schema` is not checked, whatever it is called with.

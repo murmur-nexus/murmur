@@ -417,6 +417,11 @@ fn denying_on_shell_hook_stops_the_command() {
         "nothing ran, so nothing is recorded as having run:\n{}",
         session.trace_raw
     );
+    assert!(
+        session.events("effect_started").is_empty(),
+        "a denied command is never journaled:\n{}",
+        session.trace_raw
+    );
 }
 
 /// An unconfined session's commands run as the operator, and a denying `on-shell` hook still
@@ -499,6 +504,11 @@ fn denying_on_tool_call_hook_stops_the_tool() {
             .iter()
             .any(|e| e["tool_name"] == "spender"),
         "a denied tool call is not recorded as a tool call:\n{}",
+        session.trace_raw
+    );
+    assert!(
+        session.events("effect_started").is_empty(),
+        "a denied tool call is never journaled:\n{}",
         session.trace_raw
     );
 }

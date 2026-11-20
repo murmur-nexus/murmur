@@ -4719,6 +4719,9 @@ fn launch(
             .resume
             .as_ref()
             .map(|resume| resume.trace_dir.clone());
+        // The session `--resume` named, which the unfinished-effects report falls back to when
+        // the resumed trace records no `session_start`.
+        let resume_from_session = trace_resumed_from.clone();
         let trace_context_id = supplied_context_id.clone();
         // Lineage for `session_start`, from the handle the spawning capsule's launcher injected.
         // Both `None` for a capsule nobody delegated, and both omitted from the record then.
@@ -5260,6 +5263,7 @@ fn launch(
                         harness_enforcement: harness_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
+                        unfinished_effects: None,
                         current_task_id: None,
                         image_limits: staged
                             .context
@@ -5471,6 +5475,25 @@ fn launch(
                             .ok()
                     });
                     if let Some(trace_dir) = resumed_trace_dir {
+                        // Calls the resumed session journaled and recorded no outcome for. The
+                        // resumed trace is only read; the report goes into this session's trace
+                        // and, as a fact, ahead of the first task's text — before the agent acts
+                        // on anything, unlike the loss report below, which runs after it.
+                        if let Some(effects) = crate::effect_journal::read_unfinished_effects(
+                            &trace_dir,
+                            resume_from_session.as_deref().unwrap_or_default(),
+                        ) {
+                            if let Err(error) = trace.write_effects_unfinished(&effects).await {
+                                crate::runtime_err!(
+                                    "[capsule-runtime] could not record effects_unfinished \
+                                     ({error}); the resumed agent is still told about the {} \
+                                     call(s) session {} left without an outcome",
+                                    effects.effects.len(),
+                                    effects.from_session
+                                );
+                            }
+                            state.unfinished_effects = Some(effects);
+                        }
                         if let Some(report) =
                             crate::detached_reconcile::reconcile_prior_session(
                                 &trace_dir,
@@ -6355,6 +6378,7 @@ fn launch(
         harness_enforcement: None,
         current_traceparent,
         current_task_provenance: None,
+        unfinished_effects: None,
         current_task_id: None,
         image_limits: murmur_artifact::ContextImagesConfig::default(),
         current_task_images: Vec::new(),
@@ -9228,6 +9252,11 @@ pub(crate) struct CapsuleStoreState {
     /// script-capsule path, which runs no task loop and so has no task in scope — that stamps
     /// `untrusted`, the safe class.
     pub(crate) current_task_provenance: Option<TaskProvenance>,
+    /// The calls the session `mur run --resume` resumed started and recorded no outcome for, set
+    /// once at launch by the resume and taken by the first fresh attempt of the first task the
+    /// launch runs, which reads them ahead of its task text. `None` on every other launch, and
+    /// once taken.
+    pub(crate) unfinished_effects: Option<crate::effect_journal::UnfinishedEffects>,
     /// The id of the task now in scope, set beside `current_task_provenance` at every
     /// task-activation site. The tool and driver stores dispatched for the task record it on each
     /// `member_request` they send. `None` on the script-capsule path.
@@ -20398,6 +20427,7 @@ inference:
             harness_enforcement: None,
             current_traceparent: None,
             current_task_provenance: None,
+            unfinished_effects: None,
             current_task_id: None,
             image_limits: murmur_artifact::ContextImagesConfig::default(),
             provider_tool_terms: crate::provider_tool::ProviderToolTerms::default(),
@@ -24238,6 +24268,7 @@ inference:
                     shell.stderr_bytes,
                     shell.duration_ms,
                     shell.resource_limit.clone(),
+                    None,
                 )
                 .await
                 .unwrap();
