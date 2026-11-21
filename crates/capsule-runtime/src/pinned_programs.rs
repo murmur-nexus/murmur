@@ -40,7 +40,7 @@ pub const FILES_DIR: &str = "files";
 pub const BIN_DIR: &str = "bin";
 
 /// The name prefix of an install in flight.
-pub const PARTIAL_PREFIX: &str = ".partial-";
+pub use crate::murmur_home::PARTIAL_PREFIX;
 
 /// The most bytes a download, and the tree unpacked from it, may hold: 2 GiB.
 pub const MAX_PINNED_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -133,27 +133,25 @@ pub enum PinnedStoreError {
 /// uncommitted.
 #[derive(Debug)]
 pub struct PartialDownload {
-    dir: PathBuf,
-    kept: bool,
+    partial: crate::murmur_home::PartialDir,
 }
 
 impl PartialDownload {
     /// Creates a fresh owner-only `.partial-*` folder under `store_root`.
     pub fn begin(store_root: &Path) -> Result<Self, PinnedStoreError> {
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random)
-            .map_err(|err| PinnedStoreError::Store(format!("no randomness for a name: {err}")))?;
-        let dir = store_root.join(format!(
-            "{PARTIAL_PREFIX}{:016x}",
-            u64::from_be_bytes(random)
-        ));
-        create_private_dir(&dir)?;
-        Ok(Self { dir, kept: false })
+        let partial = crate::murmur_home::PartialDir::create(store_root)
+            .map_err(|err| store_error(store_root, err))?;
+        Ok(Self { partial })
+    }
+
+    /// The folder being assembled.
+    fn dir(&self) -> &Path {
+        self.partial.path()
     }
 
     /// The file the download streams into.
     pub fn download_path(&self) -> PathBuf {
-        self.dir.join(DOWNLOAD_FILE)
+        self.dir().join(DOWNLOAD_FILE)
     }
 
     /// Opens [`Self::download_path`] for writing, owner-only.
@@ -165,14 +163,6 @@ impl PartialDownload {
             .mode(crate::murmur_home::PRIVATE_FILE_MODE)
             .open(self.download_path())
             .map_err(|err| store_error(&self.download_path(), err))
-    }
-}
-
-impl Drop for PartialDownload {
-    fn drop(&mut self) {
-        if !self.kept {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
     }
 }
 
@@ -220,7 +210,7 @@ pub(crate) fn commit_download_capped(
     cap: u64,
 ) -> Result<CommittedEntry, PinnedStoreError> {
     let entry = entry_path(store_root, &download.sha256)?;
-    let files = partial.dir.join(FILES_DIR);
+    let files = partial.dir().join(FILES_DIR);
     create_private_dir(&files)?;
     let downloaded = partial.download_path();
     let program_file = match &download.run {
@@ -260,7 +250,7 @@ pub(crate) fn commit_download_capped(
         }
     };
     let tree = list_tree(&files).map_err(PinnedStoreError::Store)?;
-    link_program(&partial.dir, program, &program_file)?;
+    link_program(partial.dir(), program, &program_file)?;
     let record = PinnedRecord {
         url: download.url.clone(),
         sha256: download.sha256.clone(),
@@ -270,11 +260,11 @@ pub(crate) fn commit_download_capped(
         fetched_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         files: tree,
     };
-    write_record(&partial.dir, &record)?;
+    write_record(partial.dir(), &record)?;
 
-    match std::fs::rename(&partial.dir, &entry) {
+    match std::fs::rename(partial.dir(), &entry) {
         Ok(()) => {
-            partial.kept = true;
+            partial.partial.keep();
             let program_path = std::fs::canonicalize(entry.join(FILES_DIR).join(&program_file))
                 .map_err(|err| store_error(&entry, err))?;
             Ok(CommittedEntry {

@@ -12,7 +12,7 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [capabilities.containment](../reference/containment.md#field-containment) | Whether a command can reach the store by its path |
+| [capabilities.containment](../reference/containment.md#field-containment) | Which containment class the capsule's commands must run under |
 | [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | Which programs the capsule's commands may run, by name |
 | [capabilities.filesystem.workdir_exec](../reference/containment.md#field-workdir-exec) | Whether build scripts the capsule compiles may run |
 | [capabilities.resources.workdir_max_bytes](../reference/resource-limits.md#host-resource-limits) | The ceiling the seed counts against with the work folder |
@@ -102,9 +102,11 @@ or procedural macros needs more:
 |---|---|
 | Linking build scripts and procedural macros | `cc`, `ld`, `as` and `ar` on `shell.allow`, and an `interpreter_runtime` entry for `cc` naming the folders it reads, as [Derived interpreter runtimes](../reference/containment.md#derived-interpreter-runtime) describes |
 | Compiling large crates | A larger [`capabilities.resources.memory_bytes`](../reference/resource-limits.md#address-space-and-memory): `rustc` on a large crate needs more address space than the default |
-| Running build scripts | [`capabilities.filesystem.workdir_exec: true`](../reference/containment.md#field-workdir-exec), which runs the capsule at `advisory`: a build script is a program the capsule compiled, and `scoped` and `sealed` run none. Every workspace crate with a `build.rs` compiles and runs it again in each clone, so this applies even when every dependency is seeded |
-Put the toolchain's own `bin` folder first on `PATH` when you run `mur`, rather than
-`~/.cargo/bin`.
+| Running build scripts | [`capabilities.filesystem.workdir_exec: true`](../reference/containment.md#field-workdir-exec), which caps the achieved class at `advisory`: a build script is a program the capsule compiled, and `scoped` and `sealed` run none. Commands still run under Landlock on Linux, so the store stays out of their reach. Every workspace crate with a `build.rs` compiles and runs it again in each clone, so this applies even when every dependency is seeded |
+
+Put the toolchain's own `bin` folder first on `PATH` when you run `mur`, so `cargo` and `rustc`
+resolve to the toolchain you lent rather than to the rustup proxies in `~/.cargo/bin`, which read
+`~/.rustup` outside it.
 
 ## Step 5 — run a capsule on another clone
 
@@ -135,8 +137,8 @@ When the entry matches but cannot be used, the run prints
 | Exact lockfile match | A `Cargo.lock` that differs by one byte finds no entry and builds cold. No nearest match is tried |
 | Same inputs as the host build | A unit is `Fresh` only with the same `rustc`, the same effective Cargo configuration and its sources at the same absolute path. A `~/.cargo/config.toml` the host build read but the capsule cannot changes the profile and rebuilds everything: lend it, or build without it |
 | The store is yours to fill | Only `mur build-cache add` writes the store; nothing a capsule produces is copied into it. Whatever folder you import becomes what every later capsule on that lockfile starts from. `add` refuses a folder inside `~/.murmur` |
-| Containment | At `scoped` and `sealed` no command can open the store. At `advisory` and `unconfined` nothing in the kernel stops a command that names it by path; the seed is still provided. A project with build scripts runs at `advisory`, so the store is protected only by its owner-only modes against other accounts, not against the capsule |
-| Disk | The seed counts against `capabilities.resources.workdir_max_bytes` at its full size, reflinked or not. An entry that would pass the ceiling is not seeded. On btrfs and XFS the copy shares extents with the store and costs almost nothing; on other filesystems it is a full copy |
+| Containment | On a Linux host with Landlock no command can open the store, whatever class the capsule declares, `workdir_exec: true` included. On a host without Landlock (macOS, older Linux) and under `mur run --unconfined`, nothing in the kernel stops a command that names the store by its path; the seed is still provided |
+| Disk | The seed counts against `capabilities.resources.workdir_max_bytes` at its full size, reflinked or not. An entry that would pass the ceiling is not seeded. On btrfs and XFS the copy shares extents with the store and costs almost nothing; on other filesystems it is a full copy. A `mur` process killed before its session ends leaves the seed in the session's records directory until [`trace.retain`](../reference/manifest.md#trace-retain) removes it |
 | Cargo only | The lookup reads `Cargo.lock` at the work folder's root and sets `CARGO_TARGET_DIR`; no other toolchain is cached |
 
 ## Summary

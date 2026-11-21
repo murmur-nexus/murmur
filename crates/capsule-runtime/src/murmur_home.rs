@@ -61,6 +61,64 @@ pub fn ensure_murmur_home_at(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The name prefix of a store folder being assembled, or of an entry being replaced: never read as
+/// an entry.
+pub const PARTIAL_PREFIX: &str = ".partial-";
+
+/// A store entry being assembled: an owner-only `<store_root>/.partial-<random>/`, removed when
+/// dropped unless [`Self::keep`] was called once it was renamed into place.
+#[derive(Debug)]
+pub struct PartialDir {
+    dir: PathBuf,
+    kept: bool,
+}
+
+impl PartialDir {
+    /// Creates a fresh owner-only `.partial-*` folder under `store_root`.
+    pub fn create(store_root: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = partial_name(store_root)?;
+        std::fs::DirBuilder::new()
+            .mode(MURMUR_HOME_DIR_MODE)
+            .create(&dir)?;
+        let partial = Self { dir, kept: false };
+        std::fs::set_permissions(
+            &partial.dir,
+            std::fs::Permissions::from_mode(MURMUR_HOME_DIR_MODE),
+        )?;
+        Ok(partial)
+    }
+
+    /// The folder being assembled.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Leaves the folder where it was renamed to: dropping no longer removes it.
+    pub fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for PartialDir {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// A fresh `<store_root>/.partial-<random>` name. Creates nothing.
+pub fn partial_name(store_root: &Path) -> std::io::Result<PathBuf> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|error| std::io::Error::other(format!("no randomness for a name: {error}")))?;
+    Ok(store_root.join(format!(
+        "{PARTIAL_PREFIX}{:016x}",
+        u64::from_be_bytes(random)
+    )))
+}
+
 /// Create `path` if missing and hold it at [`MURMUR_HOME_DIR_MODE`]. Only `path` itself gets the
 /// mode; a missing ancestor is created under the umask, so callers hold each level oldest first.
 pub fn hold_private_dir(path: &Path) -> Result<(), String> {

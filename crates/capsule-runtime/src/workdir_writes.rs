@@ -1028,12 +1028,6 @@ mod tests {
         ),
         (
             "build_cache.rs",
-            "drop",
-            "Removes an uncommitted `.partial-*` folder under `~/.murmur/build-cache`: the store, \
-             outside every work folder.",
-        ),
-        (
-            "build_cache.rs",
             "write_record",
             "Creates `entry.json` in a `.partial-*` folder under `~/.murmur/build-cache`: the \
              store, outside every work folder.",

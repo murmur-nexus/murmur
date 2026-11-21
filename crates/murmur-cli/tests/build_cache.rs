@@ -420,7 +420,7 @@ fn seed_dir(output: &Output) -> PathBuf {
     records_dir(output).join("home/.cache/cargo-target")
 }
 
-// ── S1: mur build-cache add and list ──────────────────────────────────────────────────
+// ── mur build-cache add and list ──────────────────────────────────────────────────
 
 #[test]
 fn build_cache_add_stores_an_operator_built_target_and_list_shows_it() {
@@ -622,7 +622,7 @@ fn build_cache_add_refusals_name_the_path_and_leave_the_store_unchanged() {
     assert!(entry.join("entry.json").is_file());
 }
 
-// ── S2, S4: a second capsule on the same lockfile starts warm ─────────────────────────
+// ── a second capsule on the same lockfile starts warm ─────────────────────────
 
 fn starts_warm_on(test: &str, containment: &str) {
     if capsule_runtime::skip_without_egress_namespace(test) {
@@ -685,7 +685,7 @@ fn starts_warm_on(test: &str, containment: &str) {
     // Removed when the session ended.
     assert!(!seed.exists());
 
-    // S4: nothing network-shaped between session_start and the first model request.
+    // Nothing network-shaped between session_start and the first model request.
     let events = trace(&output);
     let begin = events
         .iter()
@@ -734,7 +734,7 @@ fn a_second_capsule_on_the_same_lockfile_starts_warm_at_sealed() {
     );
 }
 
-// ── S3: no clone can corrupt or alter what another reads ──────────────────────────────
+// ── no clone can corrupt or alter what another reads ──────────────────────────────
 
 fn no_clone_alters_another_on(test: &str, containment: &str) {
     if capsule_runtime::skip_without_egress_namespace(test) {
@@ -821,7 +821,7 @@ fn no_clone_can_alter_what_another_reads_at_sealed() {
     no_clone_alters_another_on("no_clone_can_alter_what_another_reads_at_sealed", "sealed");
 }
 
-// ── S5: nothing changes where nothing matches ─────────────────────────────────────────
+// ── nothing changes where nothing matches ─────────────────────────────────────────
 
 #[test]
 fn nothing_changes_where_nothing_matches() {
@@ -897,7 +897,7 @@ fn nothing_changes_where_nothing_matches() {
     assert!(has_line(&text, "seed-present"), "{text}");
 }
 
-// ── S6: an unusable entry is reported and the run goes on cold ────────────────────────
+// ── an unusable entry is reported and the run goes on cold ────────────────────────
 
 #[test]
 fn an_unusable_entry_is_reported_with_w_run_014_and_the_run_goes_on() {
@@ -973,7 +973,7 @@ fn an_unusable_entry_is_reported_with_w_run_014_and_the_run_goes_on() {
     );
 }
 
-// ── S7: the seed is removed when the session ends, never through a link ───────────────
+// ── the seed is removed when the session ends, never through a link ───────────────
 
 fn removed_at_session_end_on(test: &str, containment: &str) {
     if capsule_runtime::skip_without_egress_namespace(test) {

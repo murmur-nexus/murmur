@@ -23,13 +23,15 @@
 //! ([`SeededTarget`]).
 
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::member_call::elapsed_ms;
+use crate::murmur_home::PartialDir;
 use crate::tree_copy::{CopyError, CopyOptions, Modes, Reflink, Unreadable};
 use crate::workdir_fs::{EntryKind, WorkdirRoot};
 
@@ -42,8 +44,7 @@ pub const ENTRY_FILE: &str = "entry.json";
 /// The folder of an entry holding the imported target folder.
 pub const ENTRY_TARGET_DIR: &str = "target";
 
-/// The name prefix of an import in flight, or of an entry being replaced.
-pub const PARTIAL_PREFIX: &str = ".partial-";
+pub use crate::murmur_home::PARTIAL_PREFIX;
 
 /// The file at a work folder's root whose bytes key the lookup.
 pub const LOCKFILE_NAME: &str = "Cargo.lock";
@@ -222,9 +223,10 @@ pub fn add(
     crate::murmur_home::hold_private_dir(store_root)
         .map_err(|reason| io(store_root, std::io::Error::other(reason)))?;
 
-    let partial = Partial::create(store_root).map_err(|e| io(store_root, e))?;
-    let target = partial.dir.join(ENTRY_TARGET_DIR);
-    create_private_dir(&target).map_err(|e| io(&target, e))?;
+    let partial = PartialDir::create(store_root).map_err(|e| io(store_root, e))?;
+    let target = partial.path().join(ENTRY_TARGET_DIR);
+    crate::murmur_home::hold_private_dir(&target)
+        .map_err(|reason| io(&target, std::io::Error::other(reason)))?;
     let held = |path: &Path| {
         WorkdirRoot::open(path).map_err(|error| io(path, std::io::Error::from(error)))
     };
@@ -257,13 +259,11 @@ pub fn add(
         bytes: copied.bytes,
         rustc: rustc_of_target(&resolved),
     };
-    let record_path = partial.dir.join(ENTRY_FILE);
+    let record_path = partial.path().join(ENTRY_FILE);
     write_record(&record_path, &record).map_err(|e| io(&record_path, e))?;
 
     let entry = store_root.join(&key);
-    partial
-        .commit(store_root, &entry)
-        .map_err(|e| io(&entry, e))?;
+    commit(partial, store_root, &entry).map_err(|e| io(&entry, e))?;
     Ok(AddedEntry {
         entry,
         record,
@@ -271,67 +271,29 @@ pub fn add(
     })
 }
 
-/// An import in flight: `<store>/.partial-<random>/`, removed when dropped uncommitted.
-struct Partial {
-    dir: PathBuf,
-    kept: bool,
-}
-
-impl Partial {
-    fn create(store_root: &Path) -> std::io::Result<Self> {
-        let dir = partial_name(store_root)?;
-        create_private_dir(&dir)?;
-        Ok(Self { dir, kept: false })
-    }
-
-    /// Moves the assembled folder to `entry`. An entry already there is first renamed to a
-    /// `.partial-*` name, then removed once the new one is in place, or put back if it is not.
-    fn commit(mut self, store_root: &Path, entry: &Path) -> std::io::Result<()> {
-        let replaced = match std::fs::symlink_metadata(entry) {
-            Ok(_) => {
-                let aside = partial_name(store_root)?;
-                std::fs::rename(entry, &aside)?;
-                Some(aside)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = std::fs::rename(&self.dir, entry) {
-            if let Some(aside) = &replaced {
-                let _ = std::fs::rename(aside, entry);
-            }
-            return Err(error);
+/// Moves the assembled `partial` to `entry`. An entry already there is first renamed to a
+/// `.partial-*` name, then removed once the new one is in place, or put back if it is not.
+fn commit(mut partial: PartialDir, store_root: &Path, entry: &Path) -> std::io::Result<()> {
+    let replaced = match std::fs::symlink_metadata(entry) {
+        Ok(_) => {
+            let aside = crate::murmur_home::partial_name(store_root)?;
+            std::fs::rename(entry, &aside)?;
+            Some(aside)
         }
-        self.kept = true;
-        if let Some(aside) = replaced {
-            std::fs::remove_dir_all(&aside)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = std::fs::rename(partial.path(), entry) {
+        if let Some(aside) = &replaced {
+            let _ = std::fs::rename(aside, entry);
         }
-        Ok(())
+        return Err(error);
     }
-}
-
-impl Drop for Partial {
-    fn drop(&mut self) {
-        if !self.kept {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+    partial.keep();
+    if let Some(aside) = replaced {
+        std::fs::remove_dir_all(&aside)?;
     }
-}
-
-fn partial_name(store_root: &Path) -> std::io::Result<PathBuf> {
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random)
-        .map_err(|error| std::io::Error::other(format!("no randomness for a name: {error}")))?;
-    Ok(store_root.join(format!(
-        "{PARTIAL_PREFIX}{:016x}",
-        u64::from_be_bytes(random)
-    )))
-}
-
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new()
-        .mode(crate::murmur_home::MURMUR_HOME_DIR_MODE)
-        .create(path)
+    Ok(())
 }
 
 fn write_record(path: &Path, record: &EntryRecord) -> std::io::Result<()> {
@@ -709,10 +671,6 @@ fn read_root_lockfile(workdir: &WorkdirRoot) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() as u64 <= MAX_LOCKFILE_BYTES).then_some(bytes)
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
