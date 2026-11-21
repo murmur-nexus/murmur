@@ -91,6 +91,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 ### Runtime & Security
 
 - [Containment](/reference/containment.md): The enforcement tier each host resolves to, and the containment class a capsule can require of it.
+- [Contained Capsule Limits](/reference/capsule-limits.md): Every limit a `scoped` or `sealed` capsule's commands run into, the grant that lifts each, and what each `mur doctor --programs` cause means.
 - [Resource Limits](/reference/resource-limits.md): `capabilities.limits` (bounding components) versus `capabilities.resources` (bounding OS processes).
 - [Session Directories](/reference/workdir.md): The three locations every session has — the work folder the capsule works in, the records directory the runtime keeps about it, and the runtime directory it writes for its own use.
 - [Resource Plane](/reference/resource-plane.md): The two read-only file surfaces a capsule serves under `/resources/`, each addressing a separate subtree for a separate audience.

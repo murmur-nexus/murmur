@@ -15,7 +15,7 @@ const PAGE: &str = "reference/capsule-limits.md";
 /// The rows every limit section's table holds, in this order.
 const LIMIT_ROWS: [&str; 5] = ["What fails", "Why", "Lifted by", "Shown by", "Doctor"];
 
-/// Anchors other pages, cards and the doctor's grant text link to.
+/// Anchors other pages link to; renaming one breaks every link into the page.
 const REQUIRED_ANCHORS: [&str; 7] = [
     "doctor-causes",
     "no-network",
@@ -152,6 +152,14 @@ fn anchors(lines: &[&str]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The `#anchor` of each same-page link in a cell: `[Namespaces](#namespaces)` → `namespaces`.
+fn link_targets(cell: &str) -> Vec<&str> {
+    cell.split("](#")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next())
+        .collect()
+}
+
 /// The cause table: first cell (the backticks stripped) → second cell.
 fn cause_table(lines: &[&str]) -> BTreeMap<String, String> {
     let heading = lines
@@ -193,11 +201,7 @@ fn every_cause_row_links_to_a_limit_section_on_the_page() {
     let lines = prose_lines(&text);
     let page_anchors = anchors(&lines);
     for (cause, limit) in cause_table(&lines) {
-        let targets: Vec<&str> = limit
-            .split("](#")
-            .skip(1)
-            .filter_map(|rest| rest.split(')').next())
-            .collect();
+        let targets = link_targets(&limit);
         assert!(
             !targets.is_empty(),
             "the row for `{cause}` links to no section of the page: {limit:?}"
@@ -278,4 +282,71 @@ fn the_page_is_in_the_reference_nav_right_after_containment() {
         previous.contains("reference/containment.md"),
         "{PAGE} should follow the Containment entry in the nav, but follows {previous:?}"
     );
+}
+
+/// The limit sections, by anchor, each with its `Doctor` row.
+fn doctor_rows(lines: &[&str]) -> BTreeMap<String, String> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("### "))
+        .filter_map(|(i, line)| {
+            let anchor = heading_anchor(line)?.to_string();
+            let doctor = first_table(lines, i + 1)
+                .into_iter()
+                .find(|row| row[0] == "Doctor")?;
+            Some((anchor, doctor.get(1).cloned().unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// The backticked spans of a cell.
+fn backticked(cell: &str) -> Vec<&str> {
+    cell.split('`').skip(1).step_by(2).collect()
+}
+
+/// The backticked words of a cell shaped like a multi-word cause, `not-installed`. A one-word
+/// cause such as `failed` is indistinguishable from a program name, so it is not collected.
+fn kebab_words(cell: &str) -> Vec<&str> {
+    backticked(cell)
+        .into_iter()
+        .filter(|word| {
+            word.contains('-')
+                && word
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase()))
+        })
+        .collect()
+}
+
+#[test]
+fn each_sections_doctor_row_agrees_with_the_cause_table() {
+    let text = page();
+    let lines = prose_lines(&text);
+    let rows = doctor_rows(&lines);
+    let doctor = doctor_causes();
+    let mut problems = Vec::new();
+
+    for (anchor, cell) in &rows {
+        for word in kebab_words(cell) {
+            if !doctor.contains(word) {
+                problems.push(format!(
+                    "#{anchor}'s Doctor row names `{word}`, a cause the doctor never prints"
+                ));
+            }
+        }
+    }
+    for (cause, limit) in cause_table(&lines) {
+        for target in link_targets(&limit) {
+            let named = rows
+                .get(target)
+                .is_some_and(|cell| backticked(cell).contains(&cause.as_str()));
+            if !named {
+                problems.push(format!(
+                    "the row for `{cause}` links to #{target}, whose Doctor row does not name it"
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

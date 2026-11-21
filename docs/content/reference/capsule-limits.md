@@ -2,9 +2,9 @@
 
 Every limit on this page applies to a capsule whose `mur run --explain-scope` reports
 `achieved: scoped` or `achieved: sealed`. On a Linux host with Landlock that is every capsule that
-does not set `capabilities.filesystem.workdir_exec: true`, whatever class it declares; with that key
-the capsule reports `achieved: advisory` and keeps every limit but
-[Programs the capsule writes](#workdir-exec). An [unconfined launch](containment.md#unconfined)
+does not set `capabilities.filesystem.workdir_exec: true` and whose work folder does not contain
+`~/.murmur`, whatever class it declares. With `workdir_exec: true` the capsule reports
+`achieved: advisory` and keeps every limit but [Programs the capsule writes](#workdir-exec). An [unconfined launch](containment.md#unconfined)
 lifts every limit except the resource limits the manifest declares, and a host with no kernel
 containment enforces only what the [tier table](containment.md#subprocess-enforcement-tiers) gives
 it.
@@ -214,7 +214,7 @@ RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo mur run --task task.md
 | What the next probe needs | `mur doctor --programs cargo` |
 | The compiler folders | The commands under [Compiler helpers](#compiler-helpers) |
 
-Every clone builds its dependencies from cold;
+A fresh work folder builds every dependency from cold;
 [How to share a build cache between capsules](../how-to/share-a-build-cache.md) seeds them. In a
 `bash` command `time` is a shell keyword: `command time -v` runs `/usr/bin/time`, which `time` in
 `shell.allow` grants.
@@ -369,7 +369,7 @@ Every clone builds its dependencies from cold;
 
 | | |
 |---|---|
-| What fails | Past `cgroup_memory_bytes` the tree is OOM-killed; past `cgroup_pids_max` a fork fails with `EAGAIN`; each names its limit in a `resource_limit:` line. `cgroup_cpu_percent` and `cgroup_io_bytes_per_sec` slow the tree down |
+| What fails | Past `cgroup_memory_bytes` the tree is OOM-killed; past `cgroup_pids_max` a fork fails with `EAGAIN`. A `resource_limit:` line names the limit when no other command ran in the scope at the same time. `cgroup_cpu_percent` and `cgroup_io_bytes_per_sec` slow the tree down |
 | Why | A cgroup scope bounds the whole subprocess tree. See [Host resource limits](resource-limits.md#host-resource-limits) and [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | Lifted by | A larger value of each `capabilities.resources.cgroup_*` field |
 | Shown by | The `Memory bound` and `Cgroup scope` blocks of `mur doctor`; `io.max:` under `Resource plane` in `mur run --explain-scope` |
