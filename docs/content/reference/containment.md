@@ -8,6 +8,8 @@ enforcement tier each host resolves to, the containment class a capsule can requ
 fixed grants a contained capsule receives, and how each claim is checked.
 [`mur doctor --programs`](cli.md#doctor-programs) starts programs inside the sandbox a capsule
 would get on this host and reports what it cannot run, with the grant that would lift each refusal.
+[What a contained capsule cannot do](capsule-limits.md) lists every limit a `scoped` or `sealed`
+capsule's commands run into, each with the grant that lifts it and the command that shows it.
 
 ---
 

@@ -1651,7 +1651,8 @@ Each grant that edits the manifest also says to add the program to `capabilities
 when the manifest does not name it, and no grant names a program the manifest already grants.
 Follow a grant and probe again to get the next missing piece: a C compiler or a cargo build
 typically needs several in turn. Under the unconfined stance no cause puts a failure down to a
-sandbox: a failure there is `failed`.
+sandbox: a failure there is `failed`. [What a contained capsule cannot do](capsule-limits.md#doctor-causes)
+maps each cause to the limit behind it.
 
 ### Murmur home { #doctor-murmur-home }
 

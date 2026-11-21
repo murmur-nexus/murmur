@@ -176,6 +176,10 @@ Run Playwright's test runner through `node` rather than through `npx playwright`
 node node_modules/@playwright/test/cli.js test
 ```
 
+A browser that fails on a file or library outside its grants has met one of the limits
+[What a contained capsule cannot do](../reference/capsule-limits.md) lists, with the grant that
+lifts each.
+
 Install the project's dependencies on the host before the run, or with `npm ci --ignore-scripts`
 inside the capsule as [How to run Node tests in a capsule](run-node-tests-in-capsule.md) shows.
 
