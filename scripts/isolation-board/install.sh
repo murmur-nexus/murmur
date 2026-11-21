@@ -10,7 +10,7 @@
 # trusted copies after a reviewed change to any of them lands.
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ $# -ge 1 ] && [ $# -le 2 ] || { echo "usage: install.sh <project-dir> [<trusted-tree>]" >&2; exit 2; }
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then echo "usage: install.sh <project-dir> [<trusted-tree>]" >&2; exit 2; fi
 PROJECT="$(cd "$1" && pwd)" || { echo "no project directory at $1" >&2; exit 2; }
 TRUSTED="$(cd "${2:-$HERE/../..}" && git rev-parse --show-toplevel)" || { echo "${2:-$HERE/../..} is not a git tree" >&2; exit 2; }
 BOARD="$PROJECT/.nexus/transit"

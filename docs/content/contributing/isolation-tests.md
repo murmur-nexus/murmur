@@ -9,7 +9,7 @@ host-skip line and returns, and nextest counts it as a pass:
 | Host-skip line | Printed by |
 |---|---|
 | `[SKIP-HOST] <test>: <reason>` | the `capsule_runtime` host checks and murmur-cli's test helpers |
-| `skipping <test>: <reason>` | six `capsule-runtime` sandbox tests, the `kernel_tier_*` move, link and truncate tests among them |
+| `skipping <test>: <reason>` | `capsule-runtime` sandbox tests that need the kernel tier with a Landlock ruleset, the `kernel_tier_*` move, link and truncate tests among them |
 
 This page covers how a Transit board proves those tests through a card, with per-test results in
 which a skip is never a pass.
@@ -25,7 +25,7 @@ therefore not a route: a capsule cannot give a test the namespaces the capsule i
 | Placement | What it needs | What it can prove |
 |---|---|---|
 | Contained capsule (a board's capsule stage) | nothing beyond the board | every test that needs no namespace of its own. Each isolation test passes with a host-skip line, which proves nothing about isolation |
-| Unconfined capsule (`mur run --unconfined`, or `containment: unconfined`) | the operator gives up the capsule's boundary for the whole session | the isolation tests, since nothing sits between the commands and the host. The model's commands then run with the operator's `HOME`, credentials and `sudo` |
+| Unconfined capsule (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`) | the operator gives up the capsule's boundary for the whole session | the isolation tests, since nothing sits between the commands and the host. The model's commands then run with the operator's `HOME`, credentials and `sudo` |
 | Host runner (`scripts/isolation-proofs.py run`, in a board's script stage) | the host grants below | the isolation tests, run as the operator outside any sandbox, with evidence a judging stage checks |
 
 The reference board uses the host runner. It runs only the named test sets, not a model's
@@ -161,7 +161,7 @@ and in the card's log, and `nexus transit why <card>` shows its first failing li
 | Command | 0 | 1 | 2 | 3 |
 |---|---|---|---|---|
 | `run` | every test passed | a test failed | refused; no evidence file exists | no test failed, but one was skipped for the host or never ran |
-| `judge` | pass | a failure, a test with no evidence, or a missing required set or test | the evidence is unusable: wrong format, another commit, a changed tree, or a JUnit report whose hash no longer matches | |
+| `judge` | pass | a failure, a test with no evidence, or a missing required set or test | the evidence is unusable: wrong format, another commit, a changed tree, a JUnit report that is missing or whose hash no longer matches, a test whose recorded status differs from its report, or, with `--require-set`, a different classification | |
 | `list`, `handover` | done | | refused: a malformed classification or report | |
 
 `run` refuses as root, inside a sandbox, without `cargo-nextest`, for an unknown or empty

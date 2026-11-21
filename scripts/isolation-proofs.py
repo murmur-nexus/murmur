@@ -77,8 +77,9 @@ FEATURE_RE = re.compile(r"[A-Za-z0-9_/+.-]+")
 EXACT_NAME_RE = re.compile(r"[A-Za-z0-9_:]+")
 
 # A host skip: a line holding `[SKIP-HOST]` (the capsule_runtime helpers and murmur-cli's
-# `common::tiers`), or one starting `skipping <test>:` (six capsule-runtime sandbox tests,
-# `scoped_landlock_enforcement` among them). Leading whitespace is ignored.
+# `common::tiers`), or one starting `skipping <test>:` (capsule-runtime sandbox tests that need the
+# kernel tier, every caller of `scoped_landlock_enforcement` among them). Leading whitespace is
+# ignored.
 HOST_SKIP_MARK = "[SKIP-HOST]"
 UNPREFIXED_SKIP_RE = re.compile(r"skipping \S+:")
 FAILURE_TAGS = ("failure", "error", "flakyFailure", "flakyError", "rerunFailure", "rerunError")
