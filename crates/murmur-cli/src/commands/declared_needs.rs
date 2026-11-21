@@ -30,6 +30,22 @@ pub(crate) fn installed_declared_needs(
     capsule_writable: &[&Path],
     pinned: &[capsule_runtime::pinned_programs::ResolvedPinnedProgram],
 ) -> Result<Vec<ResolvedProgramNeeds>, CliError> {
+    let tools = installed_declared_tool_needs(artifacts, lock, project_dir)?;
+    Ok(capsule_runtime::declared_needs::derive_declared_needs(
+        &tools,
+        shell_allow,
+        capsule_writable,
+        pinned,
+    ))
+}
+
+/// The declared program needs of each `runtime: tool` entry of `artifacts`, read from the stores
+/// as [`installed_declared_needs`] reads them, before they are resolved against a `shell.allow`.
+pub(crate) fn installed_declared_tool_needs(
+    artifacts: &[RuntimeArtifact],
+    lock: Option<&MurmurLock>,
+    project_dir: &Path,
+) -> Result<Vec<DeclaredToolNeeds>, CliError> {
     let registry = FallbackRegistry {
         primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
@@ -72,12 +88,7 @@ pub(crate) fn installed_declared_needs(
             programs,
         });
     }
-    Ok(capsule_runtime::declared_needs::derive_declared_needs(
-        &tools,
-        shell_allow,
-        capsule_writable,
-        pinned,
-    ))
+    Ok(tools)
 }
 
 /// The trees a launch with `workdir_root` lets the capsule's commands write, owned, for

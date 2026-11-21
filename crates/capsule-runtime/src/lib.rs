@@ -111,6 +111,7 @@ pub mod plan;
 pub mod precompile;
 pub mod proc_view;
 pub mod process_driver;
+pub mod program_probe;
 pub(crate) mod protected_paths;
 pub mod provider_tool;
 pub(crate) mod race;

@@ -201,6 +201,7 @@ section that explains it.
 | `W-RUN-012` | A tool the capsule pins pins a download of a program `shell.allow` grants, and nothing usable runs under that name, or the stored copy fails its checksum | [W-RUN-012](#w-run-012) |
 | `W-RUN-013` | `mur doctor` could not tell whether a `transport: process` harness is logged in | [W-RUN-013](#w-run-013) |
 | `W-RUN-014` | The build cache holds an entry for the work folder's `Cargo.lock`, and it could not be seeded into the session | [W-RUN-014](#w-run-014) |
+| `W-RUN-015` | `mur doctor --programs` probed a program `capabilities.shell.allow` grants, and it cannot run in this capsule | [W-RUN-015](#w-run-015) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -3872,6 +3873,24 @@ warning[W-RUN-014]: build cache entry <entry> matches this work folder's Cargo.l
 Whatever was copied is removed, `CARGO_TARGET_DIR` is not set, and the session runs and builds without the seed. `session_start.build_cache` records the same reason with `outcome: "skipped"`.
 
 **What to do:** raise `capabilities.resources.workdir_max_bytes`, fix the entry's permissions, or add the entry again.
+
+### W-RUN-015 — a granted program that cannot run in this capsule { #w-run-015 }
+
+```text
+[mur doctor] warning[W-RUN-015]: unshare is in capabilities.shell.allow and cannot run in this capsule: the capsule's seccomp filter refuses unshare, setns, mount, pivot_root and chroot at every contained floor; unshare exited 1
+```
+
+**Fires when** [`mur doctor --programs`](cli.md#doctor-programs) starts a program
+`capabilities.shell.allow` grants inside the sandbox this capsule would get on this host, and the
+probe does not exit 0. The line goes to stderr and the warning is counted. The finding's `subject`
+is the program, its message
+`<program> is in capabilities.shell.allow and cannot run in this capsule: <reason>`, and its `Fix:`
+the probe's grant, or `see the Programs section of mur doctor --programs` when the cause
+(`failed`, `timed-out`) has none. The [causes](cli.md#doctor-programs-causes) table lists each
+cause and its grant.
+
+Nothing is refused: `mur run` still launches, and a command naming the program fails as the probe
+did.
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 

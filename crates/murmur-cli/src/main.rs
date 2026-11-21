@@ -215,6 +215,11 @@ enum Commands {
         /// Print one JSON document: the verdict, the exit code, the tally and every finding
         #[arg(long)]
         json: bool,
+        /// Start each named program, comma-separated, inside the sandbox this project's capsule
+        /// would get here and report whether it runs; with no names, a fixed list of common
+        /// programs then every capabilities.shell.allow entry
+        #[arg(long, value_name = "NAMES", value_delimiter = ',', num_args = 0..=1)]
+        programs: Option<Vec<String>>,
     },
     /// Build a .mur.zip artifact from a source directory
     Build {
@@ -791,7 +796,11 @@ fn main() {
             run_version(json);
             Ok(())
         }
-        Commands::Doctor { bind, json } => run_doctor(&bind, json),
+        Commands::Doctor {
+            bind,
+            json,
+            programs,
+        } => run_doctor(&bind, json, programs.as_deref()),
         Commands::Build { source, output } => run_build(&source, output.as_deref()),
         Commands::Publish { artifact_path } => run_publish(artifact_path.as_deref()),
         Commands::Install {

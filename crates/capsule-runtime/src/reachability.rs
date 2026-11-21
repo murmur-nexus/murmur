@@ -229,7 +229,7 @@ pub(crate) fn shebang_line_of(head: &[u8]) -> Option<String> {
 
 /// Last path component of `raw`, as an owned `String`. `None` for an empty or root-only string,
 /// which cannot name a binary.
-fn base_name(raw: &str) -> Option<String> {
+pub(crate) fn base_name(raw: &str) -> Option<String> {
     Path::new(raw)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
