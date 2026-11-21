@@ -679,7 +679,7 @@ pub(crate) mod tests {
         let can_reflink = reflinks_in(scratch.path());
         if !can_reflink {
             crate::runtime_err!(
-                "[SKIP-HOST] {} cannot reflink: only the copy branch runs",
+                "{} cannot reflink: the reflink branch falls back to copying",
                 scratch.path().display()
             );
         }

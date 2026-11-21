@@ -755,14 +755,26 @@ fn no_clone_alters_another_on(test: &str, containment: &str) {
     let warm = world.operator_build(&clone_a);
     let entry = world.add(&clone_a, &warm);
     let before = digest(&entry);
-    let rlib = before
+    // Cargo before 1.100 writes the rlib to `debug/deps/`, later releases to
+    // `debug/build/dep-a/<hash>/out/`: the entry says where this toolchain put it.
+    let (rlib_rel, rlib) = before
         .iter()
-        .find(|(rel, _)| rel.starts_with("target/debug/deps/libdep_a-") && rel.ends_with(".rlib"))
-        .map(|(rel, bytes)| (entry.join(rel), sha256_hex(bytes)))
+        .find(|(rel, _)| {
+            let name = Path::new(rel).file_name().unwrap().to_string_lossy();
+            rel.starts_with("target/debug/")
+                && name.starts_with("libdep_a-")
+                && name.ends_with(".rlib")
+        })
+        .map(|(rel, bytes)| {
+            let within = rel.strip_prefix("target/").unwrap().to_string();
+            (within, (entry.join(rel), sha256_hex(bytes)))
+        })
         .expect("dep-a's rlib in the entry");
     let reflinks = reflinks_in(&world.base);
 
-    let corrupt = "for f in \"$CARGO_TARGET_DIR\"/debug/deps/libdep_a-*.rlib; do printf junk > \"$f\" && echo \"corrupted $f\"; done";
+    let corrupt = format!(
+        "f=\"$CARGO_TARGET_DIR\"/{rlib_rel}; printf junk > \"$f\" && echo \"corrupted $f\""
+    );
     let plant = format!(
         "echo x > {}; echo \"exit=$?\"",
         entry.join("target/planted").display()
@@ -771,7 +783,7 @@ fn no_clone_alters_another_on(test: &str, containment: &str) {
     let (output, requests) = world.run(
         Some(&clone_a),
         vec![
-            bash("c1", corrupt),
+            bash("c1", &corrupt),
             bash("c2", &plant),
             bash("c3", &overwrite),
         ],
@@ -797,7 +809,7 @@ fn no_clone_alters_another_on(test: &str, containment: &str) {
     }
     assert_eq!(digest(&entry), before, "the store is unchanged");
 
-    let check = format!("sha256sum \"$CARGO_TARGET_DIR\"/debug/deps/libdep_a-*.rlib; {BUILD}");
+    let check = format!("sha256sum \"$CARGO_TARGET_DIR\"/{rlib_rel}; {BUILD}");
     let (output, requests) = world.run(Some(&clone_b), vec![bash("r2", &check)], &[]);
     assert_ok(&output);
     let report = session_start(&output)["build_cache"].clone();
