@@ -15,8 +15,9 @@ const PAGE: &str = "reference/capsule-limits.md";
 /// The rows every limit section's table holds, in this order.
 const LIMIT_ROWS: [&str; 5] = ["What fails", "Why", "Lifted by", "Shown by", "Doctor"];
 
-/// Anchors other pages link to; renaming one breaks every link into the page.
-const REQUIRED_ANCHORS: [&str; 7] = [
+/// Anchors other pages and the scope report's readers link to; renaming one breaks every link
+/// into the page.
+const REQUIRED_ANCHORS: [&str; 12] = [
     "doctor-causes",
     "no-network",
     "home-folder",
@@ -24,6 +25,21 @@ const REQUIRED_ANCHORS: [&str; 7] = [
     "namespaces",
     "compiler-helpers",
     "cargo",
+    "environment",
+    "memory-bytes",
+    "workdir-size",
+    "process-limits",
+    "cgroup-limits",
+];
+
+/// The sections whose `Shown by` row names lines of `mur run --explain-scope`'s `Resources` and
+/// `Shell environment` blocks.
+const EXPLAIN_SCOPE_SECTIONS: [&str; 5] = [
+    "memory-bytes",
+    "workdir-size",
+    "process-limits",
+    "cgroup-limits",
+    "environment",
 ];
 
 fn docs_dir() -> PathBuf {
@@ -284,20 +300,25 @@ fn the_page_is_in_the_reference_nav_right_after_containment() {
     );
 }
 
-/// The limit sections, by anchor, each with its `Doctor` row.
-fn doctor_rows(lines: &[&str]) -> BTreeMap<String, String> {
+/// The limit sections, by anchor, each with its row called `name`.
+fn section_rows(lines: &[&str], name: &str) -> BTreeMap<String, String> {
     lines
         .iter()
         .enumerate()
         .filter(|(_, line)| line.starts_with("### "))
         .filter_map(|(i, line)| {
             let anchor = heading_anchor(line)?.to_string();
-            let doctor = first_table(lines, i + 1)
+            let row = first_table(lines, i + 1)
                 .into_iter()
-                .find(|row| row[0] == "Doctor")?;
-            Some((anchor, doctor.get(1).cloned().unwrap_or_default()))
+                .find(|row| row[0] == name)?;
+            Some((anchor, row.get(1).cloned().unwrap_or_default()))
         })
         .collect()
+}
+
+/// The limit sections, by anchor, each with its `Doctor` row.
+fn doctor_rows(lines: &[&str]) -> BTreeMap<String, String> {
+    section_rows(lines, "Doctor")
 }
 
 /// The backticked spans of a cell.
@@ -349,4 +370,129 @@ fn each_sections_doctor_row_agrees_with_the_cause_table() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn every_limit_section_names_a_mur_command_that_shows_it() {
+    let text = page();
+    let lines = prose_lines(&text);
+    let rows = section_rows(&lines, "Shown by");
+    assert!(!rows.is_empty(), "{PAGE} has no `Shown by` rows");
+    let mut problems = Vec::new();
+    for (anchor, cell) in &rows {
+        if !backticked(cell)
+            .iter()
+            .any(|span| span.starts_with("mur ") || *span == "mur")
+        {
+            problems.push(format!(
+                "#{anchor}'s Shown by row names no `mur …` command: {cell:?}"
+            ));
+        }
+        if cell.contains("No `mur` command") {
+            problems.push(format!(
+                "#{anchor}'s Shown by row says no `mur` command shows it"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The output of `mur run --explain-scope` on a fresh project, under a fresh `HOME` outside
+/// `/tmp` with an empty `~/.murmur/config.yaml`.
+fn explain_scope_text() -> String {
+    let scratch = tempfile::Builder::new()
+        .prefix("capsule-limits-doc")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let home = scratch.path().join("home");
+    let project = scratch.path().join("project");
+    fs::create_dir_all(home.join(".murmur")).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(home.join(".murmur/config.yaml"), "").unwrap();
+    fs::write(
+        project.join("murmur.yaml"),
+        "name: limits-fixture\nversion: 0.1.0\ncapabilities:\n  shell:\n    allow: [bash]\n",
+    )
+    .unwrap();
+    fs::write(project.join("capsule.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_mur"))
+        .env("HOME", &home)
+        .current_dir(&project)
+        .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+/// The text report's blocks: each unindented heading line with the labels of its indented lines,
+/// a label being a line's text up to and including its first `:`.
+fn report_blocks(report: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut blocks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut current = None;
+    for line in report.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            current = Some(line.trim().to_string());
+            blocks.entry(line.trim().to_string()).or_default();
+        } else if let (Some(block), Some(colon)) = (&current, line.find(':')) {
+            let label = line[..=colon].trim().to_string();
+            blocks.get_mut(block).unwrap().insert(label);
+        }
+    }
+    blocks
+}
+
+/// Each line label the five resource and environment sections name, such as `memory_bytes:`, is
+/// a line of an `--explain-scope` block the same cell names, such as `Resources`.
+#[test]
+fn the_explain_scope_labels_the_page_names_are_printed() {
+    let text = page();
+    let lines = prose_lines(&text);
+    let rows = section_rows(&lines, "Shown by");
+    let report = explain_scope_text();
+    let blocks = report_blocks(&report);
+    for heading in ["Resources", "Shell environment"] {
+        assert!(
+            blocks.contains_key(heading),
+            "no {heading} block:\n{report}"
+        );
+    }
+
+    let mut problems = Vec::new();
+    for anchor in EXPLAIN_SCOPE_SECTIONS {
+        let Some(cell) = rows.get(anchor) else {
+            problems.push(format!("#{anchor} has no Shown by row"));
+            continue;
+        };
+        let spans = backticked(cell);
+        let named_blocks: Vec<&BTreeSet<String>> =
+            spans.iter().filter_map(|span| blocks.get(*span)).collect();
+        let labels: Vec<&str> = spans
+            .iter()
+            .copied()
+            .filter(|span| span.ends_with(':'))
+            .collect();
+        if named_blocks.is_empty() || labels.is_empty() {
+            problems.push(format!(
+                "#{anchor}'s Shown by row names no `--explain-scope` block and line: {cell:?}"
+            ));
+        }
+        for label in labels {
+            if !named_blocks.iter().any(|block| block.contains(label)) {
+                problems.push(format!(
+                    "#{anchor} names `{label}`, which no block its Shown by row names prints"
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "{}\n--- mur run --explain-scope ---\n{report}",
+        problems.join("\n")
+    );
 }

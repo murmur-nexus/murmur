@@ -278,7 +278,7 @@ A fresh work folder builds every dependency from cold;
 | What fails | A host variable the command expects is unset: `AWS_PROFILE`, `SSH_AUTH_SOCK`, `NODE_OPTIONS` |
 | Why | A shell command starts from an empty environment plus a fixed baseline, with every credential-shaped name removed. See [Process environment](manifest.md#process-environment) |
 | Lifted by | The name in `capabilities.shell.baseline_env`, with `mur run` started with it set. A name that matches a credential pattern or `capabilities.shell.strip_env` is always removed, and `HOME`, `TMPDIR`, `TMP` and `TEMP` are always the session's |
-| Shown by | No `mur` command prints a command's environment; `capabilities.shell.baseline_env` and `strip_env` in `murmur.yaml` are the whole of it |
+| Shown by | The `Shell environment` block of `mur run --explain-scope`, names only: `baseline:` (passed through when `mur run` has them set), `always removed:`, `strip env:` and `session's own:`. The session also sets `CARGO_TARGET_DIR` when it holds a [build cache](../how-to/share-a-build-cache.md) seed |
 | Doctor | Not reported by `mur doctor` |
 
 ## Network { #network }
@@ -352,7 +352,7 @@ A fresh work folder builds every dependency from cold;
 | What fails | `memory allocation of … bytes failed` and `SIGABRT` from `rustc`; `Cannot allocate Wasm memory` from `node`; a JVM that cannot start its heap |
 | Why | `capabilities.resources.memory_bytes` is `RLIMIT_AS`, the address space each process may reserve, 2 GiB by default. See [`memory_bytes` and `cgroup_memory_bytes`](resource-limits.md#address-space-and-memory) |
 | Lifted by | A larger `capabilities.resources.memory_bytes` (`68719476736` runs `node`), with RAM capped by `cgroup_memory_bytes` |
-| Shown by | No `mur` command prints the value; it is `memory_bytes` in `murmur.yaml`, or the default. `mur doctor` prints [`W-RUN-010`](diagnostics.md#w-run-010) when `shell.allow` names `node` under 32 GiB |
+| Shown by | `memory_bytes:` in the `Resources` block of `mur run --explain-scope`, with `(declared)` or `(default)`. `mur doctor` prints [`W-RUN-010`](diagnostics.md#w-run-010) when `shell.allow` names `node` under 32 GiB |
 | Doctor | `W-RUN-010`, for `node` and `nodejs` only |
 
 ### Work folder size { #workdir-size }
@@ -362,7 +362,7 @@ A fresh work folder builds every dependency from cold;
 | What fails | The session ends with `E-RUN-013`: `work folder, $HOME and $TMPDIR together grew to <N> bytes, past the <M> byte ceiling (capabilities.resources.workdir_max_bytes)` |
 | Why | The work folder, home folder and temporary folder together are held under one ceiling, 10 GiB by default. See [Host resource limits](resource-limits.md#host-resource-limits) |
 | Lifted by | A larger `capabilities.resources.workdir_max_bytes` |
-| Shown by | No `mur` command prints the value; it is `workdir_max_bytes` in `murmur.yaml`, or the default |
+| Shown by | `workdir_max_bytes:` in the `Resources` block of `mur run --explain-scope` |
 | Doctor | Not reported by `mur doctor` |
 
 ### The cgroup scope { #cgroup-limits }
@@ -372,7 +372,7 @@ A fresh work folder builds every dependency from cold;
 | What fails | Past `cgroup_memory_bytes` the tree is OOM-killed; past `cgroup_pids_max` a fork fails with `EAGAIN`. A `resource_limit:` line names the limit when no other command ran in the scope at the same time. `cgroup_cpu_percent` and `cgroup_io_bytes_per_sec` slow the tree down |
 | Why | A cgroup scope bounds the whole subprocess tree. See [Host resource limits](resource-limits.md#host-resource-limits) and [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | Lifted by | A larger value of each `capabilities.resources.cgroup_*` field |
-| Shown by | The `Memory bound` and `Cgroup scope` blocks of `mur doctor`; `io.max:` under `Resource plane` in `mur run --explain-scope` |
+| Shown by | `cgroup_memory_bytes:`, `cgroup_pids_max:`, `cgroup_cpu_percent:` and `cgroup_io_bytes_per_sec:` in the `Resources` block of `mur run --explain-scope`, and `io.max:` under its `Resource plane`; the `Memory bound` and `Cgroup scope` blocks of `mur doctor` |
 | Doctor | The `Memory bound` and `Cgroup scope` blocks |
 
 ### Per-process limits { #process-limits }
@@ -382,7 +382,7 @@ A fresh work folder builds every dependency from cold;
 | What fails | `EMFILE` past `max_open_files`; `SIGXFSZ` past `max_file_size_bytes`; `SIGXCPU`, then `SIGKILL`, past `cpu_seconds`; `EAGAIN` from `fork` past `max_processes` where no cgroup scope applies |
 | Why | Each command runs under hard `setrlimit` ceilings. See [Host resource limits](resource-limits.md#host-resource-limits) |
 | Lifted by | A larger value of the field under `capabilities.resources` |
-| Shown by | No `mur` command prints the values; the trace's `shell` event names `cpu_seconds` and `max_file_size_bytes` in `resource_limit` ([Which limit a subprocess hit](resource-limits.md#which-limit)) |
+| Shown by | `max_open_files:`, `max_file_size_bytes:`, `max_processes:` and `cpu_seconds:` in the `Resources` block of `mur run --explain-scope`. After a run, the trace's `shell` event names `cpu_seconds` and `max_file_size_bytes` in `resource_limit` ([Which limit a subprocess hit](resource-limits.md#which-limit)) |
 | Doctor | Not reported by `mur doctor` |
 
 ## Always refused { #always-refused }

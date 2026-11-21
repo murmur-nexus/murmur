@@ -1340,8 +1340,9 @@ pub(crate) fn build_shell_env(
     cargo_target_dir: Option<&std::path::Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
+    let host_names: Vec<(&str, bool)> = shell_host_env_names(policy).collect();
 
-    for key in DEFAULT_ENV_BASELINE {
+    for (key, _) in host_names.iter().filter(|(_, declared)| !declared) {
         if let Ok(value) = std::env::var(key) {
             env.insert((*key).to_string(), value);
         }
@@ -1351,16 +1352,9 @@ pub(crate) fn build_shell_env(
         env.insert(key.clone(), value.clone());
     }
 
-    for key in &policy.shell_baseline_env {
-        // Formation names and the spawner lifeline are never a subprocess's: a baseline
-        // entry naming one supplies nothing from the host.
-        if crate::formation::is_member_grant_env(key)
-            || key == crate::lifeline::SPAWNER_LIFELINE_ENV
-        {
-            continue;
-        }
+    for (key, _) in host_names.iter().filter(|(_, declared)| *declared) {
         if let Ok(value) = std::env::var(key) {
-            env.insert(key.clone(), value);
+            env.insert((*key).to_string(), value);
         }
     }
 
@@ -1375,29 +1369,28 @@ pub(crate) fn build_shell_env(
     // HOME/USERPROFILE, and so no strip_env pattern can remove the session's.
     let home = home_dir.ok_or_else(|| NO_HOME_FOLDER_REFUSAL.to_string())?;
     let home = home.to_string_lossy().into_owned();
+    // Whatever an override, a baseline entry or the host said, a command reads each of these as
+    // the session's own value below, or not at all.
+    for name in SESSION_ENV {
+        env.remove(name);
+    }
     env.insert("HOME".to_string(), home.clone());
     env.insert("USERPROFILE".to_string(), home);
-    // Runtime-owned on the same terms: whatever an override, a baseline entry or the host said,
-    // a command reads the session's own runtime directory here, or no such variable at all.
-    env.remove(crate::runtime_dir::RUNTIME_DIR_ENV);
     if let Some(runtime_dir) = runtime_dir {
         env.insert(
             crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
             runtime_dir.to_string_lossy().into_owned(),
         );
     }
-    // And the session's records directory, on the same terms.
-    env.remove(crate::records_dir::RECORDS_DIR_ENV);
     if let Some(records_dir) = records_dir {
         env.insert(
             crate::records_dir::RECORDS_DIR_ENV.to_string(),
             records_dir.to_string_lossy().into_owned(),
         );
     }
-    // And the session's temporary folder, under all three names programs look for it by.
-    for name in crate::temp_dir::TEMP_DIR_ENV {
-        env.remove(name);
-        if let Some(tmpdir) = tmpdir {
+    // The session's temporary folder, under all three names programs look for it by.
+    if let Some(tmpdir) = tmpdir {
+        for name in crate::temp_dir::TEMP_DIR_ENV {
             env.insert(name.to_string(), tmpdir.to_string());
         }
     }
@@ -1410,6 +1403,120 @@ pub(crate) fn build_shell_env(
     }
 
     Ok(env)
+}
+
+/// The names [`build_shell_env`] reads from `mur run`'s own environment, each with whether the
+/// manifest declared it: [`DEFAULT_ENV_BASELINE`] (`false`), then every
+/// `capabilities.shell.baseline_env` name (`true`) but a formation member's grant names and the
+/// spawner lifeline, which are never a subprocess's. A declared name is read after the guest's
+/// `env_overrides` and so wins over them; a baseline name is read before. Names only: nothing
+/// here reads a value.
+pub(crate) fn shell_host_env_names(
+    policy: &CapabilityPolicy,
+) -> impl Iterator<Item = (&str, bool)> {
+    DEFAULT_ENV_BASELINE
+        .iter()
+        .map(|name| (*name, false))
+        .chain(
+            policy
+                .shell_baseline_env
+                .iter()
+                .map(String::as_str)
+                .filter(|name| {
+                    !crate::formation::is_member_grant_env(name)
+                        && *name != crate::lifeline::SPAWNER_LIFELINE_ENV
+                })
+                .map(|name| (name, true)),
+        )
+}
+
+/// The names a contained session's shell environment takes from the session alone:
+/// [`build_shell_env`] removes each from whatever the host, the guest's overrides and the manifest
+/// supplied, then sets `HOME` and `USERPROFILE` to the session's home folder, the runtime and
+/// records directory names to the session's own directories, and the three temporary-folder names
+/// to its temporary folder. `CARGO_TARGET_DIR` is not among them: the session sets it only when it
+/// holds a build cache seed, and passes it through like any other name otherwise.
+pub(crate) const SESSION_ENV: [&str; 7] = [
+    "HOME",
+    "USERPROFILE",
+    crate::runtime_dir::RUNTIME_DIR_ENV,
+    crate::records_dir::RECORDS_DIR_ENV,
+    crate::temp_dir::TEMP_DIR_ENV[0],
+    crate::temp_dir::TEMP_DIR_ENV[1],
+    crate::temp_dir::TEMP_DIR_ENV[2],
+];
+
+/// The names, never the values, a contained session's shell command starts with:
+/// `ScopeReport::shell_env`, the `Shell environment` block of `mur run --explain-scope`.
+///
+/// Built from the policy and the same name lists [`build_shell_env`] composes the environment
+/// from, so it states what the launch does without reading any variable. An unconfined session's
+/// commands run on [`build_unconfined_env`] instead, which starts from `mur run`'s whole
+/// environment; this report still states the contained composition there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShellEnvReport {
+    /// The names a command receives from `mur run`'s environment when `mur run` has them set:
+    /// [`shell_host_env_names`] less every name the credential backstop, `strip_env`,
+    /// [`ARTIFACT_CONFIG_ENV`] or [`SESSION_ENV`] takes away. Sorted, each once.
+    pub baseline: Vec<String>,
+    /// [`CREDENTIAL_ENV_PATTERNS`], in order: the patterns removed from every command's
+    /// environment whatever the manifest says.
+    pub always_removed: Vec<&'static str>,
+    /// `capabilities.shell.strip_env`, verbatim: the manifest's own patterns, removed on the same
+    /// terms as [`Self::always_removed`].
+    pub strip_env: Vec<String>,
+    /// [`SESSION_ENV`], sorted: the names the session sets from its own folders, which no host
+    /// value, override or manifest entry reaches.
+    pub session_set: Vec<&'static str>,
+}
+
+impl ShellEnvReport {
+    /// The report for `policy`'s shell commands.
+    pub(crate) fn for_policy(policy: &CapabilityPolicy) -> Self {
+        let mut baseline: Vec<String> = shell_host_env_names(policy)
+            .map(|(name, _)| name)
+            .filter(|name| {
+                !credential_backstop_drops(name, &policy.shell_strip_env)
+                    && *name != ARTIFACT_CONFIG_ENV
+                    && !SESSION_ENV.contains(name)
+            })
+            .map(str::to_string)
+            .collect();
+        baseline.sort();
+        baseline.dedup();
+        let mut session_set = SESSION_ENV.to_vec();
+        session_set.sort_unstable();
+        Self {
+            baseline,
+            always_removed: CREDENTIAL_ENV_PATTERNS.to_vec(),
+            strip_env: policy.shell_strip_env.clone(),
+            session_set,
+        }
+    }
+
+    /// The `Shell environment` block of `--explain-scope`: one comma-separated line per list,
+    /// `<none>` for an empty one. Ends with a newline.
+    #[must_use]
+    pub fn render(&self) -> String {
+        fn line(label: &str, names: &[impl AsRef<str>]) -> String {
+            let names = if names.is_empty() {
+                "<none>".to_string()
+            } else {
+                names
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("  {:<16}{names}\n", format!("{label}:"))
+        }
+        let mut out = String::from("Shell environment\n");
+        out.push_str(&line("baseline", &self.baseline));
+        out.push_str(&line("always removed", &self.always_removed));
+        out.push_str(&line("strip env", &self.strip_env));
+        out.push_str(&line("session's own", &self.session_set));
+        out
+    }
 }
 
 /// The names `mur` itself owns for a session's lineage. Never copied from this process's
@@ -4312,6 +4419,156 @@ mod tests {
         for name in crate::temp_dir::TEMP_DIR_ENV {
             assert!(!DEFAULT_ENV_BASELINE.contains(&name), "{name}");
         }
+    }
+
+    /// With nothing declared the report names the default baseline less `HOME`, which the
+    /// session sets, the built-in patterns in order, no `strip_env` and the session's own names.
+    #[test]
+    fn shell_env_report_names_the_lists_the_environment_is_built_from() {
+        let report = ShellEnvReport::for_policy(&CapabilityPolicy::default());
+        let mut baseline: Vec<&str> = DEFAULT_ENV_BASELINE
+            .iter()
+            .copied()
+            .filter(|name| *name != "HOME")
+            .collect();
+        baseline.sort_unstable();
+        assert_eq!(report.baseline, baseline);
+        assert_eq!(report.always_removed, CREDENTIAL_ENV_PATTERNS);
+        assert!(report.strip_env.is_empty());
+        assert_eq!(
+            report.session_set,
+            [
+                "HOME",
+                "MURMUR_RECORDS_DIR",
+                "MURMUR_RUNTIME_DIR",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "USERPROFILE"
+            ]
+        );
+    }
+
+    /// A `baseline_env` name reaches `baseline` only when `build_shell_env` would pass it
+    /// through: a reserved name, a name a built-in pattern or `strip_env` removes, the artifact
+    /// config name and a session-owned name are all left out, and a repeated name appears once.
+    #[test]
+    fn shell_env_report_leaves_out_every_baseline_env_name_the_launch_drops() {
+        let policy = CapabilityPolicy {
+            shell_baseline_env: [
+                "NODE_OPTIONS",
+                "AWS_PROFILE",
+                "MY_TOKEN",
+                "HOME",
+                "TMPDIR",
+                "PATH",
+                ARTIFACT_CONFIG_ENV,
+                crate::lifeline::SPAWNER_LIFELINE_ENV,
+                crate::formation::FORMATION_PEERS_ENV,
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            shell_strip_env: vec!["MY_*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let report = ShellEnvReport::for_policy(&policy);
+        assert!(report.baseline.contains(&"NODE_OPTIONS".to_string()));
+        for dropped in [
+            "AWS_PROFILE",
+            "MY_TOKEN",
+            "HOME",
+            "TMPDIR",
+            ARTIFACT_CONFIG_ENV,
+            crate::lifeline::SPAWNER_LIFELINE_ENV,
+            crate::formation::FORMATION_PEERS_ENV,
+        ] {
+            assert!(
+                !report.baseline.iter().any(|name| name == dropped),
+                "{dropped}"
+            );
+        }
+        assert_eq!(
+            report
+                .baseline
+                .iter()
+                .filter(|name| *name == "PATH")
+                .count(),
+            1
+        );
+        assert_eq!(report.strip_env, ["MY_*"]);
+    }
+
+    /// Every name `build_shell_env` returns without overrides is one the report lists, in
+    /// `baseline` or `session_set`, so the report never omits a name the launch hands a command.
+    /// Reads this process's environment and changes none of it.
+    #[test]
+    fn build_shell_env_returns_only_names_the_shell_env_report_lists() {
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_baseline_env: vec!["PATH".to_string(), "NODE_OPTIONS".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let report = ShellEnvReport::for_policy(&policy);
+        let env = build_shell_env(
+            &policy,
+            &[],
+            Some(temp.path()),
+            Some(temp.path()),
+            Some(temp.path()),
+            Some("/session/tmp"),
+            None,
+        )
+        .unwrap();
+        for name in env.keys() {
+            assert!(
+                report.baseline.contains(name) || report.session_set.contains(&name.as_str()),
+                "{name}"
+            );
+        }
+    }
+
+    /// Each [`SESSION_ENV`] name is set by the session whatever a guest override says, so the
+    /// report's `session_set` lists only names the launch does set.
+    #[test]
+    fn build_shell_env_sets_every_session_env_name_over_an_override() {
+        let temp = tempdir().unwrap();
+        let overrides: Vec<(String, String)> = SESSION_ENV
+            .iter()
+            .map(|name| ((*name).to_string(), "from-the-guest".to_string()))
+            .collect();
+        let env = build_shell_env(
+            &CapabilityPolicy::default(),
+            &overrides,
+            Some(temp.path()),
+            Some(temp.path()),
+            Some(temp.path()),
+            Some("/session/tmp"),
+            None,
+        )
+        .unwrap();
+        for name in SESSION_ENV {
+            let value = env.get(name).unwrap_or_else(|| panic!("{name} unset"));
+            assert_ne!(value, "from-the-guest", "{name}");
+        }
+    }
+
+    /// The text block: one comma-separated line per list, `<none>` for an empty one.
+    #[test]
+    fn shell_env_report_renders_one_line_per_list() {
+        let report = ShellEnvReport {
+            baseline: vec!["LANG".to_string(), "PATH".to_string()],
+            always_removed: vec!["AWS_*", "*_API_KEY"],
+            strip_env: Vec::new(),
+            session_set: vec!["HOME", "TMPDIR"],
+        };
+        assert_eq!(
+            report.render(),
+            "Shell environment\n\
+             \x20 baseline:       LANG, PATH\n\
+             \x20 always removed: AWS_*, *_API_KEY\n\
+             \x20 strip env:      <none>\n\
+             \x20 session's own:  HOME, TMPDIR\n"
+        );
     }
 }
 

@@ -338,9 +338,10 @@ pub use runtime::{
 // The one question about a variable name a caller outside the runtime needs answered: would the
 // credential backstop drop it, and by which pattern. `shell` is otherwise crate-private, and these
 // are what `secret_shaped_env_grants` and `check_env_allow_reaches_guests` judge a
-// `capabilities.env.allow` entry with.
+// `capabilities.env.allow` entry with. `ShellEnvReport` is `ScopeReport::shell_env`'s type.
 pub use shell::{
     credential_backstop_drops, credential_backstop_match, BackstopMatch, BackstopPatternSource,
+    ShellEnvReport,
 };
 pub use spawn_credential::{
     SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,

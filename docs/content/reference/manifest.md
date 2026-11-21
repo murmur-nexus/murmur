@@ -1149,6 +1149,9 @@ A shell tool call, a plan's `shell` step, or a program a WASM tool runs through 
 | 6 | The session | `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, as for the harness |
 | 7 | The session's temporary folder | `TMPDIR`, `TMP` and `TEMP`: `/tmp` where the session maps `/tmp` onto its [temporary folder](containment.md#temp-folder), and the folder's absolute path where it does not. No earlier row sets them, `capabilities.shell.baseline_env` included |
 
+The `Shell environment` block of [`mur run --explain-scope`](cli.md#mur-run) names the variables
+rows 1, 3, 4, 5, 6 and 7 pass through, remove or set for the project, and never their values.
+
 A delegated child `mur` starts from an empty environment and receives the parent's `USER` and
 `LOGNAME` beside its `PATH` and `HOME`, each only when the parent holds it.
 [The child's environment](roost-api.md#the-childs-environment) lists every variable it receives.

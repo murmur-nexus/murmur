@@ -381,7 +381,10 @@ fn a_credential_location_warns_and_launches() {
     if capsule_runtime::skip_without_egress_namespace(TEST) {
         return;
     }
-    let capsule = Capsule::new(false).with("  containment: scoped\n  shell:\n    allow: [bash]\n");
+    let capsule = Capsule::new(false).with(
+        "  containment: scoped\n  shell:\n    allow: [bash]\n    strip_env: [\"MY_*\"]\n  \
+         resources:\n    max_open_files: 4096\n",
+    );
     fs::create_dir_all(capsule.home.join(".ssh")).unwrap();
     fs::create_dir_all(capsule.home.join(".cargo")).unwrap();
     fs::write(capsule.home.join(".cargo/credentials.toml"), "").unwrap();
@@ -430,6 +433,32 @@ fn a_credential_location_warns_and_launches() {
         json!("~/.cargo/credentials.toml")
     );
     assert_eq!(grants[2]["credential_location"], Value::Null);
+
+    // The trace records the same resources and shell environment names `--explain-scope` states.
+    let effective_grants = &session_start(&output)["effective_grants"];
+    let explained = capsule.explain_json(&[]);
+    for key in ["resources", "shell_env"] {
+        assert_eq!(effective_grants[key], explained[key], "{key}");
+    }
+    let resources = effective_grants["resources"].as_object().unwrap();
+    assert_eq!(resources.len(), 10, "{resources:?}");
+    assert_eq!(
+        resources["max_open_files"],
+        json!({"value": 4096, "declared": true})
+    );
+    assert_eq!(
+        resources["cpu_seconds"],
+        json!({"value": null, "declared": false})
+    );
+    let shell_env = &effective_grants["shell_env"];
+    for key in ["baseline", "always_removed", "strip_env", "session_set"] {
+        assert!(shell_env[key].is_array(), "shell_env.{key}: {shell_env}");
+    }
+    assert_eq!(shell_env["strip_env"], json!(["MY_*"]));
+    assert!(shell_env["session_set"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("HOME")));
 
     let doctor = capsule.doctor();
     let doctor_text = format!("{}{}", stdout(&doctor), stderr(&doctor));
