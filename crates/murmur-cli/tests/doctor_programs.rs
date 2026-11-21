@@ -3,7 +3,7 @@
 //!
 //! Every test spawns probes, so each stands down with `[SKIP-HOST]` where this host cannot create
 //! the capsule's network namespace, and where a host fact it reads (`/usr/bin/curl`,
-//! `/snap/bin/curl`, a rustup `cargo`) is missing. The scratch `HOME` and the project lie outside
+//! a rustup `cargo`) is missing. The scratch `HOME` and the project lie outside
 //! `/tmp`: the `scoped` tier maps a private `/tmp` over the host's, which would hide a probe's work
 //! folder under it.
 
@@ -339,31 +339,40 @@ fn curl_as_a_snap_wrapper_is_refused_naming_the_real_copy() {
     if skip_without_namespace(TEST) {
         return;
     }
-    let snap = fs::read_link("/snap/bin/curl").ok();
-    if snap.as_deref() != Some(Path::new("/usr/bin/snap")) || !Path::new("/usr/bin/curl").exists() {
-        return skip_host(
-            TEST,
-            "needs /snap/bin/curl -> /usr/bin/snap and /usr/bin/curl",
-        );
+    if !Path::new("/usr/bin/curl").exists() {
+        return skip_host(TEST, "needs /usr/bin/curl");
     }
     let fixture = Fixture::new("  shell:\n    allow: [curl]\n", None);
+    // A snap-style bin folder of the fixture's own: `curl` is a link to `snap`, which is a
+    // link to a program that starts nothing, as on a host that installs curl as a snap.
+    let snap_bin = fixture.home.path().join("snap-bin");
+    fs::create_dir_all(&snap_bin).unwrap();
+    std::os::unix::fs::symlink("/bin/false", snap_bin.join("snap")).unwrap();
+    std::os::unix::fs::symlink("snap", snap_bin.join("curl")).unwrap();
+    let snap_bin = snap_bin.display().to_string();
     let path = |value: &str| vec![("PATH".to_string(), value.to_string())];
     let output = fixture.doctor(
         &["--json", "--programs", "curl"],
-        &path("/snap/bin:/usr/local/bin:/usr/bin:/bin"),
+        &path(&format!("{snap_bin}:/usr/local/bin:/usr/bin:/bin")),
     );
     let report = document(&output);
     assert_eq!(report["exit_code"], 0, "{report:#}");
     let curl = program(&report, "curl");
     assert_eq!(curl["status"], "refused", "{curl:#}");
     assert_eq!(curl["cause"], "snap-wrapper", "{curl:#}");
-    assert_eq!(curl["resolved"], "/snap/bin/curl");
+    assert_eq!(curl["resolved"], format!("{snap_bin}/curl"));
     assert!(
-        curl["reason"].as_str().unwrap().contains("/usr/bin/snap"),
+        curl["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{snap_bin}/snap")),
         "{curl:#}"
     );
     let grant = curl["grant"].as_str().unwrap();
-    assert!(grant.contains("put /usr/bin ahead of /snap/bin"), "{grant}");
+    assert!(
+        grant.contains(&format!("put /usr/bin ahead of {snap_bin}")),
+        "{grant}"
+    );
     assert!(grant.contains("/usr/bin/curl"), "{grant}");
     let warnings = w_run_015(&report);
     assert_eq!(warnings.len(), 1, "{report:#}");
@@ -371,7 +380,7 @@ fn curl_as_a_snap_wrapper_is_refused_naming_the_real_copy() {
 
     let output = fixture.doctor(
         &["--json", "--programs", "curl"],
-        &path("/usr/local/bin:/usr/bin:/bin:/snap/bin"),
+        &path(&format!("/usr/local/bin:/usr/bin:/bin:{snap_bin}")),
     );
     let report = document(&output);
     let curl = program(&report, "curl");
