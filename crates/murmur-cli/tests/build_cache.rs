@@ -262,10 +262,13 @@ impl World {
         let clone = self.base.join(name);
         fs::create_dir_all(clone.join("src")).unwrap();
         fs::create_dir_all(clone.join(".cargo")).unwrap();
+        // `[workspace]` makes the clone its own workspace root: `CARGO_TARGET_TMPDIR` can lie
+        // inside this repository, and Cargo refuses a package that finds an ancestor workspace
+        // manifest which does not list it.
         fs::write(
             clone.join("Cargo.toml"),
             "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\ndep-a = \"0.1.0\"\n",
+             [dependencies]\ndep-a = \"0.1.0\"\n\n[workspace]\n",
         )
         .unwrap();
         fs::write(
