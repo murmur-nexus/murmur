@@ -1060,13 +1060,14 @@ murmur/tool-git          {{ v.murmur_tool_git }}    tool     murmur:tool/run@0.2
 Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store resolution `mur run` performs before staging. In a formation directory, check that its `roster.yaml` is admitted.
 
 ```bash
-mur doctor [--bind <ADDR>] [--json]
+mur doctor [--bind <ADDR>] [--json] [--programs [<NAMES>]]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--bind` | `127.0.0.1` | The address `mur run --bind` would bind the capsule's door on. With an address off loopback and no [`network.authentication`](manifest.md#field-network-authentication), prints [`W-SEC-032`](diagnostics.md#w-sec-032) |
 | `--json` | off | Print one JSON document on stdout: the verdict, the exit code, the tally and every finding. The text report goes to stderr. See [`mur doctor --json`](#mur-doctor-json) |
+| `--programs [<NAMES>]` | off | Start each named program (comma-separated) inside the sandbox this project's capsule would get on this host and report whether it runs. With no names, the [default list](#doctor-programs) then every `capabilities.shell.allow` entry. See [Programs](#doctor-programs) |
 
 What it checks depends on the current directory:
 
@@ -1357,6 +1358,7 @@ lines: errors in print order, then warnings in print order. When `verdict` is `r
 | `cgroup-scope` | [`Cgroup scope`](#doctor-cgroup-scope): `E-RUN-012` |
 | `runtime-directory` | [`Runtime directory`](#doctor-runtime-directory): [`E-IO-004`](diagnostics.md#e-io-004) |
 | `host-paths` | [`Host paths`](#doctor-host-paths): [`E-CFG-004`](diagnostics.md#e-cfg-004) |
+| `programs` | [`Programs`](#doctor-programs): [`W-RUN-015`](diagnostics.md#w-run-015) |
 
 An error that stops `mur doctor` before its tally (no project, an unreadable `murmur.yaml`, a `HOME`
 that cannot hold `~/.murmur`) is printed on stderr as the text form prints it, and the document is
@@ -1366,6 +1368,53 @@ it has none).
 
 ```bash
 mur doctor --json 2>/dev/null | jq -r .verdict
+```
+
+With `--programs`, a `programs` object follows `findings`; without it there is no `programs` key.
+
+```json
+  "programs": {
+    "containment": "scoped",
+    "mechanism": "landlock+seccomp",
+    "path": "/usr/local/bin:/usr/bin:/bin",
+    "probed": [
+      {
+        "program": "unshare",
+        "status": "refused",
+        "in_shell_allow": true,
+        "resolved": "/usr/bin/unshare",
+        "probe": ["unshare", "--user", "--map-root-user", "true"],
+        "exit_code": 1,
+        "cause": "namespaces-refused",
+        "reason": "the capsule's seccomp filter refuses unshare, setns, mount, pivot_root and chroot at every contained floor; unshare exited 1",
+        "grant": "no manifest grant lifts this; only an unconfined launch does (mur run --unconfined, or containment: unconfined in ~/.murmur/config.yaml)",
+        "note": null,
+        "detail": "unshare: unshare failed: Operation not permitted"
+      }
+    ]
+  }
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `programs.containment` | string | The class the probes ran under: `unconfined`, `advisory`, `scoped` or `sealed` |
+| `programs.mechanism` | string | The tier's mechanism: `mountns+pivot_root+landlock+seccomp`, `landlock+seccomp`, `seccomp-only`, `none` or `unconfined` |
+| `programs.path` | string | The `PATH` every probe resolved its program on: a `mur run` shell command's |
+| `programs.probed[].program` | string | The program's name |
+| `programs.probed[].status` | string | `runs` or `refused` |
+| `programs.probed[].in_shell_allow` | boolean | Whether `capabilities.shell.allow` names it |
+| `programs.probed[].resolved` | string or `null` | The first match on `path`, as found there (a link is not followed); `null` when there is none |
+| `programs.probed[].probe` | array of strings | The deciding step's argv |
+| `programs.probed[].exit_code` | integer or `null` | The deciding step's exit code; `null` when it was not started, did not start, or was killed |
+| `programs.probed[].cause` | string or `null` | One of the [causes](#doctor-programs-causes); `null` when `runs` |
+| `programs.probed[].reason` | string or `null` | Why it cannot run; `null` when `runs` |
+| `programs.probed[].grant` | string or `null` | What lifts the refusal; `null` when `runs`, `failed` or `timed-out` |
+| `programs.probed[].note` | string or `null` | A fact that is not a refusal, such as the hosts `curl` can reach |
+| `programs.probed[].detail` | string | The deciding step's last three stderr lines, trimmed and joined by newlines; `""` when it printed none |
+
+```bash
+mur doctor --json --programs 2>/dev/null \
+  | jq '.programs.probed[] | select(.status=="refused") | {program, cause, grant}'
 ```
 
 ### Process harness { #doctor-process-harness }
@@ -1523,6 +1572,84 @@ it for the project's declared containment, or `<none>`. An entry reaching a cred
 prints [`W-SEC-034`](diagnostics.md#w-sec-034) to stderr. An entry `mur run` would refuse prints
 `error[E-CFG-004]` naming it on stderr, and `mur doctor` exits `1` — see
 [Refusals and the exit code](#doctor-refusals).
+
+### Programs { #doctor-programs }
+
+With `--programs`, a `Programs` section closes the report: each program started inside the
+sandbox a `mur run` shell command of this project would get on this host — the same containment
+class, tier, Landlock grants, seccomp filter, network namespace, cgroup scope, environment, `PATH`,
+home and temporary folders — in a scratch work folder under `~/.murmur/probes/`. Each probe runs
+with the program added to `capabilities.shell.allow`, so the grant it reports is complete. The
+section only reports: nothing is granted, and the project, its `workdir/` and `murmur.yaml` are not
+written. The scratch folder, its runtime directory and cgroup scope are removed when probing ends.
+In a formation directory it prints `Programs: not probed — run mur doctor --programs in a member's
+project`.
+
+| Program | Probe | Timeout |
+|---|---|---|
+| `sh` | `sh -c :` | 30 s |
+| `bash`, `git`, `curl`, `wget`, `npm`, `make`, `rustc`, `jq`, `rg` | `<program> --version` | 30 s |
+| `python3` | `python3 -c pass` | 30 s |
+| `node` | `node -e 0` | 30 s |
+| `cc` | `cc hello.c -o hello` on a generated `hello.c` | 120 s |
+| `cargo` | `cargo --version`, then `cargo build --offline --quiet` of a generated dependency-free crate, its target in the scratch folder | 30 s, 180 s |
+| `go` | `go version` | 30 s |
+| `unshare` | `unshare --user --map-root-user true` | 30 s |
+| `sudo` | `sudo -n true` | 30 s |
+| Any other name | `<name> --version` | 30 s |
+
+With no names the default list is the table's programs in this order: `sh`, `bash`, `git`, `curl`,
+`wget`, `python3`, `node`, `npm`, `make`, `cc`, `cargo`, `rustc`, `go`, `jq`, `rg`, `unshare`,
+`sudo`, then each `capabilities.shell.allow` entry not already listed. Each program is probed once.
+A program whose step exits 0 runs; the first step that does not exit 0 decides.
+
+```text
+Programs (probed inside the sandbox: scoped, landlock+seccomp)
+  PATH: /usr/local/bin:/usr/bin:/bin:/home/u/.cargo/bin
+  ✓  bash      runs · /usr/bin/bash
+  ✗  curl      refused (not-in-shell-allow) · /usr/bin/curl
+        Probe: curl --version → exit 0
+        Reason: curl runs only once capabilities.shell.allow names it
+        Grant: add curl to capabilities.shell.allow
+        Note: reaches only hosts in capabilities.network.allow (none declared)
+```
+
+| Line | Meaning |
+|---|---|
+| `Programs (probed inside the sandbox: <class>, <mechanism>)` | The class and tier the probes ran under. Under the unconfined stance it reads `Programs (ran unconfined: no Landlock, seccomp or namespaces restricted them)`; on a host with no kernel containment, `Programs (probed with POSIX resource limits only: no sandbox on this host restricts which programs start)` |
+| `PATH: …` | The `PATH` every probe resolved its program on |
+| `✓  <program>   runs · <path>` | It runs as the manifest stands, from `<path>` |
+| `✗  <program>   refused (<cause>) · <path>` | It cannot run; `<cause>` is one of the [causes](#doctor-programs-causes). `not on PATH` replaces `<path>` when nothing matched |
+| `Probe: <argv> → exit <n>` | The deciding step and its exit code (`no exit code` when it did not start or was killed) |
+| `Reason:`, `Grant:` | Why it cannot run, and what lifts it. No `Grant:` for `failed` and `timed-out` |
+| `Output:` | The deciding step's last stderr lines, up to three |
+| `Note:` | A fact that is not a refusal: for `curl`, `wget` and `git`, the hosts `capabilities.network.allow` lets them reach |
+
+A refused program the manifest grants in `capabilities.shell.allow` prints
+`[mur doctor] warning[W-RUN-015]: …` on stderr and is a counted warning,
+[`W-RUN-015`](diagnostics.md#w-run-015), with the grant as its `Fix:` line. No probe changes the
+passed-check count or the exit code.
+
+#### Causes { #doctor-programs-causes }
+
+| `cause` | Means | Grant |
+|---|---|---|
+| `not-installed` | Not found on the capsule's `PATH`; nothing was started | Install it so it is on `mur run`'s `PATH` |
+| `not-in-shell-allow` | It runs once added to `capabilities.shell.allow` | Add it to `capabilities.shell.allow` |
+| `snap-wrapper` | It resolves to the snap launcher (`/snap/bin/<p>` → `/usr/bin/snap`), which cannot start a snap inside the capsule | Put the folder of the first non-snap copy later on `PATH` ahead of `/snap/bin`, or install the distribution's package |
+| `namespaces-refused` | It needs `unshare`, `setns`, `mount`, `pivot_root` or `chroot`, which the capsule's seccomp filter refuses at every contained floor | None in the manifest; only an unconfined launch (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`) |
+| `no-new-privileges` | It gains privilege through a setuid bit (`sudo`, `su`), which `no_new_privs` refuses | None in the manifest; only an unconfined launch |
+| `host-path-needed` | A rustup proxy (`cargo`, `rustc` under `~/.cargo/bin`) whose `RUSTUP_HOME` or `CARGO_HOME` no [`host_paths`](config.md#host-paths) entry lends | The `host_paths` entries (`{path: <dir>, access: read}`), and `mur run` started with both variables set |
+| `interpreter-runtime-needed` | A program it runs or a library it loads lies outside every executable grant: a rustup toolchain under a lent `RUSTUP_HOME` (a host path is never executable), or `error while loading shared libraries: <lib>` | [`capabilities.shell.interpreter_runtime`](manifest.md) naming the toolchain folder, or the host folder holding the library |
+| `interpreter-not-allowed` | A `#!` script whose interpreter chain (`env` → `node`) is not all in `capabilities.shell.allow` | Add the missing interpreters to `capabilities.shell.allow` |
+| `helper-not-allowed` | A compile or link step could not run a helper (`linker \`cc\` not found`, `cc1`, `collect2`, `ld`) | Add the helper to `capabilities.shell.allow`; on `sealed`, the [`W-SEC-012`](diagnostics.md#w-sec-012) path |
+| `no-sandbox` | The sandbox could not be prepared (`E-CAP-005`, `E-RUN-012`, a failed enforcement setup); nothing was started, and every program reports it | The refusal's hint |
+| `timed-out` | A step outran its timeout and was killed | — |
+| `failed` | Anything else; `Reason:` is `exited <n>` | — |
+
+Each grant that edits the manifest also says to add the program to `capabilities.shell.allow`
+when the manifest does not name it. Under the unconfined stance no cause puts a failure down to a
+sandbox: a failure there is `failed`.
 
 ### Murmur home { #doctor-murmur-home }
 

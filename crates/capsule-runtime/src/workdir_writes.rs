@@ -229,6 +229,7 @@ mod tests {
         ("sealed.rs", include_str!("sealed.rs")),
         ("shell.rs", include_str!("shell.rs")),
         ("session_check.rs", include_str!("session_check.rs")),
+        ("program_probe.rs", include_str!("program_probe.rs")),
         ("tool_annotations.rs", include_str!("tool_annotations.rs")),
         ("trace.rs", include_str!("trace.rs")),
         ("trace_blobs.rs", include_str!("trace_blobs.rs")),
@@ -287,6 +288,21 @@ mod tests {
     /// `workdir.join(...)` calls whose argument is not a literal or a named constant, each with
     /// the reason no entry name can be resolved from the source text.
     const DYNAMIC_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "program_probe.rs",
+            "&file.path",
+            "A file a `mur doctor --programs` probe step writes (`hello.c`, `hello/Cargo.toml`, \
+             `hello/src/main.rs`) into the probe's own scratch work folder \
+             `~/.murmur/probes/<id>/work`, never a session's or the project's work folder. The \
+             paths are fixed in `program_probe::probe_spec`.",
+        ),
+        (
+            "program_probe.rs",
+            "&sub",
+            "The scratch folders of one `mur doctor --programs` run, `<id>/work`, \
+             `<id>/records/home` and `<id>/records/tmp`, created beneath `~/.murmur/probes`, \
+             outside every session's and the project's work folder.",
+        ),
         (
             "record_seal.rs",
             "format!(\"{stream_file}{SEAL_SUFFIX}\")",
@@ -1043,6 +1059,19 @@ mod tests {
             "read_entry_record",
             "Reads an entry's `entry.json` under `~/.murmur/build-cache`: the store, which only \
              `mur build-cache add` writes, outside every work folder.",
+        ),
+        (
+            "program_probe.rs",
+            "default_toolchain",
+            "Reads rustup's `settings.toml` in the operator's `RUSTUP_HOME`, a host folder, to name \
+             the toolchain a probe's grant points at: outside every work folder, and read only.",
+        ),
+        (
+            "program_probe.rs",
+            "missing_library",
+            "Asks whether a shared library exists in a standard host library folder \
+             (`/usr/lib/x86_64-linux-gnu`, …) to name the folder a probe's grant points at: \
+             outside every work folder, and nothing is opened.",
         ),
         (
             "record_seal.rs",

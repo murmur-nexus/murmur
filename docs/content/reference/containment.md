@@ -6,6 +6,8 @@ bound what a WASM artifact does inside the workdir — [What bounds a WASM
 artifact](#artifact-boundary) names the grant that does. This page covers the
 enforcement tier each host resolves to, the containment class a capsule can require of it, the
 fixed grants a contained capsule receives, and how each claim is checked.
+[`mur doctor --programs`](cli.md#doctor-programs) starts programs inside the sandbox a capsule
+would get on this host and reports what it cannot run, with the grant that would lift each refusal.
 
 ---
 

@@ -107,6 +107,7 @@ pub(crate) mod peer_tasks;
 #[cfg(test)]
 mod pinned_port;
 pub mod pinned_programs;
+pub mod program_probe;
 pub mod plan;
 pub mod precompile;
 pub mod proc_view;
