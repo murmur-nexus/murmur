@@ -102,7 +102,7 @@ store-success-output = true
 inherits = "ci"
 default-filter = """
 (binary_id(capsule-runtime)
-  & not test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/))
+  & not test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|program_probe|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/))
 | binary_id(capsule-runtime::child_signal_disposition)
 | binary_id(capsule-runtime::closed_stdout)
 | binary_id(committed-components)
@@ -149,7 +149,7 @@ path = "junit.xml"
 inherits = "ci"
 default-filter = """
 (binary_id(capsule-runtime)
-  & test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/)
+  & test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|program_probe|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/)
   & not (
       test(=sandbox::linux_integration_tests::kernel_full_denies_filesystem_access_outside_workdir)
     | test(=sandbox::linux_integration_tests::kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix)
@@ -328,6 +328,7 @@ inherits = "ci"
 # prove nothing. class-isolation excludes them by name; keep the two lists equal.
 default-filter = """
 binary_id(murmur-cli::browser_in_capsule)
+| binary_id(murmur-cli::doctor_programs)
 | binary_id(murmur-cli::unconfined)
 | (binary_id(capsule-runtime)
     & (

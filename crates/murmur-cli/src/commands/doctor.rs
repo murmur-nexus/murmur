@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
+use capsule_runtime::program_probe::ProgramsReport;
 use capsule_runtime::{
     applied_mechanism, caller_overflow_fix, caller_overflow_warning,
     capability_policy_from_runtime_manifest, check_egress_namespace,
@@ -81,6 +82,8 @@ enum DoctorBlock {
     RuntimeDirectory,
     /// The `Host paths` block.
     HostPaths,
+    /// The `Programs` block of `mur doctor --programs`.
+    Programs,
 }
 
 /// One counted finding: an error, which makes `mur doctor` exit `1`, or a warning, which does not.
@@ -136,6 +139,9 @@ struct Findings {
     errors: Vec<Finding>,
     /// Findings that leave the exit code at `0`.
     warnings: Vec<Finding>,
+    /// What `mur doctor --programs` probed, `None` without the flag: `programs` in
+    /// `mur doctor --json`.
+    programs: Option<ProgramsReport>,
 }
 
 impl Findings {
@@ -2448,6 +2454,9 @@ struct DoctorReport {
     /// Every counted finding, in the order the text form prints its `Fix:` lines: errors, then
     /// warnings, each in print order.
     findings: Vec<DoctorFinding>,
+    /// What `--programs` probed; absent without the flag, so the document is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    programs: Option<ProgramsReport>,
 }
 
 /// One entry of [`DoctorReport::findings`]. Serialized keys keep the field order.
@@ -2500,6 +2509,7 @@ impl DoctorReport {
                         .map(|finding| DoctorFinding::new(Severity::Warning, finding)),
                 )
                 .collect(),
+            programs: findings.programs.clone(),
         }
     }
 
@@ -2520,6 +2530,7 @@ impl DoctorReport {
                 message: error.message.lines().next().unwrap_or_default().to_string(),
                 fix: error.hint.clone().unwrap_or_default(),
             }],
+            programs: None,
         }
     }
 
@@ -2531,7 +2542,7 @@ impl DoctorReport {
     }
 }
 
-/// `mur doctor [--json]`.
+/// `mur doctor [--json] [--programs [<NAMES>]]`.
 ///
 /// A current directory holding `roster.yaml` and no `murmur.yaml` is a formation directory, and
 /// is checked as one by [`check_formation`] without walking up; `bind_addr` has nothing to check
@@ -2542,7 +2553,15 @@ impl DoctorReport {
 /// document, [`DoctorReport`], whose `exit_code` the process exits with. An error that stops doctor
 /// before its tally is printed as the text form prints it and becomes a `refused` document with
 /// that error as its one finding.
-pub(crate) fn run_doctor(bind_addr: &str, json: bool) -> Result<(), CliError> {
+///
+/// With `programs`, a project's doctor also probes those programs (the default list when empty)
+/// inside the sandbox its capsule would get here ([`report_programs`]); a formation directory
+/// says they were not probed.
+pub(crate) fn run_doctor(
+    bind_addr: &str,
+    json: bool,
+    programs: Option<&[String]>,
+) -> Result<(), CliError> {
     if json {
         capsule_runtime::diagnostic::send_stdout_to_stderr();
     }
@@ -2555,9 +2574,16 @@ pub(crate) fn run_doctor(bind_addr: &str, json: bool) -> Result<(), CliError> {
             DoctorBlock::Project,
         ),
         Ok(cwd) if resolve_roster_path(&cwd).exists() && !resolve_manifest_path(&cwd).exists() => {
-            (check_formation(&cwd), DoctorBlock::Roster)
+            let checked = check_formation(&cwd);
+            if programs.is_some() && checked.is_ok() {
+                capsule_runtime::report_println!(
+                    "Programs: not probed \u{2014} run mur doctor --programs in a member's project"
+                );
+                capsule_runtime::report_println!();
+            }
+            (checked, DoctorBlock::Roster)
         }
-        Ok(_) => (check_project(bind_addr), DoctorBlock::Project),
+        Ok(_) => (check_project(bind_addr, programs), DoctorBlock::Project),
     };
     if !json {
         let (total_pass, findings) = checked?;
@@ -2673,7 +2699,10 @@ fn artifact_attestation(
 /// Check every artifact the current project declares against the stores a session
 /// resolves from, and return the passed-check count and the findings for the tally. The checklist
 /// is the manifest — editing `murmur.yaml` changes what is checked, with no change here.
-fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
+fn check_project(
+    bind_addr: &str,
+    programs: Option<&[String]>,
+) -> Result<(u32, Findings), CliError> {
     let mut findings = Findings::default();
     let project_root = find_project_root().map_err(|mut error| {
         error.hint = Some(
@@ -3498,7 +3527,154 @@ fn check_project(bind_addr: &str) -> Result<(u32, Findings), CliError> {
 
     capsule_runtime::report_println!();
 
+    if let Some(names) = programs {
+        let declared_tools = crate::commands::declared_needs::installed_declared_tool_needs(
+            &runtime_manifest.artifacts,
+            lock.as_ref(),
+            &project_root,
+        )
+        .unwrap_or_default();
+        let mut policy = capability_policy.clone();
+        policy.host_paths = crate::config::launch_host_paths(
+            effective_config.as_ref(),
+            &project_root.join("workdir"),
+        )
+        .unwrap_or_default();
+        let inputs = capsule_runtime::program_probe::ProbeInputs {
+            policy,
+            declared_floor,
+            workdir: project_root.join("workdir"),
+            pinned_tools,
+            declared_tools,
+        };
+        let names = (!names.is_empty()).then_some(names);
+        report_programs(inputs, host_probe, names, &mut findings);
+        capsule_runtime::report_println!();
+    }
+
     Ok((total_pass, findings))
+}
+
+/// The `Programs` section of `mur doctor --programs`: each of `names` (else
+/// [`capsule_runtime::program_probe::COMMON_PROGRAMS`] then each `shell.allow` entry) started
+/// inside the sandbox a launch of this capsule would get here, one line each with its reason,
+/// grant and note beneath, and one `W-RUN-015` warning per refused program the manifest grants.
+/// The report goes to `findings.programs` for `mur doctor --json`. Nothing is counted as a check.
+fn report_programs(
+    inputs: capsule_runtime::program_probe::ProbeInputs,
+    host_probe: HostProbe,
+    names: Option<&[String]>,
+    findings: &mut Findings,
+) {
+    use capsule_runtime::program_probe::{
+        probe_spec, programs_to_probe, ProbeStatus, ProgramProbeRunner,
+    };
+    let specs: Vec<_> = programs_to_probe(names, &inputs.policy.shell_allow)
+        .iter()
+        .map(|name| probe_spec(name))
+        .collect();
+    let runner = ProgramProbeRunner::new(inputs, host_probe);
+    let report = runner.report(&specs);
+    let header = if runner.unconfined() {
+        "Programs (ran unconfined: no Landlock, seccomp or namespaces restricted them)".to_string()
+    } else if runner.environment_only() {
+        "Programs (probed with POSIX resource limits only: no sandbox on this host restricts which \
+         programs start)"
+            .to_string()
+    } else {
+        format!(
+            "Programs (probed inside the sandbox: {}, {})",
+            report.containment, report.mechanism
+        )
+    };
+    drop(runner);
+    capsule_runtime::report_print!("{}", render_programs(&header, &report));
+    for probe in &report.probed {
+        if probe.status != ProbeStatus::Refused || !probe.in_shell_allow {
+            continue;
+        }
+        let reason = probe.reason.as_deref().unwrap_or("it did not run");
+        let message = format!(
+            "{} is in capabilities.shell.allow and cannot run in this capsule: {reason}",
+            probe.program
+        );
+        capsule_runtime::report_eprintln!(
+            "[mur doctor] warning[{}]: {message}",
+            murmur_artifact::W_RUN_015
+        );
+        findings.warning(
+            murmur_artifact::W_RUN_015,
+            DoctorBlock::Programs,
+            Some(probe.program.clone()),
+            message,
+            probe
+                .grant
+                .clone()
+                .unwrap_or_else(|| "see the Programs section of mur doctor --programs".to_string()),
+        );
+    }
+    findings.programs = Some(report);
+}
+
+/// The `Programs` section's text: `header`, the `PATH` the probes resolved on, then per program
+/// `  ✓  <program>   runs · <resolved>` or `  ✗  <program>   refused (<cause>) · <resolved>`, and
+/// beneath a refused one its `Probe:`, `Reason:`, `Grant:` and `Output:` lines; a `Note:` line
+/// beneath either.
+fn render_programs(
+    header: &str,
+    report: &capsule_runtime::program_probe::ProgramsReport,
+) -> String {
+    use capsule_runtime::program_probe::ProbeStatus;
+    use std::fmt::Write as _;
+    let mut text = format!("{header}\n  PATH: {}\n", report.path);
+    let width = report
+        .probed
+        .iter()
+        .map(|probe| probe.program.len())
+        .max()
+        .unwrap_or(0);
+    const INDENT: &str = "        ";
+    for probe in &report.probed {
+        let resolved = probe.resolved.as_deref().unwrap_or("not on PATH");
+        match probe.status {
+            ProbeStatus::Runs => {
+                let _ = writeln!(
+                    text,
+                    "  \u{2713}  {:<width$}   runs \u{00B7} {resolved}",
+                    probe.program
+                );
+            }
+            ProbeStatus::Refused => {
+                let cause = probe.cause.map_or("refused", |cause| cause.as_str());
+                let _ = writeln!(
+                    text,
+                    "  \u{2717}  {:<width$}   refused ({cause}) \u{00B7} {resolved}",
+                    probe.program
+                );
+                let exit = probe
+                    .exit_code
+                    .map_or_else(|| "no exit code".to_string(), |code| format!("exit {code}"));
+                let _ = writeln!(
+                    text,
+                    "{INDENT}Probe: {} \u{2192} {exit}",
+                    probe.probe.join(" ")
+                );
+                if let Some(reason) = &probe.reason {
+                    let _ = writeln!(text, "{INDENT}Reason: {reason}");
+                }
+                if let Some(grant) = &probe.grant {
+                    let _ = writeln!(text, "{INDENT}Grant: {grant}");
+                }
+                for line in probe.detail.lines() {
+                    let _ = writeln!(text, "{INDENT}Output: {line}");
+                }
+            }
+        }
+        if let Some(note) = &probe.note {
+            let _ = writeln!(text, "{INDENT}Note: {note}");
+        }
+    }
+    text
 }
 
 /// The `Host paths` section: each `host_paths` entry of the global config resolved, its access and
@@ -3884,9 +4060,59 @@ mod tests {
             (DoctorBlock::CgroupScope, "cgroup-scope"),
             (DoctorBlock::RuntimeDirectory, "runtime-directory"),
             (DoctorBlock::HostPaths, "host-paths"),
+            (DoctorBlock::Programs, "programs"),
         ] {
             assert_eq!(serde_json::to_value(block).unwrap(), name);
         }
+    }
+
+    /// Without `--programs` the document has no `programs` key; with it, `programs` follows
+    /// `findings` with its keys in order.
+    #[test]
+    fn the_programs_key_is_added_after_findings_only_when_probed() {
+        use capsule_runtime::program_probe::{ProbeCause, ProbeStatus, ProgramProbe};
+        let mut findings = Findings::default();
+        let plain = DoctorReport::from_findings(2, &findings).render();
+        assert!(!plain.contains("\"programs\""), "{plain}");
+        findings.programs = Some(ProgramsReport {
+            containment: "scoped".to_string(),
+            mechanism: "landlock+seccomp".to_string(),
+            path: "/usr/bin:/bin".to_string(),
+            probed: vec![ProgramProbe {
+                program: "curl".to_string(),
+                status: ProbeStatus::Refused,
+                in_shell_allow: false,
+                resolved: Some("/usr/bin/curl".to_string()),
+                probe: vec!["curl".to_string(), "--version".to_string()],
+                exit_code: Some(0),
+                cause: Some(ProbeCause::NotInShellAllow),
+                reason: Some("curl runs only once capabilities.shell.allow names it".to_string()),
+                grant: Some("add curl to capabilities.shell.allow".to_string()),
+                note: None,
+                detail: String::new(),
+            }],
+        });
+        let probed = DoctorReport::from_findings(2, &findings).render();
+        let at = |key: &str| probed.find(&format!("\"{key}\":")).unwrap();
+        assert!(at("findings") < at("programs"), "{probed}");
+        assert!(
+            at("containment") < at("mechanism") && at("mechanism") < at("path"),
+            "{probed}"
+        );
+        assert!(at("path") < at("probed"), "{probed}");
+
+        let text = render_programs(
+            "Programs (probed inside the sandbox: scoped, landlock+seccomp)",
+            findings.programs.as_ref().unwrap(),
+        );
+        assert_eq!(
+            text,
+            "Programs (probed inside the sandbox: scoped, landlock+seccomp)\n  PATH: \
+             /usr/bin:/bin\n  \u{2717}  curl   refused (not-in-shell-allow) \u{00B7} \
+             /usr/bin/curl\n        Probe: curl --version \u{2192} exit 0\n        Reason: curl \
+             runs only once capabilities.shell.allow names it\n        Grant: add curl to \
+             capabilities.shell.allow\n"
+        );
     }
 
     /// Nothing found closes with `All checks passed.` and does not fail.

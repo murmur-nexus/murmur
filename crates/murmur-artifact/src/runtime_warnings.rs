@@ -109,6 +109,14 @@ pub const W_RUN_013: &str = "W-RUN-013";
 /// Never refuses a launch. Printed by `mur run`, once per launch.
 pub const W_RUN_014: &str = "W-RUN-014";
 
+/// `mur doctor --programs` probed a program `capabilities.shell.allow` grants, and it cannot run
+/// in this capsule: the probe, run inside the sandbox a launch would get on this host, did not
+/// exit 0.
+///
+/// Nothing is refused: a launch still starts, and a command naming the program fails as the probe
+/// did. Printed by `mur doctor --programs`, once per program.
+pub const W_RUN_015: &str = "W-RUN-015";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -124,7 +132,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
-            W_RUN_011, W_RUN_012, W_RUN_013, W_RUN_014,
+            W_RUN_011, W_RUN_012, W_RUN_013, W_RUN_014, W_RUN_015,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
