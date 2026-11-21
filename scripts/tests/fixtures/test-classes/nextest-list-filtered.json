@@ -1,0 +1,44 @@
+{
+ "test-count": 2,
+ "rust-suites": {
+  "murmur-cli::unconfined": {
+   "package-name": "murmur-cli",
+   "binary-id": "murmur-cli::unconfined",
+   "binary-name": "unconfined",
+   "package-id": "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev",
+   "kind": "test",
+   "binary-path": "/work/murmur/target/debug/deps/unconfined-52af96f297fa7303",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/murmur-cli",
+   "status": "listed",
+   "testcases": {
+    "a_contained_run_as_root_is_unchanged": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    },
+    "an_unconfined_command_gets_only_the_declared_limits": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    }
+   }
+  },
+  "murmur-cli::version_cmd": {
+   "package-name": "murmur-cli",
+   "binary-id": "murmur-cli::version_cmd",
+   "binary-name": "version_cmd",
+   "package-id": "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev",
+   "kind": "test",
+   "binary-path": "/work/murmur/target/debug/deps/version_cmd-c040b2351a8e6442",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/murmur-cli",
+   "status": "skipped",
+   "testcases": {}
+  }
+ }
+}

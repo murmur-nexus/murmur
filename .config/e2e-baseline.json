@@ -1,0 +1,201 @@
+{
+  "format": "murmur.e2e-baseline/1",
+  "commit": "e61e385398ad3344cdf5ba313323f2b48b30fdc2",
+  "tree_clean": true,
+  "measured_at": "2026-11-21T03:12:50Z",
+  "host": {
+    "kernel": "7.0.0-28-generic",
+    "load_1min_at_start": 10.07,
+    "nextest": "0.9.148",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "disk_free_before_gb": 56.2,
+    "disk_free_after_gb": 75.1
+  },
+  "command": "python3 -I scripts/e2e-coverage.py --target-dir /home/agape/.cache/murmur-targets/8258f42a/ctd --profiles /home/agape/.cache/murmur-targets/8258f42a/prof --out .config/e2e-baseline.json --keep-going --recheck-target-dir /home/agape/.cache/murmur-targets/8258f42a/td",
+  "definition": "line coverage of workspace source compiled into mur and mur-roost, executed while the e2e tests ran",
+  "objects": [
+    "mur",
+    "mur-roost"
+  ],
+  "ignore_filename_regex": "/\\.cargo/|/rustc/|/tests/|/home/agape/\\.cache/murmur\\-targets/8258f42a/ctd/",
+  "features": "beta-all",
+  "cargo_config": [
+    "target.x86_64-unknown-linux-gnu.rustflags=[\"-C\",\"instrument-coverage\"]",
+    "profile.dev.package.\"*\".opt-level=2",
+    "profile.test.package.\"*\".opt-level=2"
+  ],
+  "profile_runtime_patch": [
+    "mur: already patched at 0x55fde84",
+    "mur-roost: already patched at 0x96ec44"
+  ],
+  "e2e_filterset": "kind(test) & (\n  (package(murmur-cli)\n    - binary_id(murmur-cli::dev_version_script)\n    - binary_id(murmur-cli::host_probe_staging)\n    - binary_id(murmur-cli::install_script)\n    - binary_id(murmur-cli::shell_desc_driver))\n  | binary_id(mur-roost::delegation_bounds)\n  | binary_id(mur-roost::machine_ceiling)\n  | binary_id(mur-roost::restart_census)\n  | binary_id(mur-roost::version_output)\n)",
+  "only": null,
+  "coverage": {
+    "all_e2e": {
+      "lines_total": 101845,
+      "lines_covered": 79724,
+      "percent": 78.28
+    },
+    "capsule_e2e": {
+      "lines_total": 101845,
+      "lines_covered": 16957,
+      "percent": 16.65
+    },
+    "by_crate": {
+      "capsule-runtime": {
+        "lines_total": 68677,
+        "lines_covered": 52682,
+        "percent": 76.71
+      },
+      "mur-roost": {
+        "lines_total": 735,
+        "lines_covered": 567,
+        "percent": 77.14
+      },
+      "murmur-artifact": {
+        "lines_total": 8590,
+        "lines_covered": 6509,
+        "percent": 75.77
+      },
+      "murmur-cli": {
+        "lines_total": 23843,
+        "lines_covered": 19966,
+        "percent": 83.74
+      }
+    }
+  },
+  "runs": [
+    {
+      "part": "capsule",
+      "profile": "class-capsule",
+      "tests_run": 341,
+      "passed": 340,
+      "failed": 1,
+      "skipped": 0,
+      "junit_sha256": "401d4de5f83abcf1c55884f1cb00670552106765dce5a0d77da1815e233276db"
+    },
+    {
+      "part": "isolation",
+      "profile": "class-isolation",
+      "tests_run": 1820,
+      "passed": 1818,
+      "failed": 2,
+      "skipped": 0,
+      "junit_sha256": "03c1d64d6ae7b4c9f0fa20d7eea356705894078404a7d278b4ba309c02e6e526"
+    },
+    {
+      "part": "host",
+      "profile": "class-host",
+      "tests_run": 18,
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0,
+      "junit_sha256": "fe264e5ce97c4e0cbbbe1db1aad1951706ea29da699a56b2190b03a62295882f"
+    }
+  ],
+  "failed_under_instrumentation": [
+    {
+      "binary_id": "murmur-cli::list_cmd",
+      "test": "list_outside_project_dir_falls_back_to_global_store",
+      "passes_uninstrumented": false
+    },
+    {
+      "binary_id": "murmur-cli::doctor_cmd",
+      "test": "doctor_fails_with_e_io_001_when_no_project_root_is_found",
+      "passes_uninstrumented": false
+    },
+    {
+      "binary_id": "murmur-cli::doctor_json",
+      "test": "no_project_is_one_refused_document",
+      "passes_uninstrumented": false
+    }
+  ],
+  "stray_profiles": {
+    "count": 26,
+    "directories": [
+      "/space/_murmur/murmur-worktrees/card-8258f42a/crates/murmur-cli",
+      "/tmp/.tmp1pm3BI/.murmur/records/tmp/.tmpUkXknm/ses_01a1fbe138ff7ba1835feb1b9431f935/children/mute-worker-d814ff985e552b7f",
+      "/tmp/.tmp2d0Fwc/.murmur/records/tmp/.tmp7ntzng/ses_01a1fbe29fa77db1a8f6d0c2a704a5f6/children/plain-reviewer-13d23e28a66f453c",
+      "/tmp/.tmp3ZlnUp/.murmur/records/tmp/.tmp1M53R8/ses_01a1fbe1c3ff77018cf6277d650eec94/children/long-worker-7c36522e62d36a42",
+      "/tmp/.tmp3zMi8Q/.murmur/records/tmp/.tmpLJeixw/ses_01a1fbe184b27840ac5fe802b25e4055/children/forger-f02d13010398352c",
+      "/tmp/.tmpEY18wj/.murmur/records/tmp/.tmp7DH0NX/ses_01a1fbe2370c7891b2a2dd7555273293/children/mute-worker-32204658b53e0f89",
+      "/tmp/.tmpJLf4gg/.murmur/records/tmp/.tmpFnUJpW/ses_01a1fbe192c978e3a6ca7ac1895f5b62/children/worker-5033b7cab35a2cd7",
+      "/tmp/.tmpJqejaJ/.murmur/records/tmp/.tmprIZNyf/ses_01a1fbe238d773729d62cddefc7a2b26/children/mute-worker-77db1eefdb4cb4e3",
+      "/tmp/.tmpMEMKc4/.murmur/records/tmp/.tmpg9gv1P/ses_01a1fbe14f307621b67b4763a0b2de8f/children/mute-worker-e5146b41c6909248",
+      "/tmp/.tmpMmfx9L/.murmur/records/tmp/.tmpHRZpBh/ses_01a1fbe25e5076f193ba9d728cda120a/children/worker-7c35d45a6c896d82",
+      "/tmp/.tmpOXNX1p/.murmur/records/tmp/.tmpXNRARf/ses_01a1fbe1ead071f29d1b1af5be392eba/children/long-worker-09875df46be5144a",
+      "/tmp/.tmpOnTJ8n/.murmur/records/tmp/.tmpaKwOsz/workdir/ses_01a1fbe1dadd7e52b997a39f34d51964/children/worker-41d75e392c3cd52c",
+      "/tmp/.tmpQOD7Vf/.murmur/records/tmp/.tmpAk1gMG/ses_01a1fbe1f512721387c91a5b42aa8151/children/long-worker-d3d396453ab3b8e2",
+      "/tmp/.tmpQd4Ggo/.murmur/records/tmp/.tmpe6Ij0F/ses_01a1fbe294e879f1a49f6310aeec0809/children/worker-0f9d0d9f968b296f",
+      "/tmp/.tmpQd4Ggo/.murmur/records/tmp/.tmpe6Ij0F/ses_01a1fbe294e879f1a49f6310aeec0809/children/worker-three-ac97caa45b7c9445",
+      "/tmp/.tmpQd4Ggo/.murmur/records/tmp/.tmpe6Ij0F/ses_01a1fbe294e879f1a49f6310aeec0809/children/worker-two-a93729a490603b3d",
+      "/tmp/.tmpSzKaHV/.murmur/records/tmp/.tmpnDgET8/ses_01a1fbe2548974838dc4be56e72851db/children/auth-worker-f814ad1b25a6d283",
+      "/tmp/.tmpTOVniJ/.murmur/records/tmp/.tmp9se9S1/ses_01a1fbe262d97300930e99ea15160362/children/mute-worker-a067e8c9b2cb997a",
+      "/tmp/.tmpTWJ6xj/.murmur/records/tmp/.tmpIE71wQ/ses_01a1fbe225ab7bd08462b97bd0c21ad4/children/worker-a5be0566e2535c8c",
+      "/tmp/.tmpb3YhNe/.murmur/records/tmp/.tmpl2IXPw/ses_01a1fbe238db70909bd4783fb84ad8a0/children/long-staying-worker-9f26157738e230ed",
+      "/tmp/.tmpbRuTYk/.murmur/records/tmp/.tmpEHV5qB/ses_01a1fbe1b7f172f2b9863ac1e4c80195/children/worker-77f25bf761ee6a03",
+      "/tmp/.tmpfH6qc4/.murmur/records/tmp/.tmpePNaaK/ses_01a1fbe252a87c90860f770a03b992d6/children/worker-dc4845583e063d97",
+      "/tmp/.tmpi20If6/.murmur/records/tmp/.tmpu6jW66/ses_01a1fbe202bd7dc2bdb5dccbc5beed39/children/staying-worker-aa01adb304442fc5",
+      "/tmp/.tmpmaeqQb/.murmur/records/tmp/.tmphADXJN/ses_01a1fbe1fb4578b0a4b56b2f2ea1a3cf/children/worker-9457999c1a69ca6d",
+      "/tmp/.tmpmaeqQb/.murmur/records/tmp/.tmphADXJN/ses_01a1fbe1fb4578b0a4b56b2f2ea1a3cf/children/worker-two-4bde7ab2ac4d2fb4",
+      "/tmp/.tmpoaiMHb/.murmur/records/tmp/.tmpouILc7/ses_01a1fbe280a37702a3274ba54e1cb9f5/children/reviewer-71b518bb6733797c"
+    ]
+  },
+  "mutation_sample": {
+    "tool": "cargo-mutants 27.1.0",
+    "crate": "murmur-cli",
+    "files": [
+      "crates/murmur-cli/src/commands/list.rs"
+    ],
+    "test_filter": "binary_id(murmur-cli::list_cmd) | binary_id(murmur-cli::closed_output)",
+    "command": "TMPDIR=/var/tmp/mut-8258 CARGO_TARGET_DIR=$TD cargo mutants --in-place -p murmur-cli --file crates/murmur-cli/src/commands/list.rs --test-tool nextest --timeout 300 -o $EV -C --features=beta-all -C --test=list_cmd -C --test=closed_output -- -E 'binary_id(murmur-cli::list_cmd) | binary_id(murmur-cli::closed_output)'",
+    "chosen_because": "212 lines and 8 functions behind `mur list`, with no #[cfg(test)] module, so no unit test can catch its mutants and the score is the e2e tests' alone; list_cmd (11 tests) and closed_output (12) drive `mur list` without launching a capsule, both are capsule class, and a mutant rebuilds only the mur binary (murmur-cli has no lib target). Chosen before any run; see the build summary.",
+    "mutants_total": 13,
+    "caught": 5,
+    "missed": 6,
+    "timeout": 0,
+    "unviable": 2,
+    "caught_of_viable": "5 of 11",
+    "wall_seconds": 223,
+    "time_cap_seconds": 2400,
+    "stopped_by_cap": false,
+    "missed_list": [
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 46,
+        "mutation": "replace contract_matches -> Vec<String> with vec![]",
+        "function": "contract_matches"
+      },
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 46,
+        "mutation": "replace contract_matches -> Vec<String> with vec![String::new()]",
+        "function": "contract_matches"
+      },
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 46,
+        "mutation": "replace contract_matches -> Vec<String> with vec![\"xyzzy\".into()]",
+        "function": "contract_matches"
+      },
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 57,
+        "mutation": "delete ! in filter_by_contract",
+        "function": "filter_by_contract"
+      },
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 63,
+        "mutation": "replace format_contracts -> String with String::new()",
+        "function": "format_contracts"
+      },
+      {
+        "file": "crates/murmur-cli/src/commands/list.rs",
+        "line": 63,
+        "mutation": "replace format_contracts -> String with \"xyzzy\".into()",
+        "function": "format_contracts"
+      }
+    ]
+  }
+}

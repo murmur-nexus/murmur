@@ -77,6 +77,14 @@ jobs:
         # `--timings` records each crate's build time.
         run: |
           cargo test --workspace --no-run --timings --features beta-all
+      - name: Check every test has a class
+        # Every test is in one class -- capsule, isolation or host -- by the class profiles'
+        # `default-filter` in .config/nextest.toml (docs/content/contributing/test-classes.md).
+        # This lists the tests of the build above, and of the featureless `new_roster` the
+        # "Test the build releases ship" step builds anyway, and fails on a test no class selects
+        # or two select. Drift from the checked-in .config/test-classes.tsv is reported in the step
+        # summary, not failed: the class rules are the gate, the list is regenerated from them.
+        run: python3 -I scripts/test-classes.py check
       - name: Give capsules a network namespace and a cgroup scope
         # A capsule with a WASM tool, driver or hook runs its guests in worker processes spawned
         # under its containment class, so, like a shell capsule, it needs the session's network
@@ -369,6 +377,14 @@ jobs:
       - name: Lints without features
         # Code only some features use must be gated behind them, and this run is what catches it.
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-classes-tool:
+    name: test-classes tool
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests of scripts/test-classes.py
+        run: python3 -I -m unittest discover -s scripts/tests -p 'test_test_classes*.py' -v
 
   wit-versions:
     name: wit-versions

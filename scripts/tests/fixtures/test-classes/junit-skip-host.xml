@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="murmur-cli::guest_workers">
+    <testcase name="tools_worker_runs_under_scoped" classname="murmur-cli::guest_workers" timestamp="2026-11-20T20:41:23.185-05:00" time="0.011">
+      <system-out>
+running 1 test
+test tools_worker_runs_under_scoped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.01s
+
+</system-out>
+      <system-err>[SKIP-HOST] tools_worker_runs_under_scoped: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security module's policy. Inside a container, the container runtime's seccomp profile is the usual blocker: it refuses unshare(CLONE_NE
+</system-err>
+    </testcase>
+  </testsuite>
+</testsuites>

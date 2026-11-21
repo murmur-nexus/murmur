@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="murmur-cli::version_cmd">
+    <testcase name="dash_dash_version_is_unchanged" classname="murmur-cli::version_cmd" timestamp="2026-11-20T20:40:04.298-05:00" time="0.017">
+      <system-out>
+running 1 test
+test dash_dash_version_is_unchanged ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s
+
+</system-out>
+      <system-err />
+    </testcase>
+    <testcase name="version_json_is_one_object_naming_the_same_level_and_packages" classname="murmur-cli::version_cmd" timestamp="2026-11-20T20:40:04.309-05:00" time="0.023">
+      <system-out>
+running 1 test
+test version_json_is_one_object_naming_the_same_level_and_packages ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s
+
+</system-out>
+      <system-err />
+    </testcase>
+  </testsuite>
+</testsuites>

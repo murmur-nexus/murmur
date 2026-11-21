@@ -74,7 +74,7 @@ When the feature is ready for all users:
 
 ## Running tests
 
-Run the unit tests plus the integration suites for the area you touched before submitting:
+Run the unit tests plus the integration suites for the area you touched before submitting. [Test classes](test-classes.md) says which tests need an isolating host and how to run one class:
 
 ```bash
 cargo test --workspace --lib --bins     # unit tests across all crates

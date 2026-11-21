@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="capsule-runtime">
+    <testcase name="interpreter_runtime::tests::perl_is_recognised_by_perl_parse" classname="capsule-runtime" timestamp="2026-11-20T20:42:05.843-05:00" time="0.035">
+      <system-out>[SKIP] no perl on PATH
+</system-out>
+      <system-err />
+    </testcase>
+  </testsuite>
+</testsuites>

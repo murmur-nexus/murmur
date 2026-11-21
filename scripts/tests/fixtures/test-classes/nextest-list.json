@@ -1,0 +1,180 @@
+{
+ "rust-build-meta": {
+  "target-directory": "/work/murmur/target",
+  "build-directory": "/work/murmur/target",
+  "base-output-directories": [
+   "debug"
+  ],
+  "non-test-binaries": {
+   "path+file:///work/murmur/crates/committed-components#0.0.0": [
+    {
+     "name": "committed-components",
+     "kind": "bin-exe",
+     "path": "debug/committed-components",
+     "build-platform": "target"
+    }
+   ],
+   "path+file:///work/murmur/crates/mur-roost#0.13.0-dev": [
+    {
+     "name": "mur-roost",
+     "kind": "bin-exe",
+     "path": "debug/mur-roost",
+     "build-platform": "target"
+    }
+   ],
+   "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev": [
+    {
+     "name": "mur",
+     "kind": "bin-exe",
+     "path": "debug/mur",
+     "build-platform": "target"
+    }
+   ]
+  },
+  "build-script-out-dirs": {
+   "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev": "debug/build/murmur-cli-323e2f4b2fd3c256/out"
+  },
+  "build-script-info": {
+   "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev": {
+    "envs": {
+     "MUR_BUILD_COMMIT": "e61e385398ad3344cdf5ba313323f2b48b30fdc2"
+    }
+   }
+  },
+  "linked-paths": [
+   "debug/build/ring-7a696445193b1ccb/out",
+   "debug/build/wasmtime-b4f468e7cec2c9fb/out"
+  ],
+  "platforms": {
+   "host": {
+    "platform": {
+     "triple": "x86_64-unknown-linux-gnu",
+     "target-features": "unknown"
+    },
+    "libdir": {
+     "status": "available",
+     "path": "/work/rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib"
+    }
+   },
+   "targets": []
+  },
+  "target-platforms": [
+   {
+    "triple": "x86_64-unknown-linux-gnu",
+    "target-features": "unknown"
+   }
+  ],
+  "target-platform": null
+ },
+ "test-count": 8,
+ "rust-suites": {
+  "murmur-artifact": {
+   "package-name": "murmur-artifact",
+   "binary-id": "murmur-artifact",
+   "binary-name": "murmur_artifact",
+   "package-id": "path+file:///work/murmur/crates/murmur-artifact#0.13.0-dev",
+   "kind": "lib",
+   "binary-path": "/work/murmur/target/debug/deps/murmur_artifact-3b9f14f7b006be86",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/murmur-artifact",
+   "status": "listed",
+   "testcases": {
+    "artifact::tests::load_manifest_reads_packed_entry": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    },
+    "artifact::tests::load_manifest_yaml_default_ceiling_does_not_reject_small_manifest": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    }
+   }
+  },
+  "mur-roost::version_output": {
+   "package-name": "mur-roost",
+   "binary-id": "mur-roost::version_output",
+   "binary-name": "version_output",
+   "package-id": "path+file:///work/murmur/crates/mur-roost#0.13.0-dev",
+   "kind": "test",
+   "binary-path": "/work/murmur/target/debug/deps/version_output-88933de78abb162d",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/mur-roost",
+   "status": "listed",
+   "testcases": {
+    "a_full_disk_on_stdout_fails_version_with_e_io_003": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    }
+   }
+  },
+  "murmur-cli::guest_workers": {
+   "package-name": "murmur-cli",
+   "binary-id": "murmur-cli::guest_workers",
+   "binary-name": "guest_workers",
+   "package-id": "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev",
+   "kind": "test",
+   "binary-path": "/work/murmur/target/debug/deps/guest_workers-85b8b88b67540bf0",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/murmur-cli",
+   "status": "listed",
+   "testcases": {
+    "a_hook_starts_the_hooks_worker": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    },
+    "a_task_runs_through_the_driver_and_tools_workers": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    },
+    "tools_worker_runs_under_scoped": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    }
+   }
+  },
+  "murmur-cli::deploy_precompile": {
+   "package-name": "murmur-cli",
+   "binary-id": "murmur-cli::deploy_precompile",
+   "binary-name": "deploy_precompile",
+   "package-id": "path+file:///work/murmur/crates/murmur-cli#0.13.0-dev",
+   "kind": "test",
+   "binary-path": "/work/murmur/target/debug/deps/deploy_precompile-cd4e87c353da2e47",
+   "build-platform": "target",
+   "cwd": "/work/murmur/crates/murmur-cli",
+   "status": "listed",
+   "testcases": {
+    "a_ceiling_set_only_for_the_target_warns_and_the_launch_is_warm": {
+     "kind": "test",
+     "ignored": false,
+     "filter-match": {
+      "status": "matches"
+     }
+    },
+    "measured_first_launch_after_a_deploy": {
+     "kind": "test",
+     "ignored": true,
+     "filter-match": {
+      "status": "matches"
+     }
+    }
+   }
+  }
+ }
+}
