@@ -83,7 +83,7 @@ class Workspace:
             testcase.addCleanup(patcher.stop)
 
     def listings(self, value):
-        return mock.patch.object(tool, "listings", lambda rules, filters: value)
+        return mock.patch.object(tool, "listings", lambda rules: value)
 
 
 def run_main(argv) -> tuple[int, str, str]:

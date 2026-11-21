@@ -20,8 +20,8 @@ could have run.
 | Class | Tests | `unit` | `integration` | `e2e` |
 |---|---:|---:|---:|---:|
 | `capsule` | 3,426 | 3,012 | 73 | 341 |
-| `isolation` | 3,520 | 1,611 | 80 | 1,829 |
-| `host` | 18 | 0 | 0 | 18 |
+| `isolation` | 3,515 | 1,606 | 80 | 1,829 |
+| `host` | 23 | 5 | 0 | 18 |
 
 These are the counts of `.config/test-classes.tsv`; `python3 -I scripts/test-classes.py list --json`
 prints them for the list as it stands.
@@ -154,6 +154,11 @@ added, removed or reclassified since the list was written; CI does not fail on t
 `--strict` does. `list [--class C] [--kind K] [--json]` reads the checked-in list, and `--live`
 recomputes it from nextest.
 
+`generate`, `check` and `list --live` build the featureless `new_roster` binary, which replaces
+`target/debug/mur` with a build that has no beta features. Do not run them beside a test run that
+uses the same target directory: that run's capsule launches fail with `E-RUN-066`. The next build
+with `--features beta-all` puts the full `mur` back.
+
 | Exit code | `test-classes.py` and `e2e-coverage.py` |
 |---|---|
 | 0 | ok |
@@ -218,6 +223,7 @@ end tests pin down; no CI job reads it.
 | Profiles from children that clear their environment or run confined | `mur`'s guest workers and capsule commands can lose `LLVM_PROFILE_FILE`, or may not write where it points; their lines count as uncovered. The script deletes the stray `default*.profraw` files such children leave and records how many in `stray_profiles` |
 | Instrumentation-only failures | an instrumented build is slower, and a test with a tight deadline can fail under it; `failed_under_instrumentation` lists each with `passes_uninstrumented` |
 | `race-windows` tests | the 4 tests compiled only with the `race-windows` feature, which `scripts/test.sh` turns on and CI does not, are outside the list. Their binaries' rules classify them (`isolation`) when they are built |
+| Five `host` tests need a host without a sealed root | the `capsule-runtime` `sandbox::linux_integration_tests::kernel_full_*` tests in `class-host` need Landlock with no sealed root. A host that can build a sealed root, as one prepared like CI's does, makes them print a host-skip line, so `audit --class host` fails there |
 | Classes are checked by running them | a `capsule` test that passes in the construction without proving anything there would be missed; the construction catches failures and host-skip lines |
 
 The `race-windows` tests:

@@ -211,7 +211,7 @@ def nextest_version() -> str:
     return first.split()[1] if len(first.split()) > 1 else first
 
 
-def listings(rules: dict, filters: dict[str, str]) -> dict[str, dict]:
+def listings(rules: dict) -> dict[str, dict]:
     """Every listing `compute` needs, per configuration, run a few at a time.
 
     Per configuration: the full set (no class profile), one per class profile, and the e2e
@@ -293,10 +293,12 @@ def classify(rules: dict, results: dict[str, dict]) -> tuple[dict, list[str]]:
     return rows, findings
 
 
-def compute(rules: dict | None = None, filters: dict[str, str] | None = None) -> tuple[dict, list[str]]:
+def compute(rules: dict | None = None) -> tuple[dict, list[str]]:
     rules = rules if rules is not None else load_rules()
-    filters = filters if filters is not None else class_filters()
-    return classify(rules, listings(rules, filters))
+    # A class profile with no `default-filter` would select every test; refuse it as unusable
+    # rather than report thousands of overlaps.
+    class_filters()
+    return classify(rules, listings(rules))
 
 
 # --- the list --------------------------------------------------------------------------------
