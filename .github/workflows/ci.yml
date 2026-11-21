@@ -474,6 +474,22 @@ jobs:
         # job's copy fails here rather than during a release.
         run: python .github/scripts/check-workflow-invocations.py
 
+  isolation-proofs-script:
+    name: isolation-proofs-script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Unit tests of the isolation runner
+        # scripts/isolation-proofs.py is what a board's host stage runs and its judging stage
+        # trusts: it decides that a host-skip line is no evidence and that a changed tree makes
+        # evidence unusable. Its unit tests need no cargo and no host isolation, and they read the
+        # recorded nextest reports under scripts/tests/fixtures/isolation/, so a change to the
+        # runner, or to the JUnit shape it parses, fails here rather than on a board.
+        run: python3 -I -m unittest discover -s scripts/tests -v
+
   macos:
     name: macos (${{ matrix.target }})
     # Compiles every target and every feature at each Apple triple the release publishes, on the

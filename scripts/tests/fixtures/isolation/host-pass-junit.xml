@@ -1,0 +1,82 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="0" errors="0" uuid="dae1dc49-3297-4acb-bc9c-506f3a7baab6" timestamp="2026-11-20T17:21:08.873-05:00" time="0.253">
+    <testsuite name="capsule-runtime" tests="3" skipped="0" errors="0" failures="0">
+        <testcase name="sandbox::linux_integration_tests::kernel_tier_refuses_rename_into_the_workdir" classname="capsule-runtime" timestamp="2026-11-20T17:21:08.882-05:00" time="0.243">
+            <system-out>
+running 1 test
+exit 0
+--- stdout
+--- stderr
+mv: cannot move '/tmp/.tmpn2Ests/outside/y' to './y': Permission denied
+ln: failed to create hard link './y2' =&gt; '/tmp/.tmpn2Ests/outside/y': Invalid cross-device link
+---
+test sandbox::linux_integration_tests::kernel_tier_refuses_rename_into_the_workdir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3253 filtered out; finished in 0.23s
+
+</system-out>
+            <system-err />
+        </testcase>
+        <testcase name="sandbox::linux_integration_tests::kernel_tier_truncate_outside_the_workdir_is_refused" classname="capsule-runtime" timestamp="2026-11-20T17:21:08.882-05:00" time="0.243">
+            <system-out>
+running 1 test
+exit 13
+--- stdout
+--- stderr
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings:
+LANGUAGE = (unset),
+LC_ALL = (unset),
+LANG = "en_US.UTF-8"
+    are supported and installed on your system.
+perl: warning: Falling back to the standard locale ("C").
+Permission denied
+---
+exit 0
+--- stdout
+--- stderr
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings:
+LANGUAGE = (unset),
+LC_ALL = (unset),
+LANG = "en_US.UTF-8"
+    are supported and installed on your system.
+perl: warning: Falling back to the standard locale ("C").
+---
+test sandbox::linux_integration_tests::kernel_tier_truncate_outside_the_workdir_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3253 filtered out; finished in 0.23s
+
+</system-out>
+            <system-err />
+        </testcase>
+        <testcase name="sandbox::linux_integration_tests::kernel_tier_refuses_rename_out_of_the_workdir" classname="capsule-runtime" timestamp="2026-11-20T17:21:08.882-05:00" time="0.244">
+            <system-out>
+running 1 test
+exit 0
+--- stdout
+--- stderr
+mv: cannot move 'x' to '/tmp/.tmpemYGvN/outside/x': Permission denied
+ln: failed to create hard link '/tmp/.tmpemYGvN/outside/x2' =&gt; 'x': Permission denied
+---
+test sandbox::linux_integration_tests::kernel_tier_refuses_rename_out_of_the_workdir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3253 filtered out; finished in 0.23s
+
+</system-out>
+            <system-err />
+        </testcase>
+    </testsuite>
+    <testsuite name="murmur-cli::guest_workers" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="tools_worker_runs_under_scoped" classname="murmur-cli::guest_workers" timestamp="2026-11-20T17:21:24.913-05:00" time="10.001">
+            <system-out>
+running 1 test
+test tools_worker_runs_under_scoped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 9.99s
+
+</system-out>
+            <system-err />
+        </testcase>
+    </testsuite>
+</testsuites>

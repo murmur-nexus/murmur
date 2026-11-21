@@ -1,0 +1,77 @@
+# isolation-board: a Transit board that proves Murmur's isolation-sensitive tests on the host and
+# fails a card on anything but a pass. Every stage is a host script: no capsule, no model, no tokens.
+#
+# Why a host board at all: inside a capsule, a Landlock or guest-worker test cannot create the
+# namespaces it needs (a capsule command's seccomp filter refuses `unshare`, `mount` and `seccomp`),
+# so it prints a host-skip line and nextest counts it as a pass. These stages run the tests outside
+# any capsule, as the board's owner, and judge per-test evidence in which a skip is never a pass.
+# docs/content/contributing/isolation-tests.md has the placements, the grants and the security note.
+#
+# Install: bash scripts/isolation-board/install.sh <project> [<trusted tree>], then
+# nexus transit doctor --project <project>. A card is a tree on the project's main; move it to
+# Isolate to prove it.
+version: 2
+name: "Isolation proofs: run on the host, judge the evidence"
+description: "Isolate runs the isolation sets of the card's tree on the host with trusted copies of the runner; Judge fails the card on any failure, skip or missing test."
+mode: transit
+
+workspace_provider:
+  type: git-clone
+  config:
+    start_point: main
+    fetch: true                     # every clone starts from main as origin has it now
+
+deliverable_kinds:
+  - { name: isolation-evidence, label: "murmur.isolation-evidence/1: per-test results of the host run" }
+  - { name: isolation-verdict, label: "The judge's lines and its JUDGE: verdict" }
+
+stages:
+  # A person decides which trees to prove by moving a card to Isolate.
+  - name: Intake
+    executor: null
+    advance_on: manual
+    new_card_position: bottom
+
+  # Boundary: authority. The runner, the classification, the nextest config and the preflight are
+  # the board's trusted copies (install.sh), never the clone's, so a card cannot change the code
+  # that judges it. The card's own test code still runs as the board's owner: see the docs' security
+  # note. The evidence is written under the board, outside the clone; a copy inside the clone is
+  # what Transit attaches, because a script's deliverable must be a path inside its workspace.
+  # The stage succeeds whenever evidence was written, pass or fail, so a failing test reaches Judge;
+  # only a refusal (no evidence) fails it. One at a time: two isolation runs at once share the host's
+  # cores and its cgroup tree, and a slow-timeout under contention would be noise in the evidence.
+  - name: Isolate
+    executor:
+      type: script
+      apply: |
+        T="$(cd "$(dirname "$TRANSIT_DELIVERABLES")/../.." && pwd)"
+        exec bash "$T/scripts/isolate.sh"
+      reverse: |
+        true
+      timeout_secs: 5400
+    advance_on: executor_success
+    concurrency: 1
+    produces: [isolation-evidence]
+    reverse_unattended: true
+
+  # Boundary: independence. Judge recomputes the clone's commit and tree, checks every JUnit report
+  # against its recorded hash and every row against its report, and requires both sets. It exits
+  # with the judge's status, so a card that is not a pass stalls here and never reaches Done.
+  - name: Judge
+    executor:
+      type: script
+      apply: |
+        T="$(cd "$(dirname "$TRANSIT_DELIVERABLES")/../.." && pwd)"
+        exec bash "$T/scripts/judge.sh"
+      reverse: |
+        true
+      timeout_secs: 300
+    advance_on: executor_success
+    requires: [isolation-evidence]
+    produces: [isolation-verdict]
+    reverse_unattended: true
+
+  # The clone is kept: Transit's `deliverables --show` reads an uncommitted deliverable from the
+  # clone, so releasing it here would leave the verdict unreadable through the board. The
+  # authoritative evidence and verdict also sit under .nexus/transit/evidence/.
+  - { name: Done, executor: null, advance_on: manual }

@@ -135,6 +135,9 @@ print what they found at every step.
 - WASM guests, drivers, hooks and the process harness run on routes no containment class
   confines, so `contained` says nothing about them.
 
+A Transit board can prove the same isolation tests through a card, outside any capsule: see
+[Isolation tests on a board](isolation-tests.md).
+
 ## Changing a WIT interface
 
 The repository commits compiled WASM components (test fixtures and the escape-conformance

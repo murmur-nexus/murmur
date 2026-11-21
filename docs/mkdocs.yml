@@ -201,3 +201,4 @@ nav:
       - Roost API: reference/roost-api.md
   - Contributing:
       - Overview: contributing/index.md
+      - Isolation tests on a board: contributing/isolation-tests.md

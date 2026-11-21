@@ -112,6 +112,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 ## Contributing
 
 - [Overview](/contributing.md): Contributor guidelines — commit sign-off (DCO), employer contributions, and how reviews work.
+- [Isolation tests on a board](/contributing/isolation-tests.md): Proving Murmur's Landlock and guest-worker tests through a Transit board on the host — the placements, the host grants and what each exposes, the runner's exit codes and evidence.
 
 ## Optional
 
