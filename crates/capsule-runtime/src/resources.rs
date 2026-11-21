@@ -482,6 +482,125 @@ pub(crate) fn declared_resource_fields(
     .collect()
 }
 
+/// One `capabilities.resources` field as [`ResourcesReport`] states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResourceValueReport {
+    /// The value from [`HostResourceLimits`]: the declared one, or the default when the manifest
+    /// leaves the field out. `null` for `cpu_seconds` or `cgroup_cpu_percent` left out, which set
+    /// no limit.
+    pub value: Option<u64>,
+    /// Whether the manifest's `capabilities.resources` block sets the field.
+    pub declared: bool,
+}
+
+/// The `capabilities.resources` values a session runs under: `ScopeReport::resources`, the
+/// `Resources` block of `mur run --explain-scope`. One field per manifest key, named as the key
+/// and in [`Self::rows`]' order, each always serialized.
+///
+/// Read from the policy's resolved [`HostResourceLimits`] and the block as declared, so it states
+/// the values the launch applies. An unconfined session applies only the declared ones, which
+/// `UnconfinedReport::resource_limits` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResourcesReport {
+    /// [`HostResourceLimits::memory_bytes`].
+    pub memory_bytes: ResourceValueReport,
+    /// [`HostResourceLimits::workdir_max_bytes`].
+    pub workdir_max_bytes: ResourceValueReport,
+    /// [`HostResourceLimits::max_open_files`].
+    pub max_open_files: ResourceValueReport,
+    /// [`HostResourceLimits::max_file_size_bytes`].
+    pub max_file_size_bytes: ResourceValueReport,
+    /// [`HostResourceLimits::max_processes`].
+    pub max_processes: ResourceValueReport,
+    /// [`HostResourceLimits::cpu_seconds`].
+    pub cpu_seconds: ResourceValueReport,
+    /// [`HostResourceLimits::cgroup_memory_bytes`].
+    pub cgroup_memory_bytes: ResourceValueReport,
+    /// [`HostResourceLimits::cgroup_pids_max`].
+    pub cgroup_pids_max: ResourceValueReport,
+    /// [`HostResourceLimits::cgroup_cpu_percent`].
+    pub cgroup_cpu_percent: ResourceValueReport,
+    /// [`HostResourceLimits::cgroup_io_bytes_per_sec`].
+    pub cgroup_io_bytes_per_sec: ResourceValueReport,
+}
+
+impl ResourcesReport {
+    /// The report for `limits`, the policy's resolved limits, and `declared`, the manifest's
+    /// `capabilities.resources` block as written.
+    #[must_use]
+    pub(crate) fn new(
+        limits: &HostResourceLimits,
+        declared: &murmur_artifact::ResourceCapabilities,
+    ) -> Self {
+        let row = |value: Option<u64>, declared: bool| ResourceValueReport { value, declared };
+        Self {
+            memory_bytes: row(Some(limits.memory_bytes), declared.memory_bytes.is_some()),
+            workdir_max_bytes: row(
+                Some(limits.workdir_max_bytes),
+                declared.workdir_max_bytes.is_some(),
+            ),
+            max_open_files: row(
+                Some(limits.max_open_files),
+                declared.max_open_files.is_some(),
+            ),
+            max_file_size_bytes: row(
+                Some(limits.max_file_size_bytes),
+                declared.max_file_size_bytes.is_some(),
+            ),
+            max_processes: row(Some(limits.max_processes), declared.max_processes.is_some()),
+            cpu_seconds: row(limits.cpu_seconds, declared.cpu_seconds.is_some()),
+            cgroup_memory_bytes: row(
+                Some(limits.cgroup_memory_bytes),
+                declared.cgroup_memory_bytes.is_some(),
+            ),
+            cgroup_pids_max: row(
+                Some(limits.cgroup_pids_max),
+                declared.cgroup_pids_max.is_some(),
+            ),
+            cgroup_cpu_percent: row(
+                limits.cgroup_cpu_percent.map(u64::from),
+                declared.cgroup_cpu_percent.is_some(),
+            ),
+            cgroup_io_bytes_per_sec: row(
+                Some(limits.cgroup_io_bytes_per_sec),
+                declared.cgroup_io_bytes_per_sec.is_some(),
+            ),
+        }
+    }
+
+    /// Every field with its manifest key, in serialization order.
+    #[must_use]
+    pub fn rows(&self) -> [(&'static str, ResourceValueReport); 10] {
+        [
+            ("memory_bytes", self.memory_bytes),
+            ("workdir_max_bytes", self.workdir_max_bytes),
+            ("max_open_files", self.max_open_files),
+            ("max_file_size_bytes", self.max_file_size_bytes),
+            ("max_processes", self.max_processes),
+            ("cpu_seconds", self.cpu_seconds),
+            ("cgroup_memory_bytes", self.cgroup_memory_bytes),
+            ("cgroup_pids_max", self.cgroup_pids_max),
+            ("cgroup_cpu_percent", self.cgroup_cpu_percent),
+            ("cgroup_io_bytes_per_sec", self.cgroup_io_bytes_per_sec),
+        ]
+    }
+
+    /// The `Resources` block of `--explain-scope`: one `<key>: <value> (declared|default)` line
+    /// per field, `<none>` for a value that sets no limit. Ends with a newline.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::from("Resources\n");
+        for (key, row) in self.rows() {
+            let value = row
+                .value
+                .map_or_else(|| "<none>".to_string(), |value| value.to_string());
+            let source = if row.declared { "declared" } else { "default" };
+            out.push_str(&format!("  {:<25}{value} ({source})\n", format!("{key}:")));
+        }
+        out
+    }
+}
+
 /// The `RLIMIT_NPROC` half of [`apply_hard_rlimits`]: set for [`NprocBound::Headroom`], left
 /// alone for [`NprocBound::CgroupPidsMax`]. Same `pre_exec` restrictions.
 ///
@@ -1622,5 +1741,124 @@ mod tests {
                 "cpu_seconds {cpu_seconds}, inherited hard {inherited_hard}"
             );
         }
+    }
+
+    /// With no `capabilities.resources` block every line is the default `HostResourceLimits`
+    /// value, and the two CPU fields set no limit.
+    #[test]
+    fn resources_report_states_the_defaults_when_nothing_is_declared() {
+        let declared = murmur_artifact::ResourceCapabilities::default();
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(None), &declared);
+        let defaults = HostResourceLimits::default();
+        assert!(report.rows().iter().all(|(_, row)| !row.declared));
+        assert_eq!(report.memory_bytes.value, Some(defaults.memory_bytes));
+        assert_eq!(
+            report.workdir_max_bytes.value,
+            Some(defaults.workdir_max_bytes)
+        );
+        assert_eq!(report.max_processes.value, Some(defaults.max_processes));
+        assert_eq!(report.cgroup_pids_max.value, Some(defaults.cgroup_pids_max));
+        assert_eq!(report.cpu_seconds.value, None);
+        assert_eq!(report.cgroup_cpu_percent.value, None);
+    }
+
+    /// A declared field reads its declared value and `declared: true`; its neighbours keep the
+    /// default and `declared: false`.
+    #[test]
+    fn resources_report_marks_the_declared_fields_alone() {
+        let declared = murmur_artifact::ResourceCapabilities {
+            memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            max_open_files: Some(4096),
+            cgroup_cpu_percent: Some(200),
+            ..Default::default()
+        };
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let declared_keys: Vec<&str> = report
+            .rows()
+            .iter()
+            .filter(|(_, row)| row.declared)
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(
+            declared_keys,
+            ["memory_bytes", "max_open_files", "cgroup_cpu_percent"]
+        );
+        assert_eq!(report.memory_bytes.value, Some(68_719_476_736));
+        assert_eq!(report.max_open_files.value, Some(4096));
+        assert_eq!(report.cgroup_cpu_percent.value, Some(200));
+        assert_eq!(
+            report.workdir_max_bytes,
+            ResourceValueReport {
+                value: Some(DEFAULT_WORKDIR_MAX_BYTES),
+                declared: false
+            }
+        );
+    }
+
+    /// Every `capabilities.resources` field has a row, the rows serialize under their own keys in
+    /// their own order, and each row says `declared` for a fully declared block. The block is
+    /// built without `..` so a new manifest field fails to compile here until it has a row.
+    #[test]
+    fn resources_report_has_one_row_per_manifest_field_under_its_key() {
+        let declared = murmur_artifact::ResourceCapabilities {
+            max_processes: Some(1),
+            max_open_files: Some(2),
+            max_file_size_bytes: Some(3),
+            cpu_seconds: Some(4),
+            memory_bytes: Some(5),
+            cgroup_memory_bytes: Some(6),
+            cgroup_pids_max: Some(7),
+            cgroup_cpu_percent: Some(8),
+            cgroup_io_bytes_per_sec: Some(9),
+            workdir_max_bytes: Some(10),
+        };
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let mut keys: Vec<&str> = report.rows().iter().map(|(key, _)| *key).collect();
+        assert!(report.rows().iter().all(|(_, row)| row.declared));
+
+        let json = serde_json::to_string(&report).unwrap();
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| {
+                json.find(&format!("\"{key}\":"))
+                    .unwrap_or_else(|| panic!("{key}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{json}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["cpu_seconds"],
+            serde_json::json!({"value": 4, "declared": true})
+        );
+
+        let mut fields = declared_resource_fields(&declared);
+        keys.sort_unstable();
+        fields.sort_unstable();
+        assert_eq!(keys, fields);
+    }
+
+    /// The text block: one aligned `<key>: <value> (<source>)` line per field, `<none>` for an
+    /// unset CPU field.
+    #[test]
+    fn resources_report_renders_one_line_per_field() {
+        let declared = murmur_artifact::ResourceCapabilities {
+            memory_bytes: Some(68_719_476_736),
+            ..Default::default()
+        };
+        let rendered =
+            ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared).render();
+        assert_eq!(
+            rendered,
+            "Resources\n\
+             \x20 memory_bytes:            68719476736 (declared)\n\
+             \x20 workdir_max_bytes:       10737418240 (default)\n\
+             \x20 max_open_files:          1024 (default)\n\
+             \x20 max_file_size_bytes:     4294967296 (default)\n\
+             \x20 max_processes:           128 (default)\n\
+             \x20 cpu_seconds:             <none> (default)\n\
+             \x20 cgroup_memory_bytes:     4294967296 (default)\n\
+             \x20 cgroup_pids_max:         256 (default)\n\
+             \x20 cgroup_cpu_percent:      <none> (default)\n\
+             \x20 cgroup_io_bytes_per_sec: 104857600 (default)\n"
+        );
     }
 }

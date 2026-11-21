@@ -179,6 +179,7 @@ default-filter = """
     | binary_id(murmur-cli::busy_door)
     | binary_id(murmur-cli::call_deadline)
     | binary_id(murmur-cli::cancel)
+    | binary_id(murmur-cli::capsule_limits_doc)
     | binary_id(murmur-cli::cgroup_scope_report)
     | binary_id(murmur-cli::code_mode_bus)
     | binary_id(murmur-cli::code_mode_e2e)

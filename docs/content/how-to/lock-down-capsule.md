@@ -335,6 +335,10 @@ Each shell invocation the agent makes appears in the session's [`trace.jsonl`](.
 {"event_type":"shell","turn":0,"command":"git status","exit_code":0,"stdout_bytes":124,"stderr_bytes":0,"duration_ms":12}
 ```
 
+A command that exits 126, cannot find a file under `~`, or cannot reach a host has met one of the
+limits [What a contained capsule cannot do](../reference/capsule-limits.md) lists, each with the grant
+that lifts it. Run `mur doctor --programs` to see which programs this capsule cannot run on this host.
+
 ---
 
 ## Step 6 — watch for warnings and keep secrets out of the manifest

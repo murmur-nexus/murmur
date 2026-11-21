@@ -437,3 +437,173 @@ fn explain_scope_report(home: &TempDir, project_dir: &Path, extra: &[&str]) -> s
         .clone();
     serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap()
 }
+
+/// The block of `rendered` that starts at the line `heading` and runs to the next blank line.
+fn text_block<'a>(rendered: &'a str, heading: &str) -> &'a str {
+    let start = rendered
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("no {heading} block:\n{rendered}"))
+        + 1;
+    let block = &rendered[start..];
+    &block[..block.find("\n\n").map_or(block.len(), |end| end + 1)]
+}
+
+/// The comma-separated names on the line labelled `label` of a `Shell environment` block.
+fn shell_env_line<'a>(block: &'a str, label: &str) -> Vec<&'a str> {
+    let line = block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(&format!("{label}:")))
+        .unwrap_or_else(|| panic!("no {label}: line:\n{block}"));
+    line.trim().split(", ").collect()
+}
+
+/// `--explain-scope` states the `capabilities.resources` values and the shell environment's names
+/// a session runs under, in text between `Effective grants` and `Resource plane` and in `--json`
+/// under `resources` and `shell_env`, and never a variable's value.
+#[test]
+fn explain_scope_prints_the_resources_and_the_shell_environment_names() {
+    const SENTINEL: &str = "sentinel-value-never-reported";
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow: [bash]\n    baseline_env: [NODE_OPTIONS, AWS_PROFILE]\n    \
+         strip_env: [\"MY_*\"]\n  resources:\n    memory_bytes: 68719476736\n    \
+         max_open_files: 4096\n    cgroup_cpu_percent: 200\n",
+    );
+    let run = |args: &[&str]| {
+        let output = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("NODE_OPTIONS", SENTINEL)
+            .current_dir(project.path())
+            .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).unwrap()
+    };
+
+    let rendered = run(&[]);
+    assert!(!rendered.contains(SENTINEL), "{rendered}");
+    let grants = rendered.find("\nEffective grants\n").unwrap();
+    let resources_at = rendered.find("\nResources\n").unwrap();
+    let shell_env_at = rendered.find("\nShell environment\n").unwrap();
+    let plane = rendered.find("\nResource plane\n").unwrap();
+    assert!(
+        grants < resources_at && resources_at < shell_env_at && shell_env_at < plane,
+        "{rendered}"
+    );
+    let resources = text_block(&rendered, "Resources");
+    for (key, value) in [
+        ("memory_bytes", "68719476736 (declared)"),
+        ("workdir_max_bytes", "10737418240 (default)"),
+        ("max_open_files", "4096 (declared)"),
+        ("max_file_size_bytes", "4294967296 (default)"),
+        ("max_processes", "128 (default)"),
+        ("cpu_seconds", "<none> (default)"),
+        ("cgroup_memory_bytes", "4294967296 (default)"),
+        ("cgroup_pids_max", "256 (default)"),
+        ("cgroup_cpu_percent", "200 (declared)"),
+        ("cgroup_io_bytes_per_sec", "104857600 (default)"),
+    ] {
+        assert!(
+            resources.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix(&format!("{key}:"))
+                    .is_some_and(|rest| rest.trim() == value)
+            }),
+            "no `{key}: {value}` line:\n{resources}"
+        );
+    }
+    assert_eq!(resources.lines().count(), 11, "{resources}");
+
+    let shell_env = text_block(&rendered, "Shell environment");
+    let baseline = shell_env_line(shell_env, "baseline");
+    for name in ["NODE_OPTIONS", "PATH", "USER", "LANG", "CARGO_HOME"] {
+        assert!(
+            baseline.contains(&name),
+            "{name} not in baseline:\n{shell_env}"
+        );
+    }
+    for name in ["AWS_PROFILE", "HOME"] {
+        assert!(
+            !baseline.contains(&name),
+            "{name} in baseline:\n{shell_env}"
+        );
+    }
+    let always_removed = shell_env_line(shell_env, "always removed");
+    assert!(always_removed.contains(&"AWS_*") && always_removed.contains(&"*_API_KEY"));
+    assert_eq!(shell_env_line(shell_env, "strip env"), ["MY_*"]);
+    let session_set = shell_env_line(shell_env, "session's own");
+    for name in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+        assert!(
+            session_set.contains(&name),
+            "{name} not set by the session:\n{shell_env}"
+        );
+    }
+
+    let json_text = run(&["--json"]);
+    assert_eq!(json_text.trim().lines().count(), 1, "{json_text}");
+    assert!(!json_text.contains(SENTINEL), "{json_text}");
+    let report: serde_json::Value = serde_json::from_str(json_text.trim()).unwrap();
+    assert_eq!(
+        report["resources"]["memory_bytes"],
+        serde_json::json!({"value": 68_719_476_736_u64, "declared": true})
+    );
+    assert_eq!(
+        report["resources"]["cpu_seconds"],
+        serde_json::json!({"value": null, "declared": false})
+    );
+    assert_eq!(report["resources"].as_object().unwrap().len(), 10);
+    let names = |key: &str| -> Vec<String> {
+        report["shell_env"][key]
+            .as_array()
+            .unwrap_or_else(|| panic!("shell_env.{key}: {report}"))
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names("baseline"), baseline);
+    assert_eq!(names("always_removed"), always_removed);
+    assert_eq!(names("strip_env"), ["MY_*"]);
+    assert_eq!(names("session_set"), session_set);
+
+    assert!(!project.path().join("workdir").exists());
+}
+
+/// With no `resources` block every line of the `Resources` block reads `(default)`.
+#[test]
+fn explain_scope_reads_default_on_every_resources_line_without_a_resources_block() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow: [bash]\n",
+    );
+    let output = mur_run(&home, project.path(), &["--explain-scope"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rendered = String::from_utf8(output).unwrap();
+    let resources = text_block(&rendered, "Resources");
+    let rows: Vec<&str> = resources.lines().skip(1).collect();
+    assert_eq!(rows.len(), 10, "{resources}");
+    assert!(
+        rows.iter().all(|row| row.ends_with(" (default)")),
+        "{resources}"
+    );
+
+    let report = explain_scope_report(&home, project.path(), &[]);
+    let fields = report["resources"].as_object().unwrap();
+    assert_eq!(fields.len(), 10);
+    assert!(
+        fields.values().all(|row| row["declared"] == false),
+        "{report}"
+    );
+    assert!(!project.path().join("workdir").exists());
+}

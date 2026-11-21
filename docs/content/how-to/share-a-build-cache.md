@@ -104,6 +104,9 @@ or procedural macros needs more:
 | Compiling large crates | A larger [`capabilities.resources.memory_bytes`](../reference/resource-limits.md#address-space-and-memory): `rustc` on a large crate needs more address space than the default |
 | Running build scripts | [`capabilities.filesystem.workdir_exec: true`](../reference/containment.md#field-workdir-exec), which caps the achieved class at `advisory`: a build script is a program the capsule compiled, and `scoped` and `sealed` run none. Commands still run under Landlock on Linux, so the store stays out of their reach. Every workspace crate with a `build.rs` compiles and runs it again in each clone, so this applies even when every dependency is seeded |
 
+[Cargo and rustup](../reference/capsule-limits.md#cargo) lists the error each missing grant gives
+and a complete manifest for a build through the rustup proxies.
+
 Put the toolchain's own `bin` folder first on `PATH` when you run `mur`, so `cargo` and `rustc`
 resolve to the toolchain you lent rather than to the rustup proxies in `~/.cargo/bin`, which read
 `~/.rustup` outside it.

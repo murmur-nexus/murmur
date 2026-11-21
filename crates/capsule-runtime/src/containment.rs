@@ -1238,6 +1238,20 @@ pub struct ScopeReport {
     /// by the caller that knows the transport, through [`Self::with_images`]; `null` until then.
     /// Always serialized.
     pub images: Option<ImagesReport>,
+    /// Every `capabilities.resources` value this session runs under, and whether the manifest
+    /// declared it or the default applies, from [`CapabilityPolicy::resources`] and
+    /// [`CapabilityPolicy::declared_resources`]. Always serialized, every field, on the same terms
+    /// as [`Self::workdir_exec`]: an absent key identifies a runtime that predates it.
+    ///
+    /// A statement of limits already resolved, never a grant: it changes no class, floor or tier.
+    pub resources: crate::resources::ResourcesReport,
+    /// The names, never the values, a shell command's environment starts with: passed through
+    /// from `mur run`'s environment, always removed, removed by `strip_env`, and set by the session
+    /// itself. Always serialized, on the same terms as [`Self::resources`].
+    ///
+    /// Names only, as [`Self::configured_artifacts`] is: no variable's value is read to build it,
+    /// and `trace.jsonl`, which carries this report verbatim, holds none.
+    pub shell_env: crate::shell::ShellEnvReport,
     /// `capabilities.env.allow`, verbatim.
     pub env_allow: Vec<String>,
     /// `capabilities.plan.submit` — whether the model is offered the `submit-plan` tool. Always
@@ -1752,6 +1766,11 @@ impl ScopeReport {
         if let Some(images) = &self.images {
             out.push_str(&render_images(images));
         }
+
+        out.push('\n');
+        out.push_str(&self.resources.render());
+        out.push('\n');
+        out.push_str(&self.shell_env.render());
 
         out.push_str("\nResource plane\n");
         match &self.exports_files {
@@ -2338,6 +2357,11 @@ pub(crate) fn scope_report_for_tier(
         parent_workdir: None,
         // Set through `with_images` by the caller that holds the manifest's transport.
         images: None,
+        resources: crate::resources::ResourcesReport::new(
+            &policy.resources,
+            &policy.declared_resources,
+        ),
+        shell_env: crate::shell::ShellEnvReport::for_policy(policy),
         env_allow: policy.env_allow.clone(),
         plan_submit: policy.plan_submit,
         install_skill: policy.install_skill.clone(),
@@ -5177,27 +5201,9 @@ mod tests {
         /// Policy fields deliberately absent from the scope report, each with the reason.
         const EXEMPT: &[(&str, &str)] = &[
             (
-                "shell_strip_env",
-                "Names host variables removed from the shell child's environment on top of the \
-                 credential patterns the runtime always strips. It subtracts from what the \
-                 capsule sees and can open nothing, so reporting it beside the grants would pad \
-                 the list an operator audits for reach.",
-            ),
-            (
-                "shell_baseline_env",
-                "The fixed variables the shell child starts with (PATH, HOME, …). It shapes the \
-                 environment of a subprocess the capsule was already granted, and names no host \
-                 resource `shell allow` and `env allow` do not already account for.",
-            ),
-            (
                 "limits",
                 "Execution ceilings for a WASM guest — memory, table elements, instance count, \
                  deadline. A bound on how much the capsule may consume, never a reach it gains.",
-            ),
-            (
-                "resources",
-                "The same, for subprocesses: rlimits, the Linux cgroup v2 scope and the \
-                 workdir size ceiling. A ceiling, not a grant, on exactly `limits`' terms.",
             ),
             (
                 "guest_workers",
@@ -5261,6 +5267,9 @@ mod tests {
             ("install_from_sources", "install_from"),
             ("containment_floor", "declared_containment"),
             ("declared_resources", "unconfined"),
+            ("resources", "resources"),
+            ("shell_baseline_env", "shell_env"),
+            ("shell_strip_env", "shell_env"),
         ];
 
         let declared = capability_policy_field_names(include_str!("types.rs"));
@@ -6597,5 +6606,41 @@ mod tests {
             .unwrap()
             .get("temp_dir")
             .is_some());
+    }
+
+    /// `Resources` and `Shell environment` print after the grants and before `Resource plane`,
+    /// and the report carries the policy's resolved limits and shell names, so the text, the
+    /// `--json` object and `session_start.effective_grants` state one set.
+    #[test]
+    fn the_resources_and_shell_environment_blocks_sit_between_the_grants_and_the_resource_plane() {
+        let report = read_only_report(&[], &["bash"]);
+        let rendered = report.render();
+        let grants = rendered.find("\nEffective grants\n").unwrap();
+        let resources = rendered.find("\nResources\n").unwrap();
+        let shell_env = rendered.find("\nShell environment\n").unwrap();
+        let plane = rendered.find("\nResource plane\n").unwrap();
+        assert!(
+            grants < resources && resources < shell_env && shell_env < plane,
+            "{rendered}"
+        );
+        assert!(rendered.contains(&report.resources.render()), "{rendered}");
+        assert!(rendered.contains(&report.shell_env.render()), "{rendered}");
+        assert_eq!(
+            report.resources,
+            crate::resources::ResourcesReport::new(
+                &crate::resources::HostResourceLimits::default(),
+                &murmur_artifact::ResourceCapabilities::default()
+            )
+        );
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["resources"]["memory_bytes"],
+            serde_json::json!({"value": crate::resources::DEFAULT_MEMORY_BYTES, "declared": false})
+        );
+        assert_eq!(
+            json["shell_env"]["session_set"],
+            serde_json::json!(report.shell_env.session_set)
+        );
     }
 }

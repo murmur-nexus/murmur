@@ -73,6 +73,9 @@ capabilities:
     workdir_max_bytes: 1073741824   # 1 GiB
 ```
 
+The `Resources` block of [`mur run --explain-scope`](cli.md#mur-run) prints the value of every field
+this session would run under, and whether the manifest declared it or the default applies.
+
 Three mechanisms enforce the block, in descending order of portability:
 
 | Mechanism | Fields | Platforms | Notes |

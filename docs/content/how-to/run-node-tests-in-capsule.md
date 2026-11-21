@@ -120,7 +120,8 @@ That decides the two commands:
 A toolchain that spawns a native binary from `node_modules` — esbuild for TypeScript, swc — needs
 [`capabilities.filesystem.workdir_exec: true`](../reference/containment.md#field-workdir-exec),
 which caps the capsule at `advisory`. A plain-JavaScript project with no vite or vitest config
-needs neither.
+needs neither. [What a contained capsule cannot do](../reference/capsule-limits.md) lists every
+other limit a command can meet here, with the grant that lifts it.
 
 ## Step 4 — check the manifest
 

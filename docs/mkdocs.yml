@@ -182,6 +182,7 @@ nav:
       - Roster Schema: reference/roster.md
       - Configuration: reference/config.md
       - Containment: reference/containment.md
+      - Contained Capsule Limits: reference/capsule-limits.md
       - Resource Limits: reference/resource-limits.md
       - Diagnostics: reference/diagnostics.md
       - Session Directories: reference/workdir.md
