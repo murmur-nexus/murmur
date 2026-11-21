@@ -1640,15 +1640,17 @@ passed-check count or the exit code.
 | `namespaces-refused` | It needs `unshare`, `setns`, `mount`, `pivot_root` or `chroot`, which the capsule's seccomp filter refuses at every contained floor | None in the manifest; only an unconfined launch (`mur run --unconfined`, or `containment: unconfined` in `~/.murmur/config.yaml`) |
 | `no-new-privileges` | It gains privilege through a setuid bit (`sudo`, `su`), which `no_new_privs` refuses | None in the manifest; only an unconfined launch |
 | `host-path-needed` | A rustup proxy (`cargo`, `rustc` under `~/.cargo/bin`) whose `RUSTUP_HOME` or `CARGO_HOME` no [`host_paths`](config.md#host-paths) entry lends | The `host_paths` entries (`{path: <dir>, access: read}`), and `mur run` started with both variables set |
-| `interpreter-runtime-needed` | A program it runs or a library it loads lies outside every executable grant: a rustup toolchain under a lent `RUSTUP_HOME` (a host path is never executable), or `error while loading shared libraries: <lib>` | [`capabilities.shell.interpreter_runtime`](manifest.md) naming the toolchain folder, or the host folder holding the library |
+| `interpreter-runtime-needed` | A file it or a program it runs needs lies outside every grant: a rustup toolchain under a lent `RUSTUP_HOME` (a host path is never executable), a library (`error while loading shared libraries: <lib>`), or a host file a compile step names by path (gcc's `cannot execute '/usr/libexec/gcc/…/cc1'`, `/usr/include/stdc-predef.h: Permission denied`) | [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) naming the folder that holds it |
 | `interpreter-not-allowed` | A `#!` script whose interpreter chain (`env` → `node`) is not all in `capabilities.shell.allow` | Add the missing interpreters to `capabilities.shell.allow` |
-| `helper-not-allowed` | A compile or link step could not run a helper (`linker \`cc\` not found`, `cc1`, `collect2`, `ld`) | Add the helper to `capabilities.shell.allow`; on `sealed`, the [`W-SEC-012`](diagnostics.md#w-sec-012) path |
+| `helper-not-allowed` | A compile or link step could not run a helper on `PATH` that `capabilities.shell.allow` does not name (``linker `cc` not found``, `cannot execute 'as'`, `ld` behind `collect2`) | Add the helper to `capabilities.shell.allow`; on `sealed`, the [`W-SEC-012`](diagnostics.md#w-sec-012) path |
 | `no-sandbox` | The sandbox could not be prepared (`E-CAP-005`, `E-RUN-012`, a failed enforcement setup); nothing was started, and every program reports it | The refusal's hint |
 | `timed-out` | A step outran its timeout and was killed | — |
 | `failed` | Anything else; `Reason:` is `exited <n>` | — |
 
 Each grant that edits the manifest also says to add the program to `capabilities.shell.allow`
-when the manifest does not name it. Under the unconfined stance no cause puts a failure down to a
+when the manifest does not name it, and no grant names a program the manifest already grants.
+Follow a grant and probe again to get the next missing piece: a C compiler or a cargo build
+typically needs several in turn. Under the unconfined stance no cause puts a failure down to a
 sandbox: a failure there is `failed`.
 
 ### Murmur home { #doctor-murmur-home }

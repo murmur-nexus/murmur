@@ -327,8 +327,6 @@ pub struct StaticFacts {
     pub shell_allow: Vec<String>,
     /// The first match on the capsule's `PATH`.
     pub resolved: Option<PathBuf>,
-    /// [`Self::resolved`] with every link followed.
-    pub canonical: Option<PathBuf>,
     /// The snap launcher [`Self::resolved`] reaches through its links (`/snap/bin/curl` →
     /// `/usr/bin/snap`): the first hop named `snap` or `snapd`.
     pub snap_launcher: Option<PathBuf>,
@@ -338,8 +336,6 @@ pub struct StaticFacts {
     pub rustup: Option<RustupHomes>,
     /// The `#!` line's program and, through `env`, the interpreter it runs: `["env", "node"]`.
     pub interpreter_chain: Vec<String>,
-    /// `capabilities.network.allow`.
-    pub network_allow: Vec<String>,
     /// The probes run unconfined: no sandbox refuses anything.
     pub unconfined: bool,
     /// The probes run on the sealed tier.
@@ -353,11 +349,7 @@ pub struct StaticFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     /// It ran to an exit.
-    Exited {
-        exit_code: i32,
-        stdout: String,
-        stderr: String,
-    },
+    Exited { exit_code: i32, stderr: String },
     /// The program could not be started: `execve` refused it.
     NotStarted { message: String },
     /// It outran its timeout and was killed.
@@ -426,9 +418,10 @@ pub fn tail_lines(text: &str) -> String {
 ///
 /// An exit 0 always means the program runs; it is refused only when the manifest does not grant
 /// it. A failure is read against the facts in a fixed order: the snap launcher, a refused
-/// namespace syscall, a refused privilege gain, a library or rustup toolchain outside every
-/// executable grant, a missing compile helper, a rustup proxy whose homes are not lent, an
-/// interpreter chain not in `shell.allow`, then `failed`. Under an unconfined launch no failure is
+/// namespace syscall, a refused privilege gain, a library, rustup toolchain or host file outside
+/// every grant, a compile helper `shell.allow` does not name, a rustup proxy whose homes are not
+/// lent, an interpreter chain not in `shell.allow`, then `failed`. No grant names a program
+/// `shell.allow` already names. Under an unconfined launch no failure is
 /// put down to a sandbox.
 #[must_use]
 pub fn classify(facts: &StaticFacts, outcome: Option<&StepOutcome>) -> Classified {
@@ -602,7 +595,32 @@ pub fn classify(facts: &StaticFacts, outcome: Option<&StepOutcome>) -> Classifie
         }
     }
 
-    if let Some(helper) = missing_helper(&lower).filter(|_| !facts.unconfined) {
+    // A host file the program, or one it runs, was refused, named by its absolute path. Read
+    // before the helper markers: rustc's outer "linking with `cc` failed" wraps gcc's inner
+    // refusal, and only the inner one names what to grant. The program's own file is left to the
+    // `#!` rule, and a rustup proxy whose homes are not lent to the `host_paths` rule: each is
+    // refused with the same words.
+    let homes_unlent = facts
+        .rustup
+        .as_ref()
+        .is_some_and(|homes| !(homes.rustup_home_lent && homes.cargo_home_lent));
+    if let Some((path, executed)) = denied_host_path(stderr).filter(|(path, _)| {
+        !facts.unconfined && !homes_unlent && facts.resolved.as_ref() != Some(path)
+    }) {
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        return Classified::refused(
+            ProbeCause::InterpreterRuntimeNeeded,
+            format!(
+                "{program}, or a program it runs, cannot {} {}, which no grant reaches; it \
+                 {failure}",
+                if executed { "execute" } else { "read" },
+                path.display()
+            ),
+            Some(runtime_grant(dir, false)),
+        );
+    }
+
+    if let Some(helper) = missing_helper(&lower, &facts.shell_allow).filter(|_| !facts.unconfined) {
         let mut grant = format!("add {helper} to capabilities.shell.allow");
         if facts.sealed {
             if let Some(path) = crate::sandbox::find_on_path(&helper) {
@@ -688,34 +706,72 @@ pub fn classify(facts: &StaticFacts, outcome: Option<&StepOutcome>) -> Classifie
     Classified::refused(ProbeCause::Failed, failure, None)
 }
 
-/// The helper program a compile or link step's output says it could not run, if any.
-fn missing_helper(lower: &str) -> Option<String> {
+/// The host file a `Permission denied` line of `stderr` was refused: the last absolute path
+/// before those words (a line may open with the refusing program's own path, as in
+/// `/usr/bin/ld: cannot open <path>: Permission denied`), and whether it was refused execution
+/// (gcc's `cannot execute '<path>'`) rather than reading.
+fn denied_host_path(stderr: &str) -> Option<(PathBuf, bool)> {
+    stderr.lines().find_map(|line| {
+        let denied_at = line.to_ascii_lowercase().find("permission denied")?;
+        let before = &line[..denied_at];
+        let start = before
+            .char_indices()
+            .rev()
+            .find(|&(at, c)| {
+                c == '/'
+                    && before[..at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|prev| prev.is_whitespace() || prev == '\'')
+            })
+            .map(|(at, _)| at)?;
+        let rest = &before[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ':' | ','))
+            .unwrap_or(rest.len());
+        let executed = before[..start].ends_with("cannot execute '");
+        (end > 1).then(|| (PathBuf::from(&rest[..end]), executed))
+    })
+}
+
+/// The helper program a compile or link step's output says it could not run, if `shell_allow`
+/// does not already name it. gcc's inner refusal (`cannot execute 'as'`) is read before rustc's
+/// outer marker (``linking with `cc` failed``), which names the step that ran the helper.
+fn missing_helper(lower: &str, shell_allow: &[String]) -> Option<String> {
+    let not_granted = |helper: &str| !shell_allow.iter().any(|allowed| allowed == helper);
+    // gcc: "cannot execute 'as': execvp: Permission denied", "collect2: fatal error: cannot
+    // find 'ld'". A helper named by its absolute path is not on `PATH`: `denied_host_path`.
+    // collect2 runs only the linker, and its refusal does not name it.
+    if lower.contains("collect2: fatal error: execvp: permission denied") && not_granted("ld") {
+        return Some("ld".to_string());
+    }
+    let denied = lower.contains("permission denied")
+        || lower.contains("cannot execute")
+        || lower.contains("cannot find");
+    if denied {
+        for helper in ["cc1plus", "cc1", "collect2", "ld", "as"] {
+            if not_granted(helper)
+                && (lower.contains(&format!("'{helper}'"))
+                    || lower.contains(&format!("{helper}: permission denied")))
+            {
+                return Some(helper.to_string());
+            }
+        }
+    }
     // rustc: "linker `cc` not found" / "linking with `cc` failed".
     for marker in ["linker `", "linking with `"] {
         if let Some(start) = lower.find(marker) {
             let rest = &lower[start + marker.len()..];
             if let Some(end) = rest.find('`') {
                 let tail = &rest[end..];
-                if lower.contains("not found")
-                    || tail.contains("failed")
-                    || lower.contains("permission denied")
+                let helper = &rest[..end];
+                if not_granted(helper)
+                    && (lower.contains("not found")
+                        || tail.contains("failed")
+                        || lower.contains("permission denied"))
                 {
-                    return Some(rest[..end].to_string());
+                    return Some(helper.to_string());
                 }
-            }
-        }
-    }
-    // gcc: "cannot execute 'cc1': execvp: Permission denied", "collect2: fatal error: cannot
-    // find 'ld'".
-    let denied = lower.contains("permission denied")
-        || lower.contains("cannot execute")
-        || lower.contains("cannot find");
-    if denied {
-        for helper in ["cc1plus", "cc1", "collect2", "ld", "as"] {
-            if lower.contains(&format!("'{helper}'"))
-                || lower.contains(&format!("{helper}: permission denied"))
-            {
-                return Some(helper.to_string());
             }
         }
     }
@@ -1120,9 +1176,6 @@ impl ProgramProbeRunner {
             .unwrap_or_default();
         let matches = path_matches(program, &path);
         let resolved = matches.first().cloned();
-        let canonical = resolved
-            .as_ref()
-            .and_then(|path| std::fs::canonicalize(path).ok());
         let snap_launcher = resolved.as_deref().and_then(snap_launcher_of);
         let non_snap_copy = matches
             .iter()
@@ -1142,12 +1195,10 @@ impl ProgramProbeRunner {
             in_shell_allow: self.in_shell_allow(program),
             shell_allow: self.inputs.policy.shell_allow.clone(),
             resolved,
-            canonical,
             snap_launcher,
             non_snap_copy,
             rustup,
             interpreter_chain,
-            network_allow: self.inputs.policy.network_allow.clone(),
             unconfined: self.unconfined(),
             sealed: self.decision.applied_tier() == EnforcementTier::KernelSealed,
             missing_library: None,
@@ -1236,7 +1287,6 @@ impl ProgramProbeRunner {
                 },
                 None => StepOutcome::Exited {
                     exit_code: run.result.exit_code,
-                    stdout: run.result.stdout,
                     stderr: run.result.stderr,
                 },
             },
@@ -1535,29 +1585,14 @@ fn is_rustup_proxy(path: &Path) -> bool {
 
 /// The `#!` line's program and, through `env`, the interpreter it execs.
 fn interpreter_chain(path: &Path) -> Vec<String> {
-    let Some(line) = crate::reachability::shebang_line(path, 256) else {
+    use crate::reachability::{base_name, shebang_interpreter_name, shebang_line};
+    let Some(launcher) =
+        shebang_line(path, 256).and_then(|line| line.split_whitespace().next().and_then(base_name))
+    else {
         return Vec::new();
     };
-    let mut tokens = line.split_whitespace();
-    let Some(first) = tokens.next().and_then(base_name) else {
-        return Vec::new();
-    };
-    let mut chain = vec![first.clone()];
-    if first == "env" {
-        if let Some(interpreter) = tokens
-            .filter(|token| !token.starts_with('-') && !token.contains('='))
-            .find_map(base_name)
-        {
-            chain.push(interpreter);
-        }
-    }
-    chain
-}
-
-fn base_name(token: &str) -> Option<String> {
-    Path::new(token)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+    let interpreter = shebang_interpreter_name(path).filter(|name| *name != launcher);
+    std::iter::once(launcher).chain(interpreter).collect()
 }
 
 #[cfg(test)]
@@ -1570,7 +1605,6 @@ mod tests {
             in_shell_allow: true,
             shell_allow: vec![program.to_string()],
             resolved: Some(PathBuf::from(format!("/usr/bin/{program}"))),
-            canonical: Some(PathBuf::from(format!("/usr/bin/{program}"))),
             ..StaticFacts::default()
         }
     }
@@ -1578,7 +1612,6 @@ mod tests {
     fn exited(exit_code: i32, stderr: &str) -> StepOutcome {
         StepOutcome::Exited {
             exit_code,
-            stdout: String::new(),
             stderr: stderr.to_string(),
         }
     }
@@ -1604,7 +1637,6 @@ mod tests {
     fn not_on_path_is_not_installed_with_the_install_grant() {
         let mut facts = facts("jq-not-a-real-binary");
         facts.resolved = None;
-        facts.canonical = None;
         let classified = cause_of(&facts, None);
         assert_eq!(classified.status, ProbeStatus::Refused);
         assert_eq!(classified.cause, Some(ProbeCause::NotInstalled));
@@ -1631,7 +1663,6 @@ mod tests {
     fn the_snap_launcher_names_the_copy_later_on_path() {
         let mut facts = facts("curl");
         facts.resolved = Some(PathBuf::from("/snap/bin/curl"));
-        facts.canonical = Some(PathBuf::from("/usr/lib/snapd/snapd"));
         facts.snap_launcher = Some(PathBuf::from("/usr/bin/snap"));
         facts.non_snap_copy = Some(PathBuf::from("/usr/bin/curl"));
         let classified = cause_of(
@@ -1718,7 +1749,6 @@ mod tests {
         facts.in_shell_allow = false;
         facts.shell_allow = vec!["bash".to_string()];
         facts.resolved = Some(PathBuf::from("/home/u/.cargo/bin/cargo"));
-        facts.canonical = Some(PathBuf::from("/home/u/.cargo/bin/rustup"));
         facts.rustup = Some(RustupHomes {
             rustup_home: PathBuf::from("/home/u/.rustup"),
             cargo_home: PathBuf::from("/home/u/.cargo"),
@@ -1778,6 +1808,14 @@ mod tests {
             Some("add env, node to capabilities.shell.allow")
         );
         let classified = cause_of(&facts, Some(&exited(126, "")));
+        assert_eq!(classified.cause, Some(ProbeCause::InterpreterNotAllowed));
+        let classified = cause_of(
+            &facts,
+            Some(&exited(
+                126,
+                "bash: line 1: /home/u/.nvm/bin/npm: Permission denied",
+            )),
+        );
         assert_eq!(classified.cause, Some(ProbeCause::InterpreterNotAllowed));
 
         // With the chain allowed, the same failure names no interpreter.
@@ -1839,17 +1877,108 @@ mod tests {
 
     #[test]
     fn a_missing_linker_or_compiler_helper_is_helper_not_allowed() {
-        for (program, stderr, helper) in [
-            ("cargo", "error: linker `cc` not found\n  |\n  = note: No such file or directory (os error 2)", "cc"),
-            ("cargo", "error: linking with `cc` failed: exit status: 1", "cc"),
-            ("cc", "cc: fatal error: cannot execute 'cc1': execvp: Permission denied", "cc1"),
-            ("cc", "collect2: fatal error: cannot find 'ld'", "ld"),
+        for (program, allow, stderr, helper) in [
+            ("cargo", &["cargo"][..], "error: linker `cc` not found\n  |\n  = note: No such file or directory (os error 2)", "cc"),
+            ("cargo", &["cargo"], "error: linking with `cc` failed: exit status: 1\n  = note: Permission denied (os error 13)", "cc"),
+            ("cc", &["cc"], "cc: fatal error: cannot execute 'as': execvp: Permission denied\ncompilation terminated.", "as"),
+            ("cc", &["cc"], "collect2: fatal error: cannot find 'ld'", "ld"),
+            ("cc", &["cc", "as"], "collect2: fatal error: execvp: Permission denied\ncompilation terminated.", "ld"),
+            // cc is granted, so rustc's outer marker is passed over for gcc's inner refusal.
+            ("cargo", &["cargo", "cc"], "error: linking with `cc` failed: exit status: 1\n  = note: cc: fatal error: cannot execute 'as': execvp: Permission denied", "as"),
         ] {
-            let classified = cause_of(&facts(program), Some(&exited(1, stderr)));
+            let mut program_facts = facts(program);
+            program_facts.shell_allow = allow.iter().map(ToString::to_string).collect();
+            let classified = cause_of(&program_facts, Some(&exited(1, stderr)));
             assert_eq!(classified.cause, Some(ProbeCause::HelperNotAllowed), "{stderr}");
             assert_eq!(
                 classified.grant.as_deref(),
                 Some(format!("add {helper} to capabilities.shell.allow").as_str()),
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_shell_allow_already_names_is_never_the_grant() {
+        let mut cargo = facts("cargo");
+        cargo.shell_allow = vec!["cargo".to_string(), "cc".to_string()];
+        let classified = cause_of(
+            &cargo,
+            Some(&exited(
+                101,
+                "error: linking with `cc` failed: exit status: 1",
+            )),
+        );
+        assert_eq!(classified.cause, Some(ProbeCause::Failed));
+        assert_eq!(classified.grant, None);
+    }
+
+    #[test]
+    fn a_host_file_a_compile_step_is_refused_is_interpreter_runtime_needed() {
+        let libexec = "/usr/libexec/gcc/x86_64-linux-gnu/13";
+        for (program, stderr, verb, dir) in [
+            (
+                "cc",
+                "cc: fatal error: cannot execute '/usr/libexec/gcc/x86_64-linux-gnu/13/cc1': \
+                 execv: Permission denied\ncompilation terminated.",
+                "execute",
+                libexec,
+            ),
+            (
+                "cc",
+                "<command-line>: fatal error: /usr/include/stdc-predef.h: Permission denied\n\
+                 compilation terminated.",
+                "read",
+                "/usr/include",
+            ),
+            (
+                "cargo",
+                "error: linking with `cc` failed: exit status: 1\n  = note: cc: fatal error: \
+                 cannot execute '/usr/libexec/gcc/x86_64-linux-gnu/13/collect2': execv: \
+                 Permission denied",
+                "execute",
+                libexec,
+            ),
+            (
+                "cargo",
+                "error: linking with `cc` failed: exit status: 1\n  = note: rust-lld: error: \
+                 cannot open /usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o: Permission denied\n  \
+                 collect2: error: ld returned 1 exit status",
+                "read",
+                "/usr/lib/gcc/x86_64-linux-gnu/13",
+            ),
+            (
+                "cc",
+                "/usr/bin/ld: cannot open /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o: \
+                 Permission denied\ncollect2: error: ld returned 1 exit status",
+                "read",
+                "/usr/lib/gcc/x86_64-linux-gnu/13",
+            ),
+        ] {
+            let mut program_facts = facts(program);
+            program_facts.shell_allow = vec![program.to_string(), "cc".to_string()];
+            let classified = cause_of(&program_facts, Some(&exited(1, stderr)));
+            assert_eq!(
+                classified.cause,
+                Some(ProbeCause::InterpreterRuntimeNeeded),
+                "{stderr}"
+            );
+            assert!(
+                classified
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(&format!("cannot {verb} {dir}/"))),
+                "{classified:?}"
+            );
+            assert_eq!(
+                classified.grant.as_deref(),
+                Some(
+                    format!(
+                        "declare capabilities.shell.interpreter_runtime: [{{binary: {program}, \
+                         dirs: [{{path: {dir}, list_dir: false}}]}}]"
+                    )
+                    .as_str()
+                ),
                 "{stderr}"
             );
         }
@@ -2059,11 +2188,14 @@ mod tests {
         );
     }
 
+    // The forced delegation failure exists only on Linux, the one platform with cgroup scopes.
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_cgroup_scope_makes_every_program_no_sandbox() {
         under_scratch_home("inner_no_cgroup_scope_makes_every_program_no_sandbox");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "run by no_cgroup_scope_makes_every_program_no_sandbox under a scratch HOME"]
     fn inner_no_cgroup_scope_makes_every_program_no_sandbox() {

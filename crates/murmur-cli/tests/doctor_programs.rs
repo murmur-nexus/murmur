@@ -169,7 +169,8 @@ fn rustup_cargo(real_home: &Path) -> bool {
         .is_some_and(|target| target.file_name().is_some_and(|name| name == "rustup"))
 }
 
-/// S1: the three cases a board found by failing, plus two programs that run.
+/// `curl` not granted, `unshare` refused by seccomp and a rustup `cargo` without its homes each
+/// come out with their cause and grant, beside two granted programs that run.
 #[test]
 fn the_board_cases_come_out_with_their_causes_and_grants() {
     const TEST: &str = "the_board_cases_come_out_with_their_causes_and_grants";
@@ -228,7 +229,7 @@ fn the_board_cases_come_out_with_their_causes_and_grants() {
     assert!(!text.contains("W-RUN-015"), "{text}");
 }
 
-/// S4: the same setup with `--json` carries the same results as a `programs` object after
+/// The same setup with `--json` carries the same results as a `programs` object after
 /// `findings`, keys in order; without `--programs` there is no `programs` key.
 #[test]
 fn the_json_document_carries_the_programs_object() {
@@ -330,7 +331,7 @@ fn the_json_document_carries_the_programs_object() {
     assert!(w_run_015(&report).is_empty(), "{report:#}");
 }
 
-/// S2: `curl` granted but resolving to the snap launcher is refused naming the copy that would
+/// `curl` granted but resolving to the snap launcher is refused naming the copy that would
 /// run; with `/usr/bin` first it runs.
 #[test]
 fn curl_as_a_snap_wrapper_is_refused_naming_the_real_copy() {
@@ -438,7 +439,7 @@ fn cgroups_named(needle: &str) -> Vec<PathBuf> {
     found
 }
 
-/// S3 and S8: `cargo` with its homes lent is no longer refused for them, and names what it needs
+/// `cargo` with its homes lent is no longer refused for them, and names what it needs
 /// next; nothing is left behind in the project, the scratch folders, the process table or the
 /// cgroup tree.
 #[test]
@@ -531,7 +532,7 @@ fn assert_build_links_or_names_cc(report: &Value) {
     }
 }
 
-/// S3, carried on: with the toolchain folder and the host library folder granted through
+/// With the toolchain folder and the host library folder granted through
 /// `interpreter_runtime`, the hello build is reached, and links or names the `cc` linker.
 #[test]
 fn cargo_with_its_toolchain_granted_reaches_the_link() {
@@ -576,7 +577,101 @@ fn cargo_with_its_toolchain_granted_reaches_the_link() {
     assert_build_links_or_names_cc(&document(&output));
 }
 
-/// S5: no names probes the common list then each `shell.allow` entry not in it, each once;
+/// Probes `name` from a manifest whose `shell.allow` names only it, applies the grant each probe
+/// prints, and probes again until it runs. A grant may not repeat, and may not add a program
+/// `shell.allow` already names.
+fn follow_grants(name: &str, config: Option<&str>, env: &[(String, String)]) {
+    const MAX_STEPS: usize = 10;
+    let mut allow = vec![name.to_string()];
+    let mut dirs: Vec<(String, bool)> = Vec::new();
+    let mut grants = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let mut capabilities = format!("  shell:\n    allow: [{}]\n", allow.join(", "));
+        if !dirs.is_empty() {
+            capabilities.push_str(&format!(
+                "    interpreter_runtime:\n      - binary: {name}\n        dirs:\n"
+            ));
+            for (path, list_dir) in &dirs {
+                capabilities.push_str(&format!(
+                    "          - path: {path}\n            list_dir: {list_dir}\n"
+                ));
+            }
+        }
+        let fixture = Fixture::new(&capabilities, config);
+        let report = document(&fixture.doctor(&["--json", "--programs", name], env));
+        let probe = program(&report, name);
+        if probe["status"] == "runs" {
+            return;
+        }
+        let grant = probe["grant"]
+            .as_str()
+            .unwrap_or_else(|| panic!("refused with no grant after {grants:?}: {probe:#}"))
+            .to_string();
+        assert!(
+            !grants.contains(&grant),
+            "{grant} repeated after {grants:?}"
+        );
+        for part in grant.split("; and ") {
+            if let Some(names) = part
+                .strip_prefix("add ")
+                .and_then(|rest| rest.strip_suffix(" to capabilities.shell.allow"))
+            {
+                for added in names.split(", ") {
+                    assert!(
+                        !allow.iter().any(|a| a == added),
+                        "{grant} names {added} again"
+                    );
+                    allow.push(added.to_string());
+                }
+            } else if let Some(rest) =
+                part.strip_prefix("declare capabilities.shell.interpreter_runtime: [{binary: ")
+            {
+                let rest = rest
+                    .strip_prefix(&format!("{name}, dirs: [{{path: "))
+                    .unwrap_or_else(|| panic!("{grant} is not keyed to {name}"));
+                let (path, rest) = rest.split_once(", list_dir: ").unwrap();
+                dirs.push((path.to_string(), rest.starts_with("true")));
+            } else {
+                panic!("a grant this walk cannot apply: {grant}");
+            }
+        }
+        grants.push(grant);
+    }
+    panic!("{name} still refused after {MAX_STEPS} grants: {grants:?}");
+}
+
+/// Starting from `shell.allow: [cc]`, and from a rustup `cargo` with its homes lent, every grant
+/// the probe prints changes the next probe's answer until the program runs: compile helpers
+/// gcc names by path get their folder, and helpers on `PATH` get a `shell.allow` entry.
+#[test]
+fn following_each_grant_leads_cc_and_cargo_to_run() {
+    const TEST: &str = "following_each_grant_leads_cc_and_cargo_to_run";
+    if skip_without_namespace(TEST) {
+        return;
+    }
+    if !Path::new("/usr/bin/cc").exists() {
+        return skip_host(TEST, "needs /usr/bin/cc");
+    }
+    let path_only = vec![(
+        "PATH".to_string(),
+        "/usr/local/bin:/usr/bin:/bin".to_string(),
+    )];
+    follow_grants("cc", None, &path_only);
+
+    let real_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    if !rustup_cargo(&real_home) {
+        return skip_host(TEST, "needs a rustup ~/.cargo/bin/cargo for its cargo half");
+    }
+    let config = format!(
+        "host_paths:\n  - path: {}\n    access: read\n  - path: {}\n    access: read\n",
+        real_home.join(".rustup").display(),
+        real_home.join(".cargo").display()
+    );
+    let env = Fixture::new("  shell:\n    allow: [cargo]\n", None).board_env();
+    follow_grants("cargo", Some(&config), &env);
+}
+
+/// No names probes the common list then each `shell.allow` entry not in it, each once;
 /// programs this host lacks are `not-installed`, not errors.
 #[test]
 fn the_default_list_is_the_common_programs_then_shell_allow() {
@@ -627,7 +722,7 @@ fn the_default_list_is_the_common_programs_then_shell_allow() {
     assert_eq!(report["errors"], 0, "{report:#}");
 }
 
-/// S6: a program `shell.allow` grants that is refused is one counted `W-RUN-015`, with the grant
+/// A program `shell.allow` grants that is refused is one counted `W-RUN-015`, with the grant
 /// as its fix, and the verdict stays `ready`.
 #[test]
 fn a_granted_program_that_cannot_run_is_a_counted_warning() {
