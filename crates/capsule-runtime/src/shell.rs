@@ -1321,8 +1321,12 @@ pub(crate) fn attribute_resource_limit(
 /// from the host, `env_overrides`, `capabilities.shell.baseline_env`, the credential backstop,
 /// and then the runtime-owned names no entry before them can set — `HOME` and `USERPROFILE` from
 /// `home_dir`, `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and
-/// `records_dir`, and `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
-/// [`ARTIFACT_CONFIG_ENV`] is removed whatever an earlier step supplied.
+/// `records_dir`, `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent, and
+/// `CARGO_TARGET_DIR` from `cargo_target_dir` when the session holds a build cache seed
+/// ([`crate::build_cache`]). [`ARTIFACT_CONFIG_ENV`] is removed whatever an earlier step supplied.
+///
+/// Without a seed, `CARGO_TARGET_DIR` is an ordinary name: it reaches the command from
+/// `env_overrides` or `capabilities.shell.baseline_env` exactly as any other would.
 ///
 /// `home_dir` is the session's home folder, `home/` in its records directory. `None` refuses the
 /// command: no command runs without it, and none is handed a home anywhere else.
@@ -1333,6 +1337,7 @@ pub(crate) fn build_shell_env(
     runtime_dir: Option<&std::path::Path>,
     records_dir: Option<&std::path::Path>,
     tmpdir: Option<&str>,
+    cargo_target_dir: Option<&std::path::Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -1396,6 +1401,13 @@ pub(crate) fn build_shell_env(
             env.insert(name.to_string(), tmpdir.to_string());
         }
     }
+    // And the session's build cache seed, only when there is one.
+    if let Some(cargo_target_dir) = cargo_target_dir {
+        env.insert(
+            crate::build_cache::CARGO_TARGET_DIR_ENV.to_string(),
+            cargo_target_dir.to_string_lossy().into_owned(),
+        );
+    }
 
     Ok(env)
 }
@@ -1430,6 +1442,7 @@ pub(crate) fn subprocess_env(
                 env_overrides,
                 enforcement.runtime_dir_path(),
                 enforcement.records_dir_path(),
+                enforcement.cargo_target_dir(),
             )
         } else {
             build_shell_env(
@@ -1439,6 +1452,7 @@ pub(crate) fn subprocess_env(
                 enforcement.runtime_dir_path(),
                 enforcement.records_dir_path(),
                 enforcement.tmpdir_value().as_deref(),
+                enforcement.cargo_target_dir(),
             )?
             .into_iter()
             .map(|(key, value)| (OsString::from(key), OsString::from(value)))
@@ -1491,7 +1505,8 @@ pub(crate) fn append_pinned_program_path(
 /// `base` (this process's whole environment, [`std::env::vars_os`], on every production path), then
 /// `env_overrides`, minus the lineage names ([`LINEAGE_ENV`] and every formation member grant
 /// name), [`ARTIFACT_CONFIG_ENV`] and whatever `capabilities.shell.strip_env` matches, and then
-/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`.
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`, and
+/// `CARGO_TARGET_DIR` from `cargo_target_dir` when the session holds a build cache seed.
 ///
 /// The credential backstop ([`CREDENTIAL_ENV_PATTERNS`]) is not applied, and `HOME`,
 /// `USERPROFILE`, `TMPDIR`, `TMP` and `TEMP` are whatever `base` holds: the operator chose to run
@@ -1502,6 +1517,7 @@ pub(crate) fn build_unconfined_env(
     env_overrides: &[(String, String)],
     runtime_dir: Option<&std::path::Path>,
     records_dir: Option<&std::path::Path>,
+    cargo_target_dir: Option<&std::path::Path>,
 ) -> BTreeMap<OsString, OsString> {
     let mut env: BTreeMap<OsString, OsString> = base.into_iter().collect();
     for (key, value) in env_overrides {
@@ -1531,6 +1547,12 @@ pub(crate) fn build_unconfined_env(
         env.insert(
             OsString::from(crate::records_dir::RECORDS_DIR_ENV),
             records_dir.as_os_str().to_owned(),
+        );
+    }
+    if let Some(cargo_target_dir) = cargo_target_dir {
+        env.insert(
+            OsString::from(crate::build_cache::CARGO_TARGET_DIR_ENV),
+            cargo_target_dir.as_os_str().to_owned(),
         );
     }
     env
@@ -2468,7 +2490,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let policy = CapabilityPolicy::default();
 
-        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
+        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None, None).unwrap();
 
         let expected_home = temp.path().to_string_lossy().into_owned();
         assert_eq!(env.get("HOME"), Some(&expected_home));
@@ -2477,8 +2499,16 @@ mod tests {
 
     #[test]
     fn no_home_folder_build_shell_env_refuses() {
-        let error =
-            build_shell_env(&CapabilityPolicy::default(), &[], None, None, None, None).unwrap_err();
+        let error = build_shell_env(
+            &CapabilityPolicy::default(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error, NO_HOME_FOLDER_REFUSAL);
         assert!(error.contains("home folder"), "{error}");
     }
@@ -2560,8 +2590,16 @@ mod tests {
             ("SAFE_VAR".to_string(), "kept".to_string()),
         ];
 
-        let env =
-            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            Some(temp.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(!env.contains_key("AWS_ACCESS_KEY_ID"));
         assert!(!env.contains_key("DOCKER_AUTH_CONFIG"));
@@ -2596,7 +2634,8 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
+        let shell =
+            build_shell_env(&policy, &[], Some(temp.path()), None, None, None, None).unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
         assert!(
             !declared.contains_key(FORMATION_LIFELINE_ENV),
@@ -2620,7 +2659,8 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
+        let shell =
+            build_shell_env(&policy, &[], Some(temp.path()), None, None, None, None).unwrap();
         std::env::remove_var(SPAWNER_LIFELINE_ENV);
         assert!(!declared.contains_key(SPAWNER_LIFELINE_ENV), "{declared:?}");
         assert!(!shell.contains_key(SPAWNER_LIFELINE_ENV), "{shell:?}");
@@ -2703,8 +2743,16 @@ mod tests {
         };
         let overrides = vec![("HOME".to_string(), "/tmp/guest-controlled".to_string())];
 
-        let env =
-            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            Some(temp.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             env.get("HOME"),
@@ -2718,7 +2766,7 @@ mod tests {
         let policy = CapabilityPolicy::default();
 
         std::env::set_var("CARGO_HOME", "/fake/cargo/home");
-        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
+        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None, None).unwrap();
         std::env::remove_var("CARGO_HOME");
 
         assert_eq!(env.get("CARGO_HOME"), Some(&"/fake/cargo/home".to_string()));
@@ -2743,6 +2791,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let stripped = build_shell_env(
@@ -2752,6 +2801,7 @@ mod tests {
             },
             &[],
             Some(root.path()),
+            None,
             None,
             None,
             None,
@@ -2837,8 +2887,16 @@ mod tests {
         };
         let overrides = vec![("MYCOMPANY_SECRET".to_string(), "leaked".to_string())];
 
-        let env =
-            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            Some(temp.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(!env.contains_key("MYCOMPANY_SECRET"));
     }
@@ -3671,6 +3729,145 @@ mod tests {
         assert_eq!(attribute_resource_limit(None, None, true), None);
     }
 
+    /// With a build cache seed, `CARGO_TARGET_DIR` is runtime-owned: an override, a declared
+    /// baseline name and a host value all lose to the seed, on the contained tier and the
+    /// unconfined one. Without a seed the name is an ordinary one: on the contained tier the
+    /// baseline entry, applied after the overrides, passes the host value through; on the
+    /// unconfined tier an override wins over the inherited host value.
+    #[test]
+    fn build_cache_seed_owns_cargo_target_dir_and_nothing_changes_without_one() {
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        let name = crate::build_cache::CARGO_TARGET_DIR_ENV;
+        std::env::set_var(name, "/host/target");
+        let policy = CapabilityPolicy {
+            shell_baseline_env: vec![name.to_string()],
+            env_allow: vec![name.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let seed = std::path::Path::new("/records/home/.cache/cargo-target");
+        let overrides = [(name.to_string(), "/override/target".to_string())];
+        let contained = |overrides: &[(String, String)], seed: Option<&std::path::Path>| {
+            build_shell_env(
+                &policy,
+                overrides,
+                Some(root.path()),
+                None,
+                None,
+                None,
+                seed,
+            )
+            .unwrap()
+            .get(name)
+            .cloned()
+        };
+        let unconfined = |overrides: &[(String, String)], seed: Option<&std::path::Path>| {
+            build_unconfined_env(&policy, std::env::vars_os(), overrides, None, None, seed)
+                .get(std::ffi::OsStr::new(name))
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+
+        let seeded = Some(seed.display().to_string());
+        assert_eq!(contained(&overrides, Some(seed)), seeded);
+        assert_eq!(contained(&[], Some(seed)), seeded);
+        assert_eq!(unconfined(&overrides, Some(seed)), seeded);
+        assert_eq!(unconfined(&[], Some(seed)), seeded);
+
+        assert_eq!(contained(&[], None).as_deref(), Some("/host/target"));
+        assert_eq!(contained(&overrides, None).as_deref(), Some("/host/target"));
+        assert_eq!(
+            build_shell_env(
+                &CapabilityPolicy::default(),
+                &overrides,
+                Some(root.path()),
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .get(name)
+            .map(String::as_str),
+            Some("/override/target")
+        );
+        assert_eq!(unconfined(&[], None).as_deref(), Some("/host/target"));
+        assert_eq!(
+            unconfined(&overrides, None).as_deref(),
+            Some("/override/target")
+        );
+
+        // Every other name is what it is without a seed: the seed adds exactly one entry.
+        let mut with = build_shell_env(
+            &policy,
+            &[],
+            Some(root.path()),
+            None,
+            None,
+            None,
+            Some(seed),
+        )
+        .unwrap();
+        let without =
+            build_shell_env(&policy, &[], Some(root.path()), None, None, None, None).unwrap();
+        with.insert(name.to_string(), "/host/target".to_string());
+        assert_eq!(with, without);
+
+        std::env::remove_var(name);
+        let plain = CapabilityPolicy::default();
+        assert!(
+            !build_shell_env(&plain, &[], Some(root.path()), None, None, None, None)
+                .unwrap()
+                .contains_key(name)
+        );
+        assert!(
+            !build_unconfined_env(&plain, std::env::vars_os(), &[], None, None, None)
+                .contains_key(std::ffi::OsStr::new(name))
+        );
+    }
+
+    /// The seed reaches every command spawned on a session's enforcement through
+    /// [`subprocess_env`], on the contained tier and the unconfined one, from the session's
+    /// runtime directory roots; roots without a seed set no `CARGO_TARGET_DIR`.
+    #[test]
+    fn subprocess_env_carries_the_build_cache_seed_on_every_tier() {
+        let base = tempfile::tempdir().unwrap();
+        let seed = base.path().join("records/home/.cache/cargo-target");
+        let name = std::ffi::OsString::from(crate::build_cache::CARGO_TARGET_DIR_ENV);
+        std::env::remove_var(&name);
+        for tier in [
+            crate::sandbox::EnforcementTier::EnvironmentOnly,
+            crate::sandbox::EnforcementTier::Unconfined,
+        ] {
+            let with = crate::sandbox::ShellEnforcement {
+                tier,
+                ..crate::sandbox::ShellEnforcement::environment_only()
+            }
+            .with_runtime_dir(
+                crate::sandbox::test_runtime_dir(base.path()).with_cargo_target(Some(seed.clone())),
+                None,
+            );
+            let without = crate::sandbox::ShellEnforcement {
+                tier,
+                ..crate::sandbox::ShellEnforcement::environment_only()
+            }
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(base.path()), None);
+            assert_eq!(
+                subprocess_env(&CapabilityPolicy::default(), &[], &with)
+                    .unwrap()
+                    .get(&name),
+                Some(&seed.clone().into_os_string()),
+                "{tier:?}"
+            );
+            assert_eq!(
+                subprocess_env(&CapabilityPolicy::default(), &[], &without)
+                    .unwrap()
+                    .get(&name),
+                None,
+                "{tier:?}"
+            );
+        }
+    }
+
     /// `MURMUR_RUNTIME_DIR` is runtime-owned like `HOME`: an override, a declared baseline name
     /// and a host value all lose to the session's own runtime directory, and with none there is
     /// no such variable.
@@ -3696,6 +3893,7 @@ mod tests {
             Some(std::path::Path::new("/runtime/dir")),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3704,8 +3902,16 @@ mod tests {
             Some("/runtime/dir")
         );
 
-        let without =
-            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
+        let without = build_shell_env(
+            &policy,
+            &overrides,
+            Some(root.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
     }
@@ -3767,6 +3973,7 @@ mod tests {
             &overrides,
             Some(std::path::Path::new("/session/runtime")),
             Some(std::path::Path::new("/session/records")),
+            None,
         );
         for name in &removed {
             assert_eq!(
@@ -3796,7 +4003,7 @@ mod tests {
             Some("/session/records")
         );
         // With no session directories, neither variable is set at all.
-        let without = build_unconfined_env(&policy, host, &overrides, None, None);
+        let without = build_unconfined_env(&policy, host, &overrides, None, None, None);
         assert_eq!(get(&without, crate::runtime_dir::RUNTIME_DIR_ENV), None);
         assert_eq!(get(&without, crate::records_dir::RECORDS_DIR_ENV), None);
     }
@@ -3915,6 +4122,7 @@ mod tests {
             None,
             Some(std::path::Path::new("/records/dir")),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3923,8 +4131,16 @@ mod tests {
             Some("/records/dir")
         );
 
-        let without =
-            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
+        let without = build_shell_env(
+            &policy,
+            &overrides,
+            Some(root.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!without.contains_key(crate::records_dir::RECORDS_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
     }
@@ -3950,8 +4166,16 @@ mod tests {
             .map(|name| (name.to_string(), "/override".to_string()))
             .collect();
 
-        let env =
-            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            Some(root.path()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let declared = build_declared_env(&policy);
         for name in names {
             std::env::remove_var(name);
@@ -4062,6 +4286,7 @@ mod tests {
                 None,
                 None,
                 enforcement.tmpdir_value().as_deref(),
+                None,
             )
             .unwrap();
             for name in TEMP_DIR_ENV {

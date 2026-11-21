@@ -42,6 +42,7 @@ use commands::topology::{run_topology, TopologyArgs};
 use commands::{
     beta::{run_beta, BetaCommand},
     build::run_build,
+    build_cache::{run_build_cache, BuildCacheCommand},
     cancel::run_cancel,
     config_cmd::{run_config, ConfigCommand},
     control::{run_control, ControlCommand},
@@ -271,6 +272,11 @@ enum Commands {
         /// Print the report as one JSON object on stdout
         #[arg(long)]
         json: bool,
+    },
+    /// Import and list the Cargo build caches capsules start warm from (~/.murmur/build-cache/)
+    BuildCache {
+        #[command(subcommand)]
+        command: BuildCacheCommand,
     },
     /// Run a capsule component with local lockfile-aware tool resolution
     Run {
@@ -799,6 +805,7 @@ fn main() {
             workdir,
             json,
         } => run_precompile(&files, workdir.as_deref(), json),
+        Commands::BuildCache { command } => run_build_cache(command),
         Commands::Run {
             roster: Some(roster),
             task,

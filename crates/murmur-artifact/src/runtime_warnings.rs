@@ -100,6 +100,15 @@ pub const W_RUN_012: &str = "W-RUN-012";
 /// with `E-RUN-033`.
 pub const W_RUN_013: &str = "W-RUN-013";
 
+/// The build cache store holds an entry for the work folder's `Cargo.lock`, and staging could not
+/// seed it into the session's home folder: the copy would pass
+/// `capabilities.resources.workdir_max_bytes`, a file of the entry could not be read, or its
+/// record or a write failed. Whatever was copied is removed, `CARGO_TARGET_DIR` is not set, and
+/// the session builds without the seed.
+///
+/// Never refuses a launch. Printed by `mur run`, once per launch.
+pub const W_RUN_014: &str = "W-RUN-014";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -115,7 +124,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009, W_RUN_010,
-            W_RUN_011, W_RUN_012, W_RUN_013,
+            W_RUN_011, W_RUN_012, W_RUN_013, W_RUN_014,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

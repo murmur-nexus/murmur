@@ -289,6 +289,10 @@ pub struct RuntimeDirRoots {
     /// granted exactly as [`Self::temp`] is. `None` for roots held outside a session, where no
     /// command runs.
     pub home: Option<WorkdirRoot>,
+    /// The session's build cache seed ([`crate::build_cache`]) beneath [`Self::home`]: the value
+    /// of `CARGO_TARGET_DIR` in every command and harness of the session. `None` when staging
+    /// seeded nothing, and then no command is told of one.
+    pub cargo_target: Option<PathBuf>,
 }
 
 impl RuntimeDirRoots {
@@ -303,6 +307,7 @@ impl RuntimeDirRoots {
             records: None,
             temp: None,
             home: None,
+            cargo_target: None,
         }
     }
 
@@ -324,6 +329,13 @@ impl RuntimeDirRoots {
     #[must_use]
     pub fn with_home(mut self, home: WorkdirRoot) -> Self {
         self.home = Some(home);
+        self
+    }
+
+    /// These roots with `cargo_target` as the session's build cache seed.
+    #[must_use]
+    pub fn with_cargo_target(mut self, cargo_target: Option<PathBuf>) -> Self {
+        self.cargo_target = cargo_target;
         self
     }
 }

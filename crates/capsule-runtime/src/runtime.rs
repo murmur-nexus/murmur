@@ -3774,12 +3774,38 @@ pub fn stage_session(
                     .display()
             ),
         })?;
+    // The build cache seed, copied into the home folder before any guest worker or command
+    // starts, so every command and harness of the session is told of it or of none. Never fails
+    // the launch: a matching entry that cannot be used is reported (`W-RUN-014`) and skipped.
+    let build_cache = crate::build_cache::build_cache_store_root()
+        .ok()
+        .and_then(|store_root| {
+            crate::build_cache::seed_session(
+                &accessible_root,
+                &home_root,
+                &store_root,
+                &crate::build_cache::SeedLimits {
+                    max_bytes: request.capability_policy.resources.workdir_max_bytes,
+                    measured: vec![accessible_root.path(), temp_root.path(), home_root.path()],
+                    reflink: crate::tree_copy::Reflink::Try,
+                },
+            )
+        });
+    let (build_cache, build_cache_seed) = match build_cache {
+        Some(seed) => (Some(seed.report), seed.seeded),
+        None => (None, None),
+    };
     let runtime_dirs = runtime_dir_guard
         .roots()
         .clone()
         .with_records(records_root.clone())
         .with_temp(temp_root)
-        .with_home(home_root);
+        .with_home(home_root)
+        .with_cargo_target(
+            build_cache_seed
+                .as_ref()
+                .map(|seed| seed.path().to_path_buf()),
+        );
     let runtime_root = runtime_dirs.runtime.clone();
     let manifest_file_name = request
         .manifest_file
@@ -4073,6 +4099,8 @@ pub fn stage_session(
         runtime_root,
         runtime_dirs,
         runtime_dir_guard: Some(runtime_dir_guard),
+        build_cache,
+        build_cache_seed,
         records_dir: records_dir.path().to_path_buf(),
         records_root,
         manifest_file_name,
@@ -4234,6 +4262,9 @@ fn launch(
     let runtime_dir_owner =
         crate::runtime_dir::SharedRuntimeDir::new(staged.runtime_dir_guard.take());
     let _remove_runtime_dir = runtime_dir_owner.remove_on_drop();
+    // Removes the session's build cache seed on every return from this function, after every
+    // command has ended.
+    let _remove_build_cache_seed = staged.build_cache_seed.take();
 
     // A lifeline winds the process down, so only a launch that owns the process may hold one, and
     // only an agent session — the one kind with a door, and so the one kind a formation has as a
@@ -4893,6 +4924,7 @@ fn launch(
         let trace_system_prompt = system_prompt.clone();
         let system_prompt_overridden = staged.system_prompt_overridden;
         let instruction_files_for_trace = staged.instruction_files.clone();
+        let build_cache_for_trace = staged.build_cache.clone();
         let registry_for_pull = Arc::clone(&staged.registry);
         let source_supply_for_pull = staged.source_supply.clone();
         let compiled_forms_for_pull = staged.compiled_forms.clone();
@@ -4997,6 +5029,7 @@ fn launch(
             trace.set_formation_id(formation_id.as_ref());
             trace.set_formation_member(formation_member.as_deref());
             trace.set_instruction_files(instruction_files_for_trace.as_ref());
+            trace.set_build_cache(build_cache_for_trace);
             trace
                 .write_session_start(inference.max_turns, primary_limits, tools_declared)
                 .await
@@ -6284,6 +6317,7 @@ fn launch(
     trace.set_host_facts(&staged.host_facts);
     trace.set_formation_id(staged.formation_id.as_ref());
     trace.set_formation_member(staged.formation_member.as_deref());
+    trace.set_build_cache(staged.build_cache.clone());
     let mut tools_declared: Vec<String> = staged.allowlisted_tools.iter().cloned().collect();
     tools_declared.sort_unstable();
     rt.block_on(trace.write_session_start(None, None, tools_declared))
@@ -22926,6 +22960,7 @@ inference:
             &declaring,
             &subprocess_guest_env(&agent),
             Some(tmp.path()),
+            None,
             None,
             None,
             None,

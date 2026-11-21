@@ -266,6 +266,7 @@ pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
 pub const E_IO_002: &str = "E-IO-002"; // permission denied (host, not capsule)
 pub const E_IO_003: &str = "E-IO-003"; // general I/O error
 pub const E_IO_004: &str = "E-IO-004"; // HOME cannot hold ~/.murmur
+pub const E_IO_005: &str = "E-IO-005"; // mur build-cache add was given a lockfile that is not a regular file, or a source that is not a Cargo target folder or lies inside ~/.murmur
 
 // Artifact index
 pub const E_IDX_001: &str = "E-IDX-001"; // a file in the directory given to mur index cannot be indexed, or the directory holds no .mur.zip

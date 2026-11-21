@@ -676,6 +676,13 @@ pub struct StagedSession {
     /// session ends — `launch` takes it and drops it on return, and a `StagedSession` dropped
     /// unlaunched drops it with itself.
     pub(crate) runtime_dir_guard: Option<crate::runtime_dir::RuntimeDir>,
+    /// What staging did with the build cache entry matching the work folder's `Cargo.lock`
+    /// ([`crate::build_cache`]), for `session_start.build_cache` and `mur run`'s notice. `None`
+    /// when no entry matched.
+    pub build_cache: Option<crate::build_cache::BuildCacheReport>,
+    /// Owns the session's build cache seed on the same terms as [`Self::runtime_dir_guard`]:
+    /// dropping it removes the seed.
+    pub(crate) build_cache_seed: Option<crate::build_cache::SeededTarget>,
     pub(crate) manifest_dir: PathBuf,
     pub(crate) capsule_name: String,
     pub(crate) capsule_version: String,

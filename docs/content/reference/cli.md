@@ -11,6 +11,8 @@ Every `mur` command, its flags, and what each one does.
 | `mur publish` | Publish a built artifact into the global store |
 | `mur install` | Fetch and install artifacts from the global store, the configured sources, or a file |
 | `mur precompile` | Compile WASM artifact files for this machine, so their first launch skips compiling |
+| `mur build-cache add` | Import a Cargo target folder built on this host, so capsules on a matching `Cargo.lock` start warm |
+| `mur build-cache list` | List the imported Cargo target folders |
 | `mur list` | List installed artifacts in the project or global store |
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
 | `mur version` | Print this `mur`'s version, the WIT level it serves and that level's package versions |
@@ -934,6 +936,71 @@ A `mur` release older than this command exits with `error: unrecognized subcomma
 
 ---
 
+## `mur build-cache` { #mur-build-cache }
+
+Import a Cargo target folder you built on this host into the build cache store, `~/.murmur/build-cache/`, and list what it holds. Every capsule launched with a `--workdir` whose root holds a byte-identical `Cargo.lock` starts with a private copy of the matching entry as `CARGO_TARGET_DIR`: see [Share a build cache between capsules](../how-to/share-a-build-cache.md).
+
+```bash
+mur build-cache add --lockfile <Cargo.lock> <TARGET>
+mur build-cache list
+```
+
+| Argument or flag | Default | Description |
+|---|---|---|
+| `add --lockfile` | — | The `Cargo.lock` the target folder was built from (required). The entry is keyed by the SHA-256 of its bytes |
+| `add <TARGET>` | — | The target folder (required): one holding `CACHEDIR.TAG` or `.rustc_info.json`, which Cargo writes into every target folder it uses |
+
+`add` copies the target folder into `~/.murmur/build-cache/<sha256>/target/`, reflinked where the filesystem can share extents and copied otherwise, keeping every file's modification time and narrowing modes to `0700` for directories and executable files and `0600` for the rest. Links inside it are recreated, never followed. A file it cannot read fails the import. A second `add` of the same lockfile replaces the entry whole: the new entry is assembled in a `.partial-*` folder and moved into place by one rename. Whatever the target folder holds becomes what every later capsule on that lockfile starts from.
+
+The store is written only by `mur build-cache add`. `mur run` reads it at staging and copies nothing a capsule produced into it. To remove an entry, delete its folder.
+
+### Entry layout { #build-cache-entry }
+
+```text
+~/.murmur/build-cache/
+  <sha256>/
+    entry.json
+    target/
+```
+
+| `entry.json` field | Type | Description |
+|---|---|---|
+| `lockfile_sha256` | string | SHA-256 of the `Cargo.lock`, the folder name |
+| `added_at` | string | When the entry was added, RFC 3339 UTC |
+| `source` | string | The target folder imported, as an absolute path |
+| `files` | integer | Regular files under `target/` |
+| `bytes` | integer | Bytes of regular-file content under `target/` |
+| `rustc` | string or `null` | The first line of the `rustc -vV` output Cargo recorded in the target folder's `.rustc_info.json`; `null` when it recorded none |
+
+### Output { #build-cache-output }
+
+| Command | Prints on stdout |
+|---|---|
+| `add` | `added <sha256> (<n> files, <m> bytes) from <source>` |
+| `list`, entries stored | One line per entry, sorted by key: `<sha256>  <n> files  <m> bytes  <rustc or ->  <added_at>  <source>` |
+| `list`, an entry whose `entry.json` cannot be read | `<sha256>  unreadable entry record: <reason>` |
+| `list`, nothing stored | `no build cache entries in <store>` |
+
+```text
+$ mur build-cache add --lockfile ~/src/app/Cargo.lock ~/build/app-target
+added 3f1c…9a2e (2140 files, 812736410 bytes) from /home/alice/build/app-target
+$ mur build-cache list
+3f1c…9a2e  2140 files  812736410 bytes  rustc 1.0.0 (abcdef012 2026-01-01)  2026-11-20T21:00:00Z  /home/alice/build/app-target
+```
+
+### Refusals { #build-cache-refusals }
+
+Each exits non-zero, names the path and the reason, and leaves the store unchanged.
+
+| Code | Refused when |
+|---|---|
+| [`E-IO-001`](diagnostics.md#index) | The `--lockfile` or the target folder does not exist |
+| [`E-IO-005`](diagnostics.md#e-io-005) | The `--lockfile` is not a regular file; the target folder holds neither `CACHEDIR.TAG` nor `.rustc_info.json`, or is not a directory; or it lies inside `~/.murmur`, where every session's records and home folder live |
+| [`E-IO-002`](diagnostics.md#index) | A file of the target folder cannot be read for lack of permission |
+| [`E-IO-003`](diagnostics.md#index) | Any other read or write failed |
+
+---
+
 ## `mur list`
 
 List installed artifacts by full name, `<scope>/<name>`, sorted by name. Which store is listed follows where you run the command.
@@ -1480,6 +1547,7 @@ Murmur home (/home/alice/.murmur)
   host_facts: 0700  facts about allowlisted host binaries, safe to delete, expected owner-only
   bin: absent  cached mur binaries
   formations: 0700  formation members' working directories, each kept until its formation has ended and the entry member's trace.retain expires it, expected owner-only
+  build-cache: 0700  imported Cargo build caches, expected owner-only
   nexus-config.json: 0644  something not recognised by this build
 ```
 

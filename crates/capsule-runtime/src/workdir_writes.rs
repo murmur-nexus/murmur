@@ -201,6 +201,7 @@ mod tests {
         ("agent.rs", include_str!("agent.rs")),
         ("agent/inventory.rs", include_str!("agent/inventory.rs")),
         ("agent/process.rs", include_str!("agent/process.rs")),
+        ("build_cache.rs", include_str!("build_cache.rs")),
         ("child_launch.rs", include_str!("child_launch.rs")),
         ("delegation.rs", include_str!("delegation.rs")),
         ("delegation_plane.rs", include_str!("delegation_plane.rs")),
@@ -263,6 +264,8 @@ mod tests {
             "SESSION_TEMP_DIR_NAME",
             crate::temp_dir::SESSION_TEMP_DIR_NAME,
         ),
+        ("SEED_CACHE_DIR", crate::build_cache::SEED_CACHE_DIR),
+        ("SEED_TARGET_DIR", crate::build_cache::SEED_TARGET_DIR),
     ];
 
     /// Entry names the scanner resolves that are deliberately not declared, each with the reason.
@@ -618,7 +621,15 @@ mod tests {
     /// The receivers that name a directory beside the runtime directory, outside every workdir:
     /// `sealed-etc/`, `harness/` and the session directory holding them. No capsule command is
     /// granted any of them, so what is written there is no runtime write inside a workdir.
-    const OUTSIDE_WORKDIR_ROOTS: &[&str] = &["sealed_etc_root", "harness_root", "session_dir_root"];
+    const OUTSIDE_WORKDIR_ROOTS: &[&str] = &[
+        "sealed_etc_root",
+        "harness_root",
+        "session_dir_root",
+        // The session's home folder and its `.cache/`, beneath the records directory, which
+        // hold the build cache seed (`build_cache.rs`).
+        "session_home_root",
+        "session_cache_root",
+    ];
 
     /// Every entry the runtime writes into the runtime directory, with what it is. The files a
     /// capsule's commands read and cannot change.
@@ -1002,6 +1013,37 @@ mod tests {
     /// A row covers every listed call in that function. Anything a capsule's commands can reach
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "build_cache.rs",
+            "add",
+            "Reads the `Cargo.lock` the operator named to `mur build-cache add`, and checks the \
+             target folder it named: host paths the operator chose, outside every work folder of \
+             a running session, and only read.",
+        ),
+        (
+            "build_cache.rs",
+            "commit",
+            "Renames an assembled `.partial-*` folder into `~/.murmur/build-cache/<sha256>` and \
+             removes the entry it replaced: the store, outside every work folder.",
+        ),
+        (
+            "build_cache.rs",
+            "write_record",
+            "Creates `entry.json` in a `.partial-*` folder under `~/.murmur/build-cache`: the \
+             store, outside every work folder.",
+        ),
+        (
+            "build_cache.rs",
+            "rustc_of_target",
+            "Reads `.rustc_info.json` from the target folder the operator named to \
+             `mur build-cache add`: a host path the operator chose, only read.",
+        ),
+        (
+            "build_cache.rs",
+            "read_entry_record",
+            "Reads an entry's `entry.json` under `~/.murmur/build-cache`: the store, which only \
+             `mur build-cache add` writes, outside every work folder.",
+        ),
         (
             "record_seal.rs",
             "create_seed",

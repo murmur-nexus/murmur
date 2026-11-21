@@ -24,7 +24,7 @@ use murmur_artifact::{
     LocalRegistry, LockOrigin, LockedArtifact, LockfileError, MurmurLock, Registry, RegistryError,
     ResolvedArtifact, LOCK_VERSION,
 };
-use murmur_artifact::{runtime_warning_link, W_RUN_007};
+use murmur_artifact::{runtime_warning_link, W_RUN_007, W_RUN_014};
 
 use crate::{
     commands::trace::{resolve_session_dir, trace_head},
@@ -1045,6 +1045,9 @@ pub(crate) fn run_run(
 
     session_id = staged.session_id.clone();
     workdir = staged.accessible_workdir.clone();
+    if let Some(build_cache) = &staged.build_cache {
+        report_build_cache(build_cache);
+    }
 
     if let Some(task_value) = task_arg {
         // Into the session's runtime directory, where the agent reads it at
@@ -1610,6 +1613,32 @@ fn task_input_bytes(value: &str) -> std::io::Result<Vec<u8>> {
         fs::read(value)
     } else {
         Ok(value.as_bytes().to_vec())
+    }
+}
+
+/// The one stderr line saying what the build cache gave this launch: the seed, or `W-RUN-014`
+/// when the entry matching the work folder's `Cargo.lock` could not be used.
+fn report_build_cache(report: &capsule_runtime::build_cache::BuildCacheReport) {
+    use capsule_runtime::build_cache::SeedOutcome;
+    match report.outcome {
+        SeedOutcome::Seeded => capsule_runtime::report_eprintln!(
+            "build cache: seeded {} files, {} bytes from {} in {} ms ({} reflinked, {} copied); \
+             CARGO_TARGET_DIR={}",
+            report.files,
+            report.bytes,
+            report.entry,
+            report.duration_ms,
+            report.reflinked,
+            report.copied,
+            report.target_dir.as_deref().unwrap_or_default()
+        ),
+        SeedOutcome::Skipped => capsule_runtime::runtime_err!(
+            "warning[{W_RUN_014}]: build cache entry {} matches this work folder's Cargo.lock but \
+             was not seeded: {}; this run builds without it ({})",
+            report.entry,
+            report.reason.as_deref().unwrap_or_default(),
+            runtime_warning_link(W_RUN_014)
+        ),
     }
 }
 
