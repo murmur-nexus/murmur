@@ -64,6 +64,7 @@ section that explains it.
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-IO-004` | `HOME` is unset, relative, or names a directory in which `~/.murmur` cannot be created, so there is nowhere to keep a session's runtime and records directories | [E-IO-004](#e-io-004) |
+| `E-IO-005` | `mur build-cache add` was given a lockfile that is not a regular file, or a source that is not a Cargo target folder or lies inside `~/.murmur` | [E-IO-005](#e-io-005) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) block with a missing or blank `message` or a missing or zero `limit`, a [`lifecycle.done_check`](manifest.md#lifecycle-done-check) block with a missing or blank `command`, a `command` whose program `capabilities.shell.allow` does not list, a missing `limit` or a zero `timeout_secs`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
@@ -199,6 +200,7 @@ section that explains it.
 | `W-RUN-011` | A tool the capsule pins declares a need for a program `shell.allow` grants, and this host cannot grant it | [W-RUN-011](#w-run-011) |
 | `W-RUN-012` | A tool the capsule pins pins a download of a program `shell.allow` grants, and nothing usable runs under that name, or the stored copy fails its checksum | [W-RUN-012](#w-run-012) |
 | `W-RUN-013` | `mur doctor` could not tell whether a `transport: process` harness is logged in | [W-RUN-013](#w-run-013) |
+| `W-RUN-014` | The build cache holds an entry for the work folder's `Cargo.lock`, and it could not be seeded into the session | [W-RUN-014](#w-run-014) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -519,6 +521,19 @@ error[E-IO-004]: HOME is not set, so there is no ~/.murmur to hold this session'
 | `mur eval run` | When a case is staged |
 | `mur trace show`, `steps`, `diff`, `report`, `list`, `rm`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group, which `list` and `rm` always do; the path form needs none |
 | `mur doctor` | In place of the runtime and records directory paths, counted as a failed check |
+
+### E-IO-005 — not something `mur build-cache add` imports { #e-io-005 }
+
+[`mur build-cache add`](cli.md#mur-build-cache) refuses before writing anything:
+
+| Cause | Message |
+|---|---|
+| `--lockfile` names a directory or another non-regular file | `mur build-cache add: the lockfile <path> is not a regular file` |
+| The target folder holds neither `CACHEDIR.TAG` nor `.rustc_info.json` | `mur build-cache add: <path> is not a Cargo target folder: it holds neither CACHEDIR.TAG nor .rustc_info.json, one of which Cargo writes into every target folder it uses` |
+| The target folder is not a directory | `mur build-cache add: <path> is not a Cargo target folder: it is not a directory` |
+| The target folder lies inside `~/.murmur` | `mur build-cache add: <path> is inside <murmur home>, where every session's records and home folder live, so it is never imported` |
+
+**What to do:** point `add` at the `Cargo.lock` of the project and at the target folder a host build of it wrote (`--target-dir`, or the project's `target/`).
 
 ### E-RUN-006 — a harness binary was not found { #e-run-006 }
 
@@ -3838,6 +3853,25 @@ Nothing is refused, and `mur run` never asks: a harness that is logged out fails
 with [`E-RUN-033`](#e-run-033).
 
 **What to do:** check by hand that the harness is logged in as this user on this host.
+
+### W-RUN-014 — a matching build cache entry was not seeded { #w-run-014 }
+
+```text
+warning[W-RUN-014]: build cache entry <entry> matches this work folder's Cargo.lock but was not seeded: <reason>; this run builds without it (https://docs.murmur.nexus/reference/diagnostics/#w-run-014)
+```
+
+**Fires when** `mur run` stages a session whose `--workdir` holds a `Cargo.lock` with an entry in the [build cache](cli.md#mur-build-cache), and the entry cannot be copied into the session:
+
+| Cause | The reason |
+|---|---|
+| The entry plus what the work folder and the session's `tmp/` and `home/` hold would pass [`capabilities.resources.workdir_max_bytes`](resource-limits.md) | `its <n> bytes and the <m> bytes the work folder and the session's tmp/ and home/ already hold pass capabilities.resources.workdir_max_bytes of <max> bytes` |
+| A file of the entry cannot be read | `cannot read <path>: <error>` |
+| The entry's `entry.json` cannot be read | `its record cannot be read: <reason>` |
+| A write into the session's home folder failed | `copying into <path> failed: <error>` |
+
+Whatever was copied is removed, `CARGO_TARGET_DIR` is not set, and the session runs and builds without the seed. `session_start.build_cache` records the same reason with `outcome: "skipped"`.
+
+**What to do:** raise `capabilities.resources.workdir_max_bytes`, fix the entry's permissions, or add the entry again.
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 

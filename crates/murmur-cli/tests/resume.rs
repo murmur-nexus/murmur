@@ -562,6 +562,7 @@ fn session_start_carries_resumed_from_and_context_id() {
     assert_eq!(
         keys,
         vec![
+            "build_cache",
             "capabilities",
             "capsule_name",
             "capsule_version",

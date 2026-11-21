@@ -2752,6 +2752,14 @@ impl ShellEnforcement {
         self.home_root().map(crate::workdir_fs::WorkdirRoot::path)
     }
 
+    /// The session's build cache seed, the value of `CARGO_TARGET_DIR` in every command this
+    /// enforcement spawns. `None` when staging seeded nothing.
+    pub(crate) fn cargo_target_dir(&self) -> Option<&Path> {
+        self.runtime_dir
+            .as_ref()
+            .and_then(|roots| roots.cargo_target.as_deref())
+    }
+
     /// Hand in the session's [`crate::temp_dir::temp_mapping`] answer, decided for this
     /// enforcement's tier.
     pub(crate) fn with_temp_mapping(mut self, mapping: crate::temp_dir::TempMapping) -> Self {
@@ -10089,6 +10097,7 @@ mod linux_integration_tests {
             &crate::types::CapabilityPolicy::default(),
             &[],
             Some(home.path()),
+            None,
             None,
             None,
             None,

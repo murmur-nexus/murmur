@@ -423,12 +423,14 @@ pub(crate) fn harness_base_env(
 /// 3. the plan's `env-set`;
 /// 4. the host's `USER` and `LOGNAME`, each only where the host sets it, so no plan or allowlist
 ///    entry names a different account;
-/// 5. `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
+/// 5. `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own, and `CARGO_TARGET_DIR`
+///    when the session holds a build cache seed ([`crate::build_cache`]).
 ///
 /// The allowlist goes through the credential backstop every WASM guest gets — a credential-shaped
 /// name in `env.allow` is refused at staging, so the harness cannot be handed a key that way
 /// either. Shell subprocesses use a different, baseline-derived environment
 /// ([`shell::build_shell_env`]): a harness is a guest, not a shell command.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_harness_env(
     policy: &CapabilityPolicy,
     account: &HostAccountEnv,
@@ -439,6 +441,7 @@ pub(super) fn build_harness_env(
     // The session's temporary folder on a contained class, from `enforcement.tmpdir_value()`;
     // `None` off a contained class, where the harness keeps the host's `TMPDIR` (via `env.allow`).
     tmpdir: Option<&str>,
+    cargo_target_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = harness_base_env(policy, account);
     for (name, value) in env_set {
@@ -470,6 +473,12 @@ pub(super) fn build_harness_env(
             records_dir.to_string_lossy().into_owned(),
         );
     }
+    if let Some(cargo_target_dir) = cargo_target_dir {
+        env.insert(
+            crate::build_cache::CARGO_TARGET_DIR_ENV.to_string(),
+            cargo_target_dir.to_string_lossy().into_owned(),
+        );
+    }
     Ok(env)
 }
 
@@ -477,7 +486,8 @@ pub(super) fn build_harness_env(
 /// applied: `base` (this process's whole environment, [`std::env::vars_os`], in production) as
 /// [`shell::build_unconfined_env`] leaves it (the lineage names and whatever
 /// `capabilities.shell.strip_env` matches removed), then the plan's `env-set`, then
-/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own, and `CARGO_TARGET_DIR` when
+/// the session holds a build cache seed.
 pub(super) fn build_unconfined_harness_env(
     policy: &CapabilityPolicy,
     base: impl IntoIterator<Item = (OsString, OsString)>,
@@ -485,8 +495,9 @@ pub(super) fn build_unconfined_harness_env(
     files_dir: &str,
     runtime_dir: &Path,
     records_dir: Option<&Path>,
+    cargo_target_dir: Option<&Path>,
 ) -> Result<BTreeMap<OsString, OsString>, String> {
-    let mut env = shell::build_unconfined_env(policy, base, &[], None, None);
+    let mut env = shell::build_unconfined_env(policy, base, &[], None, None, None);
     for (name, value) in env_set {
         if !crate::process_driver::is_usable_env_name(name) {
             return Err(format!(
@@ -513,6 +524,12 @@ pub(super) fn build_unconfined_harness_env(
         env.insert(
             OsString::from(crate::records_dir::RECORDS_DIR_ENV),
             records_dir.as_os_str().to_owned(),
+        );
+    }
+    if let Some(cargo_target_dir) = cargo_target_dir {
+        env.insert(
+            OsString::from(crate::build_cache::CARGO_TARGET_DIR_ENV),
+            cargo_target_dir.as_os_str().to_owned(),
         );
     }
     Ok(env)
@@ -1137,6 +1154,7 @@ async fn run_harness(
             &files_dir_path,
             store_state.runtime_root.path(),
             Some(store_state.records_root.path()),
+            store_state.runtime_dirs.cargo_target.as_deref(),
         )
         .map_err(launch_error)?
     } else {
@@ -1149,6 +1167,7 @@ async fn run_harness(
             Some(store_state.records_root.path()),
             // The session's temporary folder on a contained class; `None` leaves the host's.
             harness_tmpdir.as_deref(),
+            store_state.runtime_dirs.cargo_target.as_deref(),
         )
         .map_err(launch_error)?
         .into_iter()
@@ -2796,6 +2815,7 @@ mod tests {
             std::path::Path::new("/runtime"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(env.get("USER").map(String::as_str), Some("alice"));
@@ -2810,6 +2830,7 @@ mod tests {
             &[("LOGNAME".to_string(), "someone-else".to_string())],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
             None,
             None,
         )
@@ -2833,6 +2854,7 @@ mod tests {
             std::path::Path::new("/runtime"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!env.contains_key("USER"), "{env:?}");
@@ -2848,6 +2870,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
             None,
             None,
         )
@@ -2877,6 +2900,7 @@ mod tests {
             std::path::Path::new("/runtime"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2903,6 +2927,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
             None,
             None,
         )
@@ -2952,6 +2977,7 @@ mod tests {
             "/files",
             std::path::Path::new("/runtime"),
             Some(std::path::Path::new("/records")),
+            None,
         )
         .unwrap();
         for name in shell::LINEAGE_ENV
@@ -2974,6 +3000,56 @@ mod tests {
             get(&env, crate::records_dir::RECORDS_DIR_ENV).as_deref(),
             Some("/records")
         );
+    }
+
+    /// With a build cache seed, `CARGO_TARGET_DIR` is the seed in the harness's environment on
+    /// a contained class and an unconfined one: no `env.allow` host value or plan `env-set` entry
+    /// displaces it. Without one, both builders pass the name on as before.
+    #[test]
+    fn harness_env_names_the_build_cache_seed_whatever_else_says() {
+        let name = crate::build_cache::CARGO_TARGET_DIR_ENV;
+        std::env::set_var(name, "/host/target");
+        let seed = std::path::Path::new("/records/home/.cache/cargo-target");
+        let env_set = [(name.to_string(), "/plan/target".to_string())];
+        let contained = |env_set: &[(String, String)], seed: Option<&std::path::Path>| {
+            build_harness_env(
+                &policy_allowing(&[name]),
+                &no_account(),
+                env_set,
+                "/files",
+                std::path::Path::new("/runtime"),
+                Some(std::path::Path::new("/records")),
+                None,
+                seed,
+            )
+            .unwrap()
+            .get(name)
+            .cloned()
+        };
+        let unconfined = |env_set: &[(String, String)], seed: Option<&std::path::Path>| {
+            build_unconfined_harness_env(
+                &CapabilityPolicy::default(),
+                std::env::vars_os(),
+                env_set,
+                "/files",
+                std::path::Path::new("/runtime"),
+                Some(std::path::Path::new("/records")),
+                seed,
+            )
+            .unwrap()
+            .get(std::ffi::OsStr::new(name))
+            .map(|value| value.to_string_lossy().into_owned())
+        };
+        let seeded = Some(seed.display().to_string());
+        assert_eq!(contained(&env_set, Some(seed)), seeded);
+        assert_eq!(contained(&[], Some(seed)), seeded);
+        assert_eq!(unconfined(&env_set, Some(seed)), seeded);
+        assert_eq!(unconfined(&[], Some(seed)), seeded);
+
+        assert_eq!(contained(&[], None).as_deref(), Some("/host/target"));
+        assert_eq!(contained(&env_set, None).as_deref(), Some("/plan/target"));
+        assert_eq!(unconfined(&[], None).as_deref(), Some("/host/target"));
+        assert_eq!(unconfined(&env_set, None).as_deref(), Some("/plan/target"));
     }
 
     /// The runtime directory is the session's, set last: no declaration, host value or `env-set`
@@ -3001,6 +3077,7 @@ mod tests {
             "/files",
             std::path::Path::new("/runtime"),
             Some(std::path::Path::new("/records")),
+            None,
             None,
         )
         .unwrap();
@@ -3034,6 +3111,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
             None,
             None,
         )
@@ -3182,6 +3260,7 @@ mod tests {
                 &[(bad.to_string(), "v".to_string())],
                 "/files",
                 std::path::Path::new("/runtime"),
+                None,
                 None,
                 None,
             )

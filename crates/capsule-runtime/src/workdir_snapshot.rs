@@ -16,7 +16,7 @@
 //!
 //! | Entry | Copied as |
 //! |---|---|
-//! | Regular file | Its content, its `rwx` bits for user, group and other, and its modification time. Setuid, setgid and sticky are dropped. |
+//! | Regular file | Its content (reflinked where the filesystem shares extents, [`crate::tree_copy`]), its `rwx` bits for user, group and other, and its modification time. Setuid, setgid and sticky are dropped. |
 //! | Directory | Recreated with its `rwx` bits; its modification time is set after its contents. |
 //! | Symbolic link | Recreated, never followed. An absolute target inside the source is re-pointed at the same place in the destination; every other target is copied verbatim. |
 //! | FIFO, socket, device node | Not copied: [`SkipReason::Fifo`], [`SkipReason::Socket`], [`SkipReason::Device`]. |
@@ -35,46 +35,13 @@
 //! [`SnapshotError::Ceiling`]; so does any write that fails. The caller removes the partial
 //! destination and starts no process.
 
-use std::ffi::{OsStr, OsString};
-use std::fs::{File, FileTimes, Permissions};
-use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::containment::FilesystemRestriction;
-use crate::workdir_fs::{fd_identity, WorkdirRoot};
+use crate::tree_copy::{CopyError, CopyOptions, Modes, Reflink, Unreadable};
+use crate::workdir_fs::WorkdirRoot;
 
-/// How many skipped entries a [`WorkdirSnapshot`] names; [`WorkdirSnapshot::skipped_count`] is
-/// the total.
-pub const SKIPPED_SAMPLE_LIMIT: usize = 20;
-
-/// Why an entry of the source was not copied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SkipReason {
-    Fifo,
-    Socket,
-    /// A character or block device node.
-    Device,
-    /// The runtime could not open or read it.
-    Unreadable,
-    /// A path the runtime writes into a work folder, or one of its own directories.
-    RuntimeOwned,
-}
-
-/// One entry of the source the copy left out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkippedEntry {
-    /// Relative to the source work folder.
-    pub path: String,
-    pub reason: SkipReason,
-}
+pub use crate::tree_copy::{SkipReason, SkippedEntry, SKIPPED_SAMPLE_LIMIT};
 
 /// What one copy of a parent's work folder put into a child's: the parent's
 /// `delegation_start.workdir_snapshot`, and what the child is told through
@@ -175,352 +142,43 @@ pub fn copy_workdir(
     destination: &WorkdirRoot,
     limits: &SnapshotLimits,
 ) -> Result<WorkdirSnapshot, SnapshotError> {
-    let root_error = |path: &str, error: crate::workdir_fs::WorkdirError| SnapshotError::Io {
-        path: path.to_string(),
-        source: error.into(),
-    };
-    let source_fd = source
-        .dir_fd()
-        .map_err(|error| root_error(&source.path().display().to_string(), error))?;
-    let destination_fd = destination
-        .dir_fd()
-        .map_err(|error| root_error(&destination.path().display().to_string(), error))?;
-    let mut excluded = limits.excluded.clone();
-    excluded.push(
-        destination
-            .identity()
-            .map_err(|error| root_error(&destination.path().display().to_string(), error))?,
-    );
-    let runtime_owned: Vec<String> = crate::workdir_writes::runtime_writes()
-        .into_iter()
-        .map(|write| write.path)
-        .collect();
-
-    let mut walk = Walk {
-        max_bytes: limits.max_bytes,
-        excluded,
-        runtime_owned,
-        source_prefixes: link_prefixes(source.path()),
-        destination: destination.path().to_path_buf(),
-        snapshot: WorkdirSnapshot {
-            source: source.path().display().to_string(),
-            files: 0,
-            dirs: 0,
-            symlinks: 0,
-            repointed_symlinks: 0,
-            bytes: 0,
-            skipped_count: 0,
-            skipped: Vec::new(),
+    let copied = crate::tree_copy::copy_tree(
+        source,
+        destination,
+        &CopyOptions {
+            max_bytes: limits.max_bytes,
+            excluded: limits.excluded.clone(),
+            skip_runtime_writes: true,
+            unreadable: Unreadable::Skip,
+            modes: Modes::Keep,
+            reflink: Reflink::Try,
         },
-    };
-    walk.copy_dir(&source_fd, &destination_fd, "")?;
-    Ok(walk.snapshot)
-}
-
-/// The forms of `source` an absolute link target can name it by: as given, and resolved, so a
-/// link written through either form is re-pointed.
-fn link_prefixes(source: &Path) -> Vec<PathBuf> {
-    let mut prefixes = vec![source.to_path_buf()];
-    if let Ok(resolved) = std::fs::canonicalize(source) {
-        if resolved != source {
-            prefixes.push(resolved);
-        }
-    }
-    prefixes
-}
-
-struct Walk {
-    max_bytes: u64,
-    excluded: Vec<(u64, u64)>,
-    runtime_owned: Vec<String>,
-    source_prefixes: Vec<PathBuf>,
-    destination: PathBuf,
-    snapshot: WorkdirSnapshot,
-}
-
-const READ_DIR: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-
-/// `O_NONBLOCK` so a source entry swapped for a FIFO after its `statat` cannot block the open.
-const READ_FILE: OFlags = OFlags::RDONLY
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK)
-    .union(OFlags::CLOEXEC);
-
-const CREATE_FILE: OFlags = OFlags::WRONLY
-    .union(OFlags::CREATE)
-    .union(OFlags::EXCL)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-
-/// User, group and other `rwx`: what is kept of a source mode.
-const PERMISSION_BITS: u32 = 0o777;
-
-impl Walk {
-    fn skip(&mut self, path: String, reason: SkipReason) {
-        self.snapshot.skipped_count += 1;
-        if self.snapshot.skipped.len() < SKIPPED_SAMPLE_LIMIT {
-            self.snapshot.skipped.push(SkippedEntry { path, reason });
-        }
-    }
-
-    fn io(&self, rel: &str, source: impl Into<std::io::Error>) -> SnapshotError {
-        SnapshotError::Io {
-            path: self.destination.join(rel).display().to_string(),
-            source: source.into(),
-        }
-    }
-
-    /// Copies the entries of `source` into `destination`, `rel` being both directories' path
-    /// relative to their roots.
-    fn copy_dir(
-        &mut self,
-        source: &OwnedFd,
-        destination: &OwnedFd,
-        rel: &str,
-    ) -> Result<(), SnapshotError> {
-        let names = match list(source) {
-            Ok(names) => names,
-            Err(_) if !rel.is_empty() => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-            Err(errno) => return Err(self.io(rel, errno)),
-        };
-        for name in names {
-            let child = if rel.is_empty() {
-                name.to_string_lossy().into_owned()
-            } else {
-                format!("{rel}/{}", name.to_string_lossy())
-            };
-            if rel.is_empty()
-                && self
-                    .runtime_owned
-                    .iter()
-                    .any(|owned| name == owned.as_str())
-            {
-                self.skip(child, SkipReason::RuntimeOwned);
-                continue;
-            }
-            let stat = match rustix::fs::statat(source, &name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => stat,
-                // Removed since the listing: there is nothing left to copy or to report.
-                Err(Errno::NOENT) => continue,
-                Err(_) => {
-                    self.skip(child, SkipReason::Unreadable);
-                    continue;
-                }
-            };
-            match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => {
-                    self.copy_file(source, destination, &name, &child, stat.st_size as u64)?
-                }
-                FileType::Directory => self.copy_subdir(source, destination, &name, &child)?,
-                FileType::Symlink => self.copy_link(source, destination, &name, &child)?,
-                FileType::Fifo => self.skip(child, SkipReason::Fifo),
-                FileType::Socket => self.skip(child, SkipReason::Socket),
-                FileType::CharacterDevice | FileType::BlockDevice => {
-                    self.skip(child, SkipReason::Device)
-                }
-                FileType::Unknown => self.skip(child, SkipReason::Unreadable),
-            }
-        }
-        Ok(())
-    }
-
-    fn check_ceiling(&self, rel: &str, more: u64) -> Result<(), SnapshotError> {
-        if self.snapshot.bytes.saturating_add(more) > self.max_bytes {
-            return Err(SnapshotError::Ceiling {
-                max_bytes: self.max_bytes,
-                path: rel.to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn copy_file(
-        &mut self,
-        source: &OwnedFd,
-        destination: &OwnedFd,
-        name: &OsStr,
-        rel: &str,
-        size: u64,
-    ) -> Result<(), SnapshotError> {
-        self.check_ceiling(rel, size)?;
-        let opened = match rustix::fs::openat(source, name, READ_FILE, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(()),
-            Err(_) => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-        };
-        let mut input = File::from(opened);
-        let metadata = match input.metadata() {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            _ => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-        };
-        let created = rustix::fs::openat(destination, name, CREATE_FILE, Mode::RUSR | Mode::WUSR)
-            .map_err(|errno| self.io(rel, errno))?;
-        let mut output = File::from(created);
-        // One byte past what is left, so a file that grew since its `statat` is caught here
-        // rather than copied past the ceiling.
-        let room = self.max_bytes.saturating_sub(self.snapshot.bytes);
-        let copied =
-            match std::io::copy(&mut (&mut input).take(room.saturating_add(1)), &mut output) {
-                Ok(copied) => copied,
-                // Readable by `statat` and open, unreadable by `read`: the parent's own business.
-                Err(error) if is_read_side(&error) => {
-                    drop(output);
-                    let _ = rustix::fs::unlinkat(destination, name, AtFlags::empty());
-                    self.skip(rel.to_string(), SkipReason::Unreadable);
-                    return Ok(());
-                }
-                Err(error) => return Err(self.io(rel, error)),
-            };
-        self.check_ceiling(rel, copied)?;
-        output
-            .set_permissions(Permissions::from_mode(
-                metadata.permissions().mode() & PERMISSION_BITS,
-            ))
-            .map_err(|error| self.io(rel, error))?;
-        if let Ok(modified) = metadata.modified() {
-            output
-                .set_times(FileTimes::new().set_modified(modified))
-                .map_err(|error| self.io(rel, error))?;
-        }
-        self.snapshot.bytes += copied;
-        self.snapshot.files += 1;
-        Ok(())
-    }
-
-    fn copy_subdir(
-        &mut self,
-        source: &OwnedFd,
-        destination: &OwnedFd,
-        name: &OsStr,
-        rel: &str,
-    ) -> Result<(), SnapshotError> {
-        let opened = match rustix::fs::openat(source, name, READ_DIR, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(()),
-            Err(_) => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-        };
-        match fd_identity(&opened) {
-            Ok(identity) if self.excluded.contains(&identity) => {
-                self.skip(rel.to_string(), SkipReason::RuntimeOwned);
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(_) => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-        }
-        // Owner-only until its contents are in, so nothing else reads a half-copied directory and
-        // a source directory without owner write still receives its entries.
-        rustix::fs::mkdirat(destination, name, Mode::RWXU).map_err(|errno| self.io(rel, errno))?;
-        let created = rustix::fs::openat(destination, name, READ_DIR, Mode::empty())
-            .map_err(|errno| self.io(rel, errno))?;
-        self.snapshot.dirs += 1;
-        self.copy_dir(&opened, &created, rel)?;
-
-        let metadata = File::from(opened)
-            .metadata()
-            .map_err(|error| self.io(rel, error))?;
-        let created = File::from(created);
-        created
-            .set_permissions(Permissions::from_mode(
-                metadata.permissions().mode() & PERMISSION_BITS,
-            ))
-            .map_err(|error| self.io(rel, error))?;
-        if let Ok(modified) = metadata.modified() {
-            created
-                .set_times(FileTimes::new().set_modified(modified))
-                .map_err(|error| self.io(rel, error))?;
-        }
-        Ok(())
-    }
-
-    fn copy_link(
-        &mut self,
-        source: &OwnedFd,
-        destination: &OwnedFd,
-        name: &OsStr,
-        rel: &str,
-    ) -> Result<(), SnapshotError> {
-        let target = match rustix::fs::readlinkat(source, name, Vec::new()) {
-            Ok(target) => target,
-            Err(Errno::NOENT) => return Ok(()),
-            Err(_) => {
-                self.skip(rel.to_string(), SkipReason::Unreadable);
-                return Ok(());
-            }
-        };
-        let target = Path::new(OsStr::from_bytes(target.as_bytes()));
-        let repointed = self.repoint(target);
-        let written = repointed.as_deref().unwrap_or(target);
-        rustix::fs::symlinkat(written, destination, name).map_err(|errno| self.io(rel, errno))?;
-        self.snapshot.symlinks += 1;
-        if repointed.is_some() {
-            self.snapshot.repointed_symlinks += 1;
-        }
-        Ok(())
-    }
-
-    /// `target` re-pointed into the destination when it is an absolute path inside the source,
-    /// else `None`.
-    fn repoint(&self, target: &Path) -> Option<PathBuf> {
-        if !target.is_absolute() {
-            return None;
-        }
-        self.source_prefixes.iter().find_map(|prefix| {
-            let rest = target.strip_prefix(prefix).ok()?;
-            Some(if rest.as_os_str().is_empty() {
-                self.destination.clone()
-            } else {
-                self.destination.join(rest)
-            })
-        })
-    }
-}
-
-/// The names in the directory `dir`, sorted, `.` and `..` left out.
-fn list(dir: &impl AsFd) -> rustix::io::Result<Vec<OsString>> {
-    let mut listing = rustix::fs::Dir::read_from(dir)?;
-    let mut names = Vec::new();
-    while let Some(entry) = listing.read() {
-        let name = OsStr::from_bytes(entry?.file_name().to_bytes()).to_os_string();
-        if name != "." && name != ".." {
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
-}
-
-/// Whether a failed copy failed reading the source rather than writing the destination: `EACCES`
-/// and `EPERM` are a source the parent's runtime may not read, and skip the file; `ENOSPC`, `EIO`
-/// and the rest stop the copy.
-fn is_read_side(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error().map(Errno::from_raw_os_error),
-        Some(Errno::ACCESS | Errno::PERM)
     )
+    .map_err(|error| match error {
+        CopyError::Ceiling { max_bytes, path } => SnapshotError::Ceiling { max_bytes, path },
+        CopyError::Io { path, source } | CopyError::Unreadable { path, source } => {
+            SnapshotError::Io { path, source }
+        }
+    })?;
+    Ok(WorkdirSnapshot {
+        source: source.path().display().to_string(),
+        files: copied.files,
+        dirs: copied.dirs,
+        symlinks: copied.symlinks,
+        repointed_symlinks: copied.repointed_symlinks,
+        bytes: copied.bytes,
+        skipped_count: copied.skipped_count,
+        skipped: copied.skipped,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{File, Permissions};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::{symlink, MetadataExt};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     struct Fixture {

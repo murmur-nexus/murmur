@@ -83,6 +83,9 @@ pub(crate) struct TraceWriter {
     /// [`Self::set_instruction_files`] before `session_start` is written; `None` until then and
     /// for a capsule without the key.
     instruction_files: Option<Vec<crate::instruction_files::InstructionFileRecord>>,
+    /// What staging did with the build cache. Set by [`Self::set_build_cache`] before
+    /// `session_start` is written; `None` until then and when no entry matched.
+    build_cache: Option<crate::build_cache::BuildCacheReport>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -440,6 +443,10 @@ struct SessionStartEvent {
     /// `error` on an `unreadable` one. `null` for a capsule without the key, `[]` for an empty
     /// list. Always written.
     instruction_files: Option<Vec<crate::instruction_files::InstructionFileRecord>>,
+    /// What staging did with the build cache entry matching the work folder's `Cargo.lock`
+    /// ([`crate::build_cache::BuildCacheReport`]), or `null` when no entry matched. A provision,
+    /// not a grant, so it sits beside `effective_grants` rather than in it. Always written.
+    build_cache: Option<crate::build_cache::BuildCacheReport>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -2994,6 +3001,7 @@ impl TraceWriter {
             runtime_artifacts: Vec::new(),
             host_facts: Vec::new(),
             instruction_files: None,
+            build_cache: None,
             resumed_from,
             context_id,
             spawned_by,
@@ -3219,6 +3227,15 @@ impl TraceWriter {
             files.map(crate::instruction_files::InstructionFiles::trace_records);
     }
 
+    /// Records what staging did with the build cache for `session_start.build_cache`; `None`
+    /// writes `null`.
+    pub(crate) fn set_build_cache(
+        &mut self,
+        build_cache: Option<crate::build_cache::BuildCacheReport>,
+    ) {
+        self.build_cache = build_cache;
+    }
+
     /// Records `inference.tool_refresh` for `session_start.tool_refresh`: the wire name under
     /// `transport: http`, `None` under `transport: process`.
     pub(crate) fn set_tool_refresh(&mut self, tool_refresh: Option<&'static str>) {
@@ -3300,6 +3317,7 @@ impl TraceWriter {
             runtime_artifacts: self.runtime_artifacts.clone(),
             host_facts: self.host_facts.clone(),
             instruction_files: self.instruction_files.clone(),
+            build_cache: self.build_cache.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),

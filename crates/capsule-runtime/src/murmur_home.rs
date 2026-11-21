@@ -33,26 +33,32 @@ const WIDE_DESCENDANT_CAP: usize = 20;
 /// directory cannot be created or its mode set. Each caller wraps the reason in its own error
 /// type.
 pub fn ensure_murmur_home() -> Result<PathBuf, String> {
+    let home = crate::state_store::murmur_home_dir()?;
+    ensure_murmur_home_at(&home)?;
+    Ok(home)
+}
+
+/// [`ensure_murmur_home`] for a murmur home its caller already resolved.
+pub fn ensure_murmur_home_at(home: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = crate::state_store::murmur_home_dir()?;
     let located = |reason: String| format!("{}: {reason}", home.display());
-    match std::fs::metadata(&home) {
+    match std::fs::metadata(home) {
         Ok(metadata) if !metadata.is_dir() => return Err(located("not a directory".to_string())),
         Ok(metadata) => {
             let mode = metadata.permissions().mode() & 0o777;
             let narrowed = mode & MURMUR_HOME_DIR_MODE;
             if narrowed != mode {
-                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(narrowed))
+                std::fs::set_permissions(home, std::fs::Permissions::from_mode(narrowed))
                     .map_err(|err| located(format!("failed to set mode {narrowed:04o}: {err}")))?;
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            hold_private_dir(&home).map_err(located)?;
+            hold_private_dir(home).map_err(located)?;
         }
         Err(err) => return Err(located(err.to_string())),
     }
-    Ok(home)
+    Ok(())
 }
 
 /// Create `path` if missing and hold it at [`MURMUR_HOME_DIR_MODE`]. Only `path` itself gets the
@@ -335,13 +341,14 @@ pub enum HomeEntryKind {
     Records,
     Programs,
     Keys,
+    BuildCache,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 17] = [
+    const KNOWN: [HomeEntryKind; 18] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -359,6 +366,7 @@ impl HomeEntryKind {
         Self::Records,
         Self::Programs,
         Self::Keys,
+        Self::BuildCache,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -382,6 +390,7 @@ impl HomeEntryKind {
             Self::Records => crate::records_dir::RECORDS_DIR_NAME,
             Self::Programs => crate::pinned_programs::PROGRAMS_DIR,
             Self::Keys => crate::record_seal::KEYS_DIR,
+            Self::BuildCache => crate::build_cache::BUILD_CACHE_DIR,
             Self::Unrecognised(name) => name,
         })
     }
@@ -407,6 +416,7 @@ impl HomeEntryKind {
             Self::Records => "every session's trace, logs, eval scores and delegation outcome",
             Self::Programs => "pinned program downloads",
             Self::Keys => "the record-seal key",
+            Self::BuildCache => "imported Cargo build caches",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -448,10 +458,10 @@ impl HomeEntryKind {
     }
 
     /// The widest mode a regular file beneath the entry may have: [`PRIVATE_FILE_MODE`], or
-    /// `0700` under `programs/`, whose unpacked downloads keep their owner execute bit.
+    /// `0700` under `programs/` and `build-cache/`, whose files keep their owner execute bit.
     pub fn allowed_file_mode(&self) -> u32 {
         match self {
-            Self::Programs => crate::pinned_programs::EXECUTABLE_FILE_MODE,
+            Self::Programs | Self::BuildCache => crate::pinned_programs::EXECUTABLE_FILE_MODE,
             // `record-seal.pub` is world-readable by design; the seed beside it is refused by
             // every launch at any group or other bit ([`crate::record_seal::HostKey`]).
             Self::Keys => crate::record_seal::PUBLIC_KEY_MODE,
@@ -971,7 +981,7 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 18);
+        assert_eq!(reports.len(), 19);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
@@ -985,9 +995,78 @@ mod tests {
         assert_eq!(reports[16].path, home.join("programs"));
         assert_eq!(reports[17].kind, HomeEntryKind::Keys);
         assert_eq!(reports[17].path, home.join("keys"));
+        assert_eq!(reports[18].kind, HomeEntryKind::BuildCache);
+        assert_eq!(reports[18].path, home.join("build-cache"));
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
+    }
+
+    /// `build-cache/` holds imported Cargo build caches, is kept until removed by hand, and an
+    /// entry as `mur build-cache add` writes it — `0700` directories and executables, `0600`
+    /// files — is not wide; a group-readable file under it is.
+    #[test]
+    fn murmur_home_build_cache_entry_names_the_store_and_allows_owner_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(HomeEntryKind::BuildCache.file_name(), Some("build-cache"));
+        assert_eq!(
+            HomeEntryKind::BuildCache.holds(),
+            "imported Cargo build caches"
+        );
+        assert_eq!(HomeEntryKind::BuildCache.kept(), None);
+        assert!(HomeEntryKind::BuildCache.expected_private());
+        assert!(!HomeEntryKind::BuildCache.safe_to_delete());
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".murmur");
+        let target = home.join("build-cache").join("ab12").join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        for dir in [
+            home.clone(),
+            home.join("build-cache"),
+            home.join("build-cache/ab12"),
+            target.clone(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let build_script = target.join("build-script-build");
+        std::fs::write(&build_script, b"x").unwrap();
+        std::fs::set_permissions(&build_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rlib = target.join("libdep_a.rlib");
+        std::fs::write(&rlib, b"x").unwrap();
+        std::fs::set_permissions(&rlib, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let report = |reports: Vec<HomeEntryReport>| {
+            reports
+                .into_iter()
+                .find(|report| report.kind == HomeEntryKind::BuildCache)
+                .unwrap()
+        };
+        match report(audit_murmur_home(&home)).state {
+            HomeEntryState::Present {
+                wide,
+                wide_descendants,
+                ..
+            } => {
+                assert!(!wide);
+                assert!(wide_descendants.is_empty(), "{wide_descendants:?}");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        std::fs::set_permissions(&rlib, std::fs::Permissions::from_mode(0o640)).unwrap();
+        match report(audit_murmur_home(&home)).state {
+            HomeEntryState::Present {
+                wide_descendants, ..
+            } => assert_eq!(
+                wide_descendants
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>(),
+                vec![rlib]
+            ),
+            other => panic!("unexpected state: {other:?}"),
+        }
     }
 
     /// `programs/` holds pinned program downloads, is kept until removed by hand, and its
