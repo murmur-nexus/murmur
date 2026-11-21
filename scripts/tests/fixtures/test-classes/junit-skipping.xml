@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="capsule-runtime">
+    <testcase name="sandbox::linux_integration_tests::kernel_full_denies_filesystem_access_outside_workdir" classname="capsule-runtime" timestamp="2026-11-10T21:44:09.369+00:00" time="0.016">
+      <system-out>
+running 1 test
+test sandbox::linux_integration_tests::kernel_full_denies_filesystem_access_outside_workdir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3169 filtered out; finished in 0.01s
+
+</system-out>
+      <system-err>skipping kernel_full_denies_filesystem_access_outside_workdir: requires EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected KernelSealed instead
+</system-err>
+    </testcase>
+  </testsuite>
+</testsuites>

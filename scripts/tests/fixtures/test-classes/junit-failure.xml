@@ -1,0 +1,286 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="murmur-cli::doctor_interface_versions">
+    <testcase name="a_declared_stale_artifact_is_an_error" classname="murmur-cli::doctor_interface_versions" timestamp="2026-11-20T20:39:50.688-05:00" time="2.168">
+      <failure message="thread 'a_declared_stale_artifact_is_an_error' (3400642) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5" type="test failure with exit code 101">thread 'a_declared_stale_artifact_is_an_error' (3400642) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security m
+</failure>
+      <rerunFailure timestamp="2026-11-20T20:39:52.858-05:00" time="2.119" message="thread 'a_declared_stale_artifact_is_an_error' (3400873) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5" type="test failure with exit code 101">thread 'a_declared_stale_artifact_is_an_error' (3400873) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+door: public (no network.authentication)
+AppArmor / user namespaces
+  this binary:  /work/murmur/target/debug/mur
+  profile attached: none (the kernel reports this binary as unconfined)
+  userns grant: restriction_disabled_host_wide
+    kernel.apparmor_restrict_unprivileged_userns is off, so unprivileged user namespaces are unrestricted for every binary on this host, not just for mur
+  network namespace: refused — unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM
+  mount namespace: not attempted (no network namespace to create it in)
+  sealed root: not attempted (no network namespace to create it in)
+  private proc: not attempted (no network namespace to create it in)
+  /etc/apparmor.d/mur-sealed: matches the profile this build ships
+
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+Murmur home (/tmp/.tmpR3YNQ7/.murmur)
+  .: 0775  the murmur home, expected owner-only
+  config.yaml: absent  provider credentials, expected owner-only
+  deploy_keys: absent  SSH private keys, expected owner-only
+  deploy_staging: absent  deployment staging copies, expected owner-only
+  deployments.json: absent  deployment records, expected owner-only
+  spend: absent  the machine spend ledger, expected owner-only
+  conversations: absent  conversation records, expected owner-only
+  running: absent  running-capsule records, expected owner-only
+  state: absent  capsule state stores, expected owner-only
+  artifacts: 0775  installed artifacts
+  compiled: absent  compiled WASM cache, safe to delete, expected owner-only
+  host_facts: absent  facts about allowlisted host binaries, safe to delete, expected owner-only
+  bin: absent  cached mur binaries
+  formations: absent  formation members' working directories, each kept until its formation has ended and the entry member's trace.retain expires it, expected owner-only
+  sessions: absent  running sessions' runtime directories, each removed when its session ends, and by the next launch when a session ended without removing its own, expected owner-only
+  records: absent  every session's trace, logs, eval scores and delegation outcome, each kept after its session ends, until its capsule's trace.retain expires it, expected owner-only
+  programs: absent  pinned program downloads, expected owner-only
+  keys: absent  the record-seal key, expected owner-only
+
+Filesystem preopens
+  - local/stale-hook (hook): nothing preopened — no capabilities.filesystem.scope declared
+
+Routes
+  shell commands    absent   landlock+seccomp
+  plan shell steps  absent   landlock+seccomp
+  WASM tools        absent   landlock+seccomp
+  drivers           absent   landlock+seccomp
+  hooks             present  landlock+seccomp (local/stale-hook)
+  process harness   absent   landlock+seccomp
+  harness tools     absent   landlock+seccomp
+
+Read-only paths
+  read_only: &lt;none&gt;
+
+Install grant
+  install skill: &lt;none&gt;
+  install tool: &lt;none&gt;
+
+Memory bound
+  cgroup_memory_bytes: 4294967296
+  memory.max 4294967296
+  memory.swap.max 0
+
+WIT level
+  this mur serves WIT level 8:
+    PACKAGE                  VERSION
+    murmur:artifact-manager  0.1.0
+    murmur:bus               0.1.0
+    murmur:capsule           0.1.0
+    murmur:conversation      0.2.0
+    murmur:driver            0.6.0
+    murmur:hook              0.9.0
+    murmur:host              0.1.0
+    murmur:message           0.1.0
+    murmur:process           0.2.0
+    murmur:runtime           0.4.0
+    murmur:runtime-guest     0.1.0
+    murmur:shell             0.1.0
+    murmur:stream            0.1.0
+    murmur:task              0.1.0
+    murmur:task-io           0.1.0
+    murmur:tool              0.2.0
+    murmur:tool-registry     0.2.0
+
+  installed:
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 8
+  ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
+
+Checking /tmp/.tmpa2XB1y/murmur.yaml...
+  ✗  local/stale-hook@0.3.0   — built against murmur:hook/lifecycle@0.8.0, this mur serves murmur:hook@0.9.0 (+1 more)
+
+Cgroup scope
+  cgroup scope: unavailable (EBUSY) — could not enable controllers [memory, pids, cpu, io] in /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-u185852.service/cgroup.subtree_control (Device or resource busy (os error 16)); the unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io
+  refused: `mur run` refuses this capsule here with E-RUN-012, because it can run a subprocess and no cgroup scope can be created to bound it
+
+
+Runtime directory
+  path:      /tmp/.tmpR3YNQ7/.murmur/sessions/&lt;session-id&gt;/runtime
+  commands:  read only (landlock)
+
+Records directory
+  path:      /tmp/.tmpR3YNQ7/.murmur/records/tmp/.tmpa2XB1y/workdir/&lt;session-id&gt;
+  commands:  read only (landlock)
+
+Temporary folder
+  path:      /tmp/.tmpR3YNQ7/.murmur/records/tmp/.tmpa2XB1y/workdir/&lt;session-id&gt;/tmp
+  TMPDIR:    /tmp/.tmpR3YNQ7/.murmur/records/tmp/.tmpa2XB1y/workdir/&lt;session-id&gt;/tmp
+  /tmp:      not mapped — this host cannot give capsule commands a private mount namespace, so a literal /tmp path is refused; TMPDIR names the session's temporary folder
+
+Process view
+  /proc:     host — this host cannot mount a private /proc in the session's PID namespace (unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM), so commands keep the host's /proc, and on scoped and sealed every open beneath it is refused
+
+Host paths
+  &lt;none&gt;
+
+0 checks passed, 3 errors found.
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security module's policy. Inside a container, the container runtime's seccomp profile is the usual blocker: it refuses unshare(CLONE_NEWUSER) and setns whatever capabilities the container holds. Run the container with a seccomp profile that permits them (Docker: `--security-opt seccomp=&lt;file&gt;`; Kubernetes: `seccompProfile: Localhost`), or create the network namespace outside the container and run mur inside it. Host readings: kernel.apparmor_restrict_unprivileged_userns=0; AppArmor profile confining mur: unconfined.
+
+Fix: make this host able to create the capsule's network namespace — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-005
+Fix: local/stale-hook: pin a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0 in murmur.yaml, then run mur install
+Fix: give `mur` a delegated cgroup v2 scope: run it under a systemd user unit with `Delegate=yes` for memory, pids, cpu and io (for example `systemd-run --user --scope -p Delegate=yes mur run`), or `mur run` refuses this capsule with E-RUN-012 — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test a_declared_stale_artifact_is_an_error ... FAILED
+
+failures:
+
+</system-out>
+        <system-err>thread 'a_declared_stale_artifact_is_an_error' (3400873) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security m
+</system-err>
+      </rerunFailure>
+      <rerunFailure timestamp="2026-11-20T20:39:54.977-05:00" time="2.072" message="thread 'a_declared_stale_artifact_is_an_error' (3400947) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5" type="test failure with exit code 101">thread 'a_declared_stale_artifact_is_an_error' (3400947) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+door: public (no network.authentication)
+AppArmor / user namespaces
+  this binary:  /work/murmur/target/debug/mur
+  profile attached: none (the kernel reports this binary as unconfined)
+  userns grant: restriction_disabled_host_wide
+    kernel.apparmor_restrict_unprivileged_userns is off, so unprivileged user namespaces are unrestricted for every binary on this host, not just for mur
+  network namespace: refused — unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM
+  mount namespace: not attempted (no network namespace to create it in)
+  sealed root: not attempted (no network namespace to create it in)
+  private proc: not attempted (no network namespace to create it in)
+  /etc/apparmor.d/mur-sealed: matches the profile this build ships
+
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+Murmur home (/tmp/.tmpEPEaeB/.murmur)
+  .: 0775  the murmur home, expected owner-only
+  config.yaml: absent  provider credentials, expected owner-only
+  deploy_keys: absent  SSH private keys, expected owner-only
+  deploy_staging: absent  deployment staging copies, expected owner-only
+  deployments.json: absent  deployment records, expected owner-only
+  spend: absent  the machine spend ledger, expected owner-only
+  conversations: absent  conversation records, expected owner-only
+  running: absent  running-capsule records, expected owner-only
+  state: absent  capsule state stores, expected owner-only
+  artifacts: 0775  installed artifacts
+  compiled: absent  compiled WASM cache, safe to delete, expected owner-only
+  host_facts: absent  facts about allowlisted host binaries, safe to delete, expected owner-only
+  bin: absent  cached mur binaries
+  formations: absent  formation members' working directories, each kept until its formation has ended and the entry member's trace.retain expires it, expected owner-only
+  sessions: absent  running sessions' runtime directories, each removed when its session ends, and by the next launch when a session ended without removing its own, expected owner-only
+  records: absent  every session's trace, logs, eval scores and delegation outcome, each kept after its session ends, until its capsule's trace.retain expires it, expected owner-only
+  programs: absent  pinned program downloads, expected owner-only
+  keys: absent  the record-seal key, expected owner-only
+
+Filesystem preopens
+  - local/stale-hook (hook): nothing preopened — no capabilities.filesystem.scope declared
+
+Routes
+  shell commands    absent   landlock+seccomp
+  plan shell steps  absent   landlock+seccomp
+  WASM tools        absent   landlock+seccomp
+  drivers           absent   landlock+seccomp
+  hooks             present  landlock+seccomp (local/stale-hook)
+  process harness   absent   landlock+seccomp
+  harness tools     absent   landlock+seccomp
+
+Read-only paths
+  read_only: &lt;none&gt;
+
+Install grant
+  install skill: &lt;none&gt;
+  install tool: &lt;none&gt;
+
+Memory bound
+  cgroup_memory_bytes: 4294967296
+  memory.max 4294967296
+  memory.swap.max 0
+
+WIT level
+  this mur serves WIT level 8:
+    PACKAGE                  VERSION
+    murmur:artifact-manager  0.1.0
+    murmur:bus               0.1.0
+    murmur:capsule           0.1.0
+    murmur:conversation      0.2.0
+    murmur:driver            0.6.0
+    murmur:hook              0.9.0
+    murmur:host              0.1.0
+    murmur:message           0.1.0
+    murmur:process           0.2.0
+    murmur:runtime           0.4.0
+    murmur:runtime-guest     0.1.0
+    murmur:shell             0.1.0
+    murmur:stream            0.1.0
+    murmur:task              0.1.0
+    murmur:task-io           0.1.0
+    murmur:tool              0.2.0
+    murmur:tool-registry     0.2.0
+
+  installed:
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 8
+  ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
+
+Checking /tmp/.tmpirm9rq/murmur.yaml...
+  ✗  local/stale-hook@0.3.0   — built against murmur:hook/lifecycle@0.8.0, this mur serves murmur:hook@0.9.0 (+1 more)
+
+Cgroup scope
+  cgroup scope: unavailable (EBUSY) — could not enable controllers [memory, pids, cpu, io] in /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-u185852.service/cgroup.subtree_control (Device or resource busy (os error 16)); the unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io
+  refused: `mur run` refuses this capsule here with E-RUN-012, because it can run a subprocess and no cgroup scope can be created to bound it
+
+
+Runtime directory
+  path:      /tmp/.tmpEPEaeB/.murmur/sessions/&lt;session-id&gt;/runtime
+  commands:  read only (landlock)
+
+Records directory
+  path:      /tmp/.tmpEPEaeB/.murmur/records/tmp/.tmpirm9rq/workdir/&lt;session-id&gt;
+  commands:  read only (landlock)
+
+Temporary folder
+  path:      /tmp/.tmpEPEaeB/.murmur/records/tmp/.tmpirm9rq/workdir/&lt;session-id&gt;/tmp
+  TMPDIR:    /tmp/.tmpEPEaeB/.murmur/records/tmp/.tmpirm9rq/workdir/&lt;session-id&gt;/tmp
+  /tmp:      not mapped — this host cannot give capsule commands a private mount namespace, so a literal /tmp path is refused; TMPDIR names the session's temporary folder
+
+Process view
+  /proc:     host — this host cannot mount a private /proc in the session's PID namespace (unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM), so commands keep the host's /proc, and on scoped and sealed every open beneath it is refused
+
+Host paths
+  &lt;none&gt;
+
+0 checks passed, 3 errors found.
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security module's policy. Inside a container, the container runtime's seccomp profile is the usual blocker: it refuses unshare(CLONE_NEWUSER) and setns whatever capabilities the container holds. Run the container with a seccomp profile that permits them (Docker: `--security-opt seccomp=&lt;file&gt;`; Kubernetes: `seccompProfile: Localhost`), or create the network namespace outside the container and run mur inside it. Host readings: kernel.apparmor_restrict_unprivileged_userns=0; AppArmor profile confining mur: unconfined.
+
+Fix: make this host able to create the capsule's network namespace — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-005
+Fix: local/stale-hook: pin a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0 in murmur.yaml, then run mur install
+Fix: give `mur` a delegated cgroup v2 scope: run it under a systemd user unit with `Delegate=yes` for memory, pids, cpu and io (for example `systemd-run --user --scope -p Delegate=yes mur run`), or `mur run` refuses this capsule with E-RUN-012 — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test a_declared_stale_artifact_is_an_error ... FAILED
+
+failures:
+
+</system-out>
+        <system-err>thread 'a_declared_stale_artifact_is_an_error' (3400947) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security m
+</system-err>
+      </rerunFailure>
+      <system-out>
+running 1 test
+test a_declared_stale_artifact_is_an_error ... FAILED
+
+failures:
+
+</system-out>
+      <system-err>thread 'a_declared_stale_artifact_is_an_error' (3400642) panicked at crates/murmur-cli/tests/doctor_interface_versions.rs:326:5:
+First refusal: error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host — a container runtime's seccomp profile, or another security m
+</system-err>
+    </testcase>
+  </testsuite>
+</testsuites>

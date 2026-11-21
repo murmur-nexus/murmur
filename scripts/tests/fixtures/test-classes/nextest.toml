@@ -1,0 +1,18 @@
+# Class profiles for the unit tests: the fixture listing's binaries, sorted as test_test_classes.py expects.
+[profile.ci]
+retries = 2
+
+[profile.class-capsule]
+inherits = "ci"
+default-filter = """
+binary_id(murmur-artifact)
+| binary_id(mur-roost::version_output)
+"""
+
+[profile.class-isolation]
+inherits = "ci"
+default-filter = "binary_id(murmur-cli::guest_workers) | binary_id(murmur-cli::deploy_precompile)"
+
+[profile.class-host]
+inherits = "ci"
+default-filter = "binary_id(murmur-cli::browser_in_capsule)"

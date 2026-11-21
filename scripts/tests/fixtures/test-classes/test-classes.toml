@@ -1,0 +1,24 @@
+format = "murmur.test-class-rules/1"
+
+[classes.capsule]
+needs = "nothing a capsule withholds"
+checked_by = "the capsule-shaped construction"
+
+[classes.isolation]
+needs = "kernel isolation"
+checked_by = "the prepared host"
+
+[classes.host]
+needs = "the host"
+checked_by = "the host"
+
+[kinds]
+e2e = "binary_id(mur-roost::version_output) | binary_id(murmur-cli::guest_workers) | binary_id(murmur-cli::deploy_precompile)"
+
+[[configuration]]
+name = "beta-all"
+args = ["--workspace", "--features", "beta-all"]
+
+[[configuration]]
+name = "default"
+args = ["-p", "murmur-cli", "--test", "new_roster"]

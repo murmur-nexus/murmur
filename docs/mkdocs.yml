@@ -202,3 +202,4 @@ nav:
   - Contributing:
       - Overview: contributing/index.md
       - Isolation tests on a board: contributing/isolation-tests.md
+      - Test Classes: contributing/test-classes.md

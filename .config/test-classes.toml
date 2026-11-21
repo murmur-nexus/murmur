@@ -1,0 +1,81 @@
+# What each test class needs, the `e2e` kind, and the nextest configurations the test list covers.
+# Read by scripts/test-classes.py; documented in docs/content/contributing/test-classes.md.
+#
+# The class rules themselves are the `default-filter` of the `class-capsule`, `class-isolation`
+# and `class-host` profiles in .config/nextest.toml, so `cargo nextest run --profile class-<C>`
+# runs one class with plain nextest. The list they produce is .config/test-classes.tsv, written
+# only by `python3 -I scripts/test-classes.py generate`.
+#
+# Left out of the list: the 4 tests compiled only with `race-windows`, a feature scripts/test.sh
+# turns on and CI does not. Building them rebuilds capsule-runtime and everything above it. Their
+# binaries' rules (class-isolation) still classify them when they are built:
+#   murmur-cli::keep_working
+#     a_task_that_finishes_inside_the_deadlines_termination_still_ends_deadline_reached
+#   murmur-cli::formation_lifeline
+#     a_task_cancelled_inside_the_formations_termination_still_ends_formation_ended
+#   murmur-cli::workdir_breach_window (the whole binary; it lists no test without the feature)
+#     a_breach_the_poll_never_saw_still_ends_the_session_with_the_ceiling_error
+#     a_session_under_its_ceiling_still_ends_ok_with_the_poll_held
+
+format = "murmur.test-class-rules/1"
+
+[classes.capsule]
+needs = """\
+Nothing a contained Murmur capsule withholds from its commands: it creates no namespace, writes \
+no cgroup, binds no AF_UNIX socket file, reaches no systemd user manager, needs no network \
+beyond loopback and no real $HOME."""
+checked_by = """\
+Run under the capsule-shaped construction (systemd-run --user with RestrictNamespaces=yes, \
+NoNewPrivileges=yes, PrivateNetwork=yes, an empty HOME and XDG_RUNTIME_DIR, no session bus, no \
+Delegate=yes), then `test-classes.py audit <junit.xml> --class capsule`: every test passes and \
+none prints a host-skip line."""
+
+[classes.isolation]
+needs = """\
+Kernel isolation an unprivileged user gets on a host prepared like CI's `contained` job: user, \
+mount, network or pid namespaces, a Landlock or seccomp assertion, a delegated cgroup scope, or \
+a real contained `mur run` launch. Nothing else from the host."""
+checked_by = """\
+Run on the prepared host inside `systemd-run --user --scope -p Delegate=yes -p TasksMax=infinity`, \
+as CI's `contained` job runs the suite, failing on any host-skip line."""
+
+[classes.host]
+needs = """\
+What a prepared host does not hand an unprivileged test process: root or sudo, a sysctl or \
+AppArmor change, a program installed outside the repo and the Rust toolchain (a browser, node), \
+internet egress or a provider key, the operator's real home or installed tools, or a property of \
+one machine."""
+checked_by = "Run on the host, in the same delegated scope as `isolation`."
+
+[kinds]
+# `unit` is every lib, bin and proc-macro test target, and `integration` every integration-test
+# binary this filterset does not select. `e2e` is an integration-test binary that runs the shipped
+# `mur` or `mur-roost`. murmur-cli has no lib target, so its integration tests reach its code only
+# through `mur`: every murmur-cli test binary is `e2e` except the four below, which run a script or
+# stage a session in process. `test-classes.py scan` reports `runs_mur` per binary.
+e2e = """
+kind(test) & (
+  (package(murmur-cli)
+    - binary_id(murmur-cli::dev_version_script)
+    - binary_id(murmur-cli::host_probe_staging)
+    - binary_id(murmur-cli::install_script)
+    - binary_id(murmur-cli::shell_desc_driver))
+  | binary_id(mur-roost::delegation_bounds)
+  | binary_id(mur-roost::machine_ceiling)
+  | binary_id(mur-roost::restart_census)
+  | binary_id(mur-roost::version_output)
+)
+"""
+
+# The nextest invocations the list covers, in order: a test listed by both takes the first one's
+# name in the list's `config` column.
+[[configuration]]
+# CI's workspace run.
+name = "beta-all"
+args = ["--workspace", "--features", "beta-all"]
+
+[[configuration]]
+# CI's featureless step. `new_roster`'s `the_default_build_has_only_the_roster_form` is compiled
+# only without `beta-mur-new`.
+name = "default"
+args = ["-p", "murmur-cli", "--test", "new_roster"]

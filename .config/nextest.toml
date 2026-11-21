@@ -76,3 +76,249 @@ failure-output = "immediate-final"
 # no evidence rather than a pass.
 path = "junit.xml"
 store-success-output = true
+
+# --- Test classes ---------------------------------------------------------------------------
+# Every test is in exactly one class, by where it can run (docs/content/contributing/test-classes.md):
+#
+#   class-capsule    a true result as a command inside a contained Murmur capsule
+#   class-isolation  needs kernel isolation an unprivileged user gets on a host prepared like CI's
+#                    `contained` job: namespaces, Landlock, seccomp, a delegated cgroup, a real
+#                    contained `mur run`
+#   class-host       needs the host itself: root, a sysctl or AppArmor change, a browser, egress,
+#                    the real home
+#
+# `cargo nextest run --profile class-<C>` runs one class; `-p` and `-E` on the command line are
+# intersected with the profile's `default-filter`. Each profile inherits `ci` (retries,
+# slow-timeout, JUnit with passing output) and writes its report to
+# target/nextest/class-<C>/junit.xml, so `ci`'s target/nextest/ci/junit.xml is never replaced.
+#
+# A rule names a test binary. A binary that mixes classes is split by test-name terms only when
+# it is large; otherwise it sits whole in the higher class. A new test binary needs a rule here:
+# `python3 -I scripts/test-classes.py check`, which CI runs, names any test no profile selects
+# or two profiles select. The list these rules produce is .config/test-classes.tsv, written by
+# `python3 -I scripts/test-classes.py generate`.
+
+[profile.class-capsule]
+inherits = "ci"
+default-filter = """
+(binary_id(capsule-runtime)
+  & not test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/))
+| binary_id(capsule-runtime::child_signal_disposition)
+| binary_id(capsule-runtime::closed_stdout)
+| binary_id(committed-components)
+| binary_id(committed-components::committed_components)
+| binary_id(murmur-artifact)
+| binary_id(murmur-artifact::docs_links)
+| binary_id(mur-roost)
+| binary_id(mur-roost::bin/mur-roost)
+| binary_id(mur-roost::delegation_bounds)
+| binary_id(mur-roost::machine_ceiling)
+| binary_id(mur-roost::permission)
+| binary_id(mur-roost::registration)
+| binary_id(mur-roost::restart_census)
+| binary_id(mur-roost::spawn_binding)
+| binary_id(mur-roost::spawn_envelope)
+| binary_id(mur-roost::version_output)
+| (binary_id(murmur-cli::bin/mur)
+    & not test(/^(commands::doctor|commands::ps|error)::/))
+| binary_id(murmur-cli::build)
+| binary_id(murmur-cli::closed_output)
+| binary_id(murmur-cli::dev_version_script)
+| binary_id(murmur-cli::eval_cmd)
+| binary_id(murmur-cli::formation_trace_tasks)
+| binary_id(murmur-cli::github_rate_limit)
+| binary_id(murmur-cli::host_probe_staging)
+| binary_id(murmur-cli::index_cmd)
+| binary_id(murmur-cli::install_grant)
+| binary_id(murmur-cli::install_lock)
+| binary_id(murmur-cli::install_script)
+| binary_id(murmur-cli::list_cmd)
+| binary_id(murmur-cli::publish_install)
+| binary_id(murmur-cli::read_only_scope)
+| binary_id(murmur-cli::session_address_any_folder)
+| binary_id(murmur-cli::topology_cmd)
+| binary_id(murmur-cli::trace_cmd)
+| binary_id(murmur-cli::version_cmd)
+| binary_id(murmur-cli::wit_contracts)
+"""
+
+[profile.class-capsule.junit]
+path = "junit.xml"
+
+[profile.class-isolation]
+inherits = "ci"
+default-filter = """
+(binary_id(capsule-runtime)
+  & test(/^(agent|artifact|cgroup|containment|detached|errors|guest_worker|host_paths|interpreter_runtime|namespace_probe|network_namespace|plan|race|resources|runtime|sandbox|sealed|session_process|shell|staged_runtime|temp_dir|trace|workdir_writes)::/))
+| binary_id(capsule-runtime::child_launch)
+| binary_id(capsule-runtime::completion_path)
+| binary_id(capsule-runtime::host_probe)
+| binary_id(capsule-runtime::plan_execution)
+| binary_id(escape-conformance)
+| (binary_id(murmur-cli::bin/mur)
+    & test(/^(commands::doctor|commands::ps|error)::/))
+| (
+      binary_id(murmur-cli::a2a)
+    | binary_id(murmur-cli::a2a_v1_door)
+    | binary_id(murmur-cli::a2a_v1_method_table)
+    | binary_id(murmur-cli::a2a_v1_stream)
+    | binary_id(murmur-cli::a2a_v1_tasks)
+    | binary_id(murmur-cli::a2a_wire_conformance)
+    | binary_id(murmur-cli::agent_pull)
+    | binary_id(murmur-cli::artifact_config)
+    | binary_id(murmur-cli::bootstrap)
+    | binary_id(murmur-cli::build_skill)
+    | binary_id(murmur-cli::busy_door)
+    | binary_id(murmur-cli::call_deadline)
+    | binary_id(murmur-cli::cancel)
+    | binary_id(murmur-cli::cgroup_scope_report)
+    | binary_id(murmur-cli::code_mode_bus)
+    | binary_id(murmur-cli::code_mode_e2e)
+    | binary_id(murmur-cli::code_mode)
+    | binary_id(murmur-cli::compaction_call_settings)
+    | binary_id(murmur-cli::compaction)
+    | binary_id(murmur-cli::compiled_forms)
+    | binary_id(murmur-cli::completion_lane)
+    | binary_id(murmur-cli::containment)
+    | binary_id(murmur-cli::continuation)
+    | binary_id(murmur-cli::control_surface)
+    | binary_id(murmur-cli::conversation)
+    | binary_id(murmur-cli::credential_gateway)
+    | binary_id(murmur-cli::declared_needs)
+    | binary_id(murmur-cli::delegation)
+    | binary_id(murmur-cli::deny)
+    | binary_id(murmur-cli::deploy_cmd)
+    | binary_id(murmur-cli::deploy_precompile)
+    | binary_id(murmur-cli::doctor_cmd)
+    | binary_id(murmur-cli::doctor_interface_versions)
+    | binary_id(murmur-cli::doctor_json)
+    | binary_id(murmur-cli::doctor_memory_bound)
+    | binary_id(murmur-cli::done_check)
+    | binary_id(murmur-cli::door_auth)
+    | binary_id(murmur-cli::door_discovery)
+    | binary_id(murmur-cli::door_token)
+    | binary_id(murmur-cli::driver_switch)
+    | binary_id(murmur-cli::egress_namespace_probe)
+    | binary_id(murmur-cli::env_allow_stripped)
+    | binary_id(murmur-cli::eval_variant)
+    | binary_id(murmur-cli::event_id_cursor)
+    | binary_id(murmur-cli::formation_calls)
+    | binary_id(murmur-cli::formation_channel)
+    | binary_id(murmur-cli::formation_credentials)
+    | binary_id(murmur-cli::formation_launch)
+    | binary_id(murmur-cli::formation_lifeline)
+    | binary_id(murmur-cli::formation_retention)
+    | binary_id(murmur-cli::graduation)
+    | binary_id(murmur-cli::guest_workers)
+    | binary_id(murmur-cli::host_paths)
+    | binary_id(murmur-cli::identity)
+    | binary_id(murmur-cli::images)
+    | binary_id(murmur-cli::inference_credential_rotation)
+    | binary_id(murmur-cli::inference_gateway)
+    | binary_id(murmur-cli::inference_retry)
+    | binary_id(murmur-cli::input_required)
+    | binary_id(murmur-cli::install_attestation)
+    | binary_id(murmur-cli::install_default_source)
+    | binary_id(murmur-cli::installed_manifest_files)
+    | binary_id(murmur-cli::instruction_files)
+    | binary_id(murmur-cli::json_launch)
+    | binary_id(murmur-cli::keep_working)
+    | binary_id(murmur-cli::launch_task)
+    | binary_id(murmur-cli::lifecycle)
+    | binary_id(murmur-cli::limits)
+    | binary_id(murmur-cli::model_limits)
+    | binary_id(murmur-cli::murmur_md)
+    | binary_id(murmur-cli::native_refusal)
+    | binary_id(murmur-cli::new_roster)
+    | binary_id(murmur-cli::no_registry_service)
+    | binary_id(murmur-cli::output_cap)
+    | binary_id(murmur-cli::peer_handoff)
+    | binary_id(murmur-cli::peer_tasks)
+    | binary_id(murmur-cli::pinned_programs)
+    | binary_id(murmur-cli::plan_tool)
+    | binary_id(murmur-cli::precompile_cmd)
+    | binary_id(murmur-cli::preopens)
+    | binary_id(murmur-cli::process_a2a_parity)
+    | binary_id(murmur-cli::process_cancel)
+    | binary_id(murmur-cli::process_containment)
+    | binary_id(murmur-cli::process_driver)
+    | binary_id(murmur-cli::process_gate)
+    | binary_id(murmur-cli::process_images)
+    | binary_id(murmur-cli::process_runner)
+    | binary_id(murmur-cli::process_sessions)
+    | binary_id(murmur-cli::process_subscription_e2e)
+    | binary_id(murmur-cli::protected_paths)
+    | binary_id(murmur-cli::provider_tool)
+    | binary_id(murmur-cli::ps_stop)
+    | binary_id(murmur-cli::recipe)
+    | binary_id(murmur-cli::record_check)
+    | binary_id(murmur-cli::records_dir)
+    | binary_id(murmur-cli::record_seal)
+    | binary_id(murmur-cli::reopen_stream)
+    | binary_id(murmur-cli::required_fields)
+    | binary_id(murmur-cli::reserved_tool_names)
+    | binary_id(murmur-cli::resource_plane)
+    | binary_id(murmur-cli::resume)
+    | binary_id(murmur-cli::retention)
+    | binary_id(murmur-cli::roost_restart)
+    | binary_id(murmur-cli::roster)
+    | binary_id(murmur-cli::running_address)
+    | binary_id(murmur-cli::run)
+    | binary_id(murmur-cli::runtime_dir)
+    | binary_id(murmur-cli::runtime_origin)
+    | binary_id(murmur-cli::sandbox_exec_dumpable)
+    | binary_id(murmur-cli::scoped_names)
+    | binary_id(murmur-cli::sealed_and_io_max_reporting)
+    | binary_id(murmur-cli::search_cmd)
+    | binary_id(murmur-cli::secret_shaped_env)
+    | binary_id(murmur-cli::seed_context)
+    | binary_id(murmur-cli::session_network_namespace)
+    | binary_id(murmur-cli::session_processes)
+    | binary_id(murmur-cli::session_status)
+    | binary_id(murmur-cli::session_temp_folder)
+    | binary_id(murmur-cli::shell_desc_driver)
+    | binary_id(murmur-cli::shell)
+    | binary_id(murmur-cli::skill_local_source)
+    | binary_id(murmur-cli::source_resolution)
+    | binary_id(murmur-cli::spawner_lifeline_kill)
+    | binary_id(murmur-cli::spawner_lifeline)
+    | binary_id(murmur-cli::spawn_registration)
+    | binary_id(murmur-cli::spend_ceiling)
+    | binary_id(murmur-cli::state)
+    | binary_id(murmur-cli::streaming_protocol_doc)
+    | binary_id(murmur-cli::streaming)
+    | binary_id(murmur-cli::structured_schema)
+    | binary_id(murmur-cli::system_prompt)
+    | binary_id(murmur-cli::task_outcome)
+    | binary_id(murmur-cli::trace_attach)
+    | binary_id(murmur-cli::trace_capture)
+    | binary_id(murmur-cli::trace_export)
+    | binary_id(murmur-cli::trace_list)
+    | binary_id(murmur-cli::trace_rm)
+    | binary_id(murmur-cli::trace)
+    | binary_id(murmur-cli::truncated_turn)
+    | binary_id(murmur-cli::trust_store_scope)
+    | binary_id(murmur-cli::unknown_manifest_keys)
+    | binary_id(murmur-cli::untrusted_fence)
+    | binary_id(murmur-cli::usage_reporting)
+    | binary_id(murmur-cli::wasm_roots)
+    | binary_id(murmur-cli::watch_heartbeat)
+    | binary_id(murmur-cli::wit_level)
+    | binary_id(murmur-cli::workdir_breach_window)
+    | binary_id(murmur-cli::workdir_cap_scenario6)
+    | binary_id(murmur-cli::workdir_writes)
+  )
+"""
+
+[profile.class-isolation.junit]
+path = "junit.xml"
+
+[profile.class-host]
+inherits = "ci"
+default-filter = """
+binary_id(murmur-cli::browser_in_capsule)
+| binary_id(murmur-cli::unconfined)
+"""
+
+[profile.class-host.junit]
+path = "junit.xml"

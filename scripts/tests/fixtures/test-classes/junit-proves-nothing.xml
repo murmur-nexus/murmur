@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="nextest-run">
+  <testsuite name="capsule-runtime">
+    <testcase name="sandbox::linux_integration_tests::kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix" classname="capsule-runtime" timestamp="2026-11-10T21:44:09.385+00:00" time="0.016">
+      <system-out>
+running 1 test
+test sandbox::linux_integration_tests::kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3169 filtered out; finished in 0.01s
+
+</system-out>
+      <system-err>SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: kernel_full_denies_write_outside_workdir_... requires EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected KernelSealed. This run does NOT execute the Landlock code path, so a green result here is not evidence writes outside the workdir are actually denied — only a real KernelFull Linux host can prove that.
+</system-err>
+    </testcase>
+  </testsuite>
+</testsuites>
