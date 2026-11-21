@@ -5201,27 +5201,9 @@ mod tests {
         /// Policy fields deliberately absent from the scope report, each with the reason.
         const EXEMPT: &[(&str, &str)] = &[
             (
-                "shell_strip_env",
-                "Names host variables removed from the shell child's environment on top of the \
-                 credential patterns the runtime always strips. It subtracts from what the \
-                 capsule sees and can open nothing, so reporting it beside the grants would pad \
-                 the list an operator audits for reach.",
-            ),
-            (
-                "shell_baseline_env",
-                "The fixed variables the shell child starts with (PATH, HOME, …). It shapes the \
-                 environment of a subprocess the capsule was already granted, and names no host \
-                 resource `shell allow` and `env allow` do not already account for.",
-            ),
-            (
                 "limits",
                 "Execution ceilings for a WASM guest — memory, table elements, instance count, \
                  deadline. A bound on how much the capsule may consume, never a reach it gains.",
-            ),
-            (
-                "resources",
-                "The same, for subprocesses: rlimits, the Linux cgroup v2 scope and the \
-                 workdir size ceiling. A ceiling, not a grant, on exactly `limits`' terms.",
             ),
             (
                 "guest_workers",
@@ -5285,6 +5267,9 @@ mod tests {
             ("install_from_sources", "install_from"),
             ("containment_floor", "declared_containment"),
             ("declared_resources", "unconfined"),
+            ("resources", "resources"),
+            ("shell_baseline_env", "shell_env"),
+            ("shell_strip_env", "shell_env"),
         ];
 
         let declared = capability_policy_field_names(include_str!("types.rs"));

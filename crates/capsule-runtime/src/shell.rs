@@ -1446,6 +1446,10 @@ pub(crate) const SESSION_ENV: [&str; 7] = [
     crate::temp_dir::TEMP_DIR_ENV[2],
 ];
 
+// `SESSION_ENV` names the temporary-folder variables by index: a fourth name would be set by
+// `build_shell_env` yet never removed first, and missing from the report.
+const _: () = assert!(crate::temp_dir::TEMP_DIR_ENV.len() == 3);
+
 /// The names, never the values, a contained session's shell command starts with:
 /// `ScopeReport::shell_env`, the `Shell environment` block of `mur run --explain-scope`.
 ///

@@ -15,8 +15,8 @@ const PAGE: &str = "reference/capsule-limits.md";
 /// The rows every limit section's table holds, in this order.
 const LIMIT_ROWS: [&str; 5] = ["What fails", "Why", "Lifted by", "Shown by", "Doctor"];
 
-/// Anchors other pages and the scope report's readers link to; renaming one breaks every link
-/// into the page.
+/// Anchors the page keeps stable for links into it, from other docs pages and from outside the
+/// site; renaming one breaks those links.
 const REQUIRED_ANCHORS: [&str; 12] = [
     "doctor-causes",
     "no-network",
