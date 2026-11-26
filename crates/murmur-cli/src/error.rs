@@ -1738,6 +1738,24 @@ mod tests {
     }
 
     #[test]
+    fn e_io_003_names_the_session_lock() {
+        let reason = "/home/u/.murmur/sessions/ses_x/.lock: Resource temporarily unavailable \
+                      (os error 11) after 8 attempts";
+        let cli = CliError::from(RuntimeError::RuntimeDirUnavailable {
+            reason: reason.to_string(),
+        });
+        assert_eq!(cli.code, E_IO_003);
+        let rendered = cli.to_string();
+        assert!(
+            rendered.starts_with(&format!(
+                "error[E-IO-003]: failed to create the runtime directory: {reason}"
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("after 8 attempts"), "{rendered}");
+    }
+
+    #[test]
     fn e_run_066_names_the_kind_and_the_reason_and_links_its_entry() {
         let message = "the driver guest worker could not be started: it speaks guest-worker \
                        protocol 99 (mur 0.0.0), not 1";
