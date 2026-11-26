@@ -2029,7 +2029,7 @@ capsule as `MUR_EC_*` variables, declared in the generated manifest. It also sta
 probes aim at:
 
 - for `signal-sibling-capsule`, a second capsule at the same class, stopped once the case is graded;
-- for `signal-unrelated-same-user`, a `sleep 600` it kills once the case is graded.
+- for `signal-unrelated-same-user`, a `sleep` it kills once the case is graded.
 
 A target that is gone after the case grades `ALLOWED`, whatever the probe reported. On
 `process-harness`, `runtime-kill-record` then kills `mur` from the host, and the case passes only

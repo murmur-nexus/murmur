@@ -412,7 +412,11 @@ def main():
 
 /// The sibling capsule a [`HostChannel::SiblingCapsule`] case signals: a shell-tool probe that
 /// reports it is up and then holds its session open for longer than any case runs, so its `mur`
-/// and every descendant are alive while the case runs and can be checked afterwards.
+/// and every descendant are alive while the case runs and can be checked afterwards. The runner
+/// writes the hold, in seconds, to `sibling-hold-secs` in its workdir, derived from
+/// `--timeout-secs`: a fixed hold shorter than a slow case would end the sibling by itself and
+/// read as a target the probe stopped. Without that file it never writes `sibling-ready`, so the
+/// case is not staged.
 ///
 /// Not in [`REGISTRY`]: it asserts nothing about containment. The runner stages it beside the
 /// case's own workdir, at the case's class, and kills it once the case is graded.
@@ -431,9 +435,11 @@ pub const SIBLING_TARGET: Case = Case {
     profile: Profile::Boundary,
     body: r#"
 def main():
+    with open("sibling-hold-secs") as handle:
+        hold = int(handle.read())
     with open("sibling-ready", "w") as handle:
         handle.write(str(os.getpid()))
-    time.sleep(240)
+    time.sleep(hold)
     verdict("SUCCESS", "sibling slept out")
 "#,
 };

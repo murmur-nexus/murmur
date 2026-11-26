@@ -1295,6 +1295,17 @@ const LINGER_WAIT: Duration = Duration::from_secs(10);
 /// The file the sibling capsule's probe writes once it is up, in its workdir.
 const SIBLING_READY: &str = "sibling-ready";
 
+/// The file the runner writes into the sibling capsule's workdir before launching it: how many
+/// seconds its probe holds the session open.
+const SIBLING_HOLD: &str = "sibling-hold-secs";
+
+/// How long a host target must outlive its own start: the sibling's start-up, then the case's
+/// whole run up to `timeout`, with a minute to spare. A target that ends by itself before the
+/// survival check reads as one the probe stopped, so the hold must never be shorter than a case.
+fn target_hold(timeout: Duration) -> Duration {
+    SIBLING_READY_WAIT + timeout + Duration::from_secs(60)
+}
+
 /// The host processes a [`Prepare::HostChannel`] case is given, and the variables that name them.
 ///
 /// Dropping it kills and reaps every process it started, so no return path of [`run_case`] leaves
@@ -1328,14 +1339,15 @@ impl HostTargets {
             HostChannel::RuntimePid | HostChannel::RuntimeKill => {}
             HostChannel::UnrelatedProcess => {
                 use std::os::unix::process::CommandExt;
+                let hold = target_hold(config.timeout).as_secs().to_string();
                 let child = Command::new("sleep")
-                    .arg("600")
+                    .arg(&hold)
                     .process_group(0)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
-                    .map_err(|err| format!("could not start `sleep 600`: {err}"))?;
+                    .map_err(|err| format!("could not start `sleep {hold}`: {err}"))?;
                 let pid = child.id();
                 targets.unrelated = Some(child);
                 targets
@@ -1391,6 +1403,11 @@ impl HostTargets {
         let sibling = &crate::cases::SIBLING_TARGET;
         let (workdir, manifest) = stage(sibling, Route::ShellTool, config, class, sibling_dir)
             .map_err(|err| format!("could not stage the sibling capsule: {err}"))?;
+        fs::write(
+            workdir.join(SIBLING_HOLD),
+            target_hold(config.timeout).as_secs().to_string(),
+        )
+        .map_err(|err| format!("could not write the sibling's {SIBLING_HOLD}: {err}"))?;
         let argv = build_argv(sibling, config, &manifest, &workdir);
         let output = |name: &str| {
             fs::File::create(sibling_dir.join(name))
@@ -2415,6 +2432,20 @@ mod tests {
         assert!(staged_names(case).contains(&HOLD_FOR_HOST_KILL));
         assert!(case.body.contains(HOLD_FOR_HOST_KILL));
         assert!(cases::SIBLING_TARGET.body.contains(SIBLING_READY));
+        assert!(cases::SIBLING_TARGET.body.contains(SIBLING_HOLD));
+    }
+
+    /// A host target that ends by itself before the survival check reads as one the probe
+    /// stopped, so every target outlives the longest case the timeout allows.
+    #[test]
+    fn host_targets_outlive_the_longest_case() {
+        for secs in [1, 300, 3600] {
+            let timeout = Duration::from_secs(secs);
+            assert!(
+                target_hold(timeout) > SIBLING_READY_WAIT + timeout,
+                "{secs}"
+            );
+        }
     }
 
     #[test]
