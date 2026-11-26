@@ -2317,8 +2317,8 @@ fn classify(reply: StartReply, stop: impl FnOnce() -> Result<bool, String>) -> S
 }
 
 /// [`delegated_base`]'s decision for `attempt`: an unsettled move refuses outright, a joined or
-/// never-created unit probes as before, and a stopped unit probes with its reason kept for the
-/// refusal.
+/// never-created unit probes the cgroup the process is in, and a stopped unit probes with its
+/// reason kept for the refusal.
 #[cfg(target_os = "linux")]
 fn base_decision(attempt: &ScopeAttempt) -> BaseDecision {
     match attempt {
@@ -2555,6 +2555,10 @@ fn start_transient_scope(unit: &str, pids: &[u32]) -> Result<(), StartFailure> {
 /// Sent only for a unit this launch asked for and gave up on. `"replace"` cancels a start job that
 /// is still queued, and the manager handles jobs and bus messages on one thread, so once the stop
 /// is answered the move into `unit` has either happened already or never will.
+///
+/// Stopping a scope signals every process in it. If the move landed after the last membership
+/// read, the stop signals this process and the `pids` it was started with; never send it for a
+/// unit this process may still need.
 #[cfg(target_os = "linux")]
 fn stop_transient_scope(unit: &str, deadline: Duration) -> Result<(), String> {
     let owned_unit = unit.to_string();
@@ -4073,7 +4077,7 @@ mod tests {
         }
     }
 
-    /// A joined unit probes exactly as before, and a refusal carries nothing extra.
+    /// A joined unit is probed with nothing to stop, and a refusal carries nothing extra.
     #[cfg(target_os = "linux")]
     #[test]
     fn scope_attempt_joined_probes_unchanged() {
