@@ -53,11 +53,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::cases::{Case, Evidence, Prepare, Profile, Route};
+use crate::cases::{Case, Evidence, HostChannel, Prepare, Profile, Route};
 use crate::driver_artifact;
 use crate::harness_protocol::{ProbeConfig, ProbeRoute};
 use crate::probe;
@@ -257,13 +257,31 @@ pub fn manifest_yaml(
     // `bash` is allowlisted so `exec-renamed-disallowed-binary` has an allowlisted basename to
     // wear; `python3` is what every probe actually runs as.
     yaml.push_str("    allow:\n      - bash\n      - python3\n");
+    let channel_names = host_channel_env_names(case);
+    if !channel_names.is_empty() {
+        // The shell-tool route's way in: a command reads a name from `mur`'s environment only
+        // when the manifest declares it here.
+        yaml.push_str("    baseline_env:\n");
+        for name in channel_names {
+            yaml.push_str(&format!("      - {name}\n"));
+        }
+    }
     if case.profile == Profile::TightResources {
         yaml.push_str(tight_resources_yaml());
     }
+    if !channel_names.is_empty() {
+        // The process-harness route's way in: the harness starts with a cleared environment and
+        // receives a name from `mur`'s only when the manifest allows it here.
+        yaml.push_str("  env:\n    allow:\n");
+        for name in channel_names {
+            yaml.push_str(&format!("      - {name}\n"));
+        }
+    }
     // `network.allow` is left entirely undeclared, so every destination is unlisted and
     // `network.unix_sockets` keeps its default of false — which is what the four network cases
-    // and the two AF_UNIX cases assert against. `env.allow` is left undeclared too: the harness
-    // environment then holds only what the driver's launch plan sets, and so does every probe
+    // and the two AF_UNIX cases assert against. `env.allow` and `shell.baseline_env` are declared
+    // only for a `Prepare::HostChannel` case, naming exactly its variables: every other harness
+    // environment holds only what the driver's launch plan sets, and so does every probe
     // subprocess's. `lifecycle.shell_grace_secs` is left undeclared too, so no probe is ever
     // demoted to the background: a demoted command's tool result carries a `wrk_` handle instead
     // of an exit code, which a `ShellExit` case cannot grade.
@@ -303,6 +321,24 @@ pub fn manifest_yaml(
     ));
     yaml.push_str("  max_turns: 2\n");
     yaml
+}
+
+/// The variables a [`Prepare::HostChannel`] case is given, empty for every other case.
+fn host_channel_env_names(case: &Case) -> &'static [&'static str] {
+    match case.prepare {
+        Prepare::HostChannel(channel) => channel.env_names(),
+        _ => &[],
+    }
+}
+
+/// The empty marker [`HostChannel::RuntimeKill`] stages on [`Route::ProcessHarness`]: the probe
+/// holds its run open once it has reported only when it finds this file in its working
+/// directory, so the runner can kill `mur` from the host mid-session.
+const HOLD_FOR_HOST_KILL: &str = "ec-hold-for-host-kill";
+
+/// Whether `case` on `route` is the one the runner kills `mur` under once the probe reported.
+fn kills_runtime_after_report(case: &Case, route: Route) -> bool {
+    case.prepare == Prepare::HostChannel(HostChannel::RuntimeKill) && route == Route::ProcessHarness
 }
 
 /// The file `probe-driver` writes its summary line to, in the capsule workdir: `probe-driver` is
@@ -349,8 +385,11 @@ fn stage(
         driver_artifact::install_into(&config.mur, guest, case_dir).map_err(io::Error::other)?;
     }
 
+    if kills_runtime_after_report(case, route) {
+        fs::write(workdir.join(HOLD_FOR_HOST_KILL), "")?;
+    }
     match case.prepare {
-        Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
+        Prepare::None | Prepare::LeakFdIntoMur { .. } | Prepare::HostChannel(_) => {}
         Prepare::WriteSealKeyPath { dest } => {
             let home =
                 capsule_runtime::murmur_home::ensure_murmur_home().map_err(io::Error::other)?;
@@ -387,6 +426,8 @@ fn staged_names(case: &Case) -> Vec<&'static str> {
     }
     match case.prepare {
         Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
+        Prepare::HostChannel(HostChannel::RuntimeKill) => names.push(HOLD_FOR_HOST_KILL),
+        Prepare::HostChannel(_) => {}
         Prepare::CopyBinaryAs { dest, .. } | Prepare::WriteSealKeyPath { dest } => names.push(dest),
     }
     names
@@ -513,6 +554,15 @@ fn build_argv(case: &Case, config: &RunnerConfig, manifest: &Path, workdir: &Pat
         argv.push("escape-conformance".to_string());
     }
 
+    if let Prepare::HostChannel(_) = case.prepare {
+        // Every wrapper from here on `exec`s, so the shell's own pid is `mur`'s: exported as
+        // `MUR_EC_RUNTIME_PID` before the `exec`, it is the host pid of the runtime under test.
+        argv.push("bash".to_string());
+        argv.push("-c".to_string());
+        argv.push("export MUR_EC_RUNTIME_PID=$$; exec \"$@\"".to_string());
+        argv.push("escape-conformance".to_string());
+    }
+
     if config.systemd_scope {
         argv.extend(
             [
@@ -546,7 +596,34 @@ fn build_argv(case: &Case, config: &RunnerConfig, manifest: &Path, workdir: &Pat
     argv
 }
 
-/// Spawns `argv`, waits up to `timeout`, and kills it if it overruns.
+/// What one launch adds to a plain `mur run`. The default adds nothing.
+#[derive(Debug, Default, Clone, Copy)]
+struct LaunchExtras<'a> {
+    /// Set in the launched process's environment, on top of the harness's own.
+    env: &'a [(String, String)],
+    /// Kill the launched process (`mur`, every wrapper having `exec`ed) as soon as this file
+    /// holds a `VERDICT=` line: the probe has reported, and the run is ended from the host.
+    kill_after_report: Option<&'a Path>,
+}
+
+/// How one launch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaunchEnd {
+    /// The exit code, `None` when killed.
+    exit_code: Option<i32>,
+    /// Killed at the timeout.
+    timed_out: bool,
+    /// Killed by [`LaunchExtras::kill_after_report`].
+    killed_after_report: bool,
+}
+
+/// Whether `path` holds a `VERDICT=` line.
+fn has_reported(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.lines().any(|line| line.starts_with("VERDICT=")))
+}
+
+/// Spawns `argv`, waits up to `timeout`, and kills it if it overruns, or once the probe reported
+/// when [`LaunchExtras::kill_after_report`] says so.
 ///
 /// stdout and stderr go to files rather than pipes: a case that writes more than a pipe buffer
 /// before exiting would otherwise deadlock the harness, and the files are evidence a reader can
@@ -556,7 +633,8 @@ fn run_with_timeout(
     case_dir: &Path,
     workdir: &Path,
     timeout: Duration,
-) -> io::Result<(Option<i32>, bool)> {
+    extras: LaunchExtras<'_>,
+) -> io::Result<LaunchEnd> {
     let stdout = fs::File::create(case_dir.join("mur-stdout.txt"))?;
     let stderr = fs::File::create(case_dir.join("mur-stderr.txt"))?;
 
@@ -564,20 +642,35 @@ fn run_with_timeout(
     command
         .args(&argv[1..])
         .current_dir(workdir)
+        .envs(extras.env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
 
     let mut child = command.spawn()?;
     let started = Instant::now();
+    let killed = |child: &mut Child, timed_out: bool| {
+        let _ = child.kill();
+        let _ = child.wait();
+        LaunchEnd {
+            exit_code: None,
+            timed_out,
+            killed_after_report: !timed_out,
+        }
+    };
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok((status.code(), false));
+            return Ok(LaunchEnd {
+                exit_code: status.code(),
+                timed_out: false,
+                killed_after_report: false,
+            });
+        }
+        if extras.kill_after_report.is_some_and(has_reported) {
+            return Ok(killed(&mut child, false));
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok((None, true));
+            return Ok(killed(&mut child, true));
         }
         sleep(Duration::from_millis(200));
     }
@@ -962,12 +1055,29 @@ pub fn run_case(
         }
     };
 
+    // Held to the end of this function: dropping it kills and reaps whatever it started, on
+    // every return path.
+    let targets = match HostTargets::start(case, config, class, &case_dir) {
+        Ok(targets) => targets,
+        Err(err) => {
+            return not_run(
+                expectation,
+                format!("could not set up the case's host targets: {err}"),
+                RunReach::NotStaged,
+            );
+        }
+    };
+
     let argv = build_argv(case, config, &manifest, &workdir);
     let driver_log = driver_log_path(&case_dir);
+    let probe_file = workdir.join(probe::PROBE_FILE);
+    let extras = LaunchExtras {
+        env: &targets.env,
+        kill_after_report: kills_runtime_after_report(case, route).then_some(probe_file.as_path()),
+    };
 
-    let (exit_code, timed_out) = match run_with_timeout(&argv, &case_dir, &workdir, config.timeout)
-    {
-        Ok(result) => result,
+    let end = match run_with_timeout(&argv, &case_dir, &workdir, config.timeout, extras) {
+        Ok(end) => end,
         Err(err) => {
             return not_run(
                 expectation,
@@ -976,6 +1086,14 @@ pub fn run_case(
             );
         }
     };
+    let LaunchEnd {
+        exit_code,
+        timed_out,
+        killed_after_report,
+    } = end;
+    // After a host kill, the session's processes have to go with the runtime. Waited for here,
+    // before anything reads the record, and any that outlive the wait are named.
+    let lingering = killed_after_report.then(|| stop_processes_under(&case_dir, LINGER_WAIT));
 
     let output = session_output(&case_dir, &workdir);
     let refusal_prefix = LAUNCH_REFUSAL_CODES
@@ -1002,7 +1120,7 @@ pub fn run_case(
         .clone()
         .unwrap_or_else(|| "the probe driver left no record of its tool call".to_string());
 
-    let (verdict, mut detail) = match case.evidence {
+    let (mut verdict, mut detail) = match case.evidence {
         Evidence::ProbeFile => match read_probe_file(&workdir) {
             Some(found) => found,
             None => (
@@ -1101,6 +1219,26 @@ pub fn run_case(
         },
     };
 
+    if !targets.survivors.is_empty() {
+        let alive: Vec<(u32, bool)> = targets
+            .survivors
+            .iter()
+            .map(|pid| (*pid, pid_alive(*pid)))
+            .collect();
+        (verdict, detail) = fold_survival(verdict, detail, &alive);
+    }
+    if kills_runtime_after_report(case, route) {
+        let checks = if killed_after_report {
+            session_record_checks(&workdir)
+        } else {
+            Vec::new()
+        };
+        (verdict, detail) = fold_runtime_kill_record(verdict, detail, killed_after_report, &checks);
+        if let Some(lingering) = &lingering {
+            detail = format!("{detail} {}", lingering_note(lingering));
+        }
+    }
+
     // Supplementary, for the resource category only: the runtime's own attribution when it made
     // one. Never grades — see `trace_resource_limit`.
     if case.category == crate::verdict::Category::ResourceExhaustion {
@@ -1144,6 +1282,453 @@ pub fn run_case(
             tool_result,
         },
     }
+}
+
+/// How long a host target has to come up: the sibling capsule's `mur` staging its session and
+/// its probe writing `sibling-ready`.
+const SIBLING_READY_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the session's processes have to exit after `mur` was killed from the host, and a
+/// stopped sibling capsule's after its `mur` was.
+const LINGER_WAIT: Duration = Duration::from_secs(10);
+
+/// The file the sibling capsule's probe writes once it is up, in its workdir.
+const SIBLING_READY: &str = "sibling-ready";
+
+/// The host processes a [`Prepare::HostChannel`] case is given, and the variables that name them.
+///
+/// Dropping it kills and reaps every process it started, so no return path of [`run_case`] leaves
+/// one running.
+#[derive(Debug, Default)]
+struct HostTargets {
+    /// Exported to `mur`, on top of `MUR_EC_RUNTIME_PID`, which `build_argv`'s wrapper exports.
+    env: Vec<(String, String)>,
+    /// Host pids that must still be alive after the case: the probe was told to reach them.
+    survivors: Vec<u32>,
+    /// The same-user process outside every capsule ([`HostChannel::UnrelatedProcess`]).
+    unrelated: Option<Child>,
+    /// The sibling capsule's `mur` ([`HostChannel::SiblingCapsule`]) and its case directory.
+    sibling: Option<(Child, PathBuf)>,
+}
+
+impl HostTargets {
+    /// Starts or finds what `case`'s host channel names. `Err` when it cannot, and the case is
+    /// then not staged: a target that is not there would make any verdict meaningless.
+    fn start(
+        case: &Case,
+        config: &RunnerConfig,
+        class: murmur_artifact::ContainmentClass,
+        case_dir: &Path,
+    ) -> Result<HostTargets, String> {
+        let mut targets = HostTargets::default();
+        let Prepare::HostChannel(channel) = case.prepare else {
+            return Ok(targets);
+        };
+        match channel {
+            HostChannel::RuntimePid | HostChannel::RuntimeKill => {}
+            HostChannel::UnrelatedProcess => {
+                use std::os::unix::process::CommandExt;
+                let child = Command::new("sleep")
+                    .arg("600")
+                    .process_group(0)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|err| format!("could not start `sleep 600`: {err}"))?;
+                let pid = child.id();
+                targets.unrelated = Some(child);
+                targets
+                    .env
+                    .push(("MUR_EC_UNRELATED_PID".to_string(), pid.to_string()));
+                targets.survivors.push(pid);
+            }
+            HostChannel::SiblingCapsule => {
+                let pids = targets.start_sibling(config, class, &case_dir.join("sibling"))?;
+                targets.env.push((
+                    "MUR_EC_SIBLING_PIDS".to_string(),
+                    pids.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ));
+                targets.survivors = pids;
+            }
+            HostChannel::OtherSession => {
+                let trace = Route::ALL
+                    .into_iter()
+                    .find_map(|route| {
+                        let preflight = self::case_dir(config, &crate::cases::PREFLIGHT, route);
+                        trace_files(&workdir_in(&preflight)).into_iter().next()
+                    })
+                    .ok_or(
+                        "no preflight session left a trace.jsonl to name as another session's",
+                    )?;
+                let root = capsule_runtime::records_dir_root()
+                    .map_err(|err| format!("no records root: {err}"))?;
+                targets.env.push((
+                    "MUR_EC_OTHER_TRACE".to_string(),
+                    trace.display().to_string(),
+                ));
+                targets.env.push((
+                    "MUR_EC_RECORDS_ROOT".to_string(),
+                    root.display().to_string(),
+                ));
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Stages [`crate::cases::SIBLING_TARGET`] in `sibling_dir` at `class`, launches it, waits
+    /// for its probe to report it is up, and returns its `mur`'s host pid followed by every
+    /// descendant's.
+    fn start_sibling(
+        &mut self,
+        config: &RunnerConfig,
+        class: murmur_artifact::ContainmentClass,
+        sibling_dir: &Path,
+    ) -> Result<Vec<u32>, String> {
+        let sibling = &crate::cases::SIBLING_TARGET;
+        let (workdir, manifest) = stage(sibling, Route::ShellTool, config, class, sibling_dir)
+            .map_err(|err| format!("could not stage the sibling capsule: {err}"))?;
+        let argv = build_argv(sibling, config, &manifest, &workdir);
+        let output = |name: &str| {
+            fs::File::create(sibling_dir.join(name))
+                .map_err(|err| format!("could not create the sibling's {name}: {err}"))
+        };
+        let child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output("mur-stdout.txt")?))
+            .stderr(Stdio::from(output("mur-stderr.txt")?))
+            .spawn()
+            .map_err(|err| format!("could not launch the sibling capsule: {err}"))?;
+        let runtime = child.id();
+        let child = &mut self.sibling.insert((child, sibling_dir.to_path_buf())).0;
+
+        let started = Instant::now();
+        let ready = workdir.join(SIBLING_READY);
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!(
+                    "the sibling capsule's `mur` exited ({status}) before its probe was up; see \
+                     {}",
+                    sibling_dir.join("mur-stderr.txt").display()
+                ));
+            }
+            if ready.is_file() {
+                let mut pids = vec![runtime];
+                pids.extend(descendants(runtime, &host_parent_table()));
+                if pids
+                    .iter()
+                    .any(|pid| cmdline_contains(*pid, probe::PROBE_SCRIPT))
+                {
+                    return Ok(pids);
+                }
+                if started.elapsed() >= SIBLING_READY_WAIT {
+                    return Err(format!(
+                        "the sibling capsule wrote {SIBLING_READY}, but no process descended \
+                         from its `mur` (pid {runtime}) runs {}: {pids:?}",
+                        probe::PROBE_SCRIPT
+                    ));
+                }
+            } else if started.elapsed() >= SIBLING_READY_WAIT {
+                return Err(format!(
+                    "the sibling capsule wrote no {SIBLING_READY} within {}s; see {}",
+                    SIBLING_READY_WAIT.as_secs(),
+                    sibling_dir.display()
+                ));
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for HostTargets {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.unrelated {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some((child, sibling_dir)) = &mut self.sibling {
+            // SIGTERM first, so the sibling's `mur` tears its session down and seals its record;
+            // SIGKILL only if it has not exited by the deadline.
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let started = Instant::now();
+            while !matches!(child.try_wait(), Ok(Some(_))) && started.elapsed() < LINGER_WAIT {
+                sleep(Duration::from_millis(200));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            stop_processes_under(sibling_dir, LINGER_WAIT);
+        }
+    }
+}
+
+/// Every host process as `(pid, parent pid)`, read from `/proc/<pid>/status`. The harness runs
+/// outside every capsule, so these are host pids.
+fn host_parent_table() -> Vec<(u32, u32)> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            let ppid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((pid, ppid))
+        })
+        .collect()
+}
+
+/// Every pid in `table` whose parent chain reaches `root`, `root` itself excluded, ascending.
+fn descendants(root: u32, table: &[(u32, u32)]) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in table {
+            if *ppid == parent && *pid != root && !found.contains(pid) {
+                found.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Whether host pid `pid`'s command line contains `needle`.
+fn cmdline_contains(pid: u32, needle: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|raw| String::from_utf8_lossy(&raw).contains(needle))
+}
+
+/// Whether host pid `pid` is alive: `/proc/<pid>` exists and its state is not `Z`.
+fn pid_alive(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .is_some_and(|state| !state.trim_start().starts_with('Z'))
+    })
+}
+
+/// The survival check of a case whose probe was told to reach `alive`'s pids, each paired with
+/// whether it was alive after the run. All alive leaves the verdict as the probe reported it; any
+/// gone is `ALLOWED`, whatever the probe reported, since something stopped a target it was told
+/// not to reach.
+fn fold_survival(verdict: Verdict, detail: String, alive: &[(u32, bool)]) -> (Verdict, String) {
+    let pids = |want: bool| {
+        alive
+            .iter()
+            .filter(|(_, is_alive)| *is_alive == want)
+            .map(|(pid, _)| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if alive.iter().all(|(_, is_alive)| *is_alive) {
+        let note = format!(
+            "[every target pid was alive after the case: {}]",
+            pids(true)
+        );
+        (verdict, format!("{detail} {note}"))
+    } else {
+        let note = format!(
+            "[target pid(s) {} were gone after the case: a target the probe was told about was \
+             stopped]",
+            pids(false)
+        );
+        (Verdict::Allowed, format!("{detail} {note}"))
+    }
+}
+
+/// What one session directory's record held once its `mur` was killed from the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecordCheck {
+    /// The session's records directory.
+    pub dir: PathBuf,
+    /// `trace.jsonl` lines whose `event_type` is `session_start`.
+    pub session_start: usize,
+    /// `trace.jsonl` lines whose `event_type` is `session_end`.
+    pub session_end: usize,
+    /// `mur trace verify`'s verdict on the directory, `Err` with the reason when there was no
+    /// trace to read or no public key to check it with.
+    pub record: Result<capsule_runtime::record_seal::Verdict, String>,
+}
+
+/// Reads every session directory of `workdir`'s records group after a host kill.
+fn session_record_checks(workdir: &Path) -> Vec<SessionRecordCheck> {
+    use capsule_runtime::record_seal;
+    let key = capsule_runtime::murmur_home::ensure_murmur_home()
+        .and_then(|home| record_seal::PublicKey::load(&record_seal::public_key_path(&home)));
+    let sessions = capsule_runtime::records_group(workdir)
+        .ok()
+        .and_then(|group| fs::read_dir(group).ok());
+    let mut checks = Vec::new();
+    for session in sessions.into_iter().flatten().flatten() {
+        let dir = session.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let trace = fs::read_to_string(dir.join("trace.jsonl"));
+        let count = |event: &str| {
+            trace.as_deref().map_or(0, |text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|value| value.get("event_type").and_then(|v| v.as_str()) == Some(event))
+                    .count()
+            })
+        };
+        let record = match (&trace, &key) {
+            (Err(err), _) => Err(format!("no trace.jsonl: {err}")),
+            (_, Err(err)) => Err(format!("no record-seal public key: {err}")),
+            (Ok(_), Ok(key)) => {
+                Ok(record_seal::verify_session_records(&dir, Some(key), None).verdict)
+            }
+        };
+        checks.push(SessionRecordCheck {
+            session_start: count("session_start"),
+            session_end: count("session_end"),
+            dir,
+            record,
+        });
+    }
+    checks
+}
+
+/// The record check of a runtime the runner killed from the host once the probe reported.
+///
+/// Every session record `unsealed`, with a `session_start` and no `session_end`, leaves the
+/// verdict as the probe reported it: the kill is visible in the record. A record that verifies
+/// is `ALLOWED`: a killed runtime left a record indistinguishable from a finished one. Anything
+/// else — no record, no key, `absent`, `unverifiable`, `changed`, a `session_end` — is
+/// `INCONCLUSIVE`, and so is a run the runner never killed, because the probe never reported.
+fn fold_runtime_kill_record(
+    verdict: Verdict,
+    detail: String,
+    killed: bool,
+    checks: &[SessionRecordCheck],
+) -> (Verdict, String) {
+    use capsule_runtime::record_seal::Verdict as Record;
+    if !killed {
+        return (
+            Verdict::Inconclusive,
+            format!(
+                "{detail} [the probe never reported, so the runner never killed mur and the \
+                 record was not checked]"
+            ),
+        );
+    }
+    if checks.is_empty() {
+        return (
+            Verdict::Inconclusive,
+            format!(
+                "{detail} [runner killed mur from the host after the probe reported, and no \
+                 session record was found to check]"
+            ),
+        );
+    }
+    let mut folded = verdict;
+    let mut found = Vec::new();
+    for check in checks {
+        let record = match &check.record {
+            Ok(record) => record.as_str().to_string(),
+            Err(reason) => format!("not checked ({reason})"),
+        };
+        found.push(format!(
+            "session_start={}, session_end={}, record={record}",
+            check.session_start, check.session_end
+        ));
+        let this = match check.record {
+            Ok(Record::Verified) => Verdict::Allowed,
+            Ok(Record::Unsealed) if check.session_start > 0 && check.session_end == 0 => verdict,
+            _ => Verdict::Inconclusive,
+        };
+        folded = match (folded, this) {
+            (Verdict::Allowed, _) | (_, Verdict::Allowed) => Verdict::Allowed,
+            (Verdict::Inconclusive, _) | (_, Verdict::Inconclusive) => Verdict::Inconclusive,
+            _ => folded,
+        };
+    }
+    let mut note = format!(
+        "[runner killed mur from the host after the probe reported: {}]",
+        found.join("; ")
+    );
+    if folded == Verdict::Allowed && verdict != Verdict::Allowed {
+        note.push_str(" [a killed runtime left a record that verifies: the kill is undetectable]");
+    }
+    (folded, format!("{detail} {note}"))
+}
+
+/// Every host process whose working directory lies under `dir`, with its name.
+fn processes_under(dir: &Path) -> Vec<(u32, String)> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+        })
+        .map(|pid| {
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            (pid, comm.trim().to_string())
+        })
+        .collect()
+}
+
+/// Waits up to `wait` for every process working under `dir` to exit, then kills any left, and
+/// returns those it had to kill.
+fn stop_processes_under(dir: &Path, wait: Duration) -> Vec<(u32, String)> {
+    let started = Instant::now();
+    loop {
+        let left = processes_under(dir);
+        if left.is_empty() {
+            return left;
+        }
+        if started.elapsed() >= wait {
+            for (pid, _) in &left {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            return left;
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
+/// The DETAIL note for the processes [`stop_processes_under`] found after a host kill.
+fn lingering_note(lingering: &[(u32, String)]) -> String {
+    if lingering.is_empty() {
+        return format!(
+            "[every process of the case had exited within {}s of the host kill]",
+            LINGER_WAIT.as_secs()
+        );
+    }
+    let named: Vec<String> = lingering
+        .iter()
+        .map(|(pid, comm)| format!("{pid} ({comm})"))
+        .collect();
+    format!(
+        "[still running {}s after the host kill, then killed by the runner: {}]",
+        LINGER_WAIT.as_secs(),
+        named.join(", ")
+    )
 }
 
 /// The whole diagnostic code at the first occurrence of `prefix` in `output`: `E-MAN-` in
@@ -1723,5 +2308,257 @@ mod tests {
         // Nothing left: nothing to say.
         assert_eq!(remove_scratch(case, &workdir).note(), None);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A host-channel case declares exactly its variables on both ways into a probe; every other
+    /// case declares neither, so its manifest is what it always was.
+    #[test]
+    fn only_a_host_channel_case_declares_its_variables() {
+        let cases = std::iter::once(&cases::PREFLIGHT)
+            .chain(std::iter::once(&cases::SIBLING_TARGET))
+            .chain(cases::all_cases());
+        let mut channels = 0;
+        for case in cases {
+            for route in case.routes() {
+                let yaml = manifest_yaml(
+                    case,
+                    route,
+                    &config(),
+                    ContainmentClass::Scoped,
+                    &case_dir_for_test(),
+                );
+                let manifest = RuntimeManifest::from_yaml_str(&yaml).unwrap();
+                let capabilities = manifest.capabilities.as_ref().unwrap();
+                let baseline = capabilities
+                    .shell
+                    .as_ref()
+                    .and_then(|shell| shell.baseline_env.clone())
+                    .unwrap_or_default();
+                let allowed = capabilities
+                    .env
+                    .as_ref()
+                    .map(|env| env.allow.clone())
+                    .unwrap_or_default();
+                match case.prepare {
+                    Prepare::HostChannel(channel) => {
+                        channels += 1;
+                        assert_eq!(baseline, channel.env_names(), "{}", case.id);
+                        assert_eq!(allowed, channel.env_names(), "{}", case.id);
+                    }
+                    _ => {
+                        assert!(!yaml.contains("baseline_env"), "{}: {yaml}", case.id);
+                        assert!(!yaml.contains("\n  env:"), "{}: {yaml}", case.id);
+                    }
+                }
+            }
+        }
+        // Six host-channel cases, each on the shell tool and the process harness.
+        assert_eq!(channels, 12);
+        let yaml = scoped_yaml("signal-sibling-capsule", Route::ProcessHarness);
+        assert!(
+            yaml.contains(
+                "    baseline_env:\n      - MUR_EC_RUNTIME_PID\n      - MUR_EC_SIBLING_PIDS\n"
+            ),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "  env:\n    allow:\n      - MUR_EC_RUNTIME_PID\n      - MUR_EC_SIBLING_PIDS\n"
+            ),
+            "{yaml}"
+        );
+    }
+
+    /// A host-channel case's `mur` is launched from a shell that exports its own pid and `exec`s,
+    /// so the exported pid is `mur`'s through every wrapper.
+    #[test]
+    fn a_host_channel_case_exports_the_runtime_pid_through_exec_wrappers() {
+        let mut cfg = config();
+        cfg.systemd_scope = true;
+        let case = cases::find("signal-own-runtime").unwrap();
+        let argv = build_argv(case, &cfg, Path::new("/tmp/m.yaml"), Path::new("/tmp/wd"));
+        assert_eq!(
+            argv[..4],
+            [
+                "bash",
+                "-c",
+                "export MUR_EC_RUNTIME_PID=$$; exec \"$@\"",
+                "escape-conformance"
+            ]
+        );
+        assert_eq!(argv[4], "systemd-run");
+        let mur = argv.iter().position(|a| a.ends_with("mur")).unwrap();
+        assert_eq!(argv[mur + 1], "run");
+
+        let plain = cases::find("record-rewrite").unwrap();
+        let argv = build_argv(plain, &cfg, Path::new("/tmp/m.yaml"), Path::new("/tmp/wd"));
+        assert_eq!(argv[0], "systemd-run");
+        assert!(!argv.iter().any(|a| a.contains("MUR_EC_")));
+    }
+
+    /// Only `runtime-kill-record` on the process harness holds its run for a host kill, and the
+    /// marker it is staged with survives the scratch cleanup.
+    #[test]
+    fn only_the_runtime_kill_case_on_the_harness_is_killed_after_it_reports() {
+        for case in std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases()) {
+            for route in Route::ALL {
+                assert_eq!(
+                    kills_runtime_after_report(case, route),
+                    case.id == "runtime-kill-record" && route == Route::ProcessHarness,
+                    "{} on {}",
+                    case.id,
+                    route.as_str()
+                );
+            }
+        }
+        let case = cases::find("runtime-kill-record").unwrap();
+        assert!(staged_names(case).contains(&HOLD_FOR_HOST_KILL));
+        assert!(case.body.contains(HOLD_FOR_HOST_KILL));
+        assert!(cases::SIBLING_TARGET.body.contains(SIBLING_READY));
+    }
+
+    #[test]
+    fn a_probe_file_has_reported_once_it_holds_a_verdict_line() {
+        let root = crate::work_root::tests::scratch_path("reported");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join(probe::PROBE_FILE);
+        assert!(!has_reported(&file));
+        fs::write(&file, "").unwrap();
+        assert!(!has_reported(&file));
+        fs::write(&file, "VERDICT=REFUSED\nDETAIL=x\n").unwrap();
+        assert!(has_reported(&file));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn descendants_follow_the_parent_chain_and_nothing_else() {
+        let table = [
+            (10, 1),
+            (11, 10),
+            (12, 11),
+            (13, 10),
+            (20, 1),
+            (21, 20),
+            // A cycle cannot loop the walk.
+            (30, 31),
+            (31, 30),
+        ];
+        assert_eq!(descendants(10, &table), [11, 12, 13]);
+        assert_eq!(descendants(20, &table), [21]);
+        assert_eq!(descendants(12, &table), Vec::<u32>::new());
+        assert_eq!(descendants(30, &table), [31]);
+    }
+
+    #[test]
+    fn this_process_is_alive_and_a_reaped_child_is_not() {
+        assert!(pid_alive(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+    }
+
+    #[test]
+    fn the_survival_check_overrides_a_refusal_when_a_target_is_gone() {
+        let (verdict, detail) = fold_survival(
+            Verdict::Refused,
+            "probe said".to_string(),
+            &[(100, true), (101, true)],
+        );
+        assert_eq!(verdict, Verdict::Refused);
+        assert_eq!(
+            detail,
+            "probe said [every target pid was alive after the case: 100 101]"
+        );
+
+        let (verdict, detail) = fold_survival(
+            Verdict::Refused,
+            "probe said".to_string(),
+            &[(100, true), (101, false)],
+        );
+        assert_eq!(verdict, Verdict::Allowed);
+        assert!(detail.contains("target pid(s) 101 were gone"), "{detail}");
+
+        // An ALLOWED stays ALLOWED either way.
+        let (verdict, _) = fold_survival(Verdict::Allowed, String::new(), &[(100, true)]);
+        assert_eq!(verdict, Verdict::Allowed);
+    }
+
+    fn record_check(
+        start: usize,
+        end: usize,
+        record: Result<capsule_runtime::record_seal::Verdict, &str>,
+    ) -> SessionRecordCheck {
+        SessionRecordCheck {
+            dir: PathBuf::from("/records/sess"),
+            session_start: start,
+            session_end: end,
+            record: record.map_err(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_runtime_kill_record_check_keeps_the_verdict_only_for_an_unsealed_record() {
+        use capsule_runtime::record_seal::Verdict as Record;
+        let fold = |killed: bool, checks: &[SessionRecordCheck]| {
+            fold_runtime_kill_record(Verdict::Refused, "probe said".to_string(), killed, checks)
+        };
+
+        let (verdict, detail) = fold(true, &[record_check(1, 0, Ok(Record::Unsealed))]);
+        assert_eq!(verdict, Verdict::Refused);
+        assert!(
+            detail.ends_with(
+                "[runner killed mur from the host after the probe reported: session_start=1, \
+                 session_end=0, record=unsealed]"
+            ),
+            "{detail}"
+        );
+
+        let (verdict, detail) = fold(true, &[record_check(1, 0, Ok(Record::Verified))]);
+        assert_eq!(verdict, Verdict::Allowed);
+        assert!(detail.contains("the kill is undetectable"), "{detail}");
+
+        for record in [Record::Absent, Record::Unverifiable, Record::Changed] {
+            let (verdict, detail) = fold(true, &[record_check(1, 0, Ok(record))]);
+            assert_eq!(verdict, Verdict::Inconclusive, "{detail}");
+            assert!(detail.contains(&format!("record={}", record.as_str())));
+        }
+        // Unsealed but with a session_end, or without a session_start: not a killed runtime.
+        assert_eq!(
+            fold(true, &[record_check(1, 1, Ok(Record::Unsealed))]).0,
+            Verdict::Inconclusive
+        );
+        assert_eq!(
+            fold(true, &[record_check(0, 0, Ok(Record::Unsealed))]).0,
+            Verdict::Inconclusive
+        );
+
+        let (verdict, detail) = fold(true, &[record_check(0, 0, Err("no trace.jsonl: gone"))]);
+        assert_eq!(verdict, Verdict::Inconclusive);
+        assert!(
+            detail.contains("not checked (no trace.jsonl: gone)"),
+            "{detail}"
+        );
+
+        let (verdict, detail) = fold(true, &[]);
+        assert_eq!(verdict, Verdict::Inconclusive);
+        assert!(detail.contains("no session record"), "{detail}");
+
+        let (verdict, detail) = fold(false, &[record_check(1, 0, Ok(Record::Unsealed))]);
+        assert_eq!(verdict, Verdict::Inconclusive);
+        assert!(detail.contains("never killed mur"), "{detail}");
+
+        // A verifying record wins over every other session's.
+        assert_eq!(
+            fold(
+                true,
+                &[
+                    record_check(1, 0, Err("no trace.jsonl: gone")),
+                    record_check(1, 0, Ok(Record::Verified))
+                ]
+            )
+            .0,
+            Verdict::Allowed
+        );
     }
 }
