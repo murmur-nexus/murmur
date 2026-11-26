@@ -94,6 +94,10 @@ probe at launch and refuses with `E-RUN-012` naming what is missing.
 At launch, before any WASM is instantiated, if the capsule can spawn a subprocess
 (`capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty, or it has a WASM tool,
 driver or hook, each of which runs in a [guest worker](../concepts/guest-workers.md) process) the
+runtime first takes the [delegated parent](resource-limits.md#delegated-parent) it already sits
+in, when every check passes: it sweeps the parent's stale `murmur-<pid>-p` cgroups, creates
+`<parent>/murmur-<pid>-p`, moves itself and its guest workers in, and skips step 1 below. A
+declined parent leaves the process where it was, and the reason is kept for a refusal. Then the
 runtime:
 
 1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
@@ -121,6 +125,29 @@ runtime:
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
    from inside its `pre_exec`, before `execve`.
 
+A delegated parent can be built by hand without root, for checking adoption on a desktop host: a
+transient delegated scope entered through a user, mount and cgroup namespace, so the scope is the
+root of the visible hierarchy, with the session bus hidden.
+
+```bash
+systemd-run --user --scope -q -p Delegate=yes -- \
+  env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent \
+  unshare -Urm -C sh -c '
+    mount -t tmpfs tmpfs /sys/fs && mkdir /sys/fs/cgroup &&
+    mount -t cgroup2 cgroup2 /sys/fs/cgroup &&
+    mkdir /sys/fs/cgroup/launcher && echo $$ > /sys/fs/cgroup/launcher/cgroup.procs &&
+    echo "+memory +pids +cpu" > /sys/fs/cgroup/cgroup.subtree_control &&
+    mur run --manifest murmur.yaml --task "Report and stop." & P=$!
+    sleep 2; cat /proc/$P/cgroup; wait $P
+    find /sys/fs/cgroup -name "murmur-*-p"'
+# expected: 0::/murmur-<pid>-p/murmur-supervisor while it runs, the launch exits 0, and the
+#   final find prints nothing
+```
+
+Leave out the `subtree_control` write and the launch refuses with `E-RUN-012`, its reason ending
+in `; no delegated parent was adopted: parent does not enable memory,pids,cpu`. In a system unit
+the same confirmation is `cat /proc/<pid>/cgroup` of a running `mur`, from any terminal.
+
 Wrapping `mur` itself in an outer delegated scope still works and is harmless — `mur` still asks
 for its own scope inside it — but is not required for the launch to succeed:
 
@@ -129,8 +156,8 @@ systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.
 ```
 
 The session's cgroup exists only while the session runs, and `mur` removes it when the session
-ends. It sits under the scope `mur` took in step 1, not under the cgroup of the shell that started
-`mur`, so read it from another terminal while the session runs. This function prints the named
+ends. It sits under the `murmur-<pid>-p` `mur` created in the parent it adopted or the scope it took in
+step 1, not under the cgroup of the shell that started `mur`, so read it from another terminal while the session runs. This function prints the named
 files of every running session's cgroup twice a second until you stop it with Ctrl-C:
 
 ```bash

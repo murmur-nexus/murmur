@@ -194,6 +194,7 @@ default-filter = """
     | binary_id(murmur-cli::conversation)
     | binary_id(murmur-cli::credential_gateway)
     | binary_id(murmur-cli::declared_needs)
+    | binary_id(murmur-cli::delegated_parent)
     | binary_id(murmur-cli::delegation)
     | binary_id(murmur-cli::deny)
     | binary_id(murmur-cli::deploy_cmd)

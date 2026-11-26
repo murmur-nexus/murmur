@@ -3464,6 +3464,10 @@ fn check_project(
     let cgroup_probe = probe_scope(
         true,
         &capability_policy.resources,
+        capability_policy
+            .declared_resources
+            .cgroup_io_bytes_per_sec
+            .is_some(),
         &project_root.join("workdir"),
     );
     capsule_runtime::report_println!();

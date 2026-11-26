@@ -2250,9 +2250,10 @@ mod tests {
             cgroup_pids_max: 16,
             ..crate::resources::HostResourceLimits::default()
         };
-        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_fork_bomb", temp.path())
-            .expect("this host delegates a cgroup scope")
-            .scope;
+        let scope =
+            crate::cgroup::prepare_scope(true, &limits, false, "ses_fork_bomb", temp.path())
+                .expect("this host delegates a cgroup scope")
+                .scope;
         let policy = CapabilityPolicy {
             shell_allow: vec!["python3".to_string()],
             resources: limits,

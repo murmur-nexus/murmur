@@ -8466,9 +8466,10 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let limits = crate::resources::HostResourceLimits::default();
-        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_nproc_bound", temp.path())
-            .expect("this host delegates a cgroup scope")
-            .scope;
+        let scope =
+            crate::cgroup::prepare_scope(true, &limits, false, "ses_nproc_bound", temp.path())
+                .expect("this host delegates a cgroup scope")
+                .scope;
         let enforcement = ShellEnforcement::environment_only()
             .with_test_session_dirs()
             .with_host_bounding(scope, None);
@@ -8501,9 +8502,10 @@ mod tests {
             max_open_files: 256,
             ..crate::resources::HostResourceLimits::default()
         };
-        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_nproc_race", temp.path())
-            .expect("this host delegates a cgroup scope")
-            .scope;
+        let scope =
+            crate::cgroup::prepare_scope(true, &limits, false, "ses_nproc_race", temp.path())
+                .expect("this host delegates a cgroup scope")
+                .scope;
         assert!(
             scope.is_some(),
             "a required scope on Linux is always created"
@@ -12976,11 +12978,16 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
         let temp = tempfile::tempdir().unwrap();
         let policy = server_policy(&["setsid"]);
-        let scope =
-            crate::cgroup::prepare_scope(true, &policy.resources, "ses_end_kills", temp.path())
-                .expect("a delegated scope")
-                .scope
-                .expect("a required scope on Linux is never None");
+        let scope = crate::cgroup::prepare_scope(
+            true,
+            &policy.resources,
+            false,
+            "ses_end_kills",
+            temp.path(),
+        )
+        .expect("a delegated scope")
+        .scope
+        .expect("a required scope on Linux is never None");
         let enforcement =
             session_enforcement(&policy).with_host_bounding(Some(Arc::clone(&scope)), None);
 
