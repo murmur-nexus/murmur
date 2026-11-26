@@ -522,7 +522,7 @@ mod tests {
     const NOT_A_BOUNDARY: &str =
         "parent is not a delegation boundary: its parent is also owned by this uid";
 
-    /// This host's desktop shape: a tmux scope in `app.slice`, which the user owns as it owns
+    /// A desktop shape: a terminal's scope in `app.slice`, which the user owns as it owns
     /// `user@1000.service` above it, every controller enabled.
     #[test]
     fn a_desktop_scope_under_a_user_manager_is_not_a_delegation_boundary() {

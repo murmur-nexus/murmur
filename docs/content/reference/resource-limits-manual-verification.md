@@ -97,7 +97,7 @@ driver or hook, each of which runs in a [guest worker](../concepts/guest-workers
 runtime first takes the [delegated parent](resource-limits.md#delegated-parent) it already sits
 in, when every check passes: it sweeps the parent's stale `murmur-<pid>-p` cgroups, creates
 `<parent>/murmur-<pid>-p`, moves itself and its guest workers in, and skips step 1 below. A
-declined parent leaves the process where it was, and the reason is kept for a refusal. Then the
+declined parent leaves the process where it was, and a later refusal names why. Then the
 runtime:
 
 1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
@@ -156,9 +156,10 @@ systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.
 ```
 
 The session's cgroup exists only while the session runs, and `mur` removes it when the session
-ends. It sits under the `murmur-<pid>-p` `mur` created in the parent it adopted or the scope it took in
-step 1, not under the cgroup of the shell that started `mur`, so read it from another terminal while the session runs. This function prints the named
-files of every running session's cgroup twice a second until you stop it with Ctrl-C:
+ends. It sits under the `murmur-<pid>-p` that `mur` created in the parent it adopted, or under the
+scope it took in step 1, not under the cgroup of the shell that started `mur`, so read it from
+another terminal while the session runs. This function prints the named files of every running
+session's cgroup twice a second until you stop it with Ctrl-C:
 
 ```bash
 watch_scope() {

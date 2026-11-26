@@ -1002,9 +1002,13 @@ fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
 #[must_use]
 pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Path) -> ScopeProbe {
     let required = requires_process_bounding(policy);
-    let declared_io = policy.declared_resources.cgroup_io_bytes_per_sec;
     if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
-        return probe_scope(required, &policy.resources, declared_io.is_some(), workdir);
+        return probe_scope(
+            required,
+            &policy.resources,
+            declares_io_limit(policy),
+            workdir,
+        );
     }
     if !required {
         let (io_max, cgroup_scope) = unrequired_scope_reports(policy);
@@ -1013,6 +1017,7 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
             io_max,
         };
     }
+    let declared_io = policy.declared_resources.cgroup_io_bytes_per_sec;
     let mut probe = probe_scope(
         true,
         &HostResourceLimits {
@@ -1020,7 +1025,7 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
                 .unwrap_or(policy.resources.cgroup_io_bytes_per_sec),
             ..policy.resources
         },
-        declared_io.is_some(),
+        declares_io_limit(policy),
         workdir,
     );
     if cfg!(target_os = "linux") && declared_io.is_none() {
@@ -1035,7 +1040,8 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
 /// Whether `policy`'s manifest declares `capabilities.resources.cgroup_io_bytes_per_sec`, which
 /// makes `io` a controller a delegated parent must enable before it is adopted. The resolved
 /// limit carries a default whether or not one was declared, so only the declaration counts.
-pub(crate) fn declares_io_limit(policy: &crate::types::CapabilityPolicy) -> bool {
+#[must_use]
+pub fn declares_io_limit(policy: &crate::types::CapabilityPolicy) -> bool {
     policy.declared_resources.cgroup_io_bytes_per_sec.is_some()
 }
 

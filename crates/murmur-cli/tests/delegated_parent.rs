@@ -25,7 +25,7 @@ const DRIVER_VERSION: &str = "0.1.0";
 /// The controllers the construction enables for the parent's children by default.
 const ENABLE_CPU_MEMORY_PIDS: &str = "+memory +pids +cpu";
 
-/// The default and `io`: what a systemd scope delegates on this host.
+/// The default and `io`: what a systemd user scope delegates when its user manager has `io`.
 const ENABLE_WITH_IO: &str = "+memory +pids +cpu +io";
 
 /// The setup the construction's `sh -c` runs before it `exec`s the test's script: a cgroup2 mount
