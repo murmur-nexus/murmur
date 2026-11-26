@@ -978,7 +978,7 @@ mod tests {
         };
         let fresh = make("ses_fresh", Duration::from_secs(10));
         let stale = make("ses_stale", Duration::from_secs(61));
-        let stale_lock = std::fs::metadata(stale.join(LOCK_FILE_NAME)).unwrap();
+        let stale_lock = rustix::fs::stat(stale.join(LOCK_FILE_NAME)).unwrap();
 
         let root = WorkdirRoot::open(sessions).unwrap();
         let mut tried = Vec::new();
@@ -988,10 +988,9 @@ mod tests {
             rustix::fs::flock(lock, FlockOperation::NonBlockingLockExclusive)
         });
 
-        use std::os::unix::fs::MetadataExt;
         assert_eq!(
             tried,
-            vec![(stale_lock.dev(), stale_lock.ino())],
+            vec![(stale_lock.st_dev, stale_lock.st_ino)],
             "only the 61-second-old lock is tried"
         );
         assert!(fresh.exists(), "a 10-second-old directory is kept");
