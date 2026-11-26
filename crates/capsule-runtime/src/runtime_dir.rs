@@ -371,6 +371,30 @@ impl RuntimeDir {
         session_id: &str,
         latch_of: &WorkdirRoot,
     ) -> Result<Self, String> {
+        Self::create_locking_with(sessions_path, session_id, latch_of, take_lock)
+    }
+
+    /// [`Self::create`] with the session lock's `flock` attempt and the pause between attempts
+    /// supplied by the caller, as [`take_lock_with`] takes them.
+    #[cfg(test)]
+    pub(crate) fn create_with_lock(
+        sessions_path: &Path,
+        session_id: &str,
+        latch_of: &WorkdirRoot,
+        try_flock: impl FnMut(&OwnedFd) -> rustix::io::Result<()>,
+        pause: impl FnMut(Duration),
+    ) -> Result<Self, String> {
+        Self::create_locking_with(sessions_path, session_id, latch_of, |root, path| {
+            take_lock_with(root, path, try_flock, pause)
+        })
+    }
+
+    fn create_locking_with(
+        sessions_path: &Path,
+        session_id: &str,
+        latch_of: &WorkdirRoot,
+        take_lock: impl FnOnce(&WorkdirRoot, &Path) -> Result<OwnedFd, String>,
+    ) -> Result<Self, String> {
         let located = |path: &Path, reason: String| format!("{}: {reason}", path.display());
         let home = crate::murmur_home::ensure_murmur_home()?;
         if sessions_path.parent() != Some(home.as_path()) {
@@ -484,9 +508,48 @@ impl Drop for RemoveRuntimeDirOnDrop {
     }
 }
 
+/// How many times [`take_lock`] tries the session lock before refusing the launch.
+pub(crate) const LOCK_ATTEMPTS: u32 = 8;
+
+/// [`take_lock`]'s pause after its first failed attempt; each later pause doubles it.
+pub(crate) const LOCK_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(5);
+
+/// The longest single pause between [`take_lock`]'s attempts.
+pub(crate) const LOCK_RETRY_MAX_PAUSE: Duration = Duration::from_millis(100);
+
 /// Opens (creating it at `0600`) and exclusively locks `<session>/.lock`, following no link.
+///
+/// Errors with `<lock path>: <reason>` when the open fails or the lock is refused with anything
+/// but a transient errno, and with `<lock path>: <reason> after LOCK_ATTEMPTS attempts` when every
+/// attempt was transient.
 fn take_lock(session_dir_root: &WorkdirRoot, session_path: &Path) -> Result<OwnedFd, String> {
+    take_lock_with(
+        session_dir_root,
+        session_path,
+        |fd| rustix::fs::flock(fd, FlockOperation::NonBlockingLockExclusive),
+        std::thread::sleep,
+    )
+}
+
+/// [`take_lock`] with the non-blocking exclusive `flock` attempt and the pause between attempts
+/// supplied by the caller.
+///
+/// `WOULDBLOCK` and `INTR` are retried up to [`LOCK_ATTEMPTS`] times, the pause doubling from
+/// [`LOCK_RETRY_FIRST_PAUSE`] up to [`LOCK_RETRY_MAX_PAUSE`]. A holder that takes the lock only
+/// to judge it, such as a sweep removing a stale directory, releases it within milliseconds, so a
+/// short wait outlasts it. The attempts never block: a live session holds its lock for its whole
+/// life, so a second launch on the same lock is refused after the bounded wait rather than
+/// waited on.
+fn take_lock_with(
+    session_dir_root: &WorkdirRoot,
+    session_path: &Path,
+    mut try_flock: impl FnMut(&OwnedFd) -> rustix::io::Result<()>,
+    mut pause: impl FnMut(Duration),
+) -> Result<OwnedFd, String> {
     let lock_path = session_path.join(LOCK_FILE_NAME);
+    let refused = |errno: rustix::io::Errno| {
+        format!("{}: {}", lock_path.display(), std::io::Error::from(errno))
+    };
     let dir = session_dir_root
         .dir_fd()
         .map_err(|error| format!("{}: {error}", session_path.display()))?;
@@ -496,10 +559,23 @@ fn take_lock(session_dir_root: &WorkdirRoot, session_path: &Path) -> Result<Owne
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(crate::murmur_home::PRIVATE_FILE_MODE as rustix::fs::RawMode),
     )
-    .map_err(|errno| format!("{}: {}", lock_path.display(), std::io::Error::from(errno)))?;
-    rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive)
-        .map_err(|errno| format!("{}: {}", lock_path.display(), std::io::Error::from(errno)))?;
-    Ok(fd)
+    .map_err(refused)?;
+    let mut next_pause = LOCK_RETRY_FIRST_PAUSE;
+    let mut attempt = 1;
+    loop {
+        match try_flock(&fd) {
+            Ok(()) => return Ok(fd),
+            Err(errno @ (rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::INTR)) => {
+                if attempt == LOCK_ATTEMPTS {
+                    return Err(format!("{} after {LOCK_ATTEMPTS} attempts", refused(errno)));
+                }
+            }
+            Err(errno) => return Err(refused(errno)),
+        }
+        pause(next_pause);
+        next_pause = (next_pause * 2).min(LOCK_RETRY_MAX_PAUSE);
+        attempt += 1;
+    }
 }
 
 /// Removes every entry of `sessions` no live session holds and older than [`STALE_AFTER`]: a
@@ -507,6 +583,22 @@ fn take_lock(session_dir_root: &WorkdirRoot, session_path: &Path) -> Result<Owne
 /// `.lock` last modified before then. A live session's lock is never free, so its directory is
 /// never removed.
 fn sweep_stale(sessions: &WorkdirRoot, now: SystemTime) {
+    sweep_stale_with(sessions, now, |lock| {
+        rustix::fs::flock(lock, FlockOperation::NonBlockingLockExclusive)
+    });
+}
+
+/// [`sweep_stale`] with the non-blocking exclusive lock attempt on a stale directory's `.lock`
+/// supplied by the caller.
+///
+/// A `.lock` is judged by age before it is tried, and only one older than [`STALE_AFTER`] is
+/// tried. A session's `.lock` is created moments before [`take_lock`] locks it, so the sweep
+/// never holds a lock some launch is about to take.
+fn sweep_stale_with(
+    sessions: &WorkdirRoot,
+    now: SystemTime,
+    mut try_lock: impl FnMut(&OwnedFd) -> rustix::io::Result<()>,
+) {
     let Ok(Some(entries)) = sessions.list_dir("") else {
         return;
     };
@@ -541,9 +633,8 @@ fn sweep_stale(sessions: &WorkdirRoot, now: SystemTime) {
         );
         match lock {
             Ok(lock) => {
-                let free = rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive);
                 let stale = rustix::fs::fstat(&lock).is_ok_and(|stat| older_than_floor(&stat));
-                if free.is_ok() && stale {
+                if stale && try_lock(&lock).is_ok() {
                     let _ = sessions.remove_dir_all(&name);
                 }
             }
@@ -683,11 +774,289 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode & 0o077, 0, "the lock file is owner-only");
+        let refusal = take_lock(&root, &session).expect_err("a second lock is refused");
+        let lock_path = session.join(LOCK_FILE_NAME).display().to_string();
+        assert!(refusal.starts_with(&format!("{lock_path}: ")), "{refusal}");
         assert!(
-            take_lock(&root, &session).is_err(),
-            "a second lock is refused"
+            refusal.contains("Resource temporarily unavailable"),
+            "{refusal}"
         );
+        assert!(refusal.ends_with(" after 8 attempts"), "{refusal}");
         drop(held);
         assert!(take_lock(&root, &session).is_ok());
+    }
+
+    fn scratch_session() -> (tempfile::TempDir, PathBuf, WorkdirRoot) {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("ses_x");
+        std::fs::create_dir_all(&session).unwrap();
+        let root = WorkdirRoot::open(&session).unwrap();
+        (temp, session, root)
+    }
+
+    /// The real non-blocking exclusive `flock`, refused with `errno` for the first `failures`
+    /// calls.
+    fn flock_failing_first(
+        failures: usize,
+        errno: rustix::io::Errno,
+    ) -> impl FnMut(&OwnedFd) -> rustix::io::Result<()> {
+        let mut calls = 0;
+        move |fd| {
+            calls += 1;
+            if calls <= failures {
+                Err(errno)
+            } else {
+                rustix::fs::flock(fd, FlockOperation::NonBlockingLockExclusive)
+            }
+        }
+    }
+
+    fn assert_lock_held(session: &Path) {
+        let other = std::fs::File::open(session.join(LOCK_FILE_NAME)).unwrap();
+        assert_eq!(
+            rustix::fs::flock(&other, FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK),
+            "another open file description cannot take the held lock"
+        );
+    }
+
+    fn ms(values: &[u64]) -> Vec<Duration> {
+        values.iter().copied().map(Duration::from_millis).collect()
+    }
+
+    #[test]
+    fn runtime_dir_lock_retries_a_would_block_and_takes_the_lock() {
+        let (_temp, session, root) = scratch_session();
+        let mut pauses = Vec::new();
+        let held = take_lock_with(
+            &root,
+            &session,
+            flock_failing_first(3, rustix::io::Errno::WOULDBLOCK),
+            |pause| pauses.push(pause),
+        )
+        .unwrap();
+        assert_eq!(pauses, ms(&[5, 10, 20]));
+        assert_lock_held(&session);
+        drop(held);
+    }
+
+    #[test]
+    fn runtime_dir_lock_retries_an_interrupted_flock() {
+        let (_temp, session, root) = scratch_session();
+        let mut pauses = Vec::new();
+        let held = take_lock_with(
+            &root,
+            &session,
+            flock_failing_first(1, rustix::io::Errno::INTR),
+            |pause| pauses.push(pause),
+        )
+        .unwrap();
+        assert_eq!(pauses, ms(&[5]));
+        assert_lock_held(&session);
+        drop(held);
+    }
+
+    #[test]
+    fn runtime_dir_lock_retries_are_bounded_and_named_in_the_refusal() {
+        let (_temp, session, root) = scratch_session();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(session.join(LOCK_FILE_NAME))
+            .unwrap();
+        rustix::fs::flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let mut pauses = Vec::new();
+        let refusal = take_lock_with(
+            &root,
+            &session,
+            |fd| rustix::fs::flock(fd, FlockOperation::NonBlockingLockExclusive),
+            |pause| pauses.push(pause),
+        )
+        .expect_err("a lock held by another open file description is refused");
+        assert_eq!(pauses, ms(&[5, 10, 20, 40, 80, 100, 100]));
+        assert_eq!(pauses.len() as u32, LOCK_ATTEMPTS - 1);
+        assert_eq!(
+            pauses.iter().sum::<Duration>(),
+            Duration::from_millis(355),
+            "the bounded wait"
+        );
+        assert_eq!(
+            refusal,
+            format!(
+                "{}: Resource temporarily unavailable (os error 11) after 8 attempts",
+                session.join(LOCK_FILE_NAME).display()
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_dir_lock_retries_no_other_errno() {
+        let (_temp, session, root) = scratch_session();
+        let mut pauses = Vec::new();
+        let mut calls = 0;
+        let refusal = take_lock_with(
+            &root,
+            &session,
+            |_| {
+                calls += 1;
+                Err(rustix::io::Errno::INVAL)
+            },
+            |pause| pauses.push(pause),
+        )
+        .expect_err("a non-transient errno is refused");
+        assert_eq!(calls, 1, "tried once");
+        assert!(pauses.is_empty(), "no pause before refusing");
+        assert_eq!(
+            refusal,
+            format!(
+                "{}: {}",
+                session.join(LOCK_FILE_NAME).display(),
+                std::io::Error::from(rustix::io::Errno::INVAL)
+            )
+        );
+        assert!(!refusal.contains("after"), "{refusal}");
+    }
+
+    #[test]
+    fn runtime_dir_create_survives_a_contended_lock() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime_dir::tests::runtime_dir_create_survives_a_contended_lock_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by runtime_dir_create_survives_a_contended_lock"]
+    fn runtime_dir_create_survives_a_contended_lock_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let sessions_path = sessions_dir().unwrap();
+        let latch = tempfile::tempdir().unwrap();
+        let latch_root = WorkdirRoot::open(latch.path()).unwrap();
+        let mut pauses = Vec::new();
+        let dir = RuntimeDir::create_with_lock(
+            &sessions_path,
+            "ses_contended",
+            &latch_root,
+            flock_failing_first(4, rustix::io::Errno::WOULDBLOCK),
+            |pause| pauses.push(pause),
+        )
+        .unwrap();
+        assert_eq!(pauses, ms(&[5, 10, 20, 40]));
+        let session = sessions_path.join("ses_contended");
+        for sub in [RUNTIME_SUBDIR, SEALED_ETC_SUBDIR, HARNESS_SUBDIR] {
+            assert_eq!(
+                crate::murmur_home::mode_of(&session.join(sub)),
+                PRIVATE_DIR_MODE,
+                "{sub}"
+            );
+        }
+        assert_eq!(dir.path(), session.join(RUNTIME_SUBDIR));
+        assert_lock_held(&session);
+        drop(dir);
+        assert!(
+            std::fs::symlink_metadata(&session).is_err(),
+            "dropping the runtime directory removes {}",
+            session.display()
+        );
+    }
+
+    #[test]
+    fn runtime_dir_sweep_never_tries_a_fresh_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path();
+        let make = |name: &str, age: Duration| {
+            let dir = sessions.join(name);
+            std::fs::create_dir_all(dir.join(RUNTIME_SUBDIR)).unwrap();
+            std::fs::write(dir.join(LOCK_FILE_NAME), b"").unwrap();
+            set_mtime(&dir.join(LOCK_FILE_NAME), age);
+            dir
+        };
+        let fresh = make("ses_fresh", Duration::from_secs(10));
+        let stale = make("ses_stale", Duration::from_secs(61));
+        let stale_lock = std::fs::metadata(stale.join(LOCK_FILE_NAME)).unwrap();
+
+        let root = WorkdirRoot::open(sessions).unwrap();
+        let mut tried = Vec::new();
+        sweep_stale_with(&root, SystemTime::now(), |lock| {
+            let stat = rustix::fs::fstat(lock).unwrap();
+            tried.push((stat.st_dev, stat.st_ino));
+            rustix::fs::flock(lock, FlockOperation::NonBlockingLockExclusive)
+        });
+
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            tried,
+            vec![(stale_lock.dev(), stale_lock.ino())],
+            "only the 61-second-old lock is tried"
+        );
+        assert!(fresh.exists(), "a 10-second-old directory is kept");
+        assert!(
+            !stale.exists(),
+            "an unlocked 61-second-old directory is removed"
+        );
+    }
+
+    #[test]
+    fn runtime_dir_concurrent_creates_never_contend() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime_dir::tests::runtime_dir_concurrent_creates_never_contend_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by runtime_dir_concurrent_creates_never_contend"]
+    fn runtime_dir_concurrent_creates_never_contend_inner() {
+        const THREADS: usize = 64;
+        const CREATES_PER_THREAD: usize = 40;
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let sessions_path = sessions_dir().unwrap();
+        let latch = tempfile::tempdir().unwrap();
+        let latch_root = WorkdirRoot::open(latch.path()).unwrap();
+        let started = std::time::Instant::now();
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    let sessions_path = &sessions_path;
+                    let latch_root = &latch_root;
+                    scope.spawn(move || {
+                        let mut failures = Vec::new();
+                        for i in 0..CREATES_PER_THREAD {
+                            let id = format!("ses_t{thread}_{i}");
+                            match RuntimeDir::create(sessions_path, &id, latch_root) {
+                                Ok(dir) => drop(dir),
+                                Err(reason) => failures.push(format!("{id}: {reason}")),
+                            }
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            failures.is_empty(),
+            "{} of {} creations failed: {failures:#?}",
+            failures.len(),
+            THREADS * CREATES_PER_THREAD
+        );
+        let left: Vec<_> = std::fs::read_dir(&sessions_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "sessions/ is empty: {left:?}");
+        assert!(elapsed < Duration::from_secs(60), "took {elapsed:?}");
     }
 }
