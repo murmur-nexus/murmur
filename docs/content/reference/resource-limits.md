@@ -146,10 +146,19 @@ or has any `runtime: tool`, `runtime: driver` or `runtime: hook` artifact or a n
 `capabilities.install.tool`, each of which runs in a [guest worker](../concepts/guest-workers.md)
 process. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
 the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any
-setup. When no systemd user session is reachable, it falls back to whatever cgroup it already
-inherited, which must itself carry `Delegate=yes` for `memory pids cpu io` (for example, by running
-under a unit configured that way, or via `systemd-run --user --scope --property=Delegate=yes`). A
-capsule with none of these, such as one made only of skills, is never blocked. See
+setup. What happens next depends on how systemd answers:
+
+| systemd | `mur` |
+|---|---|
+| Moves `mur` into the scope within 30 s of the request | Builds the session's cgroup under that scope |
+| Is unreachable, or refuses the request | Uses the cgroup it inherited |
+| Accepts the request but does not move `mur` within 30 s | Stops the unit, then uses the cgroup it inherited; a refusal then names the unit it gave up on |
+| Does not answer the request within 30 s, does not confirm the stop within 5 s, or moves `mur` into the unit while stopping it | Refuses with `E-RUN-012` |
+
+An inherited cgroup must itself carry `Delegate=yes` for `memory pids cpu io` (for example, by
+running under a unit configured that way, or via `systemd-run --user --scope
+--property=Delegate=yes`); otherwise the launch refuses with `E-RUN-012`. A capsule with none of
+these, such as one made only of skills, is never blocked. See
 [Verification](containment.md#verification) for how these bounds are checked by hand.
 
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone

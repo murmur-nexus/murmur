@@ -99,9 +99,15 @@ runtime:
 1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
    `Delegate=yes` and moves itself into it — the same mechanism rootless Podman and Docker use —
    so the scope it builds under is one it is the only process in, regardless of what cgroup it was
-   started from (an interactive shell, `cargo test`, anything else). This step is silent and
-   best-effort: on a host with no systemd user session reachable, it is skipped and step 2 runs
-   against whatever cgroup the process actually inherited;
+   started from (an interactive shell, `cargo test`, anything else). It waits up to 30 s from the
+   request for systemd to move it, then:
+    - on a host with no systemd user session reachable, or when systemd refuses the request, step 2
+      runs against whatever cgroup the process inherited;
+    - when systemd accepted the request but did not move the process in time, it stops the unit
+      (`systemctl --user list-units --all 'murmur-*'` lists no leftover unit) and step 2 runs
+      against the inherited cgroup;
+    - when the stop cannot be confirmed, or the move lands while the unit is being stopped, the
+      launch refuses with `E-RUN-012` instead;
 2. reads `/proc/self/cgroup` for the `0::` line and joins it to the `cgroup2` mount from
    `/proc/mounts` to find its delegated base;
 3. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`

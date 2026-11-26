@@ -2215,31 +2215,156 @@ fn delegated_base() -> Result<PathBuf, CgroupError> {
         return Ok(base.clone());
     }
 
-    // Best-effort: relocate into our own scope before probing. On failure, the probe below runs
-    // against the inherited cgroup — the correct fallback on a host with no systemd to ask.
-    move_self_into_own_systemd_scope();
-
-    let base = probe_delegation()?;
-    enable_controllers(&base)?;
+    let give_up = match base_decision(move_self_into_own_systemd_scope()) {
+        BaseDecision::Refuse(reason) => return Err(CgroupError::from(reason)),
+        BaseDecision::Probe { give_up } => give_up,
+    };
+    let base = probe_delegation()
+        .and_then(|base| enable_controllers(&base).map(|()| base))
+        .map_err(|error| with_give_up(error, give_up))?;
     *cached = Some(base.clone());
     Ok(base)
+}
+
+/// How long a launch waits for systemd to move it into the transient scope it asked for, from
+/// just before `StartTransientUnit` is sent until `/proc/<pid>/cgroup` names the unit.
+///
+/// The move normally lands a millisecond or two after the request, but systemd's user manager
+/// works through its job queue on one thread: with hundreds of launches asking at once, the last
+/// move in the queue lands seconds after its request. A launch that gives up too early is refused
+/// or runs in the cgroup it inherited, so the bound is generous; reaching it means systemd is
+/// stuck, not busy.
+#[cfg(target_os = "linux")]
+const SCOPE_MOVE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a launch waits for systemd to answer `StopUnit` for a unit it gave up on.
+#[cfg(target_os = "linux")]
+const SCOPE_STOP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// What asking systemd for this process's own transient scope came to.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeAttempt {
+    /// The process is in the unit it asked for.
+    Joined,
+    /// No unit can exist: there is no session bus, the D-Bus thread could not be spawned, or
+    /// systemd answered the request with an error. Nothing was stopped, because nothing was
+    /// created; the process is where it was.
+    NotCreated(String),
+    /// systemd accepted the request but did not move the process within the bound; the unit was
+    /// stopped, and the process was confirmed outside it after the stop was answered. The process
+    /// is where it was.
+    GaveUp(String),
+    /// A move into the unit may still land, or landed after the launch gave up on it: systemd did
+    /// not answer the request in time, stopping the unit could not be confirmed, or the process
+    /// was found in the unit only after the stop was answered. Where the process will live is
+    /// unknown, so the launch is refused.
+    Unsettled(String),
+}
+
+/// How the `StartTransientUnit` request ended, before any stop: the input [`classify`] decides
+/// a [`ScopeAttempt`] from.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartReply {
+    /// systemd answered with a job and the process moved into the unit by the deadline.
+    Joined,
+    /// No unit can exist; the reason why.
+    Refused(String),
+    /// systemd answered with a job, but the process was not in the unit by the deadline.
+    NotJoined(String),
+    /// systemd did not answer by the deadline, so whether a unit exists is unknown.
+    Unanswered(String),
+}
+
+/// What [`delegated_base`] does with a [`ScopeAttempt`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BaseDecision {
+    /// Refuse with this reason, without probing.
+    Refuse(String),
+    /// Probe the cgroup the process is in; a refusal from the probe carries `give_up`, the reason
+    /// the launch is not in a scope of its own, appended.
+    Probe { give_up: Option<String> },
+}
+
+/// The [`ScopeAttempt`] a request ended in. `stop` is called only for a unit systemd may have
+/// created and the process is not in: it sends `StopUnit` and returns whether the process is in
+/// the unit once the stop was answered, or why the stop could not be confirmed.
+#[cfg(target_os = "linux")]
+fn classify(reply: StartReply, stop: impl FnOnce() -> Result<bool, String>) -> ScopeAttempt {
+    match reply {
+        StartReply::Joined => ScopeAttempt::Joined,
+        StartReply::Refused(reason) => ScopeAttempt::NotCreated(reason),
+        StartReply::Unanswered(reason) => {
+            // Best-effort: whatever the stop answers, the request itself may still be in flight.
+            let _ = stop();
+            ScopeAttempt::Unsettled(format!(
+                "{reason}; the unit was asked to stop, but a move into it may still land"
+            ))
+        }
+        StartReply::NotJoined(reason) => match stop() {
+            Ok(false) => ScopeAttempt::GaveUp(format!("{reason}, so the unit was stopped")),
+            Ok(true) => ScopeAttempt::Unsettled(format!(
+                "{reason}; the move landed while the unit was being stopped"
+            )),
+            Err(error) => ScopeAttempt::Unsettled(format!(
+                "{reason}, and stopping the unit could not be confirmed ({error}), so a move \
+                 into it may still land"
+            )),
+        },
+    }
+}
+
+/// [`delegated_base`]'s decision for `attempt`: an unsettled move refuses outright, a joined or
+/// never-created unit probes the cgroup the process is in, and a stopped unit probes with its
+/// reason kept for the refusal.
+#[cfg(target_os = "linux")]
+fn base_decision(attempt: &ScopeAttempt) -> BaseDecision {
+    match attempt {
+        ScopeAttempt::Unsettled(reason) => BaseDecision::Refuse(reason.clone()),
+        ScopeAttempt::GaveUp(reason) => BaseDecision::Probe {
+            give_up: Some(reason.clone()),
+        },
+        ScopeAttempt::Joined | ScopeAttempt::NotCreated(_) => BaseDecision::Probe { give_up: None },
+    }
+}
+
+/// `error` with `give_up` appended to its message, its errno kept.
+#[cfg(target_os = "linux")]
+fn with_give_up(error: CgroupError, give_up: Option<String>) -> CgroupError {
+    match give_up {
+        Some(give_up) => CgroupError {
+            message: format!("{}; {give_up}", error.message),
+            errno: error.errno,
+        },
+        None => error,
+    }
 }
 
 /// Ask the systemd user manager for a freshly created, delegated transient scope holding this
 /// process, so the cgroup this runtime builds under is one it is the only occupant of.
 ///
-/// Best-effort and non-fatal: every failure here (no systemd, no session bus, policy denial, a
-/// migration that never lands) leaves the process exactly where it was — the state
-/// [`probe_delegation`] handles. Never let a failed optimisation become a launch refusal.
+/// A unit that cannot be created ([`ScopeAttempt::NotCreated`]: no systemd, no session bus, a
+/// refused request) and a unit given up on and stopped ([`ScopeAttempt::GaveUp`]) leave the
+/// process where it was, the state [`probe_delegation`] handles. A move that may still land
+/// ([`ScopeAttempt::Unsettled`]) refuses the launch: probing a cgroup the process may be moved out
+/// of at any moment would build the session's scope in the wrong place.
 ///
-/// Runs at most once per process — a scope is a property of the process, not the session, and
-/// [`delegated_base`] retries on failure but caches only success, so the guard has to live here.
+/// Runs at most once per process, and every caller sees the same outcome: a scope is a property
+/// of the process, not the session, and [`delegated_base`] retries on failure but caches only
+/// success, so the guard has to live here.
 #[cfg(target_os = "linux")]
-fn move_self_into_own_systemd_scope() {
-    static ATTEMPTED: std::sync::Once = std::sync::Once::new();
-    ATTEMPTED.call_once(|| {
-        let _ = request_transient_scope(&transient_scope_unit_name());
-    });
+fn move_self_into_own_systemd_scope() -> &'static ScopeAttempt {
+    static SCOPE_ATTEMPT: std::sync::OnceLock<ScopeAttempt> = std::sync::OnceLock::new();
+    SCOPE_ATTEMPT.get_or_init(|| {
+        request_transient_scope(
+            &transient_scope_unit_name(),
+            &scope_pids(),
+            std::process::id(),
+            SCOPE_MOVE_DEADLINE,
+        )
+    })
 }
 
 /// Name of the transient scope unit to ask systemd for.
@@ -2255,21 +2380,86 @@ fn transient_scope_unit_name() -> String {
     format!("murmur-{}-{serial}.scope", std::process::id())
 }
 
-/// The D-Bus half of [`move_self_into_own_systemd_scope`], plus confirmation that the kernel
-/// actually moved us.
+/// Starts `unit` holding `pids` and waits, up to `deadline` from just before the request is sent,
+/// for `member` to be in it; gives up on a unit systemd accepted by stopping it.
+///
+/// Production passes this process as `member` and as the first of `pids`.
 #[cfg(target_os = "linux")]
-fn request_transient_scope(unit: &str) -> Result<(), String> {
-    // `zbus::block_on` drives the connection on the calling thread and panics or deadlocks inside
-    // another runtime's task; run it on a thread of its own so a caller inside tokio is safe.
-    let owned_unit = unit.to_string();
+fn request_transient_scope(
+    unit: &str,
+    pids: &[u32],
+    member: u32,
+    deadline: Duration,
+) -> ScopeAttempt {
+    let bound = std::time::Instant::now() + deadline;
+    let reply = {
+        let (owned_unit, owned_pids) = (unit.to_string(), pids.to_vec());
+        match on_bus_thread(bound, move || {
+            start_transient_scope(&owned_unit, &owned_pids)
+        }) {
+            Ok(Ok(())) => match await_scope_membership(unit, member, bound) {
+                Ok(()) => StartReply::Joined,
+                Err(reason) => {
+                    StartReply::NotJoined(format!("{reason} within {}", display_bound(deadline)))
+                }
+            },
+            Ok(Err(StartFailure::NoUnit(reason))) => StartReply::Refused(reason),
+            Ok(Err(StartFailure::AnswerLost(reason))) => StartReply::Unanswered(reason),
+            Err(BusWait::NotSpawned(reason)) => StartReply::Refused(reason),
+            Err(BusWait::Unanswered) => StartReply::Unanswered(format!(
+                "systemd did not answer the request for {unit} within {}",
+                display_bound(deadline)
+            )),
+        }
+    };
+    classify(reply, || {
+        stop_transient_scope(unit, SCOPE_STOP_DEADLINE)?;
+        Ok(in_unit(unit, member))
+    })
+}
+
+/// `deadline` as a reason prints it: whole seconds as `30 s`, anything else in milliseconds.
+#[cfg(target_os = "linux")]
+fn display_bound(deadline: Duration) -> String {
+    if deadline.subsec_millis() == 0 {
+        format!("{} s", deadline.as_secs())
+    } else {
+        format!("{} ms", deadline.as_millis())
+    }
+}
+
+/// Why [`on_bus_thread`] has no answer.
+#[cfg(target_os = "linux")]
+enum BusWait {
+    /// The thread could not be started, so nothing was sent.
+    NotSpawned(String),
+    /// No answer by the deadline, or the thread died without one: a call may have been sent.
+    Unanswered,
+}
+
+/// Runs `call` on a `murmur-cgroup-scope` thread and waits for its result until `deadline`.
+///
+/// `zbus::block_on` drives the connection on the calling thread and panics or deadlocks inside
+/// another runtime's task, so the D-Bus call needs a thread of its own; waiting on a channel
+/// rather than joining keeps the wait bounded when systemd is slow to answer. A thread whose answer
+/// comes too late finishes on its own and its result is dropped.
+#[cfg(target_os = "linux")]
+fn on_bus_thread<T: Send + 'static>(
+    deadline: std::time::Instant,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, BusWait> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("murmur-cgroup-scope".to_string())
-        .spawn(move || start_transient_scope(&owned_unit))
-        .map_err(|error| format!("could not spawn the D-Bus thread: {error}"))?
-        .join()
-        .map_err(|_| "the D-Bus thread panicked".to_string())??;
-
-    await_scope_membership(unit)
+        .spawn(move || {
+            let _ = sender.send(call());
+        })
+        .map_err(|error| {
+            BusWait::NotSpawned(format!("could not spawn the D-Bus thread: {error}"))
+        })?;
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| BusWait::Unanswered)
 }
 
 /// This process, then every companion still alive: what the transient scope is started with.
@@ -2284,8 +2474,18 @@ fn scope_pids() -> Vec<u32> {
     pids
 }
 
-/// `StartTransientUnit` on the systemd user manager: create `unit` as a scope containing this
-/// process, with its cgroup subtree delegated to us.
+/// Why [`start_transient_scope`] did not get a job back.
+#[cfg(target_os = "linux")]
+enum StartFailure {
+    /// No unit can exist: there is no session bus, or systemd answered with an error.
+    NoUnit(String),
+    /// The request was sent but its answer was lost to a bus or connection failure, so systemd
+    /// may have queued the job.
+    AnswerLost(String),
+}
+
+/// `StartTransientUnit` on the systemd user manager: create `unit` as a scope containing `pids`,
+/// with its cgroup subtree delegated to us.
 ///
 /// The call is
 /// `org.freedesktop.systemd1.Manager.StartTransientUnit(in s name, in s mode, in a(sv) properties,
@@ -2300,8 +2500,12 @@ fn scope_pids() -> Vec<u32> {
 /// * `CollectMode` (`s`) — `inactive-or-failed`, so the unit is garbage-collected when this
 ///   process exits rather than lingering as a failed unit an operator has to reset.
 /// * `Description` (`s`) — what `systemctl --user list-units` shows beside the unit.
+///
+/// `Ok` means systemd answered with a job, which it does once the job is *enqueued*; the move
+/// itself lands later ([`await_scope_membership`]). The success path sends this one call and
+/// nothing else.
 #[cfg(target_os = "linux")]
-fn start_transient_scope(unit: &str) -> Result<(), String> {
+fn start_transient_scope(unit: &str, pids: &[u32]) -> Result<(), StartFailure> {
     use zbus::Variant;
 
     let properties: Vec<(&str, Variant<'_>)> = vec![
@@ -2309,7 +2513,7 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
             "Description",
             Variant::from("Murmur capsule subprocess scope"),
         ),
-        ("PIDs", Variant::from(scope_pids())),
+        ("PIDs", Variant::from(pids.to_vec())),
         ("Delegate", Variant::from(true)),
         ("CollectMode", Variant::from("inactive-or-failed")),
     ];
@@ -2319,7 +2523,7 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
     zbus::block_on(async {
         let connection = zbus::Connection::session()
             .await
-            .map_err(|error| format!("no systemd session bus: {error}"))?;
+            .map_err(|error| StartFailure::NoUnit(format!("no systemd session bus: {error}")))?;
         connection
             .call_method(
                 Some("org.freedesktop.systemd1"),
@@ -2332,39 +2536,133 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
             )
             .await
             .map(|_| ())
-            .map_err(|error| format!("systemd refused to start {unit}: {error}"))
+            .map_err(|error| match error {
+                // An error reply: systemd answered and created nothing.
+                zbus::Error::MethodError(..) | zbus::Error::FDO(_) => {
+                    StartFailure::NoUnit(format!("systemd refused to start {unit}: {error}"))
+                }
+                error => StartFailure::AnswerLost(format!(
+                    "the answer to the request for {unit} was lost: {error}"
+                )),
+            })
     })
 }
 
-/// Wait until `/proc/self/cgroup` actually reports us inside `unit`'s cgroup.
+/// `StopUnit(unit, "replace")` on the systemd user manager, waiting up to `deadline` for the
+/// answer. A unit systemd does not know (`org.freedesktop.systemd1.NoSuchUnit`) is `Ok`: nothing
+/// is left to stop.
+///
+/// Sent only for a unit this launch asked for and gave up on. `"replace"` cancels a start job that
+/// is still queued, and the manager handles jobs and bus messages on one thread, so once the stop
+/// is answered the move into `unit` has either happened already or never will.
+///
+/// Stopping a scope signals every process in it. If the move landed after the last membership
+/// read, the stop signals this process and the `pids` it was started with; never send it for a
+/// unit this process may still need.
+#[cfg(target_os = "linux")]
+fn stop_transient_scope(unit: &str, deadline: Duration) -> Result<(), String> {
+    let owned_unit = unit.to_string();
+    let call = move || {
+        zbus::block_on(async {
+            let connection = zbus::Connection::session()
+                .await
+                .map_err(|error| format!("no systemd session bus: {error}"))?;
+            match connection
+                .call_method(
+                    Some("org.freedesktop.systemd1"),
+                    "/org/freedesktop/systemd1",
+                    Some("org.freedesktop.systemd1.Manager"),
+                    "StopUnit",
+                    &(owned_unit.as_str(), "replace"),
+                )
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(zbus::Error::MethodError(name, _, _))
+                    if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(format!("systemd refused to stop {owned_unit}: {error}")),
+            }
+        })
+    };
+    match on_bus_thread(std::time::Instant::now() + deadline, call) {
+        Ok(result) => result,
+        Err(BusWait::NotSpawned(reason)) => Err(reason),
+        Err(BusWait::Unanswered) => Err(format!(
+            "systemd did not answer the stop of {unit} within {}",
+            display_bound(deadline)
+        )),
+    }
+}
+
+/// Whether `/proc/<member>/cgroup` names `unit` as the cgroup `member` is in.
+#[cfg(target_os = "linux")]
+fn in_unit(unit: &str, member: u32) -> bool {
+    let current = std::fs::read_to_string(format!("/proc/{member}/cgroup")).unwrap_or_default();
+    parse_unified_cgroup_path(&current).is_some_and(|path| path.rsplit('/').next() == Some(unit))
+}
+
+/// The sleep after membership poll number `poll` (counting from 0): 1 ms for the first 20 polls,
+/// then doubling from 2 ms, capped at 25 ms.
+///
+/// The move lands a millisecond or two after `StartTransientUnit` returns on a quiet host, and this
+/// wait sits on the launch path of every capsule that needs a scope, so the first polls are 1 ms
+/// apart. A move that has not landed after 20 ms is queued behind other launches' jobs, and the
+/// backoff keeps hundreds of waiting launches from reading `/proc/<pid>/cgroup` in a tight loop.
+#[cfg(target_os = "linux")]
+fn membership_poll_interval(poll: u32) -> Duration {
+    const FAST_POLLS: u32 = 20;
+    const CAP_MS: u64 = 25;
+    if poll < FAST_POLLS {
+        return Duration::from_millis(1);
+    }
+    let doubled = 1_u64.checked_shl(poll - FAST_POLLS + 1).unwrap_or(u64::MAX);
+    Duration::from_millis(doubled.min(CAP_MS))
+}
+
+/// What the wait sleeps after poll `poll` at `now`: [`membership_poll_interval`], cut short at
+/// `deadline`.
+#[cfg(target_os = "linux")]
+fn membership_sleep(poll: u32, now: std::time::Instant, deadline: std::time::Instant) -> Duration {
+    membership_poll_interval(poll).min(deadline.saturating_duration_since(now))
+}
+
+/// Waits until `/proc/<member>/cgroup` reports `member` inside `unit`'s cgroup, or `deadline`
+/// passes.
 ///
 /// `StartTransientUnit` returns once the job is *enqueued*, not once the move has happened, and
 /// every later step (the delegation probe, the controller enable, the scope directory) depends on
-/// where this process actually lives — so migration is confirmed from `/proc/self/cgroup`, the
-/// same source the rest of this module reads, rather than inferred from a job object path.
+/// where this process actually lives — so migration is confirmed from the same `cgroup` file the
+/// rest of this module reads, rather than inferred from a job object path.
 ///
-/// The 2s deadline mirrors [`enable_controllers`]: both wait on systemd/kernel bookkeeping that
-/// normally completes in a millisecond or two, and a wait that long means something structural is
-/// wrong. A timeout here is cheap — the caller ignores it and falls back to probing the inherited
-/// cgroup. The step is 1ms because this wait sits on the launch path of every capsule that needs a
-/// scope, and the move lands a millisecond or two after `StartTransientUnit` returns, so every
-/// step the loop oversleeps is added to the launch.
+/// The deadline is [`SCOPE_MOVE_DEADLINE`] from the request in production: with hundreds of
+/// launches in flight the user manager works through their move jobs one after another, and a
+/// launch late in that queue is moved seconds after it asked. Polls back off
+/// ([`membership_poll_interval`]) because reading `/proc/<pid>/cgroup` takes the kernel's
+/// `cgroup_mutex`, which systemd's migrations and every capsule's cgroup `mkdir` also need: hundreds
+/// of launches polling every millisecond hold up the very moves they wait for. The last read is
+/// at the deadline, never later.
 #[cfg(target_os = "linux")]
-fn await_scope_membership(unit: &str) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+fn await_scope_membership(
+    unit: &str,
+    member: u32,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut poll = 0_u32;
     loop {
-        let current = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        if let Some(path) = parse_unified_cgroup_path(&current) {
-            if path.rsplit('/').next() == Some(unit) {
-                return Ok(());
-            }
+        if in_unit(unit, member) {
+            return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        if now >= deadline {
             return Err(format!(
-                "systemd accepted the request for {unit} but this process is not in it"
+                "systemd accepted the request for {unit} but did not move process {member} into it"
             ));
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(membership_sleep(poll, now, deadline));
+        poll = poll.saturating_add(1);
     }
 }
 
@@ -3638,6 +3936,304 @@ mod tests {
         assert!(first.starts_with(&format!("murmur-{}-", std::process::id())));
         assert!(first.ends_with(".scope"));
         assert_ne!(first, second);
+    }
+
+    /// A reason as [`request_transient_scope`] words a move that did not land by the deadline.
+    #[cfg(target_os = "linux")]
+    fn not_joined_reply(unit: &str) -> StartReply {
+        let reason = await_scope_membership(unit, std::process::id(), std::time::Instant::now())
+            .expect_err("this process is not in a unit that was never started");
+        StartReply::NotJoined(format!(
+            "{reason} within {}",
+            display_bound(SCOPE_MOVE_DEADLINE)
+        ))
+    }
+
+    /// A unit that cannot exist is never stopped: whatever answered, this launch created nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_attempt_refusals_are_not_created_and_send_no_stop() {
+        for reason in [
+            "systemd refused to start murmur-1-0.scope: org.freedesktop.DBus.Error.AccessDenied: \
+             denied",
+            "systemd refused to start murmur-1-0.scope: org.freedesktop.systemd1.UnitExists: Unit \
+             murmur-1-0.scope already exists.",
+            "no systemd session bus: I/O error: No such file or directory (os error 2)",
+            "could not spawn the D-Bus thread: Resource temporarily unavailable (os error 11)",
+        ] {
+            let attempt = classify(StartReply::Refused(reason.to_string()), || {
+                panic!("a unit this launch did not create was stopped")
+            });
+            assert_eq!(attempt, ScopeAttempt::NotCreated(reason.to_string()));
+            assert_eq!(
+                base_decision(&attempt),
+                BaseDecision::Probe { give_up: None },
+                "a host with no unit to give up on probes as it always did"
+            );
+        }
+    }
+
+    /// An accepted request whose move did not land is stopped, confirmed outside the unit, and
+    /// probed; a probe refusal then carries the give-up after its own reason.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_attempt_given_up_on_is_stopped_and_its_reason_ends_a_probe_refusal() {
+        let unit = "murmur-1-0.scope";
+        let stops = std::cell::Cell::new(0);
+        let attempt = classify(not_joined_reply(unit), || {
+            stops.set(stops.get() + 1);
+            Ok(false)
+        });
+        assert_eq!(stops.get(), 1, "a unit given up on is stopped once");
+        let ScopeAttempt::GaveUp(give_up) = &attempt else {
+            panic!("expected GaveUp, got {attempt:?}");
+        };
+        for part in [unit, "30 s", "stopped"] {
+            assert!(give_up.contains(part), "{give_up:?} does not name {part:?}");
+        }
+
+        let BaseDecision::Probe {
+            give_up: Some(carried),
+        } = base_decision(&attempt)
+        else {
+            panic!("a unit given up on and stopped must still be probed");
+        };
+        let probe_refusal = CgroupError {
+            message: "delegated cgroup directory /sys/fs/cgroup/x does not exist".to_string(),
+            errno: Some(2),
+        };
+        let refusal = with_give_up(probe_refusal, Some(carried));
+        assert!(
+            refusal.message.starts_with("delegated cgroup directory"),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.message.ends_with(&format!("; {give_up}")),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.errno, Some(2), "the probe's errno is kept");
+    }
+
+    /// No answer to the request by the deadline: the stop is sent anyway, and the launch refuses
+    /// without probing, since the request may still be acted on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_attempt_unanswered_request_is_unsettled_and_refuses_without_probing() {
+        for stop_answer in [Ok(false), Err("no answer".to_string())] {
+            let stops = std::cell::Cell::new(0);
+            let attempt = classify(
+                StartReply::Unanswered(
+                    "systemd did not answer the request for murmur-1-0.scope within 30 s"
+                        .to_string(),
+                ),
+                || {
+                    stops.set(stops.get() + 1);
+                    stop_answer.clone()
+                },
+            );
+            assert_eq!(stops.get(), 1, "the stop is sent even with no answer");
+            let ScopeAttempt::Unsettled(reason) = &attempt else {
+                panic!("expected Unsettled, got {attempt:?}");
+            };
+            assert!(reason.contains("murmur-1-0.scope"), "{reason}");
+            assert_eq!(
+                base_decision(&attempt),
+                BaseDecision::Refuse(reason.clone())
+            );
+        }
+    }
+
+    /// A stop that errored or timed out, or a move found only after the stop was answered, leaves
+    /// where this process lives unknown: the launch refuses without probing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_attempt_unconfirmed_stop_or_late_move_is_unsettled() {
+        let unit = "murmur-1-0.scope";
+        for (stop_answer, expected) in [
+            (
+                Err("systemd did not answer the stop of murmur-1-0.scope within 5 s".to_string()),
+                "stopping the unit could not be confirmed (systemd did not answer the stop",
+            ),
+            (
+                Err(
+                    "systemd refused to stop murmur-1-0.scope: org.freedesktop.DBus.Error.\
+                     AccessDenied: denied"
+                        .to_string(),
+                ),
+                "stopping the unit could not be confirmed (systemd refused to stop",
+            ),
+            (Ok(true), "the move landed while the unit was being stopped"),
+        ] {
+            let attempt = classify(not_joined_reply(unit), || stop_answer);
+            let ScopeAttempt::Unsettled(reason) = &attempt else {
+                panic!("expected Unsettled, got {attempt:?}");
+            };
+            assert!(reason.contains(expected), "{reason:?}");
+            assert!(reason.contains(unit), "{reason:?}");
+            assert_eq!(
+                base_decision(&attempt),
+                BaseDecision::Refuse(reason.clone())
+            );
+        }
+    }
+
+    /// A joined unit is probed with nothing to stop, and a refusal carries nothing extra.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_attempt_joined_probes_unchanged() {
+        let attempt = classify(StartReply::Joined, || panic!("a joined unit was stopped"));
+        assert_eq!(attempt, ScopeAttempt::Joined);
+        assert_eq!(
+            base_decision(&attempt),
+            BaseDecision::Probe { give_up: None }
+        );
+        let refusal = CgroupError {
+            message: "controllers missing".to_string(),
+            errno: Some(16),
+        };
+        assert_eq!(with_give_up(refusal.clone(), None), refusal);
+    }
+
+    /// 1 ms for the first 20 polls, so a quiet host's move is seen as soon as it lands, then
+    /// doubling to a 25 ms cap; the whole bound is 30 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn membership_polls_back_off_from_one_millisecond_to_a_25_ms_cap() {
+        for poll in 0..20 {
+            assert_eq!(membership_poll_interval(poll), Duration::from_millis(1));
+        }
+        let backoff: Vec<u128> = (20..26)
+            .map(|poll| membership_poll_interval(poll).as_millis())
+            .collect();
+        assert_eq!(backoff, [2, 4, 8, 16, 25, 25]);
+        for poll in [100, 1_000, u32::MAX] {
+            assert_eq!(membership_poll_interval(poll), Duration::from_millis(25));
+        }
+        assert_eq!(SCOPE_MOVE_DEADLINE, Duration::from_secs(30));
+        assert_eq!(SCOPE_STOP_DEADLINE, Duration::from_secs(5));
+    }
+
+    /// The wait never sleeps past its deadline, and returns once it is reached.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn membership_polls_never_sleep_past_the_deadline() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            membership_sleep(30, now, now + Duration::from_millis(3)),
+            Duration::from_millis(3)
+        );
+        assert_eq!(
+            membership_sleep(30, now + Duration::from_secs(1), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            membership_sleep(0, now, now + Duration::from_secs(1)),
+            Duration::from_millis(1)
+        );
+
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let waited =
+            await_scope_membership("murmur-never-started.scope", std::process::id(), deadline);
+        let returned = std::time::Instant::now();
+        assert!(waited.is_err());
+        assert!(returned >= deadline, "the wait gave up before its deadline");
+        assert!(
+            returned < deadline + Duration::from_secs(1),
+            "the wait overslept its deadline by {:?}",
+            returned - deadline
+        );
+    }
+
+    /// Asks the session bus whether systemd still knows `unit`.
+    #[cfg(target_os = "linux")]
+    fn systemd_knows_unit(unit: &str) -> bool {
+        zbus::block_on(async {
+            let connection = zbus::Connection::session().await.expect("session bus");
+            match connection
+                .call_method(
+                    Some("org.freedesktop.systemd1"),
+                    "/org/freedesktop/systemd1",
+                    Some("org.freedesktop.systemd1.Manager"),
+                    "GetUnit",
+                    &(unit,),
+                )
+                .await
+            {
+                Ok(_) => true,
+                Err(zbus::Error::MethodError(name, _, _))
+                    if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+                {
+                    false
+                }
+                Err(error) => panic!("GetUnit {unit}: {error}"),
+            }
+        })
+    }
+
+    /// The production request against the real user manager, forced to give up: the scope is
+    /// started with one child while the wait watches another that is never moved, so the wait
+    /// reaches its real deadline. The unit is stopped and gone afterwards, and this test process,
+    /// which is never in `PIDs`, is never moved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scope_given_up_on_is_stopped_and_leaves_no_unit() {
+        const NAME: &str = "a_scope_given_up_on_is_stopped_and_leaves_no_unit";
+        if zbus::block_on(zbus::Connection::session()).is_err() {
+            crate::runtime_err!("[SKIP-HOST] {NAME}: no systemd user manager on the session bus");
+            return;
+        }
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unit = format!(
+            "murmur-test-{}-{}.scope",
+            std::process::id(),
+            SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let spawn_sleeper = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep")
+        };
+        let mut moved = spawn_sleeper();
+        let mut watched = spawn_sleeper();
+
+        let attempt = request_transient_scope(
+            &unit,
+            &[moved.id()],
+            watched.id(),
+            Duration::from_millis(300),
+        );
+        let own_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let gone_by = std::time::Instant::now() + Duration::from_secs(10);
+        let mut known = systemd_knows_unit(&unit);
+        while known && std::time::Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+            known = systemd_knows_unit(&unit);
+        }
+
+        for child in [&mut moved, &mut watched] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let ScopeAttempt::GaveUp(reason) = &attempt else {
+            panic!("expected GaveUp, got {attempt:?}");
+        };
+        for part in [unit.as_str(), "300 ms", "stopped"] {
+            assert!(reason.contains(part), "{reason:?} does not name {part:?}");
+        }
+        assert!(
+            !known,
+            "{unit} is still known to systemd 10 s after it was stopped"
+        );
+        assert!(
+            !own_cgroup.contains(&unit),
+            "the test process was moved into {unit}: {own_cgroup}"
+        );
+        assert!(!std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap_or_default()
+            .contains(&unit));
     }
 
     #[test]
