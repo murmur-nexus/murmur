@@ -21,7 +21,10 @@
 //! # How a class's expectations are chosen
 //!
 //! * **`scoped`** is the class this suite exists to assert. Every boundary case is
-//!   `Must(Refused)` except `stat-outside-workdir`, which is `Must(Succeeded)`.
+//!   `Must(Refused)` except three that assert `Must(Succeeded)`, each the class working as
+//!   declared and not an escape: `stat-outside-workdir` (Landlock does not mediate metadata),
+//!   `signal-pid1` (pid 1 is the session's PID-namespace init) and `records-writable-subfolders`
+//!   (the session's `home/` and `tmp/` records sub-folders are writable by design).
 //! * **`advisory`** is convention-only: `achieved_class_for_tier` maps both `EnvironmentOnly` and
 //!   `KernelSeccompOnly` to it, so it can promise nothing about the filesystem and cannot promise
 //!   seccomp either. Kernel-mediated cases are therefore [`Expectation::NotAsserted`] — they
@@ -55,13 +58,12 @@
 //!
 //! Every case runs on [`Route::ShellTool`], graded on the three class columns. A case whose
 //! [`Case::harness`] names an expectation also runs on [`Route::ProcessHarness`], where the probe
-//! runs as the harness's own child. While the runtime spawns a harness with no containment beyond
-//! a cleared environment, an expectation there is an [`Expectation::KnownGap`] at the verdict a
-//! run measures:
-//! it gates like `Must`, so a change that closes the gap fails the suite until the expectation
-//! flips in the same change, but it is counted as known-gap drift, never as a boundary crossing.
-//! A class column may carry a `KnownGap` too, for a route the class does not contain; its
-//! attribution says `KNOWN GAP` and why.
+//! runs as the harness's own child. The runtime spawns the harness under the session's class like
+//! a shell command, so a harness expectation at a class matches the shell-tool one there. A route
+//! or class column the class does not contain carries an [`Expectation::KnownGap`] at the verdict
+//! a run measures: it gates like `Must`, so a change that closes the gap fails the suite until the
+//! expectation flips in the same change, but it is counted as known-gap drift, never as a boundary
+//! crossing. Its attribution says `KNOWN GAP` and why.
 //!
 //! # Adding a fourth containment class
 //!
@@ -99,6 +101,46 @@ pub enum Prepare {
     /// key, into the case workdir as `dest`. The capsule's `$HOME` is synthetic, so the probe
     /// cannot compute the host's path itself.
     WriteSealKeyPath { dest: &'static str },
+    /// Hand the probe a host value it cannot find for itself, through `mur`'s environment: the
+    /// runner exports each of [`HostChannel::env_names`] to `mur`, and the manifest declares them
+    /// under `capabilities.shell.baseline_env` (the shell-tool route) and `capabilities.env.allow`
+    /// (the process-harness route), which are the only ways a name in `mur`'s environment reaches
+    /// a command or the harness.
+    HostChannel(HostChannel),
+}
+
+/// The host value a [`Prepare::HostChannel`] case receives, and what the runner starts or reads on
+/// the host to produce it. Every pid is a host pid: inside a session's PID namespace the number
+/// names nothing, or names an unrelated in-namespace process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostChannel {
+    /// `MUR_EC_RUNTIME_PID`: the host pid of this case's own `mur`.
+    RuntimePid,
+    /// `MUR_EC_RUNTIME_PID`, and `MUR_EC_SIBLING_PIDS`: a sibling capsule's `mur` and every one of
+    /// its descendants, the sibling running [`SIBLING_TARGET`] at the same class for the whole
+    /// case. The runner checks afterwards that every one of them is still alive.
+    SiblingCapsule,
+    /// `MUR_EC_RUNTIME_PID`, and `MUR_EC_UNRELATED_PID`: a process of the same user outside every
+    /// capsule, started by the runner. The runner checks afterwards that it is still alive.
+    UnrelatedProcess,
+    /// `MUR_EC_OTHER_TRACE`, another session's `trace.jsonl` (a preflight session's), and
+    /// `MUR_EC_RECORDS_ROOT`, the records root `~/.murmur/records`.
+    OtherSession,
+    /// `MUR_EC_RUNTIME_PID`. On [`Route::ProcessHarness`] the runner also kills `mur` from the
+    /// host once the probe has reported, and checks the record the killed runtime left.
+    RuntimeKill,
+}
+
+impl HostChannel {
+    /// The environment names this channel exports to `mur` and the manifest declares.
+    pub fn env_names(self) -> &'static [&'static str] {
+        match self {
+            HostChannel::RuntimePid | HostChannel::RuntimeKill => &["MUR_EC_RUNTIME_PID"],
+            HostChannel::SiblingCapsule => &["MUR_EC_RUNTIME_PID", "MUR_EC_SIBLING_PIDS"],
+            HostChannel::UnrelatedProcess => &["MUR_EC_RUNTIME_PID", "MUR_EC_UNRELATED_PID"],
+            HostChannel::OtherSession => &["MUR_EC_OTHER_TRACE", "MUR_EC_RECORDS_ROOT"],
+        }
+    }
 }
 
 /// A path from a capsule's code to the host, which a case's probe body can be run through.
@@ -113,8 +155,8 @@ pub enum Route {
     ShellTool,
     /// The process harness itself: `probe-driver` runs the probe as its own child instead of
     /// calling the bridge, as any process-transport harness can run anything. The runtime spawns
-    /// a harness with a cleared environment and no other containment at every class, so a case
-    /// on this route is graded on [`Case::harness`], one expectation whatever the class.
+    /// the harness under the session's class with a cleared environment, so a case on this route
+    /// is graded on [`Case::harness`], one expectation per class.
     ProcessHarness,
     /// A guest worker, measured as if its guest had escaped Wasmtime: `probe-driver` calls the
     /// probe guest, a WASM tool in the capsule's tools worker, over the tool bridge, and the
@@ -148,11 +190,51 @@ impl Route {
 /// Boundary cases graded on their probe file that do not run on [`Route::WasmGuest`], each with
 /// the reason. Every other such case does, and none of the resource-exhaustion cases: their
 /// ceilings and evidence are a shell command's.
-pub const NOT_ON_WASM_GUEST: &[(&str, &str)] = &[(
-    "proc-self-cwd-reopen",
-    "a guest worker's working directory is `/`, not the work folder, so there is no walk out of \
-     the work folder through /proc/self/cwd to measure",
-)];
+pub const NOT_ON_WASM_GUEST: &[(&str, &str)] = &[
+    (
+        "proc-self-cwd-reopen",
+        "a guest worker's working directory is `/`, not the work folder, so there is no walk out \
+         of the work folder through /proc/self/cwd to measure",
+    ),
+    ("signal-own-runtime", NO_GUEST_BODY_FOR_A_HOST_CHANNEL),
+    ("signal-sibling-capsule", NO_GUEST_BODY_FOR_A_HOST_CHANNEL),
+    (
+        "signal-unrelated-same-user",
+        NO_GUEST_BODY_FOR_A_HOST_CHANNEL,
+    ),
+    ("proc-enumerate-host", NO_GUEST_BODY_FOR_A_HOST_CHANNEL),
+    ("runtime-kill-record", NO_GUEST_BODY_FOR_A_HOST_CHANNEL),
+    (
+        "signal-pid1",
+        "the guest worker's `escape-probe` module (`guest_worker/escape_probe.rs`) has no body \
+         for this case and reports INCONCLUSIVE for a case it does not know",
+    ),
+    (
+        "record-cross-session-read",
+        "the guest worker's environment holds none of the MUR_EC_* variables and its \
+         `escape-probe` module (`guest_worker/escape_probe.rs`) has no body for this case, which \
+         it would report INCONCLUSIVE; a guest worker's reads of the records directory are what \
+         CI's `guest_workers` `probe_cannot_read_key_or_records` step asserts",
+    ),
+    (
+        "record-rewrite",
+        "the guest worker's `escape-probe` module (`guest_worker/escape_probe.rs`) has no body \
+         for this case, which it would report INCONCLUSIVE; a guest worker's reads of the records \
+         directory are what CI's `guest_workers` `probe_cannot_read_key_or_records` step asserts",
+    ),
+    (
+        "records-writable-subfolders",
+        "the guest worker's `escape-probe` module (`guest_worker/escape_probe.rs`) has no body \
+         for this case and reports INCONCLUSIVE for a case it does not know",
+    ),
+];
+
+/// Why a [`Prepare::HostChannel`] case whose value is a host pid does not run on
+/// [`Route::WasmGuest`].
+const NO_GUEST_BODY_FOR_A_HOST_CHANNEL: &str =
+    "the guest worker's environment holds none of the MUR_EC_* variables, and its `escape-probe` \
+     module (`guest_worker/escape_probe.rs`) has no body for this case, which it would report \
+     INCONCLUSIVE";
 
 /// Where a case's verdict is read from once the capsule has run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,17 +410,51 @@ def main():
 "#,
 };
 
+/// The sibling capsule a [`HostChannel::SiblingCapsule`] case signals: a shell-tool probe that
+/// reports it is up and then holds its session open for longer than any case runs, so its `mur`
+/// and every descendant are alive while the case runs and can be checked afterwards. The runner
+/// writes the hold, in seconds, to `sibling-hold-secs` in its workdir, derived from
+/// `--timeout-secs`: a fixed hold shorter than a slow case would end the sibling by itself and
+/// read as a target the probe stopped. Without that file it never writes `sibling-ready`, so the
+/// case is not staged.
+///
+/// Not in [`REGISTRY`]: it asserts nothing about containment. The runner stages it beside the
+/// case's own workdir, at the case's class, and kills it once the case is graded.
+pub const SIBLING_TARGET: Case = Case {
+    id: "sibling-target",
+    category: Category::Boundary,
+    summary: "reports it is up, then holds a sibling session open while another case signals it",
+    attribution: "Infrastructure for `signal-sibling-capsule`, not a containment case. Its \
+                  verdict is never graded: the runner kills it once the case beside it is graded.",
+    advisory: Must(Succeeded),
+    scoped: Must(Succeeded),
+    sealed: Must(Succeeded),
+    harness: None,
+    prepare: Prepare::None,
+    evidence: Evidence::ProbeFile,
+    profile: Profile::Boundary,
+    body: r#"
+def main():
+    with open("sibling-hold-secs") as handle:
+        hold = int(handle.read())
+    with open("sibling-ready", "w") as handle:
+        handle.write(str(os.getpid()))
+    time.sleep(hold)
+    verdict("SUCCESS", "sibling slept out")
+"#,
+};
+
 /// Cases that must never be removed. Checked by [`registry_keeps_permanent_cases`] so a deletion
 /// fails this package's own `cargo test` rather than quietly shrinking the suite.
 pub const PERMANENT_CASE_IDS: &[&str] = &["exec-renamed-disallowed-binary"];
 
-/// Minimum case set: 24 boundary cases.
-pub const BOUNDARY_CASE_COUNT: usize = 24;
+/// Minimum case set: 33 boundary cases.
+pub const BOUNDARY_CASE_COUNT: usize = 33;
 /// Minimum case set: 5 resource-exhaustion cases.
 pub const RESOURCE_CASE_COUNT: usize = 5;
 /// Cases that also run on [`Route::ProcessHarness`]. Held by the tests like the counts above, so a
 /// route cannot be dropped from a case without the diff saying so.
-pub const PROCESS_HARNESS_CASE_COUNT: usize = 2;
+pub const PROCESS_HARNESS_CASE_COUNT: usize = 11;
 /// Expectations, across every route and class column, that assert a known gap. Held by the tests
 /// for the same reason: a known gap cannot quietly become `NotAsserted` or leave the registry.
 pub const KNOWN_GAP_EXPECTATION_COUNT: usize = 0;
@@ -482,8 +598,8 @@ def main():
         category: Category::Boundary,
         summary: "stat()s /etc/shadow — a metadata-only query with no read grant",
         attribution: "This case asserts SUCCESS, not refusal, and a SUCCESS verdict here is NOT \
-                      a leaked finding. Landlock mediates open/read/write and the create-class \
-                      actions; it does not mediate bare metadata queries at any ABI. Metadata \
+                      a leaked finding and not an escape. Landlock mediates open/read/write and \
+                      the create-class actions; it does not mediate bare metadata queries at any ABI. Metadata \
                       visibility is a documented property of the `scoped` class, and a harness \
                       that reported it as a failure would be asserting something false about the \
                       class it is certifying. It is asserted at `advisory` too, where nothing is \
@@ -1479,6 +1595,607 @@ def main():
                   "attributable to seccomp)")
 "#,
     },
+    // ── Host channels and records ─────────────────────────────────────────────────────────
+    Case {
+        id: "signal-own-runtime",
+        category: Category::Boundary,
+        summary: "names its own `mur` by host pid with signal 0, and only if refused sends SIGTERM",
+        attribution: "The runner exports the host pid of this case's own `mur` as \
+                      MUR_EC_RUNTIME_PID. Signal 0 goes first and SIGTERM only when signal 0 was \
+                      refused, so a reachable runtime is reported and never stopped. At `scoped` \
+                      and `sealed` the refusal is ESRCH from the session's PID namespace: the \
+                      command sees only the session's own processes, so the host pid names \
+                      nothing. EPERM would be uid permissions instead, which a same-user `mur` \
+                      does not trigger, so it would not be containment. A reached pid whose /proc \
+                      comm is not `mur` is a number colliding with an in-namespace pid and reads \
+                      INCONCLUSIVE, never a pass. NOT ASSERTED AT `advisory`: a run whose achieved \
+                      class is `advisory` has no PID namespace and no records protection, so a \
+                      same-user command can name the runtime and the probe records ALLOWED there \
+                      without sending SIGTERM; a declared `advisory` run on a host with Landlock \
+                      achieves `scoped` and records `scoped`'s verdict. ON `process-harness`: the \
+                      harness runs under the session's class, inside the same PID namespace, so \
+                      the verdict matches the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::RuntimePid),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+import signal
+
+def main():
+    pids = env_pids("MUR_EC_RUNTIME_PID")
+    if not pids:
+        verdict("INCONCLUSIVE", "the runner exported no MUR_EC_RUNTIME_PID")
+        return
+    pid = pids[0]
+    reached, note = signal_reach(pid, signal.SIGTERM)
+    if not reached:
+        verdict("REFUSED", "this case's own mur (host pid %d) is not nameable: %s; comm=%s; %s"
+                % (pid, note, proc_comm(pid), proc_reachable()))
+        return
+    comm = proc_comm(pid)
+    if comm == "mur" or comm is None:
+        verdict("ALLOWED", "signal 0 reached this case's own mur (host pid %d): %s; comm=%s; %s"
+                % (pid, note, comm, proc_reachable()))
+    else:
+        verdict("INCONCLUSIVE", "pid %d names %s here, not the runtime: the number collides with "
+                                "an in-namespace pid; %s; %s" % (pid, comm, note, proc_reachable()))
+"#,
+    },
+    Case {
+        id: "signal-sibling-capsule",
+        category: Category::Boundary,
+        summary: "names a sibling capsule's `mur` and every descendant by host pid with signal 0",
+        attribution: "The runner starts a sibling capsule at the same class beside this one and \
+                      exports its `mur` and every descendant, by host pid, as MUR_EC_SIBLING_PIDS. \
+                      Signal 0 goes to every target first; any target it reaches is reported \
+                      ALLOWED and nothing further is sent to any of them. Only when every signal 0 \
+                      was refused does each target get SIGTERM, which must be refused too. At \
+                      `scoped` and `sealed` the refusal is ESRCH from the session's PID namespace, \
+                      which holds none of the sibling's processes; EPERM would be uid permissions, \
+                      which same-user processes do not trigger, so it would not be containment. \
+                      The runner then checks every target is still alive, and a target gone after \
+                      the case is ALLOWED whatever the probe reported. NOT ASSERTED AT `advisory`: \
+                      a run whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the probe records ALLOWED there after signal 0 alone; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class, inside the same PID namespace, so the verdict matches the \
+                      shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::SiblingCapsule),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+import signal
+
+def main():
+    pids = env_pids("MUR_EC_SIBLING_PIDS")
+    if not pids:
+        verdict("INCONCLUSIVE", "the runner exported no MUR_EC_SIBLING_PIDS")
+        return
+    reached = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            reached.append("%d (comm=%s)" % (pid, proc_comm(pid)))
+        except OSError:
+            pass
+    if reached:
+        verdict("ALLOWED", "signal 0 reached sibling pid(s) %s of %d; nothing else was sent to "
+                           "any target; %s" % (", ".join(reached), len(pids), proc_reachable()))
+        return
+    notes = []
+    for pid in pids:
+        hit, note = signal_reach(pid, signal.SIGTERM)
+        notes.append(note)
+        if hit:
+            verdict("ALLOWED", "sibling pid %d (comm=%s) was reached: %s; %s"
+                    % (pid, proc_comm(pid), "; ".join(notes), proc_reachable()))
+            return
+    verdict("REFUSED", "no sibling pid of %d is nameable: %s; %s"
+            % (len(pids), "; ".join(notes), proc_reachable()))
+"#,
+    },
+    Case {
+        id: "signal-unrelated-same-user",
+        category: Category::Boundary,
+        summary: "names a same-user process outside every capsule by host pid with signal 0",
+        attribution: "The runner starts a `sleep` of the same user, in a process group of its own \
+                      and outside every capsule, and exports its host pid as MUR_EC_UNRELATED_PID. \
+                      Signal 0 goes first and SIGTERM only when signal 0 was refused, so a \
+                      reachable process is reported and never stopped. At `scoped` and `sealed` \
+                      the refusal is ESRCH from the session's PID namespace; EPERM would be uid \
+                      permissions, which a same-user target does not trigger, so it would not be \
+                      containment. The runner then checks the target is still alive, and a target \
+                      gone after the case is ALLOWED whatever the probe reported. NOT ASSERTED AT \
+                      `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection, so the probe records ALLOWED there after signal 0 \
+                      alone; a declared `advisory` run on a host with Landlock achieves `scoped` \
+                      and records `scoped`'s verdict. ON `process-harness`: the harness runs under \
+                      the session's class, inside the same PID namespace, so the verdict matches \
+                      the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::UnrelatedProcess),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+import signal
+
+def main():
+    pids = env_pids("MUR_EC_UNRELATED_PID")
+    if not pids:
+        verdict("INCONCLUSIVE", "the runner exported no MUR_EC_UNRELATED_PID")
+        return
+    reached = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            reached.append("%d (comm=%s)" % (pid, proc_comm(pid)))
+        except OSError:
+            pass
+    if reached:
+        verdict("ALLOWED", "signal 0 reached the unrelated same-user pid(s) %s; nothing else was "
+                           "sent; %s" % (", ".join(reached), proc_reachable()))
+        return
+    notes = []
+    for pid in pids:
+        hit, note = signal_reach(pid, signal.SIGTERM)
+        notes.append(note)
+        if hit:
+            verdict("ALLOWED", "the unrelated pid %d (comm=%s) was reached: %s; %s"
+                    % (pid, proc_comm(pid), "; ".join(notes), proc_reachable()))
+            return
+    verdict("REFUSED", "the unrelated same-user process is not nameable: %s; %s"
+            % ("; ".join(notes), proc_reachable()))
+"#,
+    },
+    Case {
+        id: "proc-enumerate-host",
+        category: Category::Boundary,
+        summary: "lists /proc and opens its own `mur`'s /proc/<pid>/status and cmdline by host pid",
+        attribution: "The runner exports the host pid of this case's own `mur` as \
+                      MUR_EC_RUNTIME_PID. At `scoped` and `sealed` the command's /proc is the \
+                      session's private procfs, mounted for its PID namespace, so it lists only \
+                      the session's processes and the host pid is neither listed nor openable \
+                      (ENOENT). A host that cannot mount a private procfs keeps /proc denied \
+                      instead (EACCES from Landlock at `scoped`); `proc_reachable` in DETAIL says \
+                      which. NOT ASSERTED AT `advisory`: a run whose achieved class is `advisory` \
+                      has no PID namespace and no records protection, so the probe sees the host's \
+                      /proc and records ALLOWED there; a declared `advisory` run on a host with \
+                      Landlock achieves `scoped` and records `scoped`'s verdict. ON \
+                      `process-harness`: the harness runs under the session's class with the same \
+                      private procfs, so the verdict matches the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::RuntimePid),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+def main():
+    pids = env_pids("MUR_EC_RUNTIME_PID")
+    if not pids:
+        verdict("INCONCLUSIVE", "the runner exported no MUR_EC_RUNTIME_PID")
+        return
+    pid = pids[0]
+    try:
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+        listing = "%d numeric /proc entries visible" % len(entries)
+    except OSError as exc:
+        entries = []
+        listing = "listdir(/proc)=%s" % en(exc)
+    listed = str(pid) in entries
+    opened = False
+    notes = []
+    for leaf in ("status", "cmdline"):
+        fd, note = probe_open("/proc/%d/%s" % (pid, leaf))
+        if fd is not None:
+            os.close(fd)
+            opened = True
+        notes.append(note)
+    detail = "%s; host pid %d listed=%s; %s; %s" % (listing, pid, listed, "; ".join(notes),
+                                                   proc_reachable())
+    verdict("ALLOWED" if listed or opened else "REFUSED", detail)
+"#,
+    },
+    Case {
+        id: "signal-pid1",
+        category: Category::Boundary,
+        summary: "reads pid 1's name and sends it signal 0: the session's PID-namespace init",
+        attribution: "A control, not a boundary: this case asserts SUCCESS, and its SUCCESS is not \
+                      an escape. At `scoped` and `sealed` a command runs in the session's PID \
+                      namespace, whose pid 1 is the session's holder, named `mur-pidns-init` \
+                      (`network_namespace.rs`, PR_SET_NAME), so the host's init is not nameable at \
+                      all; SUCCESS says the namespace is in place, which is what every signal case \
+                      beside it relies on. The private /proc is mounted with `hidepid`, which \
+                      masks the holder from the command (`proc_view.rs`: it holds capabilities the \
+                      command does not), so where its name cannot be read the probe identifies it \
+                      instead by /proc/1 being masked while the command's own PID namespace is not \
+                      the kernel's initial one (inode 4026531836, PROC_PID_INIT_INO): pid 1 of \
+                      that namespace is its init, the holder. Pid 1 named anything else and \
+                      refused with EPERM reads REFUSED: that is the host's init and ordinary uid \
+                      permissions, NOT containment, and it is what this probe reports in the \
+                      host's PID namespace. NOT ASSERTED AT `advisory`: a run whose achieved class \
+                      is `advisory` has no PID namespace and no records protection, so the probe \
+                      records REFUSED there, uid permissions on the host's init; a declared \
+                      `advisory` run on a host with Landlock achieves `scoped` and records \
+                      `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class inside the same PID namespace, so its pid 1 is the same \
+                      holder and the verdict matches the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Succeeded),
+        sealed: Must(Succeeded),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Succeeded),
+            sealed: Must(Succeeded),
+        }),
+        prepare: Prepare::None,
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+# The kernel's initial PID namespace always has this inode (PROC_PID_INIT_INO).
+INITIAL_PID_NS = "pid:[4026531836]"
+
+def main():
+    comm = proc_comm(1)
+    try:
+        os.stat("/proc/1")
+        pid1 = "/proc/1 visible"
+        masked = False
+    except OSError as exc:
+        pid1 = "/proc/1 masked: stat=%s" % en(exc)
+        masked = True
+    try:
+        own_ns = os.readlink("/proc/self/ns/pid")
+    except OSError as exc:
+        own_ns = "readlink(/proc/self/ns/pid)=%s" % en(exc)
+    try:
+        os.kill(1, 0)
+        result, err = "kill(1,0)=ok", None
+    except OSError as exc:
+        result, err = "kill(1,0)=%s" % en(exc), exc.errno
+    seen = "comm=%s; %s; own pid namespace %s; %s" % (comm, pid1, own_ns, result)
+    if comm == "mur-pidns-init":
+        verdict("SUCCESS", "pid 1 is this session's PID-namespace init; the host's init is not "
+                           "nameable here; %s" % seen)
+    elif comm is None and masked and own_ns.startswith("pid:[") and own_ns != INITIAL_PID_NS:
+        verdict("SUCCESS", "pid 1 is this session's PID-namespace init, masked by hidepid: this "
+                           "process runs in a PID namespace other than the host's initial one, "
+                           "whose init is the session's holder; the host's init is not nameable "
+                           "here; %s" % seen)
+    elif err == errno.EPERM:
+        verdict("REFUSED", "pid 1 is the host's init (comm=%s); EPERM is ordinary uid permissions, "
+                           "NOT containment; %s" % (comm, seen))
+    else:
+        verdict("ALLOWED", "pid 1 is not this session's PID-namespace init and was not refused "
+                           "with EPERM; %s; %s" % (seen, proc_reachable()))
+"#,
+    },
+    Case {
+        id: "record-rewrite",
+        category: Category::Boundary,
+        summary: "tries every route to change its own session's trace.jsonl, writing no byte",
+        attribution: "The probe never writes a byte into the record: an open for writing, a \
+                      truncate to the file's own size, a rename (renamed back at once), a hard \
+                      link into `home/` opened for writing, and a symlink in `home/` opened for \
+                      writing, any of which succeeding is the finding. The records directory is \
+                      read-only to commands except its `home/` and `tmp/` sub-folders. At `scoped` \
+                      the refusals are Landlock's: EACCES for the opens and the truncate, EXDEV \
+                      for a link or rename the refer right does not cover. At `sealed` they are \
+                      the composed root's: the records directory is mounted read-only with only \
+                      its `home/` and `tmp/` binds writable, so the opens, the truncate and the \
+                      rename are EROFS, and a link across a bind is EXDEV. A link or symlink that \
+                      was created but could not be opened for writing is noted, not graded: what \
+                      matters is whether the record can change. NOT ASSERTED AT `advisory`: a run \
+                      whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the record is writable and the probe records ALLOWED there; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class with the same records directory rules, so the verdict \
+                      matches the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::None,
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+def open_for_append(path):
+    """(ok, note) for an O_WRONLY|O_APPEND open that writes nothing."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError as exc:
+        return False, en(exc)
+    os.close(fd)
+    return True, "ok"
+
+def main():
+    R = os.environ.get("MURMUR_RECORDS_DIR")
+    if not R:
+        verdict("INCONCLUSIVE", "the runtime exported no MURMUR_RECORDS_DIR")
+        return
+    T = R + "/trace.jsonl"
+    changed = []
+    notes = []
+
+    ok, note = open_for_append(T)
+    notes.append("open(trace,O_WRONLY|O_APPEND)=%s" % note)
+    if ok:
+        changed.append("append-open")
+
+    try:
+        size = os.stat(T).st_size
+    except OSError as exc:
+        notes.append("stat(trace)=%s, so no truncate was attempted" % en(exc))
+    else:
+        try:
+            os.truncate(T, size)
+            changed.append("truncate")
+            notes.append("truncate(trace,%d)=ok" % size)
+        except OSError as exc:
+            notes.append("truncate(trace,%d)=%s" % (size, en(exc)))
+
+    try:
+        os.rename(T, T + ".ec")
+    except OSError as exc:
+        notes.append("rename(trace)=%s" % en(exc))
+    else:
+        changed.append("rename")
+        try:
+            os.rename(T + ".ec", T)
+            notes.append("rename(trace)=ok, renamed back")
+        except OSError as exc:
+            notes.append("rename(trace)=ok, RENAME BACK FAILED %s: the trace is at "
+                         "trace.jsonl.ec" % en(exc))
+
+    for kind, make, name in (("link", os.link, "ec-trace-link"),
+                             ("symlink", os.symlink, "ec-trace-sym")):
+        path = R + "/home/" + name
+        try:
+            make(T, path)
+        except OSError as exc:
+            notes.append("%s(trace,home/%s)=%s" % (kind, name, en(exc)))
+            continue
+        ok, note = open_for_append(path)
+        if ok:
+            changed.append("%s write-open" % kind)
+            notes.append("%s(trace,home/%s)=ok; open(it,O_WRONLY|O_APPEND)=ok" % (kind, name))
+        else:
+            notes.append("%s(trace,home/%s)=ok (noted, not graded); open(it,O_WRONLY|O_APPEND)=%s"
+                         % (kind, name, note))
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            notes.append("unlink(home/%s)=%s" % (name, en(exc)))
+
+    if changed:
+        verdict("ALLOWED", "the session record can change through: %s; %s"
+                % (", ".join(changed), "; ".join(notes)))
+    else:
+        verdict("REFUSED", "every route to change the session record was refused: %s"
+                % "; ".join(notes))
+"#,
+    },
+    Case {
+        id: "record-cross-session-read",
+        category: Category::Boundary,
+        summary: "opens another session's trace.jsonl and lists the records root ~/.murmur/records",
+        attribution: "The runner exports a preflight session's trace.jsonl as MUR_EC_OTHER_TRACE \
+                      and the records root as MUR_EC_RECORDS_ROOT. DETAIL counts bytes read and \
+                      entries listed, never contents. At `scoped` the refusal is Landlock's \
+                      EACCES: no rule covers the records root or another session's records \
+                      directory. At `sealed` the other session's trace is the composed root's \
+                      ENOENT: no other session's records exist in it; the records root, which the \
+                      composed root reproduces on the path to the session's own records directory, \
+                      is refused EACCES by Landlock, which `sealed` applies too. NOT ASSERTED AT \
+                      `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection, so every record is readable and the probe records \
+                      ALLOWED there; a declared `advisory` run on a host with Landlock achieves \
+                      `scoped` and records `scoped`'s verdict. ON `process-harness`: the harness \
+                      runs under the session's class with the same rules, so the verdict matches \
+                      the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::OtherSession),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+def main():
+    other = os.environ.get("MUR_EC_OTHER_TRACE")
+    root = os.environ.get("MUR_EC_RECORDS_ROOT")
+    missing = [name for name, value in (("MUR_EC_OTHER_TRACE", other),
+                                        ("MUR_EC_RECORDS_ROOT", root)) if not value]
+    if missing:
+        verdict("INCONCLUSIVE", "the runner exported no %s" % " or ".join(missing))
+        return
+    reached = []
+    fd, note = probe_open(other)
+    if fd is not None:
+        count = len(os.read(fd, 65536))
+        os.close(fd)
+        reached.append("another session's trace")
+        note += " (read %d bytes)" % count
+    try:
+        listing = "listdir(records root)=ok: %d entries" % len(os.listdir(root))
+        reached.append("the records root listing")
+    except OSError as exc:
+        listing = "listdir(records root)=%s" % en(exc)
+    if reached:
+        verdict("ALLOWED", "reached %s: %s; %s" % (" and ".join(reached), note, listing))
+    else:
+        verdict("REFUSED", "%s; %s" % (note, listing))
+"#,
+    },
+    Case {
+        id: "records-writable-subfolders",
+        category: Category::Boundary,
+        summary: "writes its records `home/` and /tmp, and checks /tmp is the session's `tmp/`",
+        attribution: "This case asserts SUCCESS, and its SUCCESS is the class working as declared, \
+                      not an escape: the session's `home/` and `tmp/` records sub-folders are \
+                      writable by design, and on every tier that maps /tmp a literal /tmp path is \
+                      the session's temporary folder. The probe writes both, then compares \
+                      /tmp/ec-tmp-probe with `tmp/ec-tmp-probe` in the records directory by device \
+                      and inode, and removes both files. Either write refused is REFUSED: at \
+                      `scoped` Landlock's EACCES, at `sealed` the composed root's EROFS or ENOENT, \
+                      meaning the class lost a folder it promises. /tmp writable but not the \
+                      session's folder is ALLOWED: the command wrote the host's /tmp. NOT ASSERTED \
+                      AT `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection and maps no /tmp, so the probe records ALLOWED \
+                      there, having written the host's /tmp; a declared `advisory` run on a host \
+                      with Landlock achieves `scoped` and records `scoped`'s verdict. ON \
+                      `process-harness`: the harness runs under the session's class with the same \
+                      folders, so the verdict matches the shell-tool route at each class.",
+        advisory: NotAsserted,
+        scoped: Must(Succeeded),
+        sealed: Must(Succeeded),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Succeeded),
+            sealed: Must(Succeeded),
+        }),
+        prepare: Prepare::None,
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+def main():
+    R = os.environ.get("MURMUR_RECORDS_DIR")
+    if not R:
+        verdict("INCONCLUSIVE", "the runtime exported no MURMUR_RECORDS_DIR")
+        return
+    home_probe = R + "/home/ec-home-probe"
+    tmp_probe = "/tmp/ec-tmp-probe"
+    written = []
+    refused = []
+    for path in (home_probe, tmp_probe):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.write(fd, b"ok\n")
+            os.close(fd)
+            written.append(path)
+        except OSError as exc:
+            refused.append("create %s=%s" % (path, en(exc)))
+    same = None
+    seen = ""
+    if not refused:
+        mine = os.stat(tmp_probe)
+        try:
+            theirs = os.stat(R + "/tmp/ec-tmp-probe")
+            same = (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino)
+            seen = ("/tmp/ec-tmp-probe dev=%d ino=%d, records tmp/ec-tmp-probe dev=%d ino=%d"
+                    % (mine.st_dev, mine.st_ino, theirs.st_dev, theirs.st_ino))
+        except OSError as exc:
+            same = False
+            seen = "records tmp/ec-tmp-probe: %s" % en(exc)
+    for path in written:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if refused:
+        verdict("REFUSED", "a records sub-folder the class promises was not writable: %s"
+                % "; ".join(refused))
+    elif same:
+        verdict("SUCCESS", "both writable by design; /tmp is the session's temporary "
+                           "folder: %s" % seen)
+    else:
+        verdict("ALLOWED", "/tmp was writable and is not the session's folder: %s" % seen)
+"#,
+    },
+    Case {
+        id: "runtime-kill-record",
+        category: Category::Boundary,
+        summary: "names its own `mur` with signal 0 and only if refused sends SIGKILL; on the \
+                  harness the runner then kills `mur` and checks the record reads unsealed",
+        attribution: "The runner exports the host pid of this case's own `mur` as \
+                      MUR_EC_RUNTIME_PID. Signal 0 goes first and SIGKILL only when signal 0 was \
+                      refused, so a reachable runtime is reported and never killed by the probe. \
+                      At `scoped` and `sealed` the refusal is ESRCH from the session's PID \
+                      namespace; EPERM would be uid permissions, which a same-user `mur` does not \
+                      trigger, so it would not be containment. NOT ASSERTED AT `advisory`: a run \
+                      whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the probe records ALLOWED there without sending SIGKILL; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class inside the same PID namespace, so the probe's verdict \
+                      matches the shell-tool route at each class. On that route the probe then \
+                      holds the run open, and once it has reported the runner kills `mur` from the \
+                      host and checks the record the killed runtime left: a trace with \
+                      `session_start`, no `session_end`, which `mur trace verify` reads as \
+                      `unsealed`, keeps the verdict. A record that verifies would make the kill \
+                      undetectable and reads ALLOWED; a record that cannot be checked reads \
+                      INCONCLUSIVE.",
+        advisory: NotAsserted,
+        scoped: Must(Refused),
+        sealed: Must(Refused),
+        harness: Some(HarnessExpectation {
+            advisory: NotAsserted,
+            scoped: Must(Refused),
+            sealed: Must(Refused),
+        }),
+        prepare: Prepare::HostChannel(HostChannel::RuntimeKill),
+        evidence: Evidence::ProbeFile,
+        profile: Profile::Boundary,
+        body: r#"
+import signal
+
+def main():
+    pids = env_pids("MUR_EC_RUNTIME_PID")
+    if not pids:
+        verdict("INCONCLUSIVE", "the runner exported no MUR_EC_RUNTIME_PID")
+    else:
+        pid = pids[0]
+        reached, note = signal_reach(pid, signal.SIGKILL)
+        if reached:
+            verdict("ALLOWED", "signal 0 reached this case's own mur (host pid %d, comm=%s): %s, "
+                               "so the run reports; %s"
+                    % (pid, proc_comm(pid), note, proc_reachable()))
+        else:
+            verdict("REFUSED", "this case's own mur (host pid %d) is not nameable: %s; %s"
+                    % (pid, note, proc_reachable()))
+    if os.path.exists("ec-hold-for-host-kill"):
+        flush_verdict()
+        time.sleep(120)
+"#,
+    },
     // ── Resource exhaustion — availability, never a boundary ──────────────────────────────
     Case {
         id: "resource-fork-bomb",
@@ -1827,6 +2544,113 @@ mod tests {
     #[test]
     fn preflight_is_not_a_registry_case() {
         assert!(find(PREFLIGHT.id).is_none());
+    }
+
+    /// The sibling target holds a session open for another case; counted, it would inflate the
+    /// case counts and read as though it asserted something about containment.
+    #[test]
+    fn sibling_target_is_not_a_registry_case() {
+        assert!(find(SIBLING_TARGET.id).is_none());
+        assert_eq!(SIBLING_TARGET.prepare, Prepare::None);
+        assert!(SIBLING_TARGET.harness.is_none());
+        assert!(SIBLING_TARGET.body.contains("sibling-ready"));
+    }
+
+    /// The only cases that assert a success at `scoped`, each the class working as declared. A new
+    /// one cannot arrive without this list changing, and each says so in its attribution, so a
+    /// reader never takes its `SUCCESS` for a crossing.
+    #[test]
+    fn every_case_asserting_success_at_scoped_says_it_is_not_an_escape() {
+        const SUCCESS_AT_SCOPED: [&str; 3] = [
+            "stat-outside-workdir",
+            "signal-pid1",
+            "records-writable-subfolders",
+        ];
+        let asserting: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|case| case.scoped == Must(Succeeded))
+            .map(|case| case.id)
+            .collect();
+        assert_eq!(asserting, SUCCESS_AT_SCOPED);
+        for id in SUCCESS_AT_SCOPED {
+            let case = find(id).unwrap();
+            assert!(
+                case.attribution.contains("not an escape"),
+                "{id}: a case asserting SUCCESS must say its success is not an escape"
+            );
+        }
+    }
+
+    /// Every host-channel case names its variables in the probe body, and a body whose variable
+    /// is missing reports INCONCLUSIVE naming it rather than passing.
+    #[test]
+    fn every_host_channel_case_reads_the_variables_it_is_given() {
+        let mut channels = 0;
+        for case in REGISTRY {
+            let Prepare::HostChannel(channel) = case.prepare else {
+                continue;
+            };
+            channels += 1;
+            assert!(!channel.env_names().is_empty(), "{}", case.id);
+            assert!(
+                channel
+                    .env_names()
+                    .iter()
+                    .any(|name| case.body.contains(&format!("\"{name}\""))),
+                "{}: the body reads none of {:?}",
+                case.id,
+                channel.env_names()
+            );
+            assert!(
+                case.body.contains("the runner exported no "),
+                "{}: a missing variable must read INCONCLUSIVE naming it",
+                case.id
+            );
+            assert!(
+                NOT_ON_WASM_GUEST.iter().any(|(id, _)| *id == case.id),
+                "{}: no guest worker receives a MUR_EC_* variable",
+                case.id
+            );
+        }
+        assert_eq!(channels, 6);
+    }
+
+    /// No boundary probe sends a real signal before signal 0 was refused: a body sends signal 0
+    /// alone with `os.kill`, and a real signal only through the preamble's `signal_reach`, which
+    /// sends it only when signal 0 was refused. The resource cases are left out: the fork bomb
+    /// kills its own children.
+    #[test]
+    fn every_signal_probe_sends_signal_zero_first() {
+        for case in in_category(Category::Boundary) {
+            let body = case.body;
+            for call in body.match_indices("os.kill(").map(|(at, _)| &body[at..]) {
+                let args = &call[..call.find(')').unwrap_or(call.len())];
+                assert!(
+                    args.ends_with(", 0"),
+                    "{}: a body may send signal 0 only, not `{args})`",
+                    case.id
+                );
+            }
+            for real in ["SIGTERM", "SIGKILL"] {
+                let named = body.matches(&format!("signal.{real}")).count();
+                let through_reach = body
+                    .matches(&format!("signal_reach(pid, signal.{real})"))
+                    .count();
+                assert_eq!(
+                    named, through_reach,
+                    "{}: {real} outside signal_reach",
+                    case.id
+                );
+            }
+        }
+        let preamble = crate::probe::PREAMBLE;
+        let reach = &preamble[preamble.find("def signal_reach").unwrap()..];
+        let zero = reach.find("os.kill(pid, 0)").unwrap();
+        let real = reach.find("os.kill(pid, sig)").unwrap();
+        assert!(
+            zero < real,
+            "signal_reach must send signal 0 before the real signal"
+        );
     }
 
     #[test]

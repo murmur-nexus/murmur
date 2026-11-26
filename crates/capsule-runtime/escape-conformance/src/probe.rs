@@ -158,6 +158,41 @@ def grade_syscall(name, note, ret, err, extra=""):
         verdict("INCONCLUSIVE", "%s: ENOSYS -- kernel does not implement it, nothing proven %s %s" % (name, note, extra))
     else:
         verdict("ALLOWED", "%s reached the kernel implementation (not refused) %s %s" % (name, note, extra))
+
+def env_pids(name):
+    """The pids in the space-separated environment variable `name`; [] when unset or empty."""
+    return [int(word) for word in os.environ.get(name, "").split()]
+
+def signal_reach(pid, sig):
+    """(reached, note). Never raises.
+
+    Signal 0 goes first, and the real signal only when signal 0 was refused: naming a process
+    with signal 0 is already the escape, so a reachable target is reported and never stopped."""
+    name = getattr(sig, "name", str(sig))
+    try:
+        os.kill(pid, 0)
+        return True, "kill(%d,0)=ok; %s not sent" % (pid, name)
+    except OSError as exc:
+        probe = en(exc)
+    try:
+        os.kill(pid, sig)
+    except OSError as exc:
+        return False, "kill(%d,0)=%s; kill(%d,%s)=%s" % (pid, probe, pid, name, en(exc))
+    return True, "kill(%d,0)=%s; kill(%d,%s)=ok" % (pid, probe, pid, name)
+
+def proc_comm(pid):
+    """The stripped contents of /proc/<pid>/comm, or None when it cannot be read."""
+    try:
+        with open("/proc/%d/comm" % pid) as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+def flush_verdict():
+    """Writes the probe file now from the current verdict, exactly as the epilogue does at exit,
+    so a probe that then holds its run open has already reported."""
+    with open("__ec.probe", "w") as handle:
+        handle.write("VERDICT=%s\nDETAIL=%s\n" % (_V, " ".join(str(_D).split())))
 "#;
 
 /// Wrapped around the case body. Runs `main()` and writes the probe file no matter what.
