@@ -1924,7 +1924,7 @@ ground.
 | | Escape-conformance harness | Manual procedures |
 |---|---|---|
 | Form | One command, graded against a declared containment class, run by hand and in CI | Written scenarios with exact commands and expected output |
-| Covers | Filesystem escape, `/proc` re-open paths, inherited descriptors, device-node creation, the exec allowlist, network egress, unix sockets, the dangerous-syscall table, resource exhaustion | Launch-time refusals, the composed root observed from inside a live capsule, the fixed device set, shell-binary reachability, staged runtimes, the child's capability sets |
+| Covers | Filesystem escape, `/proc` re-open paths, other processes and session records, inherited descriptors, device-node creation, the exec allowlist, network egress, unix sockets, the dangerous-syscall table, resource exhaustion | Launch-time refusals, the composed root observed from inside a live capsule, the fixed device set, shell-binary reachability, staged runtimes, the child's capability sets |
 | Where the result lives | A dated record file the run writes | A dated entry in the procedure itself |
 
 The rest of the test suite asserts the *decision* logic: which enforcement tier a probe resolves to,
@@ -1963,7 +1963,7 @@ the record:
 |---|---|---|
 | `shell-tool` | As the capsule's `python3` tool call, under the declared class's enforcement. Every case runs on it | The `advisory`, `scoped` and `sealed` expectations |
 | `process-harness` | As the [process harness](manifest.md#transport-process) itself, which the runtime spawns under the session's class like a shell command | Per class: the harness verdict at a class matches the shell-tool verdict there |
-| `wasm-guest` | In the `tools` [guest worker](../concepts/guest-workers.md), as if WASM code had escaped its sandbox: the probe tool, `escape-conformance-probe-guest`, asks its worker to run the case, and the worker makes the probe's system calls itself, under the enforcement it was started with. Every boundary case graded on its probe file runs on it, except `proc-self-cwd-reopen` (a worker's working directory is `/`, not the work folder) | The `advisory`, `scoped` and `sealed` expectations, as on `shell-tool` |
+| `wasm-guest` | In the `tools` [guest worker](../concepts/guest-workers.md), as if WASM code had escaped its sandbox: the probe tool, `escape-conformance-probe-guest`, asks its worker to run the case, and the worker makes the probe's system calls itself, under the enforcement it was started with. Every boundary case graded on its probe file runs on it, except `proc-self-cwd-reopen` (a worker's working directory is `/`, not the work folder) and the host-process and session-record cases below (the worker has no probe for them) | The `advisory`, `scoped` and `sealed` expectations, as on `shell-tool` |
 
 An expectation is one of:
 
@@ -2007,6 +2007,34 @@ is a different folder. It must be refused at `scoped` and `sealed` and is not as
 `advisory`. On the `process-harness` route it is `REFUSED` at `scoped` and `sealed` too — the
 harness runs under the class, so Landlock and the composed root refuse the key exactly as they do
 for a shell command.
+
+Nine cases probe other processes and the session's own records. At `scoped` and `sealed` each is
+asserted on `shell-tool` and `process-harness`; at `advisory` each is recorded, not asserted.
+
+| Case | What the probe tries | Expected at `scoped` and `sealed` |
+|---|---|---|
+| `signal-own-runtime` | Signal its own `mur` by host pid | `REFUSED` |
+| `signal-sibling-capsule` | Signal a second capsule, and every process in it, by host pid | `REFUSED` |
+| `signal-unrelated-same-user` | Signal a process of the same user outside every capsule | `REFUSED` |
+| `proc-enumerate-host` | List `/proc` and open its own `mur`'s `/proc/<pid>/status` and `cmdline` | `REFUSED` |
+| `signal-pid1` | Read pid 1 and signal it: a control that the session's process namespace is in place | `SUCCESS` |
+| `record-rewrite` | Change its session's `trace.jsonl` by open, truncate, rename, hard link or symlink | `REFUSED` |
+| `record-cross-session-read` | Read another session's `trace.jsonl` and list `~/.murmur/records` | `REFUSED` |
+| `records-writable-subfolders` | Write its session's `home/` records folder and `/tmp`, which must be the session's `tmp/` | `SUCCESS` |
+| `runtime-kill-record` | Kill its own `mur` by host pid | `REFUSED` |
+
+A signal probe sends signal `0` first and a real signal only when signal `0` was refused, so a
+reachable target is reported, never stopped. For these cases the harness passes host values to the
+capsule as `MUR_EC_*` variables, declared in the generated manifest. It also starts what the
+probes aim at:
+
+- for `signal-sibling-capsule`, a second capsule at the same class, stopped once the case is graded;
+- for `signal-unrelated-same-user`, a `sleep 600` it kills once the case is graded.
+
+A target that is gone after the case grades `ALLOWED`, whatever the probe reported. On
+`process-harness`, `runtime-kill-record` then kills `mur` from the host, and the case passes only
+if the record left behind reads `unsealed` in `mur trace verify`: a trace with a `session_start`
+and no `session_end`.
 
 A host that cannot back the class under test is refused before the first case runs, and a refused
 run writes no record. The record names the environment the run happened in, and only a bare-host

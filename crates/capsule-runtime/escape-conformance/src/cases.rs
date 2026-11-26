@@ -58,13 +58,12 @@
 //!
 //! Every case runs on [`Route::ShellTool`], graded on the three class columns. A case whose
 //! [`Case::harness`] names an expectation also runs on [`Route::ProcessHarness`], where the probe
-//! runs as the harness's own child. While the runtime spawns a harness with no containment beyond
-//! a cleared environment, an expectation there is an [`Expectation::KnownGap`] at the verdict a
-//! run measures:
-//! it gates like `Must`, so a change that closes the gap fails the suite until the expectation
-//! flips in the same change, but it is counted as known-gap drift, never as a boundary crossing.
-//! A class column may carry a `KnownGap` too, for a route the class does not contain; its
-//! attribution says `KNOWN GAP` and why.
+//! runs as the harness's own child. The runtime spawns the harness under the session's class like
+//! a shell command, so a harness expectation at a class matches the shell-tool one there. A route
+//! or class column the class does not contain carries an [`Expectation::KnownGap`] at the verdict
+//! a run measures: it gates like `Must`, so a change that closes the gap fails the suite until the
+//! expectation flips in the same change, but it is counted as known-gap drift, never as a boundary
+//! crossing. Its attribution says `KNOWN GAP` and why.
 //!
 //! # Adding a fourth containment class
 //!
@@ -156,8 +155,8 @@ pub enum Route {
     ShellTool,
     /// The process harness itself: `probe-driver` runs the probe as its own child instead of
     /// calling the bridge, as any process-transport harness can run anything. The runtime spawns
-    /// a harness with a cleared environment and no other containment at every class, so a case
-    /// on this route is graded on [`Case::harness`], one expectation whatever the class.
+    /// the harness under the session's class with a cleared environment, so a case on this route
+    /// is graded on [`Case::harness`], one expectation per class.
     ProcessHarness,
     /// A guest worker, measured as if its guest had escaped Wasmtime: `probe-driver` calls the
     /// probe guest, a WASM tool in the capsule's tools worker, over the tool bridge, and the
@@ -593,8 +592,8 @@ def main():
         category: Category::Boundary,
         summary: "stat()s /etc/shadow — a metadata-only query with no read grant",
         attribution: "This case asserts SUCCESS, not refusal, and a SUCCESS verdict here is NOT \
-                      a leaked finding and not an escape. Landlock mediates open/read/write and the create-class \
-                      actions; it does not mediate bare metadata queries at any ABI. Metadata \
+                      a leaked finding and not an escape. Landlock mediates open/read/write and \
+                      the create-class actions; it does not mediate bare metadata queries at any ABI. Metadata \
                       visibility is a documented property of the `scoped` class, and a harness \
                       that reported it as a failure would be asserting something false about the \
                       class it is certifying. It is asserted at `advisory` too, where nothing is \
@@ -1829,11 +1828,10 @@ def main():
                       capabilities the command does not), so where its name cannot be read the \
                       probe identifies it instead by /proc/1 being masked while the command's \
                       own PID namespace is not the kernel's initial one (inode 4026531836, \
-                      PROC_PID_INIT_INO): pid 1 of that namespace is its init, the holder. Pid 1 named anything else and refused with EPERM \
-                      reads REFUSED: that is the host's init and ordinary uid permissions, NOT \
-                      containment. The roadmap's \"REFUSED for any ordinary uid\" is what this \
-                      probe reports at `advisory`, which shares the host PID namespace. NOT \
-                      ASSERTED AT `advisory`: `advisory` has no PID namespace and no records \
+                      PROC_PID_INIT_INO): pid 1 of that namespace is its init, the holder. Pid 1 \
+                      named anything else and refused with EPERM reads REFUSED: that is the \
+                      host's init and ordinary uid permissions, NOT containment, and it is what \
+                      this probe reports in the host's PID namespace. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no records \
                       protection. ON `process-harness`: the harness runs under the session's \
                       class inside the same PID namespace, so its pid 1 is the same holder and \
                       the verdict matches the shell-tool route at each class.",
@@ -1900,8 +1898,8 @@ def main():
                       truncate, EXDEV for a link or rename the refer right does not cover. At \
                       `sealed` they are the composed root's: the records directory is mounted \
                       read-only with only its `home/` and `tmp/` binds writable, so the opens, \
-                      the truncate and the rename are EROFS, and a link across a bind is EXDEV. A link or symlink that was created but could not be opened \
-                      for writing is noted, not graded: what matters is whether the record can \
+                      the truncate and the rename are EROFS, and a link across a bind is EXDEV. \
+                      A link or symlink that was created but could not be opened for writing is noted, not graded: what matters is whether the record can \
                       change. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no \
                       records protection, so the record is writable there. ON `process-harness`: \
                       the harness runs under the session's class with the same records \
@@ -2055,7 +2053,7 @@ def main():
         summary: "writes its records `home/` and /tmp, and checks /tmp is the session's `tmp/`",
         attribution: "This case asserts SUCCESS, and its SUCCESS is the class working as \
                       declared, not an escape: the session's `home/` and `tmp/` records \
-                      sub-folders are writable by design (PR 338), and on every tier that maps \
+                      sub-folders are writable by design, and on every tier that maps \
                       /tmp a literal /tmp path is the session's temporary folder. The probe \
                       writes both, then compares /tmp/ec-tmp-probe with `tmp/ec-tmp-probe` in the \
                       records directory by device and inode, and removes both files. Either \
@@ -2116,7 +2114,7 @@ def main():
         verdict("REFUSED", "a records sub-folder the class promises was not writable: %s"
                 % "; ".join(refused))
     elif same:
-        verdict("SUCCESS", "both writable by design, PR 338; /tmp is the session's temporary "
+        verdict("SUCCESS", "both writable by design; /tmp is the session's temporary "
                            "folder: %s" % seen)
     else:
         verdict("ALLOWED", "/tmp was writable and is not the session's folder: %s" % seen)
