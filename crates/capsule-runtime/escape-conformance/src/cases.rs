@@ -1600,14 +1600,15 @@ def main():
                       and `sealed` the refusal is ESRCH from the session's PID namespace: the \
                       command sees only the session's own processes, so the host pid names \
                       nothing. EPERM would be uid permissions instead, which a same-user `mur` \
-                      does not trigger, so it would not be containment. A reached pid whose \
-                      /proc comm is not `mur` is a number colliding with an in-namespace pid and \
-                      reads INCONCLUSIVE, never a pass. NOT ASSERTED AT `advisory`: `advisory` has \
-                      no PID namespace and no records protection, so a same-user command can name \
-                      the runtime; the probe records ALLOWED there without sending SIGTERM. ON \
-                      `process-harness`: the harness runs under the session's class, inside the \
-                      same PID namespace, so the verdict matches the shell-tool route at each \
-                      class.",
+                      does not trigger, so it would not be containment. A reached pid whose /proc \
+                      comm is not `mur` is a number colliding with an in-namespace pid and reads \
+                      INCONCLUSIVE, never a pass. NOT ASSERTED AT `advisory`: a run whose achieved \
+                      class is `advisory` has no PID namespace and no records protection, so a \
+                      same-user command can name the runtime and the probe records ALLOWED there \
+                      without sending SIGTERM; a declared `advisory` run on a host with Landlock \
+                      achieves `scoped` and records `scoped`'s verdict. ON `process-harness`: the \
+                      harness runs under the session's class, inside the same PID namespace, so \
+                      the verdict matches the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
@@ -1647,20 +1648,21 @@ def main():
         category: Category::Boundary,
         summary: "names a sibling capsule's `mur` and every descendant by host pid with signal 0",
         attribution: "The runner starts a sibling capsule at the same class beside this one and \
-                      exports its `mur` and every descendant, by host pid, as \
-                      MUR_EC_SIBLING_PIDS. Signal 0 goes to every target first; any target it \
-                      reaches is reported ALLOWED and nothing further is sent to any of them. \
-                      Only when every signal 0 was refused does each target get SIGTERM, which \
-                      must be refused too. At `scoped` and `sealed` the refusal is ESRCH from the \
-                      session's PID namespace, which holds none of the sibling's processes; EPERM \
-                      would be uid permissions, which same-user processes do not trigger, so it \
-                      would not be containment. The runner then checks every target is still \
-                      alive, and a target gone after the case is ALLOWED whatever the probe \
-                      reported. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no \
-                      records protection, so the probe records ALLOWED there after signal 0 \
-                      alone. ON `process-harness`: the harness runs under the session's class, \
-                      inside the same PID namespace, so the verdict matches the shell-tool route \
-                      at each class.",
+                      exports its `mur` and every descendant, by host pid, as MUR_EC_SIBLING_PIDS. \
+                      Signal 0 goes to every target first; any target it reaches is reported \
+                      ALLOWED and nothing further is sent to any of them. Only when every signal 0 \
+                      was refused does each target get SIGTERM, which must be refused too. At \
+                      `scoped` and `sealed` the refusal is ESRCH from the session's PID namespace, \
+                      which holds none of the sibling's processes; EPERM would be uid permissions, \
+                      which same-user processes do not trigger, so it would not be containment. \
+                      The runner then checks every target is still alive, and a target gone after \
+                      the case is ALLOWED whatever the probe reported. NOT ASSERTED AT `advisory`: \
+                      a run whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the probe records ALLOWED there after signal 0 alone; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class, inside the same PID namespace, so the verdict matches the \
+                      shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
@@ -1707,19 +1709,20 @@ def main():
         id: "signal-unrelated-same-user",
         category: Category::Boundary,
         summary: "names a same-user process outside every capsule by host pid with signal 0",
-        attribution: "The runner starts a `sleep` of the same user, in a process group of its \
-                      own and outside every capsule, and exports its host pid as \
-                      MUR_EC_UNRELATED_PID. Signal 0 goes first and SIGTERM only when signal 0 \
-                      was refused, so a reachable process is reported and never stopped. At \
-                      `scoped` and `sealed` the refusal is ESRCH from the session's PID \
-                      namespace; EPERM would be uid permissions, which a same-user target does \
-                      not trigger, so it would not be containment. The runner then checks the \
-                      target is still alive, and a target gone after the case is ALLOWED whatever \
-                      the probe reported. NOT ASSERTED AT `advisory`: `advisory` has no PID \
-                      namespace and no records protection, so the probe records ALLOWED there \
-                      after signal 0 alone. ON `process-harness`: the harness runs under the \
-                      session's class, inside the same PID namespace, so the verdict matches the \
-                      shell-tool route at each class.",
+        attribution: "The runner starts a `sleep` of the same user, in a process group of its own \
+                      and outside every capsule, and exports its host pid as MUR_EC_UNRELATED_PID. \
+                      Signal 0 goes first and SIGTERM only when signal 0 was refused, so a \
+                      reachable process is reported and never stopped. At `scoped` and `sealed` \
+                      the refusal is ESRCH from the session's PID namespace; EPERM would be uid \
+                      permissions, which a same-user target does not trigger, so it would not be \
+                      containment. The runner then checks the target is still alive, and a target \
+                      gone after the case is ALLOWED whatever the probe reported. NOT ASSERTED AT \
+                      `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection, so the probe records ALLOWED there after signal 0 \
+                      alone; a declared `advisory` run on a host with Landlock achieves `scoped` \
+                      and records `scoped`'s verdict. ON `process-harness`: the harness runs under \
+                      the session's class, inside the same PID namespace, so the verdict matches \
+                      the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
@@ -1772,8 +1775,10 @@ def main():
                       the session's processes and the host pid is neither listed nor openable \
                       (ENOENT). A host that cannot mount a private procfs keeps /proc denied \
                       instead (EACCES from Landlock at `scoped`); `proc_reachable` in DETAIL says \
-                      which. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no \
-                      records protection, so it sees the host's /proc and records ALLOWED. ON \
+                      which. NOT ASSERTED AT `advisory`: a run whose achieved class is `advisory` \
+                      has no PID namespace and no records protection, so the probe sees the host's \
+                      /proc and records ALLOWED there; a declared `advisory` run on a host with \
+                      Landlock achieves `scoped` and records `scoped`'s verdict. ON \
                       `process-harness`: the harness runs under the session's class with the same \
                       private procfs, so the verdict matches the shell-tool route at each class.",
         advisory: NotAsserted,
@@ -1818,23 +1823,26 @@ def main():
         id: "signal-pid1",
         category: Category::Boundary,
         summary: "reads pid 1's name and sends it signal 0: the session's PID-namespace init",
-        attribution: "A control, not a boundary: this case asserts SUCCESS, and its SUCCESS is \
-                      not an escape. At `scoped` and `sealed` a command runs in the session's PID \
+        attribution: "A control, not a boundary: this case asserts SUCCESS, and its SUCCESS is not \
+                      an escape. At `scoped` and `sealed` a command runs in the session's PID \
                       namespace, whose pid 1 is the session's holder, named `mur-pidns-init` \
-                      (`network_namespace.rs`, PR_SET_NAME), so the host's init is not nameable \
-                      at all; SUCCESS says the namespace is in place, which is what every signal \
-                      case beside it relies on. The private /proc is mounted with `hidepid`, \
-                      which masks the holder from the command (`proc_view.rs`: it holds \
-                      capabilities the command does not), so where its name cannot be read the \
-                      probe identifies it instead by /proc/1 being masked while the command's \
-                      own PID namespace is not the kernel's initial one (inode 4026531836, \
-                      PROC_PID_INIT_INO): pid 1 of that namespace is its init, the holder. Pid 1 \
-                      named anything else and refused with EPERM reads REFUSED: that is the \
-                      host's init and ordinary uid permissions, NOT containment, and it is what \
-                      this probe reports in the host's PID namespace. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no records \
-                      protection. ON `process-harness`: the harness runs under the session's \
-                      class inside the same PID namespace, so its pid 1 is the same holder and \
-                      the verdict matches the shell-tool route at each class.",
+                      (`network_namespace.rs`, PR_SET_NAME), so the host's init is not nameable at \
+                      all; SUCCESS says the namespace is in place, which is what every signal case \
+                      beside it relies on. The private /proc is mounted with `hidepid`, which \
+                      masks the holder from the command (`proc_view.rs`: it holds capabilities the \
+                      command does not), so where its name cannot be read the probe identifies it \
+                      instead by /proc/1 being masked while the command's own PID namespace is not \
+                      the kernel's initial one (inode 4026531836, PROC_PID_INIT_INO): pid 1 of \
+                      that namespace is its init, the holder. Pid 1 named anything else and \
+                      refused with EPERM reads REFUSED: that is the host's init and ordinary uid \
+                      permissions, NOT containment, and it is what this probe reports in the \
+                      host's PID namespace. NOT ASSERTED AT `advisory`: a run whose achieved class \
+                      is `advisory` has no PID namespace and no records protection, so the probe \
+                      records REFUSED there, uid permissions on the host's init; a declared \
+                      `advisory` run on a host with Landlock achieves `scoped` and records \
+                      `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class inside the same PID namespace, so its pid 1 is the same \
+                      holder and the verdict matches the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Succeeded),
         sealed: Must(Succeeded),
@@ -1893,17 +1901,20 @@ def main():
                       truncate to the file's own size, a rename (renamed back at once), a hard \
                       link into `home/` opened for writing, and a symlink in `home/` opened for \
                       writing, any of which succeeding is the finding. The records directory is \
-                      read-only to commands except its `home/` and `tmp/` sub-folders. At \
-                      `scoped` the refusals are Landlock's: EACCES for the opens and the \
-                      truncate, EXDEV for a link or rename the refer right does not cover. At \
-                      `sealed` they are the composed root's: the records directory is mounted \
-                      read-only with only its `home/` and `tmp/` binds writable, so the opens, \
-                      the truncate and the rename are EROFS, and a link across a bind is EXDEV. \
-                      A link or symlink that was created but could not be opened for writing is noted, not graded: what matters is whether the record can \
-                      change. NOT ASSERTED AT `advisory`: `advisory` has no PID namespace and no \
-                      records protection, so the record is writable there. ON `process-harness`: \
-                      the harness runs under the session's class with the same records \
-                      directory rules, so the verdict matches the shell-tool route at each class.",
+                      read-only to commands except its `home/` and `tmp/` sub-folders. At `scoped` \
+                      the refusals are Landlock's: EACCES for the opens and the truncate, EXDEV \
+                      for a link or rename the refer right does not cover. At `sealed` they are \
+                      the composed root's: the records directory is mounted read-only with only \
+                      its `home/` and `tmp/` binds writable, so the opens, the truncate and the \
+                      rename are EROFS, and a link across a bind is EXDEV. A link or symlink that \
+                      was created but could not be opened for writing is noted, not graded: what \
+                      matters is whether the record can change. NOT ASSERTED AT `advisory`: a run \
+                      whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the record is writable and the probe records ALLOWED there; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class with the same records directory rules, so the verdict \
+                      matches the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
@@ -2001,14 +2012,15 @@ def main():
                       entries listed, never contents. At `scoped` the refusal is Landlock's \
                       EACCES: no rule covers the records root or another session's records \
                       directory. At `sealed` the other session's trace is the composed root's \
-                      ENOENT: no other session's records exist in it; the records root, which \
-                      the composed root reproduces on the path to the session's own records \
-                      directory, is refused EACCES by Landlock, which `sealed` applies too. NOT \
-                      ASSERTED \
-                      AT `advisory`: `advisory` has no PID namespace and no records protection, \
-                      so every record is readable there. ON `process-harness`: the harness runs \
-                      under the session's class with the same rules, so the verdict matches the \
-                      shell-tool route at each class.",
+                      ENOENT: no other session's records exist in it; the records root, which the \
+                      composed root reproduces on the path to the session's own records directory, \
+                      is refused EACCES by Landlock, which `sealed` applies too. NOT ASSERTED AT \
+                      `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection, so every record is readable and the probe records \
+                      ALLOWED there; a declared `advisory` run on a host with Landlock achieves \
+                      `scoped` and records `scoped`'s verdict. ON `process-harness`: the harness \
+                      runs under the session's class with the same rules, so the verdict matches \
+                      the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
@@ -2051,19 +2063,21 @@ def main():
         id: "records-writable-subfolders",
         category: Category::Boundary,
         summary: "writes its records `home/` and /tmp, and checks /tmp is the session's `tmp/`",
-        attribution: "This case asserts SUCCESS, and its SUCCESS is the class working as \
-                      declared, not an escape: the session's `home/` and `tmp/` records \
-                      sub-folders are writable by design, and on every tier that maps \
-                      /tmp a literal /tmp path is the session's temporary folder. The probe \
-                      writes both, then compares /tmp/ec-tmp-probe with `tmp/ec-tmp-probe` in the \
-                      records directory by device and inode, and removes both files. Either \
-                      write refused is REFUSED: at `scoped` Landlock's EACCES, at `sealed` the \
-                      composed root's EROFS or ENOENT, meaning the class lost a folder it \
-                      promises. /tmp writable but not the session's folder is ALLOWED: the \
-                      command wrote the host's /tmp. NOT ASSERTED AT `advisory`: `advisory` has \
-                      no PID namespace and no records protection and maps no /tmp. ON \
-                      `process-harness`: the harness runs under the session's class with the \
-                      same folders, so the verdict matches the shell-tool route at each class.",
+        attribution: "This case asserts SUCCESS, and its SUCCESS is the class working as declared, \
+                      not an escape: the session's `home/` and `tmp/` records sub-folders are \
+                      writable by design, and on every tier that maps /tmp a literal /tmp path is \
+                      the session's temporary folder. The probe writes both, then compares \
+                      /tmp/ec-tmp-probe with `tmp/ec-tmp-probe` in the records directory by device \
+                      and inode, and removes both files. Either write refused is REFUSED: at \
+                      `scoped` Landlock's EACCES, at `sealed` the composed root's EROFS or ENOENT, \
+                      meaning the class lost a folder it promises. /tmp writable but not the \
+                      session's folder is ALLOWED: the command wrote the host's /tmp. NOT ASSERTED \
+                      AT `advisory`: a run whose achieved class is `advisory` has no PID namespace \
+                      and no records protection and maps no /tmp, so the probe records ALLOWED \
+                      there, having written the host's /tmp; a declared `advisory` run on a host \
+                      with Landlock achieves `scoped` and records `scoped`'s verdict. ON \
+                      `process-harness`: the harness runs under the session's class with the same \
+                      folders, so the verdict matches the shell-tool route at each class.",
         advisory: NotAsserted,
         scoped: Must(Succeeded),
         sealed: Must(Succeeded),
@@ -2130,17 +2144,19 @@ def main():
                       refused, so a reachable runtime is reported and never killed by the probe. \
                       At `scoped` and `sealed` the refusal is ESRCH from the session's PID \
                       namespace; EPERM would be uid permissions, which a same-user `mur` does not \
-                      trigger, so it would not be containment. NOT ASSERTED AT `advisory`: \
-                      `advisory` has no PID namespace and no records protection, so the probe \
-                      records ALLOWED there without sending SIGKILL. ON `process-harness`: the \
-                      harness runs under the session's class inside the same PID namespace, so \
-                      the probe's verdict matches the shell-tool route at each class. On that \
-                      route the probe then holds the run open, and once it has reported the \
-                      runner kills `mur` from the host and checks the record the killed runtime \
-                      left: a trace with `session_start`, no `session_end`, which `mur trace \
-                      verify` reads as `unsealed`, keeps the verdict. A record that verifies \
-                      would make the kill undetectable and reads ALLOWED; a record that cannot \
-                      be checked reads INCONCLUSIVE.",
+                      trigger, so it would not be containment. NOT ASSERTED AT `advisory`: a run \
+                      whose achieved class is `advisory` has no PID namespace and no records \
+                      protection, so the probe records ALLOWED there without sending SIGKILL; a \
+                      declared `advisory` run on a host with Landlock achieves `scoped` and \
+                      records `scoped`'s verdict. ON `process-harness`: the harness runs under the \
+                      session's class inside the same PID namespace, so the probe's verdict \
+                      matches the shell-tool route at each class. On that route the probe then \
+                      holds the run open, and once it has reported the runner kills `mur` from the \
+                      host and checks the record the killed runtime left: a trace with \
+                      `session_start`, no `session_end`, which `mur trace verify` reads as \
+                      `unsealed`, keeps the verdict. A record that verifies would make the kill \
+                      undetectable and reads ALLOWED; a record that cannot be checked reads \
+                      INCONCLUSIVE.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: Must(Refused),
