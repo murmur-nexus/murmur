@@ -34,7 +34,10 @@ A worker starts only when the capsule has an artifact of its kind:
 `mur` starts the workers during staging, once the session's work folder and runtime folder exist.
 Each worker runs in its own process group with `/` as its working directory. Under a class with
 a process namespace, `mur`'s child is a relay outside the namespace and the worker is the relay's
-child inside it. Each worker is started inside the cgroup scope `mur` runs in. It dies with `mur`.
+child inside it. On Linux each worker and its relay run in the session's
+[guest-worker cgroup](../reference/resource-limits.md#cgroup-placement), beside the session
+cgroup its shell commands run in, under the same `capabilities.resources` cgroup limits; `mur`
+stays outside both. A worker dies with `mur`.
 
 ## What never enters a worker
 
@@ -113,8 +116,11 @@ exactly that. What the class does not hold is what `mur` itself reads on an arti
 files a capsule exports. Nor does any class hold a flaw in the kernel every process shares.
 
 A worker is not limited by the memory, process-count or CPU-time rlimits: the WASM runtime
-reserves several GiB of address space for each artifact it loads, and the session's cgroup scope and each
-call's own limits bound it instead.
+reserves several GiB of address space for each artifact it loads. The guest-worker cgroup's
+`cgroup_memory_bytes`, `cgroup_pids_max` and `cgroup_cpu_percent`, and each call's own limits,
+bound it instead; see [What the cgroup limits bound](../reference/resource-limits.md#cgroup-placement).
+A worker the kernel kills at `cgroup_memory_bytes` ends the session with
+[`E-RUN-065`](../reference/diagnostics.md#e-run-065) naming that field.
 
 The [Routes block](../reference/containment.md#routes) of `mur run --explain-scope` shows the
 `wasm-tools`, `drivers` and `hooks` routes under the installed tier.

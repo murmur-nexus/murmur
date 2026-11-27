@@ -519,7 +519,16 @@ fn explain_scope_prints_the_resources_and_the_shell_environment_names() {
             "no `{key}: {value}` line:\n{resources}"
         );
     }
-    assert_eq!(resources.lines().count(), 11, "{resources}");
+    // One value line and one `bounds:` line per field, under the heading.
+    assert_eq!(resources.lines().count(), 21, "{resources}");
+    assert_eq!(
+        resources
+            .lines()
+            .filter(|line| line.starts_with("    bounds: "))
+            .count(),
+        10,
+        "{resources}"
+    );
 
     let shell_env = text_block(&rendered, "Shell environment");
     let baseline = shell_env_line(shell_env, "baseline");
@@ -591,7 +600,11 @@ fn explain_scope_reads_default_on_every_resources_line_without_a_resources_block
         .clone();
     let rendered = String::from_utf8(output).unwrap();
     let resources = text_block(&rendered, "Resources");
-    let rows: Vec<&str> = resources.lines().skip(1).collect();
+    let rows: Vec<&str> = resources
+        .lines()
+        .skip(1)
+        .filter(|line| !line.starts_with("    bounds: "))
+        .collect();
     assert_eq!(rows.len(), 10, "{resources}");
     assert!(
         rows.iter().all(|row| row.ends_with(" (default)")),

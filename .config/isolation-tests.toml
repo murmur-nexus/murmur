@@ -44,3 +44,12 @@ filter = "test(=tools_worker_runs_under_scoped)"
 needs = ["wasmtime", "user-namespace", "network-namespace", "pid-namespace", "cgroup-delegation", "seccomp", "landlock"]
 class = "scoped"
 why = "The real mur must run its WASM tools and driver guest workers under the session's seccomp filter, PID namespace and cgroup at scoped, which needs a host that installs scoped."
+
+[[set]]
+name = "guest-worker-cgroup"
+package = "murmur-cli"
+target = "test:guest_workers"
+filter = "test(=workers_run_in_their_own_cgroup_under_the_declared_limits) | test(=shell_children_keep_their_bounds_beside_the_worker_cgroup)"
+needs = ["wasmtime", "user-namespace", "network-namespace", "pid-namespace", "cgroup-delegation", "seccomp", "landlock"]
+class = "scoped"
+why = "The real mur must put its guest workers in their own cgroup under the declared memory and task limits, apart from mur and beside the session cgroup whose shell bounds still hold, which needs a host that delegates a cgroup and installs scoped."

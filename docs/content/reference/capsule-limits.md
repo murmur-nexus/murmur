@@ -369,10 +369,10 @@ A fresh work folder builds every dependency from cold;
 
 | | |
 |---|---|
-| What fails | Past `cgroup_memory_bytes` the tree is OOM-killed; past `cgroup_pids_max` a fork fails with `EAGAIN`. A `resource_limit:` line names the limit when no other command ran in the scope at the same time. `cgroup_cpu_percent` and `cgroup_io_bytes_per_sec` slow the tree down |
-| Why | A cgroup scope bounds the whole subprocess tree. See [Host resource limits](resource-limits.md#host-resource-limits) and [Which limit a subprocess hit](resource-limits.md#which-limit) |
+| What fails | Past `cgroup_memory_bytes` the tree is OOM-killed; past `cgroup_pids_max` a fork fails with `EAGAIN`. A `resource_limit:` line names the limit when no other command ran in the scope at the same time. `cgroup_cpu_percent` and `cgroup_io_bytes_per_sec` slow the tree down. The guest workers have their own cgroup with the same memory, task and CPU limits: a worker killed past `cgroup_memory_bytes`, or refused a thread past `cgroup_pids_max`, ends the session with [`E-RUN-065`](diagnostics.md#e-run-065) naming the field |
+| Why | One cgroup bounds the whole subprocess tree, and another the guest workers, each on its own. See [Host resource limits](resource-limits.md#host-resource-limits), [What the cgroup limits bound](resource-limits.md#cgroup-placement) and [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | Lifted by | A larger value of each `capabilities.resources.cgroup_*` field |
-| Shown by | `cgroup_memory_bytes:`, `cgroup_pids_max:`, `cgroup_cpu_percent:` and `cgroup_io_bytes_per_sec:` in the `Resources` block of `mur run --explain-scope`, and `io.max:` under its `Resource plane`; the `Memory bound` and `Cgroup scope` blocks of `mur doctor` |
+| Shown by | `cgroup_memory_bytes:`, `cgroup_pids_max:`, `cgroup_cpu_percent:` and `cgroup_io_bytes_per_sec:` in the `Resources` block of `mur run --explain-scope`, each with the `bounds:` line under it, and `io.max:` under its `Resource plane`; the `Memory bound` and `Cgroup scope` blocks of `mur doctor` |
 | Doctor | The `Memory bound` and `Cgroup scope` blocks |
 
 ### Per-process limits { #process-limits }

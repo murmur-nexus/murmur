@@ -957,11 +957,141 @@ fn the_lost_worker_message_names_kind_pid_call_and_exit() {
         Some(77),
         Some("hook 'sleep-hook'"),
         "was killed by signal 9 (SIGKILL)",
+        "",
     );
     assert_eq!(
         message,
         "the hooks guest worker (pid 77) was lost while running hook 'sleep-hook': it was killed \
          by signal 9 (SIGKILL); the task failed and the session ended"
+    );
+}
+
+/// A lost or refused worker whose guest-worker cgroup counted an `oom_kill` or a refused fork
+/// names the declared limit and its value; with neither counter, nothing is added.
+#[test]
+fn a_lost_guest_worker_names_the_cgroup_limit_it_reached() {
+    let memory = supervisor::limit_suffix("cgroup_memory_bytes", "268435456");
+    assert_eq!(
+        memory,
+        "; the guest-worker cgroup reached capabilities.resources.cgroup_memory_bytes \
+         (268435456 bytes)"
+    );
+    let pids = supervisor::limit_suffix("cgroup_pids_max", "64");
+    assert_eq!(
+        pids,
+        "; the guest-worker cgroup reached capabilities.resources.cgroup_pids_max (64)"
+    );
+    assert_eq!(
+        supervisor::lost_message(
+            WorkerKind::Driver,
+            Some(9),
+            Some("capsule 'balloon'"),
+            "was killed by signal 9 (SIGKILL)",
+            &memory,
+        ),
+        "the driver guest worker (pid 9) was lost while running capsule 'balloon': it was killed \
+         by signal 9 (SIGKILL); the guest-worker cgroup reached \
+         capabilities.resources.cgroup_memory_bytes (268435456 bytes); the task failed and the \
+         session ended"
+    );
+    assert_eq!(
+        supervisor::start_error(WorkerKind::Tools, "it did not say hello: eof", &pids).to_string(),
+        crate::errors::RuntimeError::GuestWorkerStart(
+            "the tools guest worker could not be started: it did not say hello: eof; the \
+             guest-worker cgroup reached capabilities.resources.cgroup_pids_max (64)"
+                .to_string()
+        )
+        .to_string()
+    );
+    assert_eq!(
+        supervisor::start_error(WorkerKind::Tools, "it did not say hello: eof", "").to_string(),
+        crate::errors::RuntimeError::GuestWorkerStart(
+            "the tools guest worker could not be started: it did not say hello: eof".to_string()
+        )
+        .to_string()
+    );
+}
+
+/// The kernel's counters pick the suffix: none on a fresh guest-worker cgroup, the pids limit once
+/// `pids.max` refuses a fork in it, the memory limit once the kernel OOM-kills a task in it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_guest_worker_cgroup_reports_the_limit_its_counters_show() {
+    let test = "a_guest_worker_cgroup_reports_the_limit_its_counters_show";
+    if crate::cgroup::skip_without_host_support(test) {
+        return;
+    }
+    let policy = crate::types::CapabilityPolicy {
+        shell_allow: vec!["bash".to_string()],
+        resources: crate::resources::HostResourceLimits {
+            cgroup_pids_max: 1,
+            cgroup_memory_bytes: 64 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let scope = crate::cgroup::prepare_worker_scope(&policy, "ses_worker_counters")
+        .expect("this host delegates a cgroup scope")
+        .expect("a shell grant requires the guest-worker cgroup");
+    assert_eq!(scope.reached_limit(), None);
+
+    // `sh` alone fills `pids.max` 1, so its one fork is refused (`sh` gives up at once, where
+    // `bash` retries for seconds).
+    let in_scope = |shell: &str, script: &str| {
+        use std::os::unix::process::CommandExt;
+        let joining = Arc::clone(&scope);
+        let mut command = std::process::Command::new(shell);
+        command
+            .args(["-c", script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `join_current_process` is one `write` to a descriptor opened before the fork.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || joining.join_current_process());
+        }
+        command.status().unwrap()
+    };
+    in_scope("sh", "/bin/true; exit 0");
+    assert_eq!(
+        scope.reached_limit(),
+        Some(("cgroup_pids_max", "1".to_string()))
+    );
+
+    // Now with room to fork, a shell that holds 256 MiB in a variable outgrows `memory.max`.
+    std::fs::write(scope.path().join("pids.max"), "16").unwrap();
+    let hog = in_scope(
+        "bash",
+        "x=$(head -c 268435456 /dev/zero | tr '\\0' a); exit 0",
+    );
+    assert!(!hog.success(), "{hog:?}");
+    assert_eq!(
+        scope.reached_limit(),
+        Some(("cgroup_memory_bytes", (64u64 << 20).to_string()))
+    );
+}
+
+/// Each worker's blocking-thread bound, and the worst-case task count of all three workers, which
+/// a declared `cgroup_pids_max` of 64 must leave headroom over.
+#[test]
+fn guest_worker_task_counts_stay_within_48() {
+    assert_eq!(WorkerKind::Tools.blocking_threads(), 14);
+    assert_eq!(WorkerKind::Driver.blocking_threads(), 7);
+    assert_eq!(WorkerKind::Hooks.blocking_threads(), 7);
+    assert_eq!(WorkerKind::Tools.worst_case_tasks(), 22);
+    assert_eq!(WorkerKind::Driver.worst_case_tasks(), 13);
+    assert_eq!(WorkerKind::Hooks.worst_case_tasks(), 13);
+    assert_eq!(
+        [WorkerKind::Driver, WorkerKind::Tools, WorkerKind::Hooks]
+            .iter()
+            .map(|kind| kind.worst_case_tasks())
+            .sum::<usize>(),
+        super::WORKERS_WORST_CASE_TASKS
+    );
+    assert_eq!(
+        super::WORKERS_WORST_CASE_TASKS,
+        48,
+        "the documented worst case"
     );
 }
 

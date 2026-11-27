@@ -735,3 +735,151 @@ fn worker_only_capsule_needs_cgroup() {
         );
     }
 }
+
+/// The value line of `key` in a text report's `Resources` block and the `bounds:` line under it.
+fn resources_row<'a>(stdout: &'a str, key: &str) -> (&'a str, &'a str) {
+    let mut lines = stdout
+        .lines()
+        .skip_while(|line| *line != "Resources")
+        .skip(1);
+    let label = format!("{key}:");
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with(&label) {
+            let bounds = lines
+                .next()
+                .and_then(|next| next.strip_prefix("    bounds: "))
+                .unwrap_or_else(|| panic!("no bounds: line under {key}:\n{stdout}"));
+            return (line, bounds);
+        }
+    }
+    panic!("no {key}: line in the Resources block:\n{stdout}");
+}
+
+/// `mur run --explain-scope` names, under each `Resources` field, the processes that field bounds:
+/// the declared `cgroup_memory_bytes` bounds the session cgroup and the guest-worker cgroup each
+/// on its own and not `mur`; `cgroup_io_bytes_per_sec` bounds the session cgroup only. The
+/// `--json` report's `resources` keeps its ten `{value, declared}` keys.
+#[test]
+fn explain_scope_states_which_processes_each_limit_bounds() {
+    let home = TempDir::new().unwrap();
+    let project = script_project(
+        "capabilities:\n  shell:\n    allow:\n      - bash\n  resources:\n    \
+         cgroup_memory_bytes: 268435456\n",
+    );
+    let cwd = project.path();
+    let text = mur(
+        false,
+        home.path(),
+        cwd,
+        &["run", "--manifest", "murmur.yaml", "--explain-scope"],
+    );
+    assert_eq!(text.code, Some(0), "{}", text.all());
+    let bounds_lines = text
+        .stdout
+        .lines()
+        .skip_while(|line| *line != "Resources")
+        .take_while(|line| !line.is_empty())
+        .filter(|line| line.starts_with("    bounds: "))
+        .count();
+    assert_eq!(bounds_lines, 10, "{}", text.all());
+
+    let (memory, memory_bounds) = resources_row(&text.stdout, "cgroup_memory_bytes");
+    assert!(memory.ends_with("268435456 (declared)"), "{memory}");
+    let (_, io_bounds) = resources_row(&text.stdout, "cgroup_io_bytes_per_sec");
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            memory_bounds,
+            "the session cgroup (shell commands, murmur:process programs and what they start) \
+             and the guest-worker cgroup (guest workers), each on its own; not mur"
+        );
+        assert_eq!(
+            io_bounds,
+            "the session cgroup only (shell commands, murmur:process programs and what they \
+             start); not guest workers or mur"
+        );
+    } else {
+        assert_eq!(memory_bounds, "nothing: cgroups do not exist on this host");
+        assert_eq!(io_bounds, "nothing: cgroups do not exist on this host");
+    }
+
+    let report = mur(
+        false,
+        home.path(),
+        cwd,
+        &[
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--explain-scope",
+            "--json",
+        ],
+    )
+    .json();
+    let resources = report["resources"].as_object().unwrap();
+    let keys: Vec<&str> = resources.keys().map(String::as_str).collect();
+    let mut expected = vec![
+        "memory_bytes",
+        "workdir_max_bytes",
+        "max_open_files",
+        "max_file_size_bytes",
+        "max_processes",
+        "cpu_seconds",
+        "cgroup_memory_bytes",
+        "cgroup_pids_max",
+        "cgroup_cpu_percent",
+        "cgroup_io_bytes_per_sec",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "{report}");
+    for (key, row) in resources {
+        let mut fields: Vec<&str> = row
+            .as_object()
+            .unwrap_or_else(|| panic!("{key}: {row}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["declared", "value"], "{key}: {row}");
+    }
+    assert_eq!(
+        report["resources"]["cgroup_memory_bytes"],
+        json!({"value": 268435456, "declared": true})
+    );
+}
+
+/// A capsule with no way to run a subprocess gets no cgroup, so `--explain-scope` says its
+/// `cgroup_*` fields bound nothing, declared or not, while its rlimit rows are unchanged.
+#[test]
+fn explain_scope_says_cgroup_fields_bound_nothing_without_a_scope() {
+    let home = TempDir::new().unwrap();
+    let project =
+        script_project("capabilities:\n  resources:\n    cgroup_memory_bytes: 268435456\n");
+    let text = mur(
+        false,
+        home.path(),
+        project.path(),
+        &["run", "--manifest", "murmur.yaml", "--explain-scope"],
+    );
+    assert_eq!(text.code, Some(0), "{}", text.all());
+    let expected = if cfg!(target_os = "linux") {
+        "nothing: this capsule declares no way to run a subprocess, so a launch creates no cgroup \
+         for it"
+    } else {
+        "nothing: cgroups do not exist on this host"
+    };
+    for key in [
+        "cgroup_memory_bytes",
+        "cgroup_pids_max",
+        "cgroup_cpu_percent",
+        "cgroup_io_bytes_per_sec",
+    ] {
+        let (_, bounds) = resources_row(&text.stdout, key);
+        assert_eq!(bounds, expected, "{key}\n{}", text.all());
+    }
+    let (_, memory_bounds) = resources_row(&text.stdout, "memory_bytes");
+    assert_eq!(
+        memory_bounds,
+        "each shell command and murmur:process program on its own (address space); not guest \
+         workers or mur"
+    );
+}

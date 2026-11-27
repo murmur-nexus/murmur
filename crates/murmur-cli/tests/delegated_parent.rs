@@ -508,9 +508,10 @@ leftovers
     assert_eq!(out.read("leftover.txt"), "", "left behind");
 }
 
-/// Under an adopted parent the declared limits land on the session cgroup exactly as under a
-/// systemd scope, `murmur-<pid>-p` itself carries none, and the launch and its guest workers sit
-/// in `murmur-<pid>-p/murmur-supervisor`.
+/// Under an adopted parent the declared limits land on the session cgroup and the guest-worker
+/// cgroup exactly as under a systemd scope, `murmur-<pid>-p` itself carries none, the launch sits
+/// in `murmur-<pid>-p/murmur-supervisor` and its guest workers in
+/// `murmur-<pid>-p/murmur-<session>-workers-<pid>-<n>`.
 #[test]
 fn declared_limits_land_on_the_session_cgroup_under_an_adopted_parent() {
     let test = "declared_limits_land_on_the_session_cgroup_under_an_adopted_parent";
@@ -523,9 +524,14 @@ fn declared_limits_land_on_the_session_cgroup_under_an_adopted_parent() {
     );
     let body = r#"
 launch held; P=$(cat "$OUT/held.pid"); own=/sys/fs/cgroup/murmur-$P-p
-n=0; until grep -qx 'populated 1' "$own"/murmur-ses_*/cgroup.events 2>/dev/null || [ $n -ge 1200 ]; do sleep 0.05; n=$((n+1)); done
-S=$(ls -d "$own"/murmur-ses_* | head -1)
+session() { ls -d "$own"/murmur-ses_* 2>/dev/null | grep -v -- -workers- | head -1; }
+n=0; until grep -qx 'populated 1' "$(session)/cgroup.events" 2>/dev/null || [ $n -ge 1200 ]; do sleep 0.05; n=$((n+1)); done
+S=$(session); W=$(ls -d "$own"/murmur-ses_*-workers-* | head -1)
 cat "$S/memory.max" > "$OUT/ses.memory.max"; cat "$S/pids.max" > "$OUT/ses.pids.max"
+cat "$W/memory.max" > "$OUT/workers.memory.max"; cat "$W/pids.max" > "$OUT/workers.pids.max"
+for p in $(cat "$W/cgroup.procs"); do
+  echo "$p $(tr '\0' ' ' < /proc/$p/cmdline)" >> "$OUT/workers.txt"
+done
 cat "$own/memory.max" > "$OUT/own.memory.max"; cat "$own/pids.max" > "$OUT/own.pids.max"
 sed -n 's/^0:://p' "/proc/$P/cgroup" > "$OUT/held.cgroup"
 for p in $(cat "$own/murmur-supervisor/cgroup.procs"); do
@@ -540,6 +546,8 @@ leftovers
     assert_eq!(launch.code, Some(0), "{}", launch.all());
     assert_eq!(out.read("ses.memory.max").trim(), "268435456");
     assert_eq!(out.read("ses.pids.max").trim(), "64");
+    assert_eq!(out.read("workers.memory.max").trim(), "268435456");
+    assert_eq!(out.read("workers.pids.max").trim(), "64");
     assert_eq!(out.read("own.memory.max").trim(), "max");
     assert_eq!(out.read("own.pids.max").trim(), "max");
     assert_eq!(
@@ -557,9 +565,22 @@ leftovers
             .any(|line| line.starts_with(&format!("{} ", launch.pid))),
         "{supervisor}"
     );
+    assert_eq!(
+        workers, 0,
+        "a guest worker in the supervisor leaf:\n{supervisor}"
+    );
+    let in_workers = out.read("workers.txt");
     assert!(
-        workers >= 1,
-        "no guest worker in the supervisor leaf:\n{supervisor}"
+        in_workers
+            .lines()
+            .any(|line| line.contains("__guest-worker")),
+        "no guest worker in the guest-worker cgroup:\n{in_workers}"
+    );
+    assert!(
+        !in_workers
+            .lines()
+            .any(|line| line.starts_with(&format!("{} ", launch.pid))),
+        "mur in the guest-worker cgroup:\n{in_workers}"
     );
     assert_eq!(out.read("leftover.txt"), "", "left behind");
 }

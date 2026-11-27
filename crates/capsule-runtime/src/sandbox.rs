@@ -3640,16 +3640,21 @@ impl ShellEnforcement {
     ///   inherited values. Wasmtime reserves several GiB of address space for each linear memory,
     ///   a worker's threads count against the uid's task total, and a worker lives the whole
     ///   session; a guest call is bounded by its fuel, epoch deadline and wall bound instead, and
-    ///   the worker by the session's cgroup scope. `RLIMIT_NOFILE`, `RLIMIT_FSIZE` and
-    ///   `RLIMIT_CORE` apply as to a command.
-    /// - No cgroup join of its own: staging forks the worker after `cgroup::await_delegated_base`
-    ///   has put `mur` in the cgroup it stays in, so the worker, its relay and the session
-    ///   namespace's holders inherit that cgroup. No held-port observation, and no ownership of
-    ///   the runtime directory.
+    ///   the worker by the guest-worker cgroup's `memory.max` and `pids.max`. `RLIMIT_NOFILE`,
+    ///   `RLIMIT_FSIZE` and `RLIMIT_CORE` apply as to a command.
+    /// - cgroup: `worker_scope`, the session's guest-worker cgroup
+    ///   ([`crate::cgroup::prepare_worker_scope`]), in place of the session cgroup shell commands
+    ///   join. The spawn writes the child's pid to it before the PID-namespace fork, so the relay
+    ///   and the worker both land in it, and with it [`Self::nproc_bound`] leaves the task bound to
+    ///   its `pids.max`. `mur`, its scope watchers and the session namespace's holders stay in
+    ///   `murmur-supervisor`; no worker ever joins the session cgroup. `None` (no scope required,
+    ///   or off Linux) joins nothing. No held-port observation, and no ownership of the runtime
+    ///   directory.
     pub(crate) fn for_guest_worker(
         &self,
         closure: &WorkerGrantClosure,
         worker_image: &Path,
+        worker_scope: Option<Arc<crate::cgroup::CgroupScope>>,
     ) -> ShellEnforcement {
         let mut worker = self.clone();
         worker.landlock_grants = LandlockGrant::non_listable_files(resolve_landlock_grants(&[
@@ -3663,7 +3668,7 @@ impl ShellEnforcement {
         worker.fd_hygiene_fallback = true;
         worker.workdir_exec = false;
         worker.bind_observation = None;
-        worker.cgroup_scope = None;
+        worker.cgroup_scope = worker_scope;
         worker.workdir_guard = None;
         worker.runtime_dir_owner = None;
         worker.resource_limits.memory_bytes = u64::MAX;
@@ -15360,6 +15365,7 @@ mod guest_worker_enforcement_tests {
                     host_paths: true,
                 },
                 &image,
+                None,
             );
             assert_eq!(tools.tier, tier);
             assert!(!tools.workdir_exec);
@@ -15402,10 +15408,14 @@ mod guest_worker_enforcement_tests {
             assert_eq!(tools.resource_limits.memory_bytes, u64::MAX);
             assert_eq!(tools.resource_limits.max_processes, u64::MAX);
             assert_eq!(tools.resource_limits.cpu_seconds, None);
-            assert!(tools.cgroup_scope.is_none() && tools.runtime_dir_owner.is_none());
+            assert!(
+                tools.cgroup_scope.is_none(),
+                "no guest-worker cgroup given, none joined"
+            );
+            assert!(tools.runtime_dir_owner.is_none());
             assert!(tools.fd_hygiene_fallback && !session.fd_hygiene_fallback);
 
-            let driver = session.for_guest_worker(&WorkerGrantClosure::default(), &image);
+            let driver = session.for_guest_worker(&WorkerGrantClosure::default(), &image, None);
             assert!(driver.host_paths.is_empty(), "{tier:?}");
             assert_eq!(
                 driver.runtime_dir.is_some(),
@@ -15414,5 +15424,44 @@ mod guest_worker_enforcement_tests {
             );
             assert!(Arc::ptr_eq(&driver.session_netns, &session.session_netns));
         }
+    }
+
+    /// A worker's enforcement carries the guest-worker cgroup it is given, so its spawn joins
+    /// that cgroup and its task bound is the cgroup's `pids.max`; the session enforcement the
+    /// worker's is derived from keeps the session cgroup (here none), which no worker joins.
+    #[test]
+    fn a_guest_worker_enforcement_joins_the_guest_worker_cgroup() {
+        let test = "a_guest_worker_enforcement_joins_the_guest_worker_cgroup";
+        if crate::cgroup::skip_without_host_support(test) {
+            return;
+        }
+        let policy = crate::types::CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..Default::default()
+        };
+        let scope = crate::cgroup::prepare_worker_scope(&policy, "ses_worker_enforcement")
+            .expect("this host delegates a cgroup scope")
+            .expect("a shell grant requires the guest-worker cgroup");
+        let image = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let session = session(EnforcementTier::KernelFull);
+        let worker = session.for_guest_worker(
+            &WorkerGrantClosure::default(),
+            &image,
+            Some(Arc::clone(&scope)),
+        );
+        let joined = worker
+            .cgroup_scope
+            .as_ref()
+            .expect("the worker joins the guest-worker cgroup");
+        assert!(Arc::ptr_eq(joined, &scope));
+        assert_eq!(
+            worker.nproc_bound(),
+            crate::resources::NprocBound::CgroupPidsMax
+        );
+        assert!(session.cgroup_scope.is_none(), "the session keeps its own");
+        assert!(matches!(
+            session.nproc_bound(),
+            crate::resources::NprocBound::Headroom { .. }
+        ));
     }
 }

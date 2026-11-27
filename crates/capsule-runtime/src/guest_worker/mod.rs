@@ -91,13 +91,50 @@ impl WorkerKind {
     }
 
     /// The worker's async runtime threads: the tools worker serves concurrent bridged tool calls.
-    fn runtime_threads(self) -> usize {
+    const fn runtime_threads(self) -> usize {
         match self {
             Self::Tools => 4,
             Self::Driver | Self::Hooks => 2,
         }
     }
+
+    /// The most blocking threads the worker's async runtime starts (`max_blocking_threads`). WASI
+    /// file work runs on them; past the bound it queues, so the worker's task count stays fixed
+    /// under the guest-worker cgroup's `pids.max`, which counts threads.
+    pub(crate) const fn blocking_threads(self) -> usize {
+        match self {
+            Self::Tools => TOOLS_BLOCKING_THREADS,
+            Self::Driver => DRIVER_BLOCKING_THREADS,
+            Self::Hooks => HOOKS_BLOCKING_THREADS,
+        }
+    }
+
+    /// The most tasks one worker of this kind puts in the guest-worker cgroup: its main thread,
+    /// the epoch ticker, the stdin reader Wasmtime's WASI starts on a guest's first stdin read, its
+    /// PID-namespace relay ([`WORKER_FIXED_TASKS`]), its runtime threads and its blocking bound.
+    pub(crate) const fn worst_case_tasks(self) -> usize {
+        WORKER_FIXED_TASKS + self.runtime_threads() + self.blocking_threads()
+    }
 }
+
+/// [`WorkerKind::blocking_threads`] of the tools worker, which serves concurrent tool calls.
+const TOOLS_BLOCKING_THREADS: usize = 14;
+/// [`WorkerKind::blocking_threads`] of the driver worker.
+const DRIVER_BLOCKING_THREADS: usize = 7;
+/// [`WorkerKind::blocking_threads`] of the hooks worker.
+const HOOKS_BLOCKING_THREADS: usize = 7;
+
+/// The tasks of one worker beside its runtime's threads: the main thread, the epoch ticker, the
+/// WASI stdin reader and the PID-namespace relay process.
+const WORKER_FIXED_TASKS: usize = 4;
+
+/// [`WorkerKind::worst_case_tasks`] of all three workers together: 48, so a declared
+/// `cgroup_pids_max` of 64 leaves the kernel headroom. The docs' resource-limits page states it.
+pub(crate) const WORKERS_WORST_CASE_TASKS: usize = WorkerKind::Driver.worst_case_tasks()
+    + WorkerKind::Tools.worst_case_tasks()
+    + WorkerKind::Hooks.worst_case_tasks();
+
+const _: () = assert!(WORKERS_WORST_CASE_TASKS <= 48);
 
 const PLACEMENT_UNSPLIT: u8 = 0;
 const PLACEMENT_SUPERVISOR: u8 = 1;

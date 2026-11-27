@@ -112,7 +112,7 @@ section that explains it.
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read. For an installed capsule the path is shown as `<scope>/<name>@<version>!/<entry>`, and a missing entry means the package was built without the file | [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
-| `E-RUN-012` | The capsule can spawn subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only). `mur run --explain-scope` reports it ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |
+| `E-RUN-012` | The capsule can spawn subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only), or its [guest-worker cgroup](resource-limits.md#cgroup-placement) could not be created with its limits, which the reason names by path before any guest worker starts. `mur run --explain-scope` reports a delegation failure ahead of the launch as `cgroup scope: unavailable`, with the same reason, and `mur doctor` fails its `Cgroup scope` check | [Platform behavior](resource-limits.md#platform-behavior), [Whether the launch gets its cgroup scope](containment.md#cgroup-scope) |
 | `E-RUN-013` | The work folder, `$HOME` and `$TMPDIR` together grew past `capabilities.resources.workdir_max_bytes` | [Size ceiling](workdir.md#work-folder-ceiling) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
@@ -589,13 +589,28 @@ error[E-RUN-065]: the tools guest worker (pid 48211) was lost while running tool
 
 The message names the worker kind, its pid, the call it was running and how it ended: `exited
 with status N`, `was killed by signal N (NAME)`, `closed its connection` or `stopped answering and
-was killed`. The trace records `task_failed` with cause `runtime_error` and this message as its
+was killed`. When the kernel counted a limit reached in the session's
+[guest-worker cgroup](resource-limits.md#cgroup-placement), the message adds which one, after how
+the worker ended:
+
+| Counter in the guest-worker cgroup | Added |
+|---|---|
+| `memory.events` `oom_kill` above 0 | `; the guest-worker cgroup reached capabilities.resources.cgroup_memory_bytes (<N> bytes)` |
+| `pids.events` `max` above 0 | `; the guest-worker cgroup reached capabilities.resources.cgroup_pids_max (<N>)` |
+
+```text
+error[E-RUN-065]: the driver guest worker (pid 48230) was lost while running capsule 'balloon': it was killed by signal 9 (SIGKILL); the guest-worker cgroup reached capabilities.resources.cgroup_memory_bytes (268435456 bytes); the task failed and the session ended
+```
+
+The trace records `task_failed` with cause `runtime_error` and this message as its
 reason, then `task_end` with `exit_status: failed`, then `session_end`, and `mur` exits non-zero.
 A script capsule, which runs no task, records `session_end` with `exit_status: failed`. The worker
 is not restarted.
 
 **What to do:** when the worker `stopped answering and was killed`, `mur` ended it: its call ran
-far past `capabilities.limits.deadline_seconds` without answering. Otherwise look for what ended
+far past `capabilities.limits.deadline_seconds` without answering. When the message names a
+`capabilities.resources` field, the workers outgrew it: raise that field, or have the capsule
+use less. Otherwise look for what ended
 the process: an out-of-memory kill in the system log, a signal sent from outside, or a WASM
 artifact that crashed the worker. Run the capsule again.
 
@@ -609,7 +624,9 @@ The launch is refused before the session directory is created.
 error[E-RUN-066]: the driver guest worker could not be started: it speaks guest-worker protocol 2 (mur 0.12.0), not 1
 ```
 
-The message names the worker kind and the reason.
+The message names the worker kind and the reason, and the limit reached in the
+[guest-worker cgroup](resource-limits.md#cgroup-placement) with the same suffix as
+[`E-RUN-065`](#e-run-065) when the kernel counted one.
 
 **What to do:** check that the `mur` binary is intact and was not replaced by another version
 while the launch started. Reinstall `mur` if it was.
