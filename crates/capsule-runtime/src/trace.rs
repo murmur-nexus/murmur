@@ -4362,7 +4362,15 @@ impl TraceWriter {
             running_commands,
             keep_working,
             done_check,
-            max_turns_stop: self.task_max_turns_stop.take(),
+            // The loop records the stop before the task's ending is settled; a workdir refusal,
+            // a done check's deadline, a cancel or a refused reopen can still end the task another
+            // way, and then the turn cap did not end it.
+            max_turns_stop: self.task_max_turns_stop.take().filter(|stop| {
+                matches!(
+                    (stop.stop_reason.as_str(), exit_status),
+                    ("max_tokens", "ok") | ("tool_call", "max_turns_reached")
+                )
+            }),
         };
         self.active_task_id = None;
         self.task_event_id = None;
@@ -4611,7 +4619,9 @@ impl TraceWriter {
     }
 
     /// Records that `inference.max_turns` ended the active task on `turn`, whose stop would
-    /// otherwise have started another: the next `task_end` carries it as `max_turns_stop`.
+    /// otherwise have started another: the next `task_end` carries it as `max_turns_stop` when the
+    /// task ends as that stop implies (`ok` after `"max_tokens"`, `max_turns_reached` after
+    /// `"tool_call"`).
     pub(crate) fn record_max_turns_stop(&mut self, max_turns: u32, turn: u32, stop_reason: &str) {
         self.task_max_turns_stop = Some(MaxTurnsStop {
             max_turns,
@@ -9782,7 +9792,8 @@ mod tests {
     }
 
     /// `task_end.max_turns_stop` is the recorded stop, exactly, on that task's `task_end` only:
-    /// absent with no record, absent on the next task, and cleared by `task_start`.
+    /// absent with no record, absent on the next task, cleared by `task_start`, and dropped when
+    /// the task ended some other way than the stop implies.
     #[tokio::test]
     async fn task_end_carries_max_turns_stop_only_for_the_recording_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -9809,13 +9820,39 @@ mod tests {
         w.write_task_end("tsk_3", "max_turns_reached", 0, Vec::new(), None, None)
             .await
             .unwrap();
+        // A task something else ended after the stop was recorded.
+        for (task, stop_reason, exit_status) in [
+            ("tsk_4", "max_tokens", "failed"),
+            ("tsk_5", "max_tokens", "deadline_reached"),
+            ("tsk_6", "tool_call", "reopen_budget_exhausted"),
+        ] {
+            w.write_task_start(task, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+                .await
+                .unwrap();
+            w.record_max_turns_stop(1, 0, stop_reason);
+            w.write_task_end(task, exit_status, 0, Vec::new(), None, None)
+                .await
+                .unwrap();
+        }
+        // A tool-call stop on a task that ended `max_turns_reached` is kept.
+        w.write_task_start("tsk_7", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        w.record_max_turns_stop(1, 0, "tool_call");
+        w.write_task_end("tsk_7", "max_turns_reached", 0, Vec::new(), None, None)
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
-        let ends: Vec<_> = read_events(dir.path())
+        let mut ends: Vec<_> = read_events(dir.path())
             .into_iter()
             .filter(|e| e["event_type"] == "task_end")
             .collect();
-        assert_eq!(ends.len(), 3);
+        assert_eq!(ends.len(), 7);
+        assert_eq!(
+            ends.pop().unwrap()["max_turns_stop"],
+            serde_json::json!({"max_turns": 1, "turn": 0, "stop_reason": "tool_call"})
+        );
         assert_eq!(
             ends[0]["max_turns_stop"],
             serde_json::json!({"max_turns": 1, "turn": 0, "stop_reason": "max_tokens"})
