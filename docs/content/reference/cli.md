@@ -1653,7 +1653,7 @@ Cgroup scope
 | `<how>` | When |
 |---|---|
 | `a launch adopts the delegated parent <path>` | The [delegated parent](resource-limits.md#delegated-parent) passes every check |
-| `a launch asks the systemd user manager for a scope; it delegates <controllers>` | A session bus is reachable (`DBUS_SESSION_BUS_ADDRESS` is set, or `$XDG_RUNTIME_DIR/bus` exists) and the user manager's cgroup exists. A launch gets its scope when `<controllers>` include memory, pids and cpu |
+| `a launch asks the systemd user manager for a scope; it delegates <controllers>` | A session bus is reachable (`DBUS_SESSION_BUS_ADDRESS` is set, or `$XDG_RUNTIME_DIR/bus` exists, `/run/user/<uid>/bus` when `XDG_RUNTIME_DIR` is unset) and the user manager's cgroup exists. A launch gets its scope when `<controllers>` include memory, pids and cpu |
 | `a launch builds under mur's own cgroup, delegated to uid <uid>` | `mur`'s own cgroup is owned by its uid and lists memory, pids and cpu |
 | `no delegated cgroup is reachable` | None of the above |
 

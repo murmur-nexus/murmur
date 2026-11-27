@@ -17,17 +17,14 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use super::parent::{self, DeclineCheck, ParentFacts};
+#[cfg(target_os = "linux")]
+use super::{missing_controllers, REQUIRED_CONTROLLERS};
 
 /// The docs section the delegated-parent fixes cite.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 const URL_PARENT: &str = murmur_artifact::docs_reference_url!("resource-limits/#delegated-parent");
 
-/// The controllers a launch's scope needs from a systemd user manager or its own cgroup.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const SCOPE_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
-
 /// The controllers a report names, in the order it names them.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NAMED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu", "io"];
 
 /// `E-RUN-012`'s fix when no cause particular to this host was found.
@@ -37,14 +34,14 @@ pub(crate) const FIX_GENERIC: &str = concat!(
     murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
 );
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 const FIX_NO_CGROUP_V2: &str = concat!(
     "boot the host with the cgroup v2 unified hierarchy (systemd.unified_cgroup_hierarchy=1 on \
      the kernel command line) \u{2014} see ",
     murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
 );
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 const FIX_USER_MANAGER: &str = concat!(
     "give the systemd user manager memory, pids, cpu and io to delegate (see ",
     murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior"),
@@ -57,7 +54,7 @@ const FIX_USER_MANAGER: &str = concat!(
      loginctl enable-linger $(whoami)"
 );
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 const FIX_LINGER: &str = concat!(
     "start a systemd user manager for this user, then log in again (see ",
     murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior"),
@@ -65,7 +62,7 @@ const FIX_LINGER: &str = concat!(
     "    sudo loginctl enable-linger $(whoami)"
 );
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 const FIX_NO_BUS: &str = concat!(
     "start mur from a login that reaches the systemd user manager's session bus (an ssh or \
      desktop login sets DBUS_SESSION_BUS_ADDRESS or $XDG_RUNTIME_DIR/bus; su and sudo do not), \
@@ -182,7 +179,7 @@ pub struct LaunchHostReport {
 
 impl LaunchHostReport {
     /// The report off Linux, where no cgroup scope is needed.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(super) fn not_linux() -> Self {
         Self {
             setup: HostSetup::NotLinux,
@@ -364,17 +361,13 @@ fn session_bus_reachable(euid: u32) -> bool {
 
 /// `getrlimit(RLIMIT_NOFILE)`, `RLIM_INFINITY` as `None`.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+// `read_rlimit` takes `u32` for every platform; on glibc `RLIMIT_NOFILE` already is one, on musl
+// it is `c_int`.
+#[allow(clippy::unnecessary_cast)]
 fn read_open_files() -> OpenFiles {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `getrlimit` writes one `rlimit` through the valid, exclusively borrowed pointer and
-    // touches no other memory.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+    let Ok(limit) = crate::resources::read_rlimit(libc::RLIMIT_NOFILE as u32) else {
         return OpenFiles::default();
-    }
+    };
     let finite = |value: libc::rlim_t| (value != libc::RLIM_INFINITY).then_some(value);
     OpenFiles {
         soft: finite(limit.rlim_cur),
@@ -485,12 +478,6 @@ fn listed(contents: &str) -> Vec<String> {
     contents.split_whitespace().map(str::to_string).collect()
 }
 
-/// Which of `wanted` `contents` does not list, in `wanted`'s order.
-#[cfg(target_os = "linux")]
-fn lacking(contents: &str, wanted: &[&str]) -> Vec<String> {
-    super::missing_controllers(contents, wanted)
-}
-
 /// The report for `facts` and a capsule that does or does not declare
 /// `capabilities.resources.cgroup_io_bytes_per_sec`, which makes `io` a controller the delegated
 /// parent must provide.
@@ -527,14 +514,14 @@ pub(super) fn diagnose(facts: &HostFacts, declares_io_limit: bool) -> LaunchHost
     let user_manager_lacks = facts
         .user_manager
         .as_ref()
-        .map(|(_, controllers)| lacking(controllers, SCOPE_CONTROLLERS));
+        .map(|(_, controllers)| missing_controllers(controllers, REQUIRED_CONTROLLERS));
 
     let (scope_source, ready) = if decision.is_ok() {
         (ScopeSource::DelegatedParent, true)
     } else if let (true, Some(lacks)) = (facts.session_bus, &user_manager_lacks) {
         (ScopeSource::UserManager, lacks.is_empty())
     } else if facts.own_owner == Some(euid)
-        && lacking(&parent_facts.own_controllers, SCOPE_CONTROLLERS).is_empty()
+        && missing_controllers(&parent_facts.own_controllers, REQUIRED_CONTROLLERS).is_empty()
     {
         (ScopeSource::OwnCgroup, true)
     } else {
@@ -597,7 +584,7 @@ fn cause_and_fix(
     let wanted = parent::required_controllers(declares_io_limit);
     match decision {
         Err((DeclineCheck::ParentDoesNotEnable, _)) => {
-            let missing = lacking(&parent_facts.parent_subtree_control, &wanted);
+            let missing = missing_controllers(&parent_facts.parent_subtree_control, &wanted);
             let cause = format!(
                 "the cgroup above mur's ({parent_path}) is delegated to uid {euid} but does not \
                  enable {} for its children",
@@ -606,7 +593,7 @@ fn cause_and_fix(
             return (missing, cause, fix_parent(&parent_path));
         }
         Err((DeclineCheck::OwnDoesNotList, _)) => {
-            let missing = lacking(&parent_facts.own_controllers, &wanted);
+            let missing = missing_controllers(&parent_facts.own_controllers, &wanted);
             let cause = format!(
                 "the cgroup above mur's ({parent_path}) is delegated to uid {euid} but mur's own \
                  cgroup does not list {}",
@@ -618,7 +605,7 @@ fn cause_and_fix(
     }
     if facts.session_bus {
         if let Some((directory, controllers)) = &facts.user_manager {
-            let missing = lacking(controllers, SCOPE_CONTROLLERS);
+            let missing = missing_controllers(controllers, REQUIRED_CONTROLLERS);
             let named = named_in(&listed(controllers));
             let delegated = if named.is_empty() {
                 "no controllers".to_string()
