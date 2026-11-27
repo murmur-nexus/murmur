@@ -289,6 +289,8 @@ Where an adopted parent differs from a systemd scope:
 
 The declared limits sit on the session cgroup and the guest-worker cgroup in both.
 
+The whole setup on a fresh server, with the script and the `systemd-run` command, is in [How to prepare a server to launch many capsules at once](../how-to/prepare-a-server-for-many-capsules.md#delegated-parent).
+
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone
 and [`W-SEC-010`](diagnostics.md#w-sec-010) names the residual gap: no aggregate bound across the
 tree, and no per-process memory bound either, because macOS has no `RLIMIT_AS` and its kernel does
