@@ -572,13 +572,16 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     // Lead, under the roster's project.
     let lead = only_trace(scratch.home.path(), &scratch.path().join("crew"));
     let start = &records(&lead, "session_start")[0];
-    assert!(
-        start["tools_declared"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from("call-member")),
-        "{start}"
-    );
+    // The scaffold grants both members `session-status`, which exists only under the grant.
+    for tool in ["call-member", "session-status"] {
+        assert!(
+            start["tools_declared"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(tool)),
+            "{tool}: {start}"
+        );
+    }
     let call_start = records(&lead, "member_call_start");
     assert_eq!(call_start.len(), 1, "{lead:?}");
     let call_id = call_start[0]["call_id"].as_str().unwrap().to_string();
@@ -614,10 +617,15 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
 
     // Worker, under its own directory.
     let worker = only_trace(scratch.home.path(), &worker_dir);
-    assert!(!records(&worker, "session_start")[0]["tools_declared"]
+    let worker_declared = records(&worker, "session_start")[0]["tools_declared"]
         .as_array()
         .unwrap()
-        .contains(&Value::from("call-member")));
+        .clone();
+    assert!(!worker_declared.contains(&Value::from("call-member")));
+    assert!(
+        worker_declared.contains(&Value::from("session-status")),
+        "{worker_declared:?}"
+    );
     let received = records(&worker, "a2a_task_received");
     assert_eq!(received.len(), 1, "{worker:?}");
     assert_eq!(received[0]["caller"], "member");

@@ -150,7 +150,9 @@ a member that does not parse, an unknown member word or an unknown state makes t
 
 It answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` under the
 `old-version` profile) and exits. Otherwise it reads one task line from stdin and then follows
-`$FIXTURE_HARNESS_PROFILE`:
+`$FIXTURE_HARNESS_PROFILE`. A profile that calls through the bridge needs a capsule with something
+to bridge: the `session-status` and `quota` profiles' `session-status` calls need
+`capabilities.session_status.read: true`, and a capsule with no tool and no runtime-provided grant gets no bridge at all.
 
 | Profile | What it does |
 | --- | --- |

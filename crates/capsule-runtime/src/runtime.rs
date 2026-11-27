@@ -3988,7 +3988,11 @@ pub fn stage_session(
             })
             .map(|control| control.choices()),
     )?;
-    write_session_status_tool_manifest(&runtime_root, request.inference.as_ref())?;
+    write_session_status_tool_manifest(
+        &runtime_root,
+        request.inference.as_ref(),
+        request.capability_policy.session_status_read,
+    )?;
     write_background_command_tool_manifest(
         &runtime_root,
         request.inference.as_ref(),
@@ -12664,7 +12668,15 @@ impl CapsuleStoreState {
     }
 
     /// `session-status`: where this session stands, measured now, recorded as `session_status`.
+    /// Refused, writing no record, when the capsule declares no `capabilities.session_status`
+    /// grant.
     async fn dispatch_session_status(&self) -> Result<murmur::tool::run::ToolResult, String> {
+        if !self.capability_policy.session_status_read {
+            return Err(format!(
+                "'{SESSION_STATUS_TOOL}' needs a capabilities.session_status.read: true \
+                 declaration in murmur.yaml; this capsule declares none"
+            ));
+        }
         let Some(status) = &self.session_status else {
             return Err(format!(
                 "'{SESSION_STATUS_TOOL}' is not available in this session"
@@ -14400,14 +14412,20 @@ fn runtime_tool_manifest_yaml(name: &str, description: String, input_schema: Str
 /// Tool a capsule gains from `control.agent_settings: [inference.driver]`.
 pub(crate) const SWITCH_DRIVER_TOOL: &str = "switch-driver";
 
-/// Writes `session-status`'s synthetic manifest for every agent capsule, with the description for
-/// its transport, and for no script capsule. It needs no grant: the file exists exactly when
-/// `inference` does.
+/// Writes `session-status`'s synthetic manifest, with the description for its transport, only
+/// for an agent capsule that declares `capabilities.session_status.read: true`; `granted` is that
+/// declaration.
+///
+/// A script capsule or an ungranted agent capsule gets no file, so `session-status` is absent from
+/// its tool inventory and from `session_start`'s `tools_declared` — the grant governs the tool's
+/// existence rather than its success, as [`write_submit_plan_tool_manifest`] does. The session's
+/// status object, its deadline and its deadline notice do not depend on the file.
 fn write_session_status_tool_manifest(
     runtime_root: &WorkdirRoot,
     inference: Option<&InferenceConfig>,
+    granted: bool,
 ) -> Result<(), RuntimeError> {
-    let Some(inference) = inference else {
+    let Some(inference) = inference.filter(|_| granted) else {
         return Ok(());
     };
     let description = if inference.transport == "process" {
@@ -16599,6 +16617,47 @@ mod tests {
         assert!(!super::is_reserved_tool_name("Delegate-Task"));
     }
 
+    /// Every reserved tool exists only under its grant: an agent capsule that declares none gets
+    /// none of the eleven, so its tool inventory is empty. A further runtime-provided tool joins
+    /// this list with its writer called ungranted.
+    #[test]
+    fn every_runtime_provided_tool_is_written_only_under_its_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap();
+        let inference = inference_without_prompt();
+        let policy = CapabilityPolicy::default();
+
+        // share-file, fetch-peer-file
+        super::write_peer_handoff_tool_manifests(&root, false, false).unwrap();
+        // delegate-task
+        super::write_delegate_task_tool_manifest(&root, &[], &[]).unwrap();
+        // member-call
+        super::write_member_call_tool_manifest(&root, None).unwrap();
+        // end-without-answer
+        super::write_end_without_answer_tool_manifest(&root, None).unwrap();
+        // submit-plan
+        super::write_submit_plan_tool_manifest(&root, false).unwrap();
+        // pull-artifact, remove-artifact
+        super::artifact_change::write_artifact_change_tool_manifests(&root, &policy, true).unwrap();
+        // switch-driver
+        super::write_switch_driver_tool_manifest(&root, None).unwrap();
+        // session-status
+        super::write_session_status_tool_manifest(&root, Some(&inference), false).unwrap();
+        // background-command
+        super::write_background_command_tool_manifest(&root, Some(&inference), &policy, None, None)
+            .unwrap();
+
+        let written: Vec<_> = match std::fs::read_dir(dir.path().join("tools")) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().file_name()).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("reading tools/: {error}"),
+        };
+        assert!(
+            written.is_empty(),
+            "an ungranted agent capsule was given runtime-provided tools: {written:?}"
+        );
+    }
+
     // ── background-command ───────────────────────────────────────────────────
 
     /// A store state that demotes a `bash` command after one second, as the A2A serve loop's
@@ -17125,43 +17184,58 @@ mod tests {
         );
     }
 
-    /// `session-status` needs no grant: its manifest is written for every agent capsule, with
-    /// its transport's description and an empty-object schema, and for no script capsule.
+    /// `session-status` exists only under `capabilities.session_status.read`: a script capsule
+    /// gets no manifest whether or not it declares the grant, an ungranted agent capsule gets
+    /// none, and a granted one gets its transport's description and an empty-object schema.
     #[test]
-    fn session_status_manifest_is_written_for_every_agent_capsule_and_no_script_capsule() {
-        let script = tempfile::tempdir().unwrap();
-        super::write_session_status_tool_manifest(
-            &crate::workdir_fs::WorkdirRoot::open(script.path()).unwrap(),
-            None,
-        )
-        .unwrap();
-        assert!(!script
-            .path()
-            .join("tools")
-            .join(SESSION_STATUS_TOOL)
-            .exists());
+    fn session_status_manifest_is_written_only_for_a_granted_agent_capsule() {
+        let session_status_dir = |dir: &Path| dir.join("tools").join(SESSION_STATUS_TOOL);
+
+        for granted in [false, true] {
+            let script = tempfile::tempdir().unwrap();
+            super::write_session_status_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(script.path()).unwrap(),
+                None,
+                granted,
+            )
+            .unwrap();
+            assert!(
+                !session_status_dir(script.path()).exists(),
+                "script capsule, granted={granted}"
+            );
+        }
 
         for (transport, description) in [
             ("http", crate::session_status::description_http()),
             ("process", crate::session_status::description_process()),
         ] {
-            let agent = tempfile::tempdir().unwrap();
             let inference = murmur_artifact::InferenceConfig {
                 transport: transport.to_string(),
                 ..inference_without_prompt()
             };
+
+            let ungranted = tempfile::tempdir().unwrap();
+            super::write_session_status_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(ungranted.path()).unwrap(),
+                Some(&inference),
+                false,
+            )
+            .unwrap();
+            assert!(
+                !session_status_dir(ungranted.path()).exists(),
+                "ungranted {transport} agent capsule"
+            );
+
+            let agent = tempfile::tempdir().unwrap();
             super::write_session_status_tool_manifest(
                 &crate::workdir_fs::WorkdirRoot::open(agent.path()).unwrap(),
                 Some(&inference),
+                true,
             )
             .unwrap();
             let manifest: Value = serde_norway::from_str(
                 &std::fs::read_to_string(
-                    agent
-                        .path()
-                        .join("tools")
-                        .join(SESSION_STATUS_TOOL)
-                        .join(PACKED_MANIFEST_ENTRY),
+                    session_status_dir(agent.path()).join(PACKED_MANIFEST_ENTRY),
                 )
                 .unwrap(),
             )
@@ -24746,6 +24820,7 @@ inference:
             task_io: None,
             conversation: None,
             plan: None,
+            session_status: None,
             install: None,
             harness: None,
             containment: None,
@@ -25315,6 +25390,7 @@ inference:
                 task_io: None,
                 conversation: None,
                 plan: None,
+                session_status: None,
                 install: None,
                 harness: None,
                 containment: None,
@@ -25485,6 +25561,7 @@ inference:
                 task_io: None,
                 conversation: None,
                 plan: None,
+                session_status: None,
                 install: None,
                 harness: None,
                 containment: None,
@@ -25532,6 +25609,7 @@ inference:
             task_io: None,
             conversation: None,
             plan: None,
+            session_status: None,
             install: None,
             harness: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
@@ -25561,6 +25639,7 @@ inference:
             task_io: None,
             conversation: None,
             plan: None,
+            session_status: None,
             install: None,
             harness: None,
             containment: None,

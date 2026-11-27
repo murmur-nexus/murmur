@@ -462,6 +462,7 @@ mod tests {
                 task_io: None,
                 conversation: None,
                 plan: None,
+                session_status: None,
                 install: None,
                 harness: None,
                 containment: None,

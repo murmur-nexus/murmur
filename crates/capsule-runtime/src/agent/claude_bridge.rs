@@ -1646,10 +1646,12 @@ mod tests {
 
     /// A call the decision point lets through and a tool answers sends the harness the fenced
     /// result, and reports it under the bare name and arguments with the source it was fenced
-    /// under. `session-status` is the runtime's own tool, so the fixture's store can answer it.
+    /// under. `session-status` is the runtime's own tool, so the fixture's store can answer it
+    /// once it is granted.
     #[tokio::test]
     async fn a_dispatched_call_reports_the_fence_its_answer_carries() {
         let mut fixture = Fixture::new().await;
+        fixture.store.capability_policy.session_status_read = true;
         fixture.store.session_status = Some(Arc::new(crate::session_status::SessionStatus::new(
             Instant::now(),
             true,

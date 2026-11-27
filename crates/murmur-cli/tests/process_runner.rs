@@ -103,6 +103,8 @@ struct Built {
     /// A `HOME` outside `/tmp`, so the run's files directory under it is at its host path for a
     /// harness on a contained class, whose `/tmp` is private.
     home_off_tmp: bool,
+    /// Declares `capabilities.session_status`, which the `quota` profile's bridged calls need.
+    session_status: bool,
 }
 
 impl Built {
@@ -119,6 +121,7 @@ impl Built {
             shell: Vec::new(),
             shell_grace_secs: None,
             home_off_tmp: false,
+            session_status: false,
         }
     }
 
@@ -140,6 +143,11 @@ impl Built {
 
     fn with_tool(mut self) -> Self {
         self.tool = true;
+        self
+    }
+
+    fn with_session_status(mut self) -> Self {
+        self.session_status = true;
         self
     }
 
@@ -246,6 +254,11 @@ impl Built {
         } else {
             format!("  shell:\n    allow: [{}]\n", self.shell.join(", "))
         };
+        let session_status = if self.session_status {
+            "  session_status:\n    read: true\n"
+        } else {
+            ""
+        };
         let lifecycle = self
             .shell_grace_secs
             .map(|secs| format!("lifecycle:\n  shell_grace_secs: {secs}\n"))
@@ -257,7 +270,7 @@ impl Built {
             format!(
                 "name: process-runner\nversion: 0.1.0\nartifacts:\n{entries}\
                  capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n{shell}\
-                 inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n{config}\
+                 {session_status}inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n{config}\
                  {command}{model}{max_turns}{lifecycle}"
             ),
         )
@@ -450,9 +463,9 @@ fn s1_a_process_capsule_runs_its_harness_and_records_one_turn() {
     assert_eq!(start["version_tested"], true);
     assert_eq!(start["session_mode"], "new");
     assert_eq!(start["binary_source"], "inference.command");
-    // A capsule that declares no tool still has the runtime's own `session-status`, so every
-    // process capsule gets a bridge.
-    assert_eq!(start["bridge_tools"], serde_json::json!(["session-status"]));
+    // A capsule that declares no tool and no runtime-provided grant has an empty inventory, so
+    // it gets no bridge, and the harness still runs the task.
+    assert_eq!(start["bridge_tools"], serde_json::json!([]));
 
     let session = run.one("harness_session");
     assert_eq!(session["harness_session_id"], "fixture-session-1");
@@ -555,10 +568,9 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     }
 
     let start = run.one("harness_start");
-    assert_eq!(
-        start["bridge_tools"],
-        serde_json::json!([TOOL, "session-status"])
-    );
+    // One declared tool and no `capabilities.session_status` grant: the bridge offers that tool
+    // alone.
+    assert_eq!(start["bridge_tools"], serde_json::json!([TOOL]));
 
     let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains(TOOL), "{shown}");
@@ -885,7 +897,7 @@ fn trace_show_prints_the_latest_quota_window_per_name() {
         return;
     }
     println!("S10: `mur trace show` prints one quota line per window name, latest values, under ── Harness ──");
-    let capsule = Built::new().build();
+    let capsule = Built::new().with_session_status().build();
     let run = capsule.run("quota", &[]).succeeded();
     assert_eq!(run.result(), "QUOTA-RESULT");
     assert_eq!(run.of_type("harness_quota").len(), 2);

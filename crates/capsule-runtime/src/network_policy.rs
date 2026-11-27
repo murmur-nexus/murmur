@@ -666,6 +666,7 @@ mod tests {
             task_io: None,
             conversation: None,
             plan: None,
+            session_status: None,
             install: None,
             harness: None,
             containment: None,
@@ -772,6 +773,7 @@ mod tests {
                 task_io: declared.map(|read| murmur_artifact::TaskIoCapabilities { read }),
                 conversation: None,
                 plan: None,
+                session_status: None,
                 ..capabilities_block(None, None)
             };
             let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();

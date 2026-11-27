@@ -16,6 +16,7 @@ The relevant manifest options are:
 | [code_mode.detach_after_secs](../reference/manifest.md#code-mode) | How long a call from the model runs before it moves to the background |
 | [code_mode.tools_visible](../reference/manifest.md#code-mode) | Whether the model is offered the capsule's other tools beside the REPL |
 | [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | Which host programs the capsule offers as tools and a program may run |
+| [capabilities.session_status.read](../reference/manifest.md#capabilities-session-status) | Whether the capsule has the runtime-provided `session-status` tool |
 
 ---
 
@@ -43,6 +44,8 @@ capabilities:
     allow:
       - echo
       - uname
+  session_status:
+    read: true
 
 inference:
   transport: http

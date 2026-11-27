@@ -352,6 +352,8 @@ struct ProcessCapsule {
     profile: String,
     name: String,
     tool: bool,
+    /// Declares `capabilities.session_status`, which the `quota` profile's bridged calls need.
+    session_status: bool,
     hook: Option<DeclaredHook>,
     /// `inference.driver.config`, as manifest lines under `driver:`.
     config: Option<String>,
@@ -367,6 +369,7 @@ impl ProcessCapsule {
             profile: profile.to_string(),
             name: name.to_string(),
             tool: false,
+            session_status: false,
             hook: None,
             config: None,
             env: Vec::new(),
@@ -376,6 +379,11 @@ impl ProcessCapsule {
 
     fn with_tool(mut self) -> Self {
         self.tool = true;
+        self
+    }
+
+    fn with_session_status(mut self) -> Self {
+        self.session_status = true;
         self
     }
 
@@ -447,13 +455,18 @@ impl ProcessCapsule {
         let name = &self.name;
         let config = self.config.as_deref().unwrap_or_default();
         let inference = &self.inference;
+        let session_status = if self.session_status {
+            "  session_status:\n    read: true\n"
+        } else {
+            ""
+        };
         let manifest = project.path().join("murmur.yaml");
         fs::write(
             &manifest,
             format!(
                 "name: {name}\nversion: 0.1.0\nartifacts:\n{entries}\
                  capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
-                 {LIFECYCLE}\
+                 {session_status}{LIFECYCLE}\
                  inference:\n  transport: process\n{inference}  driver:\n    artifact: {PROCESS_DRIVER}\n{config}\
                  \x20 command: {}\n",
                 harness.to_str().unwrap()
@@ -1147,7 +1160,9 @@ fn quota_frames_reach_an_extended_stream_before_completed_and_no_plain_one() {
     ) {
         return;
     }
-    let capsule = ProcessCapsule::new("quota-stream", "quota").start();
+    let capsule = ProcessCapsule::new("quota-stream", "quota")
+        .with_session_status()
+        .start();
     let (_, events) =
         common::stream::stream_message(&capsule.url(), None, task_params("quota-1"), true);
     let labels: Vec<String> = events.iter().map(common::stream::Event::label).collect();

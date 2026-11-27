@@ -25,7 +25,7 @@ Each one appears only when the declaration in the second column is present.
 | `end-without-answer` | The same rule as `call-member` | Ends a task another formation member sent without an answer, and the runtime tells that member none came — see [`end-without-answer`](#end-without-answer) |
 | `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
 | `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
-| `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
+| `session-status` | [`capabilities.session_status.read`](manifest.md#capabilities-session-status), with an [`inference:`](manifest.md#field-inference) block, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
 | `background-command` | An [`inference:`](manifest.md#field-inference) block with either a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), or a [`code_mode.detach_after_secs`](manifest.md#code-mode), on both transports | Reports on, waits for or stops a shell command or a code mode call that moved to the background, by its work id — see [`background-command`](#background-command) |
 
 Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. Nothing was fetched, so
@@ -39,9 +39,6 @@ nothing is version-pinned, nothing is hash-verified, and no entry appears for th
 are answered before the tool allowlist is consulted. The allowlist governs which tool *artifacts*
 may run; it has no say over these eleven.
 
-`session-status` needs no grant: staging writes its manifest for every agent capsule and for no
-script capsule.
-
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `tools/<name>/`, so:
 
@@ -52,7 +49,11 @@ nothing under `tools/<name>/`, so:
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
 it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
 `switch-driver`, for `call-member` and `end-without-answer`, for `pull-artifact` and
-`remove-artifact`, for `background-command`, and for their grants.
+`remove-artifact`, for `session-status`, for `background-command`, and for their grants.
+
+An agent capsule that declares no tool artifact, no shell binary and none of these grants has an
+empty tool inventory: the model is sent no tool, and a `transport: process` harness is given no
+tool bridge.
 
 `capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
 plan guidance is part of the system prompt exactly when the tool exists.
@@ -83,8 +84,10 @@ answers ahead of a WASM artifact of the same name.
 
 ## `session-status` { #session-status }
 
-`session-status` takes no input (`{"type":"object","properties":{}}`) and returns one JSON object,
-measured at the moment of the call:
+`session-status` exists when the capsule declares
+[`capabilities.session_status.read: true`](manifest.md#capabilities-session-status). It takes no
+input (`{"type":"object","properties":{}}`) and returns one JSON object, measured at the moment of
+the call:
 
 ```json
 {
@@ -167,6 +170,8 @@ Session deadline: the runtime ends this session at 2026-10-20T14:00:00Z, in 297 
 | Carried by | The first tool result dispatched inside the margin, on either transport — under `transport: process`, the bridged tool result. A tool that ran and reported failure carries it; a refused call, or one the runtime could not run, does not |
 | How often | Once per session |
 | A turn with no tool call | Gets no notice; the deadline still ends the session |
+| A capsule with no tool | Is never handed a tool result, so it gets no notice; the deadline still ends the session |
+| `session-status` grant | Not needed: the notice rides any tool result, and the session's deadline holds with or without the tool |
 | Trace | One [`deadline_notice`](observability-schemas.md#deadline-notice) record |
 
 Nothing else the runtime adds to the conversation changes. What happens when the deadline is
