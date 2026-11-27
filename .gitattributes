@@ -1,0 +1,2 @@
+# Read by `git archive`: export-subst writes the archived commit into the stamp crates/murmur-cli/build.rs reads.
+crates/murmur-cli/build/archive-commit.txt export-subst
