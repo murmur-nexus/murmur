@@ -9,7 +9,7 @@
 //! scope. No D-Bus connection is opened.
 //!
 //! [`decide`] is the whole fail-closed decision, over [`ParentFacts`] read by
-//! [`read_parent_facts`]: every check must pass, and the first that fails is the decline reason.
+//! [`read_parent_facts_from`]: every check must pass, and the first that fails is the decline reason.
 //! Nothing a capsule can write takes part in it. Ownership alone is not enough: under a systemd
 //! user manager every cgroup below `user@<uid>.service` is owned by the user, though the user
 //! manager never delegated it, so the parent must also be where delegation to this uid begins
@@ -67,7 +67,7 @@ pub(super) enum ParentAdoption {
 }
 
 /// The relative path of `unified_path`'s parent, `None` for the visible root itself.
-fn parent_of(unified_path: &str) -> Option<&str> {
+pub(super) fn parent_of(unified_path: &str) -> Option<&str> {
     let trimmed = unified_path.trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
@@ -79,12 +79,12 @@ fn parent_of(unified_path: &str) -> Option<&str> {
 }
 
 /// `relative` (a path from `/proc/self/cgroup`) under `mount`.
-fn under_mount(mount: &Path, relative: &str) -> PathBuf {
+pub(super) fn under_mount(mount: &Path, relative: &str) -> PathBuf {
     mount.join(relative.trim_start_matches('/'))
 }
 
 /// Whether `name` is a systemd user manager's own cgroup: `user@<digits>.service`.
-fn is_user_manager(name: &str) -> bool {
+pub(super) fn is_user_manager(name: &str) -> bool {
     name.strip_prefix("user@")
         .and_then(|rest| rest.strip_suffix(".service"))
         .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()))
@@ -92,7 +92,7 @@ fn is_user_manager(name: &str) -> bool {
 
 /// The controllers a parent must provide: memory, pids and cpu, plus io when the capsule declares
 /// `capabilities.resources.cgroup_io_bytes_per_sec`.
-fn required_controllers(declares_io_limit: bool) -> Vec<&'static str> {
+pub(super) fn required_controllers(declares_io_limit: bool) -> Vec<&'static str> {
     let mut wanted = PARENT_CONTROLLERS.to_vec();
     if declares_io_limit {
         wanted.push("io");
@@ -117,17 +117,37 @@ fn required_controllers(declares_io_limit: bool) -> Vec<&'static str> {
 /// The controllers are memory, pids and cpu, and io when `declares_io_limit`; the missing ones are
 /// comma-joined in that order. An owner that could not be read fails its check.
 pub(super) fn decide(facts: &ParentFacts, declares_io_limit: bool) -> Result<PathBuf, String> {
+    decide_with_check(facts, declares_io_limit).map_err(|(_, reason)| reason)
+}
+
+/// Which of [`decide`]'s checks declined the parent, where a caller words the decline itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeclineCheck {
+    /// Checks 1 to 6: there is no parent, or it is not a delegation boundary this uid owns.
+    NotDelegated,
+    /// Check 7: the parent does not enable every controller for its children.
+    ParentDoesNotEnable,
+    /// Check 8: this process's own cgroup does not list every controller.
+    OwnDoesNotList,
+}
+
+/// [`decide`], with the check that declined beside the reason.
+pub(super) fn decide_with_check(
+    facts: &ParentFacts,
+    declares_io_limit: bool,
+) -> Result<PathBuf, (DeclineCheck, String)> {
+    let not_delegated = |reason: &str| Err((DeclineCheck::NotDelegated, reason.to_string()));
     let Some(unified_path) = facts.unified_path.as_deref() else {
-        return Err("no cgroup v2 unified hierarchy".to_string());
+        return not_delegated("no cgroup v2 unified hierarchy");
     };
     let Some(parent_relative) = parent_of(unified_path) else {
-        return Err("this process's cgroup has no parent".to_string());
+        return not_delegated("this process's cgroup has no parent");
     };
     if !facts.parent_has_cgroup_type {
-        return Err("parent is the root cgroup".to_string());
+        return not_delegated("parent is the root cgroup");
     }
     if facts.parent_owner != Some(facts.euid) {
-        return Err("parent not owned by this uid".to_string());
+        return not_delegated("parent not owned by this uid");
     }
     let parent = under_mount(&facts.mount, parent_relative);
     if parent
@@ -135,31 +155,37 @@ pub(super) fn decide(facts: &ParentFacts, declares_io_limit: bool) -> Result<Pat
         .and_then(|name| name.to_str())
         .is_some_and(is_user_manager)
     {
-        return Err("parent is a systemd user manager's own cgroup".to_string());
+        return not_delegated("parent is a systemd user manager's own cgroup");
     }
     let parent_is_visible_root = parent_relative == "/";
     if !parent_is_visible_root && facts.grandparent_owner.is_none_or(|uid| uid == facts.euid) {
-        return Err(
-            "parent is not a delegation boundary: its parent is also owned by this uid".to_string(),
+        return not_delegated(
+            "parent is not a delegation boundary: its parent is also owned by this uid",
         );
     }
     let wanted = required_controllers(declares_io_limit);
     let not_enabled = super::missing_controllers(&facts.parent_subtree_control, &wanted);
     if !not_enabled.is_empty() {
-        return Err(format!("parent does not enable {}", not_enabled.join(",")));
+        return Err((
+            DeclineCheck::ParentDoesNotEnable,
+            format!("parent does not enable {}", not_enabled.join(",")),
+        ));
     }
     let not_listed = super::missing_controllers(&facts.own_controllers, &wanted);
     if !not_listed.is_empty() {
-        return Err(format!(
-            "this process's cgroup does not list {}",
-            not_listed.join(",")
+        return Err((
+            DeclineCheck::OwnDoesNotList,
+            format!(
+                "this process's cgroup does not list {}",
+                not_listed.join(",")
+            ),
         ));
     }
     Ok(parent)
 }
 
 /// The uid owning `path`, when it is a directory whose metadata can be read.
-fn directory_owner(path: &Path) -> Option<u32> {
+pub(super) fn directory_owner(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
 
     std::fs::symlink_metadata(path)
@@ -168,22 +194,21 @@ fn directory_owner(path: &Path) -> Option<u32> {
         .map(|metadata| metadata.uid())
 }
 
-/// The facts [`decide`] needs, read from `/proc/self/cgroup`, `/proc/mounts` and the cgroup
-/// directories. Needs no privilege; whatever cannot be read is recorded as absent, which fails
-/// the check that needs it.
-pub(super) fn read_parent_facts() -> ParentFacts {
-    let unified_path = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|contents| super::parse_unified_cgroup_path(&contents));
-    let mount = PathBuf::from(
-        std::fs::read_to_string("/proc/mounts")
-            .map(|contents| super::parse_cgroup2_mount(&contents))
-            .unwrap_or_else(|_| super::DEFAULT_CGROUP2_MOUNT.to_string()),
-    );
+/// The facts [`decide`] needs: `proc_self_cgroup` (the contents of `/proc/self/cgroup`, `None`
+/// when unreadable) parsed, and the cgroup directories of the cgroup2 hierarchy at `mount` read.
+/// Needs no privilege; whatever cannot be read is recorded as absent, which fails the check that
+/// needs it. The two `/proc` reads are [`super::host_setup::read_host_facts`]'s, which every
+/// caller in a process shares.
+pub(super) fn read_parent_facts_from(
+    proc_self_cgroup: Option<&str>,
+    mount: PathBuf,
+    euid: u32,
+) -> ParentFacts {
+    let unified_path = proc_self_cgroup.and_then(super::parse_unified_cgroup_path);
     let mut facts = ParentFacts {
         unified_path: unified_path.clone(),
         mount,
-        euid: crate::murmur_home::current_euid(),
+        euid,
         parent_has_cgroup_type: false,
         parent_owner: None,
         grandparent_owner: None,

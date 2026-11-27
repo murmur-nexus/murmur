@@ -98,8 +98,14 @@ use std::sync::{
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+mod host_setup;
 #[cfg(target_os = "linux")]
 mod parent;
+
+pub use host_setup::{
+    render_launch_host, DelegatedParentReport, HostSetup, LaunchHostReport, OpenFiles, ScopeSource,
+    UserManagerReport,
+};
 
 use crate::resources::HostResourceLimits;
 
@@ -2458,11 +2464,50 @@ fn adopt_delegated_parent(declares_io_limit: bool) -> &'static parent::ParentAdo
     static ADOPTION: std::sync::OnceLock<parent::ParentAdoption> = std::sync::OnceLock::new();
     ADOPTION.get_or_init(|| {
         parent::adopt(
-            &parent::read_parent_facts(),
+            &launch_host_facts().parent,
             declares_io_limit,
             &companion_pids(),
         )
     })
+}
+
+/// What a launch's cgroup scope depends on here ([`host_setup::read_host_facts`]), read once per
+/// process by whoever asks first: [`adopt_delegated_parent`], `mur doctor` through
+/// [`launch_host_report`], or a refusal through [`delegation_unavailable`]. Adoption is the first
+/// thing in a process that can move it, and it reads these facts before it does, so every caller
+/// sees the cgroup the process started in.
+#[cfg(target_os = "linux")]
+fn launch_host_facts() -> &'static host_setup::HostFacts {
+    static FACTS: std::sync::OnceLock<host_setup::HostFacts> = std::sync::OnceLock::new();
+    FACTS.get_or_init(host_setup::read_host_facts)
+}
+
+/// Which host setup this process is in and how a launch here would get its cgroup scope, for a
+/// capsule that does or does not declare `capabilities.resources.cgroup_io_bytes_per_sec`: the
+/// `host setup:` lines of `mur doctor`'s `Cgroup scope` block and its `cgroup_host` JSON key.
+/// Reads the process's facts without privilege, writes nothing and opens no D-Bus connection.
+/// Off Linux the setup is `not-linux` and the report is ready.
+#[must_use]
+pub fn launch_host_report(declares_io_limit: bool) -> LaunchHostReport {
+    #[cfg(target_os = "linux")]
+    {
+        host_setup::diagnose(launch_host_facts(), declares_io_limit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = declares_io_limit;
+        LaunchHostReport::not_linux()
+    }
+}
+
+/// `E-RUN-012` for a launch refused with `reason`: the cause found on this host and its fix
+/// beside it, from [`launch_host_report`] for the capsule's own `declares_io_limit`.
+pub(crate) fn delegation_unavailable(
+    reason: String,
+    declares_io_limit: bool,
+) -> crate::errors::RuntimeError {
+    let (cause, fix) = host_setup::refusal_cause_and_fix(&launch_host_report(declares_io_limit));
+    crate::errors::RuntimeError::CgroupDelegationUnavailable { reason, cause, fix }
 }
 
 /// How long a launch waits for systemd to move it into the transient scope it asked for, from

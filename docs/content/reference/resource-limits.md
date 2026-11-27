@@ -214,6 +214,13 @@ these, such as one made only of skills, is never blocked. A refusal after a decl
 `mur` confirms it may create a child cgroup under the delegated base by asking the kernel for write
 and search permission on it, without creating one.
 
+To learn which setup a host is in before launching, run `mur doctor` in the project: its
+[`Cgroup scope`](cli.md#doctor-cgroup-scope) block names the setup (systemd user manager, login
+session, system unit or another cgroup), where a launch takes its scope from, whether a delegated
+parent would be adopted, and the open-file limit. On a host where a launch gets no scope it also
+prints the cause and the commands that fix it, which `E-RUN-012` repeats as `this host: <cause>`
+and its hint.
+
 #### Delegated parent { #delegated-parent }
 
 A launcher that starts hundreds of capsules at once can give `mur` a cgroup to build under

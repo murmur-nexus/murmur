@@ -368,8 +368,11 @@ fn execute_inner(
         // workdir device, so a per-plan repetition would say nothing new.
         Ok(prepared) => prepared.scope,
         Err(reason) => {
-            let error =
-                crate::errors::RuntimeError::CgroupDelegationUnavailable { reason }.to_string();
+            let error = crate::cgroup::delegation_unavailable(
+                reason,
+                crate::cgroup::declares_io_limit(&ctx.capability_policy),
+            )
+            .to_string();
             return Ok(refused_before_any_step(
                 &plan,
                 ctx,
