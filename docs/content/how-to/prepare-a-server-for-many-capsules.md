@@ -29,10 +29,11 @@ The host settings this guide changes are:
 | `LimitNOFILE=` or `ulimit -n` | How many files the launcher may hold open |
 
 !!! note "What was measured, and on what"
-    The numbers in this guide come from one AWS `m7i.8xlarge` (32 vCPU, 16 cores) running a fresh
-    Ubuntu 22.04 with kernel 6.8 and systemd 249, launching sealed capsules against a stub model
-    that does no inference, 1,500 launches per run. Thresholds move on other hosts: treat each
-    number as the order of magnitude to expect, and measure your own.
+    The rates and thresholds in this guide come from one AWS `m7i.8xlarge` (32 vCPU, 16 cores)
+    running a fresh Ubuntu 22.04 with kernel 6.8 and systemd 249, launching sealed capsules against
+    a stub model that does no inference, 1,500 launches per run. The example output comes from a
+    fresh Ubuntu 22.04 VM with 16 vCPU. Thresholds move on other hosts: treat each number as the
+    order of magnitude to expect, and measure your own.
 
 You need `mur` installed (see [Install](../getting-started/install.md)), `sudo` on the server, and a
 project folder whose `murmur.yaml` declares a capsule that starts subprocesses.
@@ -120,8 +121,9 @@ See "systemctl status user@1000.service" and "journalctl -xeu user@1000.service"
 ```
 
 The drop-in is in place all the same. Log out of the server and log in again: the new login starts
-the user manager, within seconds, with the new delegation. The failed restart also skipped `enable-linger`, which
-keeps the user manager running when no one is logged in, so run it after logging back in:
+the user manager, within seconds, with the new delegation. The failed restart also skipped
+`enable-linger`, which keeps the user manager running when no one is logged in, so run it after
+logging back in:
 
 ```bash
 sudo loginctl enable-linger $(whoami)
