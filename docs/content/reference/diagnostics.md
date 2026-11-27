@@ -103,12 +103,12 @@ section that explains it.
 | `E-ROS-008` | A `reachability` rule lists the entry member in `to` | [E-ROS-008](#e-ros-008) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry that pins per-platform hashes (`sha256.platforms`), or a malformed `origin` / `session` pair. For a missing entry, the hint lists the installed artifacts with a close name | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry that pins per-platform hashes (`sha256.platforms`), or a malformed `origin` / `session` pair. For a missing entry, the hint lists any installed artifact with a close name | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
 | `E-RUN-007` | Agent loop failed at runtime | — |
-| `E-RUN-008` | Required artifact not installed locally. The hint lists the installed artifacts with a close name | [`mur run`](cli.md#mur-run) |
+| `E-RUN-008` | Required artifact not installed locally. The hint lists any installed artifact with a close name | [`mur run`](cli.md#mur-run) |
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read. For an installed capsule the path is shown as `<scope>/<name>@<version>!/<entry>`, and a missing entry means the package was built without the file | [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
