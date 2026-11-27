@@ -2842,12 +2842,30 @@ fn probe_delegation() -> Result<PathBuf, CgroupError> {
         .into());
     }
 
-    // The probe must confirm we can actually *create* a child here, not just read the directory:
-    // a readable cgroup with no write permission is the exact shape of an undelegated host.
-    // Named per-pid so two `mur` processes probing concurrently never race on the same path.
-    let probe_dir = base.join(format!("murmur-delegation-probe-{}", std::process::id()));
-    let _ = std::fs::remove_dir(&probe_dir);
-    std::fs::create_dir(&probe_dir).map_err(|error| {
+    // A readable cgroup with no write permission is the exact shape of an undelegated host.
+    check_child_creatable(&base)?;
+
+    Ok(base)
+}
+
+/// Whether this process may create a child cgroup under `base`, asked without creating one.
+///
+/// `accessat(base, W_OK | X_OK, AT_EACCESS)` makes the checks the kernel's `mkdir` makes on the
+/// parent directory: write and search permission for the effective ids, and `EROFS` on a read-only
+/// mount. A refusal keeps that errno. A `mkdir` that would fail for any other reason, such as
+/// `cgroup.max.descendants` or `ENOMEM`, passes this check and is refused one step later, with
+/// `E-RUN-012` as well, by the session scope's own `mkdir` in [`create_scope_dir`].
+#[cfg(target_os = "linux")]
+fn check_child_creatable(base: &Path) -> Result<(), CgroupError> {
+    use rustix::fs::{Access, AtFlags, CWD};
+    rustix::fs::accessat(
+        CWD,
+        base,
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )
+    .map_err(|errno| {
+        let error = std::io::Error::from(errno);
         CgroupError::io(
             format!(
                 "cannot create a child cgroup under {} ({error}); the unit `mur` runs under needs \
@@ -2856,10 +2874,7 @@ fn probe_delegation() -> Result<PathBuf, CgroupError> {
             ),
             &error,
         )
-    })?;
-    let _ = std::fs::remove_dir(&probe_dir);
-
-    Ok(base)
+    })
 }
 
 /// Enable `memory`, `pids`, `cpu` (and `io`, best-effort) in the delegated base's
@@ -4592,5 +4607,118 @@ mod tests {
         assert_eq!(device_major_minor(0x800), (8, 0));
         // 259:3 (`nvme0n1p3`) needs the wide major field, which the legacy 8+8 layout truncates.
         assert_eq!(device_major_minor((259 << 8) | 3), (259, 3));
+    }
+
+    /// The names `watch` reports created or deleted since it was last drained, in order.
+    #[cfg(target_os = "linux")]
+    fn drain_created_and_deleted(watch: &std::os::fd::OwnedFd) -> Vec<String> {
+        let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+        let mut reader = rustix::fs::inotify::Reader::new(watch, &mut buffer);
+        let mut names = Vec::new();
+        loop {
+            match reader.next() {
+                Ok(event) => {
+                    if let Some(name) = event.file_name() {
+                        names.push(name.to_string_lossy().into_owned());
+                    }
+                }
+                Err(rustix::io::Errno::AGAIN) => return names,
+                Err(error) => panic!("reading the inotify watch failed: {error}"),
+            }
+        }
+    }
+
+    /// Resolving the delegation on a delegated host creates and removes no cgroup under the base:
+    /// the check is a permission question, so no `murmur-delegation-probe-<pid>` appears there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_delegation_check_creates_no_cgroup() {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+        if skip_without_host_support("the_delegation_check_creates_no_cgroup") {
+            return;
+        }
+        let base = delegated_base(false).expect("a delegated base");
+        let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &base, WatchFlags::CREATE | WatchFlags::DELETE).unwrap();
+
+        // cgroupfs must report a `mkdir` and an `rmdir` here, or an empty drain below proves
+        // nothing.
+        let sanity = format!("murmur-inotify-sanity-{}", std::process::id());
+        std::fs::create_dir(base.join(&sanity)).unwrap();
+        std::fs::remove_dir(base.join(&sanity)).unwrap();
+        let seen = drain_created_and_deleted(&watch);
+        assert_eq!(
+            seen.iter().filter(|name| **name == sanity).count(),
+            2,
+            "inotify did not report the sanity directory's mkdir and rmdir under {}: {seen:?}",
+            base.display()
+        );
+
+        assert_eq!(
+            probe_delegation().expect("the delegation check passes"),
+            base
+        );
+        // Other tests in this binary create and remove scopes under the same base concurrently,
+        // so only the probe's own name counts.
+        let probes: Vec<String> = drain_created_and_deleted(&watch)
+            .into_iter()
+            .filter(|name| name.starts_with("murmur-delegation-probe-"))
+            .collect();
+        assert!(
+            probes.is_empty(),
+            "the delegation check created a cgroup under {}: {probes:?}",
+            base.display()
+        );
+    }
+
+    /// A directory this uid may not write is refused with `EACCES` and the delegation message a
+    /// launch's `E-RUN-012` carries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_write_check_refuses_a_directory_this_uid_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            crate::runtime_err!(
+                "[SKIP-HOST] the_write_check_refuses_a_directory_this_uid_cannot_write: root \
+                 bypasses directory permissions"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let undelegated = temp.path().join("undelegated");
+        std::fs::create_dir(&undelegated).unwrap();
+        std::fs::set_permissions(&undelegated, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let refusal = check_child_creatable(&undelegated).expect_err("a 0555 directory is refused");
+        assert_eq!(refusal.errno, Some(libc::EACCES));
+        assert_eq!(
+            refusal.message,
+            format!(
+                "cannot create a child cgroup under {} (Permission denied (os error 13)); the \
+                 unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io",
+                undelegated.display()
+            )
+        );
+    }
+
+    /// A writable directory passes the check and is left exactly as it was: same entries, same
+    /// modification time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_write_check_leaves_a_writable_directory_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("present"), b"").unwrap();
+        let state = || {
+            let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            let modified = std::fs::metadata(temp.path()).unwrap().modified().unwrap();
+            (names, modified)
+        };
+        let before = state();
+        check_child_creatable(temp.path()).expect("a writable directory passes");
+        assert_eq!(state(), before);
     }
 }
