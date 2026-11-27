@@ -3605,7 +3605,7 @@ What each outcome leaves behind:
 | The task's [`response` artifact](streaming-protocol.md#standard-events) that `GetTask` reports, and the task output an `on-task-end` hook reads | — | The same marked text | The failure |
 | The [conversation record](workdir.md#the-conversation-record) | The turn's thinking and text, with `"truncated": true`, then the runtime's user message stating the cut | The turn's thinking and text, with `"truncated": true` | The turn's thinking and text, with `"truncated": true`, when it had any |
 | The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"decision": "capped"`, `"stop_reason": "max_tokens"` | The same | The same |
-| The trace's [`task_end`](observability-schemas.md#task-end) | `capped_turns` counts the turn | The same; `exit_status` `"ok"` | The same; `exit_status` `"failed"`, after a [`task_failed`](observability-schemas.md#task-failed) with cause `output_cap` |
+| The trace's [`task_end`](observability-schemas.md#task-end) | `capped_turns` counts the turn | The same; `exit_status` `"ok"`; [`max_turns_stop`](observability-schemas.md#task-end) names `inference.max_turns` and `stop_reason` `"max_tokens"` | The same; `exit_status` `"failed"`, after a [`task_failed`](observability-schemas.md#task-failed) with cause `output_cap` |
 
 A tool call in a capped turn is never run, in any outcome: its arguments may be cut. The user
 message names it, and the record keeps only the turn's thinking and text.

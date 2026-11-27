@@ -15,7 +15,7 @@ use std::{
 };
 
 use assert_cmd::Command;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 const DRIVER_NAME: &str = "local/truncation-driver";
@@ -129,6 +129,15 @@ impl Run {
                     .map(str::to_string)
             })
             .unwrap_or_default()
+    }
+
+    /// The trace's last `task_end` line.
+    fn task_end(&self) -> Value {
+        self.trace()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rfind(|ev| ev.get("event_type").and_then(Value::as_str) == Some("task_end"))
+            .unwrap_or_else(|| panic!("a task_end line; trace: {}", self.trace()))
     }
 
     /// The assistant messages the conversation record holds for this run's context.
@@ -405,6 +414,10 @@ fn two_empty_capped_turns_in_a_row_end_the_task_failed() {
         .expect("a task_end");
     assert_eq!(task_end["exit_status"], "failed");
     assert_eq!(task_end["capped_turns"], 2);
+    assert!(
+        task_end.get("max_turns_stop").is_none(),
+        "no turn cap is set, so none ended the task: {task_end}"
+    );
     assert_eq!(run.result(), format!("error: {reason}"));
 
     let stderr = run.stderr();
@@ -447,5 +460,87 @@ fn trace_steps_renders_a_capped_turn_as_truncated() {
     assert!(
         !rendered.contains("truncated"),
         "a normal turn's line is unchanged: {rendered}"
+    );
+}
+
+/// `inference.max_turns: 1` is the one-turn setting: a turn cut at the output cap makes one model
+/// call, ends the task `ok` with the fragment and marker as its answer, and `task_end` says the
+/// turn cap ended it and why that turn stopped.
+#[test]
+fn max_turns_1_ends_a_capped_task_after_one_turn_and_says_why() {
+    let run = run(None, Some(1));
+    run.assert_success();
+
+    let inference = run.sole_inference();
+    assert_eq!(inference["decision"], "capped");
+    assert_eq!(inference["stop_reason"], "max_tokens");
+    assert_eq!(run.exit_status(), "ok", "trace: {}", run.trace());
+    let task_end = run.task_end();
+    assert_eq!(task_end["exit_status"], "ok");
+    assert_eq!(
+        task_end["max_turns_stop"],
+        json!({"max_turns": 1, "turn": 0, "stop_reason": "max_tokens"}),
+        "{task_end}"
+    );
+    assert_eq!(run.result(), format!("{PARTIAL_TEXT}\n\n{MARKER}"));
+}
+
+/// With a turn cap that allows another turn, a capped turn goes on as it does with no cap; the
+/// record names the turn that spent the cap.
+#[test]
+fn a_capped_turn_continues_when_max_turns_allows_another() {
+    let run = run(None, Some(2));
+    run.assert_success();
+
+    let events = run.inference_events();
+    assert_eq!(events.len(), 2, "two turns: {events:?}");
+    for event in &events {
+        assert_eq!(event["decision"], "capped");
+    }
+    let stderr = run.stderr();
+    let warnings = warning_lines(&stderr);
+    assert_eq!(warnings.len(), 2, "one warning per capped turn: {stderr}");
+    assert!(
+        warnings[0].contains("the task goes on with another turn"),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        !warnings[1].contains("the task goes on with another turn"),
+        "{}",
+        warnings[1]
+    );
+    assert_eq!(
+        run.task_end()["max_turns_stop"],
+        json!({"max_turns": 2, "turn": 1, "stop_reason": "max_tokens"})
+    );
+}
+
+/// A one-turn task the model ended itself carries no turn-cap record.
+#[test]
+fn max_turns_1_ending_on_end_turn_writes_no_max_turns_stop() {
+    let run = run(Some("ENDTURN"), Some(1));
+    run.assert_success();
+
+    assert_eq!(run.sole_inference()["stop_reason"], "end_turn");
+    let task_end = run.task_end();
+    assert_eq!(task_end["exit_status"], "ok");
+    assert!(task_end.get("max_turns_stop").is_none(), "{task_end}");
+}
+
+/// A one-turn task whose turn called a tool runs out of turns: it ends `max_turns_reached`, and
+/// the record names the tool call as the stop.
+#[test]
+fn max_turns_1_ends_on_a_tool_call_and_names_it() {
+    let run = run(Some("TOOLTHENCAP"), Some(1));
+    assert!(!run.output.status.success(), "stderr: {}", run.stderr());
+
+    assert_eq!(run.sole_inference()["stop_reason"], "tool_call");
+    let task_end = run.task_end();
+    assert_eq!(task_end["exit_status"], "max_turns_reached");
+    assert_eq!(
+        task_end["max_turns_stop"],
+        json!({"max_turns": 1, "turn": 0, "stop_reason": "tool_call"}),
+        "{task_end}"
     );
 }

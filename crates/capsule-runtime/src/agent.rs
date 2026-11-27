@@ -1328,6 +1328,9 @@ pub(crate) async fn run_agent_loop(
     // Capped turns in a row with no text and no tool call, this attempt. The second ends the task
     // failed; any other response resets it.
     let mut empty_capped_in_a_row = 0u32;
+    // The number and `stop_reason` of the last tool-call turn. The loop runs out only after one
+    // (an `end_turn` or a capped last turn returns), so it names the turn that spent the cap.
+    let mut last_continuing_turn: Option<(u32, String)> = None;
     for attempt_turn in 0..turn_bound {
         let turn = first_turn as usize + attempt_turn;
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
@@ -2633,6 +2636,7 @@ pub(crate) async fn run_agent_loop(
                 // The turn's whole contribution, in the order it entered the context: the
                 // assistant message that asked for the tools, then each tool result.
                 append_to_record(record.as_mut(), &messages[turn_start..]);
+                last_continuing_turn = Some((turn_u32, stop_reason.to_string()));
             }
             "end_turn" => {
                 return finish_completed_turn(
@@ -2749,6 +2753,9 @@ pub(crate) async fn run_agent_loop(
                     truncation_warning_message(cap),
                     runtime_warning_link(W_RUN_001)
                 );
+                if let Some(max_turns) = task_max_turns.or(inference.max_turns) {
+                    trace.record_max_turns_stop(max_turns, turn_u32, stop_reason);
+                }
                 return finish_completed_turn(
                     store_state,
                     trace,
@@ -2801,6 +2808,13 @@ pub(crate) async fn run_agent_loop(
     }
 
     // Only a set cap ends the loop here: an uncapped one never spends `usize::MAX` turns.
+    // An attempt handed no turns at all has no turn of its own to name.
+    if let (Some(max_turns), Some((turn, stop_reason))) = (
+        task_max_turns.or(inference.max_turns),
+        last_continuing_turn.as_ref(),
+    ) {
+        trace.record_max_turns_stop(max_turns, *turn, stop_reason);
+    }
     let exceeded = max_turns_exceeded_message(
         task_max_turns.unwrap_or(u32::MAX),
         trace.task_agent_turns(),

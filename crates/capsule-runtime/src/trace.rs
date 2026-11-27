@@ -142,6 +142,9 @@ pub(crate) struct TraceWriter {
     /// Agent-loop `inference` lines whose `stop_reason` is `"max_tokens"`, written since
     /// `task_start`: `task_end.capped_turns`. Reset with the other per-task counters.
     task_capped_turns: u32,
+    /// The turn-cap stop the agent loop recorded for the active task: `task_end.max_turns_stop`.
+    /// Cleared at `task_start`, taken by `task_end`.
+    task_max_turns_stop: Option<MaxTurnsStop>,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
     /// How many `task_failed` lines this writer has written, so a caller can tell whether one run
@@ -1663,6 +1666,24 @@ struct TaskEndEvent {
     /// How `lifecycle.done_check` went for this task. Absent when the capsule does not set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     done_check: Option<DoneCheckSummary>,
+    /// Present when `inference.max_turns`, not the model, ended the task: the last allowed turn
+    /// stopped with `"max_tokens"` (the task ends `ok`, the fragment its answer) or
+    /// `"tool_call"` (the task ends `max_turns_reached`), either of which would otherwise have
+    /// started another turn. Absent for a task the model ended (`"end_turn"`) and for every task
+    /// a failure, cancel, spend ceiling or deadline ended, including the `output_cap` bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_turns_stop: Option<MaxTurnsStop>,
+}
+
+/// `task_end.max_turns_stop`: the turn cap that ended the task and how its last turn stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct MaxTurnsStop {
+    /// The task's `inference.max_turns`.
+    pub(crate) max_turns: u32,
+    /// The last allowed turn's number: its `inference.turn`.
+    pub(crate) turn: u32,
+    /// That turn's `inference.stop_reason`: `"max_tokens"` or `"tool_call"`.
+    pub(crate) stop_reason: String,
 }
 
 /// `task_end.done_check`: the runs of `lifecycle.done_check`'s command for this task, the reopens
@@ -3027,6 +3048,7 @@ impl TraceWriter {
             task_agent_turns: 0,
             task_hook_inferences: 0,
             task_capped_turns: 0,
+            task_max_turns_stop: None,
             task_start_instant: None,
             active_task_id: None,
             task_failures_written: 0,
@@ -4268,6 +4290,7 @@ impl TraceWriter {
         self.task_agent_turns = 0;
         self.task_hook_inferences = 0;
         self.task_capped_turns = 0;
+        self.task_max_turns_stop = None;
         let started = Instant::now();
         self.task_start_instant = Some(started);
         self.active_task_id = Some(task_id.to_string());
@@ -4339,6 +4362,7 @@ impl TraceWriter {
             running_commands,
             keep_working,
             done_check,
+            max_turns_stop: self.task_max_turns_stop.take(),
         };
         self.active_task_id = None;
         self.task_event_id = None;
@@ -4584,6 +4608,16 @@ impl TraceWriter {
     /// exists to bound, and the spend ceiling is per capsule, not per task.
     pub(crate) fn task_turns(&self) -> u32 {
         self.task_turns
+    }
+
+    /// Records that `inference.max_turns` ended the active task on `turn`, whose stop would
+    /// otherwise have started another: the next `task_end` carries it as `max_turns_stop`.
+    pub(crate) fn record_max_turns_stop(&mut self, max_turns: u32, turn: u32, stop_reason: &str) {
+        self.task_max_turns_stop = Some(MaxTurnsStop {
+            max_turns,
+            turn,
+            stop_reason: stop_reason.to_string(),
+        });
     }
 
     /// How many of [`Self::task_turns`] were hook `run-inference` calls.
@@ -9745,6 +9779,53 @@ mod tests {
             .map(|e| e["capped_turns"].clone())
             .collect();
         assert_eq!(capped, vec![serde_json::json!(2), serde_json::json!(0)]);
+    }
+
+    /// `task_end.max_turns_stop` is the recorded stop, exactly, on that task's `task_end` only:
+    /// absent with no record, absent on the next task, and cleared by `task_start`.
+    #[tokio::test]
+    async fn task_end_carries_max_turns_stop_only_for_the_recording_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        w.record_max_turns_stop(1, 0, "max_tokens");
+        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None, None)
+            .await
+            .unwrap();
+        // The next task, with no record of its own.
+        w.write_task_start("tsk_2", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        w.write_task_end("tsk_2", "ok", 0, Vec::new(), None, None)
+            .await
+            .unwrap();
+        // A record left from before `task_start` belongs to no task.
+        w.record_max_turns_stop(4, 3, "tool_call");
+        w.write_task_start("tsk_3", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        w.write_task_end("tsk_3", "max_turns_reached", 0, Vec::new(), None, None)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let ends: Vec<_> = read_events(dir.path())
+            .into_iter()
+            .filter(|e| e["event_type"] == "task_end")
+            .collect();
+        assert_eq!(ends.len(), 3);
+        assert_eq!(
+            ends[0]["max_turns_stop"],
+            serde_json::json!({"max_turns": 1, "turn": 0, "stop_reason": "max_tokens"})
+        );
+        for end in &ends[1..] {
+            assert!(
+                end.as_object().unwrap().get("max_turns_stop").is_none(),
+                "{end}"
+            );
+        }
     }
 
     /// `task_end.keep_working` is the summary the runtime passes, `stopped_by` `null` when unset,
