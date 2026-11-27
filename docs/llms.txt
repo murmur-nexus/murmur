@@ -75,6 +75,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Deploy a capsule to the cloud with mur deploy](/how-to/deploy-capsule-cloud.md): Uploading capsule files to a VM via SSH and getting back a public A2A endpoint.
 - [Run a capsule from the CLI or from another program](/how-to/different-ways-to-run-murmur.md): `mur run`'s two output modes and which callers each one serves.
 - [Publish your own artifact source](/how-to/publish-artifact-source.md): Building artifacts, writing their `artifacts-index.json` with `mur index`, and uploading both as a GitHub release others can install and search.
+- [Prepare a server to launch many capsules at once](/how-to/prepare-a-server-for-many-capsules.md): Reading `mur doctor`'s `Cgroup scope` block, letting the systemd user manager delegate or launching from a system unit with `Delegate=yes`, raising the launcher's open-file limit, and watching the journal and removed memory cgroups on long bursts.
 
 ## Language Guides
 
