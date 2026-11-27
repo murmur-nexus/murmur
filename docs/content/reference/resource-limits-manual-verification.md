@@ -86,8 +86,9 @@ cat "$CG/cgroup.controllers"
 mkdir "$CG/murmur-delegation-probe" && rmdir "$CG/murmur-delegation-probe" && echo "delegation OK"
 ```
 
-If the `mkdir` fails with `EACCES`, the delegation did not apply; the runtime performs this exact
-probe at launch and refuses with `E-RUN-012` naming what is missing.
+If the `mkdir` fails with `EACCES`, the delegation did not apply. At launch the runtime makes the
+same permission check `mkdir` makes, for write and search permission on the directory, without
+creating a cgroup, and refuses with `E-RUN-012` naming what is missing.
 
 ### What the runtime does with the delegation
 
@@ -113,7 +114,7 @@ runtime:
     - when the stop cannot be confirmed, or the move lands while the unit is being stopped, the
       launch refuses with `E-RUN-012` instead;
 2. reads `/proc/self/cgroup` for the `0::` line and joins it to the `cgroup2` mount from
-   `/proc/mounts` to find its delegated base;
+   `/proc/mounts` to find its delegated base, and checks write and search permission on it;
 3. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;

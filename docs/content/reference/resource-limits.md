@@ -164,6 +164,9 @@ these, such as one made only of skills, is never blocked. A refusal after a decl
 [delegated parent](#delegated-parent) ends with `; no delegated parent was adopted: <reason>`. See
 [Verification](containment.md#verification) for how these bounds are checked by hand.
 
+`mur` confirms it may create a child cgroup under the delegated base by asking the kernel for write
+and search permission on it, without creating one.
+
 #### Delegated parent { #delegated-parent }
 
 A launcher that starts hundreds of capsules at once can give `mur` a cgroup to build under
