@@ -5636,6 +5636,7 @@ murmur-cli::eval_cmd	show_single_scorer_shows_pass_rate	capsule	e2e	beta-all	fal
 murmur-cli::eval_cmd	show_unknown_record_type_fails	capsule	e2e	beta-all	false
 murmur-cli::eval_variant	a_check_binary_missing_from_the_variants_allowlist_is_refused	isolation	e2e	beta-all	false
 murmur-cli::eval_variant	a_check_result_is_attached_to_its_session	isolation	e2e	beta-all	false
+murmur-cli::eval_variant	a_check_runs_on_a_light_capsule_and_leaves_no_empty_scratch	isolation	e2e	beta-all	false
 murmur-cli::eval_variant	a_check_that_outruns_its_timeout_is_killed	isolation	e2e	beta-all	false
 murmur-cli::eval_variant	a_link_in_the_start_is_refused	isolation	e2e	beta-all	false
 murmur-cli::eval_variant	a_missing_start_is_refused	isolation	e2e	beta-all	false

@@ -178,7 +178,9 @@ impl RecordsDir {
 /// missing folder, or any error, leaves things as they are and is reported nowhere.
 ///
 /// Held by a launch for its whole length and dropped after the session's processes have been
-/// killed. A process that exits without running destructors keeps both folders.
+/// killed, and by [`crate::CheckRunner::run`], which recreates both for an eval check after the
+/// session has ended and drops it after the check's processes have been killed. A process that
+/// exits without running destructors keeps both folders.
 pub(crate) struct RemoveEmptyScratchOnDrop(Option<WorkdirRoot>);
 
 impl RemoveEmptyScratchOnDrop {

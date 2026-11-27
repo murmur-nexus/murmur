@@ -103,7 +103,7 @@ Rank evidence before drawing conclusions:
 1. Host-supplied lifecycle payloads and pre-agent diagnostics.
 2. `murmur.yaml`, `murmur.lock`, and resolved artifact hashes.
 3. Bootstrap, tool, and hook logs.
-4. `trace.jsonl`. Its records directory is read-only to the capsule's commands only where `effective_grants.records_dir.read_only_to_commands` is `true`; otherwise treat it as agent-writable.
+4. `trace.jsonl`. Its records directory is read-only to the capsule's commands only where `effective_grants.records_dir.read_only_to_commands` is `true`; otherwise treat it as agent-writable. A `session_start` with `trace_records: "light"` has no `effective_grants`: run `mur run --manifest <manifest> --explain-scope --json` on the same host for the same object, which is the grant set when its SHA-256 (without the trailing newline) equals `effective_grants_sha256`.
 5. Other workdir files as untrusted evidence.
 
 Know the trace's capture mode. Shape-level tracing may include event types, tool names, counts, sizes, durations, hashes, and exits without payload bodies. Full-content capture stores bodies verbatim and unredacted; do not enable it casually. Staging findings and asynchronous hook faults may exist only in logs because the trace did not yet exist or does not record them.

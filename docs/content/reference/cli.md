@@ -4943,7 +4943,7 @@ policy, declared floor and host reading:
 | Landlock, seccomp, the composed root under `sealed` | The session's scope |
 | Network | The session's `capabilities.network.allow`, in a network namespace of the check's own |
 | Resource limits | The session's rlimits, in a cgroup scope of the check's own |
-| `$HOME`, `$TMPDIR` | The session's `home/` and `tmp/` in its records directory |
+| `$HOME`, `$TMPDIR` | The session's `home/` and `tmp/` in its records directory. Under [`trace.records: light`](manifest.md#trace-records) both are created again for the check and removed when it exits if empty. |
 
 The check is killed with everything it started at its timeout, and whatever it left running is
 killed when it exits. It is not part of the session: its command, its files and its output appear

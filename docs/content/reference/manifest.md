@@ -1637,9 +1637,11 @@ mur run --manifest murmur.yaml --explain-scope --json | head -c -1 | sha256sum
 | Case | Effect |
 |---|---|
 | The session is killed outright (`SIGKILL`, a forced exit) | `home/` and `tmp/` are kept, empty or not |
+| A command ran while `/tmp` was [mapped onto `tmp/`](containment.md#temp-folder-env) and its work folder or `HOME` lay under the host's `/tmp` | `tmp/` holds the empty folder each was bound back onto, so it is not empty and is kept |
 | `trace.capture` | Independent. Pair `light` with `trace.capture: none` for the smallest record. |
 | `trace.retain` | Independent. `trace.retain` removes whole sessions at a later launch; `trace.records` makes each session's record smaller. |
 | A delegated child or a formation member | Follows its own manifest's `trace.records` |
+| A [`mur eval run` check](cli.md#mur-eval-run-check) | Runs after the session has ended with `home/` and `tmp/` as its `$HOME` and `$TMPDIR`, created again for it; each is removed when the check exits if it is empty |
 
 #### `lifecycle` { #field-lifecycle }
 
