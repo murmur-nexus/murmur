@@ -42,6 +42,12 @@
 //! The request is best-effort and silent: with no systemd, no session bus, or a policy denial,
 //! the runtime probes whatever cgroup it inherited, exactly as it does when this step is skipped.
 //!
+//! Before that request, the `parent` module checks whether the process already sits in a cgroup
+//! whose parent is a delegated subtree this uid owns — a system unit with `Delegate=yes` and
+//! `User=`, or a cgroup namespace rooted at a delegated cgroup — and when every check passes takes
+//! it: `<parent>/murmur-<pid>-p` becomes the base, and systemd is never asked. Hundreds of
+//! launches at once then do not queue on the user manager, and no session bus is needed.
+//!
 //! ## Fail closed, but only where the threat exists
 //!
 //! On Linux, a capsule that can spawn *any* subprocess and cannot be given a cgroup
@@ -77,6 +83,9 @@ use std::sync::{
 };
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+mod parent;
 
 use crate::resources::HostResourceLimits;
 
@@ -728,9 +737,13 @@ pub(crate) struct PreparedScope {
 /// The returned [`PreparedScope`] always carries an [`IoMaxReport`], on every one of those paths:
 /// the declared I/O ceiling is reported as applying, as not applying, or as not required, and
 /// never left silent.
+///
+/// `declares_io_limit` is whether the capsule declares `cgroup_io_bytes_per_sec`, which
+/// [`delegated_base`] reads if this is the process's first resolution.
 pub(crate) fn prepare_scope(
     required: bool,
     limits: &HostResourceLimits,
+    declares_io_limit: bool,
     session_id: &str,
     workdir: &Path,
 ) -> Result<PreparedScope, String> {
@@ -750,6 +763,7 @@ pub(crate) fn prepare_scope(
         let (scope, io_max) = CgroupScope::create(
             &scope_limits(limits),
             IoMaxWrite::Declared(limits.cgroup_io_bytes_per_sec),
+            declares_io_limit,
             session_id,
             workdir,
         )?;
@@ -762,7 +776,7 @@ pub(crate) fn prepare_scope(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (session_id, workdir);
+        let _ = (declares_io_limit, session_id, workdir);
         Ok(PreparedScope {
             scope: None,
             io_max: IoMaxReport::not_required(limits.cgroup_io_bytes_per_sec, NOT_LINUX_REASON),
@@ -782,8 +796,15 @@ pub(crate) fn prepare_policy_scope(
     workdir: &Path,
 ) -> Result<PreparedScope, String> {
     let required = requires_process_bounding(policy);
+    let declares_io_limit = declares_io_limit(policy);
     if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
-        return prepare_scope(required, &policy.resources, session_id, workdir);
+        return prepare_scope(
+            required,
+            &policy.resources,
+            declares_io_limit,
+            session_id,
+            workdir,
+        );
     }
     let reported_bytes_per_sec = policy.resources.cgroup_io_bytes_per_sec;
     if !required {
@@ -805,8 +826,13 @@ pub(crate) fn prepare_policy_scope(
             Some(bytes_per_sec) => IoMaxWrite::Declared(bytes_per_sec),
             None => IoMaxWrite::Undeclared(reported_bytes_per_sec),
         };
-        let (scope, io_max) =
-            CgroupScope::create(&declared_scope_limits(declared), io, session_id, workdir)?;
+        let (scope, io_max) = CgroupScope::create(
+            &declared_scope_limits(declared),
+            io,
+            declares_io_limit,
+            session_id,
+            workdir,
+        )?;
         let scope = Arc::new(scope);
         Ok(PreparedScope {
             cgroup_scope: CgroupScopeReport::of_prepared(Some(&scope), true),
@@ -888,7 +914,12 @@ pub struct ScopeProbe {
 /// not survive the call. Never run at launch: a launch learns the same answer from
 /// [`prepare_scope`].
 #[must_use]
-pub fn probe_scope(required: bool, limits: &HostResourceLimits, workdir: &Path) -> ScopeProbe {
+pub fn probe_scope(
+    required: bool,
+    limits: &HostResourceLimits,
+    declares_io_limit: bool,
+    workdir: &Path,
+) -> ScopeProbe {
     let declared = limits.cgroup_io_bytes_per_sec;
     if !required {
         return ScopeProbe {
@@ -898,7 +929,7 @@ pub fn probe_scope(required: bool, limits: &HostResourceLimits, workdir: &Path) 
     }
     #[cfg(target_os = "linux")]
     {
-        let base = match delegated_base() {
+        let base = match delegated_base(declares_io_limit) {
             Ok(base) => base,
             Err(error) => {
                 return ScopeProbe {
@@ -934,7 +965,7 @@ pub fn probe_scope(required: bool, limits: &HostResourceLimits, workdir: &Path) 
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = workdir;
+        let _ = (declares_io_limit, workdir);
         ScopeProbe {
             cgroup_scope: CgroupScopeReport::not_required(NOT_LINUX_CGROUP_REASON),
             io_max: IoMaxReport::not_required(declared, NOT_LINUX_REASON),
@@ -972,7 +1003,12 @@ fn scope_dir_refusal(path: &Path, error: &std::io::Error) -> CgroupError {
 pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Path) -> ScopeProbe {
     let required = requires_process_bounding(policy);
     if policy.containment_floor != murmur_artifact::ContainmentClass::Unconfined {
-        return probe_scope(required, &policy.resources, workdir);
+        return probe_scope(
+            required,
+            &policy.resources,
+            declares_io_limit(policy),
+            workdir,
+        );
     }
     if !required {
         let (io_max, cgroup_scope) = unrequired_scope_reports(policy);
@@ -989,6 +1025,7 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
                 .unwrap_or(policy.resources.cgroup_io_bytes_per_sec),
             ..policy.resources
         },
+        declares_io_limit(policy),
         workdir,
     );
     if cfg!(target_os = "linux") && declared_io.is_none() {
@@ -998,6 +1035,14 @@ pub fn explain_scope_probe(policy: &crate::types::CapabilityPolicy, workdir: &Pa
         );
     }
     probe
+}
+
+/// Whether `policy`'s manifest declares `capabilities.resources.cgroup_io_bytes_per_sec`, which
+/// makes `io` a controller a delegated parent must enable before it is adopted. The resolved
+/// limit carries a default whether or not one was declared, so only the declaration counts.
+#[must_use]
+pub fn declares_io_limit(policy: &crate::types::CapabilityPolicy) -> bool {
+    policy.declared_resources.cgroup_io_bytes_per_sec.is_some()
 }
 
 /// Does this policy give the capsule any way to run a subprocess at all?
@@ -1151,47 +1196,61 @@ impl CgroupScope {
         if self.path.as_os_str().is_empty() {
             return Vec::new();
         }
-        std::fs::read_to_string(self.path.join("cgroup.procs"))
-            .map(|procs| {
-                procs
-                    .lines()
-                    .filter_map(|line| line.trim().parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        member_pids_of(&self.path)
     }
 
-    /// `cgroup.kill` for a kernel that has none: freeze, `SIGKILL` each listed pid, thaw.
-    ///
-    /// Freezing first stops a listed process from forking a child the loop has not seen, and
-    /// keeps a pid from being reused between reading it and signalling it. A frozen task still
-    /// takes `SIGKILL`; it dies once thawed.
+    /// `cgroup.kill` for a kernel that has none: [`kill_cgroup_by_freezing`] on this scope.
     #[cfg(target_os = "linux")]
-    #[allow(unsafe_code)]
     fn kill_by_freezing(&self) -> std::io::Result<()> {
-        let freeze = self.path.join("cgroup.freeze");
-        let deadline = std::time::Instant::now() + KILL_FALLBACK_DEADLINE;
-        loop {
-            let pids = self.member_pids();
-            if pids.is_empty() {
-                return Ok(());
-            }
-            // Best-effort: a kernel without the freezer still gets every listed pid killed.
-            let _ = write_existing(&freeze, "1");
-            for pid in pids {
-                // SAFETY: `kill` takes two integers and dereferences nothing.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-            let _ = write_existing(&freeze, "0");
-            if std::time::Instant::now() >= deadline {
-                return Err(std::io::Error::other(format!(
-                    "processes were still in {} after {} ms of SIGKILL",
-                    self.path.display(),
-                    KILL_FALLBACK_DEADLINE.as_millis()
-                )));
-            }
-            std::thread::sleep(KILL_POLL_INTERVAL);
+        kill_cgroup_by_freezing(&self.path)
+    }
+}
+
+/// Every pid the `cgroup.procs` of the cgroup at `path` lists now. Empty when the file cannot be
+/// read, which is a cgroup whose directory is already gone.
+fn member_pids_of(path: &Path) -> Vec<i32> {
+    std::fs::read_to_string(path.join("cgroup.procs"))
+        .map(|procs| {
+            procs
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `cgroup.kill` for a kernel that has none, on the cgroup at `path`: freeze, `SIGKILL` each
+/// listed pid, thaw, repeated until it lists none or [`KILL_FALLBACK_DEADLINE`] has passed.
+///
+/// Freezing first stops a listed process from forking a child the loop has not seen, and
+/// keeps a pid from being reused between reading it and signalling it. A frozen task still
+/// takes `SIGKILL`; it dies once thawed. Only the processes of `path` itself are listed, not
+/// those of its descendants.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn kill_cgroup_by_freezing(path: &Path) -> std::io::Result<()> {
+    let freeze = path.join("cgroup.freeze");
+    let deadline = std::time::Instant::now() + KILL_FALLBACK_DEADLINE;
+    loop {
+        let pids = member_pids_of(path);
+        if pids.is_empty() {
+            return Ok(());
         }
+        // Best-effort: a kernel without the freezer still gets every listed pid killed.
+        let _ = write_existing(&freeze, "1");
+        for pid in pids {
+            // SAFETY: `kill` takes two integers and dereferences nothing.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = write_existing(&freeze, "0");
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "processes were still in {} after {} ms of SIGKILL",
+                path.display(),
+                KILL_FALLBACK_DEADLINE.as_millis()
+            )));
+        }
+        std::thread::sleep(KILL_POLL_INTERVAL);
     }
 }
 
@@ -1787,13 +1846,16 @@ impl CgroupScope {
     /// controllers are delegated, so a failure there means the bound genuinely does not exist and
     /// the launch must not proceed. The one exception is a kernel that exposes no
     /// `memory.swap.max` at all (see [`ScopeLimit::absent_ok`]).
+    ///
+    /// `declares_io_limit` is [`delegated_base`]'s, for a process whose first resolution this is.
     fn create(
         limits: &[ScopeLimit],
         io: IoMaxWrite,
+        declares_io_limit: bool,
         session_id: &str,
         workdir: &Path,
     ) -> Result<(Self, IoMaxReport), String> {
-        let base = delegated_base()?;
+        let base = delegated_base(declares_io_limit)?;
 
         let path = base.join(scope_dir_name(session_id));
         create_scope_dir(&path).map_err(|error| scope_dir_refusal(&path, &error))?;
@@ -2122,7 +2184,7 @@ pub(crate) static DELEGATED_BASE_RESOLUTION_SPAWNS: std::sync::atomic::AtomicUsi
 /// whose `cgroup.subtree_control` the resolution writes.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn resolve_delegated_base_in_background() {
-    resolve_delegated_base_in_background_with(&[]);
+    resolve_delegated_base_in_background_with(&[], false);
 }
 
 /// The guest-worker processes that move with this process: into its transient scope and into
@@ -2146,21 +2208,30 @@ fn companion_pids() -> Vec<u32> {
 /// forked after it is created there. Staging calls it for a capsule that needs a scope before it
 /// creates any session folder or forks a guest worker, whose spawn also forks the session
 /// namespace's holder processes. Off Linux there is nothing to wait for.
-pub(crate) fn await_delegated_base() -> Result<(), String> {
+///
+/// `declares_io_limit` is [`delegated_base`]'s: whether the capsule declares
+/// `capabilities.resources.cgroup_io_bytes_per_sec`.
+pub(crate) fn await_delegated_base(declares_io_limit: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         #[cfg(test)]
         if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
             return Err("forced: delegation refused by the test seam".to_string());
         }
-        delegated_base()?;
+        delegated_base(declares_io_limit)?;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = declares_io_limit;
     Ok(())
 }
 
 /// The delegated-base resolution described above, with `companions` (this session's guest-worker
-/// pids, children of this process forked before this call) moving wherever this process moves.
-pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
+/// pids, children of this process forked before this call) moving wherever this process moves,
+/// and `declares_io_limit` passed to [`delegated_base`].
+pub(crate) fn resolve_delegated_base_in_background_with(
+    companions: &[u32],
+    declares_io_limit: bool,
+) {
     {
         let mut registered = COMPANION_PIDS
             .lock()
@@ -2179,7 +2250,7 @@ pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
         let _ = std::thread::Builder::new()
             .name("murmur-cgroup-base".to_string())
             .spawn(move || {
-                let _ = delegated_base();
+                let _ = delegated_base(declares_io_limit);
                 // This session's workers have moved, or never will: a later session's
                 // resolution must not find their pids, which the kernel may hand to an unrelated
                 // process once they exit.
@@ -2189,6 +2260,8 @@ pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
                     .retain(|pid| !companions.contains(pid));
             });
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = declares_io_limit;
 }
 
 /// The delegated cgroup root this process creates its scopes under, resolved once.
@@ -2204,8 +2277,16 @@ pub(crate) fn resolve_delegated_base_in_background_with(companions: &[u32]) {
 /// Resolving once, under a lock, keeps every scope a sibling directly under the real root, and
 /// makes concurrent first-callers agree on that root instead of racing to relocate each other.
 /// Only success is cached: a host that is not delegated must keep reporting so on every attempt.
+///
+/// Before systemd is asked for a scope, [`adopt_delegated_parent`] takes the delegated parent
+/// cgroup this process may already sit in; when it does, the systemd request is never made and the
+/// probe finds `<parent>/murmur-<pid>-p` as the base. `declares_io_limit` (whether the capsule
+/// declares `capabilities.resources.cgroup_io_bytes_per_sec`) makes `io` one of the controllers
+/// that parent must provide; only the first resolution in a process reads it. A refusal after a
+/// declined parent carries the decline reason, appended as `; no delegated parent was adopted:
+/// <reason>`.
 #[cfg(target_os = "linux")]
-fn delegated_base() -> Result<PathBuf, CgroupError> {
+fn delegated_base(declares_io_limit: bool) -> Result<PathBuf, CgroupError> {
     static BASE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
     // A poisoned lock guards no invariant worth honouring here: the cache is either populated or
@@ -2215,15 +2296,56 @@ fn delegated_base() -> Result<PathBuf, CgroupError> {
         return Ok(base.clone());
     }
 
-    let give_up = match base_decision(move_self_into_own_systemd_scope()) {
-        BaseDecision::Refuse(reason) => return Err(CgroupError::from(reason)),
-        BaseDecision::Probe { give_up } => give_up,
+    let declined = match adopt_delegated_parent(declares_io_limit) {
+        parent::ParentAdoption::Adopted(_) => None,
+        parent::ParentAdoption::Declined(reason) => Some(reason.as_str()),
+    };
+    let give_up = match declined {
+        None => None,
+        Some(declined) => match base_decision(move_self_into_own_systemd_scope()) {
+            BaseDecision::Refuse(reason) => {
+                return Err(with_decline(CgroupError::from(reason), Some(declined)))
+            }
+            BaseDecision::Probe { give_up } => give_up,
+        },
     };
     let base = probe_delegation()
         .and_then(|base| enable_controllers(&base).map(|()| base))
-        .map_err(|error| with_give_up(error, give_up))?;
+        .map_err(|error| with_decline(with_give_up(error, give_up), declined))?;
     *cached = Some(base.clone());
     Ok(base)
+}
+
+/// `error` with `declined`, the reason no delegated parent was adopted, appended to its message
+/// as `; no delegated parent was adopted: <reason>`, its errno kept.
+#[cfg(target_os = "linux")]
+fn with_decline(error: CgroupError, declined: Option<&str>) -> CgroupError {
+    match declined {
+        Some(reason) => CgroupError {
+            message: format!(
+                "{}; no delegated parent was adopted: {reason}",
+                error.message
+            ),
+            errno: error.errno,
+        },
+        None => error,
+    }
+}
+
+/// Adopt the delegated parent cgroup this process sits in ([`parent::adopt`]), or decline it with
+/// the reason why. Runs at most once per process, beside [`move_self_into_own_systemd_scope`]'s own
+/// guard and for the same reason: where the process lives is a property of the process, and
+/// [`delegated_base`] caches only success. The first caller's `declares_io_limit` decides.
+#[cfg(target_os = "linux")]
+fn adopt_delegated_parent(declares_io_limit: bool) -> &'static parent::ParentAdoption {
+    static ADOPTION: std::sync::OnceLock<parent::ParentAdoption> = std::sync::OnceLock::new();
+    ADOPTION.get_or_init(|| {
+        parent::adopt(
+            &parent::read_parent_facts(),
+            declares_io_limit,
+            &companion_pids(),
+        )
+    })
 }
 
 /// How long a launch waits for systemd to move it into the transient scope it asked for, from
@@ -2914,7 +3036,7 @@ pub fn cgroup_delegation_available() -> bool {
         // answers a different question and is wrong in both directions: a user manager hands out
         // a scope on a host whose controllers `enable_controllers` cannot delegate, and the
         // inherited cgroup carries delegated controllers on a host with no reachable session bus.
-        delegated_base().is_ok()
+        delegated_base(false).is_ok()
     }
 }
 
@@ -3188,6 +3310,7 @@ mod tests {
         let probe = probe_scope(
             true,
             &HostResourceLimits::default(),
+            false,
             &temp.path().join("workdir"),
         );
         assert_eq!(probe.cgroup_scope, CgroupScopeReport::delegated());
@@ -3203,11 +3326,12 @@ mod tests {
         // Counted by name rather than by directory count: this binary's other tests create and
         // remove scopes under the same base concurrently, and only `probe_scope` names one
         // `explain-scope`.
-        let leftovers: Vec<String> = std::fs::read_dir(delegated_base().expect("a delegated base"))
-            .unwrap()
-            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
-            .filter(|name| name.contains("explain-scope"))
-            .collect();
+        let leftovers: Vec<String> =
+            std::fs::read_dir(delegated_base(false).expect("a delegated base"))
+                .unwrap()
+                .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+                .filter(|name| name.contains("explain-scope"))
+                .collect();
         assert!(
             leftovers.is_empty(),
             "the throwaway cgroup outlived the probe: {leftovers:?}"
@@ -3219,9 +3343,15 @@ mod tests {
     #[test]
     fn a_probe_that_is_not_required_reports_what_a_launch_writes() {
         let limits = HostResourceLimits::default();
-        let probe = probe_scope(false, &limits, Path::new("/nonexistent/workdir"));
-        let prepared = prepare_scope(false, &limits, "s", Path::new("/nonexistent/workdir"))
-            .expect("no scope is required");
+        let probe = probe_scope(false, &limits, false, Path::new("/nonexistent/workdir"));
+        let prepared = prepare_scope(
+            false,
+            &limits,
+            false,
+            "s",
+            Path::new("/nonexistent/workdir"),
+        )
+        .expect("no scope is required");
         assert_eq!(probe.cgroup_scope, prepared.cgroup_scope);
         assert_eq!(probe.io_max, prepared.io_max);
         assert_eq!(probe.cgroup_scope.status, CgroupScopeStatus::NotRequired);
@@ -3286,6 +3416,7 @@ mod tests {
         let prepared = prepare_scope(
             true,
             &HostResourceLimits::default(),
+            false,
             "cgroup-scope-report",
             &temp.path().join("workdir"),
         )
@@ -3457,6 +3588,7 @@ mod tests {
         let scope = prepare_scope(
             false,
             &HostResourceLimits::default(),
+            false,
             "ses_test",
             temp.path(),
         )
@@ -3480,6 +3612,7 @@ mod tests {
         let scope = prepare_scope(
             true,
             &HostResourceLimits::default(),
+            false,
             "ses_test",
             temp.path(),
         )
@@ -3511,6 +3644,7 @@ mod tests {
         let prepared = prepare_scope(
             true,
             &HostResourceLimits::default(),
+            false,
             "ses_selftest",
             temp.path(),
         )
@@ -3584,7 +3718,7 @@ mod tests {
             cgroup_cpu_percent: Some(50),
             ..HostResourceLimits::default()
         };
-        let scope = prepare_scope(true, &limits, "ses_cpucap", temp.path())
+        let scope = prepare_scope(true, &limits, false, "ses_cpucap", temp.path())
             .expect(
                 "a Linux host with a systemd user session must be able to bound a subprocess tree",
             )
@@ -3609,6 +3743,7 @@ mod tests {
         let scope = prepare_scope(
             true,
             &HostResourceLimits::default(),
+            false,
             "ses_kill_fallback",
             temp.path(),
         )
@@ -3668,7 +3803,13 @@ mod tests {
     ) -> (Arc<CgroupScope>, std::process::Child) {
         let temp = tempfile::tempdir().unwrap();
         FORCE_KILL_FALLBACK.with(|flag| flag.set(fallback));
-        let scope = prepare_scope(true, &HostResourceLimits::default(), session, temp.path());
+        let scope = prepare_scope(
+            true,
+            &HostResourceLimits::default(),
+            false,
+            session,
+            temp.path(),
+        );
         FORCE_KILL_FALLBACK.with(|flag| flag.set(false));
         let scope = scope
             .expect("a delegated scope")
@@ -4417,8 +4558,8 @@ mod tests {
     #[test]
     fn background_resolution_agrees_with_a_direct_one() {
         resolve_delegated_base_in_background();
-        let first = delegated_base();
-        let second = delegated_base();
+        let first = delegated_base(false);
+        let second = delegated_base(false);
         assert_eq!(first, second);
     }
 

@@ -159,6 +159,14 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "text HAPPY-RESULT"
     echo "end HAPPY-RESULT"
     ;;
+  held)
+    # `happy`, with the turn held open for $FIXTURE_HARNESS_HOLD_SECS seconds (1 by default) before
+    # the answer: a session that runs for a known while, so a test can look at it as it runs.
+    echo "started fixture-session-1"
+    pause "${FIXTURE_HARNESS_HOLD_SECS:-1}"
+    echo "text HELD-RESULT"
+    echo "end HELD-RESULT"
+    ;;
   usage)
     # Every `usage` line is the cumulative total for the run so far, which is what the interface
     # asks for: the second names the same input as the first, so only the output grew.

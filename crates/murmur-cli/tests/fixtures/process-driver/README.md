@@ -155,6 +155,7 @@ It answers `--version` with `fixture-harness 1.0.0` (or `fixture-harness 0.9.0` 
 | Profile | What it does |
 | --- | --- |
 | `happy` | One `text` and one `end`, result `HAPPY-RESULT` |
+| `held` | `happy` with the turn held open first for `FIXTURE_HARNESS_HOLD_SECS` seconds (1 by default), result `HELD-RESULT` |
 | `usage` | Two cumulative `usage` lines around one `text`, ending at `in=120 out=30` with `cache-read=900 cache-creation=64 thinking=2`, then `end USAGE-RESULT` |
 | `usage-zero` | One `usage in=0 out=0`, then `end ZERO-RESULT`: a harness reporting that it spent nothing |
 | `usage-turns` | Two turns, reporting `in=40 out=20` and then `in=100 out=50` — totals, not increments |

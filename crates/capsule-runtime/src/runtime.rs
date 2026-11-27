@@ -3084,7 +3084,10 @@ pub fn stage_session(
     // must be forked after `cgroup::await_delegated_base` returns, as the guest workers below
     // are, so it is created in the cgroup this process moves into.
     if cgroup::requires_process_bounding(&request.capability_policy) {
-        cgroup::resolve_delegated_base_in_background_with(&[]);
+        cgroup::resolve_delegated_base_in_background_with(
+            &[],
+            cgroup::declares_io_limit(&request.capability_policy),
+        );
     }
     let engine = build_engine()?;
     let compiled_forms = CompiledForms::new(
@@ -3676,7 +3679,7 @@ pub fn stage_session(
     // or any guest worker is forked, on a host that cannot delegate one. Past this point this
     // process is in the cgroup it stays in, so every child forked below is created in it.
     if cgroup::requires_process_bounding(&request.capability_policy) {
-        cgroup::await_delegated_base()
+        cgroup::await_delegated_base(cgroup::declares_io_limit(&request.capability_policy))
             .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
     }
 
@@ -23088,6 +23091,7 @@ inference:
         let prepared = crate::cgroup::prepare_scope(
             true,
             &limits,
+            false,
             &format!("ses_pidsmax_{}", uuid::Uuid::now_v7().simple()),
             tmp.path(),
         )
@@ -23198,6 +23202,7 @@ inference:
         let prepared = crate::cgroup::prepare_scope(
             true,
             &limits,
+            false,
             &format!("ses_forkbomb_{}", uuid::Uuid::now_v7().simple()),
             tmp.path(),
         )

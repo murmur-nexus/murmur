@@ -144,9 +144,11 @@ host cannot delegate a cgroup, rather than running that tree with no aggregate c
 can spawn a subprocess when it declares `capabilities.shell.allow` or `capabilities.spawn.allow`,
 or has any `runtime: tool`, `runtime: driver` or `runtime: hook` artifact or a non-empty
 `capabilities.install.tool`, each of which runs in a [guest worker](../concepts/guest-workers.md)
-process. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
-the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any
-setup. What happens next depends on how systemd answers:
+process. On launch, `mur` first checks whether it already sits in a
+[delegated parent](#delegated-parent) cgroup its own uid owns, and takes it when every check
+passes, without asking systemd. Otherwise it asks the systemd user session for a fresh delegated
+scope of its own — the same mechanism rootless Podman and Docker use — so it works from an
+ordinary shell without any setup. What happens next depends on how systemd answers:
 
 | systemd | `mur` |
 |---|---|
@@ -158,8 +160,77 @@ setup. What happens next depends on how systemd answers:
 An inherited cgroup must itself carry `Delegate=yes` for `memory pids cpu io` (for example, by
 running under a unit configured that way, or via `systemd-run --user --scope
 --property=Delegate=yes`); otherwise the launch refuses with `E-RUN-012`. A capsule with none of
-these, such as one made only of skills, is never blocked. See
+these, such as one made only of skills, is never blocked. A refusal after a declined
+[delegated parent](#delegated-parent) ends with `; no delegated parent was adopted: <reason>`. See
 [Verification](containment.md#verification) for how these bounds are checked by hand.
+
+#### Delegated parent { #delegated-parent }
+
+A launcher that starts hundreds of capsules at once can give `mur` a cgroup to build under
+directly, so no launch asks the systemd user manager for a scope and no session bus is needed.
+The operator provides the parent once:
+
+1. Run the launcher in a system unit with `Delegate=yes` and `User=` set to the uid that runs
+   `mur`, for example `systemd-run --uid=<user> -p Delegate=yes <launcher>`.
+2. Have the launcher move itself into a leaf of the unit's cgroup, such as `<unit>/launcher`.
+3. Enable `memory pids cpu` for the unit's children, and `io` as well when a capsule declares
+   `cgroup_io_bytes_per_sec`: write `+memory +pids +cpu +io` to the unit cgroup's
+   `cgroup.subtree_control`.
+
+A `mur` started from the launcher then creates `<unit>/murmur-<pid>-p`, moves itself and its
+guest workers in, and builds the same layout a systemd scope holds:
+`murmur-<pid>-p/murmur-supervisor` for `mur` and its guest workers, and
+`murmur-<pid>-p/murmur-<session_id>-<pid>-<n>` for the session's subprocesses, with the declared
+limits. Adoption is confirmed from a running launch's `/proc/<pid>/cgroup`, which ends in
+`murmur-<pid>-p/murmur-supervisor`. `mur run --explain-scope` prints `cgroup scope: delegated`,
+as it does for a systemd scope.
+
+The parent is the cgroup above the one `mur` starts in. It is adopted only when every check
+passes, in this order; the first that fails is the reason it is declined:
+
+| # | Check | Decline reason |
+|---|---|---|
+| 1 | `/proc/self/cgroup` has a `0::` line | `no cgroup v2 unified hierarchy` |
+| 2 | `mur`'s cgroup is not the root of the visible hierarchy | `this process's cgroup has no parent` |
+| 3 | The parent is not the hierarchy's true root cgroup | `parent is the root cgroup` |
+| 4 | The parent directory is owned by `mur`'s effective uid | `parent not owned by this uid` |
+| 5 | The parent is not named `user@<n>.service` | `parent is a systemd user manager's own cgroup` |
+| 6 | The parent is the root of the visible cgroup mount, or its own parent is not owned by this uid | `parent is not a delegation boundary: its parent is also owned by this uid` |
+| 7 | The parent's `cgroup.subtree_control` lists `memory`, `pids` and `cpu`, and `io` when the capsule declares `cgroup_io_bytes_per_sec` | `parent does not enable <missing>` |
+| 8 | `mur`'s own `cgroup.controllers` lists the same | `this process's cgroup does not list <missing>` |
+
+`<missing>` names the absent controllers comma-joined in the order `memory,pids,cpu,io`. Check 6
+keeps a launch from a desktop terminal on the systemd scope: under a systemd user manager every
+cgroup below `user@<uid>.service` is owned by the user, though the manager never delegated it. A
+system unit passes it because `system.slice` above the unit is owned by root, and so does a cgroup
+namespace whose root is a delegated cgroup. A launch nested inside another launch declines at
+check 6 too. Nothing a capsule can write takes part in the checks, and no setting forces or
+disables adoption.
+
+Two more reasons decline a parent that passed the checks, after removing what was created:
+`could not create <path>: <error>` and `could not move into <path>: <error>`. A
+`murmur-<pid>-p` left by an earlier process with the same pid that cannot be removed declines with
+`<path> already exists and could not be removed: <error>`. A declined parent leaves the launch
+on the systemd path in the table above.
+
+`mur` removes its own `murmur-<pid>-p` at exit: it moves back to the cgroup it came from, kills
+what is left inside and removes the tree. A launch killed by a signal cannot, so at every
+adoption, before creating its own cgroup, `mur` sweeps the parent: it removes, with `rmdir` only,
+every empty `murmur-<pid>-p` whose process is gone. A populated cgroup and one named for a live
+process are left alone. The unit's stop removes whatever is left when the unit ends.
+
+Where an adopted parent differs from a systemd scope:
+
+- **`pids.max` above the session cgroup.** A systemd scope carries systemd's default `pids.max`;
+  `murmur-<pid>-p` shows `max`, and the unit's own `TasksMax` applies one level up. Neither is a
+  declared capsule limit.
+- **A declined parent with the session bus visible.** The launch takes the systemd path, which
+  moves it out of the unit into a user manager scope: contained, but no longer bounded by the
+  unit's own limits.
+- **After `SIGKILL` of `mur`.** `murmur-<pid>-p` stays until the next launch's sweep or the
+  unit's stop.
+
+The declared limits sit on the session cgroup in both.
 
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone
 and [`W-SEC-010`](diagnostics.md#w-sec-010) names the residual gap: no aggregate bound across the
