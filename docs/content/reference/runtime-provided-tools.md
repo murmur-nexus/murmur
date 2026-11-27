@@ -28,9 +28,8 @@ Each one appears only when the declaration in the second column is present.
 | `session-status` | [`capabilities.session_status.read`](manifest.md#capabilities-session-status), with an [`inference:`](manifest.md#field-inference) block, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
 | `background-command` | An [`inference:`](manifest.md#field-inference) block with either a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow) and a [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs), or a [`code_mode.detach_after_secs`](manifest.md#code-mode), on both transports | Reports on, waits for or stops a shell command or a code mode call that moved to the background, by its work id — see [`background-command`](#background-command) |
 
-Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. Nothing was fetched, so
-nothing is version-pinned, nothing is hash-verified, and no entry appears for them in
-`murmur.lock` or in `mur list`.
+Every one of their manifests carries `version: 0.0.0` and `runtime: tool`. They are not
+artifacts: none appears in `murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
@@ -46,10 +45,9 @@ nothing under `tools/<name>/`, so:
 - It is absent from `session_start`'s `tools_declared` in [`trace.jsonl`](observability-schemas.md).
 - A call naming it anyway is refused with a message naming the declaration that is missing.
 
-So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
-it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
-`switch-driver`, for `call-member` and `end-without-answer`, for `pull-artifact` and
-`remove-artifact`, for `session-status`, for `background-command`, and for their grants.
+So each declaration in [the table](#the-twelve) decides whether its tool exists, rather than
+whether a call to it succeeds: `capabilities.spawn.allow` decides whether `delegate-task` exists,
+and `capabilities.session_status.read` whether `session-status` does.
 
 An agent capsule that declares no tool artifact, no shell binary and none of these grants has an
 empty tool inventory: the model is sent no tool, and a `transport: process` harness is given no

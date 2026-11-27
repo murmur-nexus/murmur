@@ -284,7 +284,7 @@ fn split_notice(text: &str) -> (String, Option<String>) {
 
 // ── In the tool list ──────────────────────────────────────────────────────
 
-/// The tool names in the first request's tool array, or none when it carries no array.
+/// The tool definitions in the first request's tool array, or none when it carries no array.
 fn offered_tools(requests: &[Value]) -> Vec<Value> {
     requests[0]["tools"].as_array().cloned().unwrap_or_default()
 }
