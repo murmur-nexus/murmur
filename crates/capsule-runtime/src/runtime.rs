@@ -2504,7 +2504,12 @@ fn start_guest_workers(
     // Held by each kind's `WorkerSandbox`, so it lives in the session's `GuestWorkers` and is
     // removed once their drop has reaped every worker.
     let worker_scope = cgroup::prepare_worker_scope(&request.capability_policy, session_id)
-        .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+        .map_err(|reason| {
+            cgroup::delegation_unavailable(
+                reason,
+                cgroup::declares_io_limit(&request.capability_policy),
+            )
+        })?;
     let session_enforcement = sandbox::ShellEnforcement::resolve(
         &request.capability_policy,
         containment,
