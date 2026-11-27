@@ -3344,6 +3344,7 @@ capsule-runtime	workdir_fs::tests::every_operation_refuses_a_link_at_the_target	
 capsule-runtime	workdir_fs::tests::list_dir_reports_a_link_inside_as_a_symlink	capsule	unit	beta-all	false
 capsule-runtime	workdir_fs::tests::overwrite_in_place_keeps_the_inode_and_refuses_a_link	capsule	unit	beta-all	false
 capsule-runtime	workdir_fs::tests::remove_dir_all_unlinks_a_link_inside_without_following_it	capsule	unit	beta-all	false
+capsule-runtime	workdir_fs::tests::write_file_no_create_fails_on_a_removed_root_replaced_by_a_link	capsule	unit	beta-all	false
 capsule-runtime	workdir_snapshot::tests::workdir_snapshot_copies_contents_permission_bits_and_times	capsule	unit	beta-all	false
 capsule-runtime	workdir_snapshot::tests::workdir_snapshot_does_not_enter_an_excluded_identity_or_its_own_destination	capsule	unit	beta-all	false
 capsule-runtime	workdir_snapshot::tests::workdir_snapshot_drops_setuid_setgid_and_sticky	capsule	unit	beta-all	false

@@ -62,7 +62,7 @@ section that explains it.
 | `E-IDX-003` | `mur index` was not given a usable source: `--repo` or `--release` is unusable, or `--merge` names an index of another scope | [E-IDX-003](#e-idx-003) |
 | `E-IO-001` | File or directory not found | — |
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
-| `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
+| `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away; also a `mur run --output` path or lifecycle refused before launch, and a completed task's answer that could not be written to the `--output` file | [Piped output](cli.md#piped-output), [`mur run --output`](cli.md#mur-run) |
 | `E-IO-004` | `HOME` is unset, relative, or names a directory in which `~/.murmur` cannot be created, so there is nowhere to keep a session's runtime and records directories | [E-IO-004](#e-io-004) |
 | `E-IO-005` | `mur build-cache add` was given a lockfile that is not a regular file, or a source that is not a Cargo target folder or lies inside `~/.murmur` | [E-IO-005](#e-io-005) |
 | `E-MAN-001` | Missing required manifest field | — |

@@ -7,17 +7,13 @@
 //! at the path is ever followed, so a capsule that can write the directory cannot redirect the
 //! write.
 
-use std::ffi::CString;
-use std::fs::File;
-use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use capsule_runtime::workdir_fs::DEFAULT_FILE_MODE;
 use capsule_runtime::{
-    AfterTask, EntryKind, LifecycleConfig, LifecycleOverride, TaskAcceptance, WorkdirRoot,
-    RESULT_FILE,
+    resolve_lifecycle, AfterTask, EntryKind, LifecycleConfig, LifecycleOverride, TaskAcceptance,
+    WorkdirRoot, RESULT_FILE,
 };
 
 use crate::error::{CliError, E_IO_003};
@@ -190,13 +186,12 @@ impl OutputFile {
         self.write(&bytes).map_err(failed)
     }
 
-    /// Writes `bytes` to a uniquely named temporary file in the held parent and renames it over
-    /// the name.
+    /// Writes `bytes` through a same-directory temporary file renamed over the name, in the held
+    /// parent only.
     ///
-    /// Not `WorkdirRoot::write_file`: a creating call there reaches a removed root again by its
-    /// path, creating it and following links on the way, which would let a capsule that can write
-    /// the grandparent swap the directory for a link to another. The held descriptor is the only
-    /// way to the directory here, so a removed one fails the write.
+    /// Not `WorkdirRoot::write_file`: that reaches a removed root again by its path, creating it
+    /// and following links on the way, so a capsule that can write the grandparent could swap the
+    /// directory for a link to another. A removed parent fails the write here.
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
         match self.parent.entry_kind(&self.name) {
             Ok(None | Some(EntryKind::File)) => {}
@@ -214,8 +209,9 @@ impl OutputFile {
             }
             Err(error) => return Err(error.to_string()),
         }
-        let dir = self.parent.dir_fd().map_err(|error| error.to_string())?;
-        write_beneath(&dir, &self.name, bytes).map_err(|error| error.to_string())
+        self.parent
+            .write_file_no_create(&self.name, bytes, DEFAULT_FILE_MODE)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -236,81 +232,22 @@ fn is_the_task_file(output: &Path, task_arg: Option<&str>) -> bool {
     (task.dev(), task.ino()) == (output.dev(), output.ino())
 }
 
-/// `bytes` into `.<name>.<uuid v7>.tmp`, created exclusively and with no link followed in `dir`,
-/// then renamed over `name` in the same directory. The temporary file is removed on any failure.
-/// The file gets [`DEFAULT_FILE_MODE`] less the umask, as a shell redirect would give it.
-fn write_beneath(dir: &OwnedFd, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let temp = format!(".{name}.{}.tmp", uuid::Uuid::now_v7().simple());
-    let temp_c = CString::new(temp.as_str())?;
-    let name_c = CString::new(name)?;
-    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `dir` is an open directory descriptor borrowed for the call and `temp_c` is a
-    // NUL-terminated string that outlives it.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            temp_c.as_ptr(),
-            flags,
-            DEFAULT_FILE_MODE as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = file.write_all(bytes).and_then(|()| {
-        drop(file);
-        // SAFETY: both names are NUL-terminated strings that outlive the call, and `dir` is an
-        // open directory descriptor borrowed for it.
-        let renamed = unsafe {
-            libc::renameat(
-                dir.as_raw_fd(),
-                temp_c.as_ptr(),
-                dir.as_raw_fd(),
-                name_c.as_ptr(),
-            )
-        };
-        if renamed == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    });
-    if result.is_err() {
-        // SAFETY: as for `openat` above.
-        unsafe {
-            libc::unlinkat(dir.as_raw_fd(), temp_c.as_ptr(), 0);
-        }
-    }
-    result
-}
-
 /// Refuse --output on an agent capsule whose effective lifecycle can run a task other than
 /// the --task one.
 ///
-/// The effective lifecycle is the runtime's merge: each field `ov` sets replaces the manifest's,
-/// and a manifest without a `lifecycle:` block has the defaults (`single`, `exit`). Under
+/// The effective lifecycle is the runtime's own merge, [`resolve_lifecycle`]. Under
 /// `task_acceptance: queue` or `after_task: sleep` the session's `out/result.txt` can hold a later
 /// task's answer.
 pub(crate) fn check_output_lifecycle(
     lifecycle: Option<&LifecycleConfig>,
     ov: Option<&LifecycleOverride>,
 ) -> Result<(), CliError> {
-    let task_acceptance = ov
-        .and_then(|ov| ov.task_acceptance.clone())
-        .or_else(|| lifecycle.map(|l| l.task_acceptance.clone()))
-        .unwrap_or_default();
-    let after_task = ov
-        .and_then(|ov| ov.after_task.clone())
-        .or_else(|| lifecycle.map(|l| l.after_task.clone()))
-        .unwrap_or_default();
-
+    let effective = resolve_lifecycle(lifecycle.cloned(), ov);
     let mut at_fault = Vec::new();
-    if task_acceptance == TaskAcceptance::Queue {
+    if effective.task_acceptance == TaskAcceptance::Queue {
         at_fault.push("lifecycle.task_acceptance: queue");
     }
-    if after_task == AfterTask::Sleep {
+    if effective.after_task == AfterTask::Sleep {
         at_fault.push("lifecycle.after_task: sleep");
     }
     if at_fault.is_empty() {
@@ -330,7 +267,7 @@ pub(crate) fn check_output_lifecycle(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::ffi::{CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 

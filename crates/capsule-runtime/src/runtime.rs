@@ -15795,7 +15795,9 @@ fn generate_session_id() -> String {
     format!("ses_{}", uuid::Uuid::now_v7().simple())
 }
 
-fn resolve_lifecycle(
+/// The lifecycle a session runs under: `base`, or the defaults when there is none, with each field
+/// `override_` sets replacing `base`'s.
+pub fn resolve_lifecycle(
     base: Option<LifecycleConfig>,
     override_: Option<&murmur_artifact::LifecycleOverride>,
 ) -> LifecycleConfig {

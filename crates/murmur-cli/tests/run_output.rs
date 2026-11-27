@@ -242,7 +242,7 @@ fn records_result(run: &Run) -> Vec<u8> {
     fs::read(run.records_dir().join("out/result.txt")).unwrap()
 }
 
-// ── S1: a completed task writes its answer ────────────────────────────────────
+// ── A completed task writes its answer ────────────────────────────────────────
 
 #[test]
 fn s1_a_completed_task_writes_the_exact_answer() {
@@ -280,7 +280,7 @@ fn s1_a_completed_task_writes_the_exact_answer() {
     );
 }
 
-// ── S2: a failed task leaves no file, and removes a stale one ────────────────
+// ── A failed task leaves no file, and removes a stale one ────────────────────
 
 #[test]
 fn s2_a_failed_task_leaves_no_file_and_removes_the_stale_one() {
@@ -314,7 +314,7 @@ fn s2_a_failed_task_leaves_no_file_and_removes_the_stale_one() {
     assert!(temp_files(out_dir.path()).is_empty());
 }
 
-// ── S3: a spent turn budget leaves no file ───────────────────────────────────
+// ── A spent turn budget leaves no file ───────────────────────────────────────
 
 #[test]
 fn s3_max_turns_reached_leaves_no_file() {
@@ -351,7 +351,7 @@ fn s3_max_turns_reached_leaves_no_file() {
     assert!(!answer.exists(), "{}", run.context());
 }
 
-// ── S4: a canceled task leaves no file ───────────────────────────────────────
+// ── A canceled task leaves no file ───────────────────────────────────────────
 
 #[test]
 fn s4_a_canceled_task_leaves_no_file() {
@@ -428,7 +428,7 @@ fn s4_a_canceled_task_leaves_no_file() {
     );
 }
 
-// ── S5: parallel runs each write their own file ──────────────────────────────
+// ── Parallel runs each write their own file ──────────────────────────────────
 
 #[test]
 fn s5_parallel_runs_write_separate_exact_files() {
@@ -494,7 +494,7 @@ fn s5_parallel_runs_write_separate_exact_files() {
     assert!(temp_files(out_dir.path()).is_empty());
 }
 
-// ── S6: a lifecycle that can run another task is refused ─────────────────────
+// ── A lifecycle that can run another task is refused ─────────────────────────
 
 #[test]
 fn s6_a_lifecycle_that_runs_other_tasks_is_refused_before_staging() {
@@ -537,7 +537,7 @@ fn s6_a_lifecycle_that_runs_other_tasks_is_refused_before_staging() {
     assert!(server.requests().is_empty());
 }
 
-// ── S7: a path that is not a file to write is refused ────────────────────────
+// ── A path that is not a file to write is refused ────────────────────────────
 
 #[test]
 fn s7_paths_that_are_not_files_to_write_are_refused_and_left_alone() {
@@ -616,7 +616,7 @@ fn s7_paths_that_are_not_files_to_write_are_refused_and_left_alone() {
     assert!(server.requests().is_empty());
 }
 
-// ── S8: usage refusals touch nothing ─────────────────────────────────────────
+// ── Usage refusals touch nothing ─────────────────────────────────────────────
 
 #[test]
 fn s8_usage_refusals_exit_2_and_leave_the_stale_file() {
@@ -654,7 +654,7 @@ fn s8_usage_refusals_exit_2_and_leave_the_stale_file() {
     }
 }
 
-// ── S9: a script capsule's answer is the file it writes ──────────────────────
+// ── A script capsule's answer is the file it writes ──────────────────────────
 
 #[test]
 fn s9_a_script_capsule_writes_its_work_folder_answer() {

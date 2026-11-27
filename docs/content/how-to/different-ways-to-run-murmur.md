@@ -148,7 +148,7 @@ mur run --task task.md --output answer.txt
 test -f answer.txt && cat answer.txt
 ```
 
-The answer lands in `answer.txt` only when the task completes, so a script can test for the file instead of parsing `session:`.
+The answer lands in `answer.txt` only when the task completes. After any other outcome the file is absent, and the exit code and the `error[…]` line on standard error say why.
 
 ---
 

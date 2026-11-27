@@ -458,7 +458,22 @@ impl WorkdirRoot {
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), WorkdirError> {
-        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, false))
+        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, false, true))
+    }
+
+    /// [`Self::write_file`] through the held descriptor alone: no directory is created and a
+    /// removed root is never reached again, so a missing parent or a removed root fails
+    /// `NotFound`.
+    ///
+    /// For a root whose parent a less trusted process can write. Reaching that root again by its
+    /// path would follow a link planted where it was removed.
+    pub fn write_file_no_create(
+        &self,
+        rel: impl AsRef<Path>,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<(), WorkdirError> {
+        self.write_file_inner(rel.as_ref(), bytes, mode, false, false)
     }
 
     fn write_file_inner(
@@ -467,11 +482,14 @@ impl WorkdirRoot {
         bytes: &[u8],
         mode: u32,
         exact_mode: bool,
+        create: bool,
     ) -> Result<(), WorkdirError> {
         let rel = rel.to_string_lossy();
         let op = WorkdirOperation::Write;
-        let (parent, name) = self.parent_of(&rel, op, true)?;
-        let parent = parent.expect("a creating walk reaches the parent");
+        let (parent, name) = self.parent_of(&rel, op, create)?;
+        let Some(parent) = parent else {
+            return Err(self.io(&rel, std::io::ErrorKind::NotFound.into()));
+        };
         match self.leaf_type(&parent, name, &rel)? {
             Some(FileType::Symlink) => {
                 return Err(self.refuse(&rel, &rel, op, RefusalReason::Symlink));
@@ -523,7 +541,7 @@ impl WorkdirRoot {
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), WorkdirError> {
-        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, true))
+        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, true, true))
     }
 
     /// Truncates and rewrites the regular file at `rel` in place, creating it with `mode` if
@@ -1589,6 +1607,37 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(refusal_of(&error).refused_at, "records");
+            assert_eq!(fixture.outside_snapshot(), before);
+        }
+        NLINK_UNRELIABLE.with(|cell| cell.set(false));
+    }
+
+    #[test]
+    fn write_file_no_create_fails_on_a_removed_root_replaced_by_a_link() {
+        for nlink_unreliable in [false, true] {
+            NLINK_UNRELIABLE.with(|cell| cell.set(nlink_unreliable));
+            let fixture = fixture();
+            let dir = fixture.workdir.join("held");
+            std::fs::create_dir(&dir).unwrap();
+            let held = WorkdirRoot::open(&dir).unwrap();
+            held.write_file_no_create("answer.txt", b"first", 0o644)
+                .unwrap();
+            assert_eq!(std::fs::read(dir.join("answer.txt")).unwrap(), b"first");
+            assert!(held
+                .write_file_no_create("missing/answer.txt", b"x", 0o644)
+                .unwrap_err()
+                .is_not_found());
+            assert!(!dir.join("missing").exists());
+
+            std::fs::remove_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(&fixture.outside, &dir).unwrap();
+            let before = fixture.outside_snapshot();
+
+            let error = held
+                .write_file_no_create("answer.txt", b"second", 0o644)
+                .unwrap_err();
+
+            assert!(error.is_not_found(), "{error}");
             assert_eq!(fixture.outside_snapshot(), before);
         }
         NLINK_UNRELIABLE.with(|cell| cell.set(false));
