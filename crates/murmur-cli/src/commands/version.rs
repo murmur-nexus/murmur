@@ -27,6 +27,7 @@ pub(crate) const MACHINE_COMMANDS: &[(&str, u32)] = &[
     ("ps --json", 1),
     ("run --explain-scope --json", 2),
     ("run --json", 1),
+    ("run --output", 1),
     ("run --roster --json", 1),
     ("token", 1),
     ("trace attach --json", 1),

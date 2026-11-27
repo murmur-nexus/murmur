@@ -352,6 +352,7 @@ enum Commands {
                 "workdir",
                 "bind",
                 "explain_scope",
+                "output",
                 "readiness_tokens",
                 "workdir_identity",
                 "parent_workdir_snapshot",
@@ -374,6 +375,19 @@ enum Commands {
         /// contents are copied; otherwise the value itself is written as UTF-8 text.
         #[arg(long)]
         task: Option<String>,
+
+        /// Write the task's answer to this file once the task completes: the exact bytes of the
+        /// session's out/result.txt, renamed into place in one step. Any other outcome leaves no
+        /// file here — a regular file already at the path is removed before the run does anything
+        /// else. Requires --task. Refused for a lifecycle that can run another task after it
+        /// (queue, sleep).
+        #[arg(
+            long,
+            value_name = "FILE",
+            requires = "task",
+            conflicts_with_all = ["roster", "explain_scope"]
+        )]
+        output: Option<PathBuf>,
 
         /// Replace the manifest's system prompt for this invocation only.
         /// Overrides inference.system_prompt, system_prompt_file and system_prompt_artifact
@@ -852,6 +866,7 @@ fn main() {
             roster: None,
             spawn_grant_stdin,
             task,
+            output,
             system_prompt,
             deadline,
             inherited_deadline,
@@ -881,6 +896,7 @@ fn main() {
             store_root.as_deref(),
             spawn_grant_stdin,
             task.as_deref(),
+            output.as_deref(),
             system_prompt.as_deref(),
             deadline,
             inherited_deadline,

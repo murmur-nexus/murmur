@@ -141,6 +141,15 @@ status:  ok
 
 The `driver:` line names the driver artifact and the model. Under [`transport: process`](../reference/manifest.md#transport-process) it carries the word `process` between the two — `murmur/driver-claude-code process ()`, with the model empty when the manifest leaves it to the harness. The `skills:` line appears only when the manifest declares at least one `runtime: skill` artifact.
 
+Add [`--output`](../reference/cli.md#mur-run) when a script needs the answer itself:
+
+```bash
+mur run --task task.md --output answer.txt
+test -f answer.txt && cat answer.txt
+```
+
+The answer lands in `answer.txt` only when the task completes, so a script can test for the file instead of parsing `session:`.
+
 ---
 
 ## Step 4 — run it from another program

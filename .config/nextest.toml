@@ -300,6 +300,7 @@ default-filter = """
     | binary_id(murmur-cli::structured_schema)
     | binary_id(murmur-cli::system_prompt)
     | binary_id(murmur-cli::task_outcome)
+    | binary_id(murmur-cli::run_output)
     | binary_id(murmur-cli::trace_attach)
     | binary_id(murmur-cli::trace_capture)
     | binary_id(murmur-cli::trace_export)
