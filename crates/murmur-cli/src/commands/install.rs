@@ -31,7 +31,7 @@ use crate::{
     wit_level::{index_level_mismatch, level_mismatch},
 };
 
-use super::runtime_manifest_error_to_cli;
+use super::manifest_error_naming_installed;
 
 /// What an install holds a resolved payload to against its `murmur.lock` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -784,8 +784,9 @@ pub(crate) fn run_install(
         .map(|text| InstallRef::parse(text))
         .collect::<Result<Vec<_>, _>>()?;
     if parsed.is_empty() && !global {
-        let manifest_path = resolve_manifest_path(&find_project_root()?);
-        load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+        let root = find_project_root()?;
+        load_runtime_manifest(&resolve_manifest_path(&root))
+            .map_err(|error| manifest_error_naming_installed(error, &root))?;
     }
     let (store, project_root) = determine_store(global)?;
     let project_root_path = project_root.as_deref();
@@ -1154,8 +1155,8 @@ fn install_manifest_deps(
     let lock = read_lock_if_any(&lock_path)?;
 
     let manifest_path = resolve_manifest_path(&root);
-    let runtime_manifest =
-        load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+    let runtime_manifest = load_runtime_manifest(&manifest_path)
+        .map_err(|error| manifest_error_naming_installed(error, &root))?;
 
     // The artifacts to install, by the full name each resolves under; inline-source entries are
     // skipped, and the manifest parser has already refused any other form.

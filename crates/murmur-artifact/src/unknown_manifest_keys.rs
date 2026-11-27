@@ -47,7 +47,7 @@ impl UnknownManifestKey {
 /// `allwo` for `allow` is one of the two typos this suggester exists to catch — the other being
 /// `read-only` for `read_only` — and under plain Levenshtein it falls outside the threshold for
 /// every key shorter than nine characters.
-fn edit_distance(left: &str, right: &str) -> usize {
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
     if left.is_empty() {

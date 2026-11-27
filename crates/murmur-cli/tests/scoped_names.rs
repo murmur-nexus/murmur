@@ -776,6 +776,207 @@ fn an_owner_id_survives_a_lock_rewrite_and_a_new_entry_carries_none() {
     assert!(lock.artifact_for("local/echo-tool").is_some());
 }
 
+// ── A name that resolves to nothing names the installed artifacts close to it ──
+
+const LOCAL_CLAUSE: &str = "an artifact installed from a .mur.zip file is named local/<name>";
+const CLOSE_LOCAL_ECHO: &str = "installed under a close name: local/echo-tool (0.0.1)";
+const NAME_IT_LOCAL_ECHO: &str = "name it 'local/echo-tool' in murmur.yaml";
+
+/// `mur install --no-precompile <zip>` (with `-g` when `global`) of `echo-tool@0.0.1` from
+/// `project`, asserting the full name it prints.
+fn install_echo_tool_file(home: &TempDir, project: &Path, source: &SilentSource, global: bool) {
+    let artifacts = tempfile::tempdir().unwrap();
+    let zip = echo_tool_zip(artifacts.path());
+    let mut args = vec!["install", "--no-precompile"];
+    if global {
+        args.push("-g");
+    }
+    args.push(zip.to_str().unwrap());
+    let assert = mur(home, project, &source.api_base)
+        .args(&args)
+        .assert()
+        .success();
+    let stdout = stdout_of(&assert);
+    assert!(
+        stdout.contains("Installed local/echo-tool@0.0.1 from"),
+        "{stdout}"
+    );
+}
+
+/// A project whose `murmur.yaml` first declares nothing, has `echo-tool` installed from its file
+/// into the project store (pinned in `murmur.lock`), then declares `declared@0.0.1`.
+fn project_declaring_after_a_file_install(
+    home: &TempDir,
+    source: &SilentSource,
+    declared: &str,
+) -> TempDir {
+    let project = tempfile::tempdir().unwrap();
+    agent_manifest(project.path(), "", "");
+    install_echo_tool_file(home, project.path(), source, false);
+    agent_manifest(project.path(), &tool_entry_at(declared, "0.0.1"), "");
+    project
+}
+
+fn run_stderr(home: &TempDir, project: &Path, source: &SilentSource) -> String {
+    let assert = mur(home, project, &source.api_base)
+        .args(["run", "--task", "x"])
+        .assert()
+        .failure();
+    stderr_of(&assert)
+}
+
+#[test]
+fn a_file_install_prints_the_full_local_name_it_installed() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    agent_manifest(project.path(), "", "");
+    let source = SilentSource::new();
+    install_echo_tool_file(&home, project.path(), &source, false);
+    assert!(!source.was_contacted());
+}
+
+#[test]
+fn a_bare_name_after_a_file_install_is_told_its_local_name() {
+    let home = tempfile::tempdir().unwrap();
+    let source = SilentSource::new();
+    let project = project_declaring_after_a_file_install(&home, &source, "echo-tool");
+
+    for args in [vec!["run", "--task", "x"], vec!["install"]] {
+        let assert = mur(&home, project.path(), &source.api_base)
+            .args(&args)
+            .assert()
+            .failure();
+        let stderr = stderr_of(&assert);
+        assert!(stderr.contains("error[E-MAN-003]"), "{args:?}: {stderr}");
+        assert!(stderr.contains("artifacts[0].name"), "{args:?}: {stderr}");
+        assert!(stderr.contains("  hint: "), "{args:?}: {stderr}");
+        assert!(stderr.contains(CLOSE_LOCAL_ECHO), "{args:?}: {stderr}");
+        assert!(stderr.contains(NAME_IT_LOCAL_ECHO), "{args:?}: {stderr}");
+        assert!(stderr.contains(LOCAL_CLAUSE), "{args:?}: {stderr}");
+    }
+    assert!(!project.path().join("workdir").exists());
+    assert!(!source.was_contacted());
+}
+
+#[test]
+fn another_scope_with_a_lock_is_e_run_003_naming_the_local_name() {
+    let home = tempfile::tempdir().unwrap();
+    let source = SilentSource::new();
+    let project = project_declaring_after_a_file_install(&home, &source, "murmur/echo-tool");
+
+    let stderr = run_stderr(&home, project.path(), &source);
+    assert!(
+        stderr.contains(
+            "error[E-RUN-003]: murmur.lock missing artifact entry for 'murmur/echo-tool'"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains(CLOSE_LOCAL_ECHO), "{stderr}");
+    assert!(stderr.contains(NAME_IT_LOCAL_ECHO), "{stderr}");
+    assert!(stderr.contains(LOCAL_CLAUSE), "{stderr}");
+
+    let assert = mur(&home, project.path(), &source.api_base)
+        .args(["run", "--json", "--task", "x"])
+        .assert()
+        .failure();
+    assert_eq!(
+        stdout_of(&assert),
+        "",
+        "--json prints nothing before the error"
+    );
+    let stderr = stderr_of(&assert);
+    assert!(stderr.contains("error[E-RUN-003]"), "{stderr}");
+    assert!(stderr.contains(CLOSE_LOCAL_ECHO), "{stderr}");
+    assert!(!project.path().join("workdir").exists());
+    assert!(!source.was_contacted());
+}
+
+#[test]
+fn a_misspelt_local_name_is_e_run_003_naming_the_installed_one() {
+    let home = tempfile::tempdir().unwrap();
+    let source = SilentSource::new();
+    let project = project_declaring_after_a_file_install(&home, &source, "local/echo-tol");
+
+    let stderr = run_stderr(&home, project.path(), &source);
+    assert!(
+        stderr
+            .contains("error[E-RUN-003]: murmur.lock missing artifact entry for 'local/echo-tol'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(CLOSE_LOCAL_ECHO), "{stderr}");
+    assert!(!source.was_contacted());
+}
+
+#[test]
+fn another_scope_without_a_lock_is_e_run_008_naming_the_local_name_per_artifact() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = SilentSource::new();
+    agent_manifest(project.path(), "", "");
+    install_echo_tool_file(&home, project.path(), &source, true);
+    assert!(!project.path().join("murmur.lock").exists());
+    assert!(home
+        .path()
+        .join(".murmur/artifacts/local/echo-tool/0.0.1")
+        .is_dir());
+    agent_manifest(
+        project.path(),
+        &tool_entry_at("murmur/echo-tool", "0.0.1"),
+        "",
+    );
+
+    let stderr = run_stderr(&home, project.path(), &source);
+    let error_line = stderr
+        .lines()
+        .find(|line| line.starts_with("error[E-RUN-008]"))
+        .unwrap_or_else(|| panic!("no E-RUN-008 line: {stderr}"));
+    assert!(error_line.contains("murmur/echo-tool@0.0.1"), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    assert!(
+        lines.contains(
+            &"hint: 'murmur/echo-tool@0.0.1': installed under a close name: local/echo-tool \
+              (0.0.1) \u{2014} name it 'local/echo-tool' in murmur.yaml; an artifact installed \
+              from a .mur.zip file is named local/<name>"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        lines.contains(&"run `mur install` to install the others"),
+        "{stderr}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains(DRIVER) && line.contains("close name")),
+        "{stderr}"
+    );
+    assert!(!project.path().join("workdir").exists());
+    assert!(!source.was_contacted());
+}
+
+#[test]
+fn a_lock_miss_with_nothing_close_installed_gets_the_install_hint() {
+    let home = tempfile::tempdir().unwrap();
+    let source = SilentSource::new();
+    let project = project_declaring_after_a_file_install(&home, &source, "murmur/tool-editor");
+    agent_manifest(
+        project.path(),
+        &tool_entry_at("murmur/tool-editor", "0.6.0"),
+        "",
+    );
+
+    let stderr = run_stderr(&home, project.path(), &source);
+    assert!(
+        stderr.contains(
+            "error[E-RUN-003]: murmur.lock missing artifact entry for 'murmur/tool-editor'\n  \
+             hint: run `mur install` to install and pin every artifact murmur.yaml declares\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("echo-tool"), "{stderr}");
+    assert!(!source.was_contacted());
+}
+
 // ── Staging: tool names are unique, and the model sees only them ──────────────
 
 /// A project whose store holds the driver and, for each `(full name, description)`, the WASM

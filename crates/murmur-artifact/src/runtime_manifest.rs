@@ -2181,11 +2181,14 @@ pub enum RuntimeManifestError {
     InvalidCodeMode { field: String, message: String },
     /// A field naming an artifact to resolve does not hold a full `<scope>/<name>`, or a
     /// `source:` entry's name is not a bare name. `hint` names the form to write instead.
+    /// `unscoped` is the bare name when a field that takes a full name holds one, so a caller
+    /// with store access can look for an installed artifact of that name; `None` otherwise.
     #[error("{}: invalid artifact name in '{field}': {message}", MANIFEST_FILENAME)]
     InvalidArtifactName {
         field: String,
         message: String,
         hint: Option<String>,
+        unscoped: Option<String>,
     },
     /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
     #[error("{}", REGISTRY_BLOCK_MESSAGE)]
@@ -5575,6 +5578,7 @@ fn parse_spawn_allow(
                 field: format!("capabilities.spawn.allow[{index}]"),
                 message: error.to_string(),
                 hint: error.hint(),
+                unscoped: error.unscoped_name().map(str::to_string),
             }
         })?;
         if let Some(earlier) = parsed
@@ -5591,6 +5595,7 @@ fn parse_spawn_allow(
                 hint: Some(format!(
                     "keep one of '{earlier}' and '{name}' in capabilities.spawn.allow"
                 )),
+                unscoped: None,
             });
         }
         parsed.push(name);
@@ -5603,6 +5608,7 @@ fn parse_spawn_allow(
                 field: field.clone(),
                 message: error.to_string(),
                 hint: error.hint(),
+                unscoped: error.unscoped_name().map(str::to_string),
             }
         })?;
         if snapshotted.contains(&name) {
@@ -5612,6 +5618,7 @@ fn parse_spawn_allow(
                 hint: Some(format!(
                     "keep one '{name}' in capabilities.spawn.workdir_snapshot"
                 )),
+                unscoped: None,
             });
         }
         if !parsed.contains(&name) {
@@ -5625,6 +5632,7 @@ fn parse_spawn_allow(
                     "add '{name}' to capabilities.spawn.allow, or remove it from \
                      capabilities.spawn.workdir_snapshot"
                 )),
+                unscoped: None,
             });
         }
         snapshotted.push(name);
@@ -5649,6 +5657,7 @@ fn check_entry_name(
                 field,
                 message: error.to_string(),
                 hint: error.hint(),
+                unscoped: error.unscoped_name().map(str::to_string),
             }
         });
     }
@@ -5660,6 +5669,7 @@ fn check_entry_name(
                  where a resolved artifact comes from, and a source: entry is never resolved"
             ),
             hint: Some(format!("drop the scope: name it '{bare}'")),
+            unscoped: None,
         });
     }
     match artifact_name_format_error(name) {
@@ -5667,6 +5677,7 @@ fn check_entry_name(
             field,
             message: format!("'{name}' is not a valid artifact name: it {reason}"),
             hint: None,
+            unscoped: None,
         }),
         None => Ok(()),
     }
@@ -5711,6 +5722,7 @@ fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, Run
                         crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM
                     ),
                     hint: error.hint,
+                    unscoped: None,
                 }
             })?;
         }
@@ -9331,6 +9343,7 @@ capabilities:
                         field,
                         message,
                         hint,
+                        ..
                     } => {
                         assert_eq!(field, &format!("capabilities.install.{key}[0]"));
                         assert!(message.contains(&format!("{entry:?}")), "{message}");
@@ -9363,6 +9376,7 @@ capabilities:
                     field,
                     message,
                     hint,
+                    ..
                 } => {
                     assert_eq!(field, "capabilities.install.tool[1]");
                     assert_eq!(
@@ -16192,6 +16206,7 @@ mod scoped_name_tests {
                 field,
                 message,
                 hint,
+                ..
             }) => (field, message, hint),
             other => panic!("expected InvalidArtifactName, got {other:?}"),
         }
@@ -16222,6 +16237,31 @@ mod scoped_name_tests {
             rendered.starts_with("murmur.yaml: invalid artifact name in 'artifacts[0].name': "),
             "{rendered}"
         );
+    }
+
+    fn unscoped_of(yaml: &str) -> Option<String> {
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidArtifactName { unscoped, .. }) => unscoped,
+            other => panic!("expected InvalidArtifactName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_name_unscoped_carries_the_bare_name_of_a_bare_entry_only() {
+        let bare = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: echo-tool\n    \
+                    version: 0.0.1\n    runtime: tool\n";
+        assert_eq!(unscoped_of(bare).as_deref(), Some("echo-tool"));
+
+        let spawn = "name: cap\nversion: 0.0.1\ncapabilities:\n  spawn:\n    allow: [worker]\n";
+        assert_eq!(unscoped_of(spawn).as_deref(), Some("worker"));
+
+        let source = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: ana/style\n    \
+                      source: ./skills/style\n    runtime: skill\n";
+        assert_eq!(unscoped_of(source), None);
+
+        let install = "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  install:\n    \
+                       tool: [\"tool-*\"]\n";
+        assert_eq!(unscoped_of(install), None);
     }
 
     #[test]

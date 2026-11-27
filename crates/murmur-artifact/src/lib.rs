@@ -56,8 +56,8 @@ pub use artifact_index::{
     ATTESTATION_FILE_SUFFIX, MURMUR_INTERFACE_PREFIX,
 };
 pub use artifact_name::{
-    prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,
-    MURMUR_SCOPE, RESERVED_SCOPES,
+    close_artifact_names, prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError,
+    LOCAL_SCOPE, MURMUR_SCOPE, RESERVED_SCOPES,
 };
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{
