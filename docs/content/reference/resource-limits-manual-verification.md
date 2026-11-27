@@ -29,7 +29,7 @@ Three mechanisms, verified separately below:
 | Mechanism | Scope | Platforms | Scenario |
 |---|---|---|---|
 | `setrlimit(2)` hard ceilings | per process | all Unix | [1](#scenario-1), [4](#scenario-4), [5](#scenario-5) |
-| cgroup v2 scope | whole process tree | Linux, delegated | [2](#scenario-2), [3](#scenario-3) |
+| cgroup v2 scopes | the session's subprocess tree, and separately its guest workers ([placement](resource-limits.md#cgroup-placement)) | Linux, delegated | [2](#scenario-2), [3](#scenario-3) |
 | periodic workdir-size check | work folder, `$TMPDIR` and `$HOME` together | all | [6](#scenario-6) |
 
 ## Install requirement — systemd user cgroup delegation

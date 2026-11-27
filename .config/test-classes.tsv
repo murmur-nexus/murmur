@@ -2115,6 +2115,7 @@ capsule-runtime	resources::tests::resources_report_off_linux_bounds_no_cgroup	is
 capsule-runtime	resources::tests::resources_report_renders_one_line_per_field	isolation	unit	beta-all	false
 capsule-runtime	resources::tests::resources_report_states_the_defaults_when_nothing_is_declared	isolation	unit	beta-all	false
 capsule-runtime	resources::tests::resources_report_unconfined_bounds_only_declared_fields	isolation	unit	beta-all	false
+capsule-runtime	resources::tests::resources_report_without_a_scope_bounds_no_cgroup	isolation	unit	beta-all	false
 capsule-runtime	resources::tests::set_hard_rlimit_writes_both_the_soft_and_hard_slot	isolation	unit	beta-all	false
 capsule-runtime	resources::tests::the_cpu_fields_are_unset_unless_declared	isolation	unit	beta-all	false
 capsule-runtime	resources::tests::uid_task_count_reports_a_plausible_baseline	isolation	unit	beta-all	false
@@ -5116,6 +5117,7 @@ murmur-cli::cgroup_scope_report	a_process_transport_capsule_reports_the_harness_
 murmur-cli::cgroup_scope_report	a_read_only_cgroup_hierarchy_is_reported_as_the_refusal_it_causes	isolation	e2e	beta-all	false
 murmur-cli::cgroup_scope_report	a_sealed_wasm_capsule_gets_no_uncovered_route_warning	isolation	e2e	beta-all	false
 murmur-cli::cgroup_scope_report	common::leaks::tests::base64_matches_known_vectors	isolation	e2e	beta-all	false
+murmur-cli::cgroup_scope_report	explain_scope_says_cgroup_fields_bound_nothing_without_a_scope	isolation	e2e	beta-all	false
 murmur-cli::cgroup_scope_report	explain_scope_states_which_processes_each_limit_bounds	isolation	e2e	beta-all	false
 murmur-cli::cgroup_scope_report	worker_only_capsule_needs_cgroup	isolation	e2e	beta-all	false
 murmur-cli::closed_output	a_closed_stdout_leaves_the_exit_status_alone	capsule	e2e	beta-all	false

@@ -143,7 +143,9 @@ thread; the run then fails with [`E-RUN-065`](diagnostics.md#e-run-065) or
 [`E-RUN-066`](diagnostics.md#e-run-066) naming `capabilities.resources.cgroup_pids_max`.
 
 [`mur run --explain-scope`](cli.md#mur-run) prints a `bounds:` line under every field of its
-`Resources` block naming the processes that field bounds on this host.
+`Resources` block naming the processes that field bounds on this host. For a capsule that gets no
+cgroup, the four `cgroup_*` lines read `nothing: this capsule declares no way to run a subprocess,
+so a launch creates no cgroup for it`.
 
 ### No core dumps { #no-core-dumps }
 

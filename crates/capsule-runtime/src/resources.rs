@@ -58,6 +58,8 @@ use std::{
     time::Duration,
 };
 
+use crate::cgroup::CgroupScopeStatus;
+
 /// Default `RLIMIT_NPROC` headroom for a spawn with no cgroup scope — how much past the uid's
 /// count at that spawn a subprocess tree may add, in whichever unit this platform's
 /// `RLIMIT_NPROC` is checked against. Unused for a spawn that joins a scope. See [`NprocBound`]
@@ -588,15 +590,17 @@ impl ResourcesReport {
     /// The `Resources` block of `--explain-scope`: one `<key>: <value> (declared|default)` line
     /// per field, `<none>` for a value that sets no limit, each followed by an indented `bounds:`
     /// line naming the processes that field bounds on this host ([`resource_bounds`]).
-    /// `unconfined` is whether the session runs unconfined, which applies only declared fields.
-    /// Ends with a newline.
+    /// `unconfined` is whether the session runs unconfined, which applies only declared fields;
+    /// `scope` is what the launch gets of its cgroup scope, and a
+    /// [`CgroupScopeStatus::NotRequired`] launch creates no cgroup for any `cgroup_*` field to
+    /// bound. Ends with a newline.
     #[must_use]
-    pub fn render(&self, unconfined: bool) -> String {
-        self.render_on(cfg!(target_os = "linux"), unconfined)
+    pub fn render(&self, unconfined: bool, scope: CgroupScopeStatus) -> String {
+        self.render_on(cfg!(target_os = "linux"), unconfined, scope)
     }
 
     /// [`Self::render`] for a host that is (`linux`) or is not Linux.
-    fn render_on(&self, linux: bool, unconfined: bool) -> String {
+    fn render_on(&self, linux: bool, unconfined: bool, scope: CgroupScopeStatus) -> String {
         let mut out = String::from("Resources\n");
         for (key, row) in self.rows() {
             let value = row
@@ -606,6 +610,9 @@ impl ResourcesReport {
             out.push_str(&format!("  {:<25}{value} ({source})\n", format!("{key}:")));
             let bounds = if unconfined && !row.declared {
                 UNCONFINED_UNDECLARED_BOUNDS
+            } else if linux && key.starts_with("cgroup_") && scope == CgroupScopeStatus::NotRequired
+            {
+                NO_SCOPE_BOUNDS
             } else {
                 resource_bounds(key, linux)
             };
@@ -619,6 +626,10 @@ impl ResourcesReport {
 const UNCONFINED_UNDECLARED_BOUNDS: &str =
     "nothing: this session runs unconfined and applies only the fields it declares";
 
+/// The `bounds:` line of a `cgroup_*` field on Linux when the launch creates no cgroup.
+const NO_SCOPE_BOUNDS: &str =
+    "nothing: this capsule declares no way to run a subprocess, so a launch creates no cgroup for it";
+
 /// The `bounds:` line of a `cgroup_*` field off Linux.
 const NO_CGROUPS_BOUNDS: &str = "nothing: cgroups do not exist on this host";
 
@@ -627,8 +638,7 @@ const NO_CGROUPS_BOUNDS: &str = "nothing: cgroups do not exist on this host";
 /// cgroup and the guest-worker cgroup (`cgroup::prepare_worker_scope`) for the `cgroup_*` fields,
 /// except `cgroup_io_bytes_per_sec`, which is on the session cgroup only. `mur` itself is bounded
 /// by none of them.
-#[must_use]
-pub fn resource_bounds(key: &str, linux: bool) -> &'static str {
+fn resource_bounds(key: &str, linux: bool) -> &'static str {
     match key {
         "memory_bytes" => {
             "each shell command and murmur:process program on its own (address space); not \
@@ -1933,9 +1943,12 @@ mod tests {
              \x20   bounds: the session cgroup only (shell commands, murmur:process programs and \
              what they start); not guest workers or mur\n"
         );
-        assert_eq!(report.render_on(true, false), expected);
+        assert_eq!(
+            report.render_on(true, false, CgroupScopeStatus::Delegated),
+            expected
+        );
         #[cfg(target_os = "linux")]
-        assert_eq!(report.render(false), expected);
+        assert_eq!(report.render(false, CgroupScopeStatus::Delegated), expected);
     }
 
     /// Off Linux the four `cgroup_*` rows say cgroups do not exist; the rlimit rows are unchanged.
@@ -1943,7 +1956,7 @@ mod tests {
     fn resources_report_off_linux_bounds_no_cgroup() {
         let declared = murmur_artifact::ResourceCapabilities::default();
         let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
-        let rendered = report.render_on(false, false);
+        let rendered = report.render_on(false, false, CgroupScopeStatus::NotRequired);
         let bounds: Vec<&str> = rendered
             .lines()
             .filter_map(|line| line.strip_prefix("    bounds: "))
@@ -1956,7 +1969,33 @@ mod tests {
             "{rendered}"
         );
         #[cfg(not(target_os = "linux"))]
-        assert_eq!(report.render(false), rendered);
+        assert_eq!(
+            report.render(false, CgroupScopeStatus::NotRequired),
+            rendered
+        );
+    }
+
+    /// A launch given no cgroup scope bounds nothing with its `cgroup_*` fields, declared or not;
+    /// the rlimit rows are unchanged.
+    #[test]
+    fn resources_report_without_a_scope_bounds_no_cgroup() {
+        let declared = murmur_artifact::ResourceCapabilities {
+            cgroup_memory_bytes: Some(268_435_456),
+            ..Default::default()
+        };
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let rendered = report.render_on(true, false, CgroupScopeStatus::NotRequired);
+        let bounds: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("    bounds: "))
+            .collect();
+        assert_eq!(bounds.len(), 10, "{rendered}");
+        assert_eq!(&bounds[6..], &[NO_SCOPE_BOUNDS; 4], "{rendered}");
+        assert_eq!(
+            bounds[0],
+            resource_bounds("memory_bytes", true),
+            "{rendered}"
+        );
     }
 
     /// An unconfined session's undeclared fields bound nothing, and its declared ones bound what
@@ -1968,7 +2007,7 @@ mod tests {
             ..Default::default()
         };
         let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
-        let rendered = report.render_on(true, true);
+        let rendered = report.render_on(true, true, CgroupScopeStatus::Delegated);
         let bounds: Vec<&str> = rendered
             .lines()
             .filter_map(|line| line.strip_prefix("    bounds: "))

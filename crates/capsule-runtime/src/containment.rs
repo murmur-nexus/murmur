@@ -1768,7 +1768,11 @@ impl ScopeReport {
         }
 
         out.push('\n');
-        out.push_str(&self.resources.render(self.unconfined.is_some()));
+        out.push_str(
+            &self
+                .resources
+                .render(self.unconfined.is_some(), self.cgroup_scope.status),
+        );
         out.push('\n');
         out.push_str(&self.shell_env.render());
 
@@ -6624,7 +6628,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains(&report.resources.render(false)),
+            rendered.contains(&report.resources.render(false, report.cgroup_scope.status)),
             "{rendered}"
         );
         assert!(rendered.contains(&report.shell_env.render()), "{rendered}");

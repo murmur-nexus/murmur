@@ -846,3 +846,40 @@ fn explain_scope_states_which_processes_each_limit_bounds() {
         json!({"value": 268435456, "declared": true})
     );
 }
+
+/// A capsule with no way to run a subprocess gets no cgroup, so `--explain-scope` says its
+/// `cgroup_*` fields bound nothing, declared or not, while its rlimit rows are unchanged.
+#[test]
+fn explain_scope_says_cgroup_fields_bound_nothing_without_a_scope() {
+    let home = TempDir::new().unwrap();
+    let project =
+        script_project("capabilities:\n  resources:\n    cgroup_memory_bytes: 268435456\n");
+    let text = mur(
+        false,
+        home.path(),
+        project.path(),
+        &["run", "--manifest", "murmur.yaml", "--explain-scope"],
+    );
+    assert_eq!(text.code, Some(0), "{}", text.all());
+    let expected = if cfg!(target_os = "linux") {
+        "nothing: this capsule declares no way to run a subprocess, so a launch creates no cgroup \
+         for it"
+    } else {
+        "nothing: cgroups do not exist on this host"
+    };
+    for key in [
+        "cgroup_memory_bytes",
+        "cgroup_pids_max",
+        "cgroup_cpu_percent",
+        "cgroup_io_bytes_per_sec",
+    ] {
+        let (_, bounds) = resources_row(&text.stdout, key);
+        assert_eq!(bounds, expected, "{key}\n{}", text.all());
+    }
+    let (_, memory_bounds) = resources_row(&text.stdout, "memory_bytes");
+    assert_eq!(
+        memory_bounds,
+        "each shell command and murmur:process program on its own (address space); not guest \
+         workers or mur"
+    );
+}
