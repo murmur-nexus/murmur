@@ -3491,7 +3491,7 @@ Output sections, in the order they are printed:
 
 | Section | Printed | Contents |
 |---|---|---|
-| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a [formation member](#mur-run-formation), a `formation:  <formation-id>` line follows those. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools` |
+| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a [formation member](#mur-run-formation), a `formation:  <formation-id>` line follows those. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools`. For a session under [`trace.records: light`](manifest.md#trace-records), a `records:     light (grant set kept as sha256 <first 12 hex>…)` line follows `containment` |
 | Harness | one or more `harness_warning`, `harness_failed`, `harness_interrupt` or [`harness_quota`](observability-schemas.md#harness-quota) records | One line per warning (`warning <code>: <message>`), failed turn (`harness failed (<kind>): <message>`) and interrupt (`interrupt <method>: …`), in file order. Then one line per subscription window name, with the latest values reported under it, in the order the names were first reported: `quota <name>: used <fraction>, resets <RFC 3339 UTC>, <n> min window, <state>`. A value the harness did not report is left off the line: `quota five-hour: used 0.5, warning` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
@@ -4943,7 +4943,7 @@ policy, declared floor and host reading:
 | Landlock, seccomp, the composed root under `sealed` | The session's scope |
 | Network | The session's `capabilities.network.allow`, in a network namespace of the check's own |
 | Resource limits | The session's rlimits, in a cgroup scope of the check's own |
-| `$HOME`, `$TMPDIR` | The session's `home/` and `tmp/` in its records directory |
+| `$HOME`, `$TMPDIR` | The session's `home/` and `tmp/` in its records directory. Under [`trace.records: light`](manifest.md#trace-records) both are created again for the check and removed when it exits if empty. |
 
 The check is killed with everything it started at its timeout, and whatever it left running is
 killed when it exits. It is not part of the session: its command, its files and its output appear

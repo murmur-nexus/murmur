@@ -29,7 +29,8 @@
 //! directory's ([`crate::runtime_dir`]). `tmp/` and `home/` are the two exceptions, granted the
 //! work folder's rights by their own rule and bind; [`crate::containment::records_dir_report`] says per tier
 //! what holds. Unlike the runtime directory it is not removed when the session ends;
-//! `trace.retain` ([`crate::retention::prune_sessions`]) prunes it.
+//! `trace.retain` ([`crate::retention::prune_sessions`]) prunes it. Under `trace.records: light`
+//! [`RemoveEmptyScratchOnDrop`] removes `tmp/` and `home/` at session end when they are empty.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -169,6 +170,34 @@ impl RecordsDir {
     #[must_use]
     pub fn root(&self) -> &WorkdirRoot {
         &self.root
+    }
+}
+
+/// Under `trace.records: light`, removes the records directory's `home/` and `tmp/` when dropped,
+/// each only if it is empty ([`WorkdirRoot::remove_empty_dir`]). Best effort: a non-empty or
+/// missing folder, or any error, leaves things as they are and is reported nowhere.
+///
+/// Held by a launch for its whole length and dropped after the session's processes have been
+/// killed, and by [`crate::CheckRunner::run`], which recreates both for an eval check after the
+/// session has ended and drops it after the check's processes have been killed. A process that
+/// exits without running destructors keeps both folders.
+pub(crate) struct RemoveEmptyScratchOnDrop(Option<WorkdirRoot>);
+
+impl RemoveEmptyScratchOnDrop {
+    /// A guard that removes nothing unless `records` is
+    /// [`murmur_artifact::TraceRecords::Light`].
+    pub(crate) fn new(records: murmur_artifact::TraceRecords, records_root: &WorkdirRoot) -> Self {
+        Self(records.is_light().then(|| records_root.clone()))
+    }
+}
+
+impl Drop for RemoveEmptyScratchOnDrop {
+    fn drop(&mut self) {
+        if let Some(root) = self.0.take() {
+            for sub in [HOME_SUBDIR, crate::temp_dir::SESSION_TEMP_DIR_NAME] {
+                let _ = root.remove_empty_dir(sub);
+            }
+        }
     }
 }
 

@@ -886,3 +886,318 @@ fn pruning_a_session_does_not_cost_the_conversation_it_ran() {
     );
     drop(f.project);
 }
+
+// ── trace.records ──────────────────────────────────────────────────────────
+
+/// The one session a fixture ran, by its records directory.
+fn only_session(f: &Fixture) -> PathBuf {
+    let names = sessions(&f.sessions_root());
+    assert_eq!(names.len(), 1, "{names:?}");
+    f.sessions_root().join(&names[0])
+}
+
+/// Every event of one session's trace, in file order.
+fn trace_events(records: &Path) -> Vec<Value> {
+    fs::read_to_string(records.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The first event of `event_type` in a session's trace.
+fn event_of<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|event| event["event_type"] == event_type)
+        .unwrap_or_else(|| panic!("no {event_type} event"))
+}
+
+/// The keys of one event object, sorted.
+fn keys_of(event: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = event.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+fn trace_show(f: &Fixture, records: &Path) -> String {
+    let mut cmd = Command::cargo_bin("mur").unwrap();
+    cmd.env("HOME", f.home.path());
+    stdout_of(
+        cmd.args([
+            "trace",
+            "show",
+            records.join("trace.jsonl").to_str().unwrap(),
+        ])
+        .assert()
+        .success(),
+    )
+}
+
+/// The record is chained line by line, sealed, and `mur trace verify --json` reports it verified.
+fn assert_sealed_and_verified(f: &Fixture, records: &Path) {
+    let trace = fs::read_to_string(records.join("trace.jsonl")).unwrap();
+    let mut prev = "genesis".to_string();
+    for line in trace.lines() {
+        assert!(
+            line.ends_with(&format!(",\"prev_hash\":\"{prev}\"}}")),
+            "the line does not end with prev_hash {prev}: {line}"
+        );
+        prev = capsule_runtime::record_seal::line_hash(line.as_bytes());
+    }
+    assert!(records.join("trace.jsonl.seal").is_file());
+    let mut cmd = Command::cargo_bin("mur").unwrap();
+    cmd.env("HOME", f.home.path());
+    let report: Value = serde_json::from_str(&stdout_of(
+        cmd.args(["trace", "verify", records.to_str().unwrap(), "--json"])
+            .assert()
+            .success(),
+    ))
+    .unwrap();
+    assert_eq!(report["verdict"], "verified", "{report}");
+}
+
+/// The raw text of `session_start.effective_grants`'s value in a full record: the bytes from the
+/// key to the key that follows it, which a full line always writes next.
+fn effective_grants_text(records: &Path) -> String {
+    let trace = fs::read_to_string(records.join("trace.jsonl")).unwrap();
+    let line = trace.lines().next().unwrap();
+    let key = "\"effective_grants\":";
+    let start = line.find(key).expect("a full record has effective_grants") + key.len();
+    let end = start
+        + line[start..]
+            .find(",\"system_prompt_source\":")
+            .expect("system_prompt_source follows effective_grants");
+    let text = &line[start..end];
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        serde_json::from_str::<Value>(line).unwrap()["effective_grants"]
+    );
+    text.to_string()
+}
+
+/// An unknown `trace.records` value is refused at parse time naming the field; a typo of the key
+/// is an unknown key like any other.
+#[test]
+fn trace_records_refuses_an_unknown_value_and_warns_on_a_typo() {
+    let f = Fixture::new(responses(1), "trace:\n  records: heavy\n");
+    let assert = f.run(&[]).failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-MAN-003"), "{stderr}");
+    assert!(stderr.contains("trace.records"), "{stderr}");
+    assert!(stderr.contains("heavy"), "{stderr}");
+    assert!(sessions(&f.sessions_root()).is_empty());
+
+    let f = Fixture::new(responses(1), "trace: {recrods: light}\n");
+    let assert = f.run(&[]).success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("W-SEC-019"), "{stderr}");
+}
+
+/// No `trace.records` and `trace.records: full` write the same record: the whole grant set, no
+/// light keys, `home/` and `tmp/` kept, and no `records:` line in `mur trace show`.
+#[test]
+fn trace_records_default_and_full_write_what_main_writes() {
+    let mut key_sets = Vec::new();
+    for blocks in ["", "trace:\n  records: full\n"] {
+        let f = Fixture::new(responses(1), blocks);
+        f.run(&[]).success();
+        let records = only_session(&f);
+        let events = trace_events(&records);
+        let start = event_of(&events, "session_start");
+        assert!(start["effective_grants"].is_object(), "{blocks:?}: {start}");
+        for absent in ["effective_grants_sha256", "trace_records", "unconfined"] {
+            assert!(
+                start.get(absent).is_none(),
+                "{blocks:?}: {absent} in {start}"
+            );
+        }
+        key_sets.push(keys_of(start));
+        assert!(records.join("home").is_dir(), "{blocks:?}");
+        assert!(records.join("tmp").is_dir(), "{blocks:?}");
+        let shown = trace_show(&f, &records);
+        assert!(
+            !shown.lines().any(|line| line.starts_with("records:")),
+            "{blocks:?}: {shown}"
+        );
+        assert_sealed_and_verified(&f, &records);
+        drop(f.project);
+    }
+    assert_eq!(key_sets[0], key_sets[1]);
+}
+
+/// `trace.records: light` keeps the grant set as its digest, says so in the chained and sealed
+/// `session_start`, removes the empty `home/` and `tmp/`, and leaves every other event as a full
+/// session of the same capsule writes it.
+#[test]
+fn trace_records_light_keeps_a_digest_and_says_so() {
+    let full = Fixture::new(responses(1), "trace:\n  records: full\n");
+    full.run(&[]).success();
+    let full_records = only_session(&full);
+    let full_events = trace_events(&full_records);
+
+    let light = Fixture::new(responses(1), "trace:\n  records: light\n");
+    light.run(&[]).success();
+    let records = only_session(&light);
+    let events = trace_events(&records);
+    let start = event_of(&events, "session_start");
+
+    assert_eq!(start["trace_records"], "light", "{start}");
+    assert!(start.get("effective_grants").is_none(), "{start}");
+    let digest = start["effective_grants_sha256"].as_str().unwrap();
+    assert_eq!(digest.len(), 64, "{digest}");
+    assert!(
+        digest
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{digest}"
+    );
+    let full_start = event_of(&full_events, "session_start");
+    for mirror in [
+        "containment_declared",
+        "containment_achieved",
+        "workdir_exec",
+        "userns_grant",
+    ] {
+        assert!(start.get(mirror).is_some(), "{mirror}: {start}");
+        assert_eq!(start[mirror], full_start[mirror], "{mirror}");
+    }
+    for event_type in ["task_start", "inference", "task_end", "session_end"] {
+        assert_eq!(
+            keys_of(event_of(&events, event_type)),
+            keys_of(event_of(&full_events, event_type)),
+            "{event_type}"
+        );
+    }
+    assert!(records.join("out/result.txt").is_file());
+    assert!(!records.join("home").exists());
+    assert!(!records.join("tmp").exists());
+
+    let shown = trace_show(&light, &records);
+    let line = shown
+        .lines()
+        .find(|line| line.starts_with("records:"))
+        .unwrap_or_else(|| panic!("no records: line: {shown}"));
+    assert!(line.contains("light"), "{line}");
+    assert!(line.contains(&digest[..12]), "{line}");
+
+    assert_sealed_and_verified(&light, &records);
+    assert_sealed_and_verified(&full, &full_records);
+    drop(full.project);
+    drop(light.project);
+}
+
+/// Apparent and allocated bytes and entry counts beneath one records directory.
+#[derive(Debug, Default)]
+struct RecordsSize {
+    apparent: u64,
+    allocated: u64,
+    files: u64,
+    dirs: u64,
+    /// Every entry's path relative to the records directory, directories with a trailing `/`.
+    entries: Vec<String>,
+}
+
+fn records_size(dir: &Path) -> RecordsSize {
+    use std::os::unix::fs::MetadataExt;
+    let mut size = RecordsSize::default();
+    let root = dir;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            size.allocated += meta.blocks() * 512;
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string();
+            if meta.is_dir() {
+                size.entries.push(format!("{rel}/"));
+                size.dirs += 1;
+                stack.push(entry.path());
+            } else {
+                size.entries.push(rel);
+                size.files += 1;
+                if meta.is_file() {
+                    size.apparent += meta.len();
+                }
+            }
+        }
+    }
+    size.entries.sort();
+    size
+}
+
+/// `du`'s own account of a records directory, for the evidence; `du` absent prints that instead.
+fn du_line(dir: &Path) -> String {
+    ["-sb", "-sB1"]
+        .iter()
+        .map(|flag| {
+            std::process::Command::new("du")
+                .arg(flag)
+                .arg(dir)
+                .output()
+                .map(|out| format!("du {flag}: {}", String::from_utf8_lossy(&out.stdout).trim()))
+                .unwrap_or_else(|error| format!("du {flag}: unavailable ({error})"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// On a one-turn capsule, a light record is smaller than the default one by about the grant
+/// set's text, has two fewer directories (`home/`, `tmp/`) and the same files.
+///
+/// The light line adds `effective_grants_sha256` and `trace_records` (117 bytes with their
+/// commas) where the full one has `"effective_grants":` and its value, and the two runs'
+/// durations may differ in digit count, so the margin is 200 bytes.
+#[test]
+fn trace_records_light_is_smaller_on_a_one_turn_capsule() {
+    let default = Fixture::new(responses(1), "");
+    default.run(&[]).success();
+    let default_records = only_session(&default);
+    let grants_len = effective_grants_text(&default_records).len() as u64;
+
+    let light = Fixture::new(responses(1), "trace:\n  records: light\n");
+    light.run(&[]).success();
+    let light_records = only_session(&light);
+
+    let full = records_size(&default_records);
+    let small = records_size(&light_records);
+    eprintln!(
+        "records-size default: apparent={} allocated={} files={} dirs={} ({})",
+        full.apparent,
+        full.allocated,
+        full.files,
+        full.dirs,
+        du_line(&default_records)
+    );
+    eprintln!(
+        "records-size light:   apparent={} allocated={} files={} dirs={} ({})",
+        small.apparent,
+        small.allocated,
+        small.files,
+        small.dirs,
+        du_line(&light_records)
+    );
+    eprintln!("records-size default entries: {}", full.entries.join(" "));
+    eprintln!("records-size light entries:   {}", small.entries.join(" "));
+    eprintln!("records-size effective_grants value: {grants_len} bytes");
+    assert!(
+        small.apparent + grants_len.saturating_sub(200) <= full.apparent,
+        "light {small:?} vs default {full:?}, grant text {grants_len}"
+    );
+    assert_eq!(
+        small.dirs + 2,
+        full.dirs,
+        "light {small:?} vs default {full:?}"
+    );
+    assert_eq!(
+        small.files, full.files,
+        "light {small:?} vs default {full:?}"
+    );
+    drop(default.project);
+    drop(light.project);
+}

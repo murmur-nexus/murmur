@@ -4185,6 +4185,11 @@ pub fn stage_session(
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         trace_sync: request.trace.as_ref().and_then(|t| t.sync),
+        trace_records: request
+            .trace
+            .as_ref()
+            .map(|t| t.records)
+            .unwrap_or_default(),
         host_probe,
         provider_tool_terms,
         temp_mapping,
@@ -4284,6 +4289,13 @@ fn launch(
     let runtime_dir_owner =
         crate::runtime_dir::SharedRuntimeDir::new(staged.runtime_dir_guard.take());
     let _remove_runtime_dir = runtime_dir_owner.remove_on_drop();
+    // Under `trace.records: light`, removes the records directory's `home/` and `tmp/` on every
+    // return from this function, each only if empty. Declared before `_session_end` below, so it
+    // drops after the session's processes have been killed.
+    let _remove_empty_scratch = crate::records_dir::RemoveEmptyScratchOnDrop::new(
+        staged.trace_records,
+        &staged.records_root,
+    );
     // Removes the session's build cache seed on every return from this function, after every
     // command has ended.
     let _remove_build_cache_seed = staged.build_cache_seed.take();
@@ -4934,6 +4946,7 @@ fn launch(
             .filter(|a| !a.is_empty());
         let trace_capture = staged.trace_capture;
         let trace_sync = staged.trace_sync;
+        let trace_records = staged.trace_records;
         // Retention inputs, taken before `staged` and `run_config` are moved into the agent loop.
         // Both are `None` on a capsule that declared no `retain:` block, and `None` deletes
         // nothing, ever.
@@ -4986,6 +4999,7 @@ fn launch(
                 None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
             })?;
             trace.set_trace_sync(trace_sync);
+            trace.set_trace_records(trace_records);
             trace.set_call_deadlines(call_deadlines.clone());
             trace.set_member_requests(member_requests.clone());
             trace.set_network_requests(network_requests.clone());
@@ -6327,6 +6341,7 @@ fn launch(
             None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
         })?;
     trace.set_trace_sync(staged.trace_sync);
+    trace.set_trace_records(staged.trace_records);
     trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
     trace.set_credential_source("none");
     trace.set_gateways(session_gateway_records);

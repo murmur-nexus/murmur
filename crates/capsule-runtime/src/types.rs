@@ -783,6 +783,9 @@ pub struct StagedSession {
     /// When this session's trace lines reach the disk, from the manifest's `trace.sync`. `None`
     /// makes no sync call.
     pub(crate) trace_sync: Option<murmur_artifact::TraceSync>,
+    /// How much of the records directory this session keeps, from the manifest's
+    /// `trace.records` ([`murmur_artifact::TraceRecords::Full`] when absent).
+    pub(crate) trace_records: murmur_artifact::TraceRecords,
     /// Address the HTTP server is bound to (copied from StageRequest::bind_addr).
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).

@@ -12,6 +12,8 @@
 //! seccomp filter, network namespace and resource limits. Only its scope is new: a cgroup scope,
 //! runtime directory and network namespace of its own, each ended or removed when the check
 //! returns. `$HOME` and `$TMPDIR` are the session's `home/` and `tmp/`, as for its commands.
+//! Under `trace.records: light` the session removed both when it ended if they were empty; the
+//! check creates them again and removes them on the same terms when it returns.
 
 use std::{
     path::{Path, PathBuf},
@@ -153,6 +155,9 @@ pub struct CheckRunner {
     records_dir: PathBuf,
     /// `~/.murmur/sessions`, where the session's runtime directory was and the check's goes.
     sessions_dir: Option<PathBuf>,
+    /// The session's `trace.records`: under `Light` the check recreates `home/` and `tmp/` and
+    /// removes them again when empty.
+    trace_records: murmur_artifact::TraceRecords,
 }
 
 impl StagedSession {
@@ -174,6 +179,7 @@ impl StagedSession {
                 .parent()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
+            trace_records: self.trace_records,
         }
     }
 }
@@ -196,6 +202,27 @@ impl CheckRunner {
             error: Some(error),
             containment: containment.clone(),
         };
+
+        // Dropped on every return, after the check's processes have been killed.
+        let _remove_empty_scratch = crate::records_dir::RemoveEmptyScratchOnDrop::new(
+            self.trace_records,
+            &self.records_root,
+        );
+        if self.trace_records.is_light() {
+            let mode = crate::murmur_home::MURMUR_HOME_DIR_MODE;
+            let recreated = self
+                .records_root
+                .create_dir_all(crate::records_dir::HOME_SUBDIR, mode)
+                .and_then(|()| {
+                    self.records_root
+                        .create_dir_all(crate::temp_dir::SESSION_TEMP_DIR_NAME, mode)
+                });
+            if let Err(reason) = recreated {
+                return error(format!(
+                    "could not recreate the session's home/ and tmp/ for the check: {reason}"
+                ));
+            }
+        }
 
         if let Some(files) = check.files() {
             if let Err(refusal) = copy_tree_into(files, &self.accessible_root) {

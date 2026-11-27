@@ -722,6 +722,7 @@ mod tests {
         ".entry_kind(",
         ".remove_file(",
         ".remove_dir_all(",
+        ".remove_empty_dir(",
         ".open_beneath(",
     ];
 

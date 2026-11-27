@@ -34,7 +34,12 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let home = TempDir::new().unwrap();
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    /// A world whose `HOME` and workspace are created under `base`.
+    fn new_in(base: &Path) -> Self {
+        let home = TempDir::new_in(base).unwrap();
         let artifacts = TempDir::new().unwrap();
         let driver = common::create_driver_artifact(
             artifacts.path(),
@@ -43,7 +48,7 @@ impl World {
             &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
         );
         common::publish_local(&home, &driver).success();
-        let workspace = TempDir::new().unwrap();
+        let workspace = TempDir::new_in(base).unwrap();
         fs::write(workspace.path().join("task.md"), "Fix the bug in main.txt.").unwrap();
         Self { home, workspace }
     }
@@ -653,6 +658,71 @@ fn the_check_runs_under_the_sessions_containment() {
         .find(|event| event["event_type"] == "session_start")
         .unwrap();
     assert_eq!(run["check"]["containment"], start["containment_achieved"]);
+}
+
+// ── trace.records: light ──────────────────────────────────────────────────────
+
+/// Under `trace.records: light` the session removes its empty `home/` and `tmp/` when it ends,
+/// and the check, which runs after that with both as its `$HOME` and `$TMPDIR`, still runs: it
+/// gets both back, and they go again when the check leaves them empty. A check that writes into
+/// `$HOME` keeps it.
+///
+/// The world lives off `/tmp`: where `/tmp` is mapped onto `tmp/`, a command whose work folder or
+/// `HOME` is beneath `/tmp` leaves a mountpoint for each in `tmp/`, which then is not empty.
+#[test]
+fn a_check_runs_on_a_light_capsule_and_leaves_no_empty_scratch() {
+    if common::skip_without_host_support(
+        "a_check_runs_on_a_light_capsule_and_leaves_no_empty_scratch",
+    ) {
+        return;
+    }
+    let world = World::new_in(Path::new(env!("CARGO_TARGET_TMPDIR")));
+    let server = ScriptedServer::start([giving_up(), giving_up()].concat());
+    let capsule = world.capsule("base", &server.endpoint, "test-model", SHELL_ALLOW);
+    let manifest = capsule.join("murmur.yaml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("trace:\n  records: light\n");
+    fs::write(&manifest, text).unwrap();
+    world.dataset(&[
+        json!({"case_id": "c1", "task_path": "task.md", "check": "true"}),
+        json!({"case_id": "c2", "task_path": "task.md",
+            "check": "bash -c 'echo kept > \"$HOME/kept.txt\"'"}),
+    ]);
+    let stdout = run_ok(world.mur().args(["eval", "run", "base"]));
+
+    let record = read_json(&world.run_records("base")[0]);
+    let all = runs(&record);
+    assert_eq!(all.len(), 2, "{record:#}");
+    for run in &all {
+        assert_eq!(run["check_result"], "pass", "{run:#}");
+        assert!(run["check"]["error"].is_null(), "{run:#}");
+    }
+    assert_eq!(stdout.matches("check: pass").count(), 2, "{stdout}");
+
+    let records_dir = |case: &str| {
+        let case = record["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["case_id"] == case)
+            .unwrap();
+        PathBuf::from(case["runs"][0]["records_dir"].as_str().unwrap())
+    };
+    let empty = records_dir("c1");
+    let start = common::read_whole_trace(&empty.join("trace.jsonl"))
+        .into_iter()
+        .find(|event| event["event_type"] == "session_start")
+        .unwrap();
+    assert_eq!(start["trace_records"], "light", "{start:#}");
+    assert!(!empty.join("home").exists(), "{}", empty.display());
+    assert!(!empty.join("tmp").exists(), "{}", empty.display());
+
+    let written = records_dir("c2");
+    assert_eq!(
+        fs::read_to_string(written.join("home/kept.txt")).unwrap(),
+        "kept\n"
+    );
+    assert!(!written.join("tmp").exists(), "{}", written.display());
 }
 
 // ── S5: refusals ──────────────────────────────────────────────────────────────

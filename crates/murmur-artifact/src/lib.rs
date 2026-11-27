@@ -158,7 +158,8 @@ pub use skill_folder::{
     SkillVersionRule, SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_LEN,
 };
 pub use trace_capture::{
-    resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,
+    resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TraceRecords,
+    TRACE_CAPTURE_ACCEPTED_VALUES, TRACE_RECORDS_ACCEPTED_VALUES,
 };
 pub use unknown_manifest_keys::{
     nearest_known_key, suggestion_threshold, unknown_manifest_key_warnings,

@@ -27,6 +27,10 @@ pub(crate) struct TraceWriter {
     chain: Arc<crate::record_seal::InlineChain>,
     /// `trace.sync`, set on the chain by [`Self::set_trace_sync`]; `None` makes no sync call.
     trace_sync: Option<murmur_artifact::TraceSync>,
+    /// `trace.records`, set by [`Self::set_trace_records`]. Under
+    /// [`murmur_artifact::TraceRecords::Light`] `session_start` carries `effective_grants_sha256`
+    /// and `trace_records` in place of the `effective_grants` object.
+    trace_records: murmur_artifact::TraceRecords,
     /// The records directory the trace is in, which its seal is written beside.
     records_root: WorkdirRoot,
     /// What the seal written after `session_end` covered, for the OTel session span.
@@ -395,7 +399,19 @@ struct SessionStartEvent {
     /// this session have network access?" but not "to where?", which is the question an auditor
     /// reading a finished trace actually has. This field answers it without re-parsing the
     /// manifest, which by then may have changed or moved.
-    effective_grants: ScopeReport,
+    ///
+    /// Absent under `trace.records: light`, which writes `effective_grants_sha256` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_grants: Option<ScopeReport>,
+    /// `trace.records: light` only: the SHA-256 (lowercase hex) of the exact bytes a full session
+    /// writes as the value of `effective_grants` — `serde_json` of the same [`ScopeReport`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_grants_sha256: Option<String>,
+    /// `trace.records: light` only, and only on an unconfined session: `effective_grants`'
+    /// `unconfined` object mirrored to the top level, so a reader can still say whom the
+    /// session's commands ran as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unconfined: Option<crate::containment::UnconfinedReport>,
     /// Where the system prompt this session ran with came from: `"manifest"` when the manifest's
     /// own `inference.system_prompt`/`system_prompt_file`/`system_prompt_artifact` supplied it,
     /// `"cli"` when `mur run --system-prompt` overrode it (including when the override was empty
@@ -489,6 +505,10 @@ struct SessionStartEvent {
     /// set; absent rather than `null` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_sync: Option<SessionTraceSync>,
+    /// `"light"` under `trace.records: light`; absent at the default, so an absent key means a
+    /// full record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_records: Option<&'static str>,
 }
 
 /// `session_start.trace_sync`: `{"mode":"line"}` or `{"mode":"interval","interval_secs":N}`.
@@ -3002,6 +3022,7 @@ impl TraceWriter {
         Ok(Self {
             chain,
             trace_sync: None,
+            trace_records: murmur_artifact::TraceRecords::Full,
             records_root: records_root.clone(),
             sealed_head: None,
             session_id,
@@ -3158,6 +3179,14 @@ impl TraceWriter {
         }
     }
 
+    /// Records `trace.records` for `session_start`: under
+    /// [`murmur_artifact::TraceRecords::Light`] the event carries `effective_grants_sha256`,
+    /// `trace_records: "light"` and, on an unconfined session, a top-level `unconfined`, in place
+    /// of the `effective_grants` object. Called before `session_start` is written.
+    pub(crate) fn set_trace_records(&mut self, records: murmur_artifact::TraceRecords) {
+        self.trace_records = records;
+    }
+
     /// Records what `control:` declares for `session_start.control`.
     pub(crate) fn set_control(&mut self, control: Option<SessionControl>) {
         self.control = control;
@@ -3301,6 +3330,24 @@ impl TraceWriter {
         model_limits: Option<crate::model_limits::ResolvedModelLimits>,
         tools_declared: Vec<String>,
     ) -> std::io::Result<()> {
+        let (effective_grants, effective_grants_sha256, unconfined, trace_records) =
+            match self.trace_records {
+                murmur_artifact::TraceRecords::Full => {
+                    (Some(self.effective_grants.clone()), None, None, None)
+                }
+                murmur_artifact::TraceRecords::Light => {
+                    // The same serializer the chain writes the full line with, so the digest is
+                    // over the bytes a full session carries as the value.
+                    let bytes = serde_json::to_vec(&self.effective_grants)
+                        .map_err(std::io::Error::other)?;
+                    (
+                        None,
+                        Some(murmur_artifact::sha256_hex(&bytes)),
+                        self.effective_grants.unconfined.clone(),
+                        Some(self.trace_records.as_str()),
+                    )
+                }
+            };
         let event = SessionStartEvent {
             event_type: "session_start",
             event_id: self.session_event_id.clone(),
@@ -3328,7 +3375,9 @@ impl TraceWriter {
             containment_achieved: self.effective_grants.achieved_containment,
             workdir_exec: self.effective_grants.workdir_exec,
             userns_grant: self.effective_grants.userns_grant,
-            effective_grants: self.effective_grants.clone(),
+            effective_grants,
+            effective_grants_sha256,
+            unconfined,
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
             credential_source: self.credential_source,
@@ -3351,6 +3400,7 @@ impl TraceWriter {
                 .as_ref()
                 .map(|(_, callees)| callees.clone()),
             trace_sync: self.trace_sync.map(SessionTraceSync::from),
+            trace_records,
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -8217,6 +8267,106 @@ mod tests {
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
             "off Linux the key is present and null, not absent"
         );
+    }
+
+    /// Writes one `session_start` for `report` under `records` and returns the raw line.
+    async fn session_start_line(
+        report: &ScopeReport,
+        records: murmur_artifact::TraceRecords,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = TraceWriter::open(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            "test-session-id".to_string(),
+            "test-capsule".to_string(),
+            "1.0.0".to_string(),
+            "claude-test".to_string(),
+            vec!["shell".to_string()],
+            report.clone(),
+            TraceCapture::Meta,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        w.set_trace_records(records);
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        let content = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+        content.lines().next().unwrap().to_string()
+    }
+
+    /// `trace.records: light` keeps the grant set as the SHA-256 of the very bytes a full
+    /// `session_start` carries as `effective_grants`, says it is light, and mirrors an unconfined
+    /// session's `unconfined` object to the top level. Raw text is compared by position: a
+    /// re-serialized `Value` sorts keys and would hash different bytes.
+    #[tokio::test]
+    async fn session_start_light_records_the_grant_set_as_its_digest() {
+        let mut report = report_for(
+            ContainmentClass::Advisory,
+            EnforcementTier::EnvironmentOnly,
+            false,
+        );
+        for unconfined in [
+            None,
+            Some(crate::containment::UnconfinedReport {
+                user: Some("dev".to_string()),
+                uid: 1000,
+                home: Some("/home/dev".to_string()),
+                applies_to: crate::containment::UNCONFINED_APPLIES_TO.to_vec(),
+                resource_limits: vec!["memory_bytes"],
+            }),
+        ] {
+            report.unconfined = unconfined.clone();
+            let grant_bytes = serde_json::to_vec(&report).unwrap();
+            let full = session_start_line(&report, murmur_artifact::TraceRecords::Full).await;
+            let light = session_start_line(&report, murmur_artifact::TraceRecords::Light).await;
+
+            let key = "\"effective_grants\":";
+            let at = full
+                .find(key)
+                .expect("a full line carries effective_grants")
+                + key.len();
+            assert_eq!(
+                &full.as_bytes()[at..at + grant_bytes.len()],
+                grant_bytes.as_slice(),
+                "the full line carries serde_json of the report as the value"
+            );
+            assert!(!full.contains("\"effective_grants_sha256\""), "{full}");
+            assert!(!full.contains("\"trace_records\""), "{full}");
+
+            assert!(!light.contains(key), "{light}");
+            let light_event: Value = serde_json::from_str(&light).unwrap();
+            let full_event: Value = serde_json::from_str(&full).unwrap();
+            assert!(full_event.get("unconfined").is_none(), "{full}");
+            assert_eq!(
+                light_event["effective_grants_sha256"],
+                Value::String(murmur_artifact::sha256_hex(&grant_bytes))
+            );
+            assert_eq!(light_event["trace_records"], "light");
+            match &unconfined {
+                Some(_) => assert_eq!(
+                    light_event["unconfined"],
+                    full_event["effective_grants"]["unconfined"]
+                ),
+                None => assert!(light_event.get("unconfined").is_none(), "{light}"),
+            }
+            for mirror in [
+                "containment_declared",
+                "containment_achieved",
+                "workdir_exec",
+                "userns_grant",
+            ] {
+                assert!(light_event.get(mirror).is_some(), "{mirror}: {light}");
+                assert_eq!(light_event[mirror], full_event[mirror], "{mirror}");
+            }
+        }
     }
 
     /// Central property: `session_start.effective_grants` is the *whole* `ScopeReport`,
