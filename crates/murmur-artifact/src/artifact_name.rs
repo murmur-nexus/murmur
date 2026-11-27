@@ -14,7 +14,11 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::build::{artifact_name_format_error, MAX_ARTIFACT_NAME_LEN};
+use crate::{
+    build::{artifact_name_format_error, MAX_ARTIFACT_NAME_LEN},
+    runtime_manifest::tool_name_of,
+    unknown_manifest_keys::{edit_distance, suggestion_threshold},
+};
 
 /// The scope of an artifact installed from a `.mur.zip` file or written by `mur publish`. No
 /// source is ever asked for it.
@@ -62,6 +66,16 @@ impl ArtifactNameError {
     pub fn input(&self) -> &str {
         match self {
             Self::Unscoped { name } | Self::Malformed { name, .. } => name,
+        }
+    }
+
+    /// The bare name of an [`ArtifactNameError::Unscoped`] refusal, the text to look for among
+    /// installed artifacts; `None` for a malformed one.
+    #[must_use]
+    pub fn unscoped_name(&self) -> Option<&str> {
+        match self {
+            Self::Unscoped { name } => Some(name),
+            Self::Malformed { .. } => None,
         }
     }
 }
@@ -185,6 +199,45 @@ pub fn unscoped_name_hint(bare: &str) -> String {
     )
 }
 
+/// The `candidates` whose name is close to `wanted`, the names to offer when `wanted` resolves to
+/// nothing.
+///
+/// `wanted` may be bare or full; only its bare part is compared with each candidate's bare part.
+/// A candidate is close when the bare parts are equal, equal once one leading `murmur-` is
+/// stripped from each, or within [`suggestion_threshold`] edits of each other. A candidate whose
+/// full name is `wanted` itself is never returned.
+///
+/// Ordered with equal bare parts first, then by edit distance, then by full name; each full name
+/// appears once.
+#[must_use]
+pub fn close_artifact_names<'a, I>(wanted: &str, candidates: I) -> Vec<&'a ArtifactName>
+where
+    I: IntoIterator<Item = &'a ArtifactName>,
+{
+    let wanted_bare = tool_name_of(wanted);
+    let wanted_stripped = wanted_bare.strip_prefix("murmur-").unwrap_or(wanted_bare);
+    let mut close: Vec<(bool, usize, &'a ArtifactName)> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.as_str() != wanted)
+        .filter_map(|candidate| {
+            let bare = candidate.name();
+            let stripped = bare.strip_prefix("murmur-").unwrap_or(bare);
+            if bare == wanted_bare || stripped == wanted_stripped {
+                return Some((false, 0, candidate));
+            }
+            let distance = edit_distance(wanted_bare, bare);
+            (distance <= suggestion_threshold(wanted_bare, bare))
+                .then_some((true, distance, candidate))
+        })
+        .collect();
+    close.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
+    close.dedup_by(|left, right| left.2 == right.2);
+    close
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
 /// The reason the text after `<scope>/` in an install-entry prefix (`<scope>/<prefix>*`) is not
 /// valid, or `None` when it is. The prefix may be empty (`<scope>/*`) and may end with `-`
 /// (`ana/tool-*`); otherwise it follows the part rule.
@@ -297,5 +350,81 @@ mod tests {
         }
         let long = "a".repeat(MAX_ARTIFACT_NAME_LEN + 1);
         assert!(prefix_part_error(&long).is_some());
+    }
+
+    fn names(list: &[&str]) -> Vec<ArtifactName> {
+        list.iter()
+            .map(|n| ArtifactName::parse(n).unwrap())
+            .collect()
+    }
+
+    fn close<'a>(wanted: &str, candidates: &'a [ArtifactName]) -> Vec<&'a str> {
+        close_artifact_names(wanted, candidates)
+            .into_iter()
+            .map(ArtifactName::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn close_artifact_names_finds_the_local_name_for_a_bare_or_other_scope() {
+        let installed = names(&["local/echo-tool", "murmur/driver-anthropic"]);
+        assert_eq!(close("echo-tool", &installed), ["local/echo-tool"]);
+        assert_eq!(close("murmur/echo-tool", &installed), ["local/echo-tool"]);
+    }
+
+    #[test]
+    fn close_artifact_names_strips_one_murmur_prefix() {
+        let installed = names(&["ana/tool-x"]);
+        assert_eq!(close("murmur-tool-x", &installed), ["ana/tool-x"]);
+        let installed = names(&["ana/murmur-tool-x"]);
+        assert_eq!(close("tool-x", &installed), ["ana/murmur-tool-x"]);
+    }
+
+    #[test]
+    fn close_artifact_names_finds_a_typo_and_not_an_unrelated_name() {
+        let installed = names(&["local/echo-tool"]);
+        assert_eq!(close("local/echo-tol", &installed), ["local/echo-tool"]);
+        assert!(close("tool-editor", &installed).is_empty());
+        assert!(close("murmur/tool-editor", &installed).is_empty());
+    }
+
+    #[test]
+    fn close_artifact_names_never_returns_the_wanted_name_itself() {
+        let installed = names(&["local/echo-tool", "ana/echo-tool"]);
+        assert_eq!(close("local/echo-tool", &installed), ["ana/echo-tool"]);
+        let installed = names(&["local/echo-tool"]);
+        assert!(close("local/echo-tool", &installed).is_empty());
+    }
+
+    #[test]
+    fn close_artifact_names_orders_equal_first_then_distance_then_name_and_dedups() {
+        let installed = names(&[
+            "zed/echo-tools",
+            "local/echo-tool",
+            "ana/echo-toolss",
+            "bob/echo-tools",
+            "murmur/murmur-echo-tool",
+            "local/echo-tool",
+            "ana/echo-tool",
+        ]);
+        assert_eq!(
+            close("echo-tool", &installed),
+            [
+                "ana/echo-tool",
+                "local/echo-tool",
+                "murmur/murmur-echo-tool",
+                "bob/echo-tools",
+                "zed/echo-tools",
+                "ana/echo-toolss",
+            ]
+        );
+    }
+
+    #[test]
+    fn unscoped_name_is_the_bare_text_of_an_unscoped_refusal_only() {
+        let error = ArtifactName::parse("echo-tool").unwrap_err();
+        assert_eq!(error.unscoped_name(), Some("echo-tool"));
+        let error = ArtifactName::parse("a/b/c").unwrap_err();
+        assert_eq!(error.unscoped_name(), None);
     }
 }

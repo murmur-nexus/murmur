@@ -874,7 +874,9 @@ it". Delete `murmur.lock` and run `mur install` to regenerate it.
 
 A missing entry for a manifest artifact, an entry carrying `sha256.platforms`, an
 unsupported `lock_version`, or a malformed `origin` / `session` pair fails the run with
-`E-RUN-003`. See [Diagnostics](diagnostics.md).
+`E-RUN-003`. See [Diagnostics](diagnostics.md). For a missing entry, the hint names the installed
+and pinned artifacts whose name is close to the one declared, `local/` ones included, by the full
+`<scope>/<name>` to write in `murmur.yaml`.
 
 `mur install` with no arguments keeps `murmur.lock` in step with `murmur.yaml`: an entry pinning
 another version than the manifest declares is replaced by the declared version, and every other

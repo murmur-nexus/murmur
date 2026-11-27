@@ -31,15 +31,15 @@ use crate::{
     config::load_effective_mur_config_if_any_exists,
     error::{
         native_tool_launch_error, CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015,
-        E_RUN_016, E_RUN_019, E_RUN_047, E_RUN_051, E_RUN_053,
+        E_RUN_016, E_RUN_019, E_RUN_047, E_RUN_051, E_RUN_053, LOCK_MISSING_ENTRY_HINT,
     },
-    stores::FallbackRegistry,
+    stores::{close_names_hint, installed_names, FallbackRegistry, InstalledName},
 };
 
 use super::run_output::{check_output_lifecycle, OutputFile};
 use super::{
-    fail_run, locked_sha256, lockfile_error_to_cli, print_run_output,
-    runtime_manifest_error_to_cli, RunStatus,
+    fail_run, locked_sha256, lockfile_error_to_cli, manifest_error_naming_installed,
+    print_run_output, runtime_manifest_error_to_cli, RunStatus,
 };
 
 /// In --json mode errors must not produce any stdout output — return the error as-is.
@@ -423,7 +423,7 @@ pub(crate) fn run_run(
                 fail(
                     &session_id,
                     &workdir,
-                    runtime_manifest_error_to_cli(err),
+                    manifest_error_naming_installed(err, &project_dir),
                     json,
                 )
             })?;
@@ -871,15 +871,21 @@ pub(crate) fn run_run(
                         }
 
                         let entry = lock.artifact_for(&artifact.name).ok_or_else(|| {
+                            let hint = close_names_hint(
+                                &artifact.name,
+                                &installed_names(&project_dir, Some(&lock)),
+                            )
+                            .unwrap_or_else(|| LOCK_MISSING_ENTRY_HINT.to_string());
                             fail(
                                 &session_id,
                                 &workdir,
-                                CliError::new(
+                                CliError::with_hint(
                                     E_RUN_003,
                                     format!(
                                         "murmur.lock missing artifact entry for '{}'",
                                         artifact.name
                                     ),
+                                    hint,
                                 ),
                                 json,
                             )
@@ -920,8 +926,13 @@ pub(crate) fn run_run(
     let local_registry = LocalRegistry::new(&project_store_path);
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
 
-    check_artifacts_installed(&local_registry, &global_registry, &staged_artifacts)
-        .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    check_artifacts_installed(
+        &local_registry,
+        &global_registry,
+        &staged_artifacts,
+        &project_dir,
+    )
+    .map_err(|error| fail(&session_id, &workdir, error, json))?;
 
     // Agent capsules are manifest-only — no WASM component to discover.
     // Script capsules require exactly one root *.wasm file in the project directory, or, in
@@ -1360,18 +1371,20 @@ pub(crate) fn artifact_presence(
 
 /// Resolve every declared artifact the way staging will, refusing the session with `E-RUN-061`
 /// for the first one a store holds as a native tool, else with `E-RUN-008` naming every one
-/// that is missing.
+/// that is missing. The `E-RUN-008` hint is [`missing_artifacts_hint`] over the artifacts
+/// installed in the project store under `project_root` and the global store.
 fn check_artifacts_installed(
     project_registry: &LocalRegistry,
     global_registry: &LocalRegistry,
     artifacts: &[ArtifactRequest],
+    project_root: &Path,
 ) -> Result<(), CliError> {
     let mut missing = Vec::new();
 
     for artifact in artifacts {
         match artifact_presence(project_registry, global_registry, artifact) {
             ArtifactPresence::Missing => {
-                missing.push(format!("{}@{}", artifact.name, artifact.version));
+                missing.push((artifact.name.as_str(), artifact.version.as_str()));
             }
             ArtifactPresence::NativeTool { field } => {
                 return Err(native_tool_launch_error(&artifact.name, &field));
@@ -1384,12 +1397,48 @@ fn check_artifacts_installed(
         return Ok(());
     }
 
+    let installed = installed_names(project_root, None);
+    let listed: Vec<String> = missing
+        .iter()
+        .map(|(name, version)| format!("{name}@{version}"))
+        .collect();
     Err(CliError::with_hint(
         E_RUN_008,
-        format!("missing artifacts: {}", missing.join(", ")),
-        "run `mur install` to install all manifest dependencies",
+        format!("missing artifacts: {}", listed.join(", ")),
+        missing_artifacts_hint(&missing, &installed),
     ))
 }
+
+/// The `E-RUN-008` hint for the `missing` `(name, version)` pairs: the generic install advice
+/// when none has an installed artifact with a close name; that one artifact's
+/// [`close_names_hint`] when it is the only one missing; otherwise one line per missing artifact
+/// with a close name, then the install advice for the rest when any has none.
+fn missing_artifacts_hint(missing: &[(&str, &str)], installed: &[InstalledName]) -> String {
+    let close: Vec<(&str, &str, Option<String>)> = missing
+        .iter()
+        .map(|(name, version)| (*name, *version, close_names_hint(name, installed)))
+        .collect();
+    if close.iter().all(|(_, _, hint)| hint.is_none()) {
+        return MISSING_ARTIFACTS_HINT.to_string();
+    }
+    if let [(_, _, Some(hint))] = close.as_slice() {
+        return hint.clone();
+    }
+    let mut lines: Vec<String> = close
+        .iter()
+        .filter_map(|(name, version, hint)| {
+            hint.as_ref()
+                .map(|hint| format!("'{name}@{version}': {hint}"))
+        })
+        .collect();
+    if close.iter().any(|(_, _, hint)| hint.is_none()) {
+        lines.push("run `mur install` to install the others".to_string());
+    }
+    lines.join("\n        ")
+}
+
+/// The `E-RUN-008` hint when no missing artifact has an installed artifact with a close name.
+const MISSING_ARTIFACTS_HINT: &str = "run `mur install` to install all manifest dependencies";
 
 /// Validates `--containment` against the declarable class names, with the same shape as
 /// `parse_lifecycle_override` below: a bad value is an `E-IO-003` naming the accepted set and
@@ -1680,6 +1729,70 @@ fn report_build_cache(report: &capsule_runtime::build_cache::BuildCacheReport) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn installed(name: &str, version: &str) -> InstalledName {
+        InstalledName {
+            name: murmur_artifact::ArtifactName::parse(name).unwrap(),
+            versions: vec![version.to_string()],
+        }
+    }
+
+    #[test]
+    fn missing_artifacts_hint_is_the_install_advice_when_nothing_is_close() {
+        let held = [installed("local/echo-tool", "0.0.1")];
+        assert_eq!(
+            missing_artifacts_hint(&[("murmur/tool-editor", "0.6.0")], &held),
+            "run `mur install` to install all manifest dependencies"
+        );
+        assert_eq!(
+            missing_artifacts_hint(&[("murmur/tool-editor", "0.6.0")], &[]),
+            "run `mur install` to install all manifest dependencies"
+        );
+    }
+
+    #[test]
+    fn missing_artifacts_hint_for_one_missing_artifact_is_its_close_names_hint() {
+        let held = [installed("local/echo-tool", "0.0.1")];
+        assert_eq!(
+            missing_artifacts_hint(&[("murmur/echo-tool", "0.0.1")], &held),
+            "installed under a close name: local/echo-tool (0.0.1) \u{2014} name it \
+             'local/echo-tool' in murmur.yaml; an artifact installed from a .mur.zip file is \
+             named local/<name>"
+        );
+    }
+
+    #[test]
+    fn missing_artifacts_hint_for_several_is_one_line_each_then_the_others() {
+        let held = [
+            installed("local/echo-tool", "0.0.1"),
+            installed("ana/tool-x", "1.0.0"),
+        ];
+        assert_eq!(
+            missing_artifacts_hint(
+                &[
+                    ("murmur/echo-tool", "0.0.1"),
+                    ("murmur/driver-anthropic", "0.1.4"),
+                    ("murmur/tool-x", "1.0.0"),
+                ],
+                &held
+            ),
+            "'murmur/echo-tool@0.0.1': installed under a close name: local/echo-tool (0.0.1) \
+             \u{2014} name it 'local/echo-tool' in murmur.yaml; an artifact installed from a \
+             .mur.zip file is named local/<name>\n        'murmur/tool-x@1.0.0': installed \
+             under a close name: ana/tool-x (1.0.0) \u{2014} name it 'ana/tool-x' in \
+             murmur.yaml\n        run `mur install` to install the others"
+        );
+        assert_eq!(
+            missing_artifacts_hint(
+                &[("murmur/echo-tool", "0.0.1"), ("murmur/tool-x", "1.0.0")],
+                &held
+            )
+            .lines()
+            .count(),
+            2,
+            "no install line when every missing artifact has a close name"
+        );
+    }
 
     /// `W-RUN-007` is for a formation member nothing contains: a formation id, no lifeline, and
     /// no spawn grant on stdin.

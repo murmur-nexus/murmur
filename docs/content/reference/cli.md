@@ -2086,7 +2086,7 @@ refuses the launch with [`E-RUN-019`](diagnostics.md#e-run-019). Every other cap
 connection at all and needs no daemon running. See
 [the mur-roost HTTP API](roost-api.md#post-register).
 
-**Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]` and a `mur install` hint. Run `mur install` first to fetch missing artifacts.
+**Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]`. The hint names, for each missing artifact, the installed artifacts with a close name and the full `<scope>/<name>` to write; for a missing artifact with none, it is a `mur install` hint. Run `mur install` first to fetch missing artifacts.
 
 Current runtime constraints:
 

@@ -103,12 +103,12 @@ section that explains it.
 | `E-ROS-008` | A `reachability` rule lists the entry member in `to` | [E-ROS-008](#e-ros-008) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry that pins per-platform hashes (`sha256.platforms`), or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry that pins per-platform hashes (`sha256.platforms`), or a malformed `origin` / `session` pair. For a missing entry, the hint lists the installed artifacts with a close name | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
 | `E-RUN-007` | Agent loop failed at runtime | — |
-| `E-RUN-008` | Required artifact not installed locally | [`mur run`](cli.md#mur-run) |
+| `E-RUN-008` | Required artifact not installed locally. The hint lists the installed artifacts with a close name | [`mur run`](cli.md#mur-run) |
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read. For an installed capsule the path is shown as `<scope>/<name>@<version>!/<entry>`, and a missing entry means the package was built without the file | [Paths a manifest names](manifest.md#manifest-relative-paths) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
@@ -276,6 +276,14 @@ scoped forms — see [Artifact names](../concepts/registry.md#artifact-names):
 ```text
 error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'tool-edit' is not a full artifact name: an artifact is named <scope>/<name>
   hint: name it with its scope: 'murmur/tool-edit' for a Murmur default artifact, '<owner>/tool-edit' for one published from github.com/<owner>, or 'local/tool-edit' for one installed from a .mur.zip file
+```
+
+When an installed artifact has a close name, `mur run` and `mur install` name it in the hint
+instead, with its full name and installed versions:
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'tool-edit' is not a full artifact name: an artifact is named <scope>/<name>
+  hint: installed under a close name: local/tool-edit (0.6.0) — name it 'local/tool-edit' in murmur.yaml; an artifact installed from a .mur.zip file is named local/<name>
 ```
 
 | Manifest | Refused because |

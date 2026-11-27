@@ -94,6 +94,29 @@ pub(crate) fn fail_run(session_id: &str, workdir: &Path, error: CliError) -> Cli
     error
 }
 
+/// [`runtime_manifest_error_to_cli`], except that a bare name in a field that takes a full name
+/// is refused with a hint naming the installed artifacts close to it, when any is: the project
+/// store under `project_root`, the global store and `project_root`'s `murmur.lock`, read best
+/// effort. The message and code are unchanged.
+pub(crate) fn manifest_error_naming_installed(
+    error: RuntimeManifestError,
+    project_root: &Path,
+) -> CliError {
+    if let RuntimeManifestError::InvalidArtifactName {
+        unscoped: Some(bare),
+        ..
+    } = &error
+    {
+        let lock = read_lockfile(&project_root.join("murmur.lock")).ok();
+        let installed = crate::stores::installed_names(project_root, lock.as_ref());
+        if let Some(hint) = crate::stores::close_names_hint(bare, &installed) {
+            let generic = runtime_manifest_error_to_cli(error);
+            return CliError::with_hint(generic.code, generic.message, hint);
+        }
+    }
+    runtime_manifest_error_to_cli(error)
+}
+
 pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliError {
     match error {
         RuntimeManifestError::NotFound(path) => {
@@ -156,11 +179,13 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             field,
             message,
             hint,
+            unscoped,
         } => {
             let message = RuntimeManifestError::InvalidArtifactName {
                 field,
                 message,
                 hint: None,
+                unscoped,
             }
             .to_string();
             match hint {

@@ -58,6 +58,10 @@ the bare name:
 | A `source:` entry in `artifacts:` | `- name: style` with `source: ./skills/style` |
 | Inside a session: the tool name the model calls, `tools/<name>/` in the [runtime directory](../reference/workdir.md#runtime-directory), skill names in `MURMUR.md` | `tool-git` |
 
+A name in `murmur.yaml` that matches nothing installed is refused with a hint listing the
+installed artifacts with a close name, so `my-tool` or `murmur/my-tool` after
+`mur install ./my-tool-1.0.0.mur.zip` points at `local/my-tool`.
+
 Because a session names each artifact by its bare name, two artifacts a capsule declares cannot
 share one: `murmur/tool-edit` and `ana/tool-edit` together are refused with
 [`E-CAP-020`](../reference/diagnostics.md#e-cap-020).

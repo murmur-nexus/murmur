@@ -156,6 +156,11 @@ pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
      gateway.keyless: true if this upstream takes no key — the runtime never infers keylessness \
      from the address";
 
+/// The hint on `E-RUN-003` when no installed artifact has a name close to the one `murmur.lock`
+/// has no entry for.
+pub(crate) const LOCK_MISSING_ENTRY_HINT: &str =
+    "run `mur install` to install and pin every artifact murmur.yaml declares";
+
 /// The hint on `E-MAN-003` for `lifecycle.queue_depth: 0` under `task_acceptance: queue` in the
 /// manifest itself.
 pub(crate) const QUEUE_WITHOUT_ROOM_HINT: &str =
@@ -549,9 +554,10 @@ impl From<RuntimeError> for CliError {
                 format!("artifact integrity check failed for {name}@{version}"),
                 "artifact on disk does not match murmur.lock — re-publish or delete the lock",
             ),
-            RuntimeError::LockMissingEntry { name } => CliError::new(
+            RuntimeError::LockMissingEntry { name } => CliError::with_hint(
                 E_RUN_003,
                 format!("murmur.lock missing artifact entry for '{name}'"),
+                LOCK_MISSING_ENTRY_HINT,
             ),
             RuntimeError::LockVersionMismatch {
                 name,
