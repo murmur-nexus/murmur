@@ -36,6 +36,7 @@ use crate::{
     stores::FallbackRegistry,
 };
 
+use super::run_output::{check_output_lifecycle, OutputFile};
 use super::{
     fail_run, locked_sha256, lockfile_error_to_cli, print_run_output,
     runtime_manifest_error_to_cli, RunStatus,
@@ -132,6 +133,7 @@ pub(crate) fn run_run(
     store_root_arg: Option<&Path>,
     spawn_grant_stdin: bool,
     task_arg: Option<&str>,
+    output_arg: Option<&Path>,
     system_prompt_arg: Option<&str>,
     deadline_arg: Option<u64>,
     inherited_deadline_arg: Option<u64>,
@@ -164,6 +166,13 @@ pub(crate) fn run_run(
     let mut workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("/"))
         .join("workdir");
+
+    // Ahead of every refusal below, so a stale answer from an earlier run is gone whatever this
+    // run ends with: the file exists afterwards only if this run's task completed.
+    let output = output_arg
+        .map(|arg| OutputFile::prepare(arg, task_arg))
+        .transpose()
+        .map_err(|error| fail(&session_id, &workdir, error, json))?;
 
     // `--capsule NAME --capsule-version VERSION` runs an installed artifact rather than a project
     // directory: the manifest, and every relative path it names, are read from the artifact's own
@@ -455,6 +464,16 @@ pub(crate) fn run_run(
         &workdir,
         json,
     )?;
+
+    // A session that can run a task after the --task one would leave that task's answer in
+    // out/result.txt. A script capsule runs once, so it has no lifecycle to check.
+    if output.is_some() && runtime_manifest.inference.is_some() {
+        check_output_lifecycle(
+            runtime_manifest.lifecycle.as_ref(),
+            lifecycle_override.as_ref(),
+        )
+        .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    }
 
     // The one grant whose value murmur never sees: `capabilities.env.allow` hands a capsule a host
     // secret nothing here brokers. Emitted at this seam for the same reasons as the ignored-key
@@ -1108,6 +1127,7 @@ pub(crate) fn run_run(
         Vec::new()
     };
     let formation_id = staged.formation_id().cloned();
+    let script = runtime_manifest.inference.is_none();
 
     if json {
         let session_id_for_closure = session_id.clone();
@@ -1149,7 +1169,12 @@ pub(crate) fn run_run(
             }
         })
         .map_err(CliError::from)
-        .and_then(|launched| deadline_outcome(launched.ending, session_deadline))
+        .and_then(|launched| {
+            if let (LaunchEnding::Completed, Some(output)) = (launched.ending, &output) {
+                output.deliver(&launched.records_dir, &launched.workdir, script)?;
+            }
+            deadline_outcome(launched.ending, session_deadline)
+        })
     } else {
         // Capture fields for the startup closure before `staged` is consumed by launch_session.
         let session_id_for_startup = session_id.clone();
@@ -1201,11 +1226,20 @@ pub(crate) fn run_run(
             }
         }) {
             Ok(launched) => {
-                print_run_output(
-                    &launched.session_id,
-                    &launched.workdir,
-                    run_status_for_ending(launched.ending),
-                );
+                let status = run_status_for_ending(launched.ending);
+                if let (RunStatus::Success, Some(output)) = (status, &output) {
+                    if let Err(error) =
+                        output.deliver(&launched.records_dir, &launched.workdir, script)
+                    {
+                        print_run_output(
+                            &launched.session_id,
+                            &launched.workdir,
+                            RunStatus::Failed,
+                        );
+                        return Err(error);
+                    }
+                }
+                print_run_output(&launched.session_id, &launched.workdir, status);
                 deadline_outcome(launched.ending, session_deadline)
             }
             Err(error) => {

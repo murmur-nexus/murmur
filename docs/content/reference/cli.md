@@ -101,6 +101,7 @@ loses its key.
 | `ps --json` | 1 | [`mur ps --json`](#mur-ps-json) |
 | `run --explain-scope --json` | 2 | The `--explain-scope` row of [`mur run`](#mur-run) |
 | `run --json` | 1 | [Readiness line](#mur-run-json) |
+| `run --output` | 1 | The `--output` row of [`mur run`](#mur-run) |
 | `run --roster --json` | 1 | [Launching a formation](#mur-run-roster) |
 | `token` | 1 | [`mur token`](#mur-token): standard output is the token |
 | `trace attach --json` | 1 | [`mur trace attach`](#mur-trace-attach) |
@@ -1875,7 +1876,7 @@ A setup failure (no project or formation directory found, the manifest fails to 
 Run capsule component and resolve declared artifacts.
 
 ```bash
-mur run [--manifest <path>] [--task <path-or-text>] [--json]
+mur run [--manifest <path>] [--task <path-or-text>] [--output <file>] [--json]
 mur run --roster [<path>] [--task <path-or-text>] [--json]
 ```
 
@@ -1887,6 +1888,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
 | `--task` | — | Written as `task.md` in the session's [runtime directory](workdir.md#runtime-directory) before launch; the workdir is left alone. An existing file path is copied; any other value is written verbatim as UTF-8 text |
+| `--output` | — | File the task's answer is written to. Written only when the run ends `status: ok`: the exact bytes of the session's `out/result.txt`, with nothing trimmed or added, renamed into place in one step. A regular file already at the path is removed before anything else, so every other status and every refusal leaves no file there. A relative path is resolved against the current directory. Requires `--task`, and cannot be combined with `--roster` or `--explain-scope`. Refused with `E-IO-003` before anything is staged when the capsule declares or is given `lifecycle.task_acceptance: queue` or `lifecycle.after_task: sleep`, and when the path is a directory, a symbolic link or not a regular file, its parent directory is missing, or it is the file `--task` names. A script capsule's answer is the `out/result.txt` it writes in its work folder. A task that completed but whose answer cannot be written ends `status: failed` with `E-IO-003`, naming the records file that still holds the answer |
 | `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
 | `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). The session continued is the one the trace's own `session_start` line names, so a `trace.jsonl` copied into a folder of any name resumes as the session it records; a trace with no `session_start` resumes under its directory's name. Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes. [`mur trace show`](#mur-trace-show) over that same file skips the torn last line and says so |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
@@ -2042,6 +2044,10 @@ and leaves the launch's status alone. The first deciding task that did not compl
 status, and no later run replaces it. The trace's `session_end.exit_status` carries the same value.
 
 `--json` prints no `status:` line; the exit code and error are the same.
+
+With [`--output`](#mur-run), the file exists after the run only for `status: ok`; after every
+other status it is absent. The session's own `out/result.txt` still holds `error: …` or
+`canceled: …` for a person reading the records.
 
 ### A closed stream { #mur-run-closed-stream }
 
