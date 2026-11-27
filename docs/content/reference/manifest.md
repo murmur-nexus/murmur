@@ -1547,6 +1547,7 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `trace.retain.max_sessions` | integer ≥ 1 | no | Sessions to keep in the running session's records group, counting the running session itself. The rest are removed whole: the records directory, with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>`. On an entry member, also the project's formation directories to keep, counting the current formation's. |
 | `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 | `trace.sync` | `line`, or a duration | no | No default. When each line of `trace.jsonl` is synced to disk, so it survives the host going down. A duration is an integer, optionally suffixed `s`/`m`/`h`/`d`; a bare integer is seconds. `0` and any other value are refused with [`E-MAN-003`](diagnostics.md#e-man-003). Omitted, no sync call is made. See [Syncing the trace](#trace-sync). |
+| `trace.records` | `full \| light` | no | Default: `full`. How much each session keeps in its [records directory](workdir.md#records-directory) besides its events. Any other value is refused with [`E-MAN-003`](diagnostics.md#e-man-003). See [Light records](#trace-records). |
 
 | `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `network_request` body hashes | `blobs/` | `tool_call.output` |
 |---|---|---|---|---|---|
@@ -1593,6 +1594,52 @@ file's own directory entry is on disk. The
   into an earlier session's trace. That line is not synced, whatever either capsule sets.
 - Killing the process. A `SIGKILL` loses no written line with or without the field, because the
   kernel holds the lines. The field makes them survive a power loss or a kernel panic.
+
+##### Light records { #trace-records }
+
+`trace.records: light` makes each session's record smaller. It drops two things:
+
+| Dropped under `light` | Kept in its place |
+|---|---|
+| `session_start.effective_grants`, the whole grant set | `session_start.effective_grants_sha256`, the grant set's SHA-256 |
+| The records directory's `home/` and `tmp/`, when they are empty at session end | Nothing. A `home/` or `tmp/` that holds anything is kept with its contents. |
+
+Everything else is written as under `full`:
+
+| Kept under `light` | |
+|---|---|
+| Every other event, and every other `session_start` field | Including the top-level `containment_declared`, `containment_achieved`, `workdir_exec` and `userns_grant` |
+| `unconfined` | On an unconfined session, `effective_grants.unconfined` is written at the top level of `session_start`, so [`mur trace show`](cli.md#mur-trace-show) still says whom its commands ran as |
+| `out/`, `logs/`, `blobs/`, `children/`, `hooks/`, `completion.json` | Unchanged |
+| The `prev_hash` chain and `trace.jsonl.seal` | Unchanged; [`mur trace verify`](cli.md#mur-trace-verify) checks a light record the same way |
+
+How a reader tells a light record from a full one:
+
+| `session_start` | Record |
+|---|---|
+| `trace_records: "light"`, `effective_grants_sha256`, no `effective_grants` | Light |
+| No `trace_records` key, `effective_grants` object | Full |
+
+`trace_records` is part of the chained and sealed `session_start` line, so a light record cannot be
+passed off as a full one without failing `mur trace verify`. `mur trace show` prints
+`records:     light (grant set kept as sha256 <first 12 hex>…)` for a light record and no
+`records:` line for a full one.
+
+`effective_grants_sha256` is the lowercase hex SHA-256 of the exact bytes a full session of the
+same capsule on the same host writes as the value of `effective_grants`: the compact JSON object,
+keys in the order `session_start` writes them. [`mur run --explain-scope --json`](cli.md#mur-run)
+prints that object on one line; its SHA-256 without the trailing newline is the digest:
+
+```sh
+mur run --manifest murmur.yaml --explain-scope --json | head -c -1 | sha256sum
+```
+
+| Case | Effect |
+|---|---|
+| The session is killed outright (`SIGKILL`, a forced exit) | `home/` and `tmp/` are kept, empty or not |
+| `trace.capture` | Independent. Pair `light` with `trace.capture: none` for the smallest record. |
+| `trace.retain` | Independent. `trace.retain` removes whole sessions at a later launch; `trace.records` makes each session's record smaller. |
+| A delegated child or a formation member | Follows its own manifest's `trace.records` |
 
 #### `lifecycle` { #field-lifecycle }
 
@@ -2825,6 +2872,9 @@ Three stores grow as capsules run:
 | [Formation directories](roster.md#formation-retention) under `~/.murmur/formations/`, each with its records subtree under `~/.murmur/records/` | The roster entry member's `trace.retain` | At the end of every `mur run --roster`, by the launcher | A `[mur run] retention:` line on the launcher's stderr |
 
 **There are no defaults. A capsule with no `retain:` block deletes nothing, ever.**
+
+`trace.retain` removes whole sessions at a later launch. [`trace.records: light`](#trace-records)
+makes each session's record smaller as it is written.
 
 | Rule | Effect |
 |---|---|

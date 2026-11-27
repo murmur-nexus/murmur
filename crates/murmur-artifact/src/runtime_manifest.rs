@@ -10,7 +10,9 @@ use crate::{
     manifest::{REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE},
     manifest_path::MANIFEST_FILENAME,
     shell_words::split_shell_words,
-    trace_capture::{resolve_trace_capture, TraceCapture},
+    trace_capture::{
+        resolve_trace_capture, TraceCapture, TraceRecords, TRACE_RECORDS_ACCEPTED_VALUES,
+    },
     unknown_manifest_keys::{nearest_known_key, UnknownManifestKey},
 };
 
@@ -1477,6 +1479,11 @@ pub struct TraceConfig {
     /// resolved from `trace.sync`. `None` — the key was absent — makes no sync call: lines reach
     /// the disk whenever the kernel writes them back. There is no default.
     pub sync: Option<TraceSync>,
+    /// How much of the records directory this session keeps — resolved from `trace.records`.
+    /// [`TraceRecords::Light`] replaces `session_start.effective_grants` with its SHA-256
+    /// (`effective_grants_sha256`) and removes `home/` and `tmp/` at session end when they are
+    /// empty. Absent is [`TraceRecords::Full`].
+    pub records: TraceRecords,
 }
 
 /// The `trace.sync` setting: when a `trace.jsonl` line is on disk, so that it survives the host
@@ -2498,6 +2505,10 @@ struct RawTraceConfig {
     /// and `sync:` with nothing under it is refused there rather than read as absent.
     #[serde(default, deserialize_with = "present_yaml_value")]
     sync: Option<serde_norway::Value>,
+    /// Untyped so a block, a list and `records:` with nothing under it reach
+    /// [`parse_trace_records`] and are refused naming the field, rather than read as absent.
+    #[serde(default, deserialize_with = "present_yaml_value")]
+    records: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3280,7 +3291,7 @@ impl RawBlock for RawObservabilityConfig {
 }
 
 impl RawBlock for RawTraceConfig {
-    const KNOWN_KEYS: &'static [&'static str] = &["capture", "retain", "sync"];
+    const KNOWN_KEYS: &'static [&'static str] = &["capture", "retain", "sync", "records"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -4261,10 +4272,12 @@ impl RuntimeManifest {
                 let capture = resolve_trace_capture(raw_trace.capture.as_deref())?;
                 let retain = parse_trace_retain(raw_trace.retain)?;
                 let sync = parse_trace_sync(raw_trace.sync)?;
+                let records = parse_trace_records(raw_trace.records)?;
                 Ok::<_, RuntimeManifestError>(TraceConfig {
                     capture,
                     retain,
                     sync,
+                    records,
                 })
             })
             .transpose()?;
@@ -6684,6 +6697,33 @@ fn parse_trace_sync(
     Ok(Some(TraceSync::Interval { secs }))
 }
 
+/// Resolves `trace.records`: `full` or `light`. Absent is [`TraceRecords::Full`];
+/// `records:` with nothing under it, a block, a list and any other text are refused naming the
+/// field and both accepted values.
+fn parse_trace_records(
+    raw: Option<serde_norway::Value>,
+) -> Result<TraceRecords, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(TraceRecords::Full);
+    };
+    let shown = match scalar_text(&raw) {
+        Some(text) if text == "full" => return Ok(TraceRecords::Full),
+        Some(text) if text == "light" => return Ok(TraceRecords::Light),
+        Some(text) => text,
+        None => match &raw {
+            serde_norway::Value::Null => String::new(),
+            other => format!("{other:?}"),
+        },
+    };
+    Err(RuntimeManifestError::InvalidTraceConfig {
+        field: "trace.records".into(),
+        message: format!(
+            "must be one of: {}; got '{shown}'",
+            TRACE_RECORDS_ACCEPTED_VALUES.join(", ")
+        ),
+    })
+}
+
 fn parse_context_retain(
     raw: Option<serde_norway::Value>,
 ) -> Result<Option<ContextRetainConfig>, RuntimeManifestError> {
@@ -7415,6 +7455,7 @@ mod tests {
                     capture: expected,
                     retain: None,
                     sync: None,
+                    records: TraceRecords::Full,
                 })
             );
         }
@@ -7732,6 +7773,84 @@ mod tests {
     #[test]
     fn trace_sync_is_a_known_key() {
         assert!(unknown_keys_of("name: cap\nversion: 0.1.0\ntrace:\n  sync: line\n").is_empty());
+    }
+
+    // ── records ──────────────────────────────────────────────────────────────
+
+    fn trace_records_of(line: &str) -> Result<TraceRecords, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n{line}"
+        ))
+        .map(|manifest| manifest.trace.unwrap().records)
+    }
+
+    #[test]
+    fn trace_records_absent_is_full() {
+        assert_eq!(trace_records_of("").unwrap(), TraceRecords::Full);
+        assert_eq!(TraceRecords::default(), TraceRecords::Full);
+    }
+
+    #[test]
+    fn trace_records_accepts_full_and_light() {
+        assert_eq!(
+            trace_records_of("  records: full\n").unwrap(),
+            TraceRecords::Full
+        );
+        assert_eq!(
+            trace_records_of("  records: light\n").unwrap(),
+            TraceRecords::Light
+        );
+        assert_eq!(TraceRecords::Full.as_str(), "full");
+        assert_eq!(TraceRecords::Light.as_str(), "light");
+    }
+
+    #[test]
+    fn trace_records_alone_is_a_valid_trace_block() {
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\ntrace: {records: light}\n")
+                .expect("a trace block holding only records must parse");
+        assert_eq!(
+            manifest.trace,
+            Some(TraceConfig {
+                capture: TraceCapture::Meta,
+                retain: None,
+                sync: None,
+                records: TraceRecords::Light,
+            })
+        );
+        assert!(manifest.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn trace_records_refuses_other_text_blocks_lists_and_empty() {
+        for (line, shown) in [
+            ("  records: heavy\n", "got 'heavy'"),
+            ("  records:\n", "got ''"),
+            ("  records:\n    level: light\n", "level"),
+            ("  records: [light]\n", "Sequence"),
+        ] {
+            match trace_records_of(line) {
+                Err(RuntimeManifestError::InvalidTraceConfig { field, message }) => {
+                    assert_eq!(field, "trace.records", "{line:?}");
+                    assert!(message.contains(shown), "{line:?}: {message}");
+                    for accepted in TRACE_RECORDS_ACCEPTED_VALUES {
+                        assert!(message.contains(accepted), "{line:?}: {message}");
+                    }
+                }
+                other => panic!("{line:?}: expected a trace.records refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn trace_records_is_a_known_key_and_a_typo_of_it_is_not() {
+        assert!(
+            unknown_keys_of("name: cap\nversion: 0.1.0\ntrace:\n  records: light\n").is_empty()
+        );
+        let typo = unknown_keys_of("name: cap\nversion: 0.1.0\ntrace: {recrods: light}\n");
+        assert_eq!(typo.len(), 1, "{typo:?}");
+        assert_eq!(typo[0].0, "recrods");
+        assert_eq!(typo[0].2.as_deref(), Some("records"));
     }
 
     #[test]

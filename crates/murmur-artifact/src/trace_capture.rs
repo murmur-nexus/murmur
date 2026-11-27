@@ -99,6 +99,41 @@ pub fn resolve_trace_capture(capture: Option<&str>) -> Result<TraceCapture, Runt
     )
 }
 
+/// The `trace.records` values a manifest may name, in the order this crate reports them.
+pub const TRACE_RECORDS_ACCEPTED_VALUES: &[&str] = &["full", "light"];
+
+/// How much of the records directory a session keeps beyond its events — resolved from
+/// `trace.records`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TraceRecords {
+    /// `session_start` carries the whole `effective_grants` object, and `home/` and `tmp/` are
+    /// kept after the session ends. The default.
+    #[default]
+    Full,
+    /// `session_start` carries `effective_grants_sha256` — the SHA-256 of the bytes a full
+    /// session writes as `effective_grants` — and `trace_records: "light"` instead of the object,
+    /// and `home/` and `tmp/` are removed at session end when they are empty. Every other event,
+    /// field and file is written as under [`Self::Full`].
+    Light,
+}
+
+impl TraceRecords {
+    /// The YAML spelling of this level — the string `trace.records` accepts for it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Light => "light",
+        }
+    }
+
+    /// Whether this is [`Self::Light`].
+    #[must_use]
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -730,6 +730,23 @@ impl WorkdirRoot {
             .map_err(|errno| self.io(&rel, errno.into()))
     }
 
+    /// Removes the directory `rel` only if it is empty: one `unlinkat(…, AT_REMOVEDIR)` from its
+    /// parent's descriptor, which the kernel refuses (`ENOTEMPTY`) on a directory holding
+    /// anything, so nothing beneath it is ever deleted. `Ok(())` when `rel` is absent. A link at
+    /// `rel` is neither followed nor removed (`ENOTDIR`); a link at a parent is refused.
+    pub fn remove_empty_dir(&self, rel: impl AsRef<Path>) -> Result<(), WorkdirError> {
+        let rel = rel.as_ref().to_string_lossy();
+        let op = WorkdirOperation::Remove;
+        let (parent, name) = self.parent_of(&rel, op, false)?;
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        match rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(errno) => Err(self.io(&rel, errno.into())),
+        }
+    }
+
     /// Removes the directory `rel` and everything in it, by descriptor: each child directory is
     /// opened no-follow from its parent's descriptor, so no part of the removal resolves a path
     /// from the root. A link at `rel` or at a parent is refused; a link inside is unlinked, not
@@ -1670,6 +1687,41 @@ mod tests {
             fixture.root.entry_kind(".process-driver").unwrap(),
             Some(EntryKind::Directory)
         );
+    }
+
+    #[test]
+    fn remove_empty_dir_removes_only_an_empty_directory_and_follows_no_link() {
+        let fixture = fixture();
+        std::fs::create_dir(fixture.workdir.join("empty")).unwrap();
+        fixture.root.remove_empty_dir("empty").unwrap();
+        assert!(!fixture.workdir.join("empty").exists());
+
+        std::fs::create_dir(fixture.workdir.join("full")).unwrap();
+        std::fs::write(fixture.workdir.join("full/kept"), b"data").unwrap();
+        let error = fixture.root.remove_empty_dir("full").unwrap_err();
+        assert!(
+            matches!(&error, WorkdirError::Io { source, .. }
+                if source.raw_os_error() == Some(Errno::NOTEMPTY.raw_os_error())),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.workdir.join("full/kept")).unwrap(),
+            b"data"
+        );
+
+        fixture.root.remove_empty_dir("missing").unwrap();
+
+        let target = fixture.outside.join("empty-target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, fixture.workdir.join("linked")).unwrap();
+        let before = fixture.outside_snapshot();
+        assert!(fixture.root.remove_empty_dir("linked").is_err());
+        assert!(target.is_dir());
+        assert!(std::fs::symlink_metadata(fixture.workdir.join("linked"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fixture.outside_snapshot(), before);
     }
 
     #[test]

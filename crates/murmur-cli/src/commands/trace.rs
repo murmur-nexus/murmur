@@ -321,9 +321,20 @@ struct SessionStartEvent {
     containment_declared: Option<String>,
     #[serde(default)]
     containment_achieved: Option<String>,
-    /// The scope report, read for its `unconfined` object alone.
+    /// The scope report, read for its `unconfined` object alone. Absent under
+    /// `trace.records: light`.
     #[serde(default)]
     effective_grants: Option<TraceGrants>,
+    /// `trace.records: light` only: the SHA-256 of the grant set a full record would carry.
+    #[serde(default)]
+    effective_grants_sha256: Option<String>,
+    /// `trace.records: light` only: an unconfined session's `effective_grants.unconfined`,
+    /// mirrored to the top level.
+    #[serde(default)]
+    unconfined: Option<TraceUnconfined>,
+    /// `"light"` under `trace.records: light`; absent on a full record.
+    #[serde(default)]
+    trace_records: Option<String>,
     #[serde(default)]
     workdir_exec: Option<bool>,
     /// Where the host's permission to create an unprivileged user namespace came from;
@@ -1988,6 +1999,8 @@ struct TraceMetrics {
     containment_achieved: Option<String>,
     /// Who an unconfined session's commands ran as; `None` on a contained one.
     unconfined: Option<TraceUnconfined>,
+    /// `effective_grants_sha256` of a light record; `None` on a full one.
+    light_grants_sha256: Option<String>,
     workdir_exec: Option<bool>,
     userns_grant: Option<String>,
     system_prompt_source: Option<String>,
@@ -3479,7 +3492,14 @@ fn compute_metrics(
             tools_declared: ss.tools_declared,
             containment_declared: ss.containment_declared,
             containment_achieved: ss.containment_achieved,
-            unconfined: ss.effective_grants.and_then(|grants| grants.unconfined),
+            unconfined: match ss.effective_grants {
+                Some(grants) => grants.unconfined,
+                None => ss.unconfined,
+            },
+            light_grants_sha256: match ss.trace_records.as_deref() {
+                Some("light") => Some(ss.effective_grants_sha256.unwrap_or_default()),
+                _ => None,
+            },
             workdir_exec: ss.workdir_exec,
             userns_grant: ss.userns_grant,
             system_prompt_source: ss.system_prompt_source,
@@ -4057,6 +4077,14 @@ fn print_show(m: &TraceMetrics) {
             "containment:",
             declared,
             achieved
+        );
+    }
+    // A light record keeps the grant set only as its digest.
+    if let Some(sha) = &m.light_grants_sha256 {
+        capsule_runtime::report_println!(
+            "{:<11} light (grant set kept as sha256 {})",
+            "records:",
+            fmt_sha_short(sha)
         );
     }
     if let Some(exec) = m.workdir_exec {
@@ -7669,6 +7697,45 @@ mod tests {
         let path = dir.path().join("trace.jsonl");
         std::fs::write(&path, lines).unwrap();
         (dir, path)
+    }
+
+    /// A light record's top-level `unconfined` stands in for `effective_grants.unconfined`, and
+    /// only a light record carries the digest `mur trace show` prints on its `records:` line.
+    #[test]
+    fn trace_show_reads_a_light_records_digest_and_unconfined_mirror() {
+        let sha = "ab".repeat(32);
+        let start = |extra: &str| {
+            format!(
+                r#"{{"event_type":"session_start","session_id":"ses_child","timestamp":1791000000000,"capsule_name":"worker","capsule_version":"0.1.0","model":"m","max_turns":5{extra}}}"#
+            )
+        };
+        let light_unconfined = start(&format!(
+            r#","effective_grants_sha256":"{sha}","unconfined":{{"user":"dev","uid":1000,"home":"/home/dev"}},"trace_records":"light""#
+        ));
+        let (_dir, path) = trace_of(&format!("{light_unconfined}\n{UNENDED_TURN}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(metrics.light_grants_sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            metrics.unconfined,
+            Some(TraceUnconfined {
+                user: Some("dev".to_string()),
+                home: Some("/home/dev".to_string()),
+            })
+        );
+
+        let light_contained = start(&format!(
+            r#","effective_grants_sha256":"{sha}","trace_records":"light""#
+        ));
+        let (_dir, path) = trace_of(&format!("{light_contained}\n{UNENDED_TURN}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(metrics.light_grants_sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(metrics.unconfined, None);
+
+        let full = start(r#","effective_grants":{"unconfined":null}"#);
+        let (_dir, path) = trace_of(&format!("{full}\n{UNENDED_TURN}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(metrics.light_grants_sha256, None);
+        assert_eq!(metrics.unconfined, None);
     }
 
     /// `spend_tokens` of a trace holding `UNENDED_START` and then `lines`.
