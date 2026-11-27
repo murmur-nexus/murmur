@@ -124,7 +124,33 @@ runtime:
    [`io_max`](resource-limits.md#io-max-report) and by
    [`W-SEC-021`](diagnostics.md#w-sec-021));
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
-   from inside its `pre_exec`, before `execve`.
+   from inside its `pre_exec`, before `execve`;
+6. for a session with guest workers, creates the guest-worker cgroup,
+   `<base>/murmur-<session_id>-workers-<pid>-<n>`, before the first worker starts, with the same
+   `memory.max`, `memory.swap.max`, `pids.max` and `cpu.max` writes (all fatal) and no `io.max`;
+   each worker and its relay write their pid to its `cgroup.procs` the same way. Created at
+   staging, so its serial `<n>` is lower than the session cgroup's.
+
+The resulting layout, with `mur` outside every declared limit (see
+[What the cgroup limits bound](resource-limits.md#cgroup-placement)):
+
+| cgroup | Holds |
+|---|---|
+| `<base>/murmur-supervisor` | `mur`, its scope watchers, the session's network-namespace holders |
+| `<base>/murmur-<session_id>-<pid>-<n>` | shell commands, `murmur:process` programs and their descendants |
+| `<base>/murmur-<session_id>-workers-<pid>-<n>` | the `driver`, `tools` and `hooks` guest workers and their relays |
+
+To check it on a running shell-granted capsule that declares `cgroup_memory_bytes: 268435456` and
+`cgroup_pids_max: 64`:
+
+```bash
+P=$(pgrep -n -x mur)
+cat /proc/$P/cgroup                    # expected: …/murmur-supervisor
+for w in $(pgrep -f "__guest-worker"); do cat /proc/$w/cgroup; done
+# expected: …/murmur-<session_id>-workers-<pid>-<n> for every worker
+W=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/$(pgrep -n -f "__guest-worker driver")/cgroup)
+cat $W/memory.max $W/pids.max          # expected: 268435456 and 64
+```
 
 A delegated parent can be built by hand without root, for checking adoption on a desktop host: a
 transient delegated scope entered through a user, mount and cgroup namespace, so the scope is the
@@ -141,7 +167,8 @@ systemd-run --user --scope -q -p Delegate=yes -- \
     mur run --manifest murmur.yaml --task "Report and stop." & P=$!
     sleep 2; cat /proc/$P/cgroup; wait $P
     find /sys/fs/cgroup -name "murmur-*-p"'
-# expected: 0::/murmur-<pid>-p/murmur-supervisor while it runs, the launch exits 0, and the
+# expected: 0::/murmur-<pid>-p/murmur-supervisor while it runs (its guest workers in
+#   murmur-<pid>-p/murmur-<session_id>-workers-<pid>-<n>), the launch exits 0, and the
 #   final find prints nothing
 ```
 

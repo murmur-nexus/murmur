@@ -586,9 +586,17 @@ impl ResourcesReport {
     }
 
     /// The `Resources` block of `--explain-scope`: one `<key>: <value> (declared|default)` line
-    /// per field, `<none>` for a value that sets no limit. Ends with a newline.
+    /// per field, `<none>` for a value that sets no limit, each followed by an indented `bounds:`
+    /// line naming the processes that field bounds on this host ([`resource_bounds`]).
+    /// `unconfined` is whether the session runs unconfined, which applies only declared fields.
+    /// Ends with a newline.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render(&self, unconfined: bool) -> String {
+        self.render_on(cfg!(target_os = "linux"), unconfined)
+    }
+
+    /// [`Self::render`] for a host that is (`linux`) or is not Linux.
+    fn render_on(&self, linux: bool, unconfined: bool) -> String {
         let mut out = String::from("Resources\n");
         for (key, row) in self.rows() {
             let value = row
@@ -596,8 +604,56 @@ impl ResourcesReport {
                 .map_or_else(|| "<none>".to_string(), |value| value.to_string());
             let source = if row.declared { "declared" } else { "default" };
             out.push_str(&format!("  {:<25}{value} ({source})\n", format!("{key}:")));
+            let bounds = if unconfined && !row.declared {
+                UNCONFINED_UNDECLARED_BOUNDS
+            } else {
+                resource_bounds(key, linux)
+            };
+            out.push_str(&format!("    bounds: {bounds}\n"));
         }
         out
+    }
+}
+
+/// The `bounds:` line of a field an unconfined session leaves undeclared.
+const UNCONFINED_UNDECLARED_BOUNDS: &str =
+    "nothing: this session runs unconfined and applies only the fields it declares";
+
+/// The `bounds:` line of a `cgroup_*` field off Linux.
+const NO_CGROUPS_BOUNDS: &str = "nothing: cgroups do not exist on this host";
+
+/// Which processes the `capabilities.resources` field `key` bounds, as the `bounds:` line under
+/// its row of `--explain-scope` states it: per-process rlimits for the first six, the session
+/// cgroup and the guest-worker cgroup (`cgroup::prepare_worker_scope`) for the `cgroup_*` fields,
+/// except `cgroup_io_bytes_per_sec`, which is on the session cgroup only. `mur` itself is bounded
+/// by none of them.
+#[must_use]
+pub fn resource_bounds(key: &str, linux: bool) -> &'static str {
+    match key {
+        "memory_bytes" => {
+            "each shell command and murmur:process program on its own (address space); not \
+             guest workers or mur"
+        }
+        "workdir_max_bytes" => "the work folder, $HOME and $TMPDIR together, whoever writes them",
+        "max_open_files" | "max_file_size_bytes" => {
+            "each shell command, murmur:process program and guest worker on its own"
+        }
+        "max_processes" => {
+            "each shell command and murmur:process program on its own, only where it joins no \
+             cgroup; not guest workers"
+        }
+        "cpu_seconds" => {
+            "each shell command and murmur:process program on its own; not guest workers or mur"
+        }
+        "cgroup_memory_bytes" | "cgroup_pids_max" | "cgroup_cpu_percent" if linux => {
+            "the session cgroup (shell commands, murmur:process programs and what they start) \
+             and the guest-worker cgroup (guest workers), each on its own; not mur"
+        }
+        "cgroup_io_bytes_per_sec" if linux => {
+            "the session cgroup only (shell commands, murmur:process programs and what they \
+             start); not guest workers or mur"
+        }
+        _ => NO_CGROUPS_BOUNDS,
     }
 }
 
@@ -1837,28 +1893,92 @@ mod tests {
     }
 
     /// The text block: one aligned `<key>: <value> (<source>)` line per field, `<none>` for an
-    /// unset CPU field.
+    /// unset CPU field, each followed by the `bounds:` line naming what the field bounds.
     #[test]
     fn resources_report_renders_one_line_per_field() {
         let declared = murmur_artifact::ResourceCapabilities {
             memory_bytes: Some(68_719_476_736),
             ..Default::default()
         };
-        let rendered =
-            ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared).render();
-        assert_eq!(
-            rendered,
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let cgroups = "the session cgroup (shell commands, murmur:process programs and what they \
+                       start) and the guest-worker cgroup (guest workers), each on its own; not \
+                       mur";
+        let expected = format!(
             "Resources\n\
              \x20 memory_bytes:            68719476736 (declared)\n\
+             \x20   bounds: each shell command and murmur:process program on its own (address \
+             space); not guest workers or mur\n\
              \x20 workdir_max_bytes:       10737418240 (default)\n\
+             \x20   bounds: the work folder, $HOME and $TMPDIR together, whoever writes them\n\
              \x20 max_open_files:          1024 (default)\n\
+             \x20   bounds: each shell command, murmur:process program and guest worker on its \
+             own\n\
              \x20 max_file_size_bytes:     4294967296 (default)\n\
+             \x20   bounds: each shell command, murmur:process program and guest worker on its \
+             own\n\
              \x20 max_processes:           128 (default)\n\
+             \x20   bounds: each shell command and murmur:process program on its own, only where \
+             it joins no cgroup; not guest workers\n\
              \x20 cpu_seconds:             <none> (default)\n\
+             \x20   bounds: each shell command and murmur:process program on its own; not guest \
+             workers or mur\n\
              \x20 cgroup_memory_bytes:     4294967296 (default)\n\
+             \x20   bounds: {cgroups}\n\
              \x20 cgroup_pids_max:         256 (default)\n\
+             \x20   bounds: {cgroups}\n\
              \x20 cgroup_cpu_percent:      <none> (default)\n\
-             \x20 cgroup_io_bytes_per_sec: 104857600 (default)\n"
+             \x20   bounds: {cgroups}\n\
+             \x20 cgroup_io_bytes_per_sec: 104857600 (default)\n\
+             \x20   bounds: the session cgroup only (shell commands, murmur:process programs and \
+             what they start); not guest workers or mur\n"
         );
+        assert_eq!(report.render_on(true, false), expected);
+        #[cfg(target_os = "linux")]
+        assert_eq!(report.render(false), expected);
+    }
+
+    /// Off Linux the four `cgroup_*` rows say cgroups do not exist; the rlimit rows are unchanged.
+    #[test]
+    fn resources_report_off_linux_bounds_no_cgroup() {
+        let declared = murmur_artifact::ResourceCapabilities::default();
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let rendered = report.render_on(false, false);
+        let bounds: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("    bounds: "))
+            .collect();
+        assert_eq!(bounds.len(), 10, "{rendered}");
+        assert_eq!(&bounds[6..], &[NO_CGROUPS_BOUNDS; 4], "{rendered}");
+        assert_eq!(
+            bounds[0],
+            resource_bounds("memory_bytes", true),
+            "{rendered}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(report.render(false), rendered);
+    }
+
+    /// An unconfined session's undeclared fields bound nothing, and its declared ones bound what
+    /// they bound on a contained session.
+    #[test]
+    fn resources_report_unconfined_bounds_only_declared_fields() {
+        let declared = murmur_artifact::ResourceCapabilities {
+            cgroup_pids_max: Some(64),
+            ..Default::default()
+        };
+        let report = ResourcesReport::new(&HostResourceLimits::resolve(Some(&declared)), &declared);
+        let rendered = report.render_on(true, true);
+        let bounds: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("    bounds: "))
+            .collect();
+        for (index, bound) in bounds.iter().enumerate() {
+            if index == 7 {
+                assert_eq!(*bound, resource_bounds("cgroup_pids_max", true));
+            } else {
+                assert_eq!(*bound, UNCONFINED_UNDECLARED_BOUNDS, "{rendered}");
+            }
+        }
     }
 }

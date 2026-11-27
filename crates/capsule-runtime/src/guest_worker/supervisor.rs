@@ -179,6 +179,10 @@ pub(crate) struct WorkerConn {
     unresponsive: Mutex<Option<String>>,
     /// The session-wide loss latch this connection reports into.
     session_lost: Arc<Mutex<Option<String>>>,
+    /// The guest-worker cgroup the worker runs in, read for [`limit_suffix`] when it is lost or
+    /// refused. Weak, so the cgroup is removed when the session's `GuestWorkers` drops, after its
+    /// workers are reaped, whatever this connection's thread still holds.
+    worker_cgroup: std::sync::Weak<crate::cgroup::CgroupScope>,
     host_runtime: tokio::runtime::Handle,
     /// A frame tap for tests: every supervisor-to-worker frame, encoded.
     #[cfg(test)]
@@ -309,6 +313,15 @@ impl WorkerConn {
         }
         rx.await
             .unwrap_or_else(|_| Err(self.lost_or("the guest worker went away".to_string())))
+    }
+
+    /// [`limit_suffix`] for this worker's guest-worker cgroup, or `""` when it has none or the
+    /// cgroup is gone.
+    fn limit_suffix(&self) -> String {
+        self.worker_cgroup
+            .upgrade()
+            .and_then(|scope| scope.reached_limit())
+            .map_or_else(String::new, |(field, value)| limit_suffix(field, &value))
     }
 
     fn lost_or(&self, fallback: String) -> String {
@@ -663,20 +676,34 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
-/// The `E-RUN-065` text for a lost worker.
+/// The `E-RUN-065` text for a lost worker. `limit` is [`limit_suffix`]'s, or `""`.
 pub(crate) fn lost_message(
     kind: WorkerKind,
     pid: Option<u32>,
     call: Option<&str>,
     exit: &str,
+    limit: &str,
 ) -> String {
     let pid = pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
     let call = call.unwrap_or("no call");
     format!(
-        "the {kind} guest worker (pid {pid}) was lost while running {call}: it {exit}; the task \
-         failed and the session ended",
+        "the {kind} guest worker (pid {pid}) was lost while running {call}: it {exit}{limit}; the \
+         task failed and the session ended",
         kind = kind.as_str()
     )
+}
+
+/// What a lost or refused worker's message adds once its guest-worker cgroup's kernel counters
+/// show `field` (`cgroup_memory_bytes` or `cgroup_pids_max`, from
+/// [`crate::cgroup::CgroupScope::reached_limit`]) was reached, `value` being the limit the cgroup
+/// holds. Only workers live in that cgroup, so the counter is evidence about them.
+pub(crate) fn limit_suffix(field: &str, value: &str) -> String {
+    let unit = if field == "cgroup_memory_bytes" {
+        " bytes"
+    } else {
+        ""
+    };
+    format!("; the guest-worker cgroup reached capabilities.resources.{field} ({value}{unit})")
 }
 
 /// Each worker's guests by tool name: the id a guest has there once its hand-over finished.
@@ -769,6 +796,22 @@ impl GuestWorkers {
             .insert(kind, Arc::new(sandbox));
     }
 
+    /// The guest-worker cgroup `kind`'s sandbox joins, held weakly.
+    fn worker_cgroup(&self, kind: WorkerKind) -> std::sync::Weak<crate::cgroup::CgroupScope> {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&kind)
+            .and_then(|sandbox| {
+                sandbox
+                    .enforcement
+                    .cgroup_scope
+                    .as_ref()
+                    .map(Arc::downgrade)
+            })
+            .unwrap_or_default()
+    }
+
     /// Starts the worker of `kind` unless it is already started. Does not wait for it.
     pub(crate) fn start(self: &Arc<Self>, kind: WorkerKind) -> Arc<WorkerConn> {
         let mut conns = self
@@ -790,6 +833,7 @@ impl GuestWorkers {
             lost: Mutex::new(None),
             unresponsive: Mutex::new(None),
             session_lost: Arc::clone(&self.lost),
+            worker_cgroup: self.worker_cgroup(kind),
             host_runtime: self.host_handle.clone(),
             #[cfg(test)]
             tap: self.tap.clone(),
@@ -818,6 +862,15 @@ impl GuestWorkers {
                 // The worker is spawned from this thread, which lives as long as the connection, so
                 // its parent-death signal is tied to the connection's life.
                 let started = super::launch::start_worker(&launcher, kind, sandbox.as_deref());
+                // A worker forked into the session's PID namespace knows itself by a
+                // namespace-local pid; the process `spawn` returned is its relay, whose death
+                // takes the worker with it, so the relay is the pid this supervisor signals.
+                let behind_relay = sandbox
+                    .as_deref()
+                    .is_some_and(super::launch::WorkerSandbox::enters_pid_namespace);
+                // The sandbox holds the guest-worker cgroup: released here, so the cgroup goes
+                // with the session's `GuestWorkers` rather than with this thread.
+                drop(sandbox);
                 let (stream, child) = match started {
                     Ok(started) => started,
                     Err(reason) => {
@@ -843,13 +896,7 @@ impl GuestWorkers {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(child);
                 }
-                // A worker forked into the session's PID namespace knows itself by a
-                // namespace-local pid; the process `spawn` returned is its relay, whose death
-                // takes the worker with it, so the relay is the pid this supervisor signals.
-                let known_pid = if sandbox
-                    .as_deref()
-                    .is_some_and(super::launch::WorkerSandbox::enters_pid_namespace)
-                {
+                let known_pid = if behind_relay {
                     KnownPid::Relay(child_pid)
                 } else {
                     KnownPid::Child(child_pid)
@@ -898,7 +945,13 @@ impl GuestWorkers {
                     Some(call) => (Some(call), "stopped answering and was killed".to_string()),
                     None => (conn_thread.call_description(), describe_exit(status)),
                 };
-                let message = lost_message(kind, conn_thread.pid(), call.as_deref(), &exit);
+                let message = lost_message(
+                    kind,
+                    conn_thread.pid(),
+                    call.as_deref(),
+                    &exit,
+                    &conn_thread.limit_suffix(),
+                );
                 conn_thread.mark_lost(message);
             });
         if let Err(error) = spawned {
@@ -924,7 +977,7 @@ impl GuestWorkers {
         conns.sort_by_key(|conn| conn.kind);
         for conn in conns {
             conn.wait_started(HANDSHAKE_WAIT)
-                .map_err(|reason| start_error(conn.kind, &reason))?;
+                .map_err(|reason| start_error(conn.kind, &reason, &conn.limit_suffix()))?;
         }
         Ok(())
     }
@@ -991,7 +1044,7 @@ impl GuestWorkers {
     ) -> Result<Reply, String> {
         let conn = self.start(kind);
         if let Err(reason) = conn.wait_started_async().await {
-            return Err(start_error(kind, &reason).to_string());
+            return Err(start_error(kind, &reason, &conn.limit_suffix()).to_string());
         }
         let guest = self.ensure_loaded(&conn, name, component).await?;
         self.send_call(&conn, entry, bound, call_deadlines, |req| {
@@ -1058,7 +1111,7 @@ impl GuestWorkers {
         let conn = self.start(kind);
         conn.wait_started_async()
             .await
-            .map_err(|reason| start_error(kind, &reason).to_string())?;
+            .map_err(|reason| start_error(kind, &reason, &conn.limit_suffix()).to_string())?;
         Ok(conn)
     }
 
@@ -1613,6 +1666,7 @@ async fn wait_lost(conn: &Arc<WorkerConn>) -> String {
         conn.pid(),
         None,
         "stopped answering and was killed",
+        &conn.limit_suffix(),
     )
 }
 
@@ -1731,10 +1785,11 @@ pub(crate) fn handshake_for_test(
     handshake(kind, stream, KnownPid::Child(child)).map(|(pid, _)| pid)
 }
 
-/// The `E-RUN-066` refusal for a worker of `kind` that did not start, for `reason`.
-pub(crate) fn start_error(kind: WorkerKind, reason: &str) -> RuntimeError {
+/// The `E-RUN-066` refusal for a worker of `kind` that did not start, for `reason`. `limit` is
+/// [`limit_suffix`]'s, or `""`.
+pub(crate) fn start_error(kind: WorkerKind, reason: &str, limit: &str) -> RuntimeError {
     RuntimeError::GuestWorkerStart(format!(
-        "the {} guest worker could not be started: {reason}",
+        "the {} guest worker could not be started: {reason}{limit}",
         kind.as_str()
     ))
 }

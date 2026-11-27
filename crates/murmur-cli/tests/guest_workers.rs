@@ -693,47 +693,459 @@ fn killing_the_tools_worker_fails_the_task_and_ends_the_records() {
     assert!(!alive(driver), "the driver worker outlived the session");
 }
 
-/// On a shell-granted capsule, whose launch moves `mur` into its own cgroup scope, every worker
-/// moves with it: each worker's `/proc/<pid>/cgroup` equals `mur`'s.
-#[test]
-fn workers_share_the_cgroup_mur_moves_into() {
+/// The cgroup v2 directory `pid` is in, from its `/proc/<pid>/cgroup` `0::` line, or `None` once it
+/// is gone.
+fn cgroup_dir_of(pid: u32) -> Option<PathBuf> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .to_string();
+    Some(PathBuf::from(format!("/sys/fs/cgroup{relative}")))
+}
+
+fn read_trimmed(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_else(|error| format!("<{}: {error}>", path.display()))
+}
+
+/// The value of `key` in a flat-keyed cgroup file such as `pids.events`.
+fn cgroup_counter(path: &Path, key: &str) -> u64 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == key).then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+fn procs_of(cgroup: &Path) -> Vec<u32> {
+    fs::read_to_string(cgroup.join("cgroup.procs"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// The session cgroup `mur` (`mur_pid`) made beside its guest-worker cgroup under `base`:
+/// `murmur-<session>-<mur_pid>-<n>`, not the `-workers-` one.
+fn session_cgroup_beside(base: &Path, mur_pid: u32) -> Option<PathBuf> {
+    fs::read_dir(base).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        (name.starts_with("murmur-")
+            && name.contains(&format!("-{mur_pid}-"))
+            && !name.contains("-workers-")
+            && entry.path().is_dir())
+        .then(|| entry.path())
+    })
+}
+
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 2..].split(' ').nth(1)?.parse().ok()
+}
+
+fn argv_of(pid: u32) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+fn skip_without_cgroup_scope(test: &str) -> bool {
     // A shell grant needs the capsule's own network namespace, which staging refuses
     // (`E-CAP-005`) on a host that cannot create one.
-    if capsule_runtime::skip_without_egress_namespace("workers_share_the_cgroup_mur_moves_into") {
+    if capsule_runtime::skip_without_egress_namespace(test) {
+        return true;
+    }
+    if !common::cgroup_delegation_available() {
+        eprintln!("[SKIP-HOST] {test}: this host cannot delegate a cgroup v2 scope");
+        return true;
+    }
+    false
+}
+
+/// The declared cgroup limits of [`workers_run_in_their_own_cgroup_under_the_declared_limits`]
+/// and the shell checks.
+const CGROUP_LIMITS: &str = "  resources:\n    cgroup_memory_bytes: 268435456\n    \
+                             cgroup_pids_max: 64\n";
+
+/// Each guest worker runs in `murmur-<session>-workers-<mur pid>-<n>`, beside the session cgroup
+/// and apart from `mur`'s `murmur-supervisor`, carrying the declared `memory.max` and `pids.max`;
+/// it holds only workers and their relays; it is gone after the session; and a `SIGKILL`ed `mur`
+/// leaves no worker or relay alive.
+#[test]
+fn workers_run_in_their_own_cgroup_under_the_declared_limits() {
+    let test = "workers_run_in_their_own_cgroup_under_the_declared_limits";
+    if skip_without_cgroup_scope(test) {
         return;
     }
     let home = Home::new();
     let upstream = Upstream::start(vec![END_TURN.to_string()]);
     let extra = format!(
         "  - name: {ECHO_TOOL}\n    version: {VERSION}\n    runtime: tool\ncapabilities:\n  \
-         shell:\n    allow:\n      - bash\n{}",
+         shell:\n    allow:\n      - bash\n{CGROUP_LIMITS}{}",
         sleep_lifecycle()
     );
     let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
     let child = home.spawn(&capsule);
     let pid = child.id();
     let workers = wait_for_workers(pid, 2, Duration::from_secs(60));
-    // The task has run by the time the provider was asked, so the scope move is done.
+    // The task has run by the time the provider was asked, so the session cgroup exists.
     let started = Instant::now();
     while upstream.heads.lock().unwrap().is_empty() && started.elapsed() < WAIT {
         thread::sleep(Duration::from_millis(50));
     }
     thread::sleep(Duration::from_millis(500));
-    let mur_cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-    let worker_cgroups: Vec<(u32, std::io::Result<String>)> = workers
-        .iter()
-        .map(|w| (w.0, fs::read_to_string(format!("/proc/{}/cgroup", w.0))))
-        .collect();
+    let mur_cgroup = cgroup_dir_of(pid);
+    let worker_cgroups: Vec<(u32, Option<PathBuf>)> =
+        workers.iter().map(|w| (w.0, cgroup_dir_of(w.0))).collect();
+    let workers_dir = worker_cgroups.first().and_then(|(_, dir)| dir.clone());
+    let snapshot = workers_dir.as_ref().map(|dir| {
+        let members: Vec<(u32, Option<u32>, Vec<String>)> = procs_of(dir)
+            .into_iter()
+            .map(|member| (member, ppid_of(member), argv_of(member)))
+            .collect();
+        let base = dir.parent().unwrap().to_path_buf();
+        let session = session_cgroup_beside(&base, pid);
+        (
+            read_trimmed(&dir.join("memory.max")),
+            read_trimmed(&dir.join("pids.max")),
+            fs::read_to_string(dir.join("memory.swap.max")).ok(),
+            members,
+            base,
+            session.as_ref().map(|s| {
+                (
+                    read_trimmed(&s.join("memory.max")),
+                    read_trimmed(&s.join("pids.max")),
+                )
+            }),
+        )
+    });
     // SAFETY: plain syscall on our own child.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
     let run = finish(child, Duration::from_secs(60));
-    assert_eq!(workers.len(), 2, "{workers:?}\n{}", run.context());
-    for (worker, cgroup) in worker_cgroups {
-        let cgroup = cgroup
-            .unwrap_or_else(|error| panic!("worker {worker} is gone ({error})\n{}", run.context()));
-        assert_eq!(cgroup, mur_cgroup, "worker {worker}\n{}", run.context());
+    let context = run.context();
+    assert_eq!(workers.len(), 2, "{workers:?}\n{context}");
+    let mur_cgroup = mur_cgroup.unwrap_or_else(|| panic!("mur's cgroup unreadable\n{context}"));
+    assert!(
+        mur_cgroup.ends_with("murmur-supervisor"),
+        "mur is in {}\n{context}",
+        mur_cgroup.display()
+    );
+    let workers_dir = workers_dir.unwrap_or_else(|| panic!("no worker cgroup\n{context}"));
+    let name = workers_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let (prefix, serial) = name.rsplit_once('-').unwrap_or_else(|| panic!("{name}"));
+    assert!(
+        name.starts_with("murmur-ses_")
+            && prefix.ends_with(&format!("-workers-{pid}"))
+            && serial.parse::<u64>().is_ok(),
+        "the worker cgroup is {name}"
+    );
+    for (worker, cgroup) in &worker_cgroups {
+        assert_eq!(
+            cgroup.as_ref(),
+            Some(&workers_dir),
+            "worker {worker}\n{context}"
+        );
+        assert_ne!(cgroup.as_ref(), Some(&mur_cgroup), "worker {worker}");
+    }
+    let (memory_max, pids_max, swap_max, members, base, session) = snapshot.unwrap();
+    println!(
+        "mur: {}\nworkers: {}\nmembers: {members:?}",
+        mur_cgroup.display(),
+        workers_dir.display()
+    );
+    assert_eq!(memory_max, "268435456");
+    assert_eq!(pids_max, "64");
+    if let Some(swap) = swap_max {
+        assert_eq!(swap.trim(), "0");
+    }
+    assert!(!members.is_empty());
+    for (member, ppid, argv) in &members {
+        assert_ne!(*member, pid, "mur is in the worker cgroup");
+        let worker = argv.get(1).map(String::as_str) == Some("__guest-worker");
+        let relay = *ppid == Some(pid);
+        assert!(
+            worker || relay,
+            "{member} (parent {ppid:?}, argv {argv:?}) is neither a worker nor a relay"
+        );
+    }
+    assert_eq!(
+        session,
+        Some(("268435456".to_string(), "64".to_string())),
+        "the session cgroup beside it under {}",
+        base.display()
+    );
+    let leftover: Vec<String> = fs::read_dir(&base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains("-workers-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "worker cgroups left under {}: {leftover:?}",
+        base.display()
+    );
+
+    // `mur` killed outright: its workers and their relays go with it.
+    let upstream = Upstream::start(vec![END_TURN.to_string()]);
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+    let child = home.spawn(&capsule);
+    let pid = child.id();
+    let workers = wait_for_workers(pid, 2, Duration::from_secs(60));
+    assert_eq!(workers.len(), 2, "{workers:?}");
+    let members = cgroup_dir_of(workers[0].0)
+        .map(|dir| procs_of(&dir))
+        .unwrap_or_default();
+    assert!(!members.is_empty());
+    // SAFETY: plain syscall on our own child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = finish(child, Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(3));
+    let survivors: Vec<u32> = members
+        .iter()
+        .chain(workers.iter().map(|w| &w.0))
+        .copied()
+        .filter(|member| alive(*member))
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "alive 3 s after mur's SIGKILL: {survivors:?}"
+    );
+}
+
+/// Three workers start and a task calling a WASM tool ends `ok` under `cgroup_pids_max: 64`: the
+/// guest-worker cgroup's `pids.current` stays below 64 and `pids.events` `max` at 0.
+#[test]
+fn a_pids_ceiling_of_64_still_runs_all_three_workers() {
+    let test = "a_pids_ceiling_of_64_still_runs_all_three_workers";
+    if !common::cgroup_delegation_available() {
+        eprintln!("[SKIP-HOST] {test}: this host cannot delegate a cgroup v2 scope");
+        return;
+    }
+    let home = Home::new();
+    let upstream = Upstream::start(vec![
+        common::tool_use_response("toolu_echo", "echo-tool", json!({"text": "ping"})),
+        END_TURN.to_string(),
+    ]);
+    let extra = format!(
+        "  - name: {ECHO_TOOL}\n    version: {VERSION}\n    runtime: tool\n{}capabilities:\n  \
+         resources:\n    cgroup_pids_max: 64\n",
+        sleep_hook_entry(2)
+    );
+    let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+    let child = home.spawn(&capsule);
+    let pid = child.id();
+    let mut peak = 0u64;
+    let mut workers_dir: Option<PathBuf> = None;
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut pids_events_max = 0u64;
+    let started = Instant::now();
+    let mut child = child;
+    while child.try_wait().unwrap().is_none() && started.elapsed() < WAIT {
+        for (worker, kind, _, _) in workers_of(pid) {
+            kinds.insert(kind);
+            if workers_dir.is_none() {
+                workers_dir = cgroup_dir_of(worker);
+            }
+        }
+        if let Some(dir) = &workers_dir {
+            if let Ok(current) = fs::read_to_string(dir.join("pids.current")) {
+                peak = peak.max(current.trim().parse().unwrap_or(0));
+                pids_events_max = cgroup_counter(&dir.join("pids.events"), "max");
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let run = finish(child, WAIT);
+    println!("peak guest-worker cgroup pids.current: {peak}; pids.events max: {pids_events_max}");
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    assert!(run.stdout.contains("status:  ok"), "{}", run.context());
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        ["driver", "hooks", "tools"],
+        "{}",
+        run.context()
+    );
+    assert!(workers_dir.is_some(), "no worker cgroup seen");
+    assert!(peak > 0 && peak < 64, "peak pids.current {peak}");
+    assert_eq!(pids_events_max, 0, "a worker was refused a task");
+    assert!(common::tool_result_text(&upstream.bodies.lock().unwrap(), "toolu_echo").is_some());
+}
+
+/// What the shell-check upstream saw of the cgroups at one model request.
+#[derive(Debug, Clone, Default)]
+struct CgroupSample {
+    session_pids_max_events: u64,
+    workers_oom_kill: u64,
+    workers_pids_max_events: u64,
+    driver_in_workers: bool,
+}
+
+/// The shell checks of the cgroup experiment beside the guest-worker cgroup: (a) of 100 background
+/// `sleep`s only those under `pids.max` 64 run, (b) a 400 MiB shell variable is killed at
+/// `cgroup_memory_bytes` with exit 137, (c) a command cannot move itself to the hierarchy root or
+/// to its cgroup's parent or grandparent. Throughout, the driver worker stays in its own cgroup with
+/// neither counter moved, and the run ends `ok`.
+#[test]
+fn shell_children_keep_their_bounds_beside_the_worker_cgroup() {
+    let test = "shell_children_keep_their_bounds_beside_the_worker_cgroup";
+    if skip_without_cgroup_scope(test) {
+        return;
+    }
+    // `bash` gives up on its script at the first fork `pids.max` refuses, after seconds of its own
+    // retries, so the 100 `sleep`s are started by ten subshells, which give up in its place. They
+    // wait for the second second of the script, by when all ten exist.
+    // Once full, nothing more can fork: the wait spins on `$SECONDS`, and the count reads `/proc`
+    // with builtins alone, after the subshells are ended so no more start.
+    let spawn_many =
+        "for i in {1..10}; do ( while [ $SECONDS -lt 2 ]; do :; done; for j in {1..10}; \
+                      do sleep 30 >/dev/null 2>&1 & done; wait ) >/dev/null 2>&1 & done; \
+                      while [ $SECONDS -lt 6 ]; do :; done; \
+                      for d in /proc/[0-9]*; do read -r c < $d/comm 2>/dev/null || continue; \
+                      p=${d#/proc/}; if [ \"$c\" = bash ] && [ $p != $$ ]; then kill $p; fi; \
+                      done 2>/dev/null; n=0; for d in /proc/[0-9]*; do read -r c < $d/comm \
+                      2>/dev/null || continue; if [ \"$c\" = sleep ]; then n=$((n+1)); \
+                      kill ${d#/proc/} 2>/dev/null; fi; done; echo running=$n";
+    let hog = "x=$(head -c 419430400 /dev/zero | tr '\\0' a); echo survived";
+    let escape = "read -r line < /proc/self/cgroup; rel=${line#0::}; parent=${rel%/*}; \
+                  grand=${parent%/*}; for d in /sys/fs/cgroup /sys/fs/cgroup$parent \
+                  /sys/fs/cgroup$grand; do if echo $$ > $d/cgroup.procs 2>/dev/null; then \
+                  echo moved:$d; else echo refused:$d; fi; done";
+    let replies = [spawn_many, hog, escape];
+    let mur_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let samples: Arc<Mutex<Vec<CgroupSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let (reply_pid, reply_samples) = (Arc::clone(&mur_pid), Arc::clone(&samples));
+    let upstream = Upstream::start_with(move |index| {
+        if let Some(pid) = *reply_pid.lock().unwrap() {
+            let driver = workers_of(pid)
+                .into_iter()
+                .find(|worker| worker.1 == "driver");
+            let workers_dir = driver.as_ref().and_then(|worker| cgroup_dir_of(worker.0));
+            let mut sample = CgroupSample::default();
+            if let (Some(dir), Some(driver)) = (&workers_dir, &driver) {
+                sample.workers_oom_kill = cgroup_counter(&dir.join("memory.events"), "oom_kill");
+                sample.workers_pids_max_events = cgroup_counter(&dir.join("pids.events"), "max");
+                sample.driver_in_workers = dir
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("-workers-"))
+                    && fs::read_to_string(dir.join("cgroup.procs"))
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|line| {
+                            line.trim().parse::<u32>().ok() == Some(driver.0)
+                                || line.trim().parse::<u32>().ok() == ppid_of(driver.0)
+                        });
+                if let Some(session) = session_cgroup_beside(dir.parent().unwrap(), pid) {
+                    sample.session_pids_max_events =
+                        cgroup_counter(&session.join("pids.events"), "max");
+                }
+            }
+            reply_samples.lock().unwrap().push(sample);
+        }
+        replies.get(index).map(|command| {
+            common::tool_use_response(
+                &format!("toolu_shell_{index}"),
+                "bash",
+                json!({ "command": command }),
+            )
+        })
+    });
+    let home = Home::new();
+    let run_with = |containment: &str| {
+        let extra = format!(
+            "capabilities:\n  containment: {containment}\n  shell:\n    allow: [bash, sleep, \
+             head, tr]\n{CGROUP_LIMITS}"
+        );
+        let capsule = home.capsule(ANTHROPIC, &upstream.endpoint, &extra);
+        // Three shell calls and the closing turn, with room to spare.
+        let manifest = fs::read_to_string(&capsule.manifest).unwrap();
+        fs::write(
+            &capsule.manifest,
+            manifest.replace("max_turns: 4", "max_turns: 8"),
+        )
+        .unwrap();
+        let child = home.spawn(&capsule);
+        *mur_pid.lock().unwrap() = Some(child.id());
+        finish(child, WAIT)
+    };
+    let mut run = run_with("sealed");
+    if run.output.status.code() != Some(0) && run.context().contains("E-CAP-") {
+        eprintln!("{test}: this host does not reach sealed; running at scoped");
+        samples.lock().unwrap().clear();
+        upstream.bodies.lock().unwrap().clear();
+        run = run_with("scoped");
+    }
+    let context = run.context();
+    assert_eq!(run.output.status.code(), Some(0), "{context}");
+    assert!(run.stdout.contains("status:  ok"), "{context}");
+    let bodies = upstream.bodies.lock().unwrap().clone();
+    // The whole result text, `resource_limit:` line after the fence included.
+    let result = |index: usize| {
+        common::find_tool_result(&bodies, &format!("toolu_shell_{index}"))
+            .map(|block| common::extract_result_text(&block))
+            .unwrap_or_else(|| panic!("no result for shell call {index}\n{context}"))
+    };
+
+    let spawned = result(0);
+    let running: u32 = spawned
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("running="))
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no running= line: {spawned}"));
+    println!("running children of 100 under pids.max 64: {running}");
+    assert!((30..=63).contains(&running), "{running} running\n{spawned}");
+
+    let hogged = result(1);
+    assert!(hogged.contains("137"), "{hogged}");
+    assert!(hogged.contains("cgroup_memory_bytes"), "{hogged}");
+    assert!(
+        !hogged.lines().any(|line| line.trim() == "survived"),
+        "{hogged}"
+    );
+
+    let escaped = result(2);
+    let refused = escaped
+        .lines()
+        .filter(|line| line.trim().starts_with("refused:"))
+        .count();
+    let moved: Vec<&str> = escaped
+        .lines()
+        .filter(|line| line.trim().starts_with("moved:"))
+        .collect();
+    assert_eq!(refused, 3, "{escaped}");
+    assert!(moved.is_empty(), "{escaped}");
+
+    let samples = samples.lock().unwrap().clone();
+    println!("cgroup samples per request: {samples:?}");
+    assert_eq!(samples.len(), 4, "{samples:?}");
+    assert!(
+        samples[1].session_pids_max_events > samples[0].session_pids_max_events,
+        "the session cgroup's pids.events max did not rise: {samples:?}"
+    );
+    for sample in &samples {
+        assert!(sample.driver_in_workers, "{samples:?}");
+        assert_eq!(sample.workers_oom_kill, 0, "{samples:?}");
+        assert_eq!(sample.workers_pids_max_events, 0, "{samples:?}");
     }
 }
 

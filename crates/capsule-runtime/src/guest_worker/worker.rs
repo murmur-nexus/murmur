@@ -282,6 +282,7 @@ pub(crate) fn serve(kind: WorkerKind, stream: UnixStream) -> i32 {
     let _ticker = crate::limits::EpochTicker::spawn(&engine);
     let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(kind.runtime_threads())
+        .max_blocking_threads(kind.blocking_threads())
         .thread_name(format!("guest-worker-{}", kind.as_str()))
         .enable_all()
         .build()

@@ -81,7 +81,7 @@ Three mechanisms enforce the block, in descending order of portability:
 | Mechanism | Fields | Platforms | Notes |
 |---|---|---|---|
 | `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. `cpu_seconds` is the exception: the process gets `SIGXCPU` at `cpu_seconds` and `SIGKILL` one second later, so it can neither raise the bound nor run more than one second past it. With no `cpu_seconds`, `RLIMIT_CPU` is left as `mur` inherited it. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field; see [No core dumps](#no-core-dumps). `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
-| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host. `cgroup_cpu_percent` is the scope's `cpu.max`, written only when declared |
+| Two cgroup v2 scopes: the session cgroup around the whole subprocess tree, and the guest-worker cgroup around the guest workers; see [What the cgroup limits bound](#cgroup-placement) | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to a tree in aggregate. `cgroup_memory_bytes` is each scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host. `cgroup_cpu_percent` is the scope's `cpu.max`, written only when declared |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The [work folder](workdir.md#work-folder-ceiling), the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) are walked every 250 ms (longer when a walk itself is slow) and their sizes summed, and once more, synchronously, before the session's final status is decided. The cadence has no manifest field: it decides how far past the ceiling a writer gets, never whether the breach is reported. A breach kills every process in the session's cgroup scope, and ends the session with `E-RUN-013` — `work folder, $HOME and $TMPDIR together grew to <N> bytes, past the <M> byte ceiling (capabilities.resources.workdir_max_bytes)` — and blocks any further subprocess. The breach's `logs/bootstrap.log` line appends `; measured: <work folder>, <tmp>, <home>` |
 
 ### `memory_bytes` and `cgroup_memory_bytes` { #address-space-and-memory }
@@ -91,7 +91,7 @@ The two memory fields bound different things:
 | Field | Bounds | Mechanism |
 |---|---|---|
 | `memory_bytes` | Each process's address space: what it reserves, used or not | `RLIMIT_AS` on Linux, `RLIMIT_DATA` on macOS |
-| `cgroup_memory_bytes` | The memory the whole subprocess tree actually uses | The cgroup scope's `memory.max` |
+| `cgroup_memory_bytes` | The memory the whole subprocess tree actually uses, and separately the memory the guest workers use | The `memory.max` of the session cgroup and of the guest-worker cgroup; see [What the cgroup limits bound](#cgroup-placement) |
 
 Runtimes that reserve far more address space than they use fail under `memory_bytes` well below
 their real memory use: V8, the engine in `node`, fails with `Cannot allocate Wasm memory`, and the
@@ -99,6 +99,51 @@ JVM fails to start its heap. For those, set `memory_bytes` high —
 `68719476736` (64 GiB) runs `node` — and cap RAM with `cgroup_memory_bytes`. A capsule whose
 `capabilities.shell.allow` names `node` or `nodejs` under a limit below 32 GiB, the 2 GiB default
 included, draws [`W-RUN-010`](diagnostics.md#w-run-010).
+
+### What the cgroup limits bound { #cgroup-placement }
+
+On Linux, a launch that needs a cgroup scope builds three cgroups beside each other under the
+delegated base:
+
+| cgroup | Holds | Declared limits |
+|---|---|---|
+| `murmur-supervisor` | `mur`, its scope watchers and the session's network-namespace holders | None |
+| `murmur-<session_id>-<pid>-<n>`, the session cgroup | Shell commands, `murmur:process` programs, a `transport: process` harness and every process they start | `memory.max` from `cgroup_memory_bytes`, `memory.swap.max` `0`, `pids.max` from `cgroup_pids_max`, `cpu.max` when `cgroup_cpu_percent` is declared, `io.max` from `cgroup_io_bytes_per_sec` ([best effort](#io-max-report)) |
+| `murmur-<session_id>-workers-<pid>-<n>`, the guest-worker cgroup | The [guest workers](../concepts/guest-workers.md) `driver`, `tools` and `hooks`, and the process each one is started through | The same `memory.max`, `memory.swap.max`, `pids.max` and `cpu.max`; no `io.max` |
+
+Each of the two capsule cgroups carries the declared values on its own: a capsule's commands may
+use up to `cgroup_memory_bytes`, and its guest workers up to `cgroup_memory_bytes` more, so the
+capsule as a whole stays under twice each declared value. A fork bomb or a memory hog among the
+shell commands therefore cannot stop the driver. `mur` itself runs outside every declared limit.
+`cgroup_io_bytes_per_sec` bounds the session cgroup only.
+
+A capsule with no way to run a subprocess gets neither capsule cgroup: a script capsule with no
+artifacts and no `capabilities.shell.allow` or `capabilities.spawn.allow` runs its component in a
+`driver` worker bounded by [`capabilities.limits`](#execution-limits) alone.
+
+The guest-worker cgroup is created before the first guest worker starts. A host that cannot
+create it, or refuses one of its limit writes, refuses the launch with
+`E-RUN-012` naming its path. It is removed once the workers have
+exited, and killed with everything in it if `mur` dies.
+
+`cgroup_pids_max` counts threads. Each worker runs a fixed number of them:
+
+| Worker | Most tasks it puts in the guest-worker cgroup |
+|---|---|
+| `driver` | 13 |
+| `tools` | 22 |
+| `hooks` | 13 |
+| All three | 48 |
+
+Each count is the worker's main thread, its timer thread, a standard-input reader, the process it
+is started through, its request threads (4 for `tools`, 2 for the others) and its file-work
+threads (14 for `tools`, 7 for the others); file work past that bound waits its turn. A declared
+`cgroup_pids_max` of 64 leaves headroom over all three. Below 48, the kernel may refuse a worker a
+thread; the run then fails with [`E-RUN-065`](diagnostics.md#e-run-065) or
+[`E-RUN-066`](diagnostics.md#e-run-066) naming `capabilities.resources.cgroup_pids_max`.
+
+[`mur run --explain-scope`](cli.md#mur-run) prints a `bounds:` line under every field of its
+`Resources` block naming the processes that field bounds on this host.
 
 ### No core dumps { #no-core-dumps }
 
@@ -180,11 +225,11 @@ The operator provides the parent once:
    `cgroup_io_bytes_per_sec`: write `+memory +pids +cpu +io` to the unit cgroup's
    `cgroup.subtree_control`.
 
-A `mur` started from the launcher then creates `<unit>/murmur-<pid>-p`, moves itself and its
-guest workers in, and builds the same layout a systemd scope holds:
-`murmur-<pid>-p/murmur-supervisor` for `mur` and its guest workers, and
-`murmur-<pid>-p/murmur-<session_id>-<pid>-<n>` for the session's subprocesses, with the declared
-limits. Adoption is confirmed from a running launch's `/proc/<pid>/cgroup`, which ends in
+A `mur` started from the launcher then creates `<unit>/murmur-<pid>-p`, moves itself in, and
+builds the same [three cgroups](#cgroup-placement) a systemd scope holds:
+`murmur-<pid>-p/murmur-supervisor` for `mur`, `murmur-<pid>-p/murmur-<session_id>-<pid>-<n>` for
+the session's subprocesses and `murmur-<pid>-p/murmur-<session_id>-workers-<pid>-<n>` for its
+guest workers, the last two with the declared limits. Adoption is confirmed from a running launch's `/proc/<pid>/cgroup`, which ends in
 `murmur-<pid>-p/murmur-supervisor`. `mur run --explain-scope` prints `cgroup scope: delegated`,
 as it does for a systemd scope.
 
@@ -233,7 +278,7 @@ Where an adopted parent differs from a systemd scope:
 - **After `SIGKILL` of `mur`.** `murmur-<pid>-p` stays until the next launch's sweep or the
   unit's stop.
 
-The declared limits sit on the session cgroup in both.
+The declared limits sit on the session cgroup and the guest-worker cgroup in both.
 
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone
 and [`W-SEC-010`](diagnostics.md#w-sec-010) names the residual gap: no aggregate bound across the

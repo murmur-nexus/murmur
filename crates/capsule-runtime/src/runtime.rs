@@ -2480,7 +2480,10 @@ struct WorkerStaging<'a> {
 /// the runtime directory and `host_paths` roots for the tools worker (a script root's runtime
 /// directory for the driver worker), a hook's records `hooks/` folder for the hooks worker. Every
 /// kind is confined before any starts, so one started later in the session (the tools worker at a
-/// pulled tool's first call) is confined the same way. Returns the session's enforcement, which
+/// pulled tool's first call) is confined the same way. Every worker, and its PID-namespace relay,
+/// joins the session's guest-worker cgroup ([`cgroup::prepare_worker_scope`]), created here before
+/// the first fork; a host that cannot create it, or refuses one of its limit writes, refuses the
+/// launch with `E-RUN-012` before any worker exists. Returns the session's enforcement, which
 /// `launch_session` reuses for the shell commands.
 ///
 /// Its own frame, never inlined into [`stage_session`]: an in-process launch stages on a thread
@@ -2495,8 +2498,13 @@ fn start_guest_workers(
     runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
     temp_mapping: crate::temp_dir::TempMapping,
     accessible_workdir: &Path,
+    session_id: &str,
     staging: WorkerStaging<'_>,
 ) -> Result<sandbox::ShellEnforcement, RuntimeError> {
+    // Held by each kind's `WorkerSandbox`, so it lives in the session's `GuestWorkers` and is
+    // removed once their drop has reaped every worker.
+    let worker_scope = cgroup::prepare_worker_scope(&request.capability_policy, session_id)
+        .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
     let session_enforcement = sandbox::ShellEnforcement::resolve(
         &request.capability_policy,
         containment,
@@ -2522,7 +2530,11 @@ fn start_guest_workers(
         workers.confine(
             kind,
             crate::guest_worker::WorkerSandbox {
-                enforcement: session_enforcement.for_guest_worker(&closure, &worker_image),
+                enforcement: session_enforcement.for_guest_worker(
+                    &closure,
+                    &worker_image,
+                    worker_scope.clone(),
+                ),
                 workdir: accessible_workdir.to_path_buf(),
             },
         );
@@ -3847,6 +3859,7 @@ pub fn stage_session(
             runtime_dirs.clone(),
             temp_mapping,
             &accessible_workdir,
+            &session_id,
             WorkerStaging {
                 artifact_grants: &artifact_grants,
                 hook_components: &hook_components,

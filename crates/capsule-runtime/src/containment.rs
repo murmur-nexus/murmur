@@ -1768,7 +1768,7 @@ impl ScopeReport {
         }
 
         out.push('\n');
-        out.push_str(&self.resources.render());
+        out.push_str(&self.resources.render(self.unconfined.is_some()));
         out.push('\n');
         out.push_str(&self.shell_env.render());
 
@@ -6623,7 +6623,10 @@ mod tests {
             grants < resources && resources < shell_env && shell_env < plane,
             "{rendered}"
         );
-        assert!(rendered.contains(&report.resources.render()), "{rendered}");
+        assert!(
+            rendered.contains(&report.resources.render(false)),
+            "{rendered}"
+        );
         assert!(rendered.contains(&report.shell_env.render()), "{rendered}");
         assert_eq!(
             report.resources,

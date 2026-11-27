@@ -1,4 +1,18 @@
-//! Linux cgroup v2 scoping for a capsule's whole subprocess tree.
+//! Linux cgroup v2 scoping for everything a capsule runs: its subprocess tree and its guest workers.
+//!
+//! ## The three cgroups under the delegated base
+//!
+//! | cgroup | Holds | Declared `cgroup_*` limits |
+//! |---|---|---|
+//! | [`SUPERVISOR_LEAF`] | `mur`, its scope watchers, the session network-namespace holders | none |
+//! | `murmur-<session>-<pid>-<n>`, the session cgroup ([`prepare_scope`]) | shell commands, `murmur:process` programs and every process they start | `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, `io.max` |
+//! | `murmur-<session>-workers-<pid>-<n>`, the guest-worker cgroup ([`prepare_worker_scope`]) | the `driver`, `tools` and `hooks` guest workers and their PID-namespace relays | `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max` |
+//!
+//! The two capsule cgroups each carry the declared values on their own, so a capsule as a whole
+//! stays under twice each one. Kept apart, a shell fork bomb or memory hog cannot starve or
+//! OOM-kill the driver, and the session cgroup's counters (read for one shell call's attribution)
+//! never move for a worker. `io.max` is on the session cgroup only: it is best effort and reported
+//! per session, and a second unreported ceiling would claim what nothing checks.
 //!
 //! `resources::apply_hard_rlimits` bounds each spawned process individually. That is necessary
 //! and not sufficient: `RLIMIT_NPROC` is a **per-uid** ceiling, checked against every thread the
@@ -262,6 +276,10 @@ const REQUIRED_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
 /// processes. cgroup v2's "no internal processes" rule forbids enabling controllers in a
 /// cgroup's `subtree_control` while that cgroup directly contains tasks, so the manager has to
 /// step down into its own leaf first — the same move rootless Podman/Docker make.
+///
+/// It holds `mur`, the scope watchers and the session network-namespace holders, and carries no
+/// declared limit. Shell commands run in the session cgroup beside it and guest workers in the
+/// guest-worker cgroup beside that (see the module documentation).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SUPERVISOR_LEAF: &str = "murmur-supervisor";
 
@@ -764,7 +782,7 @@ pub(crate) fn prepare_scope(
             &scope_limits(limits),
             IoMaxWrite::Declared(limits.cgroup_io_bytes_per_sec),
             declares_io_limit,
-            session_id,
+            &scope_dir_name(session_id),
             workdir,
         )?;
         let scope = Arc::new(scope);
@@ -830,7 +848,7 @@ pub(crate) fn prepare_policy_scope(
             &declared_scope_limits(declared),
             io,
             declares_io_limit,
-            session_id,
+            &scope_dir_name(session_id),
             workdir,
         )?;
         let scope = Arc::new(scope);
@@ -848,6 +866,54 @@ pub(crate) fn prepare_policy_scope(
             io_max: IoMaxReport::not_required(reported_bytes_per_sec, NOT_LINUX_REASON),
             cgroup_scope: CgroupScopeReport::of_prepared(None, true),
         })
+    }
+}
+
+/// The guest-worker cgroup for `policy`'s session: `murmur-<session>-workers-<pid>-<n>` beside
+/// the session cgroup, holding the session's guest workers and their relays and nothing else.
+///
+/// Created with the session cgroup's limit writes: on a contained session [`scope_limits`] of the
+/// resolved limits (`memory.max`, `memory.swap.max`, `pids.max`, `cpu.max` when
+/// `cgroup_cpu_percent` is set), on an unconfined one [`declared_scope_limits`]. Never `io.max`
+/// ([`IoMaxWrite::Omitted`]). Every write is fatal as for the session cgroup, and the refusal names
+/// the directory.
+///
+/// `Ok(None)` when [`requires_process_bounding`] does not hold and off Linux. Staging calls it once
+/// per session, after [`await_delegated_base`] and before any guest worker is forked, only when
+/// the session has guest workers.
+pub(crate) fn prepare_worker_scope(
+    policy: &crate::types::CapabilityPolicy,
+    session_id: &str,
+) -> Result<Option<Arc<CgroupScope>>, String> {
+    if !requires_process_bounding(policy) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
+            return Err("forced: delegation refused by the test seam".to_string());
+        }
+        let limits = if policy.containment_floor == murmur_artifact::ContainmentClass::Unconfined {
+            declared_scope_limits(&policy.declared_resources)
+        } else {
+            scope_limits(&policy.resources)
+        };
+        let path =
+            delegated_base(declares_io_limit(policy))?.join(worker_scope_dir_name(session_id));
+        let (scope, _) = CgroupScope::create_at(path.clone(), &limits, IoMaxWrite::Omitted, &path)
+            .map_err(|reason| {
+                format!(
+                    "the guest-worker cgroup {} could not be set up: {reason}",
+                    path.display()
+                )
+            })?;
+        Ok(Some(Arc::new(scope)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = session_id;
+        Ok(None)
     }
 }
 
@@ -880,6 +946,9 @@ enum IoMaxWrite {
     /// An unconfined session declared no `cgroup_io_bytes_per_sec`: write nothing, and report the
     /// resolved value as not required.
     Undeclared(u64),
+    /// The guest-worker cgroup: write nothing and report nothing. The session cgroup's
+    /// [`IoMaxReport`] is the only `io.max` outcome a session records.
+    Omitted,
 }
 
 /// What [`probe_scope`] found: whether a launch would get its cgroup scope here, and whether the
@@ -1137,6 +1206,28 @@ impl CgroupScope {
             oom_kill: read_event_counter(&self.path.join("memory.events"), "oom_kill"),
             pids_max: read_event_counter(&self.path.join("pids.events"), "max"),
         }
+    }
+
+    /// The declared limit this scope's kernel counters say was reached since it was created, with
+    /// the value its interface file holds: `("cgroup_memory_bytes", <memory.max>)` once
+    /// `memory.events` counts an `oom_kill`, else `("cgroup_pids_max", <pids.max>)` once
+    /// `pids.events` counts a refused fork, else `None`.
+    ///
+    /// Evidence about whoever lives in the scope, so only a scope with one kind of occupant can
+    /// pin it on that occupant: the guest-worker cgroup, which holds workers only, is read this
+    /// way. The session cgroup goes through [`ScopeOccupancy`] instead.
+    pub(crate) fn reached_limit(&self) -> Option<(&'static str, String)> {
+        let field = self
+            .event_counters()
+            .attribution_since(CgroupEventCounters::default())?;
+        let file = match field {
+            "cgroup_memory_bytes" => "memory.max",
+            _ => "pids.max",
+        };
+        let value = std::fs::read_to_string(self.path.join(file))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        Some((field, value))
     }
 }
 
@@ -1760,6 +1851,21 @@ fn parse_event_counter(contents: &str, key: &str) -> u64 {
 /// Operators still find scopes by the documented `murmur-*` glob.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn scope_dir_name(session_id: &str) -> String {
+    named_scope_dir(session_id, "")
+}
+
+/// The guest-worker cgroup's directory name, `murmur-<session>-workers-<pid>-<serial>`: the
+/// session cgroup's name with `-workers` after the id, from the same serial, so the two never
+/// collide and a `murmur-*` glob finds both.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn worker_scope_dir_name(session_id: &str) -> String {
+    named_scope_dir(session_id, "-workers")
+}
+
+/// `murmur-<sanitized id><suffix>-<pid>-<serial>`, or `murmur<suffix>-<pid>-<serial>` for an id
+/// that sanitizes to nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn named_scope_dir(session_id: &str, suffix: &str) -> String {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1775,9 +1881,9 @@ fn scope_dir_name(session_id: &str) -> String {
         .collect();
     let pid = std::process::id();
     if sanitized.is_empty() {
-        format!("murmur-{pid}-{serial}")
+        format!("murmur{suffix}-{pid}-{serial}")
     } else {
-        format!("murmur-{sanitized}-{pid}-{serial}")
+        format!("murmur-{sanitized}{suffix}-{pid}-{serial}")
     }
 }
 
@@ -1848,16 +1954,26 @@ impl CgroupScope {
     /// `memory.swap.max` at all (see [`ScopeLimit::absent_ok`]).
     ///
     /// `declares_io_limit` is [`delegated_base`]'s, for a process whose first resolution this is.
+    /// `name` is the directory created under the base: [`scope_dir_name`] for the session cgroup,
+    /// [`worker_scope_dir_name`] for the guest-worker cgroup.
     fn create(
         limits: &[ScopeLimit],
         io: IoMaxWrite,
         declares_io_limit: bool,
-        session_id: &str,
+        name: &str,
         workdir: &Path,
     ) -> Result<(Self, IoMaxReport), String> {
         let base = delegated_base(declares_io_limit)?;
+        Self::create_at(base.join(name), limits, io, workdir)
+    }
 
-        let path = base.join(scope_dir_name(session_id));
+    /// [`Self::create`] at `path`, once the base is known.
+    fn create_at(
+        path: PathBuf,
+        limits: &[ScopeLimit],
+        io: IoMaxWrite,
+        workdir: &Path,
+    ) -> Result<(Self, IoMaxReport), String> {
         create_scope_dir(&path).map_err(|error| scope_dir_refusal(&path, &error))?;
 
         let scope = Self {
@@ -1875,6 +1991,7 @@ impl CgroupScope {
             IoMaxWrite::Undeclared(bytes_per_sec) => {
                 IoMaxReport::not_required(bytes_per_sec, UNCONFINED_IO_UNDECLARED_REASON)
             }
+            IoMaxWrite::Omitted => IoMaxReport::default(),
         };
 
         // Opened last, so a scope that failed any of the fatal writes above is never handed out
@@ -4536,6 +4653,154 @@ mod tests {
         let foreground = scope.enter();
         assert!(!foreground.exclusive());
         assert!(!demoted.exclusive());
+    }
+
+    /// A contained shell-granted policy declaring the cgroup fields.
+    fn worker_scope_policy(cpu: Option<u32>) -> CapabilityPolicy {
+        CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: HostResourceLimits {
+                cgroup_memory_bytes: 268_435_456,
+                cgroup_pids_max: 64,
+                cgroup_cpu_percent: cpu,
+                ..HostResourceLimits::default()
+            },
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_scope_file(scope: &CgroupScope, file: &str) -> String {
+        std::fs::read_to_string(scope.path().join(file))
+            .unwrap_or_else(|error| {
+                panic!("{file} unreadable in {}: {error}", scope.path().display())
+            })
+            .trim()
+            .to_string()
+    }
+
+    /// The guest-worker cgroup is `murmur-<session>-workers-<pid>-<n>` directly under the base the
+    /// session cgroup goes under, with the session cgroup's `memory.max`, `memory.swap.max`,
+    /// `pids.max` and `cpu.max` and no `io.max`; dropping it removes the directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_contained_worker_scope_carries_the_session_cgroup_writes() {
+        let test = "a_contained_worker_scope_carries_the_session_cgroup_writes";
+        if skip_without_host_support(test) {
+            return;
+        }
+        let scope = prepare_worker_scope(&worker_scope_policy(None), "ses_workers")
+            .expect("this host delegates a scope")
+            .expect("a shell grant requires the guest-worker cgroup");
+        let base = delegated_base(false).expect("a delegated base");
+        assert_eq!(scope.path().parent(), Some(base.as_path()));
+        let name = scope
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let prefix = format!("murmur-ses_workers-workers-{}-", std::process::id());
+        assert!(
+            name.strip_prefix(&prefix)
+                .is_some_and(|serial| serial.parse::<u64>().is_ok()),
+            "{name}"
+        );
+        assert_eq!(read_scope_file(&scope, "memory.max"), "268435456");
+        assert_eq!(read_scope_file(&scope, "pids.max"), "64");
+        assert_eq!(read_scope_file(&scope, "cpu.max"), "max 100000");
+        match std::fs::read_to_string(scope.path().join("memory.swap.max")) {
+            Ok(swap) => assert_eq!(swap.trim(), SCOPE_SWAP_MAX),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+        if let Ok(io_max) = std::fs::read_to_string(scope.path().join("io.max")) {
+            assert_eq!(io_max.trim(), "", "no io.max on the guest-worker cgroup");
+        }
+        assert!(scope.places_subprocesses());
+        assert_eq!(scope.reached_limit(), None);
+        let path = scope.path().to_path_buf();
+        drop(scope);
+        assert!(!path.exists(), "{} survived its drop", path.display());
+
+        let capped = prepare_worker_scope(&worker_scope_policy(Some(25)), "ses_workers_cpu")
+            .expect("this host delegates a scope")
+            .expect("a shell grant requires the guest-worker cgroup");
+        assert_eq!(read_scope_file(&capped, "cpu.max"), "25000 100000");
+    }
+
+    /// An unconfined session's guest-worker cgroup writes only the declared `cgroup_*` fields.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unconfined_worker_scope_writes_only_the_declared_fields() {
+        let test = "an_unconfined_worker_scope_writes_only_the_declared_fields";
+        if skip_without_host_support(test) {
+            return;
+        }
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            containment_floor: murmur_artifact::ContainmentClass::Unconfined,
+            declared_resources: murmur_artifact::ResourceCapabilities {
+                cgroup_pids_max: Some(64),
+                ..Default::default()
+            },
+            ..CapabilityPolicy::default()
+        };
+        let scope = prepare_worker_scope(&policy, "ses_workers_unconfined")
+            .expect("this host delegates a scope")
+            .expect("a declared cgroup field requires the guest-worker cgroup");
+        assert_eq!(read_scope_file(&scope, "pids.max"), "64");
+        assert_eq!(read_scope_file(&scope, "memory.max"), "max");
+    }
+
+    /// No subprocess route, or an unconfined session declaring no `cgroup_*` field: no
+    /// guest-worker cgroup, on every platform.
+    #[test]
+    fn no_worker_scope_where_no_bounding_is_required() {
+        let unconfined = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            containment_floor: murmur_artifact::ContainmentClass::Unconfined,
+            ..CapabilityPolicy::default()
+        };
+        for policy in [CapabilityPolicy::default(), unconfined] {
+            assert!(
+                prepare_worker_scope(&policy, "ses_workers_none")
+                    .expect("no scope required is never an error")
+                    .is_none(),
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// A host that cannot delegate refuses the guest-worker cgroup as it refuses the session's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_delegation_refuses_the_worker_scope() {
+        FORCE_DELEGATION_FAILURE.with(|flag| flag.set(true));
+        let refused = prepare_worker_scope(&worker_scope_policy(None), "ses_workers_refused");
+        FORCE_DELEGATION_FAILURE.with(|flag| flag.set(false));
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// Off Linux a required guest-worker cgroup is `None`, never an error.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_required_worker_scope_is_none_off_linux() {
+        assert!(
+            prepare_worker_scope(&worker_scope_policy(None), "ses_workers")
+                .expect("never an error off Linux")
+                .is_none()
+        );
+    }
+
+    /// The guest-worker cgroup's name is the session cgroup's with `-workers` after the id.
+    #[test]
+    fn worker_scope_dir_name_marks_the_workers() {
+        let pid = std::process::id();
+        assert!(
+            worker_scope_dir_name("ses_abc").starts_with(&format!("murmur-ses_abc-workers-{pid}-"))
+        );
+        assert!(worker_scope_dir_name("").starts_with(&format!("murmur-workers-{pid}-")));
+        assert!(!worker_scope_dir_name("../x").contains('/'));
     }
 
     #[test]

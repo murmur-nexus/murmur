@@ -185,6 +185,56 @@ fn memory_balloon_capsule_traps_at_its_configured_memory_cap() {
     assert_eq!(end["exit_status"], "resource_limit");
 }
 
+/// The same balloon under a 1 GiB store cap and a 256 MiB `cgroup_memory_bytes`: the kernel kills
+/// the driver guest worker the script's root runs in once it passes the guest-worker cgroup's
+/// `memory.max`, long before the store cap, and the run fails with `E-RUN-065` naming
+/// `capabilities.resources.cgroup_memory_bytes`. The shell grant gives the capsule a subprocess
+/// route, without which a script capsule with no artifacts gets no cgroup at all.
+#[test]
+fn a_worker_past_cgroup_memory_bytes_is_killed_by_the_kernel() {
+    let test = "a_worker_past_cgroup_memory_bytes_is_killed_by_the_kernel";
+    // A shell grant needs the capsule's own network namespace (`E-CAP-005` otherwise).
+    if capsule_runtime::skip_without_egress_namespace(test) {
+        return;
+    }
+    if !cfg!(target_os = "linux") || !common::cgroup_delegation_available() {
+        eprintln!("[SKIP-HOST] {test}: this host cannot delegate a cgroup v2 scope");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = create_project(
+        project.path(),
+        "capsule-memory-balloon.wasm",
+        "  shell:\n    allow: [bash]\n  resources:\n    cgroup_memory_bytes: 268435456\n  \
+         limits:\n    memory_bytes: 1073741824\n",
+    );
+
+    let assert = run_capsule(home.path(), &manifest_path).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("E-RUN-065"), "{stderr}");
+    assert!(
+        stderr.contains("the driver guest worker")
+            && stderr.contains("was killed by signal 9 (SIGKILL)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the guest-worker cgroup reached capabilities.resources.cgroup_memory_bytes \
+             (268435456 bytes)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("capabilities.limits.memory_bytes"),
+        "{stderr}"
+    );
+
+    let (start, end) = trace_frame(home.path());
+    assert_eq!(start["event_type"], "session_start");
+    assert_eq!(end["event_type"], "session_end");
+}
+
 /// A nonsensical limit is a manifest authoring error, so it must be rejected while parsing
 /// — naming the field — rather than surfacing later as an opaque trap from a guest that
 /// could never have run.

@@ -194,6 +194,12 @@ subprocess (`capabilities.shell.allow`, `capabilities.spawn.allow`, or any WASM 
 hook, which runs in a [guest worker](../concepts/guest-workers.md) process) and the answer is
 `unavailable`.
 
+A launch with guest workers also creates a guest-worker cgroup beside the session's scope before
+the first worker starts, carrying the same `memory.max`, `memory.swap.max`, `pids.max` and
+`cpu.max`. A host that cannot create it refuses the launch with `E-RUN-012` naming its path.
+`cgroup_scope` reports the session's scope only. Which processes each cgroup holds is in
+[What the cgroup limits bound](resource-limits.md#cgroup-placement).
+
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
