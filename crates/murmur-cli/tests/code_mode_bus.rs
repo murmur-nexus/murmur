@@ -32,6 +32,8 @@ const VERSION: &str = "0.1.0";
 const AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 const KEY: &str = "sk-code-mode-bus-canary-41d7";
 const WAIT: Duration = Duration::from_secs(240);
+/// The capsule-wide grant that offers the runtime-provided `session-status` tool.
+const SESSION_STATUS_GRANT: &str = "capabilities:\n  session_status:\n    read: true\n";
 const ECHO_DESCRIPTION: &str = "Sleeps sleep_ms milliseconds, then echoes its tag.";
 const ECHO_MANIFEST: &str = "description: Sleeps sleep_ms milliseconds, then echoes its tag.\n\
      input_schema: '{\"type\":\"object\",\"properties\":{\"tag\":{\"type\":\"string\"},\
@@ -296,7 +298,7 @@ fn refused(answer: &Value) -> &str {
 fn list_names_the_capsules_operations() {
     let home = Home::new();
     let model = Model::start(vec![repl("t1", json!({"op": "list"}))]);
-    let grants = "capabilities:\n  plan:\n    submit: true\n";
+    let grants = "capabilities:\n  plan:\n    submit: true\n  session_status:\n    read: true\n";
     let run = home.run(&home.base(model.endpoint(), "", "", grants));
     run.assert_ok();
 
@@ -385,7 +387,7 @@ fn call_runs_an_operation_and_refuses_with_each_check() {
         call("t7", "bus-echo", json!({})),
         call("t8", "bus-echo", json!({"tag": "b"})),
     ]);
-    let run = home.run(&home.base(model.endpoint(), "", "", ""));
+    let run = home.run(&home.base(model.endpoint(), "", "", SESSION_STATUS_GRANT));
     run.assert_ok();
 
     let ok = model.data("t1");

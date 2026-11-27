@@ -1070,6 +1070,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory; a capsule that declares nothing is not offered it. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
+| `capabilities.session_status.read` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) [`session-status`](runtime-provided-tools.md#session-status) in the capsule's inventory; a capsule that declares nothing is not offered it. Required when the `session_status:` block is present — a block that omits it is refused at parse. Capsule-wide only — declaring it on an `artifacts[]` entry is refused at parse. The session's deadline and its deadline notice hold with or without it. See [`capabilities.session_status`](#capabilities-session-status). |
 | `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that a pull — `manage.pull`, or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact) tool — may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `SKILL.md`, plus any supporting files packed beside it, which install read-only and not executable under `tools/<name>/`. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` and `remove-artifact` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
 | `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools that a pull may install, as [install entries](#install-entries). A pulled tool joins the dispatch allowlist. The same entries let a removal uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
 | `capabilities.install.from` | `[stores] \| [stores, sources]` | no | Where a pull finds what it installs. Default: `[stores]`, the project store then the global store. `[stores, sources]` (in either order) also fetches a version no store holds from the GitHub source of the artifact's scope; the runtime fetches it, records the owner id in `murmur.lock` and writes it to no store. An empty list, a list without `stores`, a duplicate and any other value are refused with `E-MAN-003`. `mur run --explain-scope` and `mur doctor` report it as `install from`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_from`. A spawned child declaring `sources` under a parent without it is refused. |
@@ -1179,6 +1180,30 @@ that submitted it: a `tool` step reaches the tools in the capsule's own inventor
 the binaries in `capabilities.shell.allow`, and a `capsule` step the names in
 `capabilities.spawn.allow`. What the grant changes is how much of that one model turn can reach
 without another turn in between.
+
+#### `capabilities.session_status` { #capabilities-session-status }
+
+Grants the capsule's agent one [runtime-provided tool](runtime-provided-tools.md),
+[`session-status`](runtime-provided-tools.md#session-status), which reports the time the session
+has run and has left, its turns, context, tokens and spend.
+
+```yaml
+capabilities:
+  session_status:
+    read: true
+```
+
+| Declared | Effect |
+|---|---|
+| `read: true` | The tool is in the inventory on both transports, and `session_start`'s `tools_declared` lists it |
+| `read: false`, or no `session_status:` block | No tool: the model is not offered it, and a call naming it anyway is refused naming `capabilities.session_status.read` |
+| `session_status:` without `read:` | Refused at parse with [`E-MAN-003`](diagnostics.md#e-man-003): a capability is never inferred |
+| On an `artifacts[]` entry | Refused at parse with `E-MAN-003`: the grant is capsule-wide |
+| On a capsule with no `inference:` block | No effect: a script capsule has no agent to offer the tool to |
+
+The grant decides only whether the tool exists. A session's
+[deadline](cli.md#mur-run-deadline), its [deadline notice](runtime-provided-tools.md#deadline-notice)
+and the counts the tool reads run with or without it.
 
 #### `capabilities.install` { #field-install }
 
@@ -3203,7 +3228,8 @@ A missing or blank `message`, a missing `limit` and `limit: 0` are refused with
 `murmur.yaml: invalid lifecycle config for 'lifecycle.keep_working.limit': must be at least 1;
 omit lifecycle.keep_working to turn the option off`.
 
-The model is told nothing about the option beyond `message` itself and the `keep_working` field of
+The model is told nothing about the option beyond `message` itself and, when the capsule grants
+[`capabilities.session_status.read`](#capabilities-session-status), the `keep_working` field of
 [`session-status`](runtime-provided-tools.md#session-status), so write `message` to stand on its
 own. Every continuation resends the whole context, so cost rises with each one. What stops the
 task, what it ends with, and how the deadline treats it are in

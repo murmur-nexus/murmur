@@ -39,14 +39,14 @@ const SCOPE: &str = "local";
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
 /// An agent capsule's manifest body: its driver against `endpoint`, an authenticated door that
-/// serves peers, `lifecycle`, `formation-probe` installed, and `localhost` — where every member's
-/// door is — in `capabilities.network.allow`.
+/// serves peers, `lifecycle`, `formation-probe` installed, `localhost` — where every member's
+/// door is — in `capabilities.network.allow`, and the `session-status` grant.
 fn member_manifest(endpoint: &str, lifecycle: &str, driver_version: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER_NAME}\n    version: {driver_version}\n    runtime: driver\n    \
          gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
          \x20 - name: {SCOPE}/{PROBE_TOOL}\n    version: {PROBE_VERSION}\n    runtime: tool\n\
-         capabilities:\n  network:\n    allow: [localhost]\n\
+         capabilities:\n  network:\n    allow: [localhost]\n  session_status:\n    read: true\n\
          lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n\
          exports:\n  peer_tasks:\n    accept: true\n\

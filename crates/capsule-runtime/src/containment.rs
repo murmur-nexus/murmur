@@ -5240,6 +5240,12 @@ mod tests {
                  artifact, on `state_declared`'s terms; `W-SEC-016` is what an operator needs, \
                  and the grant itself is per artifact.",
             ),
+            (
+                "session_status_read",
+                "Grants the `session-status` tool, which reads this session's own time, turns, \
+                 context and spend and opens no host resource or other grant. Whether it was \
+                 granted is recorded in `session_start.tools_declared`.",
+            ),
         ];
 
         /// Policy field → the key it is reported under in a serialized [`ScopeReport`].

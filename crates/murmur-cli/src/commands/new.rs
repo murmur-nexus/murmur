@@ -671,6 +671,7 @@ Follow all guidance in the guide. The manifest must pass `mur build` validation.
 Prefer murmur/tool-git and murmur/tool-editor over granting bash shell access.
 Name every artifact by its full <scope>/<name>, at the newest version the registry search lists.
 Include runtime: tool at the top level.
+For an agent capsule (one with an inference: block), grant the runtime-provided session-status tool in the top-level capabilities block: capabilities.session_status with read: true (a session_status: key holding read: true).
 
 Step 4 — Write the manifest:
 Call the {editor} tool with operation write_file, dest_path "out/murmur.yaml" and content set to the YAML.
@@ -1462,5 +1463,17 @@ mod tests {
         assert!(prompt.contains("out/murmur.yaml"));
         assert!(!prompt.contains("Call write_file with path"));
         assert!(!prompt.contains("Call read_file"));
+    }
+
+    /// The generated agent capsule keeps `session-status`, which exists only under its grant.
+    #[test]
+    fn build_task_prompt_grants_session_status() {
+        let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &anthropic_inf());
+        let line = prompt
+            .lines()
+            .find(|line| line.contains("capabilities.session_status"))
+            .unwrap_or_else(|| panic!("no line names the grant:\n{prompt}"));
+        assert!(line.contains("read: true"), "{line}");
+        assert!(line.contains("top-level capabilities block"), "{line}");
     }
 }

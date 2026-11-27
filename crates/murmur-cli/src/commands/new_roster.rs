@@ -813,9 +813,16 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
         }
     }
     let callees = callees_of(member.name);
+    yaml.comment(
+        0,
+        "What the capsule may reach, and which runtime-provided tools its model is offered.
+         Anything not declared here is denied.",
+    )
+    .see(0, "manifest/#field-capabilities")
+    .bare(0, "capabilities:");
     if !callees.is_empty() {
         yaml.comment(
-            0,
+            2,
             &format!(
                 "Where the capsule may connect. ../roster.yaml lets {} call {}, but a roster rule
                  grants a name and a credential, never egress: each call-member call is checked
@@ -826,17 +833,25 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
                 callees.join(", "),
             ),
         )
-        .see(0, "manifest/#field-capabilities")
-        .bare(0, "capabilities:")
+        .see(2, "manifest/#field-capabilities")
         .line(2, "network:", "IP destinations the capsule may reach")
         .line(4, "allow:", "anything not listed is denied")
         .line(
             6,
             "- localhost",
             "every member's door, at any port and scheme",
-        )
-        .blank();
+        );
     }
+    yaml.comment(
+        2,
+        "The runtime-provided session-status tool, which reports the time left before the
+         session's deadline, the turns taken, the context in use and the spend so far. Without
+         this grant the model is not offered the tool; the deadline holds either way.",
+    )
+    .see(2, "manifest/#capabilities-session-status")
+    .line(2, "session_status:", "the session-status tool")
+    .line(4, "read: true", "offer it; absent or false leaves it out")
+    .blank();
     let callers: Vec<&str> = REACHABILITY
         .iter()
         .filter(|(_, to)| to.contains(&member.name))
@@ -1057,7 +1072,7 @@ mod tests {
 
     /// The caller's egress is what `call-member` is checked against at the callee's door, so the
     /// member that calls declares the door host at every port, and the member that only serves
-    /// declares no capabilities at all.
+    /// declares no `network` grant.
     #[test]
     fn only_the_caller_declares_network_allow_reaching_every_door() {
         let (_, lead, worker, scaffold) = files(&default_choice());
@@ -1068,7 +1083,10 @@ mod tests {
             .map(|network| network.allow.clone())
             .unwrap_or_default();
         assert_eq!(allow, ["localhost"]);
-        assert!(worker.capabilities.is_none());
+        assert!(worker
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.network.is_none()));
         let text = scaffold.file(Path::new("lead/murmur.yaml")).unwrap();
         let prose = text
             .lines()
@@ -1082,6 +1100,41 @@ mod tests {
         ] {
             assert!(prose.contains(said), "{said}: {text}");
         }
+    }
+
+    /// Both members are granted `session-status`, each in one top-level `capabilities:` block —
+    /// lead's holding its `network:` too, since YAML would keep only the second of two.
+    #[test]
+    fn both_members_grant_session_status_in_one_capabilities_block() {
+        let (_, lead, worker, scaffold) = files(&default_choice());
+        for (member, manifest) in [("lead", &lead), ("worker", &worker)] {
+            assert_eq!(
+                manifest
+                    .capabilities
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.session_status.as_ref()),
+                Some(&murmur_artifact::SessionStatusCapabilities { read: true }),
+                "{member}"
+            );
+            let text = scaffold
+                .file(&Path::new(member).join(MANIFEST_FILENAME))
+                .unwrap();
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("capabilities:"))
+                    .count(),
+                1,
+                "{member}: {text}"
+            );
+            assert!(
+                text.contains(&format!("# {DOCS}/manifest/#capabilities-session-status\n")),
+                "{member}: {text}"
+            );
+        }
+        assert!(lead
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.network.is_some()));
     }
 
     /// Lead's prompt names the hand-off: lead does not do the task, its first reply is a

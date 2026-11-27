@@ -124,7 +124,8 @@ fn summarizing_home() -> TempDir {
 
 /// A capsule on [`MODEL`] with `driver.config.reasoning_effort: high`, reaching `endpoint`, the
 /// compactor declared with `hook_extra` spliced into its entry and `compaction_extra` into
-/// `inference.compaction`.
+/// `inference.compaction`. It grants `session-status`, its one tool, so that its agent turns carry
+/// a tool array and [`is_compaction_call`] can tell them from the compaction call.
 fn manifest(endpoint: &str, hook_extra: &str, compaction_extra: &str) -> String {
     manifest_with_key(endpoint, "test-key", "", hook_extra, compaction_extra)
 }
@@ -142,7 +143,8 @@ fn manifest_with_key(
         "name: compaction-call\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
          api_key: {api_key}\n  - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n\
-         {hook_extra}capabilities:\n  network:\n    allow:\n      - {endpoint}\n{CONTEXT}\
+         {hook_extra}capabilities:\n  network:\n    allow:\n      - {endpoint}\n  session_status:\n    \
+         read: true\n{CONTEXT}\
          inference:\n  transport: http\n  model: {MODEL}\n  max_tokens: {TURN_CAP}\n  driver:\n    \
          artifact: {DRIVER}\n    config:\n      reasoning_effort: high\n{config_extra}  compaction:\n    \
          threshold: 0.5\n{compaction_extra}"

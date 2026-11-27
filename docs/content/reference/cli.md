@@ -2212,7 +2212,7 @@ started.
 | Exit | `status:  deadline_reached`, exit code `1`, [`E-RUN-053`](diagnostics.md#e-run-053) — unless an earlier task already failed, which keeps its own status |
 | Already past at launch | The session ends before any task runs |
 | A formation's deadline before its entry member started | The launcher stops every member it started and exits `1` with [`E-RUN-053`](diagnostics.md#e-run-053), naming each stopped member |
-| The agent | Is told once, on a tool result, when [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left, and its [`session-status`](runtime-provided-tools.md#session-status) tool reports the time left — see [The deadline notice](runtime-provided-tools.md#deadline-notice) |
+| The agent | Is told once, on a tool result, when [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left, and, when the manifest grants [`capabilities.session_status.read`](manifest.md#capabilities-session-status), its [`session-status`](runtime-provided-tools.md#session-status) tool reports the time left — see [The deadline notice](runtime-provided-tools.md#deadline-notice) |
 
 A session runs under the earliest deadline placed on it. The others are not recorded.
 

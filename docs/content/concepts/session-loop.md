@@ -224,9 +224,10 @@ A session runs under the **earliest** deadline placed on it:
 
 [The deadline](../reference/cli.md#mur-run-deadline) lists how each one is counted.
 
-The agent sees only the effective deadline, through
-[`session-status`](../reference/runtime-provided-tools.md#session-status) and its one
-[deadline notice](../reference/runtime-provided-tools.md#deadline-notice). The parent's wait for a
+The agent sees only the effective deadline, through its one
+[deadline notice](../reference/runtime-provided-tools.md#deadline-notice) and, when the capsule
+grants [`capabilities.session_status.read`](../reference/manifest.md#capabilities-session-status),
+through [`session-status`](../reference/runtime-provided-tools.md#session-status). The parent's wait for a
 child, [`lifecycle.delegation_deadline_secs`](../reference/manifest.md#lifecycle-delegation-deadline-secs),
 is a separate bound: whichever falls first ends the child.
 
@@ -272,8 +273,8 @@ Continuations happen inside one task:
   trace record and one `working` status, `keep working <n> of <limit>`, on the
   [stream](../reference/streaming-protocol.md#working-messages); `task_end.keep_working` records `used`, `limit` and
   `stopped_by`, and `mur trace show` prints `kept working: 2 of 2 (stopped by limit)`.
-- The agent reads how many continuations are used and left in the `keep_working` field of
-  [`session-status`](../reference/runtime-provided-tools.md#session-status).
+- An agent granted [`session-status`](../reference/manifest.md#capabilities-session-status) reads
+  how many continuations are used and left in the tool's `keep_working` field.
 
 The runtime never judges whether the work is done, and adds no wording of its own: the message is
 the operator's, and nothing about the option enters the system prompt, `MURMUR.md` or the
@@ -337,8 +338,8 @@ A check reopen happens inside one task:
   the [stream](../reference/streaming-protocol.md#working-messages). `task_end.done_check` records
   `runs`, `reopens`, `limit`, `met` and `stopped_by`, and `mur trace show` prints
   `done check: not met  reopens 2 of 2 (stopped by limit)`.
-- The agent reads the reopens used and left in the `done_check` field of
-  [`session-status`](../reference/runtime-provided-tools.md#session-status).
+- An agent granted [`session-status`](../reference/manifest.md#capabilities-session-status) reads
+  the reopens used and left in the tool's `done_check` field.
 
 The command runs the way the agent's shell tool runs one: in the work folder, under the capsule's
 containment, environment and [resource limits](../reference/manifest.md#field-capabilities), with

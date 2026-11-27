@@ -1060,8 +1060,8 @@ fn a_coding_task_edits_a_file_through_the_bridge_and_completes() {
     );
     assert_eq!(
         starts[0]["bridge_tools"],
-        json!(["session-status", EDITOR_NAME]),
-        "the bridge offered something other than the capsule's one tool and session-status: {}",
+        json!([EDITOR_NAME]),
+        "the bridge offered something other than the capsule's one tool: {}",
         starts[0]
     );
 

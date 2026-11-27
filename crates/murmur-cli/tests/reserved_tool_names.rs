@@ -118,6 +118,10 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
             "capabilities:\n  spawn:\n    allow:\n      - local/worker\n",
         ),
         ("submit-plan", "capabilities:\n  plan:\n    submit: true\n"),
+        (
+            "session-status",
+            "capabilities:\n  session_status:\n    read: true\n",
+        ),
     ];
 
     for (name, blocks) in grants {

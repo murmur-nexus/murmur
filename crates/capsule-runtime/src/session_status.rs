@@ -1,6 +1,9 @@
 //! Where an agent session stands: what the runtime-provided `session-status` tool reports, the
 //! hard deadline a session runs under, and the one notice an agent is given before it.
 //!
+//! Every agent session holds a [`SessionStatus`], granted or not: the deadline, its notice and the
+//! counters run without the tool. Only the tool is gated, by `capabilities.session_status.read`.
+//!
 //! [`SessionStatus`] holds no number of its own. It is fed at the funnels that already produce
 //! each one — the trace writer's `inference`, `task_start` and `task_end` writes, and the http
 //! agent loop's compaction check — and a call reads the spend meter as it stands. So every field a
@@ -18,7 +21,8 @@ use crate::model_limits::{BudgetBasis, InputBudget};
 use crate::process_driver::QuotaWindow;
 use crate::spend::SpendMeter;
 
-/// The runtime-provided tool every agent capsule has, on both transports, with no grant.
+/// The runtime-provided tool an agent capsule has, on both transports, when its manifest declares
+/// `capabilities.session_status.read: true`.
 pub const SESSION_STATUS_TOOL: &str = "session-status";
 
 /// What a field reads when its limit is not set.

@@ -95,13 +95,14 @@ fn keep_working(limit: u32) -> String {
     format!("  keep_working:\n    message: \"{MESSAGE}\"\n    limit: {limit}\n")
 }
 
-/// An http capsule on `endpoint`; `lifecycle` and `inference` are spliced into their blocks.
+/// An http capsule on `endpoint`, granted `session-status`, which reports the keep-working
+/// count; `lifecycle` and `inference` are spliced into their blocks.
 fn http_manifest(endpoint: &str, lifecycle: &str, inference: &str) -> String {
     format!(
         "name: keep-working\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-         api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n\
-         lifecycle:\n  task_acceptance: single\n{lifecycle}inference:\n  transport: http\n  \
+         api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n  \
+         session_status:\n    read: true\nlifecycle:\n  task_acceptance: single\n{lifecycle}inference:\n  transport: http\n  \
          model: test-model\n{inference}  driver:\n    artifact: {DRIVER}\n"
     )
 }

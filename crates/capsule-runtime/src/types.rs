@@ -350,6 +350,15 @@ pub struct CapabilityPolicy {
     /// session's tool dispatch, its shell allowlist and its spawn grant, so a plan reaches exactly
     /// what the model could already call one call at a time.
     pub plan_submit: bool,
+    /// From `capabilities.session_status.read`: whether this capsule's model is offered the
+    /// runtime-provided `session-status` tool. `false` by default, which is deny — and which is
+    /// also why no `session-status` tool manifest is written and the capsule's model never sees
+    /// the tool exists.
+    ///
+    /// It opens no reach: the tool reads only this session's own time, turns, context and spend.
+    /// The session's deadline, its deadline notice and those counters run whether or not it is
+    /// granted; only the tool is gated.
+    pub session_status_read: bool,
     /// From `capabilities.install.skill`: the entries naming which skill artifacts a pull
     /// (`manage.pull` or the `pull-artifact` tool) may install into this session, verbatim and in
     /// declaration order. Empty by default, which is deny. With [`Self::install_tool`] also
@@ -1039,6 +1048,11 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.plan.as_ref())
         .is_some_and(|plan| plan.submit);
 
+    // Absent `capabilities.session_status` block, or `read: false` within it, both mean denied.
+    let session_status_read = caps
+        .and_then(|c| c.session_status.as_ref())
+        .is_some_and(|session_status| session_status.read);
+
     // Absent `capabilities.install` block means both lists are empty, which is deny.
     let install = caps.and_then(|c| c.install.as_ref());
     let install_skill = install.map(|i| i.skill.clone()).unwrap_or_default();
@@ -1148,6 +1162,7 @@ pub fn capability_policy_from_runtime_manifest(
         state_declared,
         conversation_declared,
         plan_submit,
+        session_status_read,
         install_skill,
         install_tool,
         install_from_sources,

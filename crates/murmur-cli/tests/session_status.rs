@@ -1,6 +1,9 @@
 //! The runtime-provided `session-status` tool, the hard `mur run --deadline` and the one deadline
 //! notice.
 //!
+//! The tool exists only under `capabilities.session_status.read`; the deadline and its notice run
+//! with or without it, so the deadline cases run some capsules ungranted.
+//!
 //! Driven through the real `mur` binary: the http cases against the real anthropic driver fixture
 //! and a scripted provider, the process cases against the fixture process driver and the fake
 //! harness calling through the real tool bridge. Every number the tool returns is compared with
@@ -103,6 +106,8 @@ fn publish_compiled(home: &TempDir, artifact: &Path) {
 struct Http<'a> {
     /// Grants `sleep` and keeps a 12-second sleep in the foreground.
     sleep: bool,
+    /// Leaves out `capabilities.session_status`, which every other capsule here declares.
+    ungranted: bool,
     inference: &'a str,
     lifecycle: &'a str,
     top: &'a str,
@@ -119,11 +124,16 @@ fn http_manifest(endpoint: &str, capsule: &Http<'_>) -> String {
     } else {
         ""
     };
+    let grant = if capsule.ungranted {
+        ""
+    } else {
+        "  session_status:\n    read: true\n"
+    };
     format!(
         "name: status\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
          api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n{shell}\
-         lifecycle:\n  task_acceptance: single\n{grace}{lifecycle}{top}inference:\n  transport: \
+         {grant}lifecycle:\n  task_acceptance: single\n{grace}{lifecycle}{top}inference:\n  transport: \
          http\n  model: test-model\n{inference}  driver:\n    artifact: {DRIVER}\n",
         lifecycle = capsule.lifecycle,
         top = capsule.top,
@@ -274,18 +284,38 @@ fn split_notice(text: &str) -> (String, Option<String>) {
 
 // ── In the tool list ──────────────────────────────────────────────────────
 
-/// Every http agent capsule is offered `session-status`, with the fixed description and an
-/// empty-object schema, granted nothing; `session_start` lists it.
-#[test]
-fn session_status_is_in_every_agent_capsules_tool_list() {
-    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
-    let server = common::ScriptedServer::start(vec![end_turn()]);
-    let project = project(&http_manifest(&server.endpoint, &Http::default()));
-    let run = run(&home, &project, &[]);
-    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+/// The tool definitions in the first request's tool array, or none when it carries no array.
+fn offered_tools(requests: &[Value]) -> Vec<Value> {
+    requests[0]["tools"].as_array().cloned().unwrap_or_default()
+}
 
-    let requests = server.requests();
-    let tools = requests[0]["tools"].as_array().expect("a tool array");
+/// `session_start.tools_declared`, as names.
+fn tools_declared(trace: &[Value]) -> Vec<String> {
+    first(trace, "session_start")["tools_declared"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools_declared is not an array: {trace:#?}"))
+        .iter()
+        .map(|name| name.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The same http capsule, granted and not: granted, it is offered `session-status` with the fixed
+/// description and an empty-object schema, and `session_start` lists it; ungranted, neither the
+/// tool array nor `tools_declared` names it.
+#[test]
+fn session_status_is_offered_only_when_granted() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+
+    let server = common::ScriptedServer::start(vec![end_turn()]);
+    let granted = project(&http_manifest(&server.endpoint, &Http::default()));
+    let run_granted = run(&home, &granted, &[]);
+    assert_eq!(
+        run_granted.output.status.code(),
+        Some(0),
+        "{}",
+        run_granted.context()
+    );
+    let tools = offered_tools(&server.requests());
     let offered: Vec<&Value> = tools
         .iter()
         .filter(|tool| tool["name"] == "session-status")
@@ -301,19 +331,159 @@ fn session_status_is_in_every_agent_capsules_tool_list() {
         json!({"type": "object", "properties": {}}),
         "{tools:#?}"
     );
-
-    let trace = run.trace();
-    let declared = first(&trace, "session_start")["tools_declared"].clone();
-    assert!(
-        declared
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|name| name == "session-status"),
-        "{declared}"
-    );
+    let trace = run_granted.trace();
+    assert_eq!(tools_declared(&trace), ["session-status"]);
     assert_eq!(first(&trace, "session_start")["deadline"], Value::Null);
     assert!(events(&trace, "session_status").is_empty());
+
+    let server = common::ScriptedServer::start(vec![end_turn()]);
+    let ungranted = project(&http_manifest(
+        &server.endpoint,
+        &Http {
+            ungranted: true,
+            ..Http::default()
+        },
+    ));
+    let run_ungranted = run(&home, &ungranted, &[]);
+    assert_eq!(
+        run_ungranted.output.status.code(),
+        Some(0),
+        "{}",
+        run_ungranted.context()
+    );
+    let tools = offered_tools(&server.requests());
+    assert!(
+        tools.iter().all(|tool| tool["name"] != "session-status"),
+        "{tools:#?}"
+    );
+    assert!(tools_declared(&run_ungranted.trace()).is_empty());
+}
+
+/// What the live sessions' runtime directories in a `HOME` held at one moment.
+#[derive(Clone)]
+struct RuntimeTools {
+    /// Whether any live runtime directory was found at all.
+    found_runtime: bool,
+    /// Every `tools/` entry under them, the driver's staged directory among them.
+    tools: Vec<PathBuf>,
+}
+
+/// [`RuntimeTools`] under `home` now.
+fn runtime_tools_under(home: &Path) -> RuntimeTools {
+    let sessions = home.join(".murmur").join("sessions");
+    let mut found_runtime = false;
+    let mut tools = Vec::new();
+    for session in fs::read_dir(&sessions).into_iter().flatten().flatten() {
+        let runtime = session.path().join("runtime");
+        if !runtime.join("MURMUR.md").is_file() {
+            continue;
+        }
+        found_runtime = true;
+        for tool in fs::read_dir(runtime.join("tools"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            tools.push(tool.path());
+        }
+    }
+    RuntimeTools {
+        found_runtime,
+        tools,
+    }
+}
+
+/// An http agent capsule with no artifact tool, no shell grant and no runtime-provided grant has
+/// an empty tool inventory: `tools_declared` is `[]`, its runtime directory holds no tool, and the
+/// provider is sent no tool definition. A `session-status` call it makes anyway is refused naming
+/// the grant and writes no record, and the run still ends `ok` on the next turn.
+#[test]
+fn a_bare_agent_capsule_has_no_tools_and_session_status_is_refused() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+    let seen: std::sync::Arc<std::sync::Mutex<Option<RuntimeTools>>> = Default::default();
+    let server = {
+        let seen = std::sync::Arc::clone(&seen);
+        let home = home.path().to_path_buf();
+        let mut answered = 0;
+        common::ScriptedServer::start_answering(2, move |_| {
+            answered += 1;
+            if answered == 1 {
+                // The session is live while its first request is held: its runtime directory is
+                // staged and not yet removed.
+                *seen.lock().unwrap() = Some(runtime_tools_under(&home));
+                tool_turn("toolu_status", "session-status", json!({}))
+            } else {
+                end_turn()
+            }
+        })
+    };
+    let project = project(&http_manifest(
+        &server.endpoint,
+        &Http {
+            ungranted: true,
+            ..Http::default()
+        },
+    ));
+    let run = run(&home, &project, &[]);
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    assert!(run.stdout.contains("status:  ok"), "{}", run.context());
+
+    let RuntimeTools {
+        found_runtime,
+        tools,
+    } = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the first request arrived");
+    assert!(
+        found_runtime,
+        "no live runtime directory under {:?}",
+        home.path()
+    );
+    // The driver is staged there too, hidden from the model; nothing else is.
+    let driver = DRIVER.rsplit('/').next().unwrap();
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool.file_name().is_some_and(|name| name == driver)),
+        "the runtime directory holds a tool: {tools:?}"
+    );
+    assert!(
+        !tools.iter().any(|tool| tool.ends_with("session-status")),
+        "{tools:?}"
+    );
+
+    let trace = run.trace();
+    assert!(tools_declared(&trace).is_empty(), "{trace:#?}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    for (n, request) in requests.iter().enumerate() {
+        assert!(
+            offered_tools(std::slice::from_ref(request)).is_empty(),
+            "request {n} offers tools: {}",
+            request["tools"]
+        );
+    }
+
+    let result = raw_tool_result(&requests, "toolu_status");
+    assert!(
+        result.contains(
+            "'session-status' needs a capabilities.session_status.read: true declaration in \
+             murmur.yaml; this capsule declares none"
+        ),
+        "{result}"
+    );
+    let call = first(&trace, "tool_call");
+    assert_eq!(call["tool_name"], "session-status", "{call}");
+    assert!(
+        call["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("capabilities.session_status.read")),
+        "the call is recorded as refused: {call}"
+    );
+    assert!(events(&trace, "session_status").is_empty(), "{trace:#?}");
 }
 
 // ── The fields match the trace ────────────────────────────────────────────
@@ -490,8 +660,8 @@ fn unset_limits_say_none_and_unreported_counts_say_unknown() {
 // ── Process transport ─────────────────────────────────────────────────────
 
 /// A process capsule whose fake harness runs `profile`, with `wait` seconds before its third
-/// call.
-fn process_project(profile: &str, wait: u64, lifecycle: &str) -> (TempDir, Project) {
+/// call, declaring `capabilities.session_status` when `granted`.
+fn process_project(profile: &str, wait: u64, lifecycle: &str, granted: bool) -> (TempDir, Project) {
     let home = TempDir::new().unwrap();
     let artifacts = TempDir::new().unwrap();
     let driver = common::create_driver_artifact_with_auth(
@@ -515,10 +685,15 @@ fn process_project(profile: &str, wait: u64, lifecycle: &str) -> (TempDir, Proje
         format!(
             "name: status-process\nversion: 0.1.0\nartifacts:\n  - name: {PROCESS_DRIVER}\n    \
              version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  env:\n    allow: \
-             [HOME, PATH, FIXTURE_HARNESS_PROFILE]\nlifecycle:\n  task_acceptance: \
+             [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n{grant}lifecycle:\n  task_acceptance: \
              single\n{lifecycle}inference:\n  transport: process\n  max_turns: 10\n  driver:\n    \
              artifact: {PROCESS_DRIVER}\n  command: {}\n",
-            harness.display()
+            harness.display(),
+            grant = if granted {
+                "  session_status:\n    read: true\n"
+            } else {
+                ""
+            },
         ),
     )
     .unwrap();
@@ -547,7 +722,8 @@ fn session_status_through_the_process_bridge() {
     // The notice falls due 30 seconds after `mur run` starts. The first two calls come right after
     // staging, the third 28 seconds later, so the notice lands on the third unless staging alone
     // took the whole 30.
-    let (home, project) = process_project("session-status", 28, "  deadline_notice_secs: 90\n");
+    let (home, project) =
+        process_project("session-status", 28, "  deadline_notice_secs: 90\n", true);
     let run = run(&home, &project, &["--deadline", "120"]);
     assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
 
@@ -655,7 +831,7 @@ fn session_status_reports_the_harness_quota_windows() {
     if common::skip_without_host_support("session_status_reports_the_harness_quota_windows") {
         return;
     }
-    let (home, project) = process_project("quota", 0, "");
+    let (home, project) = process_project("quota", 0, "", true);
     let run = run(&home, &project, &[]);
     assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
     let trace = run.trace();
@@ -749,12 +925,22 @@ struct NoticeRun {
 }
 
 fn notice_run(lifecycle: &'static str, extra: &'static [&'static str]) -> NoticeRun {
+    notice_run_granted(lifecycle, extra, true)
+}
+
+/// [`notice_run`], declaring `capabilities.session_status` only when `granted`.
+fn notice_run_granted(
+    lifecycle: &'static str,
+    extra: &'static [&'static str],
+    granted: bool,
+) -> NoticeRun {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
     let server = common::ScriptedServer::start(notice_script());
     let project = project(&http_manifest(
         &server.endpoint,
         &Http {
             sleep: true,
+            ungranted: !granted,
             lifecycle,
             ..Http::default()
         },
@@ -914,6 +1100,60 @@ fn the_deadline_notice_is_sent_once() {
     );
 }
 
+/// An ungranted capsule with a shell tool runs the same script: its `session-status` call is
+/// refused, yet exactly one tool result still carries the deadline notice and one
+/// `deadline_notice` record is written — the notice rides whichever result comes back first
+/// inside the margin, and the session's deadline does not depend on the tool.
+#[test]
+fn the_deadline_notice_reaches_a_capsule_without_session_status() {
+    if common::skip_without_host_support(
+        "the_deadline_notice_reaches_a_capsule_without_session_status",
+    ) {
+        return;
+    }
+    let ungranted =
+        notice_run_granted("  deadline_notice_secs: 40\n", &["--deadline", "75"], false);
+    assert_eq!(
+        ungranted.run.output.status.code(),
+        Some(0),
+        "{}",
+        ungranted.run.context()
+    );
+    let tools = offered_tools(&ungranted.requests);
+    assert!(
+        tools.iter().all(|tool| tool["name"] != "session-status"),
+        "{tools:#?}"
+    );
+    assert!(
+        raw_tool_result(&ungranted.requests, "toolu_3")
+            .contains("capabilities.session_status.read"),
+        "the call is refused naming the grant"
+    );
+
+    let trace = ungranted.run.trace();
+    let deadline_at = first(&trace, "session_start")["deadline"]["at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let carriers: Vec<&str> = NOTICE_TOOL_IDS
+        .iter()
+        .copied()
+        .filter(|id| {
+            split_notice(&raw_tool_result(&ungranted.requests, id))
+                .1
+                .is_some_and(|notice| {
+                    notice.starts_with(&format!("{NOTICE_PREFIX}{deadline_at}, in "))
+                })
+        })
+        .collect();
+    assert_eq!(carriers.len(), 1, "exactly one result carries the notice");
+    let notices = events(&trace, "deadline_notice");
+    assert_eq!(notices.len(), 1, "{trace:#?}");
+    assert_eq!(notices[0]["deadline_at"], deadline_at.as_str());
+    assert_eq!(notices[0]["notice_secs"], 40);
+    assert!(events(&trace, "session_status").is_empty(), "{trace:#?}");
+}
+
 // ── The deadline ends the session ─────────────────────────────────────────
 
 /// The deadline the ending cases run under: long enough that staging is over well before it, so
@@ -958,12 +1198,19 @@ fn assert_ended_by_the_deadline(run: &Run) {
     );
 }
 
-/// A turn whose provider never answers is ended by the deadline.
+/// A turn whose provider never answers is ended by the deadline. The capsule declares no
+/// `session-status` grant: the deadline is the session's, not the tool's.
 #[test]
 fn the_deadline_ends_an_http_session_in_flight() {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
     let endpoint = common::never_replying();
-    let project = project(&http_manifest(&endpoint, &Http::default()));
+    let project = project(&http_manifest(
+        &endpoint,
+        &Http {
+            ungranted: true,
+            ..Http::default()
+        },
+    ));
     let begun = Instant::now();
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
     assert!(
@@ -1039,14 +1286,16 @@ fn the_deadline_ends_a_session_in_a_foreground_command() {
     );
 }
 
-/// A harness that never answers is ended by the deadline, and is gone afterwards.
+/// A harness that never answers is ended by the deadline, and is gone afterwards. The capsule
+/// declares no `session-status` grant, so it has no tool and no bridge: the deadline does not
+/// depend on either.
 #[cfg(unix)]
 #[test]
 fn the_deadline_ends_a_process_session_and_its_harness() {
     if common::skip_without_host_support("the_deadline_ends_a_process_session_and_its_harness") {
         return;
     }
-    let (home, project) = process_project("silent", 0, "");
+    let (home, project) = process_project("silent", 0, "", false);
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
     assert_ended_by_the_deadline(&run);
     if events(&run.trace(), "task_start").is_empty() {

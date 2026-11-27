@@ -400,11 +400,12 @@ enum Commands {
         /// End the session this many seconds after `mur run` started, whatever it is doing.
         /// Reached, the runtime cancels the running task and ends the session as a first SIGTERM
         /// does, records deadline_reached, and exits non-zero with E-RUN-053. The agent is told
-        /// once, on a tool result, when lifecycle.deadline_notice_secs are left, and its
-        /// session-status tool reports the time left. Requires an agent capsule (a manifest with
-        /// an inference: block). At most 315360000 (ten years). With --roster, the formation's
-        /// one deadline. A session launched by a formation or a delegating capsule runs under the
-        /// earlier of this and the deadline it inherited.
+        /// once, on a tool result, when lifecycle.deadline_notice_secs are left, and, when the
+        /// manifest grants capabilities.session_status.read, the session-status tool reports the
+        /// time left. Requires an agent capsule (a manifest with an inference: block). At most
+        /// 315360000 (ten years). With --roster, the formation's one deadline. A session launched
+        /// by a formation or a delegating capsule runs under the earlier of this and the deadline
+        /// it inherited.
         #[arg(
             long,
             value_name = "SECONDS",

@@ -1627,6 +1627,17 @@ pub struct PlanCapabilities {
     pub submit: bool,
 }
 
+/// The `capabilities.session_status` block — the operator's grant of the runtime-provided
+/// `session-status` tool to the capsule's agent loop. Read from the capsule-wide block only: an
+/// artifact entry declaring it is refused, because the tool is offered to the agent and not to an
+/// artifact. The grant governs whether the tool exists, never the session's deadline or counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStatusCapabilities {
+    /// Whether this capsule's model is offered `session-status`. Never inferred: a
+    /// `session_status:` block that omits `read:` is rejected, exactly as `task_io:` is.
+    pub read: bool,
+}
+
 /// The `capabilities.harness` block — the operator's grant of host directories to a
 /// `transport: process` capsule's harness, beyond what its class gives every command. Read from
 /// the capsule-wide block only, and valid only on a `transport: process` capsule. Each path a
@@ -2058,6 +2069,9 @@ pub struct Capabilities {
     /// Capsule-wide grant of the runtime-provided `submit-plan` tool. `None` is deny: the tool's
     /// synthetic manifest is not written, so it is absent from the model's inventory entirely.
     pub plan: Option<PlanCapabilities>,
+    /// Capsule-wide grant of the runtime-provided `session-status` tool. `None` is deny: the
+    /// tool's synthetic manifest is not written, so it is absent from the model's inventory.
+    pub session_status: Option<SessionStatusCapabilities>,
     /// Capsule-wide grant to pull skills and tools at runtime. `None` is deny: every
     /// `manage.pull` is refused. See [`InstallCapabilities`].
     pub install: Option<InstallCapabilities>,
@@ -2618,6 +2632,8 @@ struct RawCapabilities {
     #[serde(default)]
     plan: Option<RawPlanCapabilities>,
     #[serde(default)]
+    session_status: Option<RawSessionStatusCapabilities>,
+    #[serde(default)]
     install: Option<RawInstallCapabilities>,
     #[serde(default)]
     harness: Option<RawHarnessCapabilities>,
@@ -2656,6 +2672,16 @@ struct RawPlanCapabilities {
     // than defaulted.
     #[serde(default)]
     submit: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSessionStatusCapabilities {
+    // `Option` for the reason `RawTaskIoCapabilities::read` is: an omitted key is refused rather
+    // than defaulted.
+    #[serde(default)]
+    read: Option<bool>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3366,6 +3392,7 @@ impl RawBlock for RawCapabilities {
         "task_io",
         "conversation",
         "plan",
+        "session_status",
         "install",
         "harness",
         "containment",
@@ -3414,6 +3441,9 @@ impl RawBlock for RawCapabilities {
         if let Some(plan) = &self.plan {
             collect_block(plan, &child_path(path, "plan"), out);
         }
+        if let Some(session_status) = &self.session_status {
+            collect_block(session_status, &child_path(path, "session_status"), out);
+        }
         if let Some(install) = &self.install {
             collect_block(install, &child_path(path, "install"), out);
         }
@@ -3439,6 +3469,13 @@ impl RawBlock for RawConversationCapabilities {
 
 impl RawBlock for RawPlanCapabilities {
     const KNOWN_KEYS: &'static [&'static str] = &["submit"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawSessionStatusCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["read"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -4012,6 +4049,17 @@ impl RuntimeManifest {
                                     "artifact '{name}' declares 'capabilities.harness:'; the \
                                      grant is capsule-wide and reaches the process harness, so it \
                                      is only recognized in the top-level capabilities block"
+                                ),
+                            });
+                        }
+                        if raw_caps.session_status.is_some() {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'capabilities.session_status:'; \
+                                     the grant is capsule-wide — it offers the agent a \
+                                     runtime-provided tool — and is only recognized in the \
+                                     top-level capabilities block"
                                 ),
                             });
                         }
@@ -5381,6 +5429,21 @@ fn parse_capabilities(
         })
         .transpose()?;
 
+    let session_status = raw_caps
+        .session_status
+        .map(|raw_session_status| {
+            raw_session_status
+                .read
+                .map(|read| SessionStatusCapabilities { read })
+                .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.session_status.read".to_string(),
+                    message: "must be set explicitly to true or false — a capability is never \
+                              inferred"
+                        .to_string(),
+                })
+        })
+        .transpose()?;
+
     let install = raw_caps.install.map(parse_install).transpose()?;
     let harness = raw_caps.harness.map(parse_harness).transpose()?;
 
@@ -5419,6 +5482,7 @@ fn parse_capabilities(
         task_io,
         conversation,
         plan,
+        session_status,
         install,
         harness,
         containment,
@@ -8885,6 +8949,102 @@ capabilities:
             "{:?}",
             manifest.unknown_keys
         );
+    }
+
+    // ── capabilities.session_status (capsule-wide) ───────────────────────────
+
+    /// A capsule manifest whose capsule-wide capabilities carry `session_status: <block>`.
+    fn manifest_with_session_status(block: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  session_status:\n{block}"
+        )
+    }
+
+    #[test]
+    fn session_status_read_true_grants_the_capsule() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&manifest_with_session_status("    read: true\n"))
+                .expect("a session_status block parses");
+        assert_eq!(
+            manifest.capabilities.unwrap().session_status,
+            Some(SessionStatusCapabilities { read: true })
+        );
+    }
+
+    /// `read: false` and an absent block both leave the capsule ungranted; the difference is
+    /// only whether the operator wrote the denial down.
+    #[test]
+    fn session_status_read_false_and_an_absent_block_both_leave_the_capsule_ungranted() {
+        let explicit =
+            RuntimeManifest::from_yaml_str(&manifest_with_session_status("    read: false\n"))
+                .expect("an explicit denial parses");
+        assert_eq!(
+            explicit.capabilities.unwrap().session_status,
+            Some(SessionStatusCapabilities { read: false })
+        );
+
+        let other_block = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  plan:\n    submit: true\n",
+        )
+        .expect("a capabilities block without session_status parses");
+        assert_eq!(other_block.capabilities.unwrap().session_status, None);
+    }
+
+    /// The capability is never inferred: a `session_status:` block that omits `read:` is a parse
+    /// error naming the key, exactly as `plan:` without `submit:` is.
+    #[test]
+    fn session_status_without_read_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(&manifest_with_session_status("    {}\n"))
+            .expect_err("an empty session_status block is refused");
+        match &err {
+            RuntimeManifestError::InvalidCapabilities { field, message } => {
+                assert_eq!(field, "capabilities.session_status.read");
+                assert!(message.contains("never inferred"), "{message}");
+            }
+            other => panic!("expected InvalidCapabilities, got {other:?}"),
+        }
+    }
+
+    /// An unknown key inside the block is reported by path, like every other capability block.
+    #[test]
+    fn an_unknown_session_status_key_is_reported_by_path() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_session_status(
+            "    read: true\n    write: true\n",
+        ))
+        .expect("an unknown key is a warning, not a parse error");
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .any(|key| key.block_path == "capabilities.session_status" && key.key == "write"),
+            "{:?}",
+            manifest.unknown_keys
+        );
+    }
+
+    /// The grant offers the agent a runtime-provided tool, so a per-artifact block is refused on
+    /// every role, as `capabilities.install` is.
+    #[test]
+    fn session_status_on_an_artifact_entry_is_refused_on_every_role() {
+        for runtime in ["tool", "hook", "driver", "skill"] {
+            let yaml = format!(
+                "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/a\n    version: 0.1.0\n    \
+                 runtime: {runtime}\n    capabilities:\n      session_status:\n        read: true\n"
+            );
+            let err = RuntimeManifest::from_yaml_str(&yaml)
+                .expect_err("a per-artifact session_status block is refused");
+            match &err {
+                RuntimeManifestError::InvalidArtifact { index, message } => {
+                    assert_eq!(*index, 0);
+                    assert!(message.contains("capabilities.session_status"), "{message}");
+                    assert!(
+                        message.contains("only recognized in the top-level capabilities block"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{runtime}: expected InvalidArtifact, got {other:?}"),
+            }
+        }
     }
 
     // ── capabilities.install (capsule-wide) ──────────────────────────────────
