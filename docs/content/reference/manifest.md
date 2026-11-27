@@ -1878,6 +1878,19 @@ model ends it. What bounds a task with no turn cap:
 
 Without a deadline, mur sets no wall-clock limit on a session you launch with `mur run`.
 
+##### One model turn { #inference-max-turns-one }
+
+A capsule that needs exactly one model turn per task sets `inference.max_turns: 1`. On
+`transport: http` the task makes one model call, whatever that turn stops with:
+
+| The turn stops with | Model calls | The task | The trace's [`task_end`](observability-schemas.md#task-end) |
+|---|---:|---|---|
+| `end_turn` | 1 | Ends `ok` with the model's reply | No `max_turns_stop` |
+| `max_tokens` | 1 | Ends `ok` with the fragment and a truncation marker as its answer, as [a turn cut at the output cap](#inference-max-tokens-reached) does on its last allowed turn | `max_turns_stop` with `stop_reason: "max_tokens"` |
+| `tool_call` | 1 | Runs the tools, then ends `max_turns_reached`; `mur run` exits `1` with [`E-RUN-040`](diagnostics.md#e-run-040) | `max_turns_stop` with `stop_reason: "tool_call"` |
+
+The default is no turn cap, so a turn cut at the output cap goes on to another turn.
+
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
 
 `inference.max_tokens` is the per-turn **output** cap — the `max_tokens` field of the payload the
