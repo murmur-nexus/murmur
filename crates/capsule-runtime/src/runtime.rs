@@ -2504,7 +2504,12 @@ fn start_guest_workers(
     // Held by each kind's `WorkerSandbox`, so it lives in the session's `GuestWorkers` and is
     // removed once their drop has reaped every worker.
     let worker_scope = cgroup::prepare_worker_scope(&request.capability_policy, session_id)
-        .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+        .map_err(|reason| {
+            cgroup::delegation_unavailable(
+                reason,
+                cgroup::declares_io_limit(&request.capability_policy),
+            )
+        })?;
     let session_enforcement = sandbox::ShellEnforcement::resolve(
         &request.capability_policy,
         containment,
@@ -3691,8 +3696,9 @@ pub fn stage_session(
     // or any guest worker is forked, on a host that cannot delegate one. Past this point this
     // process is in the cgroup it stays in, so every child forked below is created in it.
     if cgroup::requires_process_bounding(&request.capability_policy) {
-        cgroup::await_delegated_base(cgroup::declares_io_limit(&request.capability_policy))
-            .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+        let declares_io_limit = cgroup::declares_io_limit(&request.capability_policy);
+        cgroup::await_delegated_base(declares_io_limit)
+            .map_err(|reason| cgroup::delegation_unavailable(reason, declares_io_limit))?;
     }
 
     let accessible_workdir = if let Some(ref user_dir) = request.workdir {
@@ -7610,7 +7616,7 @@ pub(crate) fn prepare_launch_scope(
     workdir: &Path,
 ) -> Result<cgroup::PreparedScope, RuntimeError> {
     cgroup::prepare_policy_scope(policy, session_id, workdir)
-        .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
+        .map_err(|reason| cgroup::delegation_unavailable(reason, cgroup::declares_io_limit(policy)))
 }
 
 /// Whether the capsule starts a subprocess: a `shell.allow` or a `spawn.allow` grant, a
@@ -24231,7 +24237,7 @@ inference:
         let launch =
             |policy: &CapabilityPolicy| prepare_launch_scope(policy, "ses_test", temp.path());
         match launch(&with_shell) {
-            Err(RuntimeError::CgroupDelegationUnavailable { reason }) => {
+            Err(RuntimeError::CgroupDelegationUnavailable { reason, .. }) => {
                 assert!(reason.starts_with("forced:"), "{reason}");
             }
             other => panic!("{with_shell:?}: {other:?}"),

@@ -641,12 +641,15 @@ env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
 spawned:
 
 ```
-error[E-RUN-012]: this capsule can spawn subprocesses but no cgroup v2 scope could be created to bound them ({reason}); on Linux the runtime refuses to launch rather than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user delegation requirement at https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
-  hint: the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+error[E-RUN-012]: this capsule can spawn subprocesses but no cgroup v2 scope could be created to bound them ({reason}); this host: {cause}; on Linux the runtime refuses to launch rather than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user delegation requirement at https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+  hint: {fix}
 ```
 
-`{reason}` names what the host is missing, such as the delegated cgroup directory or a
-controller the runtime needs.
+| Placeholder | Holds |
+|---|---|
+| `{reason}` | What the failed operation was missing, such as the delegated cgroup directory or a controller the runtime needs |
+| `{cause}` | The cause found on this host: the `cause:` line of `mur doctor`'s [`Cgroup scope`](cli.md#doctor-cgroup-scope) block, run with the same environment |
+| `{fix}` | The fix for that cause: that block's `fix:` text. When the host's cgroups look delegated, `{cause}` says the operation itself failed and `{fix}` is ``the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior`` |
 
 Confirm no shell subprocess ran at all: the newest session `mur trace list --workdir workdir`
 lists is the refused launch, and its [records directory](workdir.md#records-directory) holds no

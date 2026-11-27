@@ -9,18 +9,19 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     declares_io_limit, detect_landlock_abi, doctor_runtime_dir, find_on_path,
     has_subprocess_route_at_staging, inspect_installed_profile, install_from_places,
-    landlock_doctor_lines, preopen_reports, probe_scope, profile_gap_remedy_parts,
-    read_only_advisory_for, render_cgroup_scope, render_install, render_read_only,
-    render_records_dir, render_routes, render_runtime_dir, render_temp_dir, route_table,
-    runtime_dir_inside_warning, served_wit_level, undeclarable_runtime_pin_role,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_uncovered_routes, warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
-    ArtifactRequest, CgroupScopeReport, CgroupScopeStatus, EgressNamespaceFailure, HostProbe,
-    InstalledProfileState, MountAttempt, NamespaceReading, PreopenReport, ProfileAttachment,
-    ProfileGap, RouteInputs, UsernsGrant, HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    landlock_doctor_lines, launch_host_report, preopen_reports, probe_scope,
+    profile_gap_remedy_parts, read_only_advisory_for, render_cgroup_scope, render_install,
+    render_launch_host, render_read_only, render_records_dir, render_routes, render_runtime_dir,
+    render_temp_dir, route_table, runtime_dir_inside_warning, served_wit_level,
+    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_uncovered_routes, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, CgroupScopeReport, CgroupScopeStatus,
+    EgressNamespaceFailure, HostProbe, InstalledProfileState, LaunchHostReport, MountAttempt,
+    NamespaceReading, PreopenReport, ProfileAttachment, ProfileGap, RouteInputs, UsernsGrant,
+    HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
+    SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     effective_containment_floor, newest_fitting_level, read_runtime_manifest_text,
@@ -143,6 +144,9 @@ struct Findings {
     /// What `mur doctor --programs` probed, `None` without the flag: `programs` in
     /// `mur doctor --json`.
     programs: Option<ProgramsReport>,
+    /// The host setup the `Cgroup scope` block printed: `cgroup_host` in `mur doctor --json`.
+    /// Set by every project doctor that reaches its tally, never by a formation's.
+    cgroup_host: Option<LaunchHostReport>,
 }
 
 impl Findings {
@@ -898,12 +902,21 @@ fn report_routes(
 
 /// The `Cgroup scope` block: whether a launch here would get the delegated cgroup v2 scope a
 /// capsule that runs subprocesses is refused without, answered by [`probe_scope`] creating and
-/// removing a child cgroup the way a launch does. Printed for every project. Returns the `Fix:`
-/// for a capsule that `needs_scope` on a host that cannot give one, which `mur run` refuses with
-/// `E-RUN-012`.
-fn report_cgroup_scope(report: &CgroupScopeReport, needs_scope: bool) -> Option<String> {
+/// removing a child cgroup the way a launch does, then the host setup `host` read without
+/// privilege ([`render_launch_host`]): with its cause and fix when a launch here gets no scope.
+/// Printed for every project. Returns the `Fix:` for a capsule that `needs_scope` on a host that
+/// cannot give one, which `mur run` refuses with `E-RUN-012`: the host's fix when its facts found
+/// a cause, else the generic one.
+fn report_cgroup_scope(
+    report: &CgroupScopeReport,
+    host: &LaunchHostReport,
+    needs_scope: bool,
+) -> Option<String> {
     capsule_runtime::report_println!("Cgroup scope");
     capsule_runtime::report_println!("  {}", render_cgroup_scope(report));
+    for line in render_launch_host(host) {
+        capsule_runtime::report_println!("  {line}");
+    }
     let refused = needs_scope && report.status == CgroupScopeStatus::Unavailable;
     if refused {
         capsule_runtime::report_println!(
@@ -917,13 +930,16 @@ fn report_cgroup_scope(report: &CgroupScopeReport, needs_scope: bool) -> Option<
     }
     capsule_runtime::report_println!();
     refused.then(|| {
-        concat!(
-            "give `mur` a delegated cgroup v2 scope: run it under a systemd user unit with \
-             `Delegate=yes` for memory, pids, cpu and io (for example `systemd-run --user --scope \
-             -p Delegate=yes mur run`), or `mur run` refuses this capsule with E-RUN-012 \u{2014} see ",
-            murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
-        )
-        .to_string()
+        host.fix.clone().unwrap_or_else(|| {
+            concat!(
+                "give `mur` a delegated cgroup v2 scope: run it under a systemd user unit with \
+                 `Delegate=yes` for memory, pids, cpu and io (for example `systemd-run --user \
+                 --scope -p Delegate=yes mur run`), or `mur run` refuses this capsule with \
+                 E-RUN-012 \u{2014} see ",
+                murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
+            )
+            .to_string()
+        })
     })
 }
 
@@ -2458,6 +2474,10 @@ struct DoctorReport {
     /// What `--programs` probed; absent without the flag, so the document is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     programs: Option<ProgramsReport>,
+    /// The host setup a launch's cgroup scope depends on; present for a project's doctor that
+    /// reached its tally, absent for a formation and in an early refused document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cgroup_host: Option<LaunchHostReport>,
 }
 
 /// One entry of [`DoctorReport::findings`]. Serialized keys keep the field order.
@@ -2511,6 +2531,7 @@ impl DoctorReport {
                 )
                 .collect(),
             programs: findings.programs.clone(),
+            cgroup_host: findings.cgroup_host.clone(),
         }
     }
 
@@ -2532,6 +2553,7 @@ impl DoctorReport {
                 fix: error.hint.clone().unwrap_or_default(),
             }],
             programs: None,
+            cgroup_host: None,
         }
     }
 
@@ -3462,6 +3484,8 @@ fn check_project(
     // Whether a launch here gets its cgroup scope, asked of the host by creating and removing a
     // child cgroup whatever the capsule declares. A failed check only for a capsule that needs a
     // scope — a subprocess route — because only that launch is refused.
+    // The host facts are read before the probe can move this process into a scope.
+    let cgroup_host = launch_host_report(declares_io_limit(&capability_policy));
     let cgroup_probe = probe_scope(
         true,
         &capability_policy.resources,
@@ -3469,7 +3493,13 @@ fn check_project(
         &project_root.join("workdir"),
     );
     capsule_runtime::report_println!();
-    if let Some(fix) = report_cgroup_scope(&cgroup_probe.cgroup_scope, can_spawn_subprocess) {
+    let cgroup_fix = report_cgroup_scope(
+        &cgroup_probe.cgroup_scope,
+        &cgroup_host,
+        can_spawn_subprocess,
+    );
+    findings.cgroup_host = Some(cgroup_host);
+    if let Some(fix) = cgroup_fix {
         findings.coded(
             E_RUN_012,
             DoctorBlock::CgroupScope,

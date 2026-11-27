@@ -1418,6 +1418,66 @@ mur doctor --json --programs 2>/dev/null \
   | jq '.programs.probed[] | select(.status=="refused") | {program, cause, grant}'
 ```
 
+A project's doctor that reaches its tally adds a `cgroup_host` object after `programs`: the
+[`Cgroup scope`](#doctor-cgroup-scope) block's host lines. A formation directory and an early
+refused document have no `cgroup_host` key.
+
+```json
+  "cgroup_host": {
+    "setup": "login-session",
+    "cgroup": "/user.slice/user-1000.slice/session-3.scope",
+    "unit": "session-3.scope",
+    "euid": 1000,
+    "scope_source": "user-manager",
+    "ready": false,
+    "delegated_parent": {
+      "path": "/sys/fs/cgroup/user.slice/user-1000.slice",
+      "owner": 0,
+      "subtree_control": ["memory", "pids"],
+      "adopts": false,
+      "reason": "parent not owned by this uid"
+    },
+    "own_controllers": ["memory", "pids"],
+    "session_bus": true,
+    "user_manager": {
+      "cgroup": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+      "controllers": ["memory", "pids"]
+    },
+    "missing": ["cpu"],
+    "cause": "this host's systemd user manager (user@1000.service) delegates only memory, pids to the scopes it creates, and a launch needs memory, pids, cpu",
+    "fix": "give the systemd user manager memory, pids, cpu and io to delegate (see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior), then restart it — …",
+    "open_files": { "soft": 1024, "hard": 1048576 }
+  }
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `cgroup_host.setup` | string | `user-manager`, `login-session`, `system-unit`, `other`, `no-cgroup-v2` or `not-linux` — the `host setup:` line's setup |
+| `cgroup_host.cgroup` | string or `null` | `mur`'s cgroup path from `/proc/self/cgroup`; `null` with no cgroup v2 hierarchy and off Linux |
+| `cgroup_host.unit` | string or `null` | The unit the setup names: `user@<n>.service`, `session-<x>.scope` or the system unit; `null` for `other`, `no-cgroup-v2` and `not-linux` |
+| `cgroup_host.euid` | integer or `null` | `mur`'s effective uid; `null` off Linux |
+| `cgroup_host.scope_source` | string | `delegated-parent`, `user-manager`, `own-cgroup` or `none` — the `host setup:` line's `<how>` |
+| `cgroup_host.ready` | boolean | Whether a launch gets its scope from `scope_source`. `true` off Linux |
+| `cgroup_host.delegated_parent` | object or `null` | The delegated parent check; `null` off Linux |
+| `cgroup_host.delegated_parent.path` | string or `null` | The parent cgroup's path under the cgroup2 mount; `null` when `mur`'s cgroup has no parent |
+| `cgroup_host.delegated_parent.owner` | integer or `null` | The uid owning the parent; `null` when there is no parent or it cannot be read |
+| `cgroup_host.delegated_parent.subtree_control` | array of strings | The parent's `cgroup.subtree_control` |
+| `cgroup_host.delegated_parent.adopts` | boolean | Whether a launch adopts the parent |
+| `cgroup_host.delegated_parent.reason` | string or `null` | Why not: the `delegated parent: not adopted` reason; `null` when `adopts` |
+| `cgroup_host.own_controllers` | array of strings | `mur`'s own `cgroup.controllers` |
+| `cgroup_host.session_bus` | boolean | Whether a session bus is reachable |
+| `cgroup_host.user_manager` | object or `null` | The systemd user manager's cgroup; `null` when it does not exist |
+| `cgroup_host.user_manager.cgroup` | string | Its path under the cgroup2 mount |
+| `cgroup_host.user_manager.controllers` | array of strings | Its `cgroup.controllers`: what it can delegate to the scopes it creates |
+| `cgroup_host.missing` | array of strings | The controllers `cause` names as missing, in the order memory, pids, cpu, io; empty when `ready` |
+| `cgroup_host.cause` | string or `null` | The `cause:` line; `null` when `ready` |
+| `cgroup_host.fix` | string or `null` | The `fix:` text, its command lines after newlines, each indented four spaces; `null` when `ready` |
+| `cgroup_host.open_files.soft`, `.hard` | integer or `null` | The open-file limit; `null` for unlimited or unreadable |
+
+```bash
+mur doctor --json 2>/dev/null | jq -r '.cgroup_host.fix // "ready"'
+```
+
 ### Process harness { #doctor-process-harness }
 
 For a capsule with `inference.transport: process`, `mur doctor` prints a `Process harness` block
@@ -1554,6 +1614,53 @@ the way a launch does — see [Whether the launch gets its cgroup scope](contain
 |---|---|---|
 | Declares `capabilities.shell.allow` or `capabilities.spawn.allow`, or has a WASM tool, driver or hook ([guest worker](../concepts/guest-workers.md)) | `refused:` line naming `E-RUN-012`, a `Fix:` line, no `All checks passed.`, exit status `1` | the line alone |
 | Runs no subprocess | the line, then `this capsule runs no subprocess, so a launch creates no scope for it`; the exit code is unchanged | the same |
+
+Between the `cgroup scope:` line and the `refused:` or `runs no subprocess` line, the block names
+the host setup `mur` runs in and how a launch there gets its scope. These lines are read from
+`/proc/self/cgroup`, the cgroup directories, the environment and the open-file limit; nothing is
+written and no D-Bus call is made.
+
+```text
+Cgroup scope
+  cgroup scope: unavailable — …
+  host setup: cgroup /launcher — no delegated cgroup is reachable
+  delegated parent: not adopted — parent does not enable memory,pids,cpu
+  open files: 1024 (hard 1048576)
+  cause: the cgroup above mur's (/sys/fs/cgroup) is delegated to uid 0 but does not enable memory, pids, cpu for its children
+  fix: enable the controllers for the children of /sys/fs/cgroup, with no process left directly in it (see https://docs.murmur.nexus/reference/resource-limits/#delegated-parent):
+      echo "+memory +pids +cpu +io" > /sys/fs/cgroup/cgroup.subtree_control
+  refused: `mur run` refuses this capsule here with E-RUN-012, …
+```
+
+| Line | Printed | Reads |
+|---|---|---|
+| `host setup:` | always | `<setup> — <how>`, from the tables below |
+| `delegated parent:` | always | `would be adopted — <parent path>`, or `not adopted — <reason>`: the first check of [Delegated parent](resource-limits.md#delegated-parent) that fails |
+| `open files:` | always | `<soft> (hard <hard>)` of the open-file limit; `unlimited` for no limit |
+| `cause:` | when a launch here gets no scope | Why, as found on this host; the same text `E-RUN-012` prints after `this host:` |
+| `fix:` | when a launch here gets no scope | The fix for that cause: a sentence, then each command on its own line. `mur doctor` prints it and runs nothing |
+
+| `<setup>` | `mur`'s cgroup |
+|---|---|
+| `systemd user manager (user@<n>.service)` | Has a `user@<n>.service` component |
+| `login session (session-<x>.scope)` | `/user.slice/user-<n>.slice/session-<x>.scope` or below |
+| `system unit (<name>)` | `/system.slice/<name>` or below |
+| `cgroup <path>` | Any other path |
+| `no cgroup v2 unified hierarchy` | `/proc/self/cgroup` has no `0::` line |
+
+`<how>` is where a launch takes its scope from, the first that applies:
+
+| `<how>` | When |
+|---|---|
+| `a launch adopts the delegated parent <path>` | The [delegated parent](resource-limits.md#delegated-parent) passes every check |
+| `a launch asks the systemd user manager for a scope; it delegates <controllers>` | A session bus is reachable (`DBUS_SESSION_BUS_ADDRESS` is set, or `$XDG_RUNTIME_DIR/bus` exists, `/run/user/<uid>/bus` when `XDG_RUNTIME_DIR` is unset) and the user manager's cgroup exists. A launch gets its scope when `<controllers>` include memory, pids and cpu |
+| `a launch builds under mur's own cgroup, delegated to uid <uid>` | `mur`'s own cgroup is owned by its uid and lists memory, pids and cpu |
+| `no delegated cgroup is reachable` | None of the above |
+
+On a host where a launch gets its scope there is no `cause:` or `fix:` line. When the capsule needs
+a scope and `cgroup scope:` reads `unavailable`, the `E-RUN-012` finding's `Fix:` is the `fix:`
+text; when the host lines show no cause, it is the generic delegation fix. Off Linux the block
+prints `host setup: not Linux — no cgroup scope is needed` in place of the three lines.
 
 ### Runtime directory { #doctor-runtime-directory }
 

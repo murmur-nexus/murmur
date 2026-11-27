@@ -278,7 +278,9 @@ impl Launch {
 /// Shell functions every script uses: `launch NAME` starts `mur run` of `$MANIFEST` in the
 /// background with its pid in `$OUT/NAME.pid`; `finish NAME` waits for it and writes its exit
 /// code; `snapshots` appends, every 50 ms until `$OUT/stop` exists, every `murmur-*` cgroup under
-/// the root, its children and `launcher` with its `populated` value to `$OUT/snap.txt`.
+/// the root, its children and `launcher` with its `populated` value to `$OUT/snap.txt`; `doctor`
+/// runs `mur doctor --json` in the manifest's folder, its document in `$OUT/doctor.json`, its text
+/// in `$OUT/doctor.err` and its exit code in `$OUT/doctor.code`.
 const FUNCTIONS: &str = r#"
 launch() { "$MUR" run --manifest "$MANIFEST" --task "do the thing" > "$OUT/$1.out" 2> "$OUT/$1.err" & echo $! > "$OUT/$1.pid"; }
 finish() { wait "$(cat "$OUT/$1.pid")"; echo $? > "$OUT/$1.code"; }
@@ -292,6 +294,7 @@ snapshots() {
   done >> "$OUT/snap.txt"
 }
 leftovers() { find /sys/fs/cgroup -name 'murmur-*' > "$OUT/leftover.txt"; }
+doctor() { (cd "$(dirname "$MANIFEST")" && "$MUR" doctor --json > "$OUT/doctor.json" 2> "$OUT/doctor.err"; echo $? > "$OUT/doctor.code"); }
 "#;
 
 /// Twelve launches at once, with snapshots of the cgroup tree while they run.
@@ -633,4 +636,177 @@ fn explain_scope_is_identical_on_an_adopted_parent() {
     );
     assert_eq!(inside.stdout, outside);
     assert_eq!(out.read("leftover.txt"), "", "left behind");
+}
+
+/// The `E-RUN-012` fix for the construction's parent, which enables nothing for its children.
+const FIX_PARENT: &str = "enable the controllers for the children of /sys/fs/cgroup, with no \
+     process left directly in it (see \
+     https://docs.murmur.nexus/reference/resource-limits/#delegated-parent):\n    \
+     echo \"+memory +pids +cpu +io\" > /sys/fs/cgroup/cgroup.subtree_control";
+
+/// The cause the construction's parent gives when it enables nothing.
+const CAUSE_PARENT: &str = "the cgroup above mur's (/sys/fs/cgroup) is delegated to uid 0 but \
+     does not enable memory, pids, cpu for its children";
+
+/// `mur doctor --json`'s exit code, document and text from `out`.
+fn doctor_report(out: &Out) -> (Option<i32>, serde_json::Value, String) {
+    let json = out.read("doctor.json");
+    let text = out.read("doctor.err");
+    let document = serde_json::from_str(&json).unwrap_or_else(|error| {
+        panic!("doctor --json printed no document ({error}):\n{json}\n{text}")
+    });
+    (out.read("doctor.code").trim().parse().ok(), document, text)
+}
+
+/// The findings of `document` in `block`.
+fn findings_in<'a>(document: &'a serde_json::Value, block: &str) -> Vec<&'a serde_json::Value> {
+    document["findings"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["block"] == block)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Cgroup scope` block of doctor's text, from its heading to the blank line after it, each
+/// line ending in a newline.
+fn cgroup_scope_block(text: &str) -> String {
+    text.lines()
+        .skip_while(|line| *line != "Cgroup scope")
+        .take_while(|line| !line.is_empty())
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A launch refused under a parent that enables nothing names that cause after `this host:` and
+/// carries the command that enables the controllers as its hint.
+#[test]
+fn a_refusal_names_the_parent_cause_and_its_fix() {
+    let test = "a_refusal_names_the_parent_cause_and_its_fix";
+    if skip(test) {
+        return;
+    }
+    let capsule = Capsule::new(1, "");
+    let out = capsule.in_parent("", &script("launch refused; finish refused\n"));
+    let refused = out.launch("refused");
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    for expected in [
+        "error[E-RUN-012]",
+        "no delegated parent was adopted: parent does not enable memory,pids,cpu",
+        &format!("; this host: {CAUSE_PARENT}; on Linux the runtime refuses"),
+        &format!("\n  hint: {FIX_PARENT}"),
+        "\n    echo \"+memory +pids +cpu +io\" > /sys/fs/cgroup/cgroup.subtree_control",
+    ] {
+        assert!(
+            refused.stderr.contains(expected),
+            "{expected}\n{}",
+            refused.all()
+        );
+    }
+}
+
+/// On a parent that is adopted, doctor prints the host setup lines and nothing more: no cause, no
+/// fix, no `cgroup-scope` finding, and `cgroup_host` says ready.
+#[test]
+fn doctor_is_quiet_on_an_adopted_parent() {
+    let test = "doctor_is_quiet_on_an_adopted_parent";
+    if skip(test) {
+        return;
+    }
+    let capsule = Capsule::new(1, "");
+    let out = capsule.in_parent(ENABLE_CPU_MEMORY_PIDS, &script("doctor; leftovers\n"));
+    let (_, document, text) = doctor_report(&out);
+    let host = &document["cgroup_host"];
+    assert_eq!(host["setup"], "other", "{host}");
+    assert_eq!(host["cgroup"], "/launcher", "{host}");
+    assert_eq!(host["scope_source"], "delegated-parent", "{host}");
+    assert_eq!(host["ready"], true, "{host}");
+    assert_eq!(host["delegated_parent"]["adopts"], true, "{host}");
+    assert_eq!(host["delegated_parent"]["path"], "/sys/fs/cgroup", "{host}");
+    assert!(host["cause"].is_null() && host["fix"].is_null(), "{host}");
+    assert!(
+        findings_in(&document, "cgroup-scope").is_empty(),
+        "{document}"
+    );
+    let block = cgroup_scope_block(&text);
+    assert!(block.contains("\n  cgroup scope: delegated\n"), "{block}");
+    assert!(
+        block.contains(
+            "\n  host setup: cgroup /launcher \u{2014} a launch adopts the delegated parent \
+             /sys/fs/cgroup\n"
+        ),
+        "{block}"
+    );
+    assert!(
+        block.contains("\n  delegated parent: would be adopted \u{2014} /sys/fs/cgroup\n"),
+        "{block}"
+    );
+    assert!(block.contains("\n  open files: "), "{block}");
+    assert!(
+        !block.contains("cause:") && !block.contains("fix:"),
+        "{block}"
+    );
+    assert_eq!(out.read("leftover.txt"), "", "left behind");
+}
+
+/// On a parent that enables nothing, doctor names the cause and prints the command that fixes it,
+/// as `cgroup_host` and as the `E-RUN-012` finding's fix, and does not run it: the parent's
+/// `cgroup.subtree_control` is still empty afterwards.
+#[test]
+fn doctor_prints_the_fix_for_a_parent_that_enables_nothing() {
+    let test = "doctor_prints_the_fix_for_a_parent_that_enables_nothing";
+    if skip(test) {
+        return;
+    }
+    let capsule = Capsule::new(1, "");
+    let out = capsule.in_parent(
+        "",
+        &script(
+            "doctor\ncat /sys/fs/cgroup/cgroup.subtree_control > \"$OUT/subtree_control\"\n\
+             leftovers\n",
+        ),
+    );
+    let (code, document, text) = doctor_report(&out);
+    assert_eq!(code, Some(1), "{text}");
+    let host = &document["cgroup_host"];
+    assert_eq!(host["ready"], false, "{host}");
+    assert_eq!(host["scope_source"], "none", "{host}");
+    assert_eq!(
+        host["missing"],
+        serde_json::json!(["memory", "pids", "cpu"]),
+        "{host}"
+    );
+    assert_eq!(host["cause"], CAUSE_PARENT, "{host}");
+    assert_eq!(host["fix"], FIX_PARENT, "{host}");
+    let scope_findings = findings_in(&document, "cgroup-scope");
+    assert_eq!(scope_findings.len(), 1, "{document}");
+    assert_eq!(scope_findings[0]["code"], "E-RUN-012", "{document}");
+    assert_eq!(scope_findings[0]["fix"], host["fix"], "{document}");
+    let block = cgroup_scope_block(&text);
+    assert!(
+        block.contains(&format!("\n  cause: {CAUSE_PARENT}\n")),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "\n  fix: enable the controllers for the children of /sys/fs/cgroup, with no process \
+             left directly in it (see \
+             https://docs.murmur.nexus/reference/resource-limits/#delegated-parent):\n      echo \
+             \"+memory +pids +cpu +io\" > /sys/fs/cgroup/cgroup.subtree_control\n"
+        ),
+        "{block}"
+    );
+    assert_eq!(
+        out.read("subtree_control").trim(),
+        "",
+        "doctor applied the fix"
+    );
+    let leftovers = out.read("leftover.txt");
+    assert!(
+        !leftovers.lines().any(|line| line.ends_with("-p")),
+        "{leftovers}"
+    );
 }

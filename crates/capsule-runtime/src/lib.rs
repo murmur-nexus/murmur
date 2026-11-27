@@ -235,9 +235,11 @@ pub use streaming::STREAM_EXTENSION_URI;
 // here rather than duplicating a probe once per crate that needs it.
 pub use cgroup::{
     active_swap_areas, cgroup_delegation_available, declares_io_limit, explain_scope_probe,
-    io_max_device_available, probe_scope, probe_swap_control, render_cgroup_scope,
-    requires_process_bounding, skip_without_host_support, CgroupScopeReport, CgroupScopeStatus,
-    IoMaxReport, IoMaxStatus, ScopeProbe, SwapControl, SCOPE_SWAP_MAX,
+    io_max_device_available, launch_host_report, probe_scope, probe_swap_control,
+    render_cgroup_scope, render_launch_host, requires_process_bounding, skip_without_host_support,
+    CgroupScopeReport, CgroupScopeStatus, DelegatedParentReport, HostSetup, IoMaxReport,
+    IoMaxStatus, LaunchHostReport, OpenFiles, ScopeProbe, ScopeSource, SwapControl,
+    UserManagerReport, SCOPE_SWAP_MAX,
 };
 // The door's protocol version and error tables: every client of a door sends the header pair,
 // and names the error it is answered with through `A2aError::from_code`.

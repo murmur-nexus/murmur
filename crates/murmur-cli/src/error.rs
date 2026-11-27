@@ -508,15 +508,16 @@ impl From<RuntimeError> for CliError {
                  the work folder and symlinks out of it are refused; have the tool write its \
                  output under that folder",
             ),
-            error @ RuntimeError::CgroupDelegationUnavailable { .. } => CliError::with_hint(
-                E_RUN_012,
-                error.to_string(),
-                concat!(
-                    "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
-                     cpu and io — see ",
-                    murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
-                ),
-            ),
+            // The hint is the fix for the cause the message names, found on this host.
+            RuntimeError::CgroupDelegationUnavailable {
+                reason,
+                cause,
+                fix,
+            } => {
+                let hint = fix.clone();
+                let message = RuntimeError::CgroupDelegationUnavailable { reason, cause, fix };
+                CliError::with_hint(E_RUN_012, message.to_string(), hint)
+            }
             // Distinct from E-CAP-003 on purpose: that one is a pre-launch refusal by a host that
             // never claimed to offer `sealed`, so the remedy is to lower the floor or move hosts.
             // This one is a host that cleared the probe and then failed to build the root, so the
@@ -1700,6 +1701,64 @@ fn extract_interface_name(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `E-RUN-012` names this host's cause in its message and carries its fix as the hint, the
+    /// fix's command lines on their own lines below it.
+    #[test]
+    fn e_run_012_carries_this_hosts_cause_and_fix() {
+        let fix =
+            "enable the controllers for the children of /sys/fs/cgroup, with no process left \
+                   directly in it (see \
+                   https://docs.murmur.nexus/reference/resource-limits/#delegated-parent):\n    \
+                   echo \"+memory +pids +cpu +io\" > /sys/fs/cgroup/cgroup.subtree_control";
+        let cli = CliError::from(RuntimeError::CgroupDelegationUnavailable {
+            reason: "no delegated parent was adopted: parent does not enable memory,pids,cpu"
+                .to_string(),
+            cause: "the cgroup above mur's (/sys/fs/cgroup) is delegated to uid 0 but does not \
+                    enable memory, pids, cpu for its children"
+                .to_string(),
+            fix: fix.to_string(),
+        });
+        assert_eq!(cli.code, E_RUN_012);
+        assert_eq!(cli.hint.as_deref(), Some(fix));
+        assert!(
+            cli.message.contains(
+                "(no delegated parent was adopted: parent does not enable memory,pids,cpu); this \
+                 host: the cgroup above mur's (/sys/fs/cgroup) is delegated to uid 0 but does not \
+                 enable memory, pids, cpu for its children; on Linux the runtime refuses"
+            ),
+            "{}",
+            cli.message
+        );
+        assert!(!cli.message.contains("subtree_control"), "{}", cli.message);
+        let rendered = cli.to_string();
+        assert!(
+            rendered.ends_with(
+                "\n  hint: enable the controllers for the children of /sys/fs/cgroup, with no \
+                 process left directly in it (see \
+                 https://docs.murmur.nexus/reference/resource-limits/#delegated-parent):\n    \
+                 echo \"+memory +pids +cpu +io\" > /sys/fs/cgroup/cgroup.subtree_control"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A refusal whose facts looked delegated keeps the generic fix, verbatim.
+    #[test]
+    fn e_run_012_keeps_the_generic_fix_when_the_host_looked_ready() {
+        let generic = "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, \
+                       pids, cpu and io \u{2014} see \
+                       https://docs.murmur.nexus/reference/resource-limits/#platform-behavior";
+        let cli = CliError::from(RuntimeError::CgroupDelegationUnavailable {
+            reason: "could not create /sys/fs/cgroup/x: Read-only file system (os error 30)"
+                .to_string(),
+            cause: "the cgroups mur reads look delegated to uid 1000, so the operation named \
+                    above is what failed"
+                .to_string(),
+            fix: generic.to_string(),
+        });
+        assert_eq!(cli.hint.as_deref(), Some(generic));
+    }
 
     #[test]
     fn e_cap_022_names_the_artifact_and_code_mode_repl() {

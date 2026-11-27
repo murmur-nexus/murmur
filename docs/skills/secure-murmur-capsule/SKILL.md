@@ -163,7 +163,7 @@ Keep these facts separate in the assessment:
 - **installed mechanism:** the enforcement tier those commands ran on (`mechanism:` / `enforcement_tier`);
 - **host ceiling:** what probing shows the host could support for a capsule declaring `sealed` (`host can back:` / `host_containment`);
 - **routes outside the class:** the class confines shell commands, plan shell steps, the programs WASM tools run through `murmur:process`, an `inference.transport: process` harness with every program it runs, and the guest workers that run WASM tools, drivers and hooks. Every route reads `under_class: true` in the `Routes` block / `routes` rows, so `W-SEC-034` does not fire today;
-- **cgroup scope:** whether a launch gets the cgroup scope a subprocess-capable capsule needs (`cgroup scope:` / `cgroup_scope`); `unavailable` predicts an `E-RUN-012` refusal.
+- **cgroup scope:** whether a launch gets the cgroup scope a subprocess-capable capsule needs (`cgroup scope:` / `cgroup_scope`); `unavailable` predicts an `E-RUN-012` refusal, and the block's `cause:` / `fix:` lines (`cgroup_host.cause` / `cgroup_host.fix`) name why on this host and the commands that fix it — report them, do not run them unasked.
 
 A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest declarable class, and lets the operator run the capsule [unconfined](https://docs.murmur.nexus/reference/containment/#unconfined); any declared floor, `advisory` included, refuses that. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
 

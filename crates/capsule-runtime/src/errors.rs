@@ -653,14 +653,21 @@ pub enum RuntimeError {
         detail: String,
     },
 
+    /// `reason` is the failed operation's; `cause` and `fix` are what
+    /// [`crate::cgroup::launch_host_report`] found on this host, read before the launch moved
+    /// anywhere: the cause in the message, the fix as the CLI's hint.
     #[error(
         "this capsule can spawn subprocesses but no cgroup v2 scope could be created to \
-         bound them ({reason}); on Linux the runtime refuses to launch rather than run a \
-         subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user \
-         delegation requirement at {}",
+         bound them ({reason}); this host: {cause}; on Linux the runtime refuses to launch rather \
+         than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd \
+         user delegation requirement at {}",
         RESOURCE_LIMITS_PLATFORM_URL
     )]
-    CgroupDelegationUnavailable { reason: String },
+    CgroupDelegationUnavailable {
+        reason: String,
+        cause: String,
+        fix: String,
+    },
 
     #[error(
         "work folder, $HOME and $TMPDIR together grew to {observed_bytes} bytes, past the \
@@ -1153,8 +1160,17 @@ mod tests {
 
     #[test]
     fn cgroup_delegation_refusal_links_the_published_platform_section() {
-        let message = RuntimeError::CgroupDelegationUnavailable { reason: "x".into() }.to_string();
-        assert!(message.contains("(x)"), "{message}");
+        let message = RuntimeError::CgroupDelegationUnavailable {
+            reason: "x".into(),
+            cause: "y".into(),
+            fix: "z".into(),
+        }
+        .to_string();
+        assert!(
+            message.contains("(x); this host: y; on Linux the runtime refuses"),
+            "{message}"
+        );
+        assert!(!message.contains('z'), "{message}");
         assert!(
             message
                 .contains("https://docs.murmur.nexus/reference/resource-limits/#platform-behavior"),
