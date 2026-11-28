@@ -27,7 +27,8 @@ The Linux x86_64 binaries are built against glibc 2.34 and run on Debian 12+, Ub
 The installer runs each binary once before putting it on your PATH, so an older host is refused with the
 loader's own message rather than a broken `mur`.
 
-On an older distribution, or on any platform without a published binary, build from source with Cargo
+On an older distribution, or on any platform without a published binary, build from source with Cargo,
+after installing the prerequisites [BUILD.md](BUILD.md) lists for your platform
 ```bash
 cargo install murmur-cli
 ```

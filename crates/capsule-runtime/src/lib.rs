@@ -33,6 +33,9 @@ pub mod artifact_supply;
 pub mod background_command;
 pub mod bindings;
 pub mod build_cache;
+#[cfg(test)]
+#[path = "../build/libseccomp.rs"]
+mod build_libseccomp;
 pub(crate) mod bus;
 pub use bus::refuse_bus_import;
 pub(crate) mod cancel;
