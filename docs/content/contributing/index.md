@@ -180,7 +180,8 @@ a different one, and a third builds the tool that compares them:
 | `alloc-bench` | Builds the `mur-alloc-bench` binary, which times component compilation and the runtime's per-session allocation churn |
 
 Every build of `mur` already needs a C compiler, because some of its dependencies ship C and
-assembly. `jemalloc` adds one more tool: it configures and builds jemalloc from source, so
+assembly, and on Linux the libseccomp development package, because `mur` links libseccomp;
+[BUILD.md](https://github.com/murmur-nexus/murmur/blob/main/BUILD.md) names both packages for each distribution. `jemalloc` adds one more tool: it configures and builds jemalloc from source, so
 `--features jemalloc` and any `--all-features` build also need `make` on `PATH`.
 
 To compare the three allocators on your own machine:

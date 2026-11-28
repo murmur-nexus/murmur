@@ -1,5 +1,7 @@
-//! Stops a Linux source build that would fail to link libseccomp before anything compiles, with
-//! the package to install, instead of a `cannot find -lseccomp` link error at the end.
+//! Stops a Linux source build that would fail to link libseccomp before `capsule-runtime`
+//! compiles, with the package to install, instead of a `cannot find -lseccomp` link error at the
+//! end. Cargo runs this script only after its dependencies' build scripts, so it is not the first
+//! step of a build.
 //!
 //! The probe asks `cc`, rustc's default linker, for `libseccomp.so` and `libseccomp.a`. It steps
 //! aside whenever the answer could differ from the real link: see `libseccomp::skip_reason`.

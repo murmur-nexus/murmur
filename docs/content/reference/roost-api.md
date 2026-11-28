@@ -25,7 +25,8 @@ curl -fsSL https://install.murmur.rs | sh
 The published Linux x86_64 binaries need glibc 2.34 or newer — Debian 12+, Ubuntu 22.04+, RHEL 9+.
 The installer runs each binary once before putting it on your `PATH`, so a host that cannot start
 them is told so and left with whatever it already had. On an older distribution, build from source
-with `cargo install murmur-cli`.
+with `cargo install murmur-cli`, after installing the packages [BUILD.md](https://github.com/murmur-nexus/murmur/blob/main/BUILD.md) lists for your
+distribution.
 
 Start it on loopback:
 
