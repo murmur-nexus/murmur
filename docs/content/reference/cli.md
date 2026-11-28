@@ -5189,8 +5189,13 @@ murmur:capsule           0.1.0
 murmur:tool-registry     0.2.0
 ```
 
-The second line is `commit unknown` for a build made without a git checkout or a
-`.cargo_vcs_info.json`. One row per package of the served level, in ascending order, each column
+The second line is `commit unknown` when the build had none of these:
+
+- a git checkout of this source
+- a `.cargo_vcs_info.json`
+- the commit `git archive` writes into the source, which a GitHub source tarball also carries
+
+One row per package of the served level, in ascending order, each column
 padded to its widest cell plus two spaces.
 
 **Output (`--json`):** one pretty-printed object and a newline.
@@ -5218,7 +5223,7 @@ padded to its widest cell plus two spaces.
 | Key | Type | Holds |
 |---|---|---|
 | `mur_version` | string | This `mur`'s version, as `mur --version` prints it: `X.Y.Z` for a release, `X.Y.Z-dev` for a build from `main`, where `X.Y.Z` is the next release |
-| `commit` | string or `null` | The 40-character lowercase hex git commit this `mur` was built from. `null` when the build had neither a git checkout nor a `.cargo_vcs_info.json` |
+| `commit` | string or `null` | The 40-character lowercase hex git commit this `mur` was built from. `null` when the build had none of a git checkout of this source, a `.cargo_vcs_info.json`, or the commit `git archive` writes into the source |
 | `wit_level` | integer | The WIT level this `mur` serves |
 | `packages` | array | Every package of that level, ascending, each `{"package", "version"}` |
 | `commands` | object | One key per machine-readable command, as it is typed after `mur`, in ascending order. Each value is the positive schema number of that command's output. See [Driving mur from another program](#machine-interface) |
